@@ -1,0 +1,16 @@
+# The directory Mix downloads dependencies into.
+/deps/
+# Build artifacts.
+/_build/
+# Generated docs.
+/doc/
+# Crash dumps.
+erl_crash.dump
+*.beam
+# `mix hex.build` output (extracted package dir + tarball).
+/attesto_phoenix-*/
+*.tar
+priv/plts/*.plt
+priv/plts/*.plt.hash
+# Test scratch output.
+/tmp/

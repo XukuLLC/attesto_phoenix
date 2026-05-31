@@ -1,0 +1,177 @@
+defmodule AttestoPhoenix.Plug.AuthenticateTest do
+  @moduledoc false
+  use ExUnit.Case, async: false
+
+  import Plug.Conn
+  import Plug.Test
+
+  alias Attesto.Token
+  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Plug.Authenticate
+
+  @issuer "https://issuer.example"
+  @subject "ou_user-123"
+  @signing_pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
+
+  defmodule Keystore do
+    @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem do
+      :attesto_phoenix
+      |> Application.fetch_env!(__MODULE__)
+      |> Keyword.fetch!(:signing_pem)
+    end
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  @user_kind Attesto.PrincipalKind.new("user", "ou_",
+               required_claims: [{"client_id", :non_empty_string}]
+             )
+
+  setup do
+    Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @signing_pem)
+    on_exit(fn -> Application.delete_env(:attesto_phoenix, __MODULE__.Keystore) end)
+
+    config =
+      Config.new(
+        issuer: @issuer,
+        audience: @issuer,
+        keystore: __MODULE__.Keystore,
+        repo: __MODULE__.Repo,
+        load_client: fn _ -> {:error, :not_found} end,
+        verify_client_secret: fn _, _ -> false end,
+        load_principal: fn subject -> {:ok, %{subject: subject, kind: :user}} end,
+        on_event: fn event -> send(self(), {:event, event}) end,
+        principal_kinds: [@user_kind],
+        require_https: false
+      )
+
+    %{config: config}
+  end
+
+  test "delegates token verification to core and assigns neutral Phoenix context", %{
+    config: config
+  } do
+    token = mint(config, scope: "openid read:reports")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    refute conn.halted
+    assert conn.assigns.attesto_claims["sub"] == @subject
+    assert conn.assigns.attesto_principal == %{subject: @subject, kind: :user}
+
+    assert conn.assigns.attesto_context == %{
+             subject: @subject,
+             client_id: "client-1",
+             scope: ["openid", "read:reports"],
+             claims: conn.assigns.attesto_claims,
+             cnf: nil,
+             principal: %{subject: @subject, kind: :user}
+           }
+
+    assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
+  end
+
+  test "a missing principal is rendered as invalid_token without exposing lookup detail", %{
+    config: config
+  } do
+    config = %{config | load_principal: fn _subject -> {:error, :not_found} end}
+    token = mint(config, scope: "openid")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert conn.halted
+    assert conn.status == 401
+    assert JSON.decode!(conn.resp_body) == %{"error" => "invalid_token"}
+    assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+    assert_receive {:event, %AttestoPhoenix.Event{name: :auth_denied, result: :invalid_token}}
+  end
+
+  test "supports custom assign keys", %{config: config} do
+    token = mint(config, scope: "read:reports")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(
+        Authenticate.init(
+          config: config,
+          claims_key: :claims,
+          principal_key: :principal,
+          context_key: :auth_context
+        )
+      )
+
+    refute conn.halted
+    assert conn.assigns.claims["sub"] == @subject
+    assert conn.assigns.principal.subject == @subject
+    assert conn.assigns.auth_context.scope == ["read:reports"]
+  end
+
+  test "enforces the configured HTTPS boundary before verifying credentials", %{config: config} do
+    config = %{config | require_https: true}
+    token = mint(config, scope: "openid")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert conn.halted
+    assert conn.status == 401
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_token"
+
+    assert_receive {:event,
+                    %AttestoPhoenix.Event{name: :auth_denied, result: :insecure_transport}}
+  end
+
+  test "uses configured error transport for core verifier failures", %{config: config} do
+    config = %{
+      config
+      | send_error: fn conn, status, body ->
+          conn
+          |> put_resp_content_type("application/vnd.host-test+json")
+          |> send_resp(status, JSON.encode!(%{"error" => body}))
+          |> halt()
+        end
+    }
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert conn.halted
+    assert conn.status == 401
+    assert JSON.decode!(conn.resp_body)["error"]["error"] == "invalid_token"
+    assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+  end
+
+  defp mint(config, opts) do
+    attesto_config = Config.to_attesto_config(config, principal_kinds: [@user_kind])
+
+    principal = %{
+      kind: "user",
+      sub: @subject,
+      scopes: String.split(Keyword.fetch!(opts, :scope), " "),
+      claims: %{"client_id" => "client-1"}
+    }
+
+    {:ok, %{access_token: token}} = Token.mint(attesto_config, principal)
+    token
+  end
+end
