@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-05-31
+
 ### Added
 
 - `mix attesto_phoenix.install`, an upgrade-aware Igniter installer. It is
