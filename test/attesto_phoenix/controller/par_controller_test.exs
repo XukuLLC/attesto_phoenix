@@ -4,6 +4,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
   import Plug.Test
 
   alias AttestoPhoenix.Controller.PARController
+  alias AttestoPhoenix.Store.PAR.ETS
 
   @endpoint_path "/oauth/par"
   @client %{id: "confidential-1", secret: "s3cr3t"}
@@ -96,6 +97,60 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["client_id"] == "confidential-1"
     assert stored["redirect_uri"] == "https://client.example/cb"
     refute Map.has_key?(stored, "client_secret")
+  end
+
+  test "uses the default ETS PAR store when par_store is unset" do
+    put_config(par_store: nil)
+
+    params = auth_params()
+    credentials = Base.encode64("confidential-1:s3cr3t")
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+
+    assert {:ok, stored} = ETS.take(body["request_uri"])
+    assert stored["client_id"] == "confidential-1"
+    assert stored["redirect_uri"] == "https://client.example/cb"
+  end
+
+  test "uses the default ETS PAR store for private_key_jwt when par_store is unset" do
+    client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+    client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+    put_config(
+      par_store: nil,
+      token_endpoint_auth_methods_supported: ["private_key_jwt"],
+      client_jwks: fn %{id: "confidential-1"} -> client_jwks end
+    )
+
+    params =
+      Map.merge(auth_params(), %{
+        "code_challenge" => "Z_P4EKbGwIkA01e3Y5fp4tMCvn_Ae5nUw7qY7XwkTrQ",
+        "code_challenge_method" => "S256",
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, "confidential-1")
+      })
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+
+    assert {:ok, stored} = ETS.take(body["request_uri"])
+    assert stored["client_id"] == "confidential-1"
+    assert stored["response_type"] == "code"
+    assert stored["code_challenge_method"] == "S256"
+    refute Map.has_key?(stored, "client_assertion")
+    refute Map.has_key?(stored, "client_assertion_type")
   end
 
   test "stores a pushed authorization request authenticated with private_key_jwt" do

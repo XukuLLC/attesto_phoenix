@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-06-01
+
+### Fixed
+
+- Treat an explicit `nil` `:par_store` config value as unset when applying the
+  default ETS PAR store. This prevents PAR from calling `nil.put/3` when hosts
+  enable pushed authorization requests without overriding the development PAR
+  store.
+- Apply the same nil-aware defaulting to authorization-endpoint PAR resolution.
+
 ## [0.6.9] - 2026-06-01
 
 ### Added

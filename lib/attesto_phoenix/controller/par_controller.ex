@@ -219,7 +219,12 @@ defmodule AttestoPhoenix.Controller.PARController do
     |> json(%{error: code, error_description: desc})
   end
 
-  defp config_field(config, field, default), do: Map.get(config, field, default)
+  defp config_field(config, field, default) do
+    case Map.get(config, field) do
+      nil -> default
+      value -> value
+    end
+  end
 
   defp config_callback(config, field) do
     case Map.fetch(config, field) do

@@ -767,7 +767,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `:authenticate_resource_owner`, `:consent`): pull it from the struct map.
   defp config_callback(config, key), do: Map.get(config, key)
 
-  defp config_field(config, key, default), do: Map.get(config, key, default)
+  defp config_field(config, key, default) do
+    case Map.get(config, key) do
+      nil -> default
+      value -> value
+    end
+  end
 
   # Read a boolean policy flag from the config struct, treating an absent or
   # non-boolean value as `false` (fail closed: a flag the host did not set never
