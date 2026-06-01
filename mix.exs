@@ -3,7 +3,7 @@ defmodule AttestoPhoenix.MixProject do
   use Mix.Project
 
   @version "0.6.7"
-  @url "https://github.com/neilberkman/attesto_phoenix"
+  @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
   def project do
