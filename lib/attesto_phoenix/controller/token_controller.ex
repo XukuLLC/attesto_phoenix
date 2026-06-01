@@ -234,16 +234,27 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   defp authenticate_client(config, conn, params) do
     case fetch_client_credentials(conn, params) do
-      {:ok, :public, client_id} ->
+      {:ok, :none, client_id} ->
         # RFC 6749 §2.1: identified but unauthenticated. Permitted only for
         # public clients, which must compensate with PKCE (RFC 7636).
-        load_public_client(config, client_id)
+        with :ok <- require_client_auth_method(config, "none") do
+          load_public_client(config, client_id)
+        end
 
-      {:ok, :secret, client_id, secret} ->
-        verify_confidential_client(config, client_id, secret)
+      {:ok, :client_secret_basic, client_id, secret} ->
+        with :ok <- require_client_auth_method(config, "client_secret_basic") do
+          verify_confidential_client(config, client_id, secret)
+        end
+
+      {:ok, :client_secret_post, client_id, secret} ->
+        with :ok <- require_client_auth_method(config, "client_secret_post") do
+          verify_confidential_client(config, client_id, secret)
+        end
 
       {:ok, :private_key_jwt, assertion} ->
-        verify_private_key_jwt_client(config, assertion)
+        with :ok <- require_client_auth_method(config, "private_key_jwt") do
+          verify_private_key_jwt_client(config, assertion)
+        end
 
       {:error, _} = err ->
         err
@@ -300,8 +311,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
   defp fetch_body_credentials(%{"client_id" => client_id} = params)
        when is_binary(client_id) and client_id != "" do
     case params["client_secret"] do
-      secret when is_binary(secret) and secret != "" -> {:ok, :secret, client_id, secret}
-      _ -> {:ok, :public, client_id}
+      secret when is_binary(secret) and secret != "" ->
+        {:ok, :client_secret_post, client_id, secret}
+
+      _ ->
+        {:ok, :none, client_id}
     end
   end
 
@@ -314,7 +328,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   defp decode_basic_credentials(encoded) do
     with {:ok, decoded} <- Base.decode64(encoded),
          [client_id, secret] <- String.split(decoded, ":", parts: 2) do
-      {:ok, :secret, URI.decode_www_form(client_id), URI.decode_www_form(secret)}
+      {:ok, :client_secret_basic, URI.decode_www_form(client_id), URI.decode_www_form(secret)}
     else
       _ -> {:error, error(@error_invalid_client, "malformed Basic authorization header")}
     end
@@ -325,6 +339,18 @@ defmodule AttestoPhoenix.Controller.TokenController do
       {:ok, :private_key_jwt, assertion}
     else
       {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp require_client_auth_method(config, method) do
+    case Map.get(config, :token_endpoint_auth_methods_supported) do
+      methods when is_list(methods) and methods != [] ->
+        if method in methods,
+          do: :ok,
+          else: {:error, error(@error_invalid_client, @client_auth_failed)}
+
+      _ ->
+        :ok
     end
   end
 

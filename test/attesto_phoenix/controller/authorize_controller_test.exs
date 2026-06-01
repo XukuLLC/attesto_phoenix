@@ -14,6 +14,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
   alias Attesto.AuthorizationCode
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
 
   # A fixed S256 PKCE pair (RFC 7636 §4.2): the challenge is the
   # BASE64URL-no-pad encoding of SHA-256(verifier). Computed inline here (the
@@ -188,6 +189,50 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert conn.status == 302
       refute Map.has_key?(location_query(conn), "state")
     end
+
+    test "can include RFC 9207 iss in successful authorization responses" do
+      put_config(authorization_response_iss: true)
+
+      conn = call(valid_params())
+
+      assert conn.status == 302
+      assert location_query(conn)["iss"] == "https://issuer.example.com"
+    end
+  end
+
+  describe "PAR-required policy" do
+    test "rejects direct authorization requests when PAR is required" do
+      put_config(
+        require_pushed_authorization_requests: true,
+        par_store: PARStore
+      )
+
+      conn = call(valid_params())
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert query["error"] == "invalid_request"
+      assert query["state"] == "xyz"
+      refute Map.has_key?(query, "code")
+    end
+
+    test "accepts authorization requests resolved from a PAR request_uri" do
+      request_uri = "urn:ietf:params:oauth:request_uri:test"
+
+      put_config(
+        require_pushed_authorization_requests: true,
+        par_store: PARStore
+      )
+
+      :ok = PARStore.put(request_uri, valid_params(), 60)
+
+      conn = call(%{"client_id" => @client_id, "request_uri" => request_uri})
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert is_binary(query["code"])
+      assert query["state"] == "xyz"
+    end
   end
 
   # ── Direct (non-redirectable) errors (OIDC Core §3.1.2.6) ─────────────────
@@ -267,6 +312,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert conn.status == 302
       assert location_query(conn)["error"] == "invalid_request"
+    end
+
+    test "can include RFC 9207 iss in authorization error responses" do
+      put_config(authorization_response_iss: true)
+
+      conn = call(valid_params(%{}) |> Map.delete("code_challenge"))
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert query["error"] == "invalid_request"
+      assert query["iss"] == "https://issuer.example.com"
     end
 
     test "PKCE plain method redirects with invalid_request (no downgrade)" do

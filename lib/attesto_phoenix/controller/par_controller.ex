@@ -72,7 +72,7 @@ defmodule AttestoPhoenix.Controller.PARController do
       ["Basic " <> encoded] when not is_map_key(params, "client_secret") ->
         with {:ok, client_id, secret} <- decode_basic(encoded),
              true <- not is_map_key(params, "client_assertion") do
-          {:ok, {:secret, client_id, secret}}
+          {:ok, {:client_secret_basic, client_id, secret}}
         else
           false -> {:error, {@error_invalid_request, "multiple client authentication methods"}}
           {:error, _} = error -> error
@@ -84,7 +84,7 @@ defmodule AttestoPhoenix.Controller.PARController do
       [] ->
         with client_id when is_binary(client_id) and client_id != "" <- params["client_id"],
              secret when is_binary(secret) and secret != "" <- params["client_secret"] do
-          {:ok, {:secret, client_id, secret}}
+          {:ok, {:client_secret_post, client_id, secret}}
         else
           _ -> {:error, {@error_invalid_client, "client authentication failed"}}
         end
@@ -94,11 +94,21 @@ defmodule AttestoPhoenix.Controller.PARController do
     end
   end
 
-  defp verify_client_auth(config, {:secret, client_id, secret}),
-    do: load_and_verify(config, client_id, secret)
+  defp verify_client_auth(config, {:client_secret_basic, client_id, secret}) do
+    with :ok <- require_client_auth_method(config, "client_secret_basic") do
+      load_and_verify(config, client_id, secret)
+    end
+  end
+
+  defp verify_client_auth(config, {:client_secret_post, client_id, secret}) do
+    with :ok <- require_client_auth_method(config, "client_secret_post") do
+      load_and_verify(config, client_id, secret)
+    end
+  end
 
   defp verify_client_auth(config, {:private_key_jwt, assertion}) do
-    with {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
+    with :ok <- require_client_auth_method(config, "private_key_jwt"),
+         {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
          {:ok, client} <- load_existing_client(config, client_id),
          {:ok, jwks} <- client_jwks(config, client),
          {:ok, _claims} <-
@@ -108,6 +118,18 @@ defmodule AttestoPhoenix.Controller.PARController do
       {:ok, client}
     else
       _ -> {:error, {@error_invalid_client, "client authentication failed"}}
+    end
+  end
+
+  defp require_client_auth_method(config, method) do
+    case Map.get(config, :token_endpoint_auth_methods_supported) do
+      methods when is_list(methods) and methods != [] ->
+        if method in methods,
+          do: :ok,
+          else: {:error, {@error_invalid_client, "client authentication failed"}}
+
+      _ ->
+        :ok
     end
   end
 

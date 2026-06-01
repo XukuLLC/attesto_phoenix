@@ -293,6 +293,42 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    test "rejects client_secret_basic when configured for private_key_jwt only" do
+      put_config(token_endpoint_auth_methods_supported: ["private_key_jwt"])
+
+      credentials = Base.encode64("confidential-1:s3cr3t")
+
+      conn =
+        :post
+        |> conn(@endpoint_path, %{"grant_type" => "client_credentials"})
+        |> put_req_header("authorization", "Basic " <> credentials)
+        |> TokenController.create(%{"grant_type" => "client_credentials"})
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+    end
+
+    test "allows private_key_jwt when configured for private_key_jwt only" do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+      put_config(
+        token_endpoint_auth_methods_supported: ["private_key_jwt"],
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end
+      )
+
+      assertion = client_assertion(client_key, "confidential-1")
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => assertion
+        })
+
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
     test "rejects private_key_jwt with a mismatched trusted client key" do
       assertion = client_assertion(JOSE.JWK.generate_key({:ec, "P-256"}), "confidential-1")
       other_key = JOSE.JWK.generate_key({:ec, "P-256"})

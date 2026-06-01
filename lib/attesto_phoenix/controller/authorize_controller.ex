@@ -202,33 +202,53 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # is never subject to the requirement (RFC 6749 keeps the code at SHOULD), so
   # the flag is scoped to OIDC requests via `openid_request?/1`.
   defp validate_request(config, client, params) do
-    params = resolve_request_uri(config, params)
+    {params, par_resolved?} = resolve_request_uri(config, params)
     registered = registered_redirect_uris(config, client)
 
-    AuthorizationRequest.validate(params,
-      registered_redirect_uris: registered,
-      require_nonce: require_nonce?(config, params),
-      require_pkce: require_pkce?(config, client),
-      request_object_jwks: client_jwks(config, client),
-      request_object_audience: config.issuer
-    )
+    with {:ok, request} <-
+           AuthorizationRequest.validate(params,
+             registered_redirect_uris: registered,
+             require_nonce: require_nonce?(config, params),
+             require_pkce: require_pkce?(config, client),
+             request_object_jwks: client_jwks(config, client),
+             request_object_audience: config.issuer
+           ),
+         :ok <- require_par_if_configured(config, request, par_resolved?) do
+      {:ok, request}
+    end
   end
 
   defp resolve_request_uri(config, %{"request_uri" => request_uri} = params)
        when is_binary(request_uri) and request_uri != "" do
     case par_store(config) do
       nil ->
-        params
+        {params, false}
 
       store ->
         case store.take(request_uri) do
-          {:ok, stored} -> Map.merge(params, stored) |> Map.delete("request_uri")
-          :error -> params
+          {:ok, stored} -> {Map.merge(params, stored) |> Map.delete("request_uri"), true}
+          :error -> {params, false}
         end
     end
   end
 
-  defp resolve_request_uri(_config, params), do: params
+  defp resolve_request_uri(_config, params), do: {params, false}
+
+  defp require_par_if_configured(config, request, false) do
+    if config_flag(config, :require_pushed_authorization_requests) do
+      {:error,
+       {:redirect,
+        %{
+          redirect_uri: request.redirect_uri,
+          error: "invalid_request",
+          state: request.state
+        }}}
+    else
+      :ok
+    end
+  end
+
+  defp require_par_if_configured(_config, _request, true), do: :ok
 
   defp par_store(config), do: config_field(config, :par_store, AttestoPhoenix.Store.PAR.ETS)
 
@@ -548,18 +568,26 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # RFC 6749 §4.1.2: success redirect. The authorization code and (when present)
   # the request `state` are appended to the redirect_uri as query parameters.
   defp redirect_with_code(conn, redirect_uri, code, state) do
-    params = [{"code", code}] ++ state_param(state)
+    params = [{"code", code}] ++ state_param(state) ++ iss_param()
     do_redirect(conn, redirect_uri, params)
   end
 
   # RFC 6749 §4.1.2.1: error redirect, echoing `state` when present.
   defp redirect_with_error(conn, redirect_uri, error_code, state) do
-    params = [{"error", error_code}] ++ state_param(state)
+    params = [{"error", error_code}] ++ state_param(state) ++ iss_param()
     do_redirect(conn, redirect_uri, params)
   end
 
   defp state_param(nil), do: []
   defp state_param(state), do: [{"state", state}]
+
+  defp iss_param do
+    config = resolve_config()
+
+    if config_flag(config, :authorization_response_iss),
+      do: [{"iss", config.issuer}],
+      else: []
+  end
 
   # RFC 6749 §3.1.2: parameters are appended to the redirect_uri's query
   # component, preserving any query already present in the registered URI.

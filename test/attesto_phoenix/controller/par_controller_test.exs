@@ -123,6 +123,45 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     refute Map.has_key?(stored, "client_assertion_type")
   end
 
+  test "rejects client_secret_basic when configured for private_key_jwt only" do
+    put_config(token_endpoint_auth_methods_supported: ["private_key_jwt"])
+
+    params = auth_params()
+    credentials = Base.encode64("confidential-1:s3cr3t")
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> PARController.create(params)
+
+    assert conn.status == 400
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+  end
+
+  test "allows private_key_jwt when configured for private_key_jwt only" do
+    client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+    client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+    put_config(
+      token_endpoint_auth_methods_supported: ["private_key_jwt"],
+      client_jwks: fn %{id: "confidential-1"} -> client_jwks end
+    )
+
+    params =
+      Map.merge(auth_params(), %{
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, "confidential-1")
+      })
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+  end
+
   test "rejects multiple client authentication methods" do
     params =
       Map.merge(auth_params(), %{

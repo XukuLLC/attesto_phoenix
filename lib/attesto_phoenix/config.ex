@@ -130,7 +130,9 @@ defmodule AttestoPhoenix.Config do
     * `:grant_types_supported` - grant types advertised/accepted by dynamic
       client registration.
     * `:token_endpoint_auth_methods_supported` - client authentication methods
-      advertised/accepted by dynamic client registration.
+      advertised/accepted by dynamic client registration and by the token/PAR
+      endpoints when configured. When unset, all package-supported methods are
+      accepted.
 
   ### Optional values (with defaults)
 
@@ -175,6 +177,11 @@ defmodule AttestoPhoenix.Config do
       non-OpenID OAuth 2.0 request is never affected (RFC 6749 keeps the
       authorization code at SHOULD, never requiring a `nonce`). The host sets
       this per its own OpenID Provider policy.
+    * `:require_pushed_authorization_requests` - require front-channel
+      authorization requests to use a PAR `request_uri` issued by this server
+      (RFC 9126). Default `false`.
+    * `:authorization_response_iss` - include the RFC 9207 `iss` authorization
+      response parameter on success and error redirects. Default `false`.
     * `:require_https` - enforce HTTPS on the endpoints. Default `true`.
     * `:trusted_proxies` - list of trusted proxy CIDRs/IPs controlling whether
       `X-Forwarded-*` headers are honored. Default `[]` (no forwarded trust).
@@ -304,6 +311,8 @@ defmodule AttestoPhoenix.Config do
     claims_parameter_supported: false,
     require_nonce: false,
     require_pkce: true,
+    require_pushed_authorization_requests: false,
+    authorization_response_iss: false,
     require_https: true,
     trusted_proxies: [],
     access_token_ttl: 900,
@@ -360,6 +369,8 @@ defmodule AttestoPhoenix.Config do
           par_store: module() | nil,
           grant_types_supported: [String.t()] | nil,
           token_endpoint_auth_methods_supported: [String.t()] | nil,
+          require_pushed_authorization_requests: boolean(),
+          authorization_response_iss: boolean(),
           authorization_endpoint: String.t() | nil,
           userinfo_endpoint: String.t() | nil,
           replay_check: callback() | module() | nil,

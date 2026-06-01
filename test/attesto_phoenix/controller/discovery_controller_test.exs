@@ -107,6 +107,22 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
                ["client_secret_basic", "client_secret_post", "private_key_jwt", "none"]
     end
 
+    test "advertises configured token endpoint auth methods" do
+      host = host_config(token_endpoint_auth_methods_supported: ["private_key_jwt"])
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["token_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+    end
+
+    test "advertises when pushed authorization requests are required" do
+      host = host_config(require_pushed_authorization_requests: true)
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["require_pushed_authorization_requests"] == true
+    end
+
     test "advertises configured scopes" do
       body =
         call_show(host_config(scopes_supported: ["read", "write"]), protocol_config())

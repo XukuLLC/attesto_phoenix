@@ -157,12 +157,29 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       response_types_supported: @response_types_supported,
       response_modes_supported: @response_modes_supported,
       grant_types_supported: @grant_types_supported,
-      token_endpoint_auth_methods_supported: @token_endpoint_auth_methods_supported,
+      token_endpoint_auth_methods_supported: token_endpoint_auth_methods_supported(config),
       scopes_supported: presence(config.scopes_supported),
+      require_pushed_authorization_requests: require_pushed_authorization_requests(config),
       pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
       registration_endpoint: registration_endpoint(config)
     ]
   end
+
+  defp token_endpoint_auth_methods_supported(%Config{
+         token_endpoint_auth_methods_supported: methods
+       })
+       when is_list(methods) and methods != [],
+       do: methods
+
+  defp token_endpoint_auth_methods_supported(%Config{}),
+    do: @token_endpoint_auth_methods_supported
+
+  defp require_pushed_authorization_requests(%Config{
+         require_pushed_authorization_requests: true
+       }),
+       do: true
+
+  defp require_pushed_authorization_requests(%Config{}), do: nil
 
   defp pushed_authorization_request_endpoint(%Config{} = config),
     do: Config.par_endpoint_url(config)
