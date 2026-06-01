@@ -42,13 +42,21 @@ defmodule AttestoPhoenix.Schema.Authorization do
 
   ## Lifecycle columns
 
+    * `:family_id` - the grant family this code will mint into, used to revoke
+      descendants when a redeemed code is replayed.
+    * `:access_token_jti` / `:access_token_expires_at` - the access token
+      produced by the successful code redemption. Stored only after issuance,
+      and used to deny the token if the code is later replayed.
+    * `:access_token_revoked_at` - set when code reuse revokes that token.
     * `:expires_at` - absolute expiry as a `utc_datetime`. Authorization
       codes are short-lived (RFC 6749 §4.1.2 recommends a maximum of ten
       minutes).
     * `:consumed_at` - set when the code is spent. The single-use contract
-      (RFC 6749 §4.1.2) is enforced by the store's atomic take; this column
-      is an audit marker for a consumed-then-rejected redemption, not a
-      second gate.
+      (RFC 6749 §4.1.2) is enforced by an atomic claim in the store; this
+      column also lets a later presentation be recognized as reuse instead of
+      an unknown code.
+    * `:consumed_success` - whether the first presentation completed all
+      redemption checks. Only successful redemption is replayed as reuse.
     * `:inserted_at` - insertion timestamp.
 
   ## Record bridge
@@ -91,8 +99,13 @@ defmodule AttestoPhoenix.Schema.Authorization do
           cnf: map() | nil,
           nonce: String.t() | nil,
           claims: map() | nil,
+          family_id: String.t() | nil,
+          access_token_jti: String.t() | nil,
+          access_token_expires_at: DateTime.t() | nil,
+          access_token_revoked_at: DateTime.t() | nil,
           expires_at: DateTime.t() | nil,
           consumed_at: DateTime.t() | nil,
+          consumed_success: boolean(),
           inserted_at: DateTime.t() | nil
         }
 
@@ -122,8 +135,13 @@ defmodule AttestoPhoenix.Schema.Authorization do
     field :cnf, :map
     field :nonce, :string
     field :claims, :map, default: %{}
+    field :family_id, :string
+    field :access_token_jti, :string
+    field :access_token_expires_at, :utc_datetime
+    field :access_token_revoked_at, :utc_datetime
     field :expires_at, :utc_datetime
     field :consumed_at, :utc_datetime
+    field :consumed_success, :boolean, default: false
     field :inserted_at, :utc_datetime
   end
 
@@ -139,7 +157,20 @@ defmodule AttestoPhoenix.Schema.Authorization do
   # from PKCE (Attesto.AuthorizationRequest's :require_pkce) issues a code with
   # no challenge/method. When present they are still constrained (the method to
   # S256, see validate_inclusion below); when absent the columns are NULL.
-  @optional [:scope, :cnf, :nonce, :claims, :consumed_at, :code_challenge, :code_challenge_method]
+  @optional [
+    :scope,
+    :cnf,
+    :nonce,
+    :claims,
+    :family_id,
+    :access_token_jti,
+    :access_token_expires_at,
+    :access_token_revoked_at,
+    :consumed_at,
+    :consumed_success,
+    :code_challenge,
+    :code_challenge_method
+  ]
 
   @doc """
   The default table name for this schema.
@@ -194,6 +225,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
       cnf: cnf_from_data(data),
       nonce: Map.get(data, :nonce),
       claims: Map.get(data, :claims, %{}),
+      family_id: Map.get(data, :family_id),
       expires_at: unix_to_datetime(Map.get(record, :expires_at)),
       inserted_at: now
     }
@@ -228,9 +260,19 @@ defmodule AttestoPhoenix.Schema.Authorization do
         code_challenge_method: row.code_challenge_method,
         dpop_jkt: dpop_jkt_from_cnf(row.cnf),
         nonce: row.nonce,
-        claims: row.claims || %{}
+        claims: row.claims || %{},
+        family_id: row.family_id
       },
       expires_at: datetime_to_unix(row.expires_at)
+    }
+  end
+
+  @doc false
+  @spec consumed_meta(t()) :: map()
+  def consumed_meta(%__MODULE__{} = row) do
+    %{
+      family_id: row.family_id,
+      subject: row.subject
     }
   end
 

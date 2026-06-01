@@ -118,10 +118,15 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     # RFC 6750 / RFC 9449 challenge already written; return it unchanged.
     conn = Authenticate.call(conn, authenticate_opts(config))
 
-    if conn.halted do
-      conn
-    else
-      respond(conn, config)
+    cond do
+      conn.halted ->
+        conn
+
+      access_token_revoked?(config, conn.assigns[@claims_key]) ->
+        invalid_token(conn, scheme_of(conn.assigns[@claims_key]))
+
+      true ->
+        respond(conn, config)
     end
   end
 
@@ -197,6 +202,26 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # bearer or mTLS-bound token gets `Bearer`.
   defp scheme_of(%{"cnf" => %{"jkt" => jkt}}) when is_binary(jkt), do: :dpop
   defp scheme_of(_claims), do: :bearer
+
+  defp access_token_revoked?(%Config{code_store: store}, %{"jti" => jti})
+       when is_atom(store) and is_binary(jti) do
+    function_exported?(store, :access_token_revoked?, 1) and store.access_token_revoked?(jti)
+  end
+
+  defp access_token_revoked?(_config, _claims), do: false
+
+  defp invalid_token(conn, scheme) do
+    challenge =
+      challenge(scheme, [
+        {"error", "invalid_token"}
+      ])
+
+    conn
+    |> put_no_store_headers()
+    |> put_resp_header("www-authenticate", challenge)
+    |> put_status(:unauthorized)
+    |> json(%{"error" => "invalid_token"})
+  end
 
   # RFC 6750 §3.1: a valid token that lacks the required scope is answered 403
   # `insufficient_scope` with the `scope` auth-param naming what is needed.

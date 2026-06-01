@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.7] - 2026-06-01
+
+### Added
+
+- Mount `POST /oauth/authorize` alongside `GET /oauth/authorize`, matching
+  OpenID Connect Core's requirement that the Authorization Endpoint support both
+  methods.
+- Extend the Ecto authorization-code store with successful-consumption markers
+  and issued-access-token tracking. When a successfully redeemed authorization
+  code is replayed, the token endpoint still returns `invalid_grant` and now
+  revokes the access token minted by the original code redemption when the Ecto
+  store is configured.
+
 ## [0.6.6] - 2026-06-01
 
 ### Fixed

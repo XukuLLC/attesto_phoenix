@@ -8,14 +8,15 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   advisory: it must be enforced by the store so that two concurrent
   redemptions of one code cannot both succeed.
 
-  `take/1` issues a `DELETE ... WHERE code_hash = $1 RETURNING ...`, so the
-  fetch and the delete are one statement. Exactly one of any number of racing
-  redemptions sees the row; every other caller sees an empty result and gets
-  `:error`. This holds across all nodes sharing the database, which the
-  single-node ETS store cannot offer. The code is consumed even when the
-  caller later rejects the redemption (mismatched redirect URI, failed PKCE
-  verifier): a code presented once is spent, which denies an attacker
-  repeated validation attempts against a captured code.
+  `take/1` issues an `UPDATE ... WHERE consumed_at IS NULL RETURNING ...`, so
+  the fetch and the consumption mark are one statement. Exactly one of any
+  number of racing redemptions sees the row as fresh; later callers either get
+  `:error` for an unsuccessful first presentation or `{:error, :consumed, meta}`
+  for a code that was already successfully redeemed. This holds across all
+  nodes sharing the database. The code is consumed even when the caller later
+  rejects the redemption (mismatched redirect URI, failed PKCE verifier): a code
+  presented once is spent, which denies an attacker repeated validation
+  attempts against a captured code.
 
   The plaintext code is never persisted; the primary key is the
   `Attesto.Secret.hash/1` digest of the code. The column layout and the
@@ -81,14 +82,84 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @impl Attesto.CodeStore
   @spec take(Attesto.CodeStore.code_hash()) :: {:ok, Attesto.CodeStore.entry()} | :error
   def take(code_hash) when is_binary(code_hash) do
+    consumed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
     query =
       from a in Authorization,
-        where: a.code_hash == ^code_hash,
+        where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().delete_all(query) do
+    case repo().update_all(query, set: [consumed_at: consumed_at]) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
-      {0, _} -> :error
+      {0, _} -> consumed_or_missing(code_hash)
+    end
+  end
+
+  @doc """
+  Marks a successfully redeemed code as reuse-trackable.
+
+  `Attesto.AuthorizationCode.redeem/4` calls this after every validation step
+  has passed. A later `take/1` for the same hash can then surface
+  `{:error, :consumed, meta}` instead of treating the replay as an unknown code.
+  """
+  @impl Attesto.CodeStore
+  @spec mark_consumed(Attesto.CodeStore.code_hash(), Attesto.CodeStore.consumed_meta()) :: :ok
+  def mark_consumed(code_hash, _meta) when is_binary(code_hash) do
+    query = from a in Authorization, where: a.code_hash == ^code_hash
+    repo().update_all(query, set: [consumed_success: true])
+    :ok
+  end
+
+  @doc false
+  @spec record_access_token(String.t(), String.t(), integer()) :: :ok
+  def record_access_token(family_id, jti, expires_at)
+      when is_binary(family_id) and is_binary(jti) and is_integer(expires_at) do
+    query = from a in Authorization, where: a.family_id == ^family_id
+
+    repo().update_all(query,
+      set: [
+        access_token_jti: jti,
+        access_token_expires_at: DateTime.from_unix!(expires_at)
+      ]
+    )
+
+    :ok
+  end
+
+  @doc false
+  @spec revoke_family_access_tokens(String.t()) :: :ok
+  def revoke_family_access_tokens(family_id) when is_binary(family_id) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    query =
+      from a in Authorization,
+        where: a.family_id == ^family_id and not is_nil(a.access_token_jti)
+
+    repo().update_all(query, set: [access_token_revoked_at: now])
+    :ok
+  end
+
+  @doc false
+  @spec access_token_revoked?(String.t()) :: boolean()
+  def access_token_revoked?(jti) when is_binary(jti) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    query =
+      from a in Authorization,
+        where:
+          a.access_token_jti == ^jti and not is_nil(a.access_token_revoked_at) and
+            a.access_token_expires_at > ^now
+
+    repo().exists?(query)
+  end
+
+  defp consumed_or_missing(code_hash) do
+    case repo().get_by(Authorization, code_hash: code_hash) do
+      %Authorization{consumed_success: true} = row ->
+        {:error, :consumed, Authorization.consumed_meta(row)}
+
+      _ ->
+        :error
     end
   end
 

@@ -64,9 +64,10 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     @live :"#{__MODULE__}.Live"
     @consumed :"#{__MODULE__}.Consumed"
+    @access_tokens :"#{__MODULE__}.AccessTokens"
 
     def reset do
-      for table <- [@live, @consumed] do
+      for table <- [@live, @consumed, @access_tokens] do
         if :ets.whereis(table) == :undefined do
           :ets.new(table, [:set, :public, :named_table])
         else
@@ -103,6 +104,23 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     def mark_consumed(code_hash, meta) do
       true = :ets.insert(@consumed, {code_hash, meta})
       :ok
+    end
+
+    def record_access_token(family_id, jti, _expires_at) do
+      true = :ets.insert(@access_tokens, {{:token, family_id}, jti})
+      :ok
+    end
+
+    def revoke_family_access_tokens(family_id) do
+      for {{:token, ^family_id}, jti} <- :ets.tab2list(@access_tokens) do
+        true = :ets.insert(@access_tokens, {{:revoked, jti}, true})
+      end
+
+      :ok
+    end
+
+    def access_token_revoked?(jti) do
+      :ets.lookup(@access_tokens, {:revoked, jti}) != []
     end
   end
 
@@ -843,6 +861,24 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       second = post_auth_code()
       assert second.status == 400
       assert body(second)["error"] == "invalid_grant"
+    end
+
+    test "reusing a code revokes the access token issued by the first redemption" do
+      enable_minting()
+      code_store = start_family_code_store(["openid"], "fam-access")
+      put_config(code_store: code_store)
+
+      first = post_auth_code()
+      assert first.status == 200
+      access_token = body(first)["access_token"]
+      jti = peek_claims(access_token)["jti"]
+      refute code_store.access_token_revoked?(jti)
+
+      second = post_auth_code()
+      assert second.status == 400
+      assert body(second)["error"] == "invalid_grant"
+
+      assert code_store.access_token_revoked?(jti)
     end
   end
 

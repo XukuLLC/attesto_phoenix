@@ -34,6 +34,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
         redirect_uri: "https://rp.example/cb",
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
         code_challenge_method: Authorization.code_challenge_method(),
+        family_id: "fam-1",
         nonce: "request-nonce",
         claims: %{"acr" => "urn:mace:incommon:iap:silver"}
       },
@@ -60,6 +61,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert data.scope == ["openid", "profile"]
       assert data.redirect_uri == "https://rp.example/cb"
       assert data.code_challenge == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+      assert data.family_id == "fam-1"
     end
 
     test "preserves expires_at as absolute unix seconds across storage" do
@@ -90,12 +92,24 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   end
 
   describe "take/1" do
-    test "returns the record and removes it so a code is redeemable once" do
+    test "returns the record and claims it so a code is redeemable once" do
       assert :ok = EctoCodeStore.put(entry("hash-once"))
 
       assert {:ok, %{code_hash: "hash-once"}} = EctoCodeStore.take("hash-once")
-      # RFC 6749 §4.1.2: the second presentation finds nothing.
+      # The first presentation has only claimed the row. Until the protocol
+      # layer reports successful redemption, a second presentation is not
+      # replay evidence and fails closed as an unknown/invalid grant.
       assert :error = EctoCodeStore.take("hash-once")
+    end
+
+    test "returns consumed metadata only after successful redemption is marked" do
+      assert :ok = EctoCodeStore.put(entry("hash-consumed", grant_data(%{family_id: "fam-ok"})))
+
+      assert {:ok, %{code_hash: "hash-consumed"}} = EctoCodeStore.take("hash-consumed")
+      assert :ok = EctoCodeStore.mark_consumed("hash-consumed", %{})
+
+      assert {:error, :consumed, %{family_id: "fam-ok", subject: "subject-1"}} =
+               EctoCodeStore.take("hash-consumed")
     end
 
     test "returns :error for an absent code_hash" do
@@ -129,10 +143,39 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
         )
         |> Enum.map(fn {:ok, result} -> result end)
 
-      # The atomic DELETE ... RETURNING serialises on the row: exactly one
-      # winner gets the record, the other gets :error.
+      # The atomic UPDATE ... RETURNING serialises on the row: exactly one
+      # winner claims the record, the other gets :error.
       assert Enum.count(results, &match?({:ok, _}, &1)) == 1
       assert Enum.count(results, &(&1 == :error)) == 1
+    end
+  end
+
+  describe "access-token revocation after authorization-code reuse" do
+    test "records, revokes, and checks the access token issued from a code family" do
+      expires_at = System.system_time(:second) + 600
+
+      assert :ok = EctoCodeStore.put(entry("hash-access", grant_data(%{family_id: "fam-access"})))
+      assert {:ok, %{code_hash: "hash-access"}} = EctoCodeStore.take("hash-access")
+
+      assert :ok = EctoCodeStore.record_access_token("fam-access", "jti-1", expires_at)
+      refute EctoCodeStore.access_token_revoked?("jti-1")
+
+      assert :ok = EctoCodeStore.revoke_family_access_tokens("fam-access")
+      assert EctoCodeStore.access_token_revoked?("jti-1")
+    end
+
+    test "expired revoked access tokens are ignored" do
+      expires_at = System.system_time(:second) - 1
+
+      assert :ok =
+               EctoCodeStore.put(entry("hash-expired-token", grant_data(%{family_id: "fam-exp"})))
+
+      assert {:ok, %{code_hash: "hash-expired-token"}} = EctoCodeStore.take("hash-expired-token")
+
+      assert :ok = EctoCodeStore.record_access_token("fam-exp", "jti-expired", expires_at)
+      assert :ok = EctoCodeStore.revoke_family_access_tokens("fam-exp")
+
+      refute EctoCodeStore.access_token_revoked?("jti-expired")
     end
   end
 end

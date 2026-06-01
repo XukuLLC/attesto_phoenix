@@ -25,11 +25,18 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateAuthorizationCodes do
       add(:cnf, :map)
       add(:nonce, :string)
       add(:claims, :map, null: false, default: %{})
+      add(:family_id, :string)
+      add(:access_token_jti, :string)
+      add(:access_token_expires_at, :utc_datetime)
+      add(:access_token_revoked_at, :utc_datetime)
       add(:expires_at, :utc_datetime, null: false)
       add(:consumed_at, :utc_datetime)
+      add(:consumed_success, :boolean, null: false, default: false)
       add(:inserted_at, :utc_datetime, null: false)
     end
 
     create(unique_index(:attesto_authorization_codes, [:code_hash]))
+    create(index(:attesto_authorization_codes, [:family_id]))
+    create(index(:attesto_authorization_codes, [:access_token_jti]))
   end
 end

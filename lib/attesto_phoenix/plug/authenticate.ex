@@ -53,7 +53,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
           emit_denied(config, conn, :invalid_token)
           conn
         else
-          assign_principal(conn, config, claims_key, opts)
+          reject_revoked_or_assign_principal(conn, config, claims_key, opts)
         end
 
       {:error, :insecure_transport} ->
@@ -67,6 +67,24 @@ defmodule AttestoPhoenix.Plug.Authenticate do
         )
     end
   end
+
+  defp reject_revoked_or_assign_principal(conn, config, claims_key, opts) do
+    claims = conn.assigns[claims_key]
+
+    if access_token_revoked?(config, claims) do
+      emit_denied(config, conn, :invalid_token)
+      OAuthError.unauthorized(conn, scheme_of(claims), "invalid_token", error_opts(config, []))
+    else
+      assign_principal(conn, config, claims_key, opts)
+    end
+  end
+
+  defp access_token_revoked?(%Config{code_store: store}, %{"jti" => jti})
+       when is_atom(store) and is_binary(jti) do
+    function_exported?(store, :access_token_revoked?, 1) and store.access_token_revoked?(jti)
+  end
+
+  defp access_token_revoked?(_config, _claims), do: false
 
   defp assign_principal(conn, config, claims_key, opts) do
     claims = conn.assigns[claims_key]

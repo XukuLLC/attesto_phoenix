@@ -1,6 +1,8 @@
 defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureIO
+
   alias Mix.Tasks.AttestoPhoenix.Gen.Migration
 
   @moduletag :tmp_dir
@@ -169,9 +171,14 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
     end
 
     test "requires at least one repo", %{tmp_dir: tmp_dir} do
-      assert_raise Mix.Error, ~r/no Ecto repos/, fn ->
-        Migration.run(["--migrations-path", migrations_dir(tmp_dir)])
-      end
+      # Mix.Ecto warns before our task raises its actionable "pass --repo"
+      # message. Capture that expected stderr so the test suite itself stays
+      # warning-free.
+      capture_io(:stderr, fn ->
+        assert_raise Mix.Error, ~r/no Ecto repos/, fn ->
+          Migration.run(["--migrations-path", migrations_dir(tmp_dir)])
+        end
+      end)
     end
   end
 end

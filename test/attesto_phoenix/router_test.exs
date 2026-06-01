@@ -69,10 +69,14 @@ defmodule AttestoPhoenix.RouterTest do
       assert find_route(DefaultRouter, :get, "/.well-known/jwks.json")
     end
 
-    test "mounts the authorization endpoint" do
-      route = find_route(DefaultRouter, :get, "/oauth/authorize")
-      assert route
-      assert route.plug == AttestoPhoenix.Controller.AuthorizeController
+    test "mounts the authorization endpoint at both GET and POST (OIDC Core §3.1.2.1)" do
+      get_route = find_route(DefaultRouter, :get, "/oauth/authorize")
+      post_route = find_route(DefaultRouter, :post, "/oauth/authorize")
+
+      assert get_route
+      assert post_route
+      assert get_route.plug == AttestoPhoenix.Controller.AuthorizeController
+      assert post_route.plug == AttestoPhoenix.Controller.AuthorizeController
     end
 
     test "mounts the token endpoint" do
@@ -111,6 +115,7 @@ defmodule AttestoPhoenix.RouterTest do
 
     test "applies the prefix to the oauth endpoints" do
       assert find_route(PrefixedRouter, :get, "/auth/oauth/authorize")
+      assert find_route(PrefixedRouter, :post, "/auth/oauth/authorize")
       assert find_route(PrefixedRouter, :post, "/auth/oauth/token")
       assert find_route(PrefixedRouter, :post, "/auth/oauth/par")
       assert find_route(PrefixedRouter, :post, "/auth/oauth/register")

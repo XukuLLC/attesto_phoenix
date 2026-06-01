@@ -39,6 +39,15 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       assert Ecto.Changeset.get_change(changeset, :claims) == %{"acr" => "phr"}
     end
 
+    test "carries the grant family id for descendant revocation" do
+      changeset =
+        base_record(%{family_id: "fam-abc"})
+        |> Authorization.from_record(now: @now)
+
+      assert changeset.valid?
+      assert Ecto.Changeset.get_change(changeset, :family_id) == "fam-abc"
+    end
+
     test "converts the unix expiry to a utc_datetime column" do
       changeset = Authorization.from_record(base_record(), now: @now)
 
@@ -160,6 +169,7 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
         cnf: nil,
         nonce: "n-0S6_WzA2Mj",
         claims: %{"acr" => "phr"},
+        family_id: "fam-record",
         expires_at: ~U[2024-01-01 00:01:00Z]
       }
 
@@ -177,7 +187,8 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
                code_challenge_method: "S256",
                dpop_jkt: nil,
                nonce: "n-0S6_WzA2Mj",
-               claims: %{"acr" => "phr"}
+               claims: %{"acr" => "phr"},
+               family_id: "fam-record"
              }
     end
 
@@ -241,6 +252,7 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       assert record.data.redirect_uri == original.data.redirect_uri
       assert record.data.code_challenge == original.data.code_challenge
       assert record.data.dpop_jkt == original.data.dpop_jkt
+      assert record.data.family_id == Map.get(original.data, :family_id)
       assert record.data.nonce == original.data.nonce
       assert record.data.claims == original.data.claims
     end

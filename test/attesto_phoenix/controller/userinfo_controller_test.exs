@@ -45,6 +45,12 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     def verification_pems, do: [signing_pem()]
   end
 
+  defmodule RevokedTokenStore do
+    @moduledoc false
+
+    def access_token_revoked?(jti), do: jti == Process.get(:attesto_phoenix_revoked_jti)
+  end
+
   # One principal kind so `Attesto.Token.mint/3` has a kind to issue under.
   @user_kind Attesto.PrincipalKind.new("user", "ou_",
                required_claims: [{"client_id", :non_empty_string}]
@@ -107,6 +113,22 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
 
       assert conn.status == 401
       assert body(conn)["error"] == "invalid_token"
+    end
+
+    test "returns 401 when a previously issued access token has been revoked" do
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.put(:code_store, __MODULE__.RevokedTokenStore)
+      |> put_config()
+
+      token = mint(scope: "openid")
+      Process.put(:attesto_phoenix_revoked_jti, peek_claims(token)["jti"])
+
+      conn = get_userinfo(token)
+
+      assert conn.status == 401
+      assert body(conn)["error"] == "invalid_token"
+      assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
     end
   end
 
@@ -292,6 +314,19 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     |> conn(@endpoint_path)
     |> maybe_authorization(token)
     |> UserinfoController.userinfo(%{})
+  end
+
+  defp peek_claims(token) do
+    config =
+      Attesto.Config.new(
+        issuer: @issuer,
+        audience: @issuer,
+        keystore: __MODULE__.Keystore,
+        principal_kinds: [@user_kind]
+      )
+
+    {:ok, claims} = Token.peek_signed_claims(config, token)
+    claims
   end
 
   defp maybe_authorization(conn, nil), do: conn

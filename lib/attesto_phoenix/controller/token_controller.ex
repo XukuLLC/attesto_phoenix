@@ -457,6 +457,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
          # Authentication Request (granted scope contains `openid`), the token
          # response additionally carries an ID Token.
          {:ok, response} <- maybe_mint_id_token(config, client, grant, scope, code, response) do
+      :ok = record_code_access_token(config, grant, response)
       emit(config, conn, :token_issued, client, scope, "authorization_code")
       # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
       # client can refresh without re-running the authorization flow. The
@@ -550,6 +551,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
       # `invalid_grant` so the replay learns nothing on the wire.
       {:error, {:reuse, meta}} ->
         revoke_reused_family(config, meta)
+        revoke_reused_access_tokens(config, meta)
         {:error, grant_error(:invalid_grant)}
 
       {:error, reason} ->
@@ -587,6 +589,22 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # caller treats revocation as a no-op.
   defp reuse_family_id(meta) do
     Map.get(meta, :family_id) || Map.get(meta, "family_id")
+  end
+
+  defp revoke_reused_access_tokens(config, meta) do
+    store = grant_store(config, :code_store)
+
+    if store && function_exported?(store, :revoke_family_access_tokens, 1) do
+      case reuse_family_id(meta) do
+        family_id when is_binary(family_id) and family_id != "" ->
+          :ok = store.revoke_family_access_tokens(family_id)
+
+        _ ->
+          :ok
+      end
+    end
+
+    :ok
   end
 
   defp rotate_refresh(config, client, presented, requested, jkt) do
@@ -871,6 +889,33 @@ defmodule AttestoPhoenix.Controller.TokenController do
         # surface it as RFC 6749 §5.2 invalid_request rather than leak detail.
         Logger.error("token mint failed: #{inspect(reason)}")
         {:error, error(@error_invalid_request, "unable to issue token")}
+    end
+  end
+
+  defp record_code_access_token(config, grant, response) do
+    store = grant_store(config, :code_store)
+
+    if store && function_exported?(store, :record_access_token, 3) do
+      with family_id when is_binary(family_id) and family_id != "" <- grant.family_id,
+           {:ok, %{"jti" => jti, "exp" => exp}} <-
+             decode_access_token_claims(response.access_token),
+           true <- is_binary(jti) and is_integer(exp) do
+        :ok = store.record_access_token(family_id, jti, exp)
+      else
+        _ -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  defp decode_access_token_claims(token) when is_binary(token) do
+    with [_header, payload, _signature] <- String.split(token, ".", parts: 3),
+         {:ok, json} <- Base.url_decode64(payload, padding: false),
+         {:ok, claims} <- JSON.decode(json) do
+      {:ok, claims}
+    else
+      _ -> :error
     end
   end
 

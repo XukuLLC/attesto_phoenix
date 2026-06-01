@@ -35,6 +35,12 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     def cert_der(_conn), do: Process.get(:attesto_phoenix_test_cert_der)
   end
 
+  defmodule RevokedTokenStore do
+    @moduledoc false
+
+    def access_token_revoked?(jti), do: jti == Process.get(:attesto_phoenix_revoked_jti)
+  end
+
   @user_kind Attesto.PrincipalKind.new("user", "ou_",
                required_claims: [{"client_id", :non_empty_string}]
              )
@@ -92,6 +98,24 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
   } do
     config = %{config | load_principal: fn _subject -> {:error, :not_found} end}
     token = mint(config, scope: "openid")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert conn.halted
+    assert conn.status == 401
+    assert JSON.decode!(conn.resp_body) == %{"error" => "invalid_token"}
+    assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+    assert_receive {:event, %AttestoPhoenix.Event{name: :auth_denied, result: :invalid_token}}
+  end
+
+  test "rejects an access token revoked after authorization-code reuse", %{config: config} do
+    token = mint(config, scope: "openid")
+    Process.put(:attesto_phoenix_revoked_jti, peek_claims(config, token)["jti"])
+    config = %{config | code_store: __MODULE__.RevokedTokenStore}
 
     conn =
       :get
@@ -246,5 +270,11 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
   defp self_signed_cert_der do
     %{cert: der} = :public_key.pkix_test_root_cert(~c"CN=attesto-phoenix-plug-test", [])
     der
+  end
+
+  defp peek_claims(config, token) do
+    attesto_config = Config.to_attesto_config(config, principal_kinds: [@user_kind])
+    {:ok, claims} = Token.peek_signed_claims(attesto_config, token)
+    claims
   end
 end

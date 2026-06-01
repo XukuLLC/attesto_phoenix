@@ -13,8 +13,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       (`AttestoPhoenix.Schema.Authorization`). Holds one row per issued
       authorization code (RFC 6749, section 4.1) plus the PKCE binding
       (RFC 7636), the optional `cnf` key binding (RFC 7800), the OIDC `nonce`,
-      mapped `claims`, and the `consumed_at` audit marker. Keyed on `code_hash`
-      (no surrogate id); consulted exactly once at the token endpoint.
+      mapped `claims`, the descendant `family_id`, consumed markers, and the
+      access-token `jti` issued from a successful redemption so code reuse can
+      revoke it. Keyed on `code_hash` (no surrogate id); consulted exactly once
+      at the token endpoint.
 
     * `attesto_refresh_tokens` - the refresh token store
       (`AttestoPhoenix.Schema.RefreshToken`, RFC 6749, section 6). Each row
@@ -301,11 +303,20 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :nonce, :string, size: <%= @nonce_size %>
         # Opaque request claims round-tripped to redemption.
         add :claims, :map, null: false, default: %{}
+        # Grant family linking this authorization code to descendants that must
+        # be revoked if the code is replayed.
+        add :family_id, :string, size: <%= @identifier_size %>
+        # The access token minted by a successful redemption; used only for
+        # revocation after authorization-code reuse.
+        add :access_token_jti, :string, size: <%= @jti_size %>
+        add :access_token_expires_at, :utc_datetime
+        add :access_token_revoked_at, :utc_datetime
         add :expires_at, :utc_datetime, null: false
-        # consumed_at is the audit marker for a consumed-then-rejected redemption
-        # (RFC 6749, section 4.1.2). The store enforces single use by the atomic
-        # delete; this column records that a code was spent.
+        # consumed_at is set by the atomic claim. consumed_success is set only
+        # after redemption validation passes, letting later re-presentation revoke
+        # descendants while a failed first presentation remains plain invalid_grant.
         add :consumed_at, :utc_datetime
+        add :consumed_success, :boolean, null: false, default: false
         # The schema carries an explicit :inserted_at (no :updated_at).
         add :inserted_at, :utc_datetime, null: false
       end
@@ -316,6 +327,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       create unique_index(:<%= @authorization_codes %>, [:code_hash])
       # Expiry sweeps scan by expiry (AttestoPhoenix.Store.Sweeper).
       create index(:<%= @authorization_codes %>, [:expires_at])
+      create index(:<%= @authorization_codes %>, [:family_id])
+      create index(:<%= @authorization_codes %>, [:access_token_jti])
 
       # Refresh token store (RFC 6749, section 6), backing
       # AttestoPhoenix.Schema.RefreshToken / AttestoPhoenix.Store.EctoRefreshStore.

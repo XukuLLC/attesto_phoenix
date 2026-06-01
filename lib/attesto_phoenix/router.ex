@@ -200,11 +200,12 @@ defmodule AttestoPhoenix.Router do
         get(unquote(jwks_path), unquote(jwks_controller), :show)
 
         # RFC 6749 §3.1 / OpenID Connect Core 1.0 §3.1.2: the authorization
-        # endpoint is a front-channel GET under the host-chosen prefix. It
+        # endpoint accepts both GET and POST under the host-chosen prefix. It
         # carries no client-authentication pipeline (RFC 6749 §3.1: the client
         # is not authenticated here; the resource owner authenticates through
         # the host's login/consent callbacks).
         get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+        post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
 
         # RFC 6749 §3.2 / RFC 7009 §2: token issuance and revocation are POST
         # endpoints under the host-chosen prefix. They authenticate the client
