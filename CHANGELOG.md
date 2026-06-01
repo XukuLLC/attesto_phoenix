@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.8] - 2026-06-01
+
+### Added
+
+- Add host-configurable FAPI-oriented authorization-server controls:
+  `:require_pushed_authorization_requests` rejects direct front-channel
+  authorization requests unless they arrive through a PAR `request_uri`, and
+  `:authorization_response_iss` includes the RFC 9207 `iss` parameter on
+  successful and error authorization responses.
+- Allow hosts to configure the advertised and accepted token endpoint client
+  authentication methods. The token endpoint and PAR endpoint now enforce
+  `:token_endpoint_auth_methods_supported` when set, so deployments can expose
+  stricter profiles such as `private_key_jwt` only.
+- Advertise configured token endpoint authentication methods and PAR-required
+  policy in OAuth/OIDC metadata.
+
 ## [0.6.7] - 2026-06-01
 
 ### Added
