@@ -203,6 +203,59 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     refute Map.has_key?(stored, "client_assertion_type")
   end
 
+  test "stores the verified DPoP proof thumbprint for sender-constrained PAR" do
+    params = auth_params()
+    credentials = Base.encode64("confidential-1:s3cr3t")
+    {proof, jkt} = dpop_proof()
+
+    conn =
+      params
+      |> https_post()
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> Plug.Conn.put_req_header("dpop", proof)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+    assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
+    assert stored["dpop_jkt"] == jkt
+  end
+
+  test "accepts an explicit PAR dpop_jkt only when it matches the DPoP proof" do
+    credentials = Base.encode64("confidential-1:s3cr3t")
+    {proof, jkt} = dpop_proof()
+    params = Map.put(auth_params(), "dpop_jkt", jkt)
+
+    conn =
+      params
+      |> https_post()
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> Plug.Conn.put_req_header("dpop", proof)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+    assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
+    assert stored["dpop_jkt"] == jkt
+  end
+
+  test "rejects an explicit PAR dpop_jkt that mismatches the DPoP proof" do
+    credentials = Base.encode64("confidential-1:s3cr3t")
+    {proof, _jkt} = dpop_proof()
+    {_other_proof, other_jkt} = dpop_proof()
+    params = Map.put(auth_params(), "dpop_jkt", other_jkt)
+
+    conn =
+      params
+      |> https_post()
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> Plug.Conn.put_req_header("dpop", proof)
+      |> PARController.create(params)
+
+    assert conn.status == 400
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_dpop_proof"
+  end
+
   test "accepts private_key_jwt assertion audience set to issuer" do
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
     client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -357,6 +410,27 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       "state" => "state-123",
       "nonce" => "nonce-123"
     }
+  end
+
+  defp https_post(params) do
+    %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
+    %Plug.Conn{base | scheme: :https, host: "issuer.example", port: 443}
+  end
+
+  defp dpop_proof do
+    jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+    {_, public_jwk} = JOSE.JWK.to_public_map(jwk)
+
+    payload = %{
+      "htm" => "POST",
+      "htu" => "https://issuer.example/oauth/par",
+      "iat" => System.system_time(:second),
+      "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    }
+
+    header = %{"alg" => "ES256", "typ" => "dpop+jwt", "jwk" => public_jwk}
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, payload) |> JOSE.JWS.compact()
+    {compact, JOSE.JWK.thumbprint(jwk)}
   end
 
   defp client_assertion(jwk, client_id, overrides \\ %{}) do

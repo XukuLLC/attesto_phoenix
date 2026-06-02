@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-06-01
+
+### Fixed
+
+- Verify DPoP proofs at the PAR endpoint and bind stored pushed
+  authorization requests to the verified proof key. If a PAR request includes
+  an explicit `dpop_jkt`, it must match the verified proof JWK thumbprint;
+  mismatches now return `invalid_dpop_proof` instead of issuing a
+  `request_uri`.
+
 ## [0.6.13] - 2026-06-01
 
 ### Fixed

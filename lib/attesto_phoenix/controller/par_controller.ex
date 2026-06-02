@@ -12,14 +12,16 @@ defmodule AttestoPhoenix.Controller.PARController do
 
   import Plug.Conn
 
-  alias Attesto.ClientAssertion
+  alias Attesto.{ClientAssertion, DPoP}
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.{Config, RequestContext}
 
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
   @error_invalid_client "invalid_client"
+  @error_invalid_dpop_proof "invalid_dpop_proof"
   @error_invalid_request "invalid_request"
+  @dpop_request_header "dpop"
   @client_assertion_max_lifetime 300
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
@@ -29,7 +31,7 @@ defmodule AttestoPhoenix.Controller.PARController do
 
     with :ok <- RequestContext.check_https(conn, config),
          {:ok, client} <- authenticate_client(config, conn, params),
-         {:ok, stored} <- store_request(config, client, params) do
+         {:ok, stored} <- store_request(config, conn, client, params) do
       conn
       |> put_status(:created)
       |> json(stored)
@@ -203,20 +205,66 @@ defmodule AttestoPhoenix.Controller.PARController do
   defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
   defp replay_check(%Config{replay_check: callback}), do: callback
 
-  defp store_request(config, client, params) do
+  defp store_request(config, conn, client, params) do
     ttl = config_field(config, :par_ttl, 90)
     request_uri = "urn:ietf:params:oauth:request_uri:" <> random()
 
-    stored =
-      params
-      |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
-      |> Map.put("client_id", client_id(config, client))
+    with {:ok, dpop_jkt} <- verify_dpop_binding(config, conn, params) do
+      stored =
+        params
+        |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
+        |> put_verified_dpop_jkt(dpop_jkt)
+        |> Map.put("client_id", client_id(config, client))
 
-    case par_store(config).put(request_uri, stored, ttl) do
-      :ok -> {:ok, %{request_uri: request_uri, expires_in: ttl}}
-      _ -> {:error, {@error_invalid_request, "could not store pushed authorization request"}}
+      case par_store(config).put(request_uri, stored, ttl) do
+        :ok -> {:ok, %{request_uri: request_uri, expires_in: ttl}}
+        _ -> {:error, {@error_invalid_request, "could not store pushed authorization request"}}
+      end
     end
   end
+
+  defp verify_dpop_binding(config, conn, params) do
+    case get_req_header(conn, @dpop_request_header) do
+      [] ->
+        if present?(Map.get(params, "dpop_jkt")) do
+          {:error, {@error_invalid_dpop_proof, "DPoP proof required"}}
+        else
+          {:ok, nil}
+        end
+
+      [proof] ->
+        verify_dpop_proof(config, conn, params, proof)
+
+      _multiple ->
+        {:error, {@error_invalid_dpop_proof, "multiple DPoP proofs"}}
+    end
+  end
+
+  defp verify_dpop_proof(config, conn, params, proof) do
+    opts = [
+      http_method: RequestContext.http_method(conn),
+      http_uri: RequestContext.canonical_url(conn, config),
+      replay_check: replay_check(config)
+    ]
+
+    with {:ok, %{jkt: verified_jkt}} <- DPoP.verify_proof(proof, opts),
+         :ok <- check_submitted_dpop_jkt(Map.get(params, "dpop_jkt"), verified_jkt) do
+      {:ok, verified_jkt}
+    else
+      {:error, reason} ->
+        {:error, {@error_invalid_dpop_proof, "invalid DPoP proof: #{inspect(reason)}"}}
+    end
+  end
+
+  defp check_submitted_dpop_jkt(nil, _verified_jkt), do: :ok
+  defp check_submitted_dpop_jkt("", _verified_jkt), do: :ok
+  defp check_submitted_dpop_jkt(verified_jkt, verified_jkt), do: :ok
+  defp check_submitted_dpop_jkt(_submitted_jkt, _verified_jkt), do: {:error, :dpop_jkt_mismatch}
+
+  defp put_verified_dpop_jkt(params, nil), do: params
+  defp put_verified_dpop_jkt(params, dpop_jkt), do: Map.put(params, "dpop_jkt", dpop_jkt)
+
+  defp present?(value), do: is_binary(value) and value != ""
 
   defp client_id(config, client) do
     case config_callback(config, :client_id) do
