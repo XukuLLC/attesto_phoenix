@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.20] - 2026-06-02
+
+### Added
+
+- Add `:refresh_token_rotation_grace_seconds` to `AttestoPhoenix.Config` and
+  pass it through to `Attesto.RefreshToken.rotate/3`. The default is now a
+  FAPI retry-compatible 60-second idempotency window for retrying a
+  just-rotated refresh token when the client did not receive or persist the
+  first rotation response; set `0` for strict immediate reuse revocation.
+
 ## [0.6.19] - 2026-06-02
 
 ### Fixed

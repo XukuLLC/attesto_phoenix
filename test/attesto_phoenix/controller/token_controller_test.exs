@@ -1025,6 +1025,77 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert peek_claims(body(rotated)["access_token"])["cnf"]["jkt"] == refresh_jkt
     end
 
+    test "confidential DPoP refresh retry returns the same successor within configured grace" do
+      enable_minting()
+      start_refresh_store()
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+
+      code_store =
+        start_dpop_confidential_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
+
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: code_store,
+        dpop_enabled: true,
+        require_pkce: false,
+        refresh_token_rotation_grace_seconds: 60
+      )
+
+      initial = post_dpop_confidential_auth_code(initial_proof)
+
+      assert initial.status == 200
+      old_refresh_token = body(initial)["refresh_token"]
+      assert is_binary(old_refresh_token)
+
+      {first_proof, _first_jkt} = dpop_proof_and_jkt([])
+      first = post_dpop_confidential_refresh(old_refresh_token, first_proof)
+
+      assert first.status == 200
+      successor = body(first)["refresh_token"]
+      assert is_binary(successor)
+
+      {retry_proof, retry_jkt} = dpop_proof_and_jkt([])
+      retry = post_dpop_confidential_refresh(old_refresh_token, retry_proof)
+
+      assert retry.status == 200
+      assert body(retry)["refresh_token"] == successor
+      assert peek_claims(body(retry)["access_token"])["cnf"]["jkt"] == retry_jkt
+    end
+
+    test "configured zero refresh rotation grace treats immediate retry as reuse" do
+      enable_minting()
+      start_refresh_store()
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+
+      code_store =
+        start_dpop_confidential_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
+
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: code_store,
+        dpop_enabled: true,
+        require_pkce: false,
+        refresh_token_rotation_grace_seconds: 0
+      )
+
+      initial = post_dpop_confidential_auth_code(initial_proof)
+
+      assert initial.status == 200
+      old_refresh_token = body(initial)["refresh_token"]
+      assert is_binary(old_refresh_token)
+
+      {first_proof, _first_jkt} = dpop_proof_and_jkt([])
+      first = post_dpop_confidential_refresh(old_refresh_token, first_proof)
+
+      assert first.status == 200
+
+      {retry_proof, _retry_jkt} = dpop_proof_and_jkt([])
+      retry = post_dpop_confidential_refresh(old_refresh_token, retry_proof)
+
+      assert retry.status == 400
+      assert body(retry)["error"] == "invalid_grant"
+    end
+
     test "public DPoP refresh rotation still requires the original proof key" do
       enable_minting()
       start_refresh_store()

@@ -192,6 +192,13 @@ defmodule AttestoPhoenix.Config do
       `X-Forwarded-*` headers are honored. Default `[]` (no forwarded trust).
     * `:access_token_ttl` - access-token lifetime, seconds. Default `900`.
     * `:refresh_token_ttl` - refresh-token lifetime, seconds. Default `1_209_600`.
+    * `:refresh_token_rotation_grace_seconds` - idempotency window, in
+      seconds, during which a just-rotated refresh token can be retried and
+      receive the same successor refresh token instead of being treated as a
+      reuse attack. Default `60`; set `0` for strict immediate reuse
+      revocation. A non-zero window is important for clients that lose the
+      first rotation response and retry the previous token (OAuth 2.0 Security
+      BCP §4.13; FAPI 2.0 Security Profile §5.3.2.1).
     * `:authorization_code_ttl` - authorization-code lifetime, seconds. Default `60`.
     * `:dpop_enabled` - enable DPoP sender-constraint support. Default `true`.
     * `:dpop_nonce_required` - require server-issued DPoP nonces. Default `false`.
@@ -324,6 +331,7 @@ defmodule AttestoPhoenix.Config do
     trusted_proxies: [],
     access_token_ttl: 900,
     refresh_token_ttl: 1_209_600,
+    refresh_token_rotation_grace_seconds: 60,
     authorization_code_ttl: 60,
     par_ttl: 90,
     dpop_enabled: true,
@@ -404,6 +412,7 @@ defmodule AttestoPhoenix.Config do
           trusted_proxies: [String.t()],
           access_token_ttl: pos_integer(),
           refresh_token_ttl: pos_integer(),
+          refresh_token_rotation_grace_seconds: non_neg_integer(),
           authorization_code_ttl: pos_integer(),
           par_ttl: pos_integer(),
           dpop_enabled: boolean(),

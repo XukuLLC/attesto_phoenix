@@ -695,6 +695,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
       [client_id: client_id(config, client)]
       |> put_optional_kw(:scope, requested)
       |> put_optional_kw(:dpop_jkt, jkt)
+      |> Keyword.put(:rotation_grace_seconds, config.refresh_token_rotation_grace_seconds)
 
     case RefreshToken.rotate(grant_store(config, :refresh_store), presented, opts) do
       {:ok, rotated} -> {:ok, rotated}
