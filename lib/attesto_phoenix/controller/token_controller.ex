@@ -1112,7 +1112,12 @@ defmodule AttestoPhoenix.Controller.TokenController do
         bind_mtls(config, conn)
 
       client_requires_dpop?(config, client) ->
-        {:error, error(@error_invalid_dpop_proof, "DPoP proof required")}
+        # RFC 9449 defines `invalid_dpop_proof` for presented DPoP proof
+        # failures. When the token request omits a required proof entirely,
+        # return a standard OAuth token-endpoint error so FAPI clients can
+        # classify the grant attempt without relying on DPoP-specific error
+        # vocabulary.
+        {:error, error(@error_invalid_request, "DPoP proof required")}
 
       client_requires_mtls?(config, client) ->
         # No DPoP proof and no client certificate, yet this client must be

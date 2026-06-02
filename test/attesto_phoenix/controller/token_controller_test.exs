@@ -812,7 +812,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         })
 
       assert conn.status == 400
-      assert body(conn)["error"] == "invalid_dpop_proof"
+      assert body(conn)["error"] == "invalid_request"
       assert body(conn)["error_description"] =~ "DPoP"
     end
 
@@ -829,7 +829,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn = post_auth_code()
 
       assert conn.status == 400
-      assert body(conn)["error"] == "invalid_dpop_proof"
+      assert body(conn)["error"] == "invalid_request"
       assert body(conn)["error_description"] =~ "DPoP"
     end
 
@@ -1060,6 +1060,40 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert retry.status == 200
       assert body(retry)["refresh_token"] == successor
       assert peek_claims(body(retry)["access_token"])["cnf"]["jkt"] == retry_jkt
+    end
+
+    test "confidential DPoP refresh without proof returns standard OAuth invalid_request" do
+      enable_minting()
+      start_refresh_store()
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+
+      code_store =
+        start_dpop_confidential_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
+
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: code_store,
+        dpop_enabled: true,
+        require_pkce: false,
+        client_requires_dpop?: fn _client -> true end
+      )
+
+      initial = post_dpop_confidential_auth_code(initial_proof)
+
+      assert initial.status == 200
+      refresh_token = body(initial)["refresh_token"]
+      assert is_binary(refresh_token)
+
+      conn =
+        post_token_with_basic_auth(%{
+          "grant_type" => "refresh_token",
+          "refresh_token" => refresh_token,
+          "scope" => "openid offline_access"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_request"
+      assert body(conn)["error_description"] =~ "DPoP"
     end
 
     test "configured zero refresh rotation grace treats immediate retry as reuse" do
@@ -1676,6 +1710,13 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   defp post_token(params) do
     :post
     |> conn(@endpoint_path, params)
+    |> TokenController.create(params)
+  end
+
+  defp post_token_with_basic_auth(params) do
+    :post
+    |> conn(@endpoint_path, params)
+    |> put_req_header("authorization", "Basic " <> Base.encode64("confidential-1:s3cr3t"))
     |> TokenController.create(params)
   end
 

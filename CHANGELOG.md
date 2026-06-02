@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.21] - 2026-06-02
+
+### Fixed
+
+- Return the standard OAuth token endpoint error `invalid_request` when a
+  client that requires DPoP omits the proof entirely. Presented-but-invalid
+  proofs still return `invalid_dpop_proof`; the omitted-proof case now matches
+  FAPI's expected token endpoint error classification.
+
 ## [0.6.20] - 2026-06-02
 
 ### Added
