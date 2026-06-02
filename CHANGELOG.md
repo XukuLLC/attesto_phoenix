@@ -8,11 +8,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.6.12] - 2026-06-01
 
+### Security
+
+- Reject replayed `private_key_jwt` client assertions at the token endpoint and
+  PAR endpoint by recording assertion `jti` values through the configured
+  replay check.
+- Enforce per-client registered grant types when a host provides
+  `:client_grant_types`, preventing a client registered for one grant from
+  minting tokens through another.
+- Bind PAR `request_uri` authorization requests to the authenticated pushed
+  request client and store that authenticated client id, rather than trusting a
+  front-channel or body-supplied `client_id`.
+
 ### Fixed
 
 - Preserve keystore-provided per-key `alg` metadata in the JWKS endpoint. This
   keeps FAPI deployments that sign ID tokens with `PS256` from advertising the
   same key as `RS256`.
+- Add the zero-arity `issue/0` entrypoint to the Ecto DPoP nonce store so
+  server-issued DPoP nonces work when the store is configured directly as a
+  behaviour module.
+- Decode form-encoded client id and secret values in revocation endpoint Basic
+  authentication, matching the token endpoint.
+- Make the default ETS PAR store tolerate concurrent first-use table creation.
 
 ## [0.6.11] - 2026-06-01
 
@@ -24,9 +42,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Add `AttestoPhoenix.PARStore.fetch/1` for authorization-endpoint resolution.
-  Existing custom stores that only implement `take/1` still work through a
-  compatibility fallback, but new stores should implement `fetch/1`.
+- Add a `fetch` callback to `AttestoPhoenix.PARStore` for authorization-endpoint
+  resolution. Existing custom stores that only implement `take/1` still work
+  through a compatibility fallback, but new stores should implement `fetch/1`.
 
 ## [0.6.10] - 2026-06-01
 

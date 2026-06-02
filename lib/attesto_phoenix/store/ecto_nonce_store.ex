@@ -58,6 +58,15 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   # RFC 9449 §8 requires an unpredictable nonce. 256 bits from a CSPRNG,
   # URL-safe base64 with no padding so the value is header-safe.
   @nonce_bytes 32
+  @default_ttl_seconds 300
+
+  @doc """
+  Mints and persists a fresh nonce valid for `ttl_seconds`, returning the
+  opaque value to put in a `DPoP-Nonce` header. Behaviour entrypoint; resolves
+  the repo from the application-wide configured `AttestoPhoenix.Config`.
+  """
+  @spec issue() :: String.t()
+  def issue, do: issue(@default_ttl_seconds)
 
   @doc """
   Mints and persists a fresh nonce valid for `ttl_seconds`, returning the

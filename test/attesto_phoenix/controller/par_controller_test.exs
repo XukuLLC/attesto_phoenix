@@ -80,6 +80,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       client_id: fn client -> client.id end,
       par_store: PARStore,
       par_ttl: 45,
+      replay_check: fn _key, _ttl -> :ok end,
       require_https: false
     )
 
@@ -105,6 +106,22 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["client_id"] == "confidential-1"
     assert stored["redirect_uri"] == "https://client.example/cb"
     refute Map.has_key?(stored, "client_secret")
+  end
+
+  test "stores the authenticated client_id instead of a body-supplied client_id" do
+    params = Map.put(auth_params(), "client_id", "body-supplied-client")
+    credentials = Base.encode64("confidential-1:s3cr3t")
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+    assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
+    assert stored["client_id"] == "confidential-1"
   end
 
   test "uses the default ETS PAR store when par_store is unset" do
@@ -184,6 +201,38 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["client_id"] == "confidential-1"
     refute Map.has_key?(stored, "client_assertion")
     refute Map.has_key?(stored, "client_assertion_type")
+  end
+
+  test "rejects replayed private_key_jwt assertions" do
+    client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+    client_jwks = %{"keys" => [public_jwk(client_key)]}
+    assertion = client_assertion(client_key, "confidential-1")
+
+    put_config(
+      client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+      replay_check: replay_once()
+    )
+
+    params =
+      Map.merge(auth_params(), %{
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => assertion
+      })
+
+    first =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert first.status == 201
+
+    second =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert second.status == 400
+    assert JSON.decode!(second.resp_body)["error"] == "invalid_client"
   end
 
   test "rejects client_secret_basic when configured for private_key_jwt only" do
@@ -267,17 +316,21 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     }
   end
 
-  defp client_assertion(jwk, client_id) do
+  defp client_assertion(jwk, client_id, overrides \\ %{}) do
     now = System.system_time(:second)
 
-    claims = %{
-      "iss" => client_id,
-      "sub" => client_id,
-      "aud" => "https://issuer.example/oauth/par",
-      "iat" => now,
-      "exp" => now + 60,
-      "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
-    }
+    claims =
+      Map.merge(
+        %{
+          "iss" => client_id,
+          "sub" => client_id,
+          "aud" => "https://issuer.example/oauth/par",
+          "iat" => now,
+          "exp" => now + 60,
+          "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+        },
+        overrides
+      )
 
     header = %{"alg" => "ES256", "kid" => JOSE.JWK.thumbprint(jwk)}
     {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
@@ -287,6 +340,19 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
   defp public_jwk(jwk) do
     {_kty, map} = JOSE.JWK.to_public_map(jwk)
     Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"})
+  end
+
+  defp replay_once do
+    fn key, _ttl ->
+      process_key = {:client_assertion_replay, key}
+
+      if Process.get(process_key) do
+        {:error, :replay}
+      else
+        Process.put(process_key, true)
+        :ok
+      end
+    end
   end
 
   @config_keys [AttestoPhoenix, AttestoPhoenix.Config]

@@ -214,7 +214,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     with {:ok, decoded} <- Base.decode64(encoded),
          [client_id, client_secret] <-
            String.split(decoded, @basic_credentials_separator, parts: 2) do
-      {:ok, client_id, client_secret}
+      {:ok, URI.decode_www_form(client_id), URI.decode_www_form(client_secret)}
     else
       # RFC 6749 §2.3.1: a malformed Basic credential is a failed
       # authentication, not a free pass.

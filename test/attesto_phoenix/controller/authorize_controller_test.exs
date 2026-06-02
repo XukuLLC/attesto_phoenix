@@ -234,6 +234,24 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert query["state"] == "xyz"
     end
 
+    test "uses the client_id from the pushed request, not the front-channel query" do
+      request_uri = "urn:ietf:params:oauth:request_uri:bound-client"
+
+      put_config(
+        require_pushed_authorization_requests: true,
+        par_store: PARStore
+      )
+
+      :ok = PARStore.put(request_uri, valid_params(), 60)
+
+      conn = call(%{"client_id" => "front-channel-client", "request_uri" => request_uri})
+
+      assert conn.status == 302
+      code = location_query(conn)["code"]
+      assert is_binary(code)
+      assert TestStore.peek(code).data.client_id == @client_id
+    end
+
     test "does not consume a PAR request_uri before host re-entry completes" do
       request_uri = "urn:ietf:params:oauth:request_uri:reentry"
 

@@ -21,6 +21,7 @@ defmodule AttestoPhoenix.ClientStore do
     * `client_redirect_uris/1` (`:client_redirect_uris`)
     * `client_public?/1` (`:client_public?`)
     * `client_requires_mtls?/1` (`:client_requires_mtls?`)
+    * `client_grant_types/1` (`:client_grant_types`)
 
   The `client` term is opaque to the library: whatever
   `load_client/1` returns is threaded back into the other callbacks unchanged.
@@ -80,9 +81,20 @@ defmodule AttestoPhoenix.ClientStore do
   """
   @callback client_requires_mtls?(client()) :: boolean()
 
+  @doc """
+  The grant types registered for this client (RFC 7591 §2).
+
+  When the host exposes this callback, the token endpoint rejects a requested
+  `grant_type` not in the returned list before dispatching to the grant
+  implementation. Return `nil` only when the host has no per-client grant
+  registry and wants the package's legacy configured-supported-grants behavior.
+  """
+  @callback client_grant_types(client()) :: [String.t()] | nil
+
   @optional_callbacks client_id: 1,
                       client_jwks: 1,
                       client_redirect_uris: 1,
                       client_public?: 1,
-                      client_requires_mtls?: 1
+                      client_requires_mtls?: 1,
+                      client_grant_types: 1
 end

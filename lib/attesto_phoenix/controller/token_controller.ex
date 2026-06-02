@@ -104,6 +104,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   import Plug.Conn
 
   alias Attesto.{AuthorizationCode, ClientAssertion, IDToken, MTLS, RefreshToken, Token}
+  alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.{Config, Event, RequestContext}
 
   require Logger
@@ -134,6 +135,10 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # RFC 9449 §4.2: the token endpoint is reached by POST, so the proof's `htm`
   # claim must equal this.
   @http_method_post "POST"
+
+  # RFC 7523 / OIDC Core §9: client assertions are short-lived JWTs, but their
+  # `jti` still has to be consumed once by the authorization server.
+  @client_assertion_max_lifetime 300
 
   # Generic, non-revealing message for any failure on the client
   # authentication path (RFC 6749 §2.3): an attacker must not be able to tell
@@ -182,18 +187,22 @@ defmodule AttestoPhoenix.Controller.TokenController do
   defp create_authenticated(config, conn, params, client) do
     case fetch_grant_type(params) do
       {:ok, grant_type} ->
-        case dispatch(config, conn, client, grant_type, params) do
-          {:ok, response} ->
-            conn
-            |> put_status(:ok)
-            |> json(response)
-
-          {:error, %{} = err} ->
-            render_token_error(config, conn, params, client, grant_type, err)
-        end
+        create_with_grant_type(config, conn, params, client, grant_type)
 
       {:error, %{} = err} ->
         render_token_error(config, conn, params, client, nil, err)
+    end
+  end
+
+  defp create_with_grant_type(config, conn, params, client, grant_type) do
+    with :ok <- require_registered_grant_type(config, client, grant_type),
+         {:ok, response} <- dispatch(config, conn, client, grant_type, params) do
+      conn
+      |> put_status(:ok)
+      |> json(response)
+    else
+      {:error, %{} = err} ->
+        render_token_error(config, conn, params, client, grant_type, err)
     end
   end
 
@@ -386,10 +395,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
     with {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
          {:ok, client} <- load_existing_client(config, client_id),
          {:ok, jwks} <- client_jwks(config, client),
-         {:ok, _claims} <-
+         {:ok, claims} <-
            ClientAssertion.verify(assertion, client_id, client_assertion_audiences(config), jwks,
-             max_lifetime: 300
-           ) do
+             max_lifetime: @client_assertion_max_lifetime
+           ),
+         :ok <- consume_client_assertion_jti(config, client_id, claims) do
       {:ok, client}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
@@ -411,7 +421,45 @@ defmodule AttestoPhoenix.Controller.TokenController do
   end
 
   defp client_assertion_audiences(config) do
-    [config.issuer, String.trim_trailing(config.issuer, "/") <> "/oauth/token"]
+    [Config.token_endpoint_url(config)]
+  end
+
+  defp consume_client_assertion_jti(config, client_id, %{"jti" => jti})
+       when is_binary(jti) and jti != "" do
+    key = client_assertion_replay_key(client_id, jti)
+
+    case invoke(replay_check(config), [key, @client_assertion_max_lifetime]) do
+      :ok -> :ok
+      _other -> {:error, :assertion_replay}
+    end
+  end
+
+  defp consume_client_assertion_jti(_config, _client_id, _claims), do: {:error, :missing_jti}
+
+  defp client_assertion_replay_key(client_id, jti) do
+    digest = :crypto.hash(:sha256, "#{client_id}\0#{jti}")
+    "client_assertion:" <> Base.url_encode64(digest, padding: false)
+  end
+
+  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
+  defp replay_check(%Config{replay_check: callback}), do: callback
+
+  defp require_registered_grant_type(config, client, grant_type) do
+    case client_grant_types(config, client) do
+      grant_types when is_list(grant_types) ->
+        if grant_type in grant_types do
+          :ok
+        else
+          {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
+        end
+
+      _not_configured ->
+        :ok
+    end
+  end
+
+  defp client_grant_types(config, client) do
+    invoke_with_default(config_callback(config, :client_grant_types), [client], nil)
   end
 
   # RFC 6749 §2.1: a client identified without a secret may proceed only if

@@ -13,12 +13,14 @@ defmodule AttestoPhoenix.Controller.PARController do
   import Plug.Conn
 
   alias Attesto.ClientAssertion
+  alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.{Config, RequestContext}
 
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
   @error_invalid_client "invalid_client"
   @error_invalid_request "invalid_request"
+  @client_assertion_max_lifetime 300
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
@@ -111,10 +113,11 @@ defmodule AttestoPhoenix.Controller.PARController do
          {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
          {:ok, client} <- load_existing_client(config, client_id),
          {:ok, jwks} <- client_jwks(config, client),
-         {:ok, _claims} <-
+         {:ok, claims} <-
            ClientAssertion.verify(assertion, client_id, client_assertion_audiences(config), jwks,
-             max_lifetime: 300
-           ) do
+             max_lifetime: @client_assertion_max_lifetime
+           ),
+         :ok <- consume_client_assertion_jti(config, client_id, claims) do
       {:ok, client}
     else
       _ -> {:error, {@error_invalid_client, "client authentication failed"}}
@@ -177,9 +180,28 @@ defmodule AttestoPhoenix.Controller.PARController do
   end
 
   defp client_assertion_audiences(config) do
-    issuer = String.trim_trailing(config.issuer, "/")
-    [config.issuer, issuer <> "/oauth/par", issuer <> "/oauth/token"]
+    [Config.par_endpoint_url(config)]
   end
+
+  defp consume_client_assertion_jti(config, client_id, %{"jti" => jti})
+       when is_binary(jti) and jti != "" do
+    key = client_assertion_replay_key(client_id, jti)
+
+    case invoke(replay_check(config), [key, @client_assertion_max_lifetime]) do
+      :ok -> :ok
+      _other -> {:error, :assertion_replay}
+    end
+  end
+
+  defp consume_client_assertion_jti(_config, _client_id, _claims), do: {:error, :missing_jti}
+
+  defp client_assertion_replay_key(client_id, jti) do
+    digest = :crypto.hash(:sha256, "#{client_id}\0#{jti}")
+    "client_assertion:" <> Base.url_encode64(digest, padding: false)
+  end
+
+  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
+  defp replay_check(%Config{replay_check: callback}), do: callback
 
   defp store_request(config, client, params) do
     ttl = config_field(config, :par_ttl, 90)
@@ -188,7 +210,7 @@ defmodule AttestoPhoenix.Controller.PARController do
     stored =
       params
       |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
-      |> Map.put_new("client_id", client_id(config, client))
+      |> Map.put("client_id", client_id(config, client))
 
     case par_store(config).put(request_uri, stored, ttl) do
       :ok -> {:ok, %{request_uri: request_uri, expires_in: ttl}}

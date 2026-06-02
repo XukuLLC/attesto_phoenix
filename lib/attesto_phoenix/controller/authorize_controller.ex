@@ -140,8 +140,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     config = resolve_config()
 
     with :ok <- RequestContext.check_https(conn, config),
+         {params, par_resolved?} <- resolve_request_uri(config, params),
          {:ok, client} <- load_client(config, params),
-         {:ok, request} <- validate_request(config, client, params) do
+         {:ok, request} <- validate_request(config, client, params, par_resolved?) do
       run_flow(conn, config, client, request)
     else
       {:error, :insecure_transport} ->
@@ -201,8 +202,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # redirectable `invalid_request`. A plain OAuth 2.0 request (no `openid` scope)
   # is never subject to the requirement (RFC 6749 keeps the code at SHOULD), so
   # the flag is scoped to OIDC requests via `openid_request?/1`.
-  defp validate_request(config, client, params) do
-    {params, par_resolved?} = resolve_request_uri(config, params)
+  defp validate_request(config, client, params, par_resolved?) do
     registered = registered_redirect_uris(config, client)
 
     with {:ok, request} <-

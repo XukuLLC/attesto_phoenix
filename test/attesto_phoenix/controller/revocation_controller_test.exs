@@ -77,6 +77,9 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
   defp maybe_basic_auth(conn, opts) do
     case Keyword.get(opts, :basic) do
+      {:encoded, encoded} ->
+        put_req_header(conn, "authorization", "Basic " <> Base.encode64(encoded))
+
       {id, secret} ->
         creds = Base.encode64("#{id}:#{secret}")
         put_req_header(conn, "authorization", "Basic #{creds}")
@@ -127,6 +130,30 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
       assert conn.status == 200
       assert_received {:revoked, @live_family}
+    end
+
+    test "form-decodes HTTP Basic credentials before verification" do
+      cfg =
+        build_config(
+          load_client: fn
+            "client space" -> {:ok, %{id: "client space"}}
+            _other -> {:error, :not_found}
+          end,
+          verify_client_secret: fn
+            %{id: "client space"}, "p+ss:word" -> true
+            _client, _secret -> false
+          end
+        )
+
+      params = %{"token" => @unknown_token}
+
+      conn =
+        params
+        |> build_conn(config: cfg, basic: {:encoded, "client%20space:p%2Bss%3Aword"})
+        |> RevocationController.create(params)
+
+      assert conn.status == 200
+      assert conn.resp_body == ""
     end
 
     test "sets no-store cache headers (RFC 6749 §5.1)" do

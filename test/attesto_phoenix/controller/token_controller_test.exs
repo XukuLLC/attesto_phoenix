@@ -169,7 +169,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       load_principal: fn _ -> {:error, :not_found} end,
       # The endpoint is exercised over plain Plug.Test conns, so disable the
       # transport requirement for these protocol-framing tests.
-      require_https: false
+      require_https: false,
+      replay_check: fn _key, _ttl -> :ok end
     ]
 
     put_config(base)
@@ -291,6 +292,32 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       # Authentication succeeded; only the grant type is rejected downstream.
       assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
+    test "rejects replayed private_key_jwt assertions" do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+        replay_check: replay_once()
+      )
+
+      assertion = client_assertion(client_key, "confidential-1")
+
+      params = %{
+        "grant_type" => "unsupported",
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => assertion
+      }
+
+      first = post_token(params)
+      assert body(first)["error"] == "unsupported_grant_type"
+
+      second = post_token(params)
+      assert second.status == 400
+      assert body(second)["error"] == "invalid_client"
+      assert body(second)["error_description"] == "client authentication failed"
     end
 
     test "rejects client_secret_basic when configured for private_key_jwt only" do
@@ -437,6 +464,20 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_request"
       assert body(conn)["error_description"] =~ "refresh_token"
+    end
+
+    test "rejects grants not registered for the authenticated client" do
+      put_config(client_grant_types: fn %{id: "confidential-1"} -> ["authorization_code"] end)
+
+      conn =
+        post_token(%{
+          "grant_type" => "client_credentials",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "unsupported_grant_type"
     end
   end
 
@@ -1314,6 +1355,19 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   defp public_jwk(jwk) do
     {_kty, map} = JOSE.JWK.to_public_map(jwk)
     Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"})
+  end
+
+  defp replay_once do
+    fn key, _ttl ->
+      process_key = {:client_assertion_replay, key}
+
+      if Process.get(process_key) do
+        {:error, :replay}
+      else
+        Process.put(process_key, true)
+        :ok
+      end
+    end
   end
 
   defp client_lookup(clients, id) do

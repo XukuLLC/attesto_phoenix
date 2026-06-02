@@ -8,7 +8,7 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
   test passes one built against the sandboxed test repo.
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DPoPNonce
@@ -38,6 +38,16 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
   end
 
   describe "issue/2" do
+    test "issue/0 resolves the application-wide configured repo", %{config: config} do
+      Application.put_env(:attesto_phoenix, :config, config)
+      on_exit(fn -> Application.delete_env(:attesto_phoenix, :config) end)
+
+      nonce = EctoNonceStore.issue()
+
+      assert is_binary(nonce)
+      assert TestRepo.get_by(DPoPNonce, nonce: nonce)
+    end
+
     test "returns an opaque url-safe value", %{config: config} do
       nonce = EctoNonceStore.issue(config, @ttl)
 

@@ -10,6 +10,32 @@ defmodule AttestoPhoenix.Store.PAR.ETS do
 
   @table :attesto_phoenix_par_requests
 
+  defmodule Owner do
+    @moduledoc false
+
+    use GenServer
+
+    def ensure_table(table) do
+      GenServer.call(__MODULE__, {:ensure_table, table})
+    end
+
+    @impl true
+    def init(state), do: {:ok, state}
+
+    @impl true
+    def handle_call({:ensure_table, table}, _from, state) do
+      case :ets.whereis(table) do
+        :undefined ->
+          :ets.new(table, [:set, :public, :named_table, read_concurrency: true])
+
+        _tid ->
+          table
+      end
+
+      {:reply, table, state}
+    end
+  end
+
   @impl true
   def put(request_uri, params, ttl_seconds) when is_binary(request_uri) and is_map(params) do
     ensure_table()
@@ -48,9 +74,14 @@ defmodule AttestoPhoenix.Store.PAR.ETS do
   end
 
   defp ensure_table do
-    case :ets.whereis(@table) do
-      :undefined -> :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
-      _tid -> @table
+    ensure_owner()
+    Owner.ensure_table(@table)
+  end
+
+  defp ensure_owner do
+    case GenServer.start_link(Owner, %{}, name: Owner) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
     end
   end
 end

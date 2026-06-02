@@ -119,6 +119,9 @@ defmodule AttestoPhoenix.Config do
       may authenticate without a secret and rely on PKCE.
     * `:client_requires_mtls?` - `(client -> boolean())`. Returns whether a
       client requires mTLS-bound token issuance.
+    * `:client_grant_types` - `(client -> [String.t()] | nil)`. Returns the
+      grant types registered for this client (RFC 7591 §2). When set, the
+      token endpoint rejects a requested grant type not in the returned list.
     * `:issue_refresh_token?` - `(client, granted_scope -> boolean())`.
       Returns whether the authorization-code grant should issue an initial
       refresh token (RFC 6749 §6). When unset, the token controller issues one
@@ -285,6 +288,7 @@ defmodule AttestoPhoenix.Config do
     :consent,
     :client_public?,
     :client_requires_mtls?,
+    :client_grant_types,
     :issue_refresh_token?,
     :code_store,
     :refresh_store,
@@ -363,6 +367,7 @@ defmodule AttestoPhoenix.Config do
           consent: callback() | nil,
           client_public?: callback() | nil,
           client_requires_mtls?: callback() | nil,
+          client_grant_types: callback() | nil,
           issue_refresh_token?: callback() | nil,
           code_store: module() | nil,
           refresh_store: module() | nil,
