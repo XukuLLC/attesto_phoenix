@@ -239,6 +239,23 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["dpop_jkt"] == jkt
   end
 
+  test "stores an explicit PAR dpop_jkt without requiring a PAR DPoP proof" do
+    credentials = Base.encode64("confidential-1:s3cr3t")
+    {_proof, jkt} = dpop_proof()
+    params = Map.put(auth_params(), "dpop_jkt", jkt)
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+    assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
+    assert stored["dpop_jkt"] == jkt
+  end
+
   test "rejects an explicit PAR dpop_jkt that mismatches the DPoP proof" do
     credentials = Base.encode64("confidential-1:s3cr3t")
     {proof, _jkt} = dpop_proof()

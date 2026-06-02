@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-06-02
+
+### Fixed
+
+- Allow PAR requests to carry an explicit `dpop_jkt` without also requiring a
+  DPoP proof on the PAR request itself. If a PAR DPoP proof is present, an
+  explicit `dpop_jkt` must still match that proof; otherwise the stored
+  thumbprint is later enforced when the authorization code is redeemed.
+
 ## [0.6.15] - 2026-06-02
 
 ### Fixed

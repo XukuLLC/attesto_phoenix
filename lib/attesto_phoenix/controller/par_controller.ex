@@ -226,11 +226,7 @@ defmodule AttestoPhoenix.Controller.PARController do
   defp verify_dpop_binding(config, conn, params) do
     case get_req_header(conn, @dpop_request_header) do
       [] ->
-        if present?(Map.get(params, "dpop_jkt")) do
-          {:error, {@error_invalid_dpop_proof, "DPoP proof required"}}
-        else
-          {:ok, nil}
-        end
+        {:ok, submitted_dpop_jkt(params)}
 
       [proof] ->
         verify_dpop_proof(config, conn, params, proof)
@@ -264,7 +260,8 @@ defmodule AttestoPhoenix.Controller.PARController do
   defp put_verified_dpop_jkt(params, nil), do: params
   defp put_verified_dpop_jkt(params, dpop_jkt), do: Map.put(params, "dpop_jkt", dpop_jkt)
 
-  defp present?(value), do: is_binary(value) and value != ""
+  defp submitted_dpop_jkt(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
+  defp submitted_dpop_jkt(_params), do: nil
 
   defp client_id(config, client) do
     case config_callback(config, :client_id) do
