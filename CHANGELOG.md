@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-06-02
+
+### Fixed
+
+- Carry the DPoP JWK thumbprint from a pushed authorization request into the
+  issued authorization code. A token request that redeems the code with a
+  different DPoP proof key is now rejected instead of minting a token bound to
+  the later key.
+
 ## [0.6.14] - 2026-06-01
 
 ### Fixed

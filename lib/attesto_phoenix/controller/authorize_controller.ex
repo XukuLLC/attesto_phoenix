@@ -143,7 +143,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          {params, par_resolved?} <- resolve_request_uri(config, params),
          {:ok, client} <- load_client(config, params),
          {:ok, request} <- validate_request(config, client, params, par_resolved?) do
-      run_flow(conn, config, client, request)
+      run_flow(conn, config, client, request, dpop_jkt_from_params(params))
     else
       {:error, :insecure_transport} ->
         # RFC 6749 §3.1 / §10.1: the authorization endpoint requires TLS. The
@@ -334,12 +334,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # the resource owner even if a session exists. Both intents are passed to the
   # host's authentication hook as `auth_opts`; the host owns the session, the
   # controller owns the protocol disposition.
-  defp run_flow(conn, config, client, request) do
+  defp run_flow(conn, config, client, request, dpop_jkt) do
     prompt_none? = @prompt_none in request.prompt
 
     case authenticate_resource_owner(conn, config, request) do
       {:authenticated, subject} ->
-        run_consent(conn, config, client, request, subject, prompt_none?)
+        run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt)
 
       {:none} ->
         # OIDC Core §3.1.2.6: the host has no already-authenticated subject it
@@ -397,10 +397,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp interaction_error_code(:consent_required), do: @error_consent_required
   defp interaction_error_code(:interaction_required), do: @error_interaction_required
 
-  defp run_consent(conn, config, client, request, subject, prompt_none?) do
+  defp run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt) do
     case consent(conn, config, request, subject) do
       {:consented, subject} ->
-        issue_and_redirect(conn, config, client, request, subject)
+        issue_and_redirect(conn, config, client, request, subject, dpop_jkt)
 
       {:halt, halted_conn} ->
         # OIDC Core §3.1.2.6: a consent screen is interactive UI, forbidden
@@ -439,17 +439,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # to a revocation family for code-reuse / refresh-reuse revocation
   # (OAuth 2.0 Security BCP §4.13, §4.14). On success, redirect back to the
   # client with `code` (and `state`).
-  defp issue_and_redirect(conn, config, client, request, subject) do
-    attrs = %{
-      client_id: client_id(config, client),
-      redirect_uri: request.redirect_uri,
-      code_challenge: request.code_challenge,
-      code_challenge_method: request.code_challenge_method,
-      subject: subject_id(subject),
-      scope: request.scope,
-      family_id: generate_family_id(),
-      claims: code_claims(request, subject)
-    }
+  defp issue_and_redirect(conn, config, client, request, subject, dpop_jkt) do
+    attrs =
+      %{
+        client_id: client_id(config, client),
+        redirect_uri: request.redirect_uri,
+        code_challenge: request.code_challenge,
+        code_challenge_method: request.code_challenge_method,
+        subject: subject_id(subject),
+        scope: request.scope,
+        family_id: generate_family_id(),
+        claims: code_claims(request, subject)
+      }
+      |> put_optional(:dpop_jkt, dpop_jkt)
 
     case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
       {:ok, code} ->
@@ -470,6 +472,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # this id, and code-reuse detection replays it to revoke the descendant
   # family. Generated with the same secret generator the codes themselves use.
   defp generate_family_id, do: Secret.generate()
+
+  # RFC 9449 §10 / FAPI2 Security Profile: a DPoP proof at PAR establishes the
+  # key thumbprint the authorization code must later be redeemed with. PAR
+  # stores that verified thumbprint in the pushed request params as `dpop_jkt`;
+  # direct authorization requests may also carry the extension parameter. The
+  # core code grant validates the thumbprint format and enforces the match at
+  # token redemption.
+  defp dpop_jkt_from_params(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
+  defp dpop_jkt_from_params(_params), do: nil
 
   # OIDC Core §3.1.3.6 / §2: the claims the token endpoint needs to mint the ID
   # token. The request `nonce` (OIDC Core §3.1.2.1) MUST be reflected into the

@@ -234,6 +234,24 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert query["state"] == "xyz"
     end
 
+    test "carries a PAR DPoP thumbprint into the issued authorization code" do
+      request_uri = "urn:ietf:params:oauth:request_uri:dpop-bound"
+      jkt = Attesto.Secret.hash("par-proof-key")
+
+      put_config(
+        require_pushed_authorization_requests: true,
+        par_store: PARStore
+      )
+
+      :ok = PARStore.put(request_uri, Map.put(valid_params(), "dpop_jkt", jkt), 60)
+
+      conn = call(%{"client_id" => @client_id, "request_uri" => request_uri})
+
+      assert conn.status == 302
+      code = location_query(conn)["code"]
+      assert TestStore.peek(code).data.dpop_jkt == jkt
+    end
+
     test "uses the client_id from the pushed request, not the front-channel query" do
       request_uri = "urn:ietf:params:oauth:request_uri:bound-client"
 

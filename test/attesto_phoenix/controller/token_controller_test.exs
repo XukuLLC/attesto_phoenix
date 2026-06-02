@@ -794,6 +794,50 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert conn.status == 200
       assert body(conn)["token_type"] == "DPoP"
     end
+
+    test "a DPoP-bound authorization code rejects a different token proof key" do
+      enable_minting()
+      {_bound_proof, bound_jkt} = dpop_proof_and_jkt([])
+      code_store = start_dpop_code_store("oc_sub-1", ["openid"], bound_jkt)
+      put_config(code_store: code_store, dpop_enabled: true)
+
+      {wrong_proof, _wrong_jkt} = dpop_proof_and_jkt([])
+
+      conn =
+        post_dpop_auth_code(
+          %{
+            "client_id" => "public-1",
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          },
+          wrong_proof
+        )
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_grant"
+    end
+
+    test "a DPoP-bound authorization code redeems with the matching token proof key" do
+      enable_minting()
+      {proof, jkt} = dpop_proof_and_jkt([])
+      code_store = start_dpop_code_store("oc_sub-1", ["openid"], jkt)
+      put_config(code_store: code_store, dpop_enabled: true)
+
+      conn =
+        post_dpop_auth_code(
+          %{
+            "client_id" => "public-1",
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          },
+          proof
+        )
+
+      assert conn.status == 200
+      assert body(conn)["token_type"] == "DPoP"
+    end
   end
 
   # FIX 4 - REVOCATION via load_client (the documented control is the lookup).
@@ -1259,6 +1303,25 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     store
   end
 
+  defp start_dpop_code_store(subject, scope, dpop_jkt) do
+    store = ensure_started(Attesto.CodeStore.ETS)
+
+    {:ok, code} =
+      Attesto.AuthorizationCode.issue(store, %{
+        client_id: "public-1",
+        redirect_uri: @redirect_uri,
+        scope: scope,
+        subject: subject,
+        code_challenge: @code_challenge,
+        code_challenge_method: "S256",
+        dpop_jkt: dpop_jkt,
+        claims: %{"nonce" => "n-dpop"}
+      })
+
+    Process.put(:auth_code, code)
+    store
+  end
+
   # A code store pre-seeded with a `family_id`-linked code (OAuth 2.0 Security
   # BCP §4.13): the initial refresh token is minted into this family, so a
   # later replay of the code carries the `family_id` reuse detection revokes.
@@ -1309,6 +1372,11 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # Build a signed DPoP proof (RFC 9449 §4.2) for POST @endpoint_path. The
   # proof key is freshly generated per call; `nonce` is included when given.
   defp dpop_proof(opts) do
+    {proof, _jkt} = dpop_proof_and_jkt(opts)
+    proof
+  end
+
+  defp dpop_proof_and_jkt(opts) do
     nonce = Keyword.get(opts, :nonce)
     jwk = JOSE.JWK.generate_key({:ec, "P-256"})
     {_, pub_map} = JOSE.JWK.to_public_map(jwk)
@@ -1324,7 +1392,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     header = %{"alg" => "ES256", "typ" => "dpop+jwt", "jwk" => pub_map}
     {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, header, payload))
-    compact
+    {compact, Attesto.DPoP.compute_jkt(pub_map)}
   end
 
   defp maybe_put(map, _k, nil), do: map
@@ -1334,6 +1402,15 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # https-only htu matches and DPoP binding is reachable).
   defp post_dpop(grant_type, proof) do
     params = %{"grant_type" => grant_type, "client_id" => "public-1", "scope" => "read"}
+    %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
+
+    %Plug.Conn{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_req_header("dpop", proof)
+    |> TokenController.create(params)
+  end
+
+  defp post_dpop_auth_code(params, proof) do
+    params = Map.put(params, "grant_type", "authorization_code")
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
     %Plug.Conn{base | scheme: :https, host: "issuer.example", port: 443}
