@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.22] - 2026-06-02
+
+### Changed
+
+- Advertise only the FAPI 2 client-authentication signing algorithms
+  (`PS256`, `ES256`, `EdDSA`) in `token_endpoint_auth_signing_alg_values_supported`,
+  matching the underlying enforcement in attesto 0.6.9 which rejects RS256
+  client assertions. Requires `attesto ~> 0.6.9`.
+
 ## [0.6.21] - 2026-06-02
 
 ### Fixed

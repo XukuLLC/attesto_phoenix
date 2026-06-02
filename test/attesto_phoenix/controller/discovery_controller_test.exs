@@ -119,7 +119,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_signing_alg_values_supported"] ==
-               Attesto.SigningAlg.allowed()
+               Attesto.SigningAlg.fapi_algs()
     end
 
     test "advertises RFC 9207 authorization response iss support when enabled" do
