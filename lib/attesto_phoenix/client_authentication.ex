@@ -95,9 +95,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
     The authenticated client and how it authenticated.
 
     `:client` is the opaque host client value returned by `:load_client`,
-    `:client_id` is the OAuth identifier (RFC 6749 §2.2) resolved through the
-    host's `:client_id` callback (or `nil` when none is configured), and
-    `:method` is the RFC 6749 §2.3 / OIDC Core §9 authentication method
+    `:client_id` is the OAuth identifier (RFC 6749 §2.2) - the host's
+    `:client_id` callback when configured, otherwise the identifier the
+    credentials carried (the Basic/body `client_id` or the assertion `sub`), so
+    it is never `nil` for a successful authentication - and `:method` is the
+    RFC 6749 §2.3 / OIDC Core §9 authentication method
     (`:client_secret_basic`, `:client_secret_post`, `:private_key_jwt`, or
     `:none` for the public-client path).
     """
@@ -311,7 +313,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
     case invoke(Config.load_client_fun(config), [client_id]) do
       {:ok, client} ->
         if invoke(verify_client_secret, [client, secret]) == true do
-          {:ok, result(config, client, method)}
+          {:ok, result(config, client, client_id, method)}
         else
           {:error, error(@error_invalid_client, @client_auth_failed)}
         end
@@ -337,7 +339,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
              accepted_algs: policy.assertion_signing_algs
            ),
          :ok <- consume_client_assertion_jti(config, policy, client_id, claims) do
-      {:ok, result(config, client, :private_key_jwt)}
+      {:ok, result(config, client, client_id, :private_key_jwt)}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
@@ -392,7 +394,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp load_public_client(config, client_id) do
     with {:ok, client} <- load_existing_client(config, client_id),
          true <- client_public?(config, client) do
-      {:ok, result(config, client, :none)}
+      {:ok, result(config, client, client_id, :none)}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
@@ -414,14 +416,22 @@ defmodule AttestoPhoenix.ClientAuthentication do
     Callback.invoke(Config.client_public_fun(config), [client], false) == true
   end
 
-  defp result(config, client, method) do
-    %Result{client: client, client_id: client_id(config, client), method: method}
+  # The authenticated OAuth `client_id` (RFC 6749 §2.2) the credentials carried
+  # - the Basic/body `client_id` or the assertion `sub` - is always known for a
+  # successful authentication, so it is the reliable identifier. The host's
+  # `:client_id` callback, when configured, maps the opaque client to its
+  # identifier and takes precedence; absent it, the presented identifier stands
+  # (never `nil` for a successful auth), so downstream uses such as the RFC 9701
+  # signed-introspection audience always have an identifier.
+  defp result(config, client, presented_client_id, method) do
+    %Result{
+      client: client,
+      client_id: resolved_client_id(config, client) || presented_client_id,
+      method: method
+    }
   end
 
-  # The client's identifier (RFC 6749 §2.2). Read defensively: when the host
-  # does not supply `:client_id` the identifier is unknown (`nil`), which is
-  # correct for audit and is never used as a credential.
-  defp client_id(config, client) do
+  defp resolved_client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
 

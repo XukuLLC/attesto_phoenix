@@ -155,7 +155,9 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 
       assert body["introspection_endpoint"] == "#{@issuer}/oauth/introspect"
-      assert is_list(body["introspection_endpoint_auth_methods_supported"])
+      methods = body["introspection_endpoint_auth_methods_supported"]
+      assert is_list(methods)
+      refute "none" in methods
 
       assert body["introspection_signing_alg_values_supported"] ==
                body["id_token_signing_alg_values_supported"]

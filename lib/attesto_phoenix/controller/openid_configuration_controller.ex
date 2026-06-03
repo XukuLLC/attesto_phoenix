@@ -208,8 +208,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       userinfo_endpoint: config.userinfo_endpoint,
       revocation_endpoint: revocation_endpoint(config),
       introspection_endpoint: Config.introspection_endpoint_url(config),
-      introspection_endpoint_auth_methods_supported:
-        token_endpoint_auth_methods_supported(config),
+      introspection_endpoint_auth_methods_supported: introspection_auth_methods(config),
       require_pushed_authorization_requests: require_pushed_authorization_requests(config),
       pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
       scopes_supported: config.scopes_supported,
@@ -240,6 +239,13 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   defp token_endpoint_auth_methods_supported(%Config{}),
     do: @token_endpoint_auth_methods_supported
+
+  # The introspection endpoint authenticates the caller and rejects the public
+  # ("none") path (RFC 7662 §2.1), so it advertises the confidential subset of
+  # the configured client-authentication methods.
+  defp introspection_auth_methods(config) do
+    Enum.reject(token_endpoint_auth_methods_supported(config), &(&1 == "none"))
+  end
 
   # RFC 9101 §10.5 / OpenID Connect Discovery §3
   # `request_object_signing_alg_values_supported`: the JWS algorithms the

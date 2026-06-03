@@ -41,7 +41,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
 
   alias Attesto.Introspection
   alias Attesto.SignedIntrospection
-  alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError, RequestContext}
   alias AttestoPhoenix.ClientAuthentication.Policy
 
   # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
@@ -74,15 +74,16 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     conn = put_no_store_headers(conn)
 
     with :ok <- check_https(conn, config),
-         {:ok, client} <- authenticate_client(config, conn, params),
+         {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
+           authenticate_client(config, conn, params),
          {:ok, token} <- fetch_token(params) do
-      respond(conn, config, client, token, params)
+      respond(conn, config, client_id, token, params)
     else
       {:error, %OAuthError{} = err} -> render_error(conn, err)
     end
   end
 
-  defp respond(conn, config, client, token, params) do
+  defp respond(conn, config, client_id, token, params) do
     protocol_config = Config.to_attesto_config(config)
 
     response =
@@ -92,8 +93,10 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
       )
 
     if signed_response_requested?(conn) do
-      {:ok, jwt} =
-        SignedIntrospection.response_jwt(protocol_config, client_id(config, client), response)
+      # The audience is the authenticated client_id, always present for a
+      # successful confidential authentication (this endpoint forbids the public
+      # path), so signing never depends on the optional `:client_id` callback.
+      {:ok, jwt} = SignedIntrospection.response_jwt(protocol_config, client_id, response)
 
       conn
       |> put_resp_header("content-type", @signed_media_type)
@@ -103,12 +106,43 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     end
   end
 
-  # RFC 9701 §4: the signed response is returned only when the caller asks for
-  # it via the Accept header; otherwise the plain JSON response is returned.
+  # RFC 9701 §4: the signed response is returned only when the caller explicitly
+  # asks for `#{@signed_media_type}` in Accept with a non-zero quality (RFC 9110
+  # §12.5.1: `q=0` means "not acceptable"); otherwise the plain JSON response is
+  # returned. A bare `*/*` or `application/json` does not opt into the signed JWT.
   defp signed_response_requested?(conn) do
     conn
     |> get_req_header("accept")
-    |> Enum.any?(&String.contains?(&1, @signed_media_type))
+    |> Enum.flat_map(&parse_accept/1)
+    |> Enum.any?(fn {media_type, q} -> media_type == @signed_media_type and q > 0.0 end)
+  end
+
+  # Parse an Accept header value into `{media_type, quality}` pairs (RFC 9110
+  # §12.5.1). Only the media type and its `q` parameter matter here; other
+  # parameters are ignored, and a missing `q` defaults to 1.0.
+  defp parse_accept(header) do
+    header
+    |> String.split(",", trim: true)
+    |> Enum.map(fn range ->
+      [media_type | params] = range |> String.trim() |> String.split(";", trim: true)
+      {String.downcase(String.trim(media_type)), quality(params)}
+    end)
+  end
+
+  defp quality(params) do
+    Enum.find_value(params, 1.0, fn param ->
+      case param |> String.trim() |> String.downcase() |> String.split("=", parts: 2) do
+        ["q", value] -> parse_q(value)
+        _ -> nil
+      end
+    end)
+  end
+
+  defp parse_q(value) do
+    case Float.parse(String.trim(value)) do
+      {q, _rest} -> q
+      :error -> 1.0
+    end
   end
 
   defp fetch_token(%{"token" => token}) when is_binary(token) and token != "", do: {:ok, token}
@@ -145,18 +179,10 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
       assertion_signing_algs: config.client_auth_signing_algs
     }
 
-    case ClientAuthentication.authenticate(
-           get_req_header(conn, "authorization"),
-           params,
-           config,
-           policy
-         ) do
-      {:ok, %ClientAuthentication.Result{client: client}} -> {:ok, client}
-      {:error, %OAuthError{}} = err -> err
-    end
+    # Return the full Result; the caller reads the authenticated client_id (the
+    # RFC 9701 audience) from it.
+    ClientAuthentication.authenticate(get_req_header(conn, "authorization"), params, config, policy)
   end
-
-  defp client_id(config, client), do: Callback.invoke(Config.client_id_fun(config), [client], nil)
 
   defp render_error(conn, %OAuthError{} = err) do
     conn

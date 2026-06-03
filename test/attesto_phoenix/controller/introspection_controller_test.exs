@@ -166,6 +166,32 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       assert conn.status == 200
       assert decode(conn.resp_body)["token_introspection"] == %{"active" => false}
     end
+
+    test "signs with the authenticated client_id even when no :client_id callback is configured" do
+      # The audience must come from the credentials, not the optional :client_id
+      # callback, so a valid config without that callback must not crash.
+      opts = Keyword.delete(config_opts(), :client_id)
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+      config = Config.new(opts)
+
+      conn = call(%{"token" => access_token(config)}, [{"accept", @signed_media_type}])
+
+      assert conn.status == 200
+      assert decode(conn.resp_body)["aud"] == @client_id
+    end
+
+    test "Accept with q=0 on the signed type returns plain JSON (RFC 9110 §12.5.1)", %{
+      config: config
+    } do
+      conn =
+        call(%{"token" => access_token(config)}, [
+          {"accept", "#{@signed_media_type};q=0, application/json;q=1"}
+        ])
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "content-type") |> List.first() =~ "application/json"
+      assert JSON.decode!(conn.resp_body)["active"] == true
+    end
   end
 
   defp decode(jwt) do
