@@ -181,8 +181,10 @@ defmodule AttestoPhoenix.Controller.PARController do
     end
   end
 
+  # FAPI 2 requires the client-assertion `aud` to be the issuer identifier;
+  # the PAR endpoint URL is not accepted.
   defp client_assertion_audiences(config) do
-    [config.issuer, Config.par_endpoint_url(config)]
+    [config.issuer]
   end
 
   defp consume_client_assertion_jti(config, client_id, %{"jti" => jti})

@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.23] - 2026-06-02
+
+### Changed
+
+- Require the client-authentication assertion `aud` to be the issuer identifier
+  at both the token and PAR endpoints (FAPI 2). The endpoint URL is no longer
+  accepted as an audience. Requires `attesto ~> 0.6.10`.
+
 ## [0.6.22] - 2026-06-02
 
 ### Changed
