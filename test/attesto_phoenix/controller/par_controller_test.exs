@@ -560,6 +560,41 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       refute Map.has_key?(stored, "state")
     end
 
+    test "a signed dpop_jkt that disagrees with the presented DPoP proof is rejected" do
+      # RFC 9101 §6.3 + RFC 9449: the signed request object's dpop_jkt is
+      # authoritative, so a presented proof for a different key is a mismatch -
+      # the body's (absent) dpop_jkt must not let the proof override the signed
+      # value. Verifying the object before DPoP reconciliation makes this so.
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> %{"keys" => [public_jwk(request_key)]} end
+      )
+
+      {proof, _proof_jkt} = dpop_proof()
+      signed_jkt = JOSE.JWK.thumbprint(JOSE.JWK.generate_key({:ec, "P-256"}))
+
+      request =
+        signed_request_object(
+          request_key,
+          "confidential-1",
+          Map.put(request_claims(), "dpop_jkt", signed_jkt)
+        )
+
+      params = Map.merge(auth_params(), %{"request" => request})
+      credentials = Base.encode64("confidential-1:s3cr3t")
+
+      conn =
+        params
+        |> https_post()
+        |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+        |> Plug.Conn.put_req_header("dpop", proof)
+        |> PARController.create(params)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_dpop_proof"
+    end
+
     test "rejects a signed request object when the client has no JWKS configured (fail closed)" do
       request_key = JOSE.JWK.generate_key({:ec, "P-256"})
 

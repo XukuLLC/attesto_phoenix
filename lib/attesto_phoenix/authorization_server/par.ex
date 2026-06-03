@@ -99,8 +99,11 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     ttl = config_field(config, :par_ttl, @default_par_ttl)
     request_uri = @request_uri_prefix <> random()
 
-    with {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params),
-         {:ok, params} <- verify_request_object(config, client, params) do
+    # Verify the request object FIRST so its signed parameters are authoritative
+    # (RFC 9101 §6.3) before DPoP reconciliation: a signed `dpop_jkt` must be the
+    # value the presented proof is checked against, never an unsigned body value.
+    with {:ok, params} <- verify_request_object(config, client, params),
+         {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params) do
       stored =
         params
         |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
