@@ -6,6 +6,62 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-03
+
+A structural refactor of the token/PAR controllers into a reusable
+authorization-server core, plus a behaviour-module install surface and several
+correctness fixes. Pre-1.0 minor bump because it carries breaking changes to
+the host-callback contract (see **BREAKING** below).
+
+### Added
+
+- Behaviour-module install for host callbacks. The Config keys `:client_store`,
+  `:principal_store`, `:consent_policy`, `:scope_policy`, `:event_sink`,
+  `:registration`, and `:claims_provider` each resolve their callbacks from a
+  single installed module. Precedence is fixed: an explicit flat callback key
+  wins; else the installed behaviour module if it exports the callback; else
+  `nil`. The required capabilities (`load_client`, `verify_client_secret`,
+  `load_principal`) are validated by *resolution* at boot, so a
+  behaviour-module-only install works. Boot-time conformance validation fails
+  fast on a typo'd or partial module.
+- `AttestoPhoenix.ClaimsProvider` behaviour — the host UserInfo/ID-Token claim
+  source (`build_userinfo_claims/3`, `build_id_token_claims/4`).
+- `AttestoPhoenix.Callback` — one callback dispatcher (function / `{m,f}` /
+  `{m,f,extra}`), replacing ~10 duplicated private `invoke/2` helpers.
+- `AttestoPhoenix.ClientAuthentication` and
+  `AttestoPhoenix.AuthorizationServer.{SenderConstraint, Token, PAR}` — conn-free
+  core modules. The token and PAR controllers are now thin adapters that lift
+  conn facts into data, call the core, and render; the core returns data and
+  audit events rather than writing the conn or emitting events.
+
+### Changed
+
+- **BREAKING:** the ID-Token extra-claims source is now the separate
+  `:build_id_token_claims` callback (`(client, subject, granted_scopes,
+  requested_claims -> map)`, and it MUST NOT carry `sub`). Previously the
+  4-arity form of `:build_userinfo_claims` doubled as the ID-Token source;
+  `:build_userinfo_claims` is now the 3-arity UserInfo source only. Hosts that
+  wired a 4-arity `:build_userinfo_claims` must move it to
+  `:build_id_token_claims`.
+- **BREAKING:** `AttestoPhoenix.ClaimsProvider` no longer declares
+  `build_principal/3`; principal building stays solely on
+  `AttestoPhoenix.PrincipalStore`. Claim sourcing and principal loading are
+  separate concerns.
+- Client-assertion `aud` now accepts the issuer **or** the concrete token/PAR
+  endpoint URL (RFC 7523 / OIDC Core §9), widened from issuer-only. The endpoint
+  URL is derived from trusted Config (issuer + path), never the request Host.
+  Still FAPI 2 valid (the issuer remains accepted).
+- Client authentication (RFC 6749 §2.3.1): a request-body `client_id` presented
+  alongside HTTP Basic is accepted as identification when it matches the Basic
+  userid, and rejected as `invalid_request` when it conflicts. Only a second
+  *credential* (body `client_secret` or `client_assertion`) is treated as a
+  competing authentication method. The token and PAR endpoints now share one
+  client-authentication implementation, so they no longer diverge.
+- PAR stores the resolved authenticated `client_id`; when no `:client_id`
+  callback is configured it leaves the request's presented `client_id` intact
+  rather than clobbering it. The opaque-struct `client[:id]`/`client["id"]`
+  fallback is removed.
+
 ## [0.6.23] - 2026-06-02
 
 ### Changed
