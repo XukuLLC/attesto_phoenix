@@ -62,6 +62,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   import Plug.Conn
 
   alias Attesto.Revocation
+  alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
 
@@ -240,8 +241,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     # RFC 6749 §5.2: an unknown or revoked client, and a wrong secret, all
     # surface to the caller as the same `invalid_client` so the endpoint is
     # not an existence oracle for client ids.
-    with {:ok, client} <- invoke(config.load_client, [client_id]),
-         true <- invoke(config.verify_client_secret, [client, client_secret]) do
+    with {:ok, client} <- Callback.invoke(config.load_client, [client_id]),
+         true <- Callback.invoke(config.verify_client_secret, [client, client_secret]) do
       {:ok, client}
     else
       _failed -> {:error, :invalid_client}
@@ -273,7 +274,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
         metadata: %{token_type_hint: Map.get(params, @token_type_hint_param)}
       )
 
-    invoke(on_event, [event])
+    Callback.invoke(on_event, [event])
     :ok
   end
 
@@ -308,22 +309,5 @@ defmodule AttestoPhoenix.Controller.RevocationController do
               "AttestoPhoenix.Controller.RevocationController: no %AttestoPhoenix.Config{} " <>
                 "in conn.private[#{inspect(@config_key)}]; wire the host pipeline that assigns it"
     end
-  end
-
-  # Invoke a configuration callback in any of the supported forms (a bare
-  # function, a `{module, function}` pair, or a full `{module, function,
-  # extra_args}` tuple), matching `AttestoPhoenix.Config`'s `callback` type.
-  defp invoke(fun, args) when is_function(fun) and is_list(args) do
-    apply(fun, args)
-  end
-
-  defp invoke({module, function}, args)
-       when is_atom(module) and is_atom(function) and is_list(args) do
-    apply(module, function, args)
-  end
-
-  defp invoke({module, function, extra_args}, args)
-       when is_atom(module) and is_atom(function) and is_list(extra_args) and is_list(args) do
-    apply(module, function, args ++ extra_args)
   end
 end

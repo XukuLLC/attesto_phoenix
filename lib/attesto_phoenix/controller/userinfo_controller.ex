@@ -75,6 +75,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   alias Attesto.DPoP.ReplayCache
   alias Attesto.Plug.Authenticate
+  alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
 
   # The conn assign `Attesto.Plug.Authenticate` writes the verified claims
@@ -294,7 +295,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   end
 
   defp principal_kinds_extra(%Config{principal_kinds: callback}) when not is_nil(callback) do
-    case invoke(callback, []) do
+    case Callback.invoke(callback, []) do
       kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
       _ -> []
     end
@@ -349,8 +350,4 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   defp put_optional(opts, _key, nil), do: opts
   defp put_optional(opts, key, value), do: Keyword.put(opts, key, value)
-
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-  defp invoke({m, f}, args) when is_atom(m) and is_atom(f), do: apply(m, f, args)
-  defp invoke({m, f, extra}, args) when is_atom(m) and is_atom(f), do: apply(m, f, args ++ extra)
 end

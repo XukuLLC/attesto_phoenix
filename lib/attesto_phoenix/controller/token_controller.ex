@@ -108,7 +108,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   alias Attesto.{AuthorizationCode, ClientAssertion, IDToken, MTLS, RefreshToken, Token}
   alias Attesto.DPoP.ReplayCache
-  alias AttestoPhoenix.{Config, Event, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
 
   require Logger
 
@@ -464,7 +464,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   end
 
   defp client_grant_types(config, client) do
-    invoke_with_default(config_callback(config, :client_grant_types), [client], nil)
+    Callback.invoke(config_callback(config, :client_grant_types), [client], nil)
   end
 
   # RFC 6749 §2.1: a client identified without a secret may proceed only if
@@ -500,7 +500,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # that forgets it cannot accidentally let confidential clients
   # authenticate without a secret.
   defp client_public?(config, client) do
-    invoke_with_default(config_callback(config, :client_public?), [client], false) == true
+    Callback.invoke(config_callback(config, :client_public?), [client], false) == true
   end
 
   # ── Grant dispatch (RFC 6749 §4) ─────────────────────────────────────────
@@ -1136,11 +1136,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # supplied the callback, since a deployment without mTLS policy never sets
   # it. (mTLS itself is off by default per `:mtls_enabled`.)
   defp client_requires_mtls?(config, client) do
-    invoke_with_default(config_callback(config, :client_requires_mtls?), [client], false) == true
+    Callback.invoke(config_callback(config, :client_requires_mtls?), [client], false) == true
   end
 
   defp client_requires_dpop?(config, client) do
-    invoke_with_default(config_callback(config, :client_requires_dpop?), [client], false) == true
+    Callback.invoke(config_callback(config, :client_requires_dpop?), [client], false) == true
   end
 
   defp mtls_cert_present?(config, conn) do
@@ -1241,7 +1241,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # absent the identifier is unknown (`nil`), which is correct for audit and is
   # never used as a credential.
   defp client_id(config, client) do
-    invoke_with_default(config_callback(config, :client_id), [client], nil)
+    Callback.invoke(config_callback(config, :client_id), [client], nil)
   end
 
   # The `Attesto.CodeStore` / `Attesto.RefreshStore` backing each stateful
@@ -1281,20 +1281,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
   defp put_optional_kw(kw, _key, []), do: kw
   defp put_optional_kw(kw, key, value), do: Keyword.put(kw, key, value)
 
-  # Callback invocation, mirroring the function/{m,f}/mfa forms the rest of the
-  # library accepts (see `AttestoPhoenix.Config`).
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-
-  defp invoke({module, fun}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args)
-
-  defp invoke({module, fun, extra}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args ++ extra)
-
+  # Callback invocation delegates to `AttestoPhoenix.Callback`, except that this
+  # endpoint additionally treats an absent (`nil`) callback as the `:no_callback`
+  # sentinel its callers branch on (rather than raising a FunctionClauseError).
   defp invoke(nil, _args), do: :no_callback
-
-  defp invoke_with_default(nil, _args, default), do: default
-  defp invoke_with_default(callback, args, _default), do: invoke(callback, args)
+  defp invoke(callback, args), do: Callback.invoke(callback, args)
 
   # ── Audit / telemetry ────────────────────────────────────────────────────
 

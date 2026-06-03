@@ -14,7 +14,7 @@ defmodule AttestoPhoenix.Controller.PARController do
 
   alias Attesto.{ClientAssertion, DPoP}
   alias Attesto.DPoP.ReplayCache
-  alias AttestoPhoenix.{Config, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, RequestContext}
 
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
@@ -148,20 +148,20 @@ defmodule AttestoPhoenix.Controller.PARController do
   end
 
   defp load_and_verify(config, client_id, secret) do
-    case invoke(config.load_client, [client_id]) do
+    case Callback.invoke(config.load_client, [client_id]) do
       {:ok, client} ->
-        if invoke(config.verify_client_secret, [client, secret]) == true,
+        if Callback.invoke(config.verify_client_secret, [client, secret]) == true,
           do: {:ok, client},
           else: {:error, {@error_invalid_client, "client authentication failed"}}
 
       _ ->
-        _ = invoke(config.verify_client_secret, [:unknown_client, secret])
+        _ = Callback.invoke(config.verify_client_secret, [:unknown_client, secret])
         {:error, {@error_invalid_client, "client authentication failed"}}
     end
   end
 
   defp load_existing_client(config, client_id) do
-    case invoke(config.load_client, [client_id]) do
+    case Callback.invoke(config.load_client, [client_id]) do
       {:ok, client} -> {:ok, client}
       _ -> {:error, :invalid_client}
     end
@@ -173,7 +173,7 @@ defmodule AttestoPhoenix.Controller.PARController do
         {:error, :missing_client_jwks}
 
       callback ->
-        case invoke(callback, [client]) do
+        case Callback.invoke(callback, [client]) do
           {:ok, jwks} -> {:ok, jwks}
           jwks when is_map(jwks) or is_list(jwks) -> {:ok, jwks}
           _ -> {:error, :missing_client_jwks}
@@ -191,7 +191,7 @@ defmodule AttestoPhoenix.Controller.PARController do
        when is_binary(jti) and jti != "" do
     key = client_assertion_replay_key(client_id, jti)
 
-    case invoke(replay_check(config), [key, @client_assertion_max_lifetime]) do
+    case Callback.invoke(replay_check(config), [key, @client_assertion_max_lifetime]) do
       :ok -> :ok
       _other -> {:error, :assertion_replay}
     end
@@ -268,7 +268,7 @@ defmodule AttestoPhoenix.Controller.PARController do
   defp client_id(config, client) do
     case config_callback(config, :client_id) do
       nil -> Map.get(client, :id) || Map.get(client, "id")
-      callback -> invoke(callback, [client])
+      callback -> Callback.invoke(callback, [client])
     end
   end
 
@@ -301,8 +301,4 @@ defmodule AttestoPhoenix.Controller.PARController do
       :error -> nil
     end
   end
-
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-  defp invoke({mod, fun}, args), do: apply(mod, fun, args)
-  defp invoke({mod, fun, extra}, args) when is_list(extra), do: apply(mod, fun, args ++ extra)
 end

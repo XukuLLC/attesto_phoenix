@@ -29,7 +29,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   alias Attesto.DPoP.ReplayCache
   alias Attesto.Plug.Authenticate, as: CoreAuthenticate
   alias Attesto.Plug.OAuthError
-  alias AttestoPhoenix.{Config, Event, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
 
   @claims_key :attesto_claims
   @principal_key :attesto_principal
@@ -90,7 +90,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     claims = conn.assigns[claims_key]
     subject = claims["sub"]
 
-    case invoke(config.load_principal, [subject]) do
+    case Callback.invoke(config.load_principal, [subject]) do
       {:ok, principal} ->
         principal_key = Keyword.get(opts, :principal_key, @principal_key)
         context_key = Keyword.get(opts, :context_key, @context_key)
@@ -158,7 +158,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   end
 
   defp principal_kinds_extra(%Config{principal_kinds: callback}) when not is_nil(callback) do
-    case invoke(callback, []) do
+    case Callback.invoke(callback, []) do
       kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
       _ -> []
     end
@@ -241,14 +241,6 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Keyword.merge(extra)
   end
-
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-
-  defp invoke({module, fun}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args)
-
-  defp invoke({module, fun, extra}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args ++ extra)
 
   defp normalize_callback(callback) when is_function(callback), do: callback
 

@@ -74,7 +74,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   import Plug.Conn
 
   alias Attesto.{Secret, SecureCompare}
-  alias AttestoPhoenix.{Config, Event}
+  alias AttestoPhoenix.{Callback, Config, Event}
 
   # RFC 7234 §5.2: a credential-bearing response must never be cached.
   @cache_control_no_store "no-store"
@@ -167,7 +167,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     config = config(conn)
 
     with {:ok, token} <- registration_bearer_token(conn),
-         {:ok, client} <- invoke(config.load_client, [client_id]),
+         {:ok, client} <- Callback.invoke(config.load_client, [client_id]),
          :ok <- verify_registration_access_token(config, client, token),
          :ok <- unregister_client(config, client) do
       send_resp(conn, :no_content, "")
@@ -484,7 +484,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # The plaintext client_secret is replaced with its one-way hash before
   # persistence so the store never holds the bearer value (RFC 6749 §2.3.1).
   defp persist(issued, config) do
-    case invoke(config.register_client, [persistable_attrs(issued)]) do
+    case Callback.invoke(config.register_client, [persistable_attrs(issued)]) do
       {:ok, stored} ->
         {:ok, stored}
 
@@ -583,7 +583,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   defp verify_registration_access_token(config, client, token) do
     with callback when not is_nil(callback) <- config.client_registration_access_token_hash,
-         hash when is_binary(hash) <- invoke(callback, [client]),
+         hash when is_binary(hash) <- Callback.invoke(callback, [client]),
          true <- token |> Secret.hash() |> SecureCompare.equal?(hash) do
       :ok
     else
@@ -601,21 +601,13 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
          )}
 
       callback ->
-        case invoke(callback, [client]) do
+        case Callback.invoke(callback, [client]) do
           :ok -> :ok
           {:ok, _client} -> :ok
           {:error, _reason} -> {:error, invalid_registration_token_error()}
         end
     end
   end
-
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-
-  defp invoke({module, fun}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args)
-
-  defp invoke({module, fun, extra}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args ++ extra)
 
   # ── Rendering (RFC 7591 §3.2.2) ──────────────────────────────────────────
 

@@ -261,6 +261,8 @@ defmodule AttestoPhoenix.Config do
   Config keys are how a host installs an implementation.
   """
 
+  alias AttestoPhoenix.Callback
+
   @enforce_keys [
     :issuer,
     :keystore,
@@ -690,17 +692,8 @@ defmodule AttestoPhoenix.Config do
         scopes,
         requested
       ) do
-    invoke(callback, [subject, scopes, requested])
+    Callback.invoke(callback, [subject, scopes, requested])
   end
-
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-
-  defp invoke({module, fun}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args)
-
-  defp invoke({module, fun, extra}, args)
-       when is_atom(module) and is_atom(fun) and is_list(extra),
-       do: apply(module, fun, args ++ extra)
 
   defp validate!(%__MODULE__{} = config) do
     Enum.each(@required, fn key ->

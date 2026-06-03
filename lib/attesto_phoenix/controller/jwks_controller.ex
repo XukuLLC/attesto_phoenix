@@ -36,6 +36,7 @@ defmodule AttestoPhoenix.Controller.JWKSController do
   import Plug.Conn
 
   alias Attesto.JWKS
+  alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
 
   # RFC 7517 §8.5.1 registers `application/jwk-set+json` for a JWK Set document.
@@ -98,19 +99,11 @@ defmodule AttestoPhoenix.Controller.JWKSController do
   end
 
   defp principal_kinds_extra(%Config{principal_kinds: callback}) when not is_nil(callback) do
-    case invoke(callback, []) do
+    case Callback.invoke(callback, []) do
       kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
       _other -> []
     end
   end
 
   defp principal_kinds_extra(_config), do: []
-
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-
-  defp invoke({module, fun}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args)
-
-  defp invoke({module, fun, extra}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args ++ extra)
 end

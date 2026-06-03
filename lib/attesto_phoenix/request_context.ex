@@ -41,6 +41,7 @@ defmodule AttestoPhoenix.RequestContext do
   unless the host opts in.
   """
 
+  alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
 
   # RFC 9449 §4.3: `htu` is the HTTP target URI of the request to which the DPoP
@@ -140,7 +141,7 @@ defmodule AttestoPhoenix.RequestContext do
   """
   @spec canonical_url(Plug.Conn.t(), Config.t()) :: String.t()
   def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu} = config) when not is_nil(htu) do
-    invoke(htu, [conn]) || canonical_url(conn, %{config | htu: nil})
+    Callback.invoke(htu, [conn]) || canonical_url(conn, %{config | htu: nil})
   end
 
   def canonical_url(%Plug.Conn{} = conn, %Config{} = config) do
@@ -172,7 +173,7 @@ defmodule AttestoPhoenix.RequestContext do
   """
   @spec cert_der(Plug.Conn.t(), Config.t()) :: binary() | nil
   def cert_der(%Plug.Conn{} = conn, %Config{cert_der: cert_der}) when not is_nil(cert_der) do
-    case invoke(cert_der, [conn]) do
+    case Callback.invoke(cert_der, [conn]) do
       der when is_binary(der) and byte_size(der) > 0 -> der
       _ -> nil
     end
@@ -391,14 +392,4 @@ defmodule AttestoPhoenix.RequestContext do
     |> Tuple.to_list()
     |> Enum.reduce(0, fn group, acc -> acc * 65_536 + group end)
   end
-
-  # ----- callback invocation -----
-
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-
-  defp invoke({module, fun}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args)
-
-  defp invoke({module, fun, extra}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args ++ extra)
 end

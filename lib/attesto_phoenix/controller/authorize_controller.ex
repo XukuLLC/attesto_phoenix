@@ -106,7 +106,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias Attesto.AuthorizationCode
   alias Attesto.AuthorizationRequest
   alias Attesto.Secret
-  alias AttestoPhoenix.{Config, Event, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
 
   require Logger
 
@@ -176,7 +176,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp load_client(config, params) do
     case params["client_id"] do
       client_id when is_binary(client_id) and client_id != "" ->
-        case invoke(config.load_client, [client_id]) do
+        case Callback.invoke(config.load_client, [client_id]) do
           {:ok, client} -> {:ok, client}
           _other -> {:error, {:direct, :invalid_client_id}}
         end
@@ -269,7 +269,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         nil
 
       callback ->
-        case invoke(callback, [client]) do
+        case Callback.invoke(callback, [client]) do
           {:ok, jwks} -> jwks
           jwks when is_map(jwks) or is_list(jwks) -> jwks
           _other -> nil
@@ -295,7 +295,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp client_public?(config, client) do
     case config_callback(config, :client_public?) do
       nil -> true
-      callback -> invoke(callback, [client]) == true
+      callback -> Callback.invoke(callback, [client]) == true
     end
   end
 
@@ -317,7 +317,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp registered_redirect_uris(config, client) do
-    case invoke_with_default(config_callback(config, :client_redirect_uris), [client], []) do
+    case Callback.invoke(config_callback(config, :client_redirect_uris), [client], []) do
       uris when is_list(uris) -> uris
       _ -> []
     end
@@ -545,7 +545,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          redirect_with_error(conn, request.redirect_uri, @error_server_error, request.state)}
 
       callback ->
-        invoke(callback, [conn, request, auth_opts(request)])
+        Callback.invoke(callback, [conn, request, auth_opts(request)])
     end
   end
 
@@ -568,7 +568,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp consent(conn, config, request, subject) do
     case config_callback(config, :consent) do
       nil -> {:consented, subject}
-      callback -> invoke(callback, [conn, request, subject])
+      callback -> Callback.invoke(callback, [conn, request, subject])
     end
   end
 
@@ -580,7 +580,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp subject_id(_subject), do: nil
 
   defp client_id(config, client) do
-    invoke_with_default(config_callback(config, :client_id), [client], nil)
+    Callback.invoke(config_callback(config, :client_id), [client], nil)
   end
 
   defp code_store(config), do: config_callback(config, :code_store)
@@ -805,17 +805,4 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   defp put_optional(map, _key, nil), do: map
   defp put_optional(map, key, value), do: Map.put(map, key, value)
-
-  # Callback invocation, mirroring the function/{m,f}/mfa forms the rest of the
-  # library accepts (see `AttestoPhoenix.Config`).
-  defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-
-  defp invoke({module, fun}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args)
-
-  defp invoke({module, fun, extra}, args) when is_atom(module) and is_atom(fun),
-    do: apply(module, fun, args ++ extra)
-
-  defp invoke_with_default(nil, _args, default), do: default
-  defp invoke_with_default(callback, args, _default), do: invoke(callback, args)
 end

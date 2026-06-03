@@ -70,6 +70,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     This module compiles only when `Plug` is available.
     """
 
+    alias AttestoPhoenix.Callback
     alias AttestoPhoenix.Config
 
     import Plug.Conn
@@ -270,7 +271,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     def no_store(conn, config \\ nil) do
       case config_callback(config, :no_store) do
         nil -> default_no_store(conn)
-        callback -> invoke(callback, [conn])
+        callback -> Callback.invoke(callback, [conn])
       end
     end
 
@@ -284,7 +285,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     def www_authenticate(conn, config \\ nil, challenge) when is_binary(challenge) do
       case config_callback(config, :www_authenticate) do
         nil -> put_resp_header(conn, "www-authenticate", challenge)
-        callback -> invoke(callback, [conn, challenge])
+        callback -> Callback.invoke(callback, [conn, challenge])
       end
     end
 
@@ -342,7 +343,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     defp do_send_error(conn, config, status, body) do
       case config_callback(config, :send_error) do
         nil -> default_send_error(conn, status, body)
-        callback -> invoke(callback, [conn, status, body])
+        callback -> Callback.invoke(callback, [conn, status, body])
       end
     end
 
@@ -400,13 +401,5 @@ if Code.ensure_loaded?(Plug.Conn) do
       |> String.replace("\\", "\\\\")
       |> String.replace("\"", "\\\"")
     end
-
-    # Invoke a configured callback expressed as an anonymous function,
-    # `{module, fun}`, or an MFA whose trailing args follow the supplied ones.
-    defp invoke(fun, args) when is_function(fun), do: apply(fun, args)
-    defp invoke({mod, fun}, args) when is_atom(mod) and is_atom(fun), do: apply(mod, fun, args)
-
-    defp invoke({mod, fun, extra}, args) when is_atom(mod) and is_atom(fun) and is_list(extra),
-      do: apply(mod, fun, args ++ extra)
   end
 end
