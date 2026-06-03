@@ -1,0 +1,202 @@
+defmodule AttestoPhoenix.AuthorizationServer.PAR do
+  @moduledoc """
+  Pushed Authorization Request storage (RFC 9126), as conn-free core.
+
+  This is the single place that turns an authenticated client and a parsed
+  authorization request into either a stored `request_uri` reference or an
+  `AttestoPhoenix.OAuthError`. The Pushed Authorization Request endpoint
+  (RFC 9126) authenticates the client (RFC 6749 §2.3), stores the submitted
+  authorization request parameters behind a `request_uri`, and returns that
+  reference to be used at the authorization endpoint, which still performs the
+  normal client/redirect/scope/PKCE validation when the reference is resolved.
+
+  ## North star
+
+  `AttestoPhoenix.Controller.PARController` parses the request off the
+  `Plug.Conn`, authenticates the client via `AttestoPhoenix.ClientAuthentication`
+  (RFC 6749 §2.3), lifts the DPoP facts into a `%Request{}` of plain data, and
+  calls `store/2`. This module reads only data, never touches a conn, and never
+  emits an event. Policy is carried on the `%AttestoPhoenix.Config{}` the caller
+  passes in (the `:par_store` persistence, the `:par_ttl`, the host callbacks);
+  nothing is hardcoded here.
+
+  ## Return value
+
+  `{:ok, %{request_uri: request_uri, expires_in: ttl}}` on success, where
+  `request_uri` is a freshly generated `urn:ietf:params:oauth:request_uri:`
+  reference (RFC 9126 §2.2) and `ttl` is the configured lifetime in seconds.
+  `{:error, %AttestoPhoenix.OAuthError{}}` on failure.
+
+  ## Security details preserved
+
+    * The stored record always carries the authenticated `client_id` resolved
+      through the host's `:client_id` callback (RFC 6749 §2.2), never a
+      body-supplied value, and the client-authentication credentials
+      (`client_secret`, `client_assertion`, `client_assertion_type`) are dropped
+      before storage.
+    * RFC 9449: when a `DPoP` proof is presented at the PAR endpoint, it is
+      verified against the canonical request URL/method (RFC 9449 §4.2 / §4.3)
+      with the configured replay check, and its `jkt` is stored as the
+      `dpop_jkt` the authorization code will later be sender-constrained to. A
+      submitted `dpop_jkt` request parameter that disagrees with the verified
+      proof's thumbprint is rejected (`invalid_dpop_proof`). Presenting more
+      than one `DPoP` proof is rejected (RFC 9449 §4.1). A `dpop_jkt` parameter
+      submitted without a proof is honoured as-is, since the proof of possession
+      is demonstrated later at the token endpoint.
+  """
+
+  alias Attesto.DPoP
+  alias Attesto.DPoP.ReplayCache
+  alias AttestoPhoenix.AuthorizationServer.PAR.Request
+  alias AttestoPhoenix.{Callback, Config, OAuthError}
+
+  @typedoc """
+  The conn-free DPoP facts the controller lifts off the PAR request
+  (RFC 9449 §4.1 / §4.2 / §4.3).
+
+    * `:proofs` - the `DPoP` request-header values
+      (`Plug.Conn.get_req_header(conn, "dpop")`); `[]` when no proof was
+      presented, more than one entry being a rejected ambiguous request.
+    * `:http_uri` - the canonical request URL (`htu`) the proof is bound to.
+    * `:http_method` - the HTTP method (`htm`) the proof is bound to.
+  """
+  @type dpop_input :: %{
+          optional(:proofs) => [String.t()],
+          optional(:http_uri) => String.t() | nil,
+          optional(:http_method) => String.t() | nil
+        }
+
+  # RFC 6749 §5.2 / RFC 9449 error codes.
+  @error_invalid_request "invalid_request"
+  @error_invalid_dpop_proof "invalid_dpop_proof"
+
+  # RFC 9126 §2.2: the `request_uri` reference scheme.
+  @request_uri_prefix "urn:ietf:params:oauth:request_uri:"
+
+  # RFC 9126 §2.2: the default `request_uri` lifetime, in seconds, when the host
+  # configures no `:par_ttl`.
+  @default_par_ttl 90
+
+  @doc """
+  Store a pushed authorization request, returning the `request_uri` reference
+  and its lifetime, or an error.
+
+  `config` is the validated `%AttestoPhoenix.Config{}` carrying the `:par_store`
+  persistence, the `:par_ttl`, and the host callbacks; `request` is the
+  `AttestoPhoenix.AuthorizationServer.PAR.Request` the controller built from the
+  authenticated client, the request body, and the conn-free DPoP facts. See the
+  module docs for the return shape and the security details preserved.
+  """
+  @spec store(Config.t(), Request.t()) ::
+          {:ok, %{request_uri: String.t(), expires_in: pos_integer()}}
+          | {:error, OAuthError.t()}
+  def store(%Config{} = config, %Request{} = request) do
+    %{client: client, params: params, dpop_input: dpop_input} = request
+    ttl = config_field(config, :par_ttl, @default_par_ttl)
+    request_uri = @request_uri_prefix <> random()
+
+    with {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params) do
+      stored =
+        params
+        |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
+        |> put_verified_dpop_jkt(dpop_jkt)
+        |> Map.put("client_id", client_id(config, client))
+
+      case par_store(config).put(request_uri, stored, ttl) do
+        :ok ->
+          {:ok, %{request_uri: request_uri, expires_in: ttl}}
+
+        _ ->
+          {:error, error(@error_invalid_request, "could not store pushed authorization request")}
+      end
+    end
+  end
+
+  # RFC 9449: bind the pushed request to a DPoP proof when one is presented.
+  # No proof keeps any submitted `dpop_jkt` parameter as-is (proof of possession
+  # is demonstrated later at the token endpoint); a single proof is verified and
+  # its thumbprint stored; more than one proof is an ambiguous request
+  # (RFC 9449 §4.1) and is rejected.
+  defp verify_dpop_binding(config, dpop_input, params) do
+    case dpop_proofs(dpop_input) do
+      [] ->
+        {:ok, submitted_dpop_jkt(params)}
+
+      [proof] ->
+        verify_dpop_proof(config, dpop_input, params, proof)
+
+      _multiple ->
+        {:error, error(@error_invalid_dpop_proof, "multiple DPoP proofs")}
+    end
+  end
+
+  defp verify_dpop_proof(config, dpop_input, params, proof) do
+    opts = [
+      http_method: http_method(dpop_input),
+      http_uri: http_uri(dpop_input),
+      replay_check: replay_check(config)
+    ]
+
+    with {:ok, %{jkt: verified_jkt}} <- DPoP.verify_proof(proof, opts),
+         :ok <- check_submitted_dpop_jkt(Map.get(params, "dpop_jkt"), verified_jkt) do
+      {:ok, verified_jkt}
+    else
+      {:error, reason} ->
+        {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: #{inspect(reason)}")}
+    end
+  end
+
+  # RFC 9449: a submitted `dpop_jkt` is honoured only when it matches the proof
+  # the client actually demonstrated; a disagreement is a confused request and
+  # is rejected (an absent or empty `dpop_jkt` is no constraint to reconcile).
+  defp check_submitted_dpop_jkt(nil, _verified_jkt), do: :ok
+  defp check_submitted_dpop_jkt("", _verified_jkt), do: :ok
+  defp check_submitted_dpop_jkt(verified_jkt, verified_jkt), do: :ok
+  defp check_submitted_dpop_jkt(_submitted_jkt, _verified_jkt), do: {:error, :dpop_jkt_mismatch}
+
+  defp put_verified_dpop_jkt(params, nil), do: params
+  defp put_verified_dpop_jkt(params, dpop_jkt), do: Map.put(params, "dpop_jkt", dpop_jkt)
+
+  defp submitted_dpop_jkt(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
+  defp submitted_dpop_jkt(_params), do: nil
+
+  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
+  defp replay_check(%Config{replay_check: callback}), do: callback
+
+  # The client's identifier (RFC 6749 §2.2). Read defensively through the
+  # host's `:client_id` callback; when none is configured the identifier is
+  # unknown (`nil`), matching the resolution used everywhere else in the
+  # library.
+  defp client_id(config, client) do
+    Callback.invoke(config_callback(config, :client_id), [client], nil)
+  end
+
+  defp par_store(config), do: config_field(config, :par_store, AttestoPhoenix.Store.PAR.ETS)
+
+  defp dpop_proofs(dpop_input), do: Map.get(dpop_input, :proofs, [])
+  defp http_uri(dpop_input), do: Map.get(dpop_input, :http_uri)
+  defp http_method(dpop_input), do: Map.get(dpop_input, :http_method)
+
+  defp random, do: 32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+
+  defp config_field(config, field, default) do
+    case Map.get(config, field) do
+      nil -> default
+      value -> value
+    end
+  end
+
+  defp config_callback(config, field) do
+    case Map.fetch(config, field) do
+      {:ok, fun} -> fun
+      :error -> nil
+    end
+  end
+
+  defp error(code, description) do
+    OAuthError.new(code_atom(code), description, status: 400)
+  end
+
+  defp code_atom(@error_invalid_request), do: :invalid_request
+  defp code_atom(@error_invalid_dpop_proof), do: :invalid_dpop_proof
+end
