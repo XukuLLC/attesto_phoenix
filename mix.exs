@@ -44,11 +44,15 @@ defmodule AttestoPhoenix.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
-  # Develop against the sibling attesto checkout when present (dev/test), so the
-  # two libraries can be co-developed before a release; prod/Hex builds use the
-  # published version constraint. Mirrors the cert example's dependency wiring.
+  # Co-develop against the sibling attesto checkout, but ONLY when explicitly
+  # opted in via ATTESTO_PATH=1 (and the checkout exists). This is deliberately
+  # NOT keyed on Mix.env alone: `mix hex.build` / `mix hex.publish` run in :dev,
+  # and a path dep cannot be packaged ("only Hex packages can be dependencies"),
+  # so a Mix.env-based switch would break publishing from a dev checkout. The
+  # default - including every publish - resolves the published version
+  # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
   defp attesto_dep do
-    if Mix.env() in [:dev, :test] and File.dir?("../attesto") do
+    if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
       {:attesto, "~> 0.6.12"}
