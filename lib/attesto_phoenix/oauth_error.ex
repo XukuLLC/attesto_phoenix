@@ -356,7 +356,7 @@ if Code.ensure_loaded?(Plug.Conn) do
     # are read defensively: a host that supplies them overrides the default
     # transport, while a config (or a `nil` config, before the pipeline has
     # assigned one) that omits them falls through to the RFC-correct default.
-    defp config_callback(%Config{} = config, key), do: Map.get(config, key)
+    defp config_callback(%Config{} = config, key), do: Callback.config_callback(config, key)
     defp config_callback(_config, _key), do: nil
 
     defp default_send_error(conn, status, body) do

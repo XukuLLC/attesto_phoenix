@@ -161,7 +161,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   """
   @spec client_requires_dpop?(Config.t(), term()) :: boolean()
   def client_requires_dpop?(%Config{} = config, client) do
-    Callback.invoke(config_callback(config, :client_requires_dpop?), [client], false) == true
+    Callback.invoke(Config.client_requires_dpop_fun(config), [client], false) == true
   end
 
   @doc """
@@ -172,7 +172,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   """
   @spec client_requires_mtls?(Config.t(), term()) :: boolean()
   def client_requires_mtls?(%Config{} = config, client) do
-    Callback.invoke(config_callback(config, :client_requires_mtls?), [client], false) == true
+    Callback.invoke(Config.client_requires_mtls_fun(config), [client], false) == true
   end
 
   # ----- internal -----
@@ -267,15 +267,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   defp issue_nonce(_config), do: ""
 
   defp client_public?(config, client) do
-    Callback.invoke(config_callback(config, :client_public?), [client], false) == true
+    Callback.invoke(Config.client_public_fun(config), [client], false) == true
   end
 
   defp dpop_proof(input), do: Map.get(input, :dpop_proof)
   defp mtls_cert_der(input), do: Map.get(input, :mtls_cert_der)
   defp http_uri(input), do: Map.get(input, :http_uri)
   defp http_method(input), do: Map.get(input, :http_method)
-
-  defp config_callback(config, key), do: Map.get(config, key)
 
   defp put_optional_kw(kw, _key, nil), do: kw
   defp put_optional_kw(kw, key, value), do: Keyword.put(kw, key, value)

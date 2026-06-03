@@ -188,7 +188,7 @@ defmodule AttestoPhoenix.Event do
   """
   @spec emit(Config.t(), name(), map() | keyword()) :: :ok
   def emit(%Config{} = config, name, fields \\ %{}) when is_atom(name) do
-    dispatch(config.on_event, new(name, fields))
+    dispatch(Config.on_event_fun(config), new(name, fields))
   end
 
   @doc """

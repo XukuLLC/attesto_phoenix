@@ -220,7 +220,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # framing-layer denial (TLS, client auth, missing grant_type) never reaches
   # the core, so the controller builds that one denial event itself.
   defp emit_all(config, events) do
-    Enum.each(events, &Event.dispatch(config.on_event, &1))
+    Enum.each(events, &Event.dispatch(Config.on_event_fun(config), &1))
   end
 
   # Build and emit the RFC 6749 §5.2 denial event for a framing-layer failure,

@@ -168,7 +168,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # unknown (`nil`), matching the resolution used everywhere else in the
   # library.
   defp client_id(config, client) do
-    Callback.invoke(config_callback(config, :client_id), [client], nil)
+    Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
 
   defp par_store(config), do: config_field(config, :par_store, AttestoPhoenix.Store.PAR.ETS)
@@ -183,13 +183,6 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     case Map.get(config, field) do
       nil -> default
       value -> value
-    end
-  end
-
-  defp config_callback(config, field) do
-    case Map.fetch(config, field) do
-      {:ok, fun} -> fun
-      :error -> nil
     end
   end
 

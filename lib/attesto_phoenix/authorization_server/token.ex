@@ -109,7 +109,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp require_registered_grant_type(%Request{} = request) do
     %{config: config, client: client, grant_type: grant_type} = request
 
-    case Callback.invoke(config_callback(config, :client_grant_types), [client], nil) do
+    case Callback.invoke(Config.client_grant_types_fun(config), [client], nil) do
       grant_types when is_list(grant_types) ->
         if grant_type in grant_types do
           :ok
@@ -235,7 +235,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # ── Grant-state delegation (Attesto core) ────────────────────────────────
 
   defp fetch_code_verifier(config, client, params) do
-    if client_public?(config, client) or config_flag(config, :require_pkce) do
+    if client_public?(config, client) or Callback.config_flag(config, :require_pkce) do
       require_param(params, "code_verifier")
     else
       {:ok, optional_param(params, "code_verifier")}
@@ -425,7 +425,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # signal. Read defensively so a host that wires neither simply never gets
   # an initial refresh token (fail-closed: no token rather than a crash).
   defp issue_refresh_token?(config, client, scope) do
-    case config_callback(config, :issue_refresh_token?) do
+    case Callback.config_callback(config, :issue_refresh_token?) do
       nil -> @offline_access_scope in scope
       callback -> invoke(callback, [client, scope]) == true
     end
@@ -508,7 +508,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # map is treated the same (fail-closed: no claims rather than a crash or a
   # malformed token).
   defp userinfo_claims(config, client, grant, scope) do
-    case config_callback(config, :build_userinfo_claims) do
+    case Config.build_userinfo_claims_fun(config) do
       nil ->
         nil
 
@@ -578,7 +578,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `:authorize_scope` callback takes the client and the requested scope and
   # returns the granted scope or `{:error, :invalid_scope}` (RFC 6749 §5.2).
   defp authorize_scope(config, client, requested) do
-    case invoke(config.authorize_scope, [client, requested]) do
+    case invoke(Config.authorize_scope_fun(config), [client, requested]) do
       {:ok, scope} when is_list(scope) -> {:ok, scope}
       {:error, _reason} -> {:error, error(@error_invalid_scope, "scope not permitted")}
       _ -> {:error, error(@error_invalid_request, "scope policy unavailable")}
@@ -671,7 +671,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp build_principal(config, client, subject, scope) do
-    case invoke(config_callback(config, :build_principal), [client, subject, scope]) do
+    case invoke(Config.build_principal_fun(config), [client, subject, scope]) do
       %{} = principal -> {:ok, principal}
       _ -> {:error, :no_principal_builder}
     end
@@ -723,7 +723,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp principal_kinds_extra(config) do
-    case config_callback(config, :principal_kinds) do
+    case Callback.config_callback(config, :principal_kinds) do
       kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
       callback -> callback |> invoke([]) |> principal_kinds_kw()
     end
@@ -740,7 +740,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # ── Configured-callback access ───────────────────────────────────────────
 
   defp client_public?(config, client) do
-    Callback.invoke(config_callback(config, :client_public?), [client], false) == true
+    Callback.invoke(Config.client_public_fun(config), [client], false) == true
   end
 
   # The client's identifier (RFC 6749 §2.2). Read defensively so this module
@@ -748,17 +748,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # the identifier is unknown (`nil`), which is correct for audit and is never
   # used as a credential.
   defp client_id(config, client) do
-    Callback.invoke(config_callback(config, :client_id), [client], nil)
+    Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
 
   # The `Attesto.CodeStore` / `Attesto.RefreshStore` backing each stateful
   # grant. Resolved from the configuration so the host owns persistence; this
   # module hardcodes no store module.
-  defp grant_store(config, key), do: config_callback(config, key)
-
-  defp config_flag(config, key), do: Map.get(config, key) == true
-
-  defp config_callback(config, key), do: Map.get(config, key)
+  defp grant_store(config, key), do: Callback.config_callback(config, key)
 
   # ── Audit events (returned as data; the controller emits) ────────────────
 

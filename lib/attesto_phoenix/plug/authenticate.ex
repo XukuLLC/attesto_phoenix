@@ -90,7 +90,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     claims = conn.assigns[claims_key]
     subject = claims["sub"]
 
-    case Callback.invoke(config.load_principal, [subject]) do
+    case Callback.invoke(Config.load_principal_fun(config), [subject]) do
       {:ok, principal} ->
         principal_key = Keyword.get(opts, :principal_key, @principal_key)
         context_key = Keyword.get(opts, :context_key, @context_key)

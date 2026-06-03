@@ -259,6 +259,32 @@ defmodule AttestoPhoenix.Config do
   function, a `{module, function}` pair, or a `{module, function, extra_args}`
   triple per key as documented above. The behaviours are the contract; the
   Config keys are how a host installs an implementation.
+
+  ## Behaviour-module Config keys
+
+  Rather than wiring every host callback as an individual flat key, a host may
+  install one behaviour module per concern and let the library resolve each
+  callback from it:
+
+    * `:client_store` - a module implementing `AttestoPhoenix.ClientStore`.
+    * `:principal_store` - a module implementing `AttestoPhoenix.PrincipalStore`.
+    * `:consent_policy` - a module implementing `AttestoPhoenix.ConsentPolicy`.
+    * `:scope_policy` - a module implementing `AttestoPhoenix.ScopePolicy`.
+    * `:event_sink` - a module implementing `AttestoPhoenix.EventSink`.
+    * `:registration` - a module implementing `AttestoPhoenix.RegistrationStore`.
+    * `:claims_provider` - a module implementing `AttestoPhoenix.ClaimsProvider`.
+
+  Each per-callback value is resolved through the matching resolver fun on this
+  module (`client_id_fun/1`, `load_principal_fun/1`, `consent_fun/1`, and so on)
+  with a single precedence: the explicit flat key wins when set; otherwise, when
+  a behaviour module is installed and exports the corresponding behaviour
+  callback (after `Code.ensure_loaded/1`), the `{module, function}` pair is used;
+  otherwise the resolution is `nil` (and the consumer's existing fail-closed
+  default applies). Flat keys therefore never break: a host that wires the
+  individual callbacks keeps the exact behaviour it had. `new/1` validates at
+  boot that any installed behaviour module is loadable and exports the callbacks
+  it claims, so a typo'd or partial module fails fast rather than silently
+  resolving to `nil` at request time.
   """
 
   alias AttestoPhoenix.Callback
@@ -278,6 +304,13 @@ defmodule AttestoPhoenix.Config do
     :load_client,
     :verify_client_secret,
     :load_principal,
+    :client_store,
+    :principal_store,
+    :consent_policy,
+    :scope_policy,
+    :event_sink,
+    :registration,
+    :claims_provider,
     :audience,
     :authorize_scope,
     :on_event,
@@ -358,6 +391,13 @@ defmodule AttestoPhoenix.Config do
           load_client: callback(),
           verify_client_secret: callback(),
           load_principal: callback(),
+          client_store: module() | nil,
+          principal_store: module() | nil,
+          consent_policy: module() | nil,
+          scope_policy: module() | nil,
+          event_sink: module() | nil,
+          registration: module() | nil,
+          claims_provider: module() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
           on_event: callback() | nil,
@@ -664,6 +704,120 @@ defmodule AttestoPhoenix.Config do
     |> URI.to_string()
   end
 
+  # ── Behaviour-module callback resolution ─────────────────────────────────
+
+  # The resolution table. Each flat callback key maps to the behaviour-module
+  # Config key that owns it and the `{function, arity}` that module must export
+  # for the `{module, function}` form to win. The precedence is fixed: an
+  # explicit flat key wins; else the installed behaviour module if it exports
+  # the callback; else `nil`. The arity is the behaviour callback's arity, used
+  # only for the `function_exported?` conformance check - the resolved value is
+  # the bare `{module, function}` pair, invoked by the caller through
+  # `AttestoPhoenix.Callback.invoke/2,3` (which appends the per-call args).
+  #
+  # `:registration` carries the optional management callbacks too, so a host
+  # that installs a single registration module gets RFC 7592 management for
+  # free; the required `register_client/1` stays a flat-only required key.
+  @resolution %{
+    load_client: {:client_store, :load_client, 1},
+    verify_client_secret: {:client_store, :verify_client_secret, 2},
+    client_id: {:client_store, :client_id, 1},
+    client_jwks: {:client_store, :client_jwks, 1},
+    client_redirect_uris: {:client_store, :client_redirect_uris, 1},
+    client_public?: {:client_store, :client_public?, 1},
+    client_requires_mtls?: {:client_store, :client_requires_mtls?, 1},
+    client_requires_dpop?: {:client_store, :client_requires_dpop?, 1},
+    client_grant_types: {:client_store, :client_grant_types, 1},
+    load_principal: {:principal_store, :load_principal, 1},
+    build_principal: {:principal_store, :build_principal, 3},
+    authenticate_resource_owner: {:consent_policy, :authenticate_resource_owner, 3},
+    consent: {:consent_policy, :consent, 3},
+    authorize_scope: {:scope_policy, :authorize_scope, 2},
+    on_event: {:event_sink, :on_event, 1},
+    register_client: {:registration, :register_client, 1},
+    unregister_client: {:registration, :unregister_client, 1},
+    client_registration_access_token_hash:
+      {:registration, :client_registration_access_token_hash, 1},
+    build_userinfo_claims: {:claims_provider, :build_userinfo_claims, 3}
+  }
+
+  # The behaviour-module Config keys, each paired with the behaviour module it
+  # is expected to implement. Used for boot-time conformance validation.
+  @behaviour_modules %{
+    client_store: AttestoPhoenix.ClientStore,
+    principal_store: AttestoPhoenix.PrincipalStore,
+    consent_policy: AttestoPhoenix.ConsentPolicy,
+    scope_policy: AttestoPhoenix.ScopePolicy,
+    event_sink: AttestoPhoenix.EventSink,
+    registration: AttestoPhoenix.RegistrationStore,
+    claims_provider: AttestoPhoenix.ClaimsProvider
+  }
+
+  @doc """
+  Resolve a configured callback by its flat `key`.
+
+  Precedence (see the "Behaviour-module Config keys" section): the explicit
+  flat key wins when set; otherwise the installed behaviour module wins when it
+  exports the corresponding behaviour callback; otherwise `nil`. The result is a
+  value an `AttestoPhoenix.Callback.invoke/2,3` caller can run (an anonymous
+  function, a `{module, function}` pair, a `{module, function, extra_args}`
+  triple), or `nil`.
+  """
+  @spec resolve_callback(t(), atom()) :: callback() | nil
+  def resolve_callback(%__MODULE__{} = config, key) when is_atom(key) do
+    case Map.get(config, key) do
+      nil -> resolve_from_store(config, key)
+      flat -> flat
+    end
+  end
+
+  defp resolve_from_store(%__MODULE__{} = config, key) do
+    with {store_key, fun, arity} <- Map.get(@resolution, key),
+         module when is_atom(module) and not is_nil(module) <- Map.get(config, store_key),
+         true <- callback_exported?(module, fun, arity) do
+      {module, fun}
+    else
+      _ -> nil
+    end
+  end
+
+  defp callback_exported?(module, fun, arity) do
+    Code.ensure_loaded?(module) and function_exported?(module, fun, arity)
+  end
+
+  # One resolver fun per flat callback key. Each is a thin alias over
+  # `resolve_callback/2` so consumers read the callback by name without knowing
+  # the resolution table, matching the integrator's "resolver funs on Config"
+  # surface. They return the same `callback()`-or-`nil` value.
+  for {key, _} <- @resolution do
+    name = key |> Atom.to_string() |> String.trim_trailing("?") |> Kernel.<>("_fun")
+    name = String.to_atom(name)
+
+    @doc """
+    Resolve the `#{key}` callback. See `resolve_callback/2`.
+    """
+    @spec unquote(name)(t()) :: callback() | nil
+    def unquote(name)(%__MODULE__{} = config), do: resolve_callback(config, unquote(key))
+  end
+
+  @doc """
+  Resolve and load the host's client by `client_id` (RFC 6749 §2.2).
+
+  A required callback (`:load_client` / `AttestoPhoenix.ClientStore`); this
+  helper invokes the resolved callback so consumers do not re-derive it.
+  """
+  @spec client_store_load(t(), String.t()) :: term()
+  def client_store_load(%__MODULE__{} = config, client_id),
+    do: Callback.invoke(load_client_fun(config), [client_id])
+
+  @doc """
+  Resolve and run the host's constant-time client-secret verification
+  (RFC 6749 §2.3.1) for `client`/`presented_secret`.
+  """
+  @spec client_store_verify_secret(t(), term(), String.t()) :: boolean()
+  def client_store_verify_secret(%__MODULE__{} = config, client, presented_secret),
+    do: Callback.invoke(verify_client_secret_fun(config), [client, presented_secret]) == true
+
   @doc """
   Invokes the host's `:build_userinfo_claims` callback for the authenticated
   subject and returns the raw claims map it produces.
@@ -676,23 +830,15 @@ defmodule AttestoPhoenix.Config do
   UserInfo endpoint cannot silently return an empty document.
   """
   @spec build_userinfo_claims(t(), String.t(), [String.t()], map()) :: map()
-  def build_userinfo_claims(
-        %__MODULE__{build_userinfo_claims: nil},
-        _subject,
-        _scopes,
-        _requested
-      ) do
-    raise ArgumentError,
-          "AttestoPhoenix.Config: :build_userinfo_claims is required to serve the UserInfo endpoint"
-  end
+  def build_userinfo_claims(%__MODULE__{} = config, subject, scopes, requested) do
+    case build_userinfo_claims_fun(config) do
+      nil ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :build_userinfo_claims is required to serve the UserInfo endpoint"
 
-  def build_userinfo_claims(
-        %__MODULE__{build_userinfo_claims: callback},
-        subject,
-        scopes,
-        requested
-      ) do
-    Callback.invoke(callback, [subject, scopes, requested])
+      callback ->
+        Callback.invoke(callback, [subject, scopes, requested])
+    end
   end
 
   defp validate!(%__MODULE__{} = config) do
@@ -712,14 +858,17 @@ defmodule AttestoPhoenix.Config do
               "or set `mtls_enabled: false`."
     end
 
-    if config.registration_enabled and is_nil(config.register_client) do
+    if config.registration_enabled and is_nil(register_client_fun(config)) do
       raise ArgumentError,
             "AttestoPhoenix.Config: :register_client is required when " <>
               ":registration_enabled is true. Add a " <>
               "`register_client: &MyApp.AuthZ.register_client/1` callback " <>
-              "(see AttestoPhoenix.RegistrationStore) or set " <>
+              "(or install a `:registration` module implementing " <>
+              "AttestoPhoenix.RegistrationStore) or set " <>
               "`registration_enabled: false` so no registration endpoint is mounted."
     end
+
+    validate_behaviour_modules!(config)
 
     validate_path!(:oauth_path_prefix, config.oauth_path_prefix)
     validate_optional_path!(:authorize_path, config.authorize_path)
@@ -730,6 +879,57 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:userinfo_path, config.userinfo_path)
 
     config
+  end
+
+  # The required (non-optional) behaviour callbacks each installed
+  # behaviour-module Config key must export. A module installed under the key
+  # must be loadable and export every `{function, arity}` here, so a typo'd or
+  # partial module fails fast at boot rather than silently resolving to `nil`
+  # at request time. Optional behaviour callbacks are not listed: a module may
+  # omit them and the resolver falls through to `nil` (the consumer's
+  # fail-closed default), so they are not boot errors.
+  @behaviour_required %{
+    client_store: [load_client: 1, verify_client_secret: 2],
+    principal_store: [load_principal: 1],
+    consent_policy: [],
+    scope_policy: [authorize_scope: 2],
+    event_sink: [on_event: 1],
+    registration: [register_client: 1],
+    claims_provider: []
+  }
+
+  # Boot-time conformance: every installed behaviour module must be loadable and
+  # must export the required callbacks of the behaviour it is installed as.
+  defp validate_behaviour_modules!(%__MODULE__{} = config) do
+    Enum.each(@behaviour_modules, fn {store_key, behaviour} ->
+      case Map.get(config, store_key) do
+        nil -> :ok
+        module -> validate_behaviour_module!(store_key, behaviour, module, config)
+      end
+    end)
+  end
+
+  defp validate_behaviour_module!(store_key, behaviour, module, _config) when is_atom(module) do
+    unless Code.ensure_loaded?(module) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: #{inspect(store_key)} is set to #{inspect(module)}, " <>
+              "which cannot be loaded. Set it to a module implementing " <>
+              "#{inspect(behaviour)}."
+    end
+
+    Enum.each(Map.fetch!(@behaviour_required, store_key), fn {fun, arity} ->
+      unless function_exported?(module, fun, arity) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{inspect(store_key)} module #{inspect(module)} " <>
+                "does not export #{fun}/#{arity}, required by #{inspect(behaviour)}."
+      end
+    end)
+  end
+
+  defp validate_behaviour_module!(store_key, behaviour, module, _config) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: #{inspect(store_key)} must be a module implementing " <>
+            "#{inspect(behaviour)}; got #{inspect(module)}."
   end
 
   # The store/callback each required key installs, so a missing-key error tells

@@ -35,4 +35,27 @@ defmodule AttestoPhoenix.Callback do
   @spec invoke(callback() | nil, [any()], any()) :: any()
   def invoke(nil, _args, default), do: default
   def invoke(callback, args, _default), do: invoke(callback, args)
+
+  @doc """
+  Read a configured callback off the config struct by `key`.
+
+  This is the single reader the controllers, plugs, and core modules share for
+  pulling a host callback out of `%AttestoPhoenix.Config{}` (or any struct/map
+  carrying it). An absent key reads as `nil`, matching the fail-closed
+  resolution used throughout the library; the value is otherwise returned
+  unchanged for an `invoke/2,3` caller to run. It carries no policy.
+  """
+  @spec config_callback(map(), atom()) :: callback() | nil
+  def config_callback(config, key) when is_map(config) and is_atom(key),
+    do: Map.get(config, key)
+
+  @doc """
+  Read a boolean policy flag off the config struct by `key`.
+
+  An absent or non-boolean value reads as `false` (fail closed: a flag the host
+  did not set never turns a control on).
+  """
+  @spec config_flag(map(), atom()) :: boolean()
+  def config_flag(config, key) when is_map(config) and is_atom(key),
+    do: Map.get(config, key) == true
 end

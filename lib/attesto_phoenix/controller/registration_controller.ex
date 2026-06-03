@@ -168,7 +168,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     config = config(conn)
 
     with {:ok, token} <- registration_bearer_token(conn),
-         {:ok, client} <- Callback.invoke(config.load_client, [client_id]),
+         {:ok, client} <- Callback.invoke(Config.load_client_fun(config), [client_id]),
          :ok <- verify_registration_access_token(config, client, token),
          :ok <- unregister_client(config, client) do
       send_resp(conn, :no_content, "")
@@ -485,7 +485,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # The plaintext client_secret is replaced with its one-way hash before
   # persistence so the store never holds the bearer value (RFC 6749 §2.3.1).
   defp persist(issued, config) do
-    case Callback.invoke(config.register_client, [persistable_attrs(issued)]) do
+    case Callback.invoke(Config.register_client_fun(config), [persistable_attrs(issued)]) do
       {:ok, stored} ->
         {:ok, stored}
 
@@ -583,7 +583,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   end
 
   defp verify_registration_access_token(config, client, token) do
-    with callback when not is_nil(callback) <- config.client_registration_access_token_hash,
+    with callback when not is_nil(callback) <-
+           Config.client_registration_access_token_hash_fun(config),
          hash when is_binary(hash) <- Callback.invoke(callback, [client]),
          true <- token |> Secret.hash() |> SecureCompare.equal?(hash) do
       :ok
@@ -593,7 +594,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   end
 
   defp unregister_client(config, client) do
-    case config.unregister_client do
+    case Config.unregister_client_fun(config) do
       nil ->
         {:error,
          error(

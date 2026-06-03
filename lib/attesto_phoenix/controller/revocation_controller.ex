@@ -241,8 +241,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     # RFC 6749 §5.2: an unknown or revoked client, and a wrong secret, all
     # surface to the caller as the same `invalid_client` so the endpoint is
     # not an existence oracle for client ids.
-    with {:ok, client} <- Callback.invoke(config.load_client, [client_id]),
-         true <- Callback.invoke(config.verify_client_secret, [client, client_secret]) do
+    with {:ok, client} <- Callback.invoke(Config.load_client_fun(config), [client_id]),
+         true <- Callback.invoke(Config.verify_client_secret_fun(config), [client, client_secret]) do
       {:ok, client}
     else
       _failed -> {:error, :invalid_client}

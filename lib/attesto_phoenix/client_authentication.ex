@@ -295,9 +295,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # checked here without a separate predicate (RFC 7009 semantics for an
   # already-revoked client).
   defp verify_confidential_client(config, client_id, secret, method) do
-    case invoke(config.load_client, [client_id]) do
+    verify_client_secret = Config.verify_client_secret_fun(config)
+
+    case invoke(Config.load_client_fun(config), [client_id]) do
       {:ok, client} ->
-        if invoke(config.verify_client_secret, [client, secret]) == true do
+        if invoke(verify_client_secret, [client, secret]) == true do
           {:ok, result(config, client, method)}
         else
           {:error, error(@error_invalid_client, @client_auth_failed)}
@@ -307,7 +309,9 @@ defmodule AttestoPhoenix.ClientAuthentication do
         # RFC 6749 §2.3 / OWASP: do not leak whether the client exists or is
         # revoked. Run a dummy verification so the lookup-failure path matches
         # the wrong-secret path in observable timing, and return one message.
-        _ = invoke(config.verify_client_secret, [:unknown_client, secret])
+        # The same resolved callback is used for the real and dummy verify so
+        # the two paths stay timing-matched.
+        _ = invoke(verify_client_secret, [:unknown_client, secret])
         {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
@@ -328,7 +332,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   defp client_jwks(config, client) do
-    case config_callback(config, :client_jwks) do
+    case Config.client_jwks_fun(config) do
       nil ->
         {:error, :missing_client_jwks}
 
@@ -383,7 +387,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   defp load_existing_client(config, client_id) do
-    case invoke(config.load_client, [client_id]) do
+    case invoke(Config.load_client_fun(config), [client_id]) do
       {:ok, client} -> {:ok, client}
       _other -> {:error, :not_found}
     end
@@ -395,7 +399,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # that forgets it cannot accidentally let confidential clients
   # authenticate without a secret.
   defp client_public?(config, client) do
-    Callback.invoke(config_callback(config, :client_public?), [client], false) == true
+    Callback.invoke(Config.client_public_fun(config), [client], false) == true
   end
 
   defp result(config, client, method) do
@@ -406,10 +410,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # does not supply `:client_id` the identifier is unknown (`nil`), which is
   # correct for audit and is never used as a credential.
   defp client_id(config, client) do
-    Callback.invoke(config_callback(config, :client_id), [client], nil)
+    Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
-
-  defp config_callback(config, key), do: Map.get(config, key)
 
   # Callback invocation delegates to `AttestoPhoenix.Callback`, except that an
   # absent (`nil`) callback is the `:no_callback` sentinel its callers branch

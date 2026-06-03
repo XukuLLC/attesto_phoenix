@@ -176,7 +176,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp load_client(config, params) do
     case params["client_id"] do
       client_id when is_binary(client_id) and client_id != "" ->
-        case Callback.invoke(config.load_client, [client_id]) do
+        case Callback.invoke(Config.load_client_fun(config), [client_id]) do
           {:ok, client} -> {:ok, client}
           _other -> {:error, {:direct, :invalid_client_id}}
         end
@@ -246,7 +246,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp require_par_if_configured(config, request, false) do
-    if config_flag(config, :require_pushed_authorization_requests) do
+    if Callback.config_flag(config, :require_pushed_authorization_requests) do
       {:error,
        {:redirect,
         %{
@@ -264,7 +264,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp par_store(config), do: config_field(config, :par_store, AttestoPhoenix.Store.PAR.ETS)
 
   defp client_jwks(config, client) do
-    case config_callback(config, :client_jwks) do
+    case Config.client_jwks_fun(config) do
       nil ->
         nil
 
@@ -286,14 +286,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # regardless of config. For a confidential client the global `:require_pkce`
     # policy applies (default `true`); a host relaxes it for confidential clients
     # only by setting `require_pkce: false` on `AttestoPhoenix.Config`.
-    client_public?(config, client) or config_flag(config, :require_pkce)
+    client_public?(config, client) or Callback.config_flag(config, :require_pkce)
   end
 
   # The host's `:client_public?` callback classifies the client. Absent the
   # callback, fail closed by treating the client as public, so PKCE stays
   # required (a confidential exemption demands a deliberate host classification).
   defp client_public?(config, client) do
-    case config_callback(config, :client_public?) do
+    case Config.client_public_fun(config) do
       nil -> true
       callback -> Callback.invoke(callback, [client]) == true
     end
@@ -306,7 +306,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `Attesto.Scope.valid_token?/1`-level validation is the core's job, so this
   # only splits on whitespace to look for `openid`.
   defp require_nonce?(config, params) do
-    config_flag(config, :require_nonce) and openid_request?(params)
+    Callback.config_flag(config, :require_nonce) and openid_request?(params)
   end
 
   defp openid_request?(params) do
@@ -317,7 +317,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp registered_redirect_uris(config, client) do
-    case Callback.invoke(config_callback(config, :client_redirect_uris), [client], []) do
+    case Callback.invoke(Config.client_redirect_uris_fun(config), [client], []) do
       uris when is_list(uris) -> uris
       _ -> []
     end
@@ -537,7 +537,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # the connection to render login UI), or `{:none}` (no subject can be
   # established without UI - used under `prompt=none`).
   defp authenticate_resource_owner(conn, config, request) do
-    case config_callback(config, :authenticate_resource_owner) do
+    case Config.authenticate_resource_owner_fun(config) do
       nil ->
         Logger.error(":authenticate_resource_owner callback is not configured")
 
@@ -566,7 +566,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # for the authenticated subject (a deployment that wants an explicit consent
   # screen supplies the callback).
   defp consent(conn, config, request, subject) do
-    case config_callback(config, :consent) do
+    case Config.consent_fun(config) do
       nil -> {:consented, subject}
       callback -> Callback.invoke(callback, [conn, request, subject])
     end
@@ -580,10 +580,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp subject_id(_subject), do: nil
 
   defp client_id(config, client) do
-    Callback.invoke(config_callback(config, :client_id), [client], nil)
+    Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
 
-  defp code_store(config), do: config_callback(config, :code_store)
+  defp code_store(config), do: Callback.config_callback(config, :code_store)
 
   # ── Redirect responses (RFC 6749 §4.1.2 / §4.1.2.1) ──────────────────────
 
@@ -606,7 +606,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp iss_param do
     config = resolve_config()
 
-    if config_flag(config, :authorization_response_iss),
+    if Callback.config_flag(config, :authorization_response_iss),
       do: [{"iss", config.issuer}],
       else: []
   end
@@ -784,22 +784,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     Config.from_otp_app(otp_app, Config)
   end
 
-  # Read a callback the frozen `AttestoPhoenix.Config` struct may not declare
-  # as a named field yet (e.g. `:client_redirect_uris`,
-  # `:authenticate_resource_owner`, `:consent`): pull it from the struct map.
-  defp config_callback(config, key), do: Map.get(config, key)
-
   defp config_field(config, key, default) do
     case Map.get(config, key) do
       nil -> default
       value -> value
     end
   end
-
-  # Read a boolean policy flag from the config struct, treating an absent or
-  # non-boolean value as `false` (fail closed: a flag the host did not set never
-  # turns a control on).
-  defp config_flag(config, key), do: Map.get(config, key) == true
 
   # ── Helpers ──────────────────────────────────────────────────────────────
 
