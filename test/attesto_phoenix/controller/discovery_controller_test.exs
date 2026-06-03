@@ -15,6 +15,15 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
   # (it checks the value is a module, not that it implements anything).
   defmodule StubKeystore do
     @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
+
+    @impl true
+    def signing_pem, do: @pem
+
+    @impl true
+    def verification_pems, do: [@pem]
   end
 
   # Build the host-facing AttestoPhoenix.Config. Only the members the
@@ -69,7 +78,16 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       assert body["token_endpoint"] == "#{@issuer}/oauth/token"
       assert body["jwks_uri"] == "#{@issuer}/.well-known/jwks.json"
       assert "code" in body["response_types_supported"]
-      assert body["response_modes_supported"] == ["query"]
+
+      assert body["response_modes_supported"] ==
+               ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
+    end
+
+    test "advertises the JARM authorization signing algorithms (RFC 8414 / §5.4)" do
+      body = call_show(host_config(), protocol_config()) |> decode_body()
+
+      # Same key as ID Tokens; the test keystore is RSA, so RS256.
+      assert body["authorization_signing_alg_values_supported"] == ["RS256"]
     end
 
     test "advertises S256 as the only code challenge method (RFC 7636)" do

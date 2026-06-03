@@ -49,7 +49,9 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
 
   import Plug.Conn, only: [put_resp_header: 3]
 
+  alias Attesto.AuthorizationRequest
   alias Attesto.Discovery
+  alias Attesto.SigningAlg
   alias AttestoPhoenix.Config
 
   # The router pipeline installs the AttestoPhoenix.Config here. This is the
@@ -69,9 +71,12 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   # supports the "code" response type. Fixed by protocol, not configured.
   @response_types_supported ["code"]
 
-  # RFC 8414 §2 `response_modes_supported`: the Phoenix authorization-code
-  # endpoint returns the code and state as redirect query parameters.
-  @response_modes_supported ["query"]
+  # RFC 8414 §2 / JARM §2.3 `response_modes_supported`: the response modes the
+  # authorization endpoint implements - the RFC 6749 default `query` and the
+  # JARM JWT modes (FAPI 2.0 Message Signing §5.4). Sourced from
+  # Attesto.AuthorizationRequest so the OAuth metadata matches the OpenID
+  # configuration and never drifts from what the request validator accepts.
+  @response_modes_supported AuthorizationRequest.supported_response_modes()
 
   # RFC 8414 §2 `grant_types_supported`: the grant types the token endpoint
   # (`AttestoPhoenix.Controller.TokenController`) actually dispatches -
@@ -186,7 +191,20 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       "token_endpoint_auth_signing_alg_values_supported",
       config.client_auth_signing_algs
     )
+    |> put_authorization_signing_alg_values_supported(config)
     |> put_authorization_response_iss_supported(config)
+  end
+
+  # JARM §3 / FAPI 2.0 Message Signing §5.4 `authorization_signing_alg_values_
+  # supported`: the algorithms the authorization endpoint signs JARM responses
+  # with - the server's own signing keys (the same set the OpenID configuration
+  # advertises as id_token_signing_alg_values_supported). Omitted when the
+  # keystore exposes none.
+  defp put_authorization_signing_alg_values_supported(metadata, %Config{keystore: keystore}) do
+    case SigningAlg.keystore_algs(keystore) do
+      [] -> metadata
+      algs -> Map.put(metadata, "authorization_signing_alg_values_supported", algs)
+    end
   end
 
   defp put_authorization_response_iss_supported(metadata, %Config{
