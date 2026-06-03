@@ -289,13 +289,16 @@ defmodule AttestoPhoenix.Config do
 
   alias AttestoPhoenix.Callback
 
+  # Only the plain required *values* are enforced by `struct!/2`. The required
+  # *capabilities* (`:load_client`, `:verify_client_secret`, `:load_principal`)
+  # are NOT enforced here, because a host may supply them via an installed
+  # behaviour module (`:client_store` / `:principal_store`) instead of a flat
+  # callback. They are validated by resolution in `validate!/1` so the
+  # behaviour-module install path actually works.
   @enforce_keys [
     :issuer,
     :keystore,
-    :repo,
-    :load_client,
-    :verify_client_secret,
-    :load_principal
+    :repo
   ]
   defstruct [
     :issuer,
@@ -463,7 +466,12 @@ defmodule AttestoPhoenix.Config do
           registration_enabled: boolean()
         }
 
+  # Required plain values: enforced for presence as struct fields.
   @required @enforce_keys
+
+  # Required capabilities: each must RESOLVE (flat callback or installed
+  # behaviour module), validated in `validate!/1` after construction.
+  @required_capabilities [:load_client, :verify_client_secret, :load_principal]
 
   @doc """
   Builds and validates a config from a keyword list or map.
@@ -850,6 +858,15 @@ defmodule AttestoPhoenix.Config do
       end
     end)
 
+    # Required capabilities are validated by RESOLUTION, not flat-key presence,
+    # so installing a behaviour module (`:client_store`/`:principal_store`)
+    # satisfies them just as a flat callback does.
+    Enum.each(@required_capabilities, fn capability ->
+      if is_nil(resolve_callback(config, capability)) do
+        raise ArgumentError, required_capability_hint(capability)
+      end
+    end)
+
     if config.mtls_enabled and is_nil(config.cert_der) do
       raise ArgumentError,
             "AttestoPhoenix.Config: :cert_der is required when :mtls_enabled is true. " <>
@@ -942,22 +959,21 @@ defmodule AttestoPhoenix.Config do
 
   defp required_key_hint(:repo), do: "Set it to your Ecto.Repo module."
 
-  defp required_key_hint(:load_client),
-    do:
-      "Add a `load_client: &MyApp.AuthZ.load_client/1` callback " <>
-        "(see AttestoPhoenix.ClientStore.load_client/1)."
-
-  defp required_key_hint(:verify_client_secret),
-    do:
-      "Add a `verify_client_secret: &MyApp.AuthZ.verify_client_secret/2` callback " <>
-        "(see AttestoPhoenix.ClientStore.verify_client_secret/2)."
-
-  defp required_key_hint(:load_principal),
-    do:
-      "Add a `load_principal: &MyApp.AuthZ.load_principal/1` callback " <>
-        "(see AttestoPhoenix.PrincipalStore.load_principal/1)."
-
   defp required_key_hint(_key), do: ""
+
+  # A required capability is unresolved when neither the flat callback nor an
+  # installed behaviour module provides it. Name BOTH install routes so the host
+  # knows it can wire a flat callback OR install the owning behaviour module.
+  defp required_capability_hint(capability) do
+    {store_key, fun, arity} = Map.fetch!(@resolution, capability)
+    behaviour = Map.fetch!(@behaviour_modules, store_key)
+
+    "AttestoPhoenix.Config: the #{inspect(capability)} capability is required but " <>
+      "unresolved. Provide it either as a flat callback " <>
+      "(`#{capability}: &MyApp.AuthZ.#{fun}/#{arity}`) or by installing a " <>
+      "`#{inspect(store_key)}` module implementing #{inspect(behaviour)} " <>
+      "(which exports #{fun}/#{arity})."
+  end
 
   # `:oauth_path_prefix` is always present (defaulted); it must be an absolute
   # path reference so it merges cleanly onto the issuer.

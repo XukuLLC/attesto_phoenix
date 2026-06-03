@@ -259,7 +259,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   end
 
   defp client_id(config, client) do
-    Callback.invoke(Map.get(config, :client_id), [client], nil)
+    Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
 
   defp request_client_id(conn, params),

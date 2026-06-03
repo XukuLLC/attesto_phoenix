@@ -105,6 +105,20 @@ defmodule AttestoPhoenix.ConfigTest do
     Config.new(Keyword.merge(base, overrides))
   end
 
+  # Like `config/1` but supplies NONE of the flat required callbacks, so the
+  # required capabilities (load_client, verify_client_secret, load_principal)
+  # must be satisfied by installed behaviour modules. Exercises the real
+  # `Config.new/1` boot surface, not `struct/2`.
+  defp behaviour_only_config(overrides \\ []) do
+    base = [
+      issuer: "https://issuer.example",
+      keystore: __MODULE__.Keystore,
+      repo: __MODULE__.Repo
+    ]
+
+    Config.new(Keyword.merge(base, overrides))
+  end
+
   describe "resolve_callback/2 precedence" do
     test "an explicit flat key wins over an installed behaviour module" do
       flat = fn _ -> :flat end
@@ -259,6 +273,44 @@ defmodule AttestoPhoenix.ConfigTest do
       # of them is accepted; the resolver simply returns nil for each.
       assert %Config{} = cfg = config(consent_policy: EmptyModule)
       assert Config.consent_fun(cfg) == nil
+    end
+
+    test "accepts required capabilities supplied entirely by behaviour modules (no flat callbacks)" do
+      # The advertised feature: install :client_store and :principal_store and
+      # the required callbacks resolve from them, with NO flat load_client /
+      # verify_client_secret / load_principal keys present.
+      cfg = behaviour_only_config(client_store: FullStore, principal_store: FullStore)
+
+      assert %Config{} = cfg
+      assert Config.load_client_fun(cfg) == {FullStore, :load_client}
+      assert Config.verify_client_secret_fun(cfg) == {FullStore, :verify_client_secret}
+      assert Config.load_principal_fun(cfg) == {FullStore, :load_principal}
+    end
+
+    test "accepts a behaviour module for one capability and a flat callback for another" do
+      cfg =
+        behaviour_only_config(
+          client_store: FullStore,
+          load_principal: fn _ -> {:ok, :flat_principal} end
+        )
+
+      assert %Config{} = cfg
+      assert Config.load_client_fun(cfg) == {FullStore, :load_client}
+      assert is_function(Config.load_principal_fun(cfg), 1)
+    end
+
+    test "rejects when a required capability resolves to neither a flat key nor a module" do
+      # client_store satisfies load_client/verify_client_secret, but nothing
+      # provides load_principal: the capability is unresolved and boot fails.
+      assert_raise ArgumentError, ~r/:load_principal capability is required but unresolved/, fn ->
+        behaviour_only_config(client_store: FullStore)
+      end
+    end
+
+    test "rejects when no required capability is wired at all" do
+      assert_raise ArgumentError, ~r/:load_client capability is required but unresolved/, fn ->
+        behaviour_only_config([])
+      end
     end
   end
 
