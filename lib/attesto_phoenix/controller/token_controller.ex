@@ -106,7 +106,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   import Plug.Conn
 
-  alias Attesto.{AuthorizationCode, IDToken, MTLS, RefreshToken, Token}
+  alias Attesto.{AuthorizationCode, IDToken, RefreshToken, Token}
+  alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, Event, OAuthError, RequestContext}
   alias AttestoPhoenix.ClientAuthentication.Policy
 
@@ -118,22 +119,15 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   # RFC 6749 §5.2 error codes.
   @error_invalid_request "invalid_request"
-  @error_invalid_client "invalid_client"
   @error_invalid_grant "invalid_grant"
   @error_invalid_scope "invalid_scope"
   @error_unsupported_grant_type "unsupported_grant_type"
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
   @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
 
-  # RFC 9449 §5 / §8 / §9.
-  @error_invalid_dpop_proof "invalid_dpop_proof"
-  @error_use_dpop_nonce "use_dpop_nonce"
+  # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
+  # to the sender-constraint core as data.
   @dpop_request_header "dpop"
-  @dpop_nonce_header "dpop-nonce"
-
-  # RFC 9449 §7.1 / RFC 6750: access-token presentation type.
-  @token_type_dpop "DPoP"
-  @token_type_bearer "Bearer"
 
   # RFC 9449 §4.2: the token endpoint is reached by POST, so the proof's `htm`
   # claim must equal this.
@@ -307,7 +301,14 @@ defmodule AttestoPhoenix.Controller.TokenController do
          {:ok, redirect_uri} <- require_param(params, "redirect_uri"),
          {:ok, binding, token_type} <- resolve_sender_constraint(config, conn, client),
          {:ok, grant} <-
-           redeem_code(config, client, code, verifier, redirect_uri, binding_jkt(binding)),
+           redeem_code(
+             config,
+             client,
+             code,
+             verifier,
+             redirect_uri,
+             SenderConstraint.binding_jkt(binding)
+           ),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, response} <-
            mint(
@@ -346,7 +347,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
              client,
              presented,
              requested,
-             refresh_binding_jkt(config, client, binding)
+             SenderConstraint.refresh_binding_jkt(config, client, binding)
            ),
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
          {:ok, response} <-
@@ -550,7 +551,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
     context =
       %{subject: grant.subject, scope: scope}
       |> put_optional(:client_id, client_id(config, client))
-      |> put_optional(:dpop_jkt, refresh_binding_jkt(config, client, binding))
+      |> put_optional(:dpop_jkt, SenderConstraint.refresh_binding_jkt(config, client, binding))
 
     # OAuth 2.0 Security BCP §4.13: mint the initial token into the code's
     # `family_id` so the spent code and its descendant tokens share one
@@ -751,7 +752,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
   defp mint(config, client, subject, scope, token_type, binding, extra_claims \\ %{}) do
     with {:ok, principal} <- build_principal(config, client, subject, scope),
          principal = merge_principal_claims(principal, extra_claims),
-         {:ok, minted} <- Token.mint(attesto_config(config), principal, mint_opts(binding)) do
+         {:ok, minted} <-
+           Token.mint(attesto_config(config), principal, SenderConstraint.mint_opts(binding)) do
       {:ok,
        %{
          access_token: minted.access_token,
@@ -806,7 +808,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
       claims: exchange_extra_claims(claims, kind_claim)
     }
 
-    with {:ok, minted} <- Token.mint(attesto_config, principal, mint_opts(binding)) do
+    with {:ok, minted} <-
+           Token.mint(attesto_config, principal, SenderConstraint.mint_opts(binding)) do
       {:ok,
        %{
          access_token: minted.access_token,
@@ -823,24 +826,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
     claims
     |> Enum.reject(fn {key, _value} -> MapSet.member?(reserved, key) end)
     |> Map.new()
-  end
-
-  # RFC 9449 / RFC 8705: turn the resolved sender-constraint binding into the
-  # `Attesto.Token.mint/3` confirmation opt. DPoP binds `cnf.jkt`; mTLS binds
-  # `cnf.x5t#S256` (the certificate thumbprint, threaded here so a real
-  # `cnf` is actually minted rather than dropped).
-  defp mint_opts(:none), do: []
-  defp mint_opts({:dpop, jkt}), do: [dpop_jkt: jkt]
-  defp mint_opts({:mtls, thumbprint}), do: [mtls_cert_thumbprint: thumbprint]
-
-  # The DPoP thumbprint a stateful grant (authorization-code redemption,
-  # refresh rotation) binds to. Only DPoP flows through those engines'
-  # `:dpop_jkt` opt; an mTLS binding carries no DPoP thumbprint.
-  defp binding_jkt({:dpop, jkt}), do: jkt
-  defp binding_jkt(_binding), do: nil
-
-  defp refresh_binding_jkt(config, client, binding) do
-    if client_public?(config, client), do: binding_jkt(binding), else: nil
   end
 
   defp build_principal(config, client, subject, scope) do
@@ -878,56 +863,30 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   # ── Sender-constraint resolution (RFC 9449 / RFC 8705) ───────────────────
 
-  # Returns `{:ok, binding, token_type}` where `binding` is one of
-  # `{:dpop, jkt}`, `{:mtls, thumbprint}`, or `:none`. DPoP takes precedence
-  # when a proof is presented (RFC 9449 §5); otherwise an mTLS certificate
-  # binds the token to its thumbprint; otherwise the token is an unbound
-  # Bearer - but only if the client does not *require* a sender constraint.
-  #
-  # RFC 8705 §3: a client configured to require certificate-bound tokens MUST
-  # NOT be silently downgraded to a Bearer token when it calls without a
-  # certificate; that would strip the sender constraint the deployment relies
-  # on. The host's `:client_requires_mtls?` callback gates this.
-  #
-  # RFC 9449 is the DPoP equivalent: a client configured for DPoP-bound token
-  # issuance must present a proof at the token endpoint. Otherwise issuing an
-  # unbound Bearer token silently removes the proof-of-possession property.
+  # Parse the sender-constraint facts off the conn and delegate the decision to
+  # the conn-free `AttestoPhoenix.AuthorizationServer.SenderConstraint` core,
+  # which returns `{:ok, binding, token_type}` (binding is `{:dpop, jkt}`,
+  # `{:mtls, thumbprint}`, or `:none`) or an `OAuthError`. A required-but-absent
+  # DPoP nonce surfaces as a `use_dpop_nonce` error whose `:headers` carry the
+  # fresh `DPoP-Nonce`, rendered verbatim by `render_error/2`.
   defp resolve_sender_constraint(config, conn, client) do
-    cond do
-      config.dpop_enabled and dpop_present?(conn) ->
-        bind_dpop(config, conn)
+    SenderConstraint.resolve(config, sender_constraint_input(config, conn), client)
+  end
 
-      config.mtls_enabled and mtls_cert_present?(config, conn) ->
-        bind_mtls(config, conn)
+  defp sender_constraint_input(config, conn) do
+    %{
+      dpop_proof: first_dpop_proof(conn),
+      mtls_cert_der: RequestContext.cert_der(conn, config),
+      http_uri: RequestContext.canonical_url(conn, config),
+      http_method: @http_method_post
+    }
+  end
 
-      client_requires_dpop?(config, client) ->
-        # RFC 9449 defines `invalid_dpop_proof` for presented DPoP proof
-        # failures. When the token request omits a required proof entirely,
-        # return a standard OAuth token-endpoint error so FAPI clients can
-        # classify the grant attempt without relying on DPoP-specific error
-        # vocabulary.
-        {:error, error(@error_invalid_request, "DPoP proof required")}
-
-      client_requires_mtls?(config, client) ->
-        # No DPoP proof and no client certificate, yet this client must be
-        # certificate-bound: refuse rather than issue an unbound token.
-        {:error, error(@error_invalid_client, "client certificate required")}
-
-      true ->
-        {:ok, :none, @token_type_bearer}
+  defp first_dpop_proof(conn) do
+    case get_req_header(conn, @dpop_request_header) do
+      [proof | _] -> proof
+      _ -> nil
     end
-  end
-
-  # The certificate-binding requirement (RFC 8705). Read defensively from the
-  # configuration; fail open to "not required" only when the host has not
-  # supplied the callback, since a deployment without mTLS policy never sets
-  # it. (mTLS itself is off by default per `:mtls_enabled`.)
-  defp client_requires_mtls?(config, client) do
-    Callback.invoke(config_callback(config, :client_requires_mtls?), [client], false) == true
-  end
-
-  defp client_requires_dpop?(config, client) do
-    Callback.invoke(config_callback(config, :client_requires_dpop?), [client], false) == true
   end
 
   defp mtls_cert_present?(config, conn) do
@@ -935,90 +894,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
   end
 
   defp dpop_present?(conn), do: get_req_header(conn, @dpop_request_header) != []
-
-  defp bind_dpop(config, conn) do
-    [proof | _] = get_req_header(conn, @dpop_request_header)
-
-    verify_opts =
-      [
-        http_method: @http_method_post,
-        http_uri: RequestContext.canonical_url(conn, config)
-      ]
-      |> put_optional_kw(:nonce_check, nonce_check(config))
-
-    case invoke_dpop_verify(proof, verify_opts) do
-      {:ok, %{jkt: jkt}} ->
-        {:ok, {:dpop, jkt}, @token_type_dpop}
-
-      {:error, :use_dpop_nonce} ->
-        # RFC 9449 §8/§9: hand the client a fresh nonce and demand a retry.
-        {:error, dpop_nonce_required(config)}
-
-      {:error, reason} ->
-        {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: #{inspect(reason)}")}
-    end
-  end
-
-  # The proof verifier is part of the `Attesto.DPoP` core; the replay-check
-  # callback is host-supplied. Both are reached only through the configured
-  # surface so this module hardcodes neither a store nor a clock.
-  defp invoke_dpop_verify(proof, opts) do
-    Attesto.DPoP.verify_proof(proof, opts)
-  end
-
-  defp bind_mtls(config, conn) do
-    case RequestContext.cert_der(conn, config) do
-      der when is_binary(der) ->
-        case MTLS.compute_thumbprint(der) do
-          {:ok, x5t} ->
-            # RFC 8705 §3: the certificate thumbprint becomes the token's
-            # `cnf.x5t#S256` (minted via `Attesto.Token`'s
-            # `:mtls_cert_thumbprint` opt). mTLS-bound tokens keep the
-            # `Bearer` type (RFC 8705 §3.1).
-            {:ok, {:mtls, x5t}, @token_type_bearer}
-
-          {:error, _reason} ->
-            {:error, error(@error_invalid_client, "invalid client certificate")}
-        end
-
-      _ ->
-        {:error, error(@error_invalid_client, "client certificate required")}
-    end
-  end
-
-  # RFC 9449 §8/§9: when the deployment requires server-issued nonces
-  # (`config.dpop_nonce_required`), hand `Attesto.DPoP.verify_proof/2` a
-  # `:nonce_check` callback that validates the proof's `nonce` claim against
-  # the configured `Attesto.DPoP.NonceStore`. The callback receives the
-  # proof's `nonce` (which may be `nil` if the client sent none) and returns
-  # `:ok` only for a currently-valid nonce, else `{:error, :use_dpop_nonce}`
-  # so the controller answers with a fresh `DPoP-Nonce`. When nonces are not
-  # required, no callback is supplied and the engine enforces none.
-  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store})
-       when is_atom(store) and not is_nil(store) do
-    fn nonce ->
-      if store.valid?(nonce), do: :ok, else: {:error, :use_dpop_nonce}
-    end
-  end
-
-  defp nonce_check(_config), do: nil
-
-  # RFC 9449 §8: issue a fresh server nonce and return it so the client can
-  # replay its proof with the `nonce` claim included.
-  defp dpop_nonce_required(config) do
-    nonce = issue_nonce(config)
-
-    error(@error_use_dpop_nonce, "DPoP proof requires a server-issued nonce",
-      status: 400,
-      headers: [{@dpop_nonce_header, nonce}]
-    )
-  end
-
-  defp issue_nonce(%Config{nonce_store: store}) when is_atom(store) and not is_nil(store) do
-    store.issue()
-  end
-
-  defp issue_nonce(_config), do: ""
 
   # ── Configured-callback access ───────────────────────────────────────────
 
@@ -1160,13 +1035,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # also returns). The string `@error_*` codes are the RFC 6749 §5.2 wire
   # values; they convert to the matching pre-existing atom code here.
   defp error(code, description), do: OAuthError.new(error_code(code), description, status: 400)
-
-  defp error(code, description, opts) do
-    OAuthError.new(error_code(code), description,
-      status: Keyword.get(opts, :status, 400),
-      headers: Keyword.get(opts, :headers, [])
-    )
-  end
 
   defp error_code(code) when is_binary(code), do: String.to_existing_atom(code)
 
