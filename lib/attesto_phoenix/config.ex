@@ -564,8 +564,30 @@ defmodule AttestoPhoenix.Config do
       default_lifetime_seconds: config.access_token_ttl,
       token_endpoint_path: token_path(config)
     ]
+    |> Keyword.merge(resolved_principal_kinds(config))
     |> Keyword.merge(extra)
     |> Attesto.Config.new()
+  end
+
+  # Resolve the host's `:principal_kinds` (a list or a callback returning one)
+  # so to_attesto_config/1 yields a complete Attesto.Config for callers that do
+  # not pass principal_kinds explicitly (e.g. the authorization endpoint signing
+  # JARM responses). An explicit `extra` still wins. Omitted when unresolved so
+  # Attesto.Config.new/1 surfaces the missing required value.
+  defp resolved_principal_kinds(%__MODULE__{} = config) do
+    case Callback.config_callback(config, :principal_kinds) do
+      kinds when is_list(kinds) and kinds != [] ->
+        [principal_kinds: kinds]
+
+      nil ->
+        []
+
+      callback ->
+        case Callback.invoke(callback, []) do
+          kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
+          _ -> []
+        end
+    end
   end
 
   # The default OAuth endpoint tails appended to the resolved

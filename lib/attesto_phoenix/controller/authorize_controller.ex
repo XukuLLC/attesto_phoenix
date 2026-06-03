@@ -105,6 +105,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   alias Attesto.AuthorizationCode
   alias Attesto.AuthorizationRequest
+  alias Attesto.JARM
   alias Attesto.Secret
   alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
 
@@ -159,7 +160,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # RFC 6749 §4.1.2.1: the client_id/redirect_uri pair is trusted, so the
         # error is reported by redirecting back to the validated redirect_uri.
         emit_failure(conn, config, error.error)
-        redirect_with_error(conn, error.redirect_uri, error.error, error.state)
+        emit_redirect_error(conn, config, error)
     end
   end
 
@@ -352,10 +353,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # login page, so a bare `{:none}` here is a host/config fault.
         if prompt_none? do
           emit_failure(conn, config, @error_login_required)
-          redirect_with_error(conn, request.redirect_uri, @error_login_required, request.state)
+          emit_error(conn, config, request, @error_login_required)
         else
           Logger.error("authenticate_resource_owner returned {:none} without prompt=none")
-          redirect_with_error(conn, request.redirect_uri, @error_server_error, request.state)
+          emit_error(conn, config, request, @error_server_error)
         end
 
       {:halt, halted_conn} ->
@@ -370,7 +371,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # under a buggy host) so the redirect is always well-formed.
         if prompt_none? do
           emit_failure(conn, config, @error_login_required)
-          redirect_with_error(conn, request.redirect_uri, @error_login_required, request.state)
+          emit_error(conn, config, request, @error_login_required)
         else
           halted_conn
         end
@@ -384,14 +385,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # by redirect like the prompt=none conversions above.
         error_code = interaction_error_code(reason)
         emit_failure(conn, config, error_code)
-        redirect_with_error(conn, request.redirect_uri, error_code, request.state)
+        emit_error(conn, config, request, error_code)
 
       other ->
         # A callback that returns no known shape is a host/config fault, not a
         # client error. Fail closed with the §4.1.2.1 server_error rather than
         # crash, and do not issue a code.
         Logger.error("authenticate_resource_owner returned #{inspect(other)}")
-        redirect_with_error(conn, request.redirect_uri, @error_server_error, request.state)
+        emit_error(conn, config, request, @error_server_error)
     end
   end
 
@@ -413,7 +414,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # carry a body) so the redirect is always well-formed.
         if prompt_none? do
           emit_failure(conn, config, @error_consent_required)
-          redirect_with_error(conn, request.redirect_uri, @error_consent_required, request.state)
+          emit_error(conn, config, request, @error_consent_required)
         else
           halted_conn
         end
@@ -426,11 +427,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         emit_denied(conn, config, client)
 
         error_code = if prompt_none?, do: @error_consent_required, else: @error_access_denied
-        redirect_with_error(conn, request.redirect_uri, error_code, request.state)
+        emit_error(conn, config, request, error_code)
 
       other ->
         Logger.error("consent returned #{inspect(other)}")
-        redirect_with_error(conn, request.redirect_uri, @error_server_error, request.state)
+        emit_error(conn, config, request, @error_server_error)
     end
   end
 
@@ -460,13 +461,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
       {:ok, code} ->
         emit_code_issued(conn, config, client, request.scope)
-        redirect_with_code(conn, request.redirect_uri, code, request.state)
+        emit_success(conn, config, request, code)
 
       {:error, reason} ->
         # Issuance failing on a validated request is a server/config fault, not
         # a client error (RFC 6749 §4.1.2.1 server_error). Do not leak detail.
         Logger.error("authorization code issuance failed: #{inspect(reason)}")
-        redirect_with_error(conn, request.redirect_uri, @error_server_error, request.state)
+        emit_error(conn, config, request, @error_server_error)
     end
   end
 
@@ -542,8 +543,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       nil ->
         Logger.error(":authenticate_resource_owner callback is not configured")
 
-        {:halt,
-         redirect_with_error(conn, request.redirect_uri, @error_server_error, request.state)}
+        {:halt, emit_error(conn, config, request, @error_server_error)}
 
       callback ->
         Callback.invoke(callback, [conn, request, auth_opts(request)])
@@ -588,25 +588,125 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   # ── Redirect responses (RFC 6749 §4.1.2 / §4.1.2.1) ──────────────────────
 
-  # RFC 6749 §4.1.2: success redirect. The authorization code and (when present)
-  # the request `state` are appended to the redirect_uri as query parameters.
-  defp redirect_with_code(conn, redirect_uri, code, state) do
-    params = [{"code", code}] ++ state_param(state) ++ iss_param()
-    do_redirect(conn, redirect_uri, params)
+  # ── Authorization response emission (query or JARM, JARM §2.3 / FAPI 2.0
+  # Message Signing §5.4) ──────────────────────────────────────────────────
+  #
+  # Every authorization response - success or error - flows through
+  # emit_response/6, which honours the request's `response_mode`: the RFC 6749
+  # default `query`, or a JARM JWT mode that returns the response as a single
+  # signed `response` JWT. The JARM audience is the request `client_id`.
+
+  # RFC 6749 §4.1.2: success. The code and (when present) `state` are the
+  # response parameters; under JARM `iss` rides inside the JWT (JARM §2.1), under
+  # the query mode it is the RFC 9207 `iss` parameter (added in emit_response/6).
+  defp emit_success(conn, config, request, code) do
+    emit_response(
+      conn,
+      config,
+      request.redirect_uri,
+      request.response_mode,
+      request.client_id,
+      drop_nil(%{"code" => code, "state" => request.state})
+    )
   end
 
-  # RFC 6749 §4.1.2.1: error redirect, echoing `state` when present.
-  defp redirect_with_error(conn, redirect_uri, error_code, state) do
-    params = [{"error", error_code}] ++ state_param(state) ++ iss_param()
-    do_redirect(conn, redirect_uri, params)
+  # RFC 6749 §4.1.2.1: error reported once the client/redirect_uri is trusted,
+  # where the validated request (and so its response_mode) is known.
+  defp emit_error(conn, config, request, error_code) do
+    emit_response(
+      conn,
+      config,
+      request.redirect_uri,
+      request.response_mode,
+      request.client_id,
+      drop_nil(%{"error" => error_code, "state" => request.state})
+    )
   end
 
-  defp state_param(nil), do: []
-  defp state_param(state), do: [{"state", state}]
+  # RFC 6749 §4.1.2.1: error surfaced from Attesto.AuthorizationRequest as a
+  # redirectable failure. The core enriches it with the requested response_mode
+  # and the client_id (JARM audience) when the client is trusted; absent those,
+  # effective_response_mode/1 falls back to the query encoding.
+  defp emit_redirect_error(conn, config, error) do
+    emit_response(
+      conn,
+      config,
+      error.redirect_uri,
+      Map.get(error, :response_mode),
+      Map.get(error, :client_id),
+      drop_nil(%{
+        "error" => error.error,
+        "error_description" => Map.get(error, :error_description),
+        "state" => error.state
+      })
+    )
+  end
 
-  defp iss_param do
-    config = resolve_config()
+  defp emit_response(conn, config, redirect_uri, response_mode, client_id, params) do
+    case effective_response_mode(response_mode) do
+      "query" ->
+        do_redirect(conn, redirect_uri, Map.to_list(params) ++ iss_param(config))
 
+      jwt_mode ->
+        {:ok, response} =
+          JARM.response_jwt(Config.to_attesto_config(config), client_id, params)
+
+        deliver_jarm(conn, redirect_uri, jwt_mode, response)
+    end
+  end
+
+  # JARM §2.3.2: `jwt` is shorthand for the response_type's default JWT mode,
+  # which for the code flow is `query.jwt`. An absent response_mode is the
+  # RFC 6749 default, `query`.
+  defp effective_response_mode(nil), do: "query"
+  defp effective_response_mode("jwt"), do: "query.jwt"
+  defp effective_response_mode(mode), do: mode
+
+  # JARM §2.3.1: deliver the signed response JWT per the requested mode.
+  defp deliver_jarm(conn, redirect_uri, "query.jwt", response) do
+    do_redirect(conn, redirect_uri, [{"response", response}])
+  end
+
+  defp deliver_jarm(conn, redirect_uri, "fragment.jwt", response) do
+    location = redirect_uri <> "#" <> URI.encode_query([{"response", response}])
+
+    conn
+    |> put_resp_header("location", location)
+    |> send_resp(:found, "")
+  end
+
+  defp deliver_jarm(conn, redirect_uri, "form_post.jwt", response) do
+    conn
+    |> put_resp_header("content-type", "text/html; charset=utf-8")
+    |> send_resp(:ok, form_post_html(redirect_uri, response))
+  end
+
+  # OAuth 2.0 Form Post Response Mode: a minimal auto-submitting form that POSTs
+  # the signed `response` to the redirect_uri. The action and value are HTML-
+  # attribute-escaped; a noscript fallback keeps it usable without scripting.
+  defp form_post_html(redirect_uri, response) do
+    action = Plug.HTML.html_escape(redirect_uri)
+    value = Plug.HTML.html_escape(response)
+
+    """
+    <!DOCTYPE html>
+    <html>
+    <head><title>Submitting…</title></head>
+    <body onload="document.forms[0].submit()">
+    <form method="post" action="#{action}">
+    <input type="hidden" name="response" value="#{value}"/>
+    <noscript><button type="submit">Continue</button></noscript>
+    </form>
+    </body>
+    </html>
+    """
+  end
+
+  defp drop_nil(params), do: :maps.filter(fn _key, value -> not is_nil(value) end, params)
+
+  # RFC 9207: the authorization server's issuer identifier as the `iss` response
+  # parameter for the query response mode (under JARM it is the JWT `iss` claim).
+  defp iss_param(config) do
     if Callback.config_flag(config, :authorization_response_iss),
       do: [{"iss", config.issuer}],
       else: []

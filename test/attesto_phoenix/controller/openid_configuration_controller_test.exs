@@ -136,6 +136,21 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
                ["client_secret_basic", "client_secret_post", "private_key_jwt", "none"]
     end
 
+    test "advertises the query and JARM response modes (JARM §2.3 / §5.4)" do
+      body = call_show(host_config(), protocol_config()) |> decode_body()
+
+      assert body["response_modes_supported"] ==
+               ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
+    end
+
+    test "advertises authorization_signing_alg_values_supported matching the ID Token algs" do
+      # JARM responses are signed with the same key as ID Tokens.
+      body = call_show(host_config(), protocol_config()) |> decode_body()
+
+      assert body["authorization_signing_alg_values_supported"] ==
+               body["id_token_signing_alg_values_supported"]
+    end
+
     test "advertises configured token endpoint auth methods" do
       host = host_config(token_endpoint_auth_methods_supported: ["private_key_jwt"])
 

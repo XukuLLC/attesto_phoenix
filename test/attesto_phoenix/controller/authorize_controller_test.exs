@@ -72,6 +72,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     Keyword.merge(
       [
         issuer: "https://issuer.example.com",
+        audience: "https://issuer.example.com",
         keystore: __MODULE__.TestKeystore,
         repo: __MODULE__.NoRepo,
         load_client: &__MODULE__.load_client/1,
@@ -83,7 +84,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         consent: &__MODULE__.consent/3,
         code_store: TestStore,
         authorization_code_ttl: 60,
-        require_https: true
+        require_https: true,
+        # A real AS configures principal kinds; needed for the derived
+        # Attesto.Config when the authorization endpoint signs JARM responses.
+        principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")]
       ],
       overrides
     )
@@ -124,6 +128,18 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       nil -> %{}
       query -> URI.decode_query(query)
     end
+  end
+
+  # Verify a JARM response JWT the way a client would: strictly, against the
+  # authorization server's signing key (TestKeystore is RSA/RS256), returning
+  # the claims.
+  defp decode_jarm(jwt) do
+    jwk = __MODULE__.TestKeystore.signing_pem() |> Attesto.Key.jwk()
+
+    assert {true, %JOSE.JWT{fields: claims}, %JOSE.JWS{}} =
+             JOSE.JWT.verify_strict(jwk, ["RS256"], jwt)
+
+    claims
   end
 
   # ── Valid flow ───────────────────────────────────────────────────────────
@@ -198,6 +214,75 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert conn.status == 302
       assert location_query(conn)["iss"] == "https://issuer.example.com"
+    end
+  end
+
+  # ── JARM (FAPI 2.0 Message Signing §5.4) ─────────────────────────────────
+
+  describe "JARM response modes" do
+    test "query.jwt returns a single signed response JWT, not plain code/state" do
+      conn = call(valid_params(%{"response_mode" => "query.jwt"}))
+
+      assert conn.status == 302
+      query = location_query(conn)
+
+      # Only `response` is in the query; code/state/iss ride inside the JWT.
+      assert is_binary(query["response"])
+      refute Map.has_key?(query, "code")
+      refute Map.has_key?(query, "state")
+
+      claims = decode_jarm(query["response"])
+      assert claims["iss"] == "https://issuer.example.com"
+      assert claims["aud"] == @client_id
+      assert is_binary(claims["code"])
+      assert claims["state"] == "xyz"
+      assert is_integer(claims["exp"])
+    end
+
+    test "the `jwt` shorthand resolves to query.jwt for the code flow (JARM §2.3.2)" do
+      conn = call(valid_params(%{"response_mode" => "jwt"}))
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert is_binary(query["response"])
+      assert decode_jarm(query["response"])["code"] |> is_binary()
+    end
+
+    test "fragment.jwt delivers the response JWT in the URL fragment" do
+      conn = call(valid_params(%{"response_mode" => "fragment.jwt"}))
+
+      assert conn.status == 302
+      fragment = conn |> location() |> URI.parse() |> Map.get(:fragment)
+      assert %{"response" => jwt} = URI.decode_query(fragment)
+      assert decode_jarm(jwt)["code"] |> is_binary()
+    end
+
+    test "form_post.jwt renders an auto-submitting HTML form posting the response" do
+      conn = call(valid_params(%{"response_mode" => "form_post.jwt"}))
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+      assert conn.resp_body =~ ~s(method="post")
+      assert conn.resp_body =~ ~s(action="https://client.example.com/callback")
+      assert conn.resp_body =~ ~s(name="response")
+      assert [_, jwt] = Regex.run(~r/name="response" value="([^"]+)"/, conn.resp_body)
+      assert decode_jarm(jwt)["code"] |> is_binary()
+    end
+
+    test "a redirectable error is itself returned as a signed JWT under query.jwt" do
+      # An invalid scope token is a redirectable invalid_scope; under a JARM mode
+      # the error must be returned as a signed response JWT, not plain params.
+      conn = call(valid_params(%{"response_mode" => "query.jwt", "scope" => ~s(open"id)}))
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert is_binary(query["response"])
+      refute Map.has_key?(query, "error")
+
+      claims = decode_jarm(query["response"])
+      assert claims["error"] == "invalid_scope"
+      assert claims["aud"] == @client_id
+      assert claims["state"] == "xyz"
     end
   end
 

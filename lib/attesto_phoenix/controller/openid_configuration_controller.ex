@@ -67,6 +67,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   import Plug.Conn, only: [put_resp_header: 3]
 
+  alias Attesto.AuthorizationRequest
   alias Attesto.OpenIDDiscovery
   alias Attesto.RequestObject.Policy
   alias Attesto.SigningAlg
@@ -92,11 +93,13 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   # the host does not override it.
   @response_types_supported ["code"]
 
-  # OpenID Connect Core §3.1.2.5 / RFC 8414 §2 `response_modes_supported`: the
-  # authorization-code flow returns its parameters in the redirect query string,
-  # so the provider supports the "query" response mode. Fixed by the flow this
-  # provider implements, not configured.
-  @response_modes_supported ["query"]
+  # OpenID Connect Core §3.1.2.5 / RFC 8414 §2 / JARM §2.3 `response_modes_
+  # supported`: the response modes the authorization endpoint implements - the
+  # RFC 6749 default `query` and the JWT Secured Authorization Response Mode
+  # variants (FAPI 2.0 Message Signing §5.4). Sourced from
+  # Attesto.AuthorizationRequest so the advertisement never drifts from what the
+  # request validator accepts and the controller emits.
+  @response_modes_supported AuthorizationRequest.supported_response_modes()
 
   # RFC 8414 §2 `grant_types_supported`: the grant types the token endpoint
   # (`AttestoPhoenix.Controller.TokenController`) actually dispatches -
@@ -264,7 +267,20 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       "token_endpoint_auth_signing_alg_values_supported",
       config.client_auth_signing_algs
     )
+    |> put_authorization_signing_alg_values_supported()
     |> put_authorization_response_iss_supported(config)
+  end
+
+  # JARM §3 / FAPI 2.0 Message Signing §5.4 `authorization_signing_alg_values_
+  # supported`: the algorithms the authorization endpoint signs JARM responses
+  # with. JARM responses are signed with the same keystore key as ID Tokens
+  # (Attesto.JARM mirrors Attesto.IDToken), so the advertised set is exactly the
+  # already-derived id_token_signing_alg_values_supported.
+  defp put_authorization_signing_alg_values_supported(metadata) do
+    case Map.get(metadata, "id_token_signing_alg_values_supported") do
+      nil -> metadata
+      algs -> Map.put(metadata, "authorization_signing_alg_values_supported", algs)
+    end
   end
 
   defp put_authorization_response_iss_supported(metadata, %Config{
