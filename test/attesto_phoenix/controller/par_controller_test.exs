@@ -525,6 +525,58 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       assert conn.status == 400
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_request_object"
     end
+
+    test "stores the verified request-object params, not the unsigned body params (RFC 9101 §6.3)" do
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> %{"keys" => [public_jwk(request_key)]} end
+      )
+
+      # The signed object grants only "openid"; the unsigned body claims more and
+      # carries a state the object omits. The stored record must reflect the
+      # signed object, never the unsigned body values.
+      request =
+        signed_request_object(
+          request_key,
+          "confidential-1",
+          Map.put(request_claims(), "scope", "openid")
+        )
+
+      params =
+        Map.merge(auth_params(), %{"request" => request, "scope" => "openid profile admin"})
+
+      credentials = Base.encode64("confidential-1:s3cr3t")
+
+      conn =
+        :post
+        |> conn(@endpoint_path, params)
+        |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+        |> PARController.create(params)
+
+      assert conn.status == 201
+      assert {:ok, stored, 45} = PARStore.lookup(JSON.decode!(conn.resp_body)["request_uri"])
+      assert stored["scope"] == "openid"
+      refute Map.has_key?(stored, "state")
+    end
+
+    test "rejects a signed request object when the client has no JWKS configured (fail closed)" do
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      # No :client_jwks configured: the request object has no key to verify
+      # against, so it is rejected rather than trusted.
+      put_config(request_object_policy: Policy.fapi_message_signing())
+
+      request =
+        signed_request_object(request_key, "confidential-1", request_claims(), %{
+          "typ" => "oauth-authz-req+jwt"
+        })
+
+      conn = par_with_request_object(request)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_request_object"
+    end
   end
 
   defp request_claims do

@@ -100,7 +100,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     request_uri = @request_uri_prefix <> random()
 
     with {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params),
-         :ok <- verify_request_object(config, client, params) do
+         {:ok, params} <- verify_request_object(config, client, params) do
       stored =
         params
         |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
@@ -203,9 +203,15 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # the AS verifies it AT the PAR endpoint (not only later at /authorize), so a
   # bad JAR is rejected here. Verification uses the authenticated client's
   # trusted JWKS, the issuer audience, and the configured request-object policy
-  # (`Attesto.RequestObject.Policy`; default generic OIDC §6.1). The object is
-  # re-verified at /authorize too (RFC 9101). A PAR carrying no `request` object
-  # is not rejected here - requiring its presence is a separate profile concern.
+  # (`Attesto.RequestObject.Policy`; default generic OIDC §6.1).
+  #
+  # On success the VERIFIED request-object parameters become the stored request
+  # (RFC 9101 §6.3: when a request object is present its signed parameters are
+  # authoritative and unsigned body parameters are ignored), so the stored PAR
+  # record never carries unsigned body values beside a verified object. The
+  # compact `request` JWT is retained so /authorize re-verifies it too. A PAR
+  # carrying no `request` object is stored as-is - requiring its presence is a
+  # separate profile concern.
   defp verify_request_object(config, client, %{"request" => request})
        when is_binary(request) and request != "" do
     opts =
@@ -215,15 +221,15 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
         )
 
     case RequestObject.verify(request, client_jwks(config, client) || %{"keys" => []}, opts) do
-      {:ok, _claims} ->
-        :ok
+      {:ok, object_params} ->
+        {:ok, Map.put(object_params, "request", request)}
 
       {:error, _reason} ->
         {:error, error(@error_invalid_request_object, "request object is invalid")}
     end
   end
 
-  defp verify_request_object(_config, _client, _params), do: :ok
+  defp verify_request_object(_config, _client, params), do: {:ok, params}
 
   # Resolve the client's trusted JWK set, mirroring the authorize controller's
   # resolution (the host's `:client_jwks` callback, returning a JWKS or `nil`).

@@ -13,6 +13,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   import Phoenix.ConnTest
 
   alias Attesto.AuthorizationCode
+  alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
 
@@ -396,6 +397,40 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert conn.status == 302
       assert location_query(conn)["error"] == "invalid_request"
+    end
+
+    test "a request object failing the FAPI Message Signing policy is rejected at /authorize" do
+      # Guards that the controller threads :request_object_policy into
+      # AuthorizationRequest.validate/2: under the FAPI profile this object
+      # (no nbf) must be rejected; the default generic policy would accept it.
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_kty, pub} = JOSE.JWK.to_public_map(request_key)
+      client_jwk = Map.merge(pub, %{"kid" => "rk", "alg" => "ES256"})
+
+      put_config(
+        client_jwks: fn _client -> %{"keys" => [client_jwk]} end,
+        request_object_policy: Policy.fapi_message_signing()
+      )
+
+      claims = %{
+        "iss" => @client_id,
+        "aud" => "https://issuer.example.com",
+        "client_id" => @client_id,
+        "redirect_uri" => @redirect_uri,
+        "response_type" => "code",
+        "scope" => "openid",
+        "code_challenge" => @code_challenge,
+        "code_challenge_method" => "S256"
+      }
+
+      header = %{"alg" => "ES256", "kid" => "rk", "typ" => "oauth-authz-req+jwt"}
+      {_header, request} = request_key |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+
+      conn =
+        call(%{"client_id" => @client_id, "redirect_uri" => @redirect_uri, "request" => request})
+
+      assert conn.status == 302
+      assert location_query(conn)["error"] == "invalid_request_object"
     end
 
     test "can include RFC 9207 iss in authorization error responses" do

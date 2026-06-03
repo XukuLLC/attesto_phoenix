@@ -925,6 +925,7 @@ defmodule AttestoPhoenix.Config do
     end
 
     validate_behaviour_modules!(config)
+    validate_request_object_policy!(config)
 
     validate_path!(:oauth_path_prefix, config.oauth_path_prefix)
     validate_optional_path!(:authorize_path, config.authorize_path)
@@ -956,6 +957,22 @@ defmodule AttestoPhoenix.Config do
 
   # Boot-time conformance: every installed behaviour module must be loadable and
   # must export the required callbacks of the behaviour it is installed as.
+  # `:request_object_policy` is a security knob; reject a wrong value at boot
+  # rather than crashing later in `RequestObject.Policy.to_verify_opts/1` when a
+  # PAR or /authorize request is verified. `apply_defaults/1` has already
+  # replaced a `nil` with `%Attesto.RequestObject.Policy{}`.
+  defp validate_request_object_policy!(%__MODULE__{
+         request_object_policy: %Attesto.RequestObject.Policy{}
+       }),
+       do: :ok
+
+  defp validate_request_object_policy!(%__MODULE__{request_object_policy: other}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :request_object_policy must be an " <>
+            "%Attesto.RequestObject.Policy{} (e.g. " <>
+            "Attesto.RequestObject.Policy.fapi_message_signing/0); got #{inspect(other)}."
+  end
+
   defp validate_behaviour_modules!(%__MODULE__{} = config) do
     Enum.each(@behaviour_modules, fn {store_key, behaviour} ->
       case Map.get(config, store_key) do

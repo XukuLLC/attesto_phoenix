@@ -1,6 +1,7 @@
 defmodule AttestoPhoenix.ConfigTest do
   use ExUnit.Case, async: true
 
+  alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Config
 
   # A behaviour module that implements every ClientStore callback the resolver
@@ -339,6 +340,23 @@ defmodule AttestoPhoenix.ConfigTest do
     test "is overridable by the host" do
       algs = ["PS256", "ES256", "RS256"]
       assert config(client_auth_signing_algs: algs).client_auth_signing_algs == algs
+    end
+  end
+
+  describe ":request_object_policy" do
+    test "defaults to the generic %Policy{} when unset" do
+      assert config().request_object_policy == %Policy{}
+    end
+
+    test "accepts an Attesto.RequestObject.Policy" do
+      policy = Policy.fapi_message_signing()
+      assert config(request_object_policy: policy).request_object_policy == policy
+    end
+
+    test "rejects a non-Policy value at boot" do
+      assert_raise ArgumentError, ~r/:request_object_policy must be an/, fn ->
+        config(request_object_policy: :fapi)
+      end
     end
   end
 end
