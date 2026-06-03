@@ -49,6 +49,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
 
   alias Attesto.DPoP
   alias Attesto.DPoP.ReplayCache
+  alias Attesto.RequestObject
   alias AttestoPhoenix.AuthorizationServer.PAR.Request
   alias AttestoPhoenix.{Callback, Config, OAuthError}
 
@@ -70,6 +71,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
 
   # RFC 6749 §5.2 / RFC 9449 error codes.
   @error_invalid_request "invalid_request"
+  @error_invalid_request_object "invalid_request_object"
   @error_invalid_dpop_proof "invalid_dpop_proof"
 
   # RFC 9126 §2.2: the `request_uri` reference scheme.
@@ -97,7 +99,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     ttl = config_field(config, :par_ttl, @default_par_ttl)
     request_uri = @request_uri_prefix <> random()
 
-    with {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params) do
+    with {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params),
+         :ok <- verify_request_object(config, client, params) do
       stored =
         params
         |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
@@ -196,10 +199,53 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     end
   end
 
+  # FAPI 2.0 Message Signing §5.3.1: when a signed `request` object is pushed,
+  # the AS verifies it AT the PAR endpoint (not only later at /authorize), so a
+  # bad JAR is rejected here. Verification uses the authenticated client's
+  # trusted JWKS, the issuer audience, and the configured request-object policy
+  # (`Attesto.RequestObject.Policy`; default generic OIDC §6.1). The object is
+  # re-verified at /authorize too (RFC 9101). A PAR carrying no `request` object
+  # is not rejected here - requiring its presence is a separate profile concern.
+  defp verify_request_object(config, client, %{"request" => request})
+       when is_binary(request) and request != "" do
+    opts =
+      [issuer: client_id(config, client), audience: config.issuer] ++
+        RequestObject.Policy.to_verify_opts(
+          config.request_object_policy || %RequestObject.Policy{}
+        )
+
+    case RequestObject.verify(request, client_jwks(config, client) || %{"keys" => []}, opts) do
+      {:ok, _claims} ->
+        :ok
+
+      {:error, _reason} ->
+        {:error, error(@error_invalid_request_object, "request object is invalid")}
+    end
+  end
+
+  defp verify_request_object(_config, _client, _params), do: :ok
+
+  # Resolve the client's trusted JWK set, mirroring the authorize controller's
+  # resolution (the host's `:client_jwks` callback, returning a JWKS or `nil`).
+  defp client_jwks(config, client) do
+    case Config.client_jwks_fun(config) do
+      nil ->
+        nil
+
+      callback ->
+        case Callback.invoke(callback, [client]) do
+          {:ok, jwks} -> jwks
+          jwks when is_map(jwks) or is_list(jwks) -> jwks
+          _other -> nil
+        end
+    end
+  end
+
   defp error(code, description) do
     OAuthError.new(code_atom(code), description, status: 400)
   end
 
   defp code_atom(@error_invalid_request), do: :invalid_request
+  defp code_atom(@error_invalid_request_object), do: :invalid_request_object
   defp code_atom(@error_invalid_dpop_proof), do: :invalid_dpop_proof
 end

@@ -156,6 +156,12 @@ defmodule AttestoPhoenix.Config do
       to `Attesto.SigningAlg.fapi_algs/0` (PS256, ES256, EdDSA). A non-FAPI
       deployment can widen it; verification and the advertised metadata stay in
       lockstep because both read this one value.
+    * `:request_object_policy` - an `Attesto.RequestObject.Policy` controlling
+      verification of signed authorization request objects (JAR, RFC 9101).
+      Defaults to `%Attesto.RequestObject.Policy{}` (generic OpenID Connect §6.1:
+      `nbf`/`exp`/`typ` not required). For FAPI 2.0 Message Signing §5.3.1 set
+      `Attesto.RequestObject.Policy.fapi_message_signing()`; the policy is then
+      enforced both at the PAR endpoint and at `/authorize`.
     * `:scopes_supported` - list of supported scope strings (concrete and
       wildcard) advertised in discovery and used as the default scope catalog.
       For an OpenID Provider the reserved `openid` scope (OpenID Connect Core
@@ -329,6 +335,7 @@ defmodule AttestoPhoenix.Config do
     :registration,
     :claims_provider,
     :client_auth_signing_algs,
+    :request_object_policy,
     :audience,
     :authorize_scope,
     :on_event,
@@ -418,6 +425,7 @@ defmodule AttestoPhoenix.Config do
           registration: module() | nil,
           claims_provider: module() | nil,
           client_auth_signing_algs: [String.t()] | nil,
+          request_object_policy: Attesto.RequestObject.Policy.t() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
           on_event: callback() | nil,
@@ -513,7 +521,8 @@ defmodule AttestoPhoenix.Config do
     %{
       config
       | client_auth_signing_algs:
-          config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs()
+          config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs(),
+        request_object_policy: config.request_object_policy || %Attesto.RequestObject.Policy{}
     }
   end
 

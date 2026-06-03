@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-06-03
+
+### Added
+
+- `:request_object_policy` Config key (an `Attesto.RequestObject.Policy`,
+  default `%Policy{}` = generic OpenID Connect §6.1). It is enforced at BOTH
+  the PAR endpoint and `/authorize`: a signed request object pushed to `/par`
+  is verified there (rejected with `invalid_request_object` if it fails the
+  policy), and re-verified at `/authorize` (RFC 9101). Set
+  `Attesto.RequestObject.Policy.fapi_message_signing()` for the FAPI 2.0
+  Message Signing §5.3.1 profile (`nbf`/`exp` required and bounded to 60
+  minutes, `typ` = `"oauth-authz-req+jwt"`). Behaviour is unchanged unless a
+  host opts in. Requires `attesto ~> 0.6.12`.
+
 ## [0.7.1] - 2026-06-03
 
 ### Added

@@ -211,7 +211,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
              require_nonce: require_nonce?(config, params),
              require_pkce: require_pkce?(config, client),
              request_object_jwks: client_jwks(config, client),
-             request_object_audience: config.issuer
+             request_object_audience: config.issuer,
+             request_object_policy: config.request_object_policy
            ),
          :ok <- require_par_if_configured(config, request, par_resolved?) do
       {:ok, request}

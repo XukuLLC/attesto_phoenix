@@ -3,6 +3,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
 
   import Plug.Test
 
+  alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Controller.PARController
   alias AttestoPhoenix.Store.PAR.ETS
 
@@ -459,6 +460,102 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     body = JSON.decode!(conn.resp_body)
     assert body["error"] == "invalid_client"
     assert body["error_description"] == "client authentication failed"
+  end
+
+  describe "PAR-time request object verification (FAPI Message Signing 2.0 §5.3.1)" do
+    test "default policy accepts a signed request object without nbf/exp" do
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> %{"keys" => [public_jwk(request_key)]} end
+      )
+
+      request =
+        signed_request_object(
+          request_key,
+          "confidential-1",
+          Map.drop(request_claims(), ["nbf", "exp"])
+        )
+
+      conn = par_with_request_object(request)
+
+      assert conn.status == 201
+    end
+
+    test "FAPI policy accepts a compliant signed request object at the PAR endpoint" do
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> %{"keys" => [public_jwk(request_key)]} end,
+        request_object_policy: Policy.fapi_message_signing()
+      )
+
+      request =
+        signed_request_object(request_key, "confidential-1", request_claims(), %{
+          "typ" => "oauth-authz-req+jwt"
+        })
+
+      conn = par_with_request_object(request)
+
+      assert conn.status == 201
+    end
+
+    test "FAPI policy rejects a non-compliant signed request object AT the PAR endpoint" do
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> %{"keys" => [public_jwk(request_key)]} end,
+        request_object_policy: Policy.fapi_message_signing()
+      )
+
+      # Missing nbf under the FAPI profile: PAR itself must reject it, not defer
+      # the rejection to /authorize.
+      request =
+        signed_request_object(
+          request_key,
+          "confidential-1",
+          Map.delete(request_claims(), "nbf"),
+          %{
+            "typ" => "oauth-authz-req+jwt"
+          }
+        )
+
+      conn = par_with_request_object(request)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_request_object"
+    end
+  end
+
+  defp request_claims do
+    now = System.system_time(:second)
+
+    %{
+      "iss" => "confidential-1",
+      "aud" => "https://issuer.example",
+      "client_id" => "confidential-1",
+      "redirect_uri" => "https://client.example/cb",
+      "response_type" => "code",
+      "scope" => "openid",
+      "nbf" => now,
+      "exp" => now + 300
+    }
+  end
+
+  defp signed_request_object(jwk, _client_id, claims, header_overrides \\ %{}) do
+    header = Map.merge(%{"alg" => "ES256", "kid" => JOSE.JWK.thumbprint(jwk)}, header_overrides)
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    compact
+  end
+
+  defp par_with_request_object(request) do
+    params = Map.merge(auth_params(), %{"request" => request})
+    credentials = Base.encode64("confidential-1:s3cr3t")
+
+    :post
+    |> conn(@endpoint_path, params)
+    |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+    |> PARController.create(params)
   end
 
   defp auth_params do
