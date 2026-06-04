@@ -129,8 +129,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # object verification, so a `request` object replacing the parameter set
   # cannot mask a `request_uri` smuggled in as a sibling form parameter.
   defp reject_request_uri(%{"request_uri" => value}) when is_binary(value) and value != "" do
-    {:error,
-     error(@error_invalid_request, "request_uri must not be used at the PAR endpoint")}
+    detail = "request_uri must not be used at the PAR endpoint"
+    {:error, error(@error_invalid_request, detail)}
   end
 
   defp reject_request_uri(_params), do: :ok
