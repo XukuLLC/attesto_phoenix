@@ -225,14 +225,19 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
     end
 
     test "advertises require_signed_request_object=true under the FAPI Message Signing policy" do
-      body =
-        call_show(
-          host_config(request_object_policy: Policy.fapi_message_signing()),
-          protocol_config()
+      # A required-request-object policy needs :client_jwks (enforced at boot),
+      # so this coherently pairs with request_parameter_supported: true - the OP
+      # never advertises "JAR required" while also saying JAR is unsupported.
+      host =
+        host_config(
+          request_object_policy: Policy.fapi_message_signing(),
+          client_jwks: fn _client -> %{"keys" => []} end
         )
-        |> decode_body()
+
+      body = call_show(host, protocol_config()) |> decode_body()
 
       assert body["require_signed_request_object"] == true
+      assert body["request_parameter_supported"] == true
     end
 
     test "advertises claims_parameter_supported=false by default (OIDC Discovery §3)" do

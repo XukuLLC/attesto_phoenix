@@ -6,6 +6,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
 
   alias Attesto.Config, as: ProtocolConfig
   alias Attesto.PrincipalKind
+  alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.DiscoveryController
 
@@ -275,6 +276,37 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         |> put_private(:attesto_phoenix_config, host_config())
 
       assert_raise RuntimeError, fn -> DiscoveryController.show(conn, %{}) end
+    end
+  end
+
+  describe "show/2 signed request object metadata (RFC 9101 §10.5)" do
+    test "advertises request_object_signing_alg_values_supported when JAR is supported" do
+      # OAuth AS metadata (RFC 8414) carries the same JAR metadata as the OpenID
+      # Provider document, so a FAPI client reading either sees identical support.
+      host = host_config(client_jwks: fn _client -> %{"keys" => []} end)
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["request_object_signing_alg_values_supported"] == ["PS256", "ES256", "EdDSA"]
+    end
+
+    test "omits the JAR metadata without request-object capability" do
+      body = call_show(host_config(), protocol_config()) |> decode_body()
+
+      refute Map.has_key?(body, "request_object_signing_alg_values_supported")
+      refute Map.has_key?(body, "require_signed_request_object")
+    end
+
+    test "advertises require_signed_request_object=true under the FAPI Message Signing policy" do
+      host =
+        host_config(
+          request_object_policy: Policy.fapi_message_signing(),
+          client_jwks: fn _client -> %{"keys" => []} end
+        )
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["require_signed_request_object"] == true
+      assert body["request_object_signing_alg_values_supported"] == ["PS256", "ES256", "EdDSA"]
     end
   end
 

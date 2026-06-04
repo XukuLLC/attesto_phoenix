@@ -69,8 +69,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   alias Attesto.AuthorizationRequest
   alias Attesto.OpenIDDiscovery
-  alias Attesto.RequestObject.Policy
-  alias Attesto.SigningAlg
+  alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.Config
 
   # The router pipeline installs the AttestoPhoenix.Config here. This is the
@@ -217,7 +216,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       # endpoint can verify a signed request object only when the host can
       # resolve a client's trusted JWKS, so an install without that capability
       # advertises `false` rather than a JAR support it cannot honour.
-      request_parameter_supported: request_objects_supported?(config),
+      request_parameter_supported: RequestObjectMetadata.supported?(config),
       request_uri_parameter_supported: @request_uri_parameter_supported,
       claims_parameter_supported: config.claims_parameter_supported,
       # RFC 9101 §10.5 / FAPI 2.0 Message Signing §5.3.1: the request-object
@@ -225,8 +224,8 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       # signed request objects are required. The algorithm list is advertised
       # only when request objects are actually supported, so discovery never
       # drifts from enforcement.
-      request_object_signing_alg_values_supported: request_object_signing_alg_values(config),
-      require_signed_request_object: require_signed_request_object(config),
+      request_object_signing_alg_values_supported: RequestObjectMetadata.signing_alg_values(config),
+      require_signed_request_object: RequestObjectMetadata.require_signed(config),
       # Host catalogs: advertised only when the host configures a non-empty list
       # (the core builder drops the nil the helper returns for `[]`).
       acr_values_supported: presence(config.acr_values_supported),
@@ -249,44 +248,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   defp introspection_auth_methods(config) do
     Enum.reject(token_endpoint_auth_methods_supported(config), &(&1 == "none"))
   end
-
-  # RFC 9101 §10.5 / OpenID Connect Discovery §3
-  # `request_object_signing_alg_values_supported`: the JWS algorithms the
-  # authorization endpoint accepts on a signed request object. Mirrors the
-  # configured request_object_policy's accepted_algs, falling back to the
-  # verifier's own default (Attesto.SigningAlg.fapi_algs/0: PS256, ES256, EdDSA)
-  # when the policy leaves it unset.
-  defp request_object_signing_algs(%Config{} = config) do
-    case request_object_policy(config).accepted_algs do
-      algs when is_list(algs) and algs != [] -> algs
-      _ -> SigningAlg.fapi_algs()
-    end
-  end
-
-  # Advertise the request-object signing algorithms only when request objects
-  # are actually supported; otherwise return nil so the core builder drops the
-  # member (no algorithm list for a capability the install does not have).
-  defp request_object_signing_alg_values(%Config{} = config) do
-    if request_objects_supported?(config), do: request_object_signing_algs(config)
-  end
-
-  # OpenID Connect Discovery §3: the authorization endpoint can verify a signed
-  # request object (JAR / RFC 9101) only when the host can resolve a client's
-  # trusted JWKS - a flat `:client_jwks` callback or an installed `:client_store`
-  # behaviour (`Config.client_jwks_fun/1` resolves either). Absent that, no
-  # client can use request objects, so the OP does not advertise the capability.
-  defp request_objects_supported?(%Config{} = config),
-    do: not is_nil(Config.client_jwks_fun(config))
-
-  # RFC 9101 §10.5 `require_signed_request_object`: advertise `true` only when
-  # the policy mandates a signed request object (FAPI 2.0 Message Signing
-  # §5.3.1); otherwise omit the member (its default is false).
-  defp require_signed_request_object(%Config{} = config) do
-    if Policy.require_request_object?(request_object_policy(config)), do: true, else: nil
-  end
-
-  defp request_object_policy(%Config{request_object_policy: %Policy{} = policy}), do: policy
-  defp request_object_policy(%Config{}), do: %Policy{}
 
   defp put_fapi_metadata(metadata, %Config{} = config) do
     metadata

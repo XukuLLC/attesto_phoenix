@@ -52,6 +52,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   alias Attesto.AuthorizationRequest
   alias Attesto.Discovery
   alias Attesto.SigningAlg
+  alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.Config
 
   # The router pipeline installs the AttestoPhoenix.Config here. This is the
@@ -174,7 +175,14 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
       introspection_endpoint: Config.introspection_endpoint_url(config),
       introspection_endpoint_auth_methods_supported: introspection_auth_methods(config),
-      registration_endpoint: registration_endpoint(config)
+      registration_endpoint: registration_endpoint(config),
+      # RFC 9101 §10.5: the signed-request-object (JAR) metadata, derived from
+      # the same capability the OpenID Provider Metadata document uses, so a
+      # FAPI client reading RFC 8414 rather than OpenID Discovery sees identical
+      # JAR support. Both members are nil-dropped by the core builder when JAR
+      # is unsupported / not required.
+      request_object_signing_alg_values_supported: RequestObjectMetadata.signing_alg_values(config),
+      require_signed_request_object: RequestObjectMetadata.require_signed(config)
     ]
   end
 

@@ -533,8 +533,12 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     test "FAPI policy rejects a PAR that carries no signed request object" do
       # FAPI 2.0 Message Signing §5.3.1: the profile mandates a signed request
       # object, so a plain PAR (parameters in the body, no `request`) is rejected
-      # at the PAR endpoint rather than stored as a plain pushed request.
-      put_config(request_object_policy: Policy.fapi_message_signing())
+      # at the PAR endpoint rather than stored as a plain pushed request. A
+      # required-request-object policy needs :client_jwks (enforced at boot).
+      put_config(
+        request_object_policy: Policy.fapi_message_signing(),
+        client_jwks: fn %{id: "confidential-1"} -> %{"keys" => []} end
+      )
 
       params = auth_params()
       credentials = Base.encode64("confidential-1:s3cr3t")
@@ -636,9 +640,11 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     test "rejects a signed request object when the client has no JWKS configured (fail closed)" do
       request_key = JOSE.JWK.generate_key({:ec, "P-256"})
 
-      # No :client_jwks configured: the request object has no key to verify
-      # against, so it is rejected rather than trusted.
-      put_config(request_object_policy: Policy.fapi_message_signing())
+      # The default (generic) policy permits a host with no :client_jwks (request
+      # objects are optional), but a request object that IS pushed still has no
+      # key to verify against, so it is rejected rather than trusted. (A policy
+      # that REQUIRES request objects without :client_jwks is rejected at boot;
+      # see AttestoPhoenix.ConfigTest.)
 
       request =
         signed_request_object(request_key, "confidential-1", request_claims(), %{

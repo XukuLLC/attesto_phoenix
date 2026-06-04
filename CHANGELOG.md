@@ -54,6 +54,20 @@ and PAR/JAR hardening. Requires `attesto ~> 0.6.13`.
   JWKS (a `:client_jwks` callback or an installed `:client_store`). An install
   without that capability now advertises `request_parameter_supported: false`
   instead of a JAR support it cannot honour.
+- The OAuth 2.0 Authorization Server Metadata document (RFC 8414) now advertises
+  the signed-request-object metadata (`require_signed_request_object` and
+  `request_object_signing_alg_values_supported`, RFC 9101 §10.5), matching the
+  OpenID Provider Metadata document so a FAPI client reading either sees
+  identical JAR support. Both documents derive it from the new conn-free
+  `AttestoPhoenix.AuthorizationServer.RequestObjectMetadata` (no more split,
+  drift-prone assembly).
+- `AttestoPhoenix.Config` now rejects at boot a `:request_object_policy` that
+  requires a signed request object (e.g. `Policy.fapi_message_signing/0`) when
+  no `:client_jwks` capability is configured. Such a config is unsatisfiable
+  (every authorization request would be rejected) and would otherwise advertise
+  the incoherent pair `request_parameter_supported: false` +
+  `require_signed_request_object: true`. Pair the policy with `:client_jwks`
+  (or an installed `:client_store`).
 
 ## [0.7.2] - 2026-06-03
 

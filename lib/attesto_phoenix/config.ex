@@ -318,6 +318,7 @@ defmodule AttestoPhoenix.Config do
   resolving to `nil` at request time.
   """
 
+  alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Callback
 
   # Only the plain required *values* are enforced by `struct!/2`. The required
@@ -438,7 +439,7 @@ defmodule AttestoPhoenix.Config do
           registration: module() | nil,
           claims_provider: module() | nil,
           client_auth_signing_algs: [String.t()] | nil,
-          request_object_policy: Attesto.RequestObject.Policy.t() | nil,
+          request_object_policy: Policy.t() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
           on_event: callback() | nil,
@@ -537,7 +538,7 @@ defmodule AttestoPhoenix.Config do
       config
       | client_auth_signing_algs:
           config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs(),
-        request_object_policy: config.request_object_policy || %Attesto.RequestObject.Policy{}
+        request_object_policy: config.request_object_policy || %Policy{}
     }
   end
 
@@ -1022,10 +1023,30 @@ defmodule AttestoPhoenix.Config do
   # rather than crashing later in `RequestObject.Policy.to_verify_opts/1` when a
   # PAR or /authorize request is verified. `apply_defaults/1` has already
   # replaced a `nil` with `%Attesto.RequestObject.Policy{}`.
-  defp validate_request_object_policy!(%__MODULE__{
-         request_object_policy: %Attesto.RequestObject.Policy{}
-       }),
-       do: :ok
+  defp validate_request_object_policy!(
+         %__MODULE__{request_object_policy: %Policy{} = policy} = config
+       ) do
+    # A policy that REQUIRES a signed request object (FAPI 2.0 Message Signing
+    # §5.3.1) is unsatisfiable without a way to resolve the client's trusted
+    # JWKS: every authorization request would be rejected (one carrying no
+    # request object fails the policy; one carrying a request object fails
+    # verification for want of keys). Fail fast at boot rather than deploy an OP
+    # that rejects every request - and that would otherwise advertise the
+    # incoherent pair `request_parameter_supported: false` +
+    # `require_signed_request_object: true`.
+    if Policy.require_request_object?(policy) and
+         is_nil(client_jwks_fun(config)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: a :request_object_policy that requires a signed " <>
+              "request object (e.g. Attesto.RequestObject.Policy.fapi_message_signing/0) " <>
+              "needs a way to resolve a client's trusted JWKS to verify it. Add a " <>
+              "`client_jwks: &MyApp.AuthZ.client_jwks/1` callback (or install a " <>
+              ":client_store module implementing AttestoPhoenix.ClientStore.client_jwks/1), " <>
+              "or relax the policy (Attesto.RequestObject.Policy.generic/0)."
+    end
+
+    :ok
+  end
 
   defp validate_request_object_policy!(%__MODULE__{request_object_policy: other}) do
     raise ArgumentError,

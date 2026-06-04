@@ -349,14 +349,37 @@ defmodule AttestoPhoenix.ConfigTest do
     end
 
     test "accepts an Attesto.RequestObject.Policy" do
+      # A policy that requires a signed request object needs :client_jwks; pair
+      # them so the config is valid (see the boot-rejection test below).
       policy = Policy.fapi_message_signing()
-      assert config(request_object_policy: policy).request_object_policy == policy
+
+      built =
+        config(request_object_policy: policy, client_jwks: fn _ -> %{"keys" => []} end)
+
+      assert built.request_object_policy == policy
     end
 
     test "rejects a non-Policy value at boot" do
       assert_raise ArgumentError, ~r/:request_object_policy must be an/, fn ->
         config(request_object_policy: :fapi)
       end
+    end
+
+    test "rejects a required-request-object policy without :client_jwks at boot" do
+      # An unsatisfiable config: every authorization request would be rejected
+      # (one with no request object fails the policy; one with a request object
+      # fails verification for want of keys). Fail fast rather than deploy it.
+      assert_raise ArgumentError, ~r/needs a way to resolve a client's trusted JWKS/, fn ->
+        config(request_object_policy: Policy.fapi_message_signing())
+      end
+    end
+
+    test "accepts a required-request-object policy when :client_jwks resolves via :client_store" do
+      # The capability may come from an installed :client_store, not only a flat
+      # :client_jwks callback.
+      built = config(request_object_policy: Policy.fapi_message_signing(), client_store: FullStore)
+
+      assert built.request_object_policy == Policy.fapi_message_signing()
     end
   end
 end
