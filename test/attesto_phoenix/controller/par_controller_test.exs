@@ -79,6 +79,10 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       end,
       load_principal: fn _ -> {:error, :not_found} end,
       client_id: fn client -> client.id end,
+      # RFC 9126 §2.1 step 3: the PAR endpoint validates the pushed request as
+      # the authorization endpoint would, so the client's registered redirect
+      # URIs must resolve for the exact-match check (RFC 6749 §3.1.2.3).
+      client_redirect_uris: fn _client -> ["https://client.example/cb"] end,
       par_store: PARStore,
       par_ttl: 45,
       replay_check: fn _key, _ttl -> :ok end,
@@ -658,6 +662,8 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       "redirect_uri" => "https://client.example/cb",
       "response_type" => "code",
       "scope" => "openid",
+      "code_challenge" => "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      "code_challenge_method" => "S256",
       "nbf" => now,
       "exp" => now + 300
     }
@@ -686,7 +692,11 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       "response_type" => "code",
       "scope" => "openid profile",
       "state" => "state-123",
-      "nonce" => "nonce-123"
+      "nonce" => "nonce-123",
+      # PKCE is required (RFC 7636 / RFC 9700 §2.1.1); the PAR endpoint enforces
+      # it at push time, so a complete pushed request carries it.
+      "code_challenge" => "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      "code_challenge_method" => "S256"
     }
   end
 

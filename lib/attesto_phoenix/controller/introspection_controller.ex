@@ -9,10 +9,12 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   and renders the response - negotiating, by the `Accept` header, between the
   plain JSON response (RFC 7662 §2.2) and a signed JWT
   (`Attesto.SignedIntrospection`, `application/token-introspection+jwt`,
-  RFC 9701). No introspection policy lives here; activeness, claim selection,
-  and the no-existence-oracle discipline are all the core's (`Attesto.Token`
-  signature/temporal/audience verification for access tokens, the
-  `Attesto.RefreshStore` for refresh tokens).
+  RFC 9701). No introspection policy is decided here: activeness, claim
+  selection, and the no-existence-oracle discipline are all the core's
+  (`Attesto.Token` signature/temporal/audience verification for access tokens,
+  the `Attesto.RefreshStore` for refresh tokens). The endpoint only captures the
+  authenticated caller and hands the host's optional `:introspection_authorize`
+  policy (RFC 7662 §4 / RFC 9701 §5) to the core, which enforces it fail-closed.
 
   ## Client authentication (RFC 7662 §2.1)
 
@@ -41,7 +43,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
 
   alias Attesto.Introspection
   alias Attesto.SignedIntrospection
-  alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext}
   alias AttestoPhoenix.ClientAuthentication.Policy
 
   # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
@@ -89,7 +91,8 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     response =
       Introspection.introspect(protocol_config, token,
         refresh_store: refresh_store(config),
-        token_type_hint: token_type_hint(params)
+        token_type_hint: token_type_hint(params),
+        authorize: caller_authorize(config, client_id)
       )
 
     if signed_response_requested?(conn) do
@@ -160,6 +163,19 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
 
   defp refresh_store(%Config{}), do: @default_refresh_store
 
+  # RFC 7662 §4 / RFC 9701 §5: build the core's caller-authorization predicate
+  # from the host's optional `:introspection_authorize` callback, capturing the
+  # authenticated caller's client_id. When the host configures none, no
+  # predicate is passed and every authenticated caller may introspect any token
+  # (the single-trust-domain default). The core treats a non-`true` return or a
+  # raise as unauthorized (fail closed) and downgrades the response to inactive.
+  defp caller_authorize(%Config{} = config, client_id) do
+    case Callback.config_callback(config, :introspection_authorize) do
+      nil -> nil
+      callback -> fn response -> Callback.invoke(callback, [client_id, response]) end
+    end
+  end
+
   defp check_https(conn, config) do
     case RequestContext.check_https(conn, config) do
       :ok -> :ok
@@ -181,7 +197,12 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
 
     # Return the full Result; the caller reads the authenticated client_id (the
     # RFC 9701 audience) from it.
-    ClientAuthentication.authenticate(get_req_header(conn, "authorization"), params, config, policy)
+    ClientAuthentication.authenticate(
+      get_req_header(conn, "authorization"),
+      params,
+      config,
+      policy
+    )
   end
 
   defp render_error(conn, %OAuthError{} = err) do

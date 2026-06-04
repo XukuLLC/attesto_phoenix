@@ -51,6 +51,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   alias Attesto.DPoP.ReplayCache
   alias Attesto.RequestObject
   alias AttestoPhoenix.AuthorizationServer.PAR.Request
+  alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.{Callback, Config, OAuthError}
 
   @typedoc """
@@ -103,6 +104,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     # (RFC 9101 §6.3) before DPoP reconciliation: a signed `dpop_jkt` must be the
     # value the presented proof is checked against, never an unsigned body value.
     with {:ok, params} <- verify_request_object(config, client, params),
+         :ok <- validate_pushed_request(config, client, params),
          {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params) do
       stored =
         params
@@ -119,6 +121,48 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
       end
     end
   end
+
+  # RFC 9126 §2.1 step 3: validate the pushed request as the authorization
+  # endpoint would - the request `redirect_uri` must exactly match one of the
+  # client's registered URIs (RFC 6749 §3.1.2.3), the `response_type`/PKCE/
+  # `response_mode` must be valid - so an invalid request is refused early here
+  # rather than only when the `request_uri` is later resolved at /authorize. The
+  # `RequestPolicy` resolvers are shared with the authorization endpoint so both
+  # validate identically. The signed `request` object, already verified and
+  # merged into `params` above, is dropped before validation so it is not
+  # re-verified (its parameters are already authoritative). Every PAR error is a
+  # direct response (RFC 9126 §2.3), never a redirect, so a redirectable
+  # classification is flattened to its OAuth error code.
+  defp validate_pushed_request(config, client, params) do
+    case RequestPolicy.validate(config, client, Map.delete(params, "request")) do
+      {:ok, _request} -> :ok
+      {:error, reason} -> {:error, par_validation_error(reason)}
+    end
+  end
+
+  # OIDC Core §3.1.2.6 classifies a redirect_uri/client_id failure as
+  # non-redirectable; at the PAR endpoint there is no redirect either way, so
+  # both the direct and the (would-be) redirect classifications collapse to a
+  # direct RFC 6749 §5.2 error response, preserving the error code the
+  # authorization endpoint would have surfaced.
+  defp par_validation_error({:direct, reason}) do
+    error(@error_invalid_request, "invalid authorization request: #{reason}")
+  end
+
+  defp par_validation_error({:redirect, %{error: code, error_description: description}}) do
+    OAuthError.new(validation_code_atom(code), description, status: 400)
+  end
+
+  # The RFC 6749 §4.1.2.1 / §5.2 error codes `Attesto.AuthorizationRequest`
+  # raises for a redirectable failure, mapped to the atoms `OAuthError` expects.
+  # An unrecognised code falls back to `invalid_request` (the §5.2 catch-all).
+  defp validation_code_atom("invalid_request"), do: :invalid_request
+  defp validation_code_atom("invalid_request_object"), do: :invalid_request_object
+  defp validation_code_atom("invalid_scope"), do: :invalid_scope
+  defp validation_code_atom("unsupported_response_type"), do: :unsupported_response_type
+  defp validation_code_atom("request_not_supported"), do: :request_not_supported
+  defp validation_code_atom("request_uri_not_supported"), do: :request_uri_not_supported
+  defp validation_code_atom(_other), do: :invalid_request
 
   # RFC 9449: bind the pushed request to a DPoP proof when one is presented.
   # No proof keeps any submitted `dpop_jkt` parameter as-is (proof of possession

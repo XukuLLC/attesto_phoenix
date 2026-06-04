@@ -107,6 +107,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias Attesto.AuthorizationRequest
   alias Attesto.JARM
   alias Attesto.Secret
+  alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
 
   require Logger
@@ -121,9 +122,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   @error_consent_required "consent_required"
   @error_interaction_required "interaction_required"
 
-  # OIDC Core §3.1.2.1: the reserved scope value marking an OpenID Connect
-  # Authentication Request, and the two `prompt` values this controller acts on.
-  @openid_scope "openid"
+  # OIDC Core §3.1.2.1: the two `prompt` values this controller acts on.
   @prompt_none "none"
   @prompt_login "login"
 
@@ -204,13 +203,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # is never subject to the requirement (RFC 6749 keeps the code at SHOULD), so
   # the flag is scoped to OIDC requests via `openid_request?/1`.
   defp validate_request(config, client, params, par_resolved?) do
-    registered = registered_redirect_uris(config, client)
-
     with {:ok, request} <-
            AuthorizationRequest.validate(params,
-             registered_redirect_uris: registered,
-             require_nonce: require_nonce?(config, params),
-             require_pkce: require_pkce?(config, client),
+             registered_redirect_uris: RequestPolicy.registered_redirect_uris(config, client),
+             require_nonce: RequestPolicy.require_nonce?(config, params),
+             require_pkce: RequestPolicy.require_pkce?(config, client),
              request_object_jwks: client_jwks(config, client),
              request_object_audience: config.issuer,
              request_object_policy: config.request_object_policy
@@ -279,51 +276,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
   end
 
-  # RFC 7636 / RFC 9700 §2.1.1: PKCE is required by default. A public client MUST
-  # always use PKCE; a confidential client MAY be exempted, but only when the
-  # host explicitly opts out via `require_pkce: false` (e.g. for an OIDC Basic
-  # profile flow). Fail closed: absent the opt-out, PKCE is required.
-  defp require_pkce?(config, client) do
-    # Public clients MUST use PKCE (RFC 9700 §2.1.1) - `client_public?` forces it
-    # regardless of config. For a confidential client the global `:require_pkce`
-    # policy applies (default `true`); a host relaxes it for confidential clients
-    # only by setting `require_pkce: false` on `AttestoPhoenix.Config`.
-    client_public?(config, client) or Callback.config_flag(config, :require_pkce)
-  end
-
-  # The host's `:client_public?` callback classifies the client. Absent the
-  # callback, fail closed by treating the client as public, so PKCE stays
-  # required (a confidential exemption demands a deliberate host classification).
-  defp client_public?(config, client) do
-    case Config.client_public_fun(config) do
-      nil -> true
-      callback -> Callback.invoke(callback, [client]) == true
-    end
-  end
-
-  # OIDC Core §3.1.2.1: only an OpenID Connect Authentication Request (one whose
-  # `scope` contains the reserved `openid` value) can be subject to the nonce
-  # requirement. The scope is re-derived from the raw params here because the
-  # normalized request does not exist yet (it is the output of `validate/2`);
-  # `Attesto.Scope.valid_token?/1`-level validation is the core's job, so this
-  # only splits on whitespace to look for `openid`.
-  defp require_nonce?(config, params) do
-    Callback.config_flag(config, :require_nonce) and openid_request?(params)
-  end
-
-  defp openid_request?(params) do
-    case Map.get(params, "scope") do
-      value when is_binary(value) -> @openid_scope in String.split(value, " ", trim: true)
-      _ -> false
-    end
-  end
-
-  defp registered_redirect_uris(config, client) do
-    case Callback.invoke(Config.client_redirect_uris_fun(config), [client], []) do
-      uris when is_list(uris) -> uris
-      _ -> []
-    end
-  end
+  # The per-request validation policy (registered redirect URIs, PKCE, nonce) is
+  # resolved by the conn-free `AttestoPhoenix.AuthorizationServer.RequestPolicy`,
+  # shared with the PAR endpoint so both validate an authorization request the
+  # same way (RFC 9126 §2.1).
 
   # ── Authenticate, consent, issue (RFC 6749 §4.1.1 / OIDC Core §3.1.2.3) ───
 

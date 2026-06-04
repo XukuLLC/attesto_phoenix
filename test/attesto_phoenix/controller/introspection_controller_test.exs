@@ -146,6 +146,51 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     end
   end
 
+  describe "create/2 :introspection_authorize caller policy (RFC 7662 §4 / RFC 9701 §5)" do
+    test "a callback that rejects the caller downgrades to active:false", %{config: config} do
+      # Reject every caller: an otherwise-active token must read inactive so a
+      # caller not entitled to it learns nothing.
+      opts =
+        Keyword.put(config_opts(), :introspection_authorize, fn _caller, _response -> false end)
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn = call(%{"token" => access_token(config)})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
+
+    test "the callback receives the authenticated caller and the response", %{config: config} do
+      test_pid = self()
+
+      authorize = fn caller, response ->
+        send(test_pid, {:authorize, caller, response["aud"]})
+        true
+      end
+
+      opts = Keyword.put(config_opts(), :introspection_authorize, authorize)
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn = call(%{"token" => access_token(config)})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body)["active"] == true
+      assert_received {:authorize, @client_id, "https://issuer.test"}
+    end
+
+    test "the callback is not consulted for an inactive token", %{config: _config} do
+      authorize = fn _caller, _response -> raise "should not be called for an inactive token" end
+      opts = Keyword.put(config_opts(), :introspection_authorize, authorize)
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn = call(%{"token" => "not-a-real-token"})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
+  end
+
   describe "create/2 signed responses (RFC 9701)" do
     test "Accept: token-introspection+jwt returns a signed JWT response", %{config: config} do
       conn = call(%{"token" => access_token(config)}, [{"accept", @signed_media_type}])

@@ -85,6 +85,10 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
     required_fields()
     |> Keyword.merge(
       client_id: fn client -> Map.get(client, :id) end,
+      # RFC 9126 §2.1 step 3: the PAR endpoint validates the pushed request as
+      # the authorization endpoint would, so the client's registered redirect
+      # URIs must be resolvable for the exact-match check (RFC 6749 §3.1.2.3).
+      client_redirect_uris: fn _client -> ["https://client.example/cb"] end,
       par_store: Store,
       par_ttl: 45,
       replay_check: fn _key, _ttl -> :ok end
@@ -110,7 +114,11 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
       "client_id" => "confidential-1",
       "redirect_uri" => "https://client.example/cb",
       "response_type" => "code",
-      "scope" => "openid profile"
+      "scope" => "openid profile",
+      # PKCE is required (RFC 7636 / RFC 9700 §2.1.1); the PAR endpoint now
+      # enforces it at push time, so a complete pushed request carries it.
+      "code_challenge" => "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      "code_challenge_method" => "S256"
     }
   end
 
@@ -265,6 +273,43 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
 
       assert {:error, %OAuthError{error: :invalid_dpop_proof, status: 400}} =
                PAR.store(config, req)
+    end
+  end
+
+  describe "authorization-request validation (RFC 9126 §2.1 step 3)" do
+    test "rejects a pushed request whose redirect_uri is not registered" do
+      config = config()
+      params = Map.put(base_params(), "redirect_uri", "https://attacker.example/cb")
+
+      assert {:error, %OAuthError{error: :invalid_request, status: 400}} =
+               PAR.store(config, request(params: params))
+    end
+
+    test "rejects a pushed request missing PKCE (RFC 7636 / RFC 9700 §2.1.1)" do
+      config = config()
+
+      params =
+        base_params() |> Map.delete("code_challenge") |> Map.delete("code_challenge_method")
+
+      assert {:error, %OAuthError{error: :invalid_request, status: 400}} =
+               PAR.store(config, request(params: params))
+    end
+
+    test "rejects a pushed request with an unsupported response_type" do
+      config = config()
+      params = Map.put(base_params(), "response_type", "token")
+
+      assert {:error, %OAuthError{error: :unsupported_response_type, status: 400}} =
+               PAR.store(config, request(params: params))
+    end
+
+    test "the validation is not deferred: an invalid request never reaches the store" do
+      config = config()
+      params = Map.put(base_params(), "redirect_uri", "https://attacker.example/cb")
+
+      assert {:error, %OAuthError{}} = PAR.store(config, request(params: params))
+      # No request_uri was minted, so nothing could have been persisted.
+      assert Store.lookup("urn:ietf:params:oauth:request_uri:anything") == :error
     end
   end
 

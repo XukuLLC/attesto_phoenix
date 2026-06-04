@@ -6,6 +6,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-06-04
+
+The FAPI 2.0 Message Signing endpoints on the Phoenix layer: signed
+authorization responses (JARM), the RFC 7662 / RFC 9701 introspection endpoint,
+and PAR/JAR hardening. Requires `attesto ~> 0.6.13`.
+
+### Added
+
+- `POST /oauth/introspect` — OAuth 2.0 Token Introspection (RFC 7662) with the
+  RFC 9701 signed-JWT response (FAPI 2.0 Message Signing §5.5). Authenticates
+  the caller through the shared `AttestoPhoenix.ClientAuthentication` core
+  (`client_secret_basic`/`client_secret_post`/`private_key_jwt`), introspects
+  via the conn-free `Attesto.Introspection`, and negotiates by `Accept` between
+  the plain JSON response and `application/token-introspection+jwt`.
+- `:introspection_authorize` Config callback `(caller_client_id, response ->
+  boolean)` — authorizes the authenticated introspection caller against the
+  token (RFC 7662 §4 / RFC 9701 §5). Consulted only for an active response;
+  a non-`true` return (or a raise) downgrades the response to
+  `%{"active" => false}` so a caller not entitled to the token learns nothing
+  about it. Optional — when unset, every authenticated caller may introspect
+  any token (the single-trust-domain default).
+- The authorization endpoint emits JARM (§5.4) responses for the JARM
+  `response_mode`s (`jwt`/`query.jwt`/`fragment.jwt`/`form_post.jwt`), and the
+  discovery documents advertise the supported `response_modes_supported`,
+  `authorization_signing_alg_values_supported`, the introspection endpoint, and
+  its signing-algorithm metadata.
+
+### Changed
+
+- The PAR endpoint now validates the pushed request as an authorization request
+  at push time (RFC 9126 §2.1 step 3): the request `redirect_uri` must exactly
+  match one of the client's registered URIs (RFC 6749 §3.1.2.3), and the
+  `response_type`/PKCE/`response_mode` must be valid, so an invalid request is
+  refused early rather than only when the `request_uri` is later resolved at
+  `/authorize`. The redirect-URI/PKCE/nonce policy is resolved by the new
+  conn-free `AttestoPhoenix.AuthorizationServer.RequestPolicy`, shared with the
+  authorization endpoint so both validate identically. **A host that mounts the
+  PAR endpoint must configure `:client_redirect_uris`** (the authorization
+  endpoint already required it).
+- `AttestoPhoenix.ClientAuthentication.Result.client_id` falls back to the
+  presented credential identifier so the signed-introspection audience (and the
+  PAR/token client identity) resolves without a separate `:client_id` callback.
+
 ## [0.7.2] - 2026-06-03
 
 ### Added

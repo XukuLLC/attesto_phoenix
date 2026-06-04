@@ -66,6 +66,17 @@ defmodule AttestoPhoenix.Config do
       Extracts the stored hash of the registration access token issued with a
       dynamic client (RFC 7592). Optional; when unset, DELETE requests fail
       closed.
+    * `:introspection_authorize` - `(caller_client_id, response -> boolean)`.
+      Authorizes the authenticated introspection caller against the token being
+      introspected (RFC 7662 §4 / RFC 9701 §5). Consulted only for an active
+      response; returning anything but `true` (or raising) downgrades the
+      response to `%{"active" => false}` so a caller not entitled to the token
+      learns nothing about it (FAPI: a regular client querying introspection is
+      a leakage risk). `response` is the RFC 7662 member map (carrying `aud`,
+      `client_id`, `sub`, `scope`, ...), letting the host match the token's
+      audience/scope against the calling protected resource. Optional - when
+      unset, every authenticated caller may introspect any token (the
+      single-trust-domain default).
     * `:principal_kinds` - non-empty list of `Attesto.PrincipalKind` values
       or a zero-arity callback returning that list, passed into the core token
       configuration.
@@ -347,6 +358,7 @@ defmodule AttestoPhoenix.Config do
     :register_client,
     :unregister_client,
     :client_registration_access_token_hash,
+    :introspection_authorize,
     :principal_kinds,
     :build_principal,
     :build_userinfo_claims,
@@ -439,6 +451,7 @@ defmodule AttestoPhoenix.Config do
           register_client: callback() | nil,
           unregister_client: callback() | nil,
           client_registration_access_token_hash: callback() | nil,
+          introspection_authorize: callback() | nil,
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
           build_principal: callback() | nil,
           build_userinfo_claims: callback() | nil,
