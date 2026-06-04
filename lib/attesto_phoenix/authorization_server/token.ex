@@ -722,8 +722,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     Config.to_attesto_config(config, principal_kinds_extra(config))
   end
 
-  defp principal_kinds_extra(config) do
-    case Callback.config_callback(config, :principal_kinds) do
+  # Read the field directly: it is declared `[PrincipalKind.t()] | callback() |
+  # nil`, so the list branch is reachable. (`config_callback/2` narrows its
+  # return to `callback() | nil`, under which the `is_list` guard cannot hold.)
+  defp principal_kinds_extra(%Config{principal_kinds: principal_kinds}) do
+    case principal_kinds do
       kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
       callback -> callback |> invoke([]) |> principal_kinds_kw()
     end

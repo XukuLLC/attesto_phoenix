@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Internal: `mix dialyzer` is clean again. `token.ex` resolves `:principal_kinds`
+  by reading the struct field directly (its type admits a list, unlike the
+  `callback() | nil` reader), and two fail-closed grant-pipeline clauses are
+  documented in `.dialyzer_ignore.exs`. No behaviour change.
+
 ## [0.7.3] - 2026-06-04
 
 The FAPI 2.0 Message Signing endpoints on the Phoenix layer: signed
