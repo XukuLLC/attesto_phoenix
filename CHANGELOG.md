@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-06-04
+
+Requires `attesto ~> 0.6.13`.
+
 ### Security / FAPI 2.0 conformance
 
 Closes four conformance gaps found by auditing the OpenID FAPI 2.0 test suite
