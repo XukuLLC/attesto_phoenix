@@ -6,6 +6,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-06-10
+
+Requires `attesto ~> 0.6.13`.
+
 ### Security
 
 - **PAR `request_uri` is now single-use (RFC 9126 §2.2 / FAPI 2.0).** The
