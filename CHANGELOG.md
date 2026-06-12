@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-06-12
+
+Requires `attesto ~> 0.6.13`.
+
+### Fixed
+
+- The token endpoint no longer short-circuits a missing PKCE `code_verifier` as
+  `invalid_request`. PKCE enforcement is challenge-based:
+  `Token.fetch_code_verifier/3` passes the verifier through to
+  `Attesto.AuthorizationCode.redeem/4`, which requires a matching verifier for a
+  challenge-bound code and collapses a missing OR mismatched verifier to a single
+  `invalid_grant` (RFC 7636 §4.6). The authorization/PAR endpoint still requires a
+  `code_challenge` for clients that must use PKCE (`RequestPolicy.require_pkce?/2`),
+  so a challenge-bound code is always issued. Matches the FAPI
+  ensure-pkce-code-verifier-required test (it expects `invalid_grant`).
+
 ## [0.7.5] - 2026-06-10
 
 Requires `attesto ~> 0.6.13`.

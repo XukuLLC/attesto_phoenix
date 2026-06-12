@@ -45,7 +45,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   """
 
   alias Attesto.{AuthorizationCode, IDToken, RefreshToken}
-  alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, Config, Event, OAuthError}
@@ -235,12 +234,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # ── Grant-state delegation (Attesto core) ────────────────────────────────
 
-  defp fetch_code_verifier(config, client, params) do
-    if RequestPolicy.require_pkce?(config, client) do
-      require_param(params, "code_verifier")
-    else
-      {:ok, optional_param(params, "code_verifier")}
-    end
+  # PKCE enforcement is challenge-based and belongs to the code, not the request:
+  # the authorization/PAR endpoint already requires a `code_challenge`
+  # (RequestPolicy.require_pkce?/2) for clients that must use PKCE, so the issued
+  # code carries one. `Attesto.AuthorizationCode.redeem/4` then requires a
+  # matching `code_verifier` and collapses a missing OR mismatched verifier to
+  # `invalid_grant` (RFC 7636 §4.6). So the verifier is passed through optionally
+  # rather than short-circuited here as `invalid_request`.
+  defp fetch_code_verifier(_config, _client, params) do
+    {:ok, optional_param(params, "code_verifier")}
   end
 
   defp redeem_code(config, client, code, verifier, redirect_uri, jkt) do

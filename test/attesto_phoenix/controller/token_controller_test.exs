@@ -549,7 +549,14 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
-    test "authorization_code without a code_verifier is rejected (PKCE mandatory)" do
+    test "authorization_code with a missing code_verifier fails as invalid_grant (RFC 7636 §4.6)" do
+      # PKCE enforcement is challenge-based in AuthorizationCode.redeem/4, not a
+      # request short-circuit: a verifier missing against a challenge-bound code
+      # (and an unknown code) both collapse to invalid_grant, never
+      # invalid_request - matching the FAPI ensure-pkce-code-verifier-required
+      # test (it expects invalid_grant).
+      put_config(code_store: ensure_started(Attesto.CodeStore.ETS))
+
       conn =
         post_token(%{
           "grant_type" => "authorization_code",
@@ -559,8 +566,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         })
 
       assert conn.status == 400
-      assert body(conn)["error"] == "invalid_request"
-      assert body(conn)["error_description"] =~ "code_verifier"
+      assert body(conn)["error"] == "invalid_grant"
     end
 
     test "confidential authorization_code may omit code_verifier when host relaxes PKCE" do
