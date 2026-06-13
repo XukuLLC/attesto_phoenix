@@ -15,8 +15,8 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   """
 
   alias Attesto.AuthorizationRequest
-  alias AttestoPhoenix.{Callback, Config}
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
+  alias AttestoPhoenix.{Callback, Config}
 
   @doc """
   Validate `params` as an authorization request for `client`, resolving the
