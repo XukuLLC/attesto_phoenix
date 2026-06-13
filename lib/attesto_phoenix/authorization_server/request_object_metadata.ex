@@ -20,7 +20,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestObjectMetadata do
 
   JAR support exists only when the host can resolve a client's trusted JWKS -
   a flat `:client_jwks` callback or an installed `:client_store` behaviour
-  (`Config.client_jwks_fun/1` resolves either). Absent that, no client can use a
+  (the config resolves either). Absent that, no client can use a
   request object, so the capability is not advertised.
   """
   @spec supported?(Config.t()) :: boolean()

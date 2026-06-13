@@ -88,9 +88,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
       {:error, %OAuthError{} = err} ->
         {:error, err, [denied_event(request, err)]}
-
-      {:error, %OAuthError{} = err, events} ->
-        {:error, err, events ++ [denied_event(request, err)]}
     end
   end
 

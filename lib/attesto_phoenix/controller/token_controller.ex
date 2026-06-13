@@ -7,7 +7,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   no-store cache headers (RFC 7234 §5.2), authenticates the client (RFC 6749
   §2.3), lifts the request and the relevant conn facts into a plain
   `AttestoPhoenix.AuthorizationServer.Token.Request`, calls the conn-free core
-  `AttestoPhoenix.AuthorizationServer.Token.issue/1`, emits the audit events the
+  `AttestoPhoenix.AuthorizationServer.Token.issue/2`, emits the audit events the
   core returns as data, and renders the RFC 6749 §5.1 success body or the
   RFC 6749 §5.2 error body. It carries no business-domain logic; every grant,
   claim, and policy decision lives in the core or behind a
