@@ -15,7 +15,23 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   alias Attesto.AuthorizationCode
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
+
+  # A PAR store that resolves (fetch) normally but whose single-use claim (take)
+  # always loses - simulating a concurrent completion (on another node) that
+  # consumed the reference first. Used to exercise the atomic single-use gate in
+  # `issue_and_redirect/6` without orchestrating a real race.
+  defmodule TakeLosesPARStore do
+    @moduledoc false
+    @behaviour AttestoPhoenix.PARStore
+
+    defdelegate put(request_uri, params, ttl_seconds), to: ETS
+    defdelegate fetch(request_uri), to: ETS
+
+    @impl true
+    def take(_request_uri), do: :error
+  end
 
   # A fixed S256 PKCE pair (RFC 7636 §4.2): the challenge is the
   # BASE64URL-no-pad encoding of SHA-256(verifier). Computed inline here (the
@@ -322,6 +338,37 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       query = location_query(conn)
       assert is_binary(query["code"])
       assert query["state"] == "xyz"
+    end
+
+    test "completion consumes the PAR request_uri (RFC 9126 single-use)" do
+      request_uri = "urn:ietf:params:oauth:request_uri:single-use"
+
+      put_config(require_pushed_authorization_requests: true, par_store: PARStore)
+      :ok = PARStore.put(request_uri, valid_params(), 60)
+
+      conn = call(%{"client_id" => @client_id, "request_uri" => request_uri})
+
+      assert conn.status == 302
+      assert is_binary(location_query(conn)["code"])
+      # The reference was claimed atomically at completion, so the store no longer
+      # holds it - a later presentation resolves nothing.
+      assert :error = PARStore.fetch(request_uri)
+    end
+
+    test "a lost single-use claim at completion redirects invalid_request_uri and issues no code" do
+      request_uri = "urn:ietf:params:oauth:request_uri:race-lost"
+
+      # fetch resolves (the request is validated and consent runs) but the atomic
+      # take loses - as if a concurrent completion consumed the reference first.
+      put_config(require_pushed_authorization_requests: true, par_store: TakeLosesPARStore)
+      :ok = TakeLosesPARStore.put(request_uri, valid_params(), 60)
+
+      conn = call(%{"client_id" => @client_id, "request_uri" => request_uri})
+
+      assert conn.status == 302
+      query = location_query(conn)
+      refute Map.has_key?(query, "code")
+      assert query["error"] == "invalid_request_uri"
     end
 
     test "ignores front-channel state outside a resolved PAR request" do

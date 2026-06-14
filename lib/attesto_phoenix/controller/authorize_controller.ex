@@ -117,6 +117,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   @error_access_denied "access_denied"
   @error_server_error "server_error"
 
+  # RFC 9126 §2.3: the PAR `request_uri` is no longer usable. Reported at
+  # completion (by redirect, the request is already validated) when the
+  # single-use claim is lost - a concurrent completion consumed the reference, or
+  # it expired during login/consent.
+  @error_invalid_request_uri "invalid_request_uri"
+
   # OIDC Core §3.1.2.6 error codes reported by redirect when prompt=none cannot
   # be satisfied without interaction.
   @error_login_required "login_required"
@@ -444,29 +450,45 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # (OAuth 2.0 Security BCP §4.13, §4.14). On success, redirect back to the
   # client with `code` (and `state`).
   defp issue_and_redirect(conn, config, client, request, subject, dpop_jkt) do
-    attrs =
-      %{
-        client_id: client_id(config, client),
-        redirect_uri: request.redirect_uri,
-        code_challenge: request.code_challenge,
-        code_challenge_method: request.code_challenge_method,
-        subject: subject_id(subject),
-        scope: request.scope,
-        family_id: generate_family_id(),
-        claims: code_claims(request, subject)
-      }
-      |> put_optional(:dpop_jkt, dpop_jkt)
+    # RFC 9126 §2.2: claim the PAR `request_uri` as the atomic single-use gate
+    # BEFORE issuing the code, so two concurrent completions (on any node) cannot
+    # each mint a code from one pushed request - exactly one wins the claim.
+    case claim_par_request_uri(conn, config) do
+      :ok ->
+        attrs =
+          %{
+            client_id: client_id(config, client),
+            redirect_uri: request.redirect_uri,
+            code_challenge: request.code_challenge,
+            code_challenge_method: request.code_challenge_method,
+            subject: subject_id(subject),
+            scope: request.scope,
+            family_id: generate_family_id(),
+            claims: code_claims(request, subject)
+          }
+          |> put_optional(:dpop_jkt, dpop_jkt)
 
-    case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
-      {:ok, code} ->
-        emit_code_issued(conn, config, client, request.scope)
-        emit_success(conn, config, request, code)
+        case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
+          {:ok, code} ->
+            emit_code_issued(conn, config, client, request.scope)
+            emit_success(conn, config, request, code)
 
-      {:error, reason} ->
-        # Issuance failing on a validated request is a server/config fault, not
-        # a client error (RFC 6749 §4.1.2.1 server_error). Do not leak detail.
-        Logger.error("authorization code issuance failed: #{inspect(reason)}")
-        emit_error(conn, config, request, @error_server_error)
+          {:error, reason} ->
+            # Issuance failing on a validated request is a server/config fault,
+            # not a client error (RFC 6749 §4.1.2.1 server_error). Do not leak
+            # detail.
+            Logger.error("authorization code issuance failed: #{inspect(reason)}")
+            emit_error(conn, config, request, @error_server_error)
+        end
+
+      :error ->
+        # RFC 9126 §2.2/§2.3: the single-use claim was lost - a concurrent
+        # completion already consumed this `request_uri`, or it expired during
+        # login/consent - so no second code is minted from it. The request is
+        # fully validated here (trusted redirect_uri), so report by redirect like
+        # the other completion-phase failures.
+        emit_failure(conn, config, @error_invalid_request_uri)
+        emit_error(conn, config, request, @error_invalid_request_uri)
     end
   end
 
@@ -599,13 +621,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # response parameters; under JARM `iss` rides inside the JWT (JARM §2.1), under
   # the query mode it is the RFC 9207 `iss` parameter (added in emit_response/6).
   defp emit_success(conn, config, request, code) do
-    # RFC 9126 §2.2 / FAPI 2.0: the PAR `request_uri` is one-time-use. It is
-    # resolved with a non-consuming `fetch` so the host can establish login and
-    # consent and re-enter `/authorize` with the same reference, but once a code
-    # is actually issued the reference is consumed, so a completed flow cannot be
-    # replayed within the remaining TTL.
-    consume_par_request_uri(conn, config)
-
+    # The PAR `request_uri` has already been claimed (consumed) atomically in
+    # `issue_and_redirect/6` before the code was issued (RFC 9126 §2.2), so the
+    # success response is just the redirect.
     emit_response(
       conn,
       config,
@@ -617,25 +635,41 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   # Stash the PAR reference (only when it actually resolved a stored request) so
-  # the success path can consume it; a non-PAR or unresolved request stashes
+  # the completion path can claim it; a non-PAR or unresolved request stashes
   # nothing.
   defp stash_par_request_uri(conn, uri, true) when is_binary(uri) and uri != "",
     do: Plug.Conn.put_private(conn, :attesto_par_request_uri, uri)
 
   defp stash_par_request_uri(conn, _uri, _par_resolved?), do: conn
 
-  # Consume the stashed PAR `request_uri` from the store (single-use). Best
-  # effort: a store without `take/1`, or an already-evicted entry, is a no-op -
-  # the code has already been issued.
-  defp consume_par_request_uri(conn, config) do
+  # Claim the stashed PAR `request_uri` as the atomic single-use gate, BEFORE the
+  # code is issued (RFC 9126 §2.2). It was resolved with a non-consuming `fetch`
+  # so the host could establish login/consent and re-enter `/authorize`, but
+  # completion consumes it exactly once via the store's atomic `take/1`: the
+  # single winner among any concurrent completions (on any node) gets `:ok` and
+  # issues a code; the rest get `:error` and issue nothing.
+  #
+  #   * `:ok` - won the claim, or not a PAR request (nothing to claim), or the
+  #     store does not implement the optional `take/1` (cannot enforce single
+  #     use; proceed best-effort, as before).
+  #   * `:error` - lost the claim: the reference was already consumed by a
+  #     concurrent completion, or expired during login/consent.
+  defp claim_par_request_uri(conn, config) do
     case conn.private[:attesto_par_request_uri] do
-      uri when is_binary(uri) and uri != "" ->
-        store = par_store(config)
-        if function_exported?(store, :take, 1), do: store.take(uri)
-        :ok
+      uri when is_binary(uri) and uri != "" -> claim_reference(par_store(config), uri)
+      _ -> :ok
+    end
+  end
 
-      _ ->
-        :ok
+  # Consume the reference via the store's atomic `take/1`. A store that does not
+  # implement the optional callback cannot enforce single use, so proceed
+  # best-effort (`:ok`); otherwise the `take` result IS the claim outcome
+  # (`{:ok, _}` won, `:error` lost).
+  defp claim_reference(store, uri) do
+    cond do
+      not function_exported?(store, :take, 1) -> :ok
+      match?({:ok, _}, store.take(uri)) -> :ok
+      true -> :error
     end
   end
 

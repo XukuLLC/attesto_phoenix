@@ -5,7 +5,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   Generates an Ecto migration that creates the persistence backing the
   Ecto-based stores ship with `attesto_phoenix`.
 
-  The migration creates four tables, named to match the runtime schemas
+  The migration creates five tables, named to match the runtime schemas
   exactly so a by-the-docs deploy installs tables the Ecto-backed stores can
   use without modification:
 
@@ -36,6 +36,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       as its PRIMARY KEY (`AttestoPhoenix.Schema.DPoPReplay`, RFC 9449,
       section 11.1). A row is the record that a given proof JWT has already been
       seen within its acceptance window.
+
+    * `attesto_pushed_authorization_requests` - the Pushed Authorization Request
+      store (`AttestoPhoenix.Schema.PushedAuthorizationRequest`, RFC 9126). Each
+      row maps a one-time `request_uri` reference (the PRIMARY KEY) to the stored,
+      validated authorization request `params` and the reference `expires_at`, so
+      a `request_uri` pushed to one node is resolvable on every node (FAPI 2.0
+      requires PAR).
 
   ## Usage
 
@@ -209,10 +216,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     # The base table names are fixed by the runtime schemas and MUST match them
     # exactly, or a by-the-docs deploy installs tables the stores cannot use:
     #
-    #   * AttestoPhoenix.Schema.Authorization -> "attesto_authorization_codes"
-    #   * AttestoPhoenix.Schema.RefreshToken  -> "attesto_refresh_tokens"
-    #   * AttestoPhoenix.Schema.DPoPReplay    -> "dpop_replays"
-    #   * AttestoPhoenix.Schema.DPoPNonce     -> "dpop_nonces"
+    #   * AttestoPhoenix.Schema.Authorization               -> "attesto_authorization_codes"
+    #   * AttestoPhoenix.Schema.RefreshToken                -> "attesto_refresh_tokens"
+    #   * AttestoPhoenix.Schema.DPoPReplay                  -> "dpop_replays"
+    #   * AttestoPhoenix.Schema.DPoPNonce                   -> "dpop_nonces"
+    #   * AttestoPhoenix.Schema.PushedAuthorizationRequest  -> "attesto_pushed_authorization_requests"
     #
     # The optional --table-prefix is the only thing the host may vary; the base
     # names are not host-configurable because the schemas hardcode them.
@@ -223,6 +231,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       refresh_tokens: table_name(prefix, "attesto_refresh_tokens"),
       dpop_nonces: table_name(prefix, "dpop_nonces"),
       dpop_replays: table_name(prefix, "dpop_replays"),
+      pushed_authorization_requests: table_name(prefix, "attesto_pushed_authorization_requests"),
       hash_size: @hash_column_size,
       jti_size: @jti_column_size,
       nonce_size: @nonce_column_size,
@@ -409,9 +418,27 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
       # Expiry sweeps scan by expires_at; replay decisions hit the primary key.
       create index(:<%= @dpop_replays %>, [:expires_at])
+
+      # Pushed Authorization Request store (RFC 9126), backing
+      # AttestoPhoenix.Schema.PushedAuthorizationRequest /
+      # AttestoPhoenix.Store.EctoPARStore. The one-time request_uri reference is
+      # the PRIMARY KEY, so resolution at /authorize (and the optional single-use
+      # take/1 = DELETE ... RETURNING) hits the primary key. The stored, validated
+      # request params live in a jsonb column; expires_at bounds the reference's
+      # life (RFC 9126 section 2.2) and is re-checked on read.
+      create table(:<%= @pushed_authorization_requests %>, primary_key: false) do
+        add :request_uri, :string, size: <%= @identifier_size %>, primary_key: true, null: false
+        add :params, :map, null: false
+        add :expires_at, :utc_datetime, null: false
+        add :inserted_at, :utc_datetime, null: false
+      end
+
+      # Expiry sweeps scan by expires_at; resolution hits the primary key.
+      create index(:<%= @pushed_authorization_requests %>, [:expires_at])
     end
 
     def down do
+      drop table(:<%= @pushed_authorization_requests %>)
       drop table(:<%= @dpop_replays %>)
       drop table(:<%= @dpop_nonces %>)
       drop table(:<%= @refresh_tokens %>)

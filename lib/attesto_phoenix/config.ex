@@ -150,7 +150,11 @@ defmodule AttestoPhoenix.Config do
       `:refresh_store` is configured.
     * `:code_store` - module implementing `Attesto.CodeStore`.
     * `:refresh_store` - module implementing `Attesto.RefreshStore`.
-    * `:par_store` - module implementing `AttestoPhoenix.PARStore`.
+    * `:par_store` - module implementing `AttestoPhoenix.PARStore`. Defaults to
+      the single-node `AttestoPhoenix.Store.PAR.ETS`; use
+      `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
+      deployment so a `request_uri` resolves on every node (FAPI 2.0 requires
+      PAR).
     * `:grant_types_supported` - grant types advertised/accepted by dynamic
       client registration.
     * `:token_endpoint_auth_methods_supported` - client authentication methods

@@ -211,6 +211,9 @@ if Code.ensure_loaded?(Igniter) do
           refresh_store: AttestoPhoenix.Store.EctoRefreshStore,
           nonce_store: AttestoPhoenix.Store.EctoNonceStore,
           replay_check: {AttestoPhoenix.Store.EctoReplayCheck, :check_and_record},
+          # PAR reference store (RFC 9126). Ecto-backed so a request_uri pushed to
+          # one node resolves on every node; FAPI 2.0 requires PAR.
+          par_store: AttestoPhoenix.Store.EctoPARStore,
           # Periodic expiry sweep of the Ecto stores (AttestoPhoenix.Store.Sweeper).
           sweep_interval_ms: 60_000,
           # Sender-constraint and transport defaults (additive; reproduce the

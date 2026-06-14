@@ -1,8 +1,8 @@
 defmodule AttestoPhoenix.Store.Sweeper do
   @moduledoc """
   Optional periodic housekeeping `GenServer` that deletes expired rows from the
-  Ecto-backed authorization-code, refresh-token, DPoP-nonce, and DPoP-replay
-  tables.
+  Ecto-backed authorization-code, refresh-token, DPoP-nonce, DPoP-replay, and
+  pushed-authorization-request tables.
 
   Each of these tables carries an `expires_at` column whose semantics are fixed
   by the relevant RFC:
@@ -17,6 +17,8 @@ defmodule AttestoPhoenix.Store.Sweeper do
     * DPoP proof `jti` replay records - RFC 9449 §11.1 (a `jti` need only be
       remembered for the proof `iat` acceptance window; past that window the
       record is dead weight).
+    * pushed authorization requests - RFC 9126 §2.2 (a `request_uri` reference is
+      short-lived; past its expiry it can resolve nothing).
 
   ## Correctness vs. housekeeping
 
@@ -77,6 +79,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
   @refresh_tokens "attesto_refresh_tokens"
   @dpop_nonces "dpop_nonces"
   @dpop_replays "dpop_replays"
+  @pushed_authorization_requests "attesto_pushed_authorization_requests"
 
   @doc """
   Starts the sweeper.
@@ -152,12 +155,13 @@ defmodule AttestoPhoenix.Store.Sweeper do
       @authorization_codes => delete_expired(repo, expired_query(@authorization_codes, now), prefix),
       @refresh_tokens => delete_expired(repo, expired_query(@refresh_tokens, now), prefix),
       @dpop_nonces => delete_expired(repo, expired_query(@dpop_nonces, now), prefix),
-      @dpop_replays => delete_expired(repo, expired_query(@dpop_replays, now), prefix)
+      @dpop_replays => delete_expired(repo, expired_query(@dpop_replays, now), prefix),
+      @pushed_authorization_requests => delete_expired(repo, expired_query(@pushed_authorization_requests, now), prefix)
     }
   end
 
   # `from/2` requires a literal string source, so each generated table gets its
-  # own clause keyed off the compile-time module attribute. All four clauses are
+  # own clause keyed off the compile-time module attribute. All five clauses are
   # the identical strict `WHERE expires_at < $now` predicate.
   defp expired_query(@authorization_codes, now), do: from(r in @authorization_codes, where: r.expires_at < ^now)
 
@@ -166,6 +170,9 @@ defmodule AttestoPhoenix.Store.Sweeper do
   defp expired_query(@dpop_nonces, now), do: from(r in @dpop_nonces, where: r.expires_at < ^now)
 
   defp expired_query(@dpop_replays, now), do: from(r in @dpop_replays, where: r.expires_at < ^now)
+
+  defp expired_query(@pushed_authorization_requests, now),
+    do: from(r in @pushed_authorization_requests, where: r.expires_at < ^now)
 
   defp delete_expired(repo, query, prefix) do
     {deleted, _} = repo.delete_all(query, prefix: prefix)

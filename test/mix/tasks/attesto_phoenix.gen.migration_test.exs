@@ -33,21 +33,35 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
   end
 
   describe "run/1" do
-    test "generates a migration creating all four stores", %{tmp_dir: tmp_dir} do
+    test "generates a migration creating all five stores", %{tmp_dir: tmp_dir} do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
       # Table names MUST match the runtime schemas' table names exactly, or a
       # by-the-docs deploy installs tables the stores cannot use:
-      #   * AttestoPhoenix.Schema.Authorization -> attesto_authorization_codes
-      #   * AttestoPhoenix.Schema.RefreshToken  -> attesto_refresh_tokens
-      #   * AttestoPhoenix.Schema.DPoPNonce     -> dpop_nonces
-      #   * AttestoPhoenix.Schema.DPoPReplay    -> dpop_replays
+      #   * AttestoPhoenix.Schema.Authorization               -> attesto_authorization_codes
+      #   * AttestoPhoenix.Schema.RefreshToken                -> attesto_refresh_tokens
+      #   * AttestoPhoenix.Schema.DPoPNonce                   -> dpop_nonces
+      #   * AttestoPhoenix.Schema.DPoPReplay                  -> dpop_replays
+      #   * AttestoPhoenix.Schema.PushedAuthorizationRequest  -> attesto_pushed_authorization_requests
       assert source =~ ~s|use Ecto.Migration|
       assert source =~ ~s|create table(:attesto_authorization_codes|
       assert source =~ ~s|create table(:attesto_refresh_tokens|
       assert source =~ ~s|create table(:dpop_nonces|
       assert source =~ ~s|create table(:dpop_replays|
+      assert source =~ ~s|create table(:attesto_pushed_authorization_requests|
+    end
+
+    test "pushed_authorization_requests keys on request_uri as PK with a jsonb params column", %{tmp_dir: tmp_dir} do
+      run!([], tmp_dir)
+      source = generated_migration(tmp_dir)
+
+      # PushedAuthorizationRequest declares @primary_key {:request_uri, :string},
+      # so request_uri is the PRIMARY KEY; params is jsonb (:map); expires_at is
+      # indexed for sweeps.
+      assert source =~ ~s|add :request_uri, :string, size: 255, primary_key: true, null: false|
+      assert source =~ ~s|add :params, :map, null: false|
+      assert source =~ ~s|create index(:attesto_pushed_authorization_requests, [:expires_at])|
     end
 
     test "creates the unique constraints the schemas name", %{tmp_dir: tmp_dir} do

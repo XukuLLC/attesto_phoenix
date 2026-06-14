@@ -24,9 +24,10 @@ primitives, and the token-lifecycle building blocks.
   and the JARM JWT response modes.
 - Protected-resource plugs that verify Bearer JWTs and enforce DPoP / mTLS
   sender-constraint binding.
-- Ecto-backed implementations of the attesto store behaviours for authorization
-  codes, refresh tokens, and (for clustered deployments) DPoP nonces and proof
-  `jti` replay records.
+- Ecto-backed implementations of every mutable store the OAuth/OIDC flows need
+  — authorization codes, refresh tokens, DPoP nonces, DPoP proof `jti` replay
+  records, and Pushed Authorization Request (PAR) references — so a clustered or
+  load-balanced deployment keeps no OAuth state per node.
 
 It deliberately does **not** own your client registry, principal store, secret
 hashing, scope catalog, or audit log. Those are application policy and are
@@ -67,7 +68,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.7"}
+    {:attesto_phoenix, "~> 0.8"}
   ]
 end
 ```
@@ -78,7 +79,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.7"},
+    {:attesto_phoenix, "~> 0.8"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
@@ -292,11 +293,10 @@ an external client compatibility check.
 
 ## Database migration
 
-The library owns four operational tables backing the attesto store behaviours:
-`authorizations`, `refresh_tokens`, `dpop_nonces`, and `dpop_replays`. It does
-**not** own a clients table (that is yours, behind `:load_client`). The default
-PAR store is single-node ETS; clustered deployments should provide a
-`AttestoPhoenix.PARStore` backed by shared storage.
+The library owns five operational tables backing the attesto store behaviours:
+`attesto_authorization_codes`, `attesto_refresh_tokens`, `dpop_nonces`,
+`dpop_replays`, and `attesto_pushed_authorization_requests`. It does **not** own
+a clients table (that is yours, behind `:load_client`).
 
 Generate the migration into your app:
 
@@ -310,9 +310,33 @@ Then run it:
 mix ecto.migrate
 ```
 
-Single-node deployments may skip the Ecto nonce/replay tables and wire
-attesto's in-memory ETS implementations via `:nonce_store` and `:replay_check`;
-the Ecto variants exist for clustered correctness.
+### Clustering
+
+Every mutable OAuth store has a Postgres-backed implementation, so a clustered
+or load-balanced deployment holds no OAuth state per node — a request can bounce
+across machines mid-flow. Access tokens are stateless signed JWTs (any node
+validates any token against the shared keystore); everything else lives in
+Postgres with atomic single-use enforcement (`DELETE … RETURNING` for codes and
+PAR references, conditional `UPDATE` for nonces, `INSERT … ON CONFLICT` for the
+replay cache, transactional refresh rotation/family revocation).
+
+To be fully clusterable, wire the Ecto stores (the `mix attesto_phoenix.install`
+config block does this by default):
+
+```elixir
+code_store:    AttestoPhoenix.Store.EctoCodeStore,
+refresh_store: AttestoPhoenix.Store.EctoRefreshStore,
+nonce_store:   AttestoPhoenix.Store.EctoNonceStore,
+replay_check:  {AttestoPhoenix.Store.EctoReplayCheck, :check_and_record},
+par_store:     AttestoPhoenix.Store.EctoPARStore
+```
+
+Single-node deployments may instead leave the defaults (in-memory ETS for
+nonces, replay, and PAR); the Ecto variants exist for clustered correctness.
+**PAR is the one to watch**: its default is single-node ETS, but FAPI 2.0
+*requires* PAR, so a clustered FAPI deployment must set
+`par_store: AttestoPhoenix.Store.EctoPARStore` or a pushed `request_uri` will not
+resolve on the node that later handles `/authorize`.
 
 ## Guides and examples
 

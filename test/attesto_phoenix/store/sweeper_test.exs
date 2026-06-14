@@ -52,7 +52,8 @@ defmodule AttestoPhoenix.Store.SweeperTest do
     "attesto_authorization_codes",
     "attesto_refresh_tokens",
     "dpop_nonces",
-    "dpop_replays"
+    "dpop_replays",
+    "attesto_pushed_authorization_requests"
   ]
 
   defp valid_config(overrides) do
@@ -137,7 +138,8 @@ defmodule AttestoPhoenix.Store.SweeperTest do
         "attesto_authorization_codes" => 3,
         "attesto_refresh_tokens" => 1,
         "dpop_nonces" => 0,
-        "dpop_replays" => 7
+        "dpop_replays" => 7,
+        "attesto_pushed_authorization_requests" => 2
       })
 
       config = valid_config(sweep_interval_ms: 60_000)
@@ -149,7 +151,8 @@ defmodule AttestoPhoenix.Store.SweeperTest do
                "attesto_authorization_codes" => 3,
                "attesto_refresh_tokens" => 1,
                "dpop_nonces" => 0,
-               "dpop_replays" => 7
+               "dpop_replays" => 7,
+               "attesto_pushed_authorization_requests" => 2
              }
 
       swept = RecordingRepo.calls() |> Enum.map(& &1.table) |> Enum.sort()

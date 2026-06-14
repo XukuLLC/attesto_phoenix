@@ -6,6 +6,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-14
+
+Requires `attesto ~> 0.6.16`.
+
+### Added
+
+- **`AttestoPhoenix.Store.EctoPARStore` — a Postgres-backed Pushed Authorization
+  Request store (RFC 9126), closing the last per-node gap to a fully clusterable
+  authorization server.** PAR was the only mutable OAuth store without an Ecto
+  implementation: the default `AttestoPhoenix.Store.PAR.ETS` keeps the
+  `request_uri` → params mapping in per-node memory, so a reference pushed to one
+  node could not be resolved when `/authorize` landed on another — and FAPI 2.0
+  *requires* PAR. The new store persists each pushed request so any node resolves
+  a `request_uri` issued by any other, matching the code/refresh/nonce/replay
+  Ecto stores. `fetch/1` is non-consuming (the authorization endpoint may
+  re-enter after a login/consent detour); `take/1` is an atomic single-use
+  `DELETE … RETURNING`.
+  - New `AttestoPhoenix.Schema.PushedAuthorizationRequest` (table
+    `attesto_pushed_authorization_requests`, keyed on the `request_uri` primary
+    key, `params` as `jsonb`).
+  - `mix attesto_phoenix.gen.migration` now creates the fifth table, and
+    `mix attesto_phoenix.install` wires `par_store: …EctoPARStore` by default, so
+    a by-the-docs install is cluster-safe out of the box.
+  - `AttestoPhoenix.Store.Sweeper` now also reclaims expired PAR references.
+
+- **Atomic single-use of the PAR `request_uri` at completion.** The
+  authorization endpoint now claims the pushed reference with the store's atomic
+  `take/1` *before* issuing the code (it was previously consumed after issuance,
+  with the result ignored), so two concurrent completions — on one node or
+  across a cluster — can no longer each mint a code from one pushed request:
+  exactly one wins the claim; the loser is redirected `invalid_request_uri` and
+  issues nothing. Resolution still uses the non-consuming `fetch/1`, so a host
+  may establish login/consent and re-enter `/authorize` with the same reference.
+
+### Changed
+
+- README documents the clustering story end-to-end and the PAR caveat; the
+  `:par_store` config doc points at `EctoPARStore` for clustered/FAPI
+  deployments. The default `par_store` is unchanged (single-node ETS), so
+  existing single-node hosts are unaffected.
+
 ## [0.7.7] - 2026-06-13
 
 Requires `attesto ~> 0.6.16`.
