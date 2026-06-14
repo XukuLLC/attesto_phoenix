@@ -165,6 +165,14 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
     jar_alg_values = RequestObjectMetadata.signing_alg_values(config)
 
     [
+      # RFC 8414 §2: the authorization endpoint is REQUIRED whenever any
+      # supported grant type uses it (authorization_code does). The core builder
+      # derives only issuer/token_endpoint, so it MUST be supplied here or the
+      # RFC 8414 document silently omits it (and an OAuth client - e.g. the
+      # ChatGPT MCP connector - that reads this document rather than OpenID
+      # Discovery cannot run the code flow). Derived from the same path
+      # resolution as token_endpoint so the two can never diverge.
+      authorization_endpoint: Config.authorize_endpoint_url(config),
       response_types_supported: @response_types_supported,
       response_modes_supported: @response_modes_supported,
       grant_types_supported: @grant_types_supported,

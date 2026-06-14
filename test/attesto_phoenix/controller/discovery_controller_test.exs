@@ -76,6 +76,10 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
 
       assert conn.status == 200
       assert body["issuer"] == @issuer
+      # RFC 8414 §2: authorization_endpoint is REQUIRED for the code flow and
+      # must be present in the OAuth metadata, derived from the same path
+      # resolution as token_endpoint.
+      assert body["authorization_endpoint"] == "#{@issuer}/oauth/authorize"
       assert body["token_endpoint"] == "#{@issuer}/oauth/token"
       assert body["jwks_uri"] == "#{@issuer}/.well-known/jwks.json"
       assert "code" in body["response_types_supported"]

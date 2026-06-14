@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-14
+
+### Fixed
+
+- **The RFC 8414 `/.well-known/oauth-authorization-server` document now advertises
+  `authorization_endpoint`.** It was omitted entirely: `Attesto.Discovery` derives
+  only `issuer`/`token_endpoint`, and the controller's host-member list never
+  supplied `authorization_endpoint`, so the OAuth metadata silently lacked a field
+  RFC 8414 §2 requires for the authorization-code flow. An OAuth client that reads
+  this document rather than OpenID Discovery (e.g. the ChatGPT MCP connector)
+  therefore concluded the server "does not implement OAuth." It is now derived via
+  `Config.authorize_endpoint_url/1` — the same path resolution as `token_endpoint`,
+  so the two cannot diverge. (OpenID Discovery's `/.well-known/openid-configuration`
+  already advertised it.)
+
 ## [0.9.0] - 2026-06-14
 
 Requires `attesto ~> 0.7.0`.
