@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-06-13
+
+Requires `attesto ~> 0.6.16`.
+
+### Fixed
+
+- **Token endpoint finalizes the authorization code only after the full
+  response is built.** The `authorization_code` grant now calls
+  `Attesto.AuthorizationCode.finalize/3` (new in attesto 0.6.16) once the access
+  token, optional refresh token, and id_token have all been minted and recorded
+  successfully. Previously the reuse marker was set the moment the code
+  validated, so any later failure in the same request (a refresh-store write
+  error, an id_token mint fault, a host `build_principal` callback returning the
+  subject under the wrong key) left the code spent AND flagged as a successful
+  redemption — turning a legitimate client retry into a false reuse attack that
+  revoked the whole refresh-token family. A redemption that validates but fails
+  downstream is now a clean `invalid_grant` on replay.
+
 ## [0.7.6] - 2026-06-12
 
 Requires `attesto ~> 0.6.13`.

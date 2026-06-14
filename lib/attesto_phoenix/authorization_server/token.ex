@@ -157,13 +157,27 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, response} <- maybe_mint_id_token(config, client, grant, scope, code, response) do
       :ok = record_code_access_token(config, grant, response)
       issued = token_issued_event(request, scope, "authorization_code")
+
       # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
       # client can refresh without re-running the authorization flow. The
       # initial token is minted into the code's `family_id` (OAuth 2.0 Security
       # BCP §4.13) so a later replay of the same code, surfaced as
       # `{:error, {:reuse, meta}}` by `Attesto.AuthorizationCode.redeem/4`,
       # carries the `family_id` needed to revoke this exact descendant family.
-      maybe_issue_refresh_token(request, grant, scope, binding, response, [issued])
+      #
+      # Only on full success do we finalize the code (record the reuse marker).
+      # `redeem/4` claimed and validated the code but deferred that marker, so a
+      # failure ANYWHERE above (mint, refresh persistence, a host-callback fault)
+      # leaves the code spent-but-unfinalized: the client's retry is a clean
+      # `invalid_grant`, never a false reuse that would revoke the family.
+      case maybe_issue_refresh_token(request, grant, scope, binding, response, [issued]) do
+        {:ok, response, events} ->
+          :ok = AuthorizationCode.finalize(grant_store(config, :code_store), code, grant)
+          {:ok, response, events}
+
+        {:error, %OAuthError{}} = error ->
+          error
+      end
     end
   end
 
