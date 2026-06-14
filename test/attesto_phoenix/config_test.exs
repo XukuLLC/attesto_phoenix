@@ -421,4 +421,93 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.client_id_metadata_enabled?(config(client_id_metadata: [enabled: true]))
     end
   end
+
+  # Boot-time discovery-document safety guard (the "silent discovery mismatch"
+  # class of failure): `new/1` must fail fast rather than build a config that
+  # would serve a discovery document missing a required endpoint (RFC 8414 §2 /
+  # OpenID Connect Discovery §3) or advertising an endpoint the router does not
+  # mount.
+  describe "boot-time discovery validation: required endpoints (check #1)" do
+    test "a valid config still builds (every required endpoint resolves absolute)" do
+      built = config()
+
+      # The four required discovery members the library derives are all absolute.
+      assert Config.issuer(built) == "https://issuer.example"
+      assert Config.authorize_endpoint_url(built) =~ ~r{^https://issuer\.example/oauth/authorize$}
+      assert Config.token_endpoint_url(built) =~ ~r{^https://issuer\.example/oauth/token$}
+      assert Config.jwks_uri(built) =~ ~r{^https://issuer\.example/\.well-known/jwks\.json$}
+    end
+
+    test "a scheme-less :issuer raises (authorization_endpoint would be host-less)" do
+      # `URI.merge/2` on a scheme-less issuer yields a path-only, host-less
+      # endpoint URL - the discovery document would advertise an unresolvable
+      # `authorization_endpoint`/`token_endpoint`.
+      assert_raise ArgumentError, ~r/non-absolute|absolute URL/, fn ->
+        config(issuer: "issuer.example")
+      end
+    end
+
+    test "a path-only :issuer raises" do
+      assert_raise ArgumentError, ~r/absolute URL/, fn ->
+        config(issuer: "/oauth")
+      end
+    end
+
+    test "the raised message names the offending member and the issuer" do
+      message =
+        assert_raise(ArgumentError, fn -> config(issuer: "issuer.example") end).message
+
+      # `issuer` is validated first (it is the root cause of every host-less
+      # derived endpoint), so it is the member named.
+      assert message =~ "issuer"
+      assert message =~ "issuer.example"
+      assert message =~ "absolute URL"
+    end
+  end
+
+  describe "boot-time discovery validation: prefix vs override consistency (check #2)" do
+    test "the default prefix with no overrides builds" do
+      assert %Config{} = config()
+    end
+
+    test "a custom :oauth_path_prefix with endpoints derived from it builds" do
+      built = config(oauth_path_prefix: "/mcp/oauth")
+
+      assert Config.token_path(built) == "/mcp/oauth/token"
+      assert Config.par_path(built) == "/mcp/oauth/par"
+    end
+
+    test "a custom prefix with an override that stays under the prefix builds" do
+      # Renaming a tail but keeping the prefix is still mounted under the same
+      # tree, so it is allowed.
+      built = config(oauth_path_prefix: "/mcp/oauth", token_path: "/mcp/oauth/token2")
+
+      assert Config.token_path(built) == "/mcp/oauth/token2"
+    end
+
+    test "a custom prefix with an override that leaves the prefix raises" do
+      assert_raise ArgumentError, ~r/sits outside the configured :oauth_path_prefix/, fn ->
+        config(oauth_path_prefix: "/mcp/oauth", token_path: "/oauth/token")
+      end
+    end
+
+    test "the raised message names both the advertised path and the prefix-derived path" do
+      message =
+        assert_raise(ArgumentError, fn ->
+          config(oauth_path_prefix: "/mcp/oauth", token_path: "/elsewhere/token")
+        end).message
+
+      assert message =~ "/elsewhere/token"
+      assert message =~ "/mcp/oauth/token"
+      assert message =~ ":token_path"
+    end
+
+    test "an override on the DEFAULT prefix is allowed (documented per-endpoint override)" do
+      # With the default prefix the host has not declared a custom mount tree, so
+      # a single per-endpoint override is the documented feature, not a mismatch.
+      built = config(token_path: "/custom/token")
+
+      assert Config.token_path(built) == "/custom/token"
+    end
+  end
 end

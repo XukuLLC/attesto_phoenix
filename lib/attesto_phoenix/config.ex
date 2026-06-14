@@ -1085,7 +1085,154 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:registration_path, config.registration_path)
     validate_optional_path!(:userinfo_path, config.userinfo_path)
 
+    validate_discovery_endpoints!(config)
+    validate_advertised_paths_consistent!(config)
+
     config
+  end
+
+  # ── Boot-time discovery-document safety guard ────────────────────────────
+  #
+  # A discovery document that omits a required endpoint - or advertises an
+  # endpoint at a path the router does not mount - is a "silent" failure: the
+  # document still serializes and is served 200, but a conformant client reading
+  # it (RFC 8414 §2 for the OAuth metadata, OpenID Connect Discovery §3 for the
+  # OpenID configuration) is misdirected to a missing or wrong endpoint and the
+  # flow breaks with no error on the server. The motivating regression: the
+  # RFC 8414 document once omitted `authorization_endpoint` (RFC 8414 §2 REQUIRES
+  # it for the authorization-code flow) because the controller never supplied it,
+  # so an OAuth client that reads RFC 8414 rather than OpenID Discovery (the
+  # ChatGPT MCP connector) got a document missing a required endpoint. The two
+  # checks below promote that class of failure from "ships a broken document" to
+  # "fails fast at boot", matching how the required-key validation above already
+  # fails `new/1` with an `ArgumentError`.
+
+  # The discovery endpoints this library is responsible for deriving and that a
+  # conformant authorization-code / OpenID Provider discovery document MUST carry
+  # (RFC 8414 §2: `issuer`, `authorization_endpoint`, `token_endpoint`,
+  # `jwks_uri`; OpenID Connect Discovery §3 requires the same set). Each entry is
+  # `{member_name, resolver}` where the resolver derives the advertised value
+  # from this config; the library owns every one of them (they are derived from
+  # `:issuer` and the resolved endpoint paths), so every one MUST resolve to a
+  # non-nil absolute https/http URL or the document would silently omit or
+  # mis-advertise a required member.
+  @required_discovery_endpoints [
+    {"issuer", &__MODULE__.issuer/1},
+    {"authorization_endpoint", &__MODULE__.authorize_endpoint_url/1},
+    {"token_endpoint", &__MODULE__.token_endpoint_url/1},
+    {"jwks_uri", &__MODULE__.jwks_uri/1}
+  ]
+
+  @doc false
+  @spec issuer(t()) :: String.t() | nil
+  def issuer(%__MODULE__{issuer: issuer}), do: issuer
+
+  # Check #1: every required discovery endpoint must resolve to a non-nil
+  # absolute URL. Because all of them are derived from `:issuer` (directly, or
+  # via `URI.merge/2` with a resolved path), the realistic failure mode is an
+  # `:issuer` that is not an absolute URL with a scheme and host (e.g.
+  # `"issuer.example"` or `"/oauth"`): `URI.merge/2` then yields a path-only,
+  # host-less endpoint URL, and the discovery document advertises an endpoint a
+  # client cannot resolve. Validating the derived URLs (not just `:issuer`) also
+  # guards against any future regression where a resolver returns nil/empty.
+  defp validate_discovery_endpoints!(%__MODULE__{} = config) do
+    Enum.each(@required_discovery_endpoints, fn {member, resolver} ->
+      url = resolver.(config)
+
+      if not absolute_url?(url) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: the discovery document would advertise a missing " <>
+                "or non-absolute #{member} (#{inspect(url)}). RFC 8414 §2 / OpenID Connect " <>
+                "Discovery §3 require #{member} to be an absolute URL. This is almost always " <>
+                "an :issuer that is not an absolute https URL (got #{inspect(config.issuer)}); " <>
+                "set :issuer to the full origin, e.g. \"https://api.example\"."
+      end
+    end)
+  end
+
+  # An absolute URL for discovery purposes has both a scheme and a host. A
+  # path-only string (what `URI.merge/2` yields from a scheme-less issuer) has a
+  # nil host and is rejected.
+  defp absolute_url?(value) when is_binary(value) and value != "" do
+    case URI.parse(value) do
+      %URI{scheme: scheme, host: host} when is_binary(scheme) and is_binary(host) and host != "" -> true
+      _ -> false
+    end
+  end
+
+  defp absolute_url?(_), do: false
+
+  # The OAuth endpoint members whose advertised path the router mounts, paired
+  # with the resolver that yields the advertised path and the canonical tail the
+  # router appends under its own `/oauth` mount prefix. The well-known documents
+  # and `jwks_uri` are anchored at the host root (RFC 8615) and are NOT relocated
+  # by `:oauth_path_prefix`, so they are not in this set. The authorization
+  # endpoint is excluded because the host MAY serve it off-server via the
+  # `:authorization_endpoint` absolute-URL override (it runs the host login UI),
+  # which the router does not mount.
+  @mounted_oauth_endpoints [
+    {:token_path, &__MODULE__.token_path/1, @token_tail},
+    {:par_path, &__MODULE__.par_path/1, @par_tail},
+    {:revocation_path, &__MODULE__.revocation_path/1, @revocation_tail},
+    {:introspection_path, &__MODULE__.introspection_path/1, @introspection_tail},
+    {:registration_path, &__MODULE__.registration_path/1, @registration_tail},
+    {:userinfo_path, &__MODULE__.userinfo_path/1, @userinfo_tail}
+  ]
+
+  # Check #2: detect an `:oauth_path_prefix` vs explicit-override mismatch that
+  # the router provably cannot serve.
+  #
+  # The router macro (`AttestoPhoenix.Router.attesto_routes/1`) mounts EVERY
+  # OAuth endpoint at a single shared prefix - a compile-time `"/oauth" <> tail`
+  # joined under the macro's own `:prefix` option - so the mounted routes always
+  # share one common mount tree and each ends in its canonical tail. The router's
+  # macro `:prefix` is invisible at config-build time, so a full
+  # advertised-vs-mounted cross-check is impossible here (the override could be
+  # exactly where the host mounted the route by hand). What IS provable is the
+  # discovery document's INTERNAL consistency: the host having committed to a
+  # non-default `:oauth_path_prefix` (a deliberate "all my OAuth endpoints live
+  # under this prefix" statement) AND then advertising one endpoint OUTSIDE that
+  # prefix via an explicit per-endpoint override.
+  #
+  # We deliberately scope the check to a NON-DEFAULT `:oauth_path_prefix`. A
+  # per-endpoint override is a documented, legitimate feature (the integrator's
+  # "explicit endpoint overrides plus sane defaults"); flagging every override
+  # would break that contract and contradict "do not invent constraints". But
+  # once a host sets a custom prefix, an override that does not sit under it is
+  # the precise silent mismatch a downstream consumer hit: discovery advertises
+  # that endpoint under a different prefix than its siblings (and than the prefix
+  # the host declared), while the router mounts them all together, so a client is
+  # misdirected to a route that is not served. That divergence is provable from
+  # the config alone, so we raise.
+  @default_oauth_path_prefix "/oauth"
+
+  defp validate_advertised_paths_consistent!(%__MODULE__{oauth_path_prefix: @default_oauth_path_prefix}), do: :ok
+
+  defp validate_advertised_paths_consistent!(%__MODULE__{} = config) do
+    prefix = String.trim_trailing(to_string(config.oauth_path_prefix), "/")
+
+    Enum.each(@mounted_oauth_endpoints, fn {key, resolver, tail} ->
+      path = resolver.(config)
+      derived = join_path(config.oauth_path_prefix, tail)
+
+      # Consistent iff the advertised path is the prefix-derived path, or at
+      # least sits under the declared prefix (an override that merely renames the
+      # tail but keeps the prefix is still mounted under the same tree). A path
+      # that leaves the prefix entirely is the provable divergence.
+      under_prefix? = path == derived or String.starts_with?(path, prefix <> "/")
+
+      if not under_prefix? do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{inspect(key)} advertises #{inspect(path)}, which sits " <>
+                "outside the configured :oauth_path_prefix #{inspect(config.oauth_path_prefix)} " <>
+                "(the prefix-derived path is #{inspect(derived)}). The router mounts every OAuth " <>
+                "endpoint under one shared prefix, so an override that leaves that tree is " <>
+                "advertised at a path the router does not serve - the exact silent discovery " <>
+                "mismatch this guard prevents. Either drop the #{inspect(key)} override so the " <>
+                "endpoint derives from :oauth_path_prefix, or set :oauth_path_prefix to the prefix " <>
+                "you actually mount the routes under (and mount via `attesto_routes(prefix: ...)`)."
+      end
+    end)
   end
 
   # The required (non-optional) behaviour callbacks each installed

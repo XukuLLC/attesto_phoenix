@@ -6,7 +6,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.9.1] - 2026-06-14
+## [0.9.2] - 2026-06-14
+
+### Added
+
+- **Boot-time discovery-document safety guard.** `AttestoPhoenix.Config.new/1`
+  now validates, at config-build time (alongside the existing required-key
+  checks), that the discovery documents it will serve are internally consistent —
+  so a "silent discovery mismatch" (a document that omits a required endpoint or
+  advertises one the router does not mount, served 200 with no error) can no
+  longer ship. It raises `ArgumentError` with an actionable message for two
+  classes of failure:
+  - **A required discovery endpoint that would be missing or non-absolute.** The
+    RFC 8414 §2 / OpenID Connect Discovery §3 endpoints the library derives —
+    `issuer`, `authorization_endpoint`, `token_endpoint`, and `jwks_uri` — must
+    each resolve to an absolute URL (scheme + host). The realistic trigger is an
+    `:issuer` that is not an absolute https URL (e.g. `"issuer.example"`), which
+    `URI.merge/2` turns into host-less, unresolvable endpoint URLs; this is the
+    same class of failure as the 0.9.1 regression where the RFC 8414 document
+    silently omitted `authorization_endpoint`.
+  - **An `:oauth_path_prefix` vs explicit per-endpoint override mismatch.** When a
+    host declares a non-default `:oauth_path_prefix` (committing every OAuth
+    endpoint to one mount tree) but then sets a per-endpoint override
+    (`:token_path` and friends) that escapes that prefix, discovery would
+    advertise that endpoint at a path the router — which mounts every OAuth
+    endpoint under one shared prefix — does not serve. That provable divergence
+    now fails fast. A per-endpoint override on the default prefix, or one that
+    stays under the declared prefix, remains a supported feature.
 
 ### Fixed
 

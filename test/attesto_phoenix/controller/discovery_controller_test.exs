@@ -244,20 +244,29 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       assert body["jwks_uri"] == "#{@issuer}/.well-known/jwks.json"
     end
 
-    test "an explicit per-endpoint override wins over :oauth_path_prefix" do
+    test "an explicit per-endpoint override under the prefix wins over :oauth_path_prefix" do
       host =
         host_config(
           oauth_path_prefix: "/mcp/oauth",
-          par_path: "/custom/par",
+          par_path: "/mcp/oauth/custom-par",
           registration_enabled: true,
           register_client: fn _ -> {:error, :unsupported} end
         )
 
       body = call_show(host, protocol_config()) |> decode_body()
 
-      assert body["pushed_authorization_request_endpoint"] == "#{@issuer}/custom/par"
+      assert body["pushed_authorization_request_endpoint"] == "#{@issuer}/mcp/oauth/custom-par"
       # The unoverridden endpoint still follows the prefix.
       assert body["registration_endpoint"] == "#{@issuer}/mcp/oauth/register"
+    end
+
+    test "an override that leaves a custom :oauth_path_prefix fails fast at config build" do
+      # The boot-time discovery guard (AttestoPhoenix.Config) rejects an override
+      # that escapes the declared prefix: discovery would advertise the endpoint
+      # at a path the router does not mount - the silent discovery mismatch.
+      assert_raise ArgumentError, ~r/sits outside the configured :oauth_path_prefix/, fn ->
+        host_config(oauth_path_prefix: "/mcp/oauth", par_path: "/custom/par")
+      end
     end
 
     test "marks the response publicly cacheable (RFC 8414 §3)" do
