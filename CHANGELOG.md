@@ -65,7 +65,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   RFC 8414 §2 requires for the authorization-code flow. An OAuth client that reads
   this document rather than OpenID Discovery (e.g. the ChatGPT MCP connector)
   therefore concluded the server "does not implement OAuth." It is now derived via
-  `Config.authorize_endpoint_url/1` — the same path resolution as `token_endpoint`,
+  `authorize_endpoint_url/1` — the same path resolution as `token_endpoint`,
   so the two cannot diverge. (OpenID Discovery's `/.well-known/openid-configuration`
   already advertised it.)
 
