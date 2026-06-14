@@ -6,6 +6,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-06-14
+
+### Fixed
+
+- **A CIMD client no longer crashes a host `:authorize_scope` policy.** A Client
+  ID Metadata Document need not declare a `scope` member, so the metadata map
+  attesto hands the host policy callbacks carried no scope key at all. A scope
+  policy written for a registered client (reading `client.scopes`) raised
+  `KeyError` on it, 500-ing the token endpoint for an otherwise valid CIMD
+  authorization_code exchange (observed end-to-end against the ChatGPT MCP
+  connector). `host_client/1` now exposes the document's *declared* scopes — or
+  an empty set when the document omits `scope` — under the atom `:scopes` key, so
+  the callback reads an empty *declared* set instead of a missing key. The host
+  still owns what an empty set grants (typically the resource owner's consent).
+
+### Added
+
+- **`AttestoPhoenix.ClientIdMetadata.scopes/1`** — the public accessor for a CIMD
+  document's declared scopes (its space-delimited RFC 7591 §2 `scope` member as a
+  list; `[]` when absent), alongside the existing `client_id/1`, `redirect_uris/1`,
+  and `jwks/1` accessors.
+
 ## [0.9.1] - 2026-06-14
 
 ### Added

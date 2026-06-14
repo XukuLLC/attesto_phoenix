@@ -121,6 +121,25 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   def jwks(_client), do: nil
 
   @doc """
+  The scopes the CIMD document *declares*, as a list.
+
+  `draft-ietf-oauth-client-id-metadata-document-01` §7 carries the RFC 7591 §2
+  client-metadata field set, in which `scope` is an OPTIONAL, space-delimited
+  string. A document that omits it declares no scopes, so this returns `[]` — an
+  empty *declared* set, never a missing key. A CIMD client therefore has no
+  registered scope cap of its own; what an empty declared set grants is host
+  policy (typically the scopes the resource owner consents to).
+
+  This is the value `AttestoPhoenix.AuthorizationServer.Token` exposes to a host
+  `:authorize_scope` policy as `client.scopes`, so a callback written for a
+  registered client's scope list reads a CIMD client as an empty set instead of
+  raising `KeyError`.
+  """
+  @spec scopes(client()) :: [String.t()]
+  def scopes(%{"scope" => scope}) when is_binary(scope), do: String.split(scope)
+  def scopes(_client), do: []
+
+  @doc """
   Returns `true` iff `redirect_uri` is same-origin (scheme, host, and port) with
   the CIMD `client_id` URL (draft §2's optional same-origin tightening).
 

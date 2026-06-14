@@ -1612,6 +1612,44 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
       assert body(conn)["error_description"] == "client authentication failed"
     end
+
+    test "an authorization_code exchange runs :authorize_scope on a CIMD client with no scope member" do
+      enable_minting()
+
+      # A CIMD document that declares NO `scope` member (the ChatGPT MCP
+      # connector's document does exactly this), so the bare metadata map handed
+      # to the host policy callbacks carries no scope key at all.
+      CimdFetcher.script(@cimd_public_client_id, %{
+        "redirect_uris" => [@redirect_uri],
+        "token_endpoint_auth_method" => "none"
+      })
+
+      # A scope policy written for a registered client reads `client.scopes`,
+      # which would `KeyError` on the bare CIMD map (500-ing the token endpoint)
+      # without the host_client guard. It must instead see an empty declared set.
+      test_pid = self()
+
+      put_config(
+        code_store: cimd_code_store(["openid"]),
+        authorize_scope: fn client, requested ->
+          send(test_pid, {:authorize_scope_saw, client.scopes})
+          {:ok, requested}
+        end
+      )
+
+      conn =
+        post_token(%{
+          "grant_type" => "authorization_code",
+          "client_id" => @cimd_public_client_id,
+          "code" => Process.get(:auth_code),
+          "code_verifier" => @code_verifier,
+          "redirect_uri" => @redirect_uri
+        })
+
+      assert conn.status == 200
+      assert body(conn)["scope"] == "openid"
+      assert_receive {:authorize_scope_saw, []}
+    end
   end
 
   # ── Helpers ──────────────────────────────────────────────────────────────
@@ -1679,6 +1717,26 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         redirect_uri: @redirect_uri,
         scope: scope,
         subject: subject,
+        code_challenge: @code_challenge,
+        code_challenge_method: "S256"
+      })
+
+    Process.put(:auth_code, code)
+    store
+  end
+
+  # A code store whose stored grant is bound to the CIMD client_id URL, so the
+  # exchange resolves the CIMD document (public, none + PKCE) and runs the host
+  # policy callbacks against its metadata map.
+  defp cimd_code_store(scope) do
+    store = ensure_started(ETS)
+
+    {:ok, code} =
+      Attesto.AuthorizationCode.issue(store, %{
+        client_id: @cimd_public_client_id,
+        redirect_uri: @redirect_uri,
+        scope: scope,
+        subject: "oc_sub-1",
         code_challenge: @code_challenge,
         code_challenge_method: "S256"
       })

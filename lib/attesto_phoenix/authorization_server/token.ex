@@ -767,7 +767,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `draft-ietf-oauth-client-id-metadata-document-01` §7), with the internal
   # `{:cimd, _}` tag stripped, so a CIMD-aware host reads it like any client map.
   # A registered client passes through untouched.
-  defp host_client({:cimd, metadata}), do: metadata
+  #
+  # One guard: a CIMD document need NOT declare a `scope` member, so the bare map
+  # carries no scope key at all - and `:authorize_scope` fires on every token
+  # exchange, including the authorization_code grant a CIMD client actually uses.
+  # A scope policy written for a registered client reads `client.scopes`, which
+  # would `KeyError` on the bare map. Expose the document's *declared* scopes (or
+  # an empty set) under the atom `:scopes` key so that callback degrades to an
+  # empty set instead of raising; the host still owns what an empty set grants.
+  defp host_client({:cimd, metadata}) do
+    Map.put(metadata, :scopes, ClientIdMetadata.scopes(metadata))
+  end
+
   defp host_client(client), do: client
 
   # The `Attesto.CodeStore` / `Attesto.RefreshStore` backing each stateful
