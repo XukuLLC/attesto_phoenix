@@ -44,10 +44,10 @@ defmodule AttestoPhoenix.ClientIdMetadata.Fetcher.Req do
 
   ## Options
 
-    * `:resolver` - 2-arity fun `(charlist_host, :inet | :inet6) ->
-      {:ok, [:inet.ip_address()]} | {:error, term()}`. Defaults to
-      `:inet.getaddrs/2`. Injected by tests to exercise the SSRF guard and the
-      DNS-rebinding pin without real DNS.
+    * `:resolver` - a 2-arity DNS resolver
+      `(charlist_host, :inet | :inet6 -> {:ok, [:inet.ip_address()]} | {:error, term()})`.
+      Defaults to `:inet.getaddrs/2`. Injected by tests to exercise the SSRF
+      guard and the DNS-rebinding pin without real DNS.
     * `:allow_loopback` - when `true`, loopback addresses (`127.0.0.0/8`, `::1`)
       are permitted (the draft's "AS runs on loopback" exception). Default
       `false`.

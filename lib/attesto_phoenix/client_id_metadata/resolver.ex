@@ -65,7 +65,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   A reason `resolve/2` refused to produce a client. `:invalid_client_id` and
   `:blocked_host` are local policy failures (no network); `{:fetch, reason}`
   wraps a fetcher error; `:invalid_json` is an undecodable body; and a bare
-  `Attesto.ClientIdMetadata.document_error/0` is a validation failure.
+  `t:Attesto.ClientIdMetadata.document_error/0` is a validation failure.
   """
   @type error ::
           {:invalid_client_id, ClientIdMetadata.url_error()}
