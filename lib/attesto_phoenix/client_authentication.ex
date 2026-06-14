@@ -17,6 +17,21 @@ defmodule AttestoPhoenix.ClientAuthentication do
   OIDC Core §9). Presenting more than one client-authentication method is
   rejected (RFC 6749 §2.3).
 
+  ## Client ID Metadata Documents (CIMD)
+
+  When CIMD (`draft-ietf-oauth-client-id-metadata-document-01`) is enabled and
+  the presented `client_id` is a CIMD URL, the client is dereferenced from that
+  URL (`AttestoPhoenix.ClientIdMetadata`) rather than looked up in the host
+  registry. A CIMD client carries no shared symmetric secret (the document
+  validation strips `client_secret_*` and the symmetric auth methods), so it can
+  only authenticate as a **public client** (`none` + PKCE) or with
+  **`private_key_jwt`** keyed by the document's `jwks` / `jwks_uri`. The Basic /
+  body-secret paths therefore never resolve a CIMD client: a `client_secret`
+  presented for a CIMD `client_id` finds no secret to verify and fails with the
+  generic `invalid_client` message like any other failed authentication. CIMD
+  resolution is consulted only on the secretless (`none`) and `private_key_jwt`
+  paths, where the host registry would not hold the URL.
+
   ## Policy
 
   The one decision that differs between callers is carried as data on
@@ -58,7 +73,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   alias Attesto.ClientAssertion
   alias Attesto.DPoP.ReplayCache
-  alias AttestoPhoenix.{Callback, Config, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, OAuthError}
 
   defmodule Policy do
     @moduledoc """
@@ -340,6 +355,17 @@ defmodule AttestoPhoenix.ClientAuthentication do
     end
   end
 
+  # A CIMD client's `private_key_jwt` verification keys are the document's
+  # `jwks` / `jwks_uri` (RFC 7523 / OIDC Core §9), not the host's `:client_jwks`
+  # callback. A document that carried neither has no keys, so `private_key_jwt`
+  # is impossible for it and authentication fails closed.
+  defp client_jwks(_config, {:cimd, metadata}) do
+    case ClientIdMetadata.jwks(metadata) do
+      nil -> {:error, :missing_client_jwks}
+      jwks -> {:ok, jwks}
+    end
+  end
+
   defp client_jwks(config, client) do
     case Config.client_jwks_fun(config) do
       nil ->
@@ -393,10 +419,25 @@ defmodule AttestoPhoenix.ClientAuthentication do
     end
   end
 
+  # Resolve the client for the secretless (`none`) and `private_key_jwt` paths.
+  # A CIMD `client_id` (an HTTPS URL, with the feature enabled) is dereferenced
+  # to its metadata document and wrapped as `{:cimd, metadata}` so the
+  # public-client and jwks discriminators read the document directly; any opaque
+  # `client_id` (or any `client_id` while CIMD is off) goes to the host's
+  # `:load_client` registry unchanged. A CIMD resolution failure is reported as
+  # `:not_found`, identical to an unknown registry client, so the generic
+  # `invalid_client` message never reveals which path was taken.
   defp load_existing_client(config, client_id) do
-    case invoke(Config.load_client_fun(config), [client_id]) do
-      {:ok, client} -> {:ok, client}
-      _other -> {:error, :not_found}
+    if ClientIdMetadata.cimd_client_id?(client_id, config) do
+      case ClientIdMetadata.resolve(client_id, config) do
+        {:ok, metadata} -> {:ok, {:cimd, metadata}}
+        {:error, _reason} -> {:error, :not_found}
+      end
+    else
+      case invoke(Config.load_client_fun(config), [client_id]) do
+        {:ok, client} -> {:ok, client}
+        _other -> {:error, :not_found}
+      end
     end
   end
 
@@ -405,6 +446,12 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # public) when the host has not supplied the callback, so a deployment
   # that forgets it cannot accidentally let confidential clients
   # authenticate without a secret.
+  # A CIMD client holds no shared symmetric secret (the document validation
+  # strips `client_secret_*` and the symmetric auth methods), so it is a public
+  # client by construction - it relies on PKCE downstream. A registered client
+  # defers to the host's `:client_public?` discriminator.
+  defp client_public?(_config, {:cimd, _metadata}), do: true
+
   defp client_public?(config, client) do
     Callback.invoke(Config.client_public_fun(config), [client], false) == true
   end
@@ -423,6 +470,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
       method: method
     }
   end
+
+  # A CIMD client's identifier is the URL its document is bound to; a registered
+  # client's is the host's `:client_id` callback (falling back to the presented
+  # identifier in `result/4` when absent).
+  defp resolved_client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
 
   defp resolved_client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)

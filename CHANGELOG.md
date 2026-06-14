@@ -6,6 +6,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-14
+
+Requires `attesto ~> 0.7.0`.
+
+### Added
+
+- **Client ID Metadata Documents (CIMD,
+  `draft-ietf-oauth-client-id-metadata-document-01`) — opt-in, default off.** A
+  client can identify itself with no prior registration by using an HTTPS URL as
+  its `client_id`; the authorization server dereferences that URL to a JSON
+  client metadata document and uses it as the client. Enable with
+  `client_id_metadata: [enabled: true, ...]` in the config.
+  - `AttestoPhoenix.ClientIdMetadata.Fetcher` (+ the default
+    `...Fetcher.Req`) — the SSRF-guarded outbound GET. It resolves the host,
+    rejects any A/AAAA address that is special-use (RFC 6890: loopback, private,
+    link-local, CGNAT, multicast, reserved, and every IPv6 form that embeds an
+    IPv4 — IPv4-mapped, NAT64 `64:ff9b::/96` and local-use `64:ff9b:1::/48`,
+    6to4, IPv4-compatible — unwrapped and re-checked), pins the connection to a
+    validated IP to close the DNS-rebinding window (TLS SNI/cert stay on the
+    original hostname), refuses redirects, requires `200` + JSON, and caps the
+    body at 5 KB. Requires the optional `:req` dependency, or a host-supplied
+    `:fetcher` (e.g. a CIMD proxy service).
+  - `AttestoPhoenix.ClientIdMetadata.Cache` (default Ecto, cluster-coherent;
+    ETS opt-out) — respects RFC 9111 cache headers clamped to bounds, never
+    caches errors/invalid documents, re-checks expiry on read. New table
+    `attesto_client_id_metadata` (`mix attesto_phoenix.gen.migration`), swept by
+    `AttestoPhoenix.Store.Sweeper`.
+  - `AttestoPhoenix.ClientIdMetadata.Resolver` + integration: a CIMD `client_id`
+    URL resolves via the document and is wired through the authorization, PAR,
+    and token endpoints as a `{:cimd, metadata}` client — PKCE forced, treated
+    as a public client (or `private_key_jwt` via the document `jwks`/`jwks_uri`),
+    `redirect_uri` exact-matched against the document's `redirect_uris` and (by
+    default) required to be same-origin with the `client_id` URL. Opaque
+    `client_id`s still resolve through `:load_client` unchanged.
+  - Discovery advertises `client_id_metadata_document_supported` when enabled.
+
+- New optional dependency `{:req, "~> 0.5", optional: true}` for the default
+  CIMD fetcher (a host that never enables CIMD pays nothing).
+
 ## [0.8.0] - 2026-06-14
 
 Requires `attesto ~> 0.6.16`.

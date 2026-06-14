@@ -1,8 +1,8 @@
 defmodule AttestoPhoenix.Store.Sweeper do
   @moduledoc """
   Optional periodic housekeeping `GenServer` that deletes expired rows from the
-  Ecto-backed authorization-code, refresh-token, DPoP-nonce, DPoP-replay, and
-  pushed-authorization-request tables.
+  Ecto-backed authorization-code, refresh-token, DPoP-nonce, DPoP-replay,
+  pushed-authorization-request, and client-id-metadata-cache tables.
 
   Each of these tables carries an `expires_at` column whose semantics are fixed
   by the relevant RFC:
@@ -19,6 +19,9 @@ defmodule AttestoPhoenix.Store.Sweeper do
       record is dead weight).
     * pushed authorization requests - RFC 9126 §2.2 (a `request_uri` reference is
       short-lived; past its expiry it can resolve nothing).
+    * cached Client ID Metadata Documents -
+      `draft-ietf-oauth-client-id-metadata-document-01` §6 / RFC 9111 (a cached
+      document is fresh only until its `expires_at`; past that it is re-fetched).
 
   ## Correctness vs. housekeeping
 
@@ -80,6 +83,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
   @dpop_nonces "dpop_nonces"
   @dpop_replays "dpop_replays"
   @pushed_authorization_requests "attesto_pushed_authorization_requests"
+  @client_id_metadata "attesto_client_id_metadata"
 
   @doc """
   Starts the sweeper.
@@ -156,7 +160,9 @@ defmodule AttestoPhoenix.Store.Sweeper do
       @refresh_tokens => delete_expired(repo, expired_query(@refresh_tokens, now), prefix),
       @dpop_nonces => delete_expired(repo, expired_query(@dpop_nonces, now), prefix),
       @dpop_replays => delete_expired(repo, expired_query(@dpop_replays, now), prefix),
-      @pushed_authorization_requests => delete_expired(repo, expired_query(@pushed_authorization_requests, now), prefix)
+      @pushed_authorization_requests =>
+        delete_expired(repo, expired_query(@pushed_authorization_requests, now), prefix),
+      @client_id_metadata => delete_expired(repo, expired_query(@client_id_metadata, now), prefix)
     }
   end
 
@@ -173,6 +179,8 @@ defmodule AttestoPhoenix.Store.Sweeper do
 
   defp expired_query(@pushed_authorization_requests, now),
     do: from(r in @pushed_authorization_requests, where: r.expires_at < ^now)
+
+  defp expired_query(@client_id_metadata, now), do: from(r in @client_id_metadata, where: r.expires_at < ^now)
 
   defp delete_expired(repo, query, prefix) do
     {deleted, _} = repo.delete_all(query, prefix: prefix)

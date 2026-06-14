@@ -1491,6 +1491,129 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
   end
 
+  # ── Client ID Metadata Documents - CIMD (draft-ietf-oauth-client-id-metadata-document-01) ──
+  #
+  # The token endpoint resolves a CIMD `client_id` URL through the configured
+  # fetcher + cache (a STUB fetcher serving a canned document, the per-node ETS
+  # cache) instead of the host `:load_client` registry. A CIMD client carries no
+  # symmetric secret, so it authenticates only as a public client (`none` + PKCE)
+  # or with `private_key_jwt` keyed by the document's `jwks`; `client_secret_*`
+  # is refused. Each test confirms that authentication succeeds (the request gets
+  # past client-auth and is only rejected on the unsupported grant type) or, for
+  # the secret path, that it fails closed.
+  describe "CIMD client authentication" do
+    alias AttestoPhoenix.ClientIdMetadata.Cache.ETS, as: CimdETS
+
+    @cimd_public_client_id "https://app.example/clients/public.json"
+    @cimd_pkjwt_client_id "https://app.example/clients/pkjwt.json"
+
+    defmodule CimdFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      def script(url, doc) do
+        body = JSON.encode!(Map.put(doc, "client_id", url))
+        Agent.update(__MODULE__, &Map.put(&1, url, body))
+      end
+
+      @impl true
+      def fetch(url, _opts) do
+        case Agent.get(__MODULE__, &Map.get(&1, url)) do
+          nil -> {:error, {:status, 404}}
+          body -> {:ok, %{body: body, cache_control: []}}
+        end
+      end
+    end
+
+    setup do
+      {:ok, _} =
+        start_supervised(%{id: CimdFetcher, start: {Agent, :start_link, [fn -> %{} end, [name: CimdFetcher]]}})
+
+      put_config(client_id_metadata: [enabled: true, fetcher: CimdFetcher, cache: CimdETS])
+      :ok
+    end
+
+    test "a CIMD public client (none + PKCE) authenticates, only the grant type is rejected" do
+      CimdFetcher.script(@cimd_public_client_id, %{
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "none"
+      })
+
+      conn =
+        post_token(%{"grant_type" => "unsupported", "client_id" => @cimd_public_client_id})
+
+      # Authentication succeeded (the CIMD client is public by construction); the
+      # request is only rejected downstream on the unsupported grant type. An
+      # auth failure would have been invalid_client instead.
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
+    test "a CIMD client authenticates via private_key_jwt keyed by the document's jwks" do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      CimdFetcher.script(@cimd_pkjwt_client_id, %{
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "private_key_jwt",
+        "jwks" => %{"keys" => [public_jwk(client_key)]}
+      })
+
+      assertion = client_assertion(client_key, @cimd_pkjwt_client_id)
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+          "client_assertion" => assertion
+        })
+
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
+    test "private_key_jwt fails when the assertion is not signed by the document's jwks" do
+      doc_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      attacker_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      CimdFetcher.script(@cimd_pkjwt_client_id, %{
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "private_key_jwt",
+        "jwks" => %{"keys" => [public_jwk(doc_key)]}
+      })
+
+      # The assertion is signed by a key NOT in the document's jwks.
+      assertion = client_assertion(attacker_key, @cimd_pkjwt_client_id)
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+          "client_assertion" => assertion
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+    end
+
+    test "a client_secret presented for a CIMD client_id is refused" do
+      CimdFetcher.script(@cimd_public_client_id, %{
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "none"
+      })
+
+      # CIMD clients hold no symmetric secret; the secret path never resolves the
+      # CIMD document and fails with the generic invalid_client message.
+      conn =
+        post_token(%{
+          "grant_type" => "authorization_code",
+          "client_id" => @cimd_public_client_id,
+          "client_secret" => "anything"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+      assert body(conn)["error_description"] == "client authentication failed"
+    end
+  end
+
   # ── Helpers ──────────────────────────────────────────────────────────────
 
   # Add the claim-shaped config the minting paths need: a keystore, a

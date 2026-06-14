@@ -241,6 +241,46 @@ defmodule AttestoPhoenix.Config do
     * `:dpop_nonce_required` - require server-issued DPoP nonces. Default `false`.
     * `:mtls_enabled` - enable mTLS (RFC 8705) `cnf` binding. Default `false`.
     * `:registration_enabled` - enable `/oauth/register`. Default `false`.
+    * `:client_id_metadata` - Client ID Metadata Document support - CIMD
+      (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG). A
+      keyword list configuring whether (and how) the authorization server
+      dereferences an HTTPS `client_id` URL to a client metadata document. The
+      whole feature is off by default; when `enabled: true`, discovery
+      advertises `client_id_metadata_document_supported` and
+      `AttestoPhoenix.ClientIdMetadata.Resolver` resolves a CIMD `client_id`
+      through the configured fetcher and cache. Read it back with
+      `client_id_metadata/1` (the merged, defaulted keyword list) or the
+      `client_id_metadata_enabled?/1` predicate. Recognized members, with their
+      defaults:
+
+        * `:enabled` - master switch. Default `false`.
+        * `:fetcher` - module implementing
+          `AttestoPhoenix.ClientIdMetadata.Fetcher` (the SSRF-guarded outbound
+          `GET`). Default `AttestoPhoenix.ClientIdMetadata.Fetcher.Req`. A host
+          may override with its own HTTP stack or a CIMD proxy service.
+        * `:cache` - module implementing
+          `AttestoPhoenix.ClientIdMetadata.Cache`. Default
+          `AttestoPhoenix.ClientIdMetadata.Cache.Ecto` (cluster-coherent); a
+          single-node deployment may select
+          `AttestoPhoenix.ClientIdMetadata.Cache.ETS`.
+        * `:allow_loopback` - permit loopback addresses (the draft's "AS runs on
+          loopback" exception; development only). Default `false`.
+        * `:max_document_bytes` - body size cap for the fetched document
+          (draft's recommended 5 KB). Default `5_120`.
+        * `:request_timeout_ms` - connect and receive timeout for the fetch.
+          Default `5_000`.
+        * `:cache_ttl_bounds` - `{min_seconds, max_seconds}` the resolver clamps
+          the response's `Cache-Control: max-age` / `Expires` freshness to
+          (RFC 9111). Default `{60, 86_400}`.
+        * `:require_same_origin_redirect_uri` - additionally require the request
+          `redirect_uri` to be same-origin with the `client_id` URL, on top of
+          the exact-match against the document's `redirect_uris` (draft §2 MAY,
+          enforced by default here). Default `true`.
+        * `:allowed_hosts` - optional allowlist of hostnames a CIMD `client_id`
+          URL may resolve through; `nil` means "any public host" (subject to the
+          fetcher's SSRF guard). Default `nil`.
+        * `:blocked_hosts` - hostnames a CIMD `client_id` URL must never resolve
+          through, checked before any network work. Default `[]`.
     * `:replay_check` - DPoP `jti` replay check (module or `{module, fun}`).
       Defaults to the single-node ETS replay cache.
     * `:nonce_store` - `Attesto.DPoP.NonceStore` implementation. Defaults to
@@ -333,6 +373,8 @@ defmodule AttestoPhoenix.Config do
   # behaviour module (`:client_store` / `:principal_store`) instead of a flat
   # callback. They are validated by resolution in `validate!/1` so the
   # behaviour-module install path actually works.
+  alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
+
   @enforce_keys [
     :issuer,
     :keystore,
@@ -419,6 +461,7 @@ defmodule AttestoPhoenix.Config do
     dpop_nonce_required: false,
     mtls_enabled: false,
     registration_enabled: false,
+    client_id_metadata: [],
     basic_realm: "OAuth"
   ]
 
@@ -511,7 +554,8 @@ defmodule AttestoPhoenix.Config do
           dpop_enabled: boolean(),
           dpop_nonce_required: boolean(),
           mtls_enabled: boolean(),
-          registration_enabled: boolean()
+          registration_enabled: boolean(),
+          client_id_metadata: keyword()
         }
 
   # Required plain values: enforced for presence as struct fields.
@@ -538,13 +582,39 @@ defmodule AttestoPhoenix.Config do
     |> validate!()
   end
 
-  # Defaults that cannot be static struct values (they call a function).
+  # Defaults that cannot be static struct values (they call a function) or that
+  # merge a host-supplied keyword list over the library's defaults.
   defp apply_defaults(%__MODULE__{} = config) do
     %{
       config
       | client_auth_signing_algs: config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs(),
-        request_object_policy: config.request_object_policy || %Policy{}
+        request_object_policy: config.request_object_policy || %Policy{},
+        client_id_metadata: normalize_client_id_metadata(config.client_id_metadata)
     }
+  end
+
+  # The CIMD defaults the host's `:client_id_metadata` keyword list is merged
+  # over (`draft-ietf-oauth-client-id-metadata-document-01` §9). The whole
+  # feature is off by default; a host enables it with `enabled: true` and may
+  # override any individual member. The merged list is what `client_id_metadata/1`
+  # returns and what the resolver / discovery wiring read.
+  @client_id_metadata_defaults [
+    enabled: false,
+    fetcher: Req,
+    cache: AttestoPhoenix.ClientIdMetadata.Cache.Ecto,
+    allow_loopback: false,
+    max_document_bytes: 5_120,
+    request_timeout_ms: 5_000,
+    cache_ttl_bounds: {60, 86_400},
+    require_same_origin_redirect_uri: true,
+    allowed_hosts: nil,
+    blocked_hosts: []
+  ]
+
+  defp normalize_client_id_metadata(nil), do: @client_id_metadata_defaults
+
+  defp normalize_client_id_metadata(opts) when is_list(opts) do
+    Keyword.merge(@client_id_metadata_defaults, opts)
   end
 
   @doc """
@@ -556,6 +626,34 @@ defmodule AttestoPhoenix.Config do
     otp_app
     |> Application.get_env(key, [])
     |> new()
+  end
+
+  @doc """
+  Returns the merged, defaulted Client ID Metadata Document (CIMD) options.
+
+  This is the host's `:client_id_metadata` keyword list merged over the library
+  defaults (`draft-ietf-oauth-client-id-metadata-document-01` §9), so every
+  recognized member (`:enabled`, `:fetcher`, `:cache`, `:allow_loopback`,
+  `:max_document_bytes`, `:request_timeout_ms`, `:cache_ttl_bounds`,
+  `:require_same_origin_redirect_uri`, `:allowed_hosts`, `:blocked_hosts`) is
+  always present. `AttestoPhoenix.ClientIdMetadata.Resolver` and the discovery
+  wiring read the feature's configuration through this helper rather than
+  reaching into the struct field directly.
+  """
+  @spec client_id_metadata(t()) :: keyword()
+  def client_id_metadata(%__MODULE__{client_id_metadata: opts}), do: opts
+
+  @doc """
+  Returns `true` iff Client ID Metadata Document support is enabled.
+
+  The feature is off unless the host sets `client_id_metadata: [enabled: true]`.
+  Discovery advertises `client_id_metadata_document_supported` and the
+  authorization endpoint resolves a CIMD `client_id` URL only when this is
+  `true`.
+  """
+  @spec client_id_metadata_enabled?(t()) :: boolean()
+  def client_id_metadata_enabled?(%__MODULE__{} = config) do
+    config |> client_id_metadata() |> Keyword.get(:enabled, false) == true
   end
 
   @doc """

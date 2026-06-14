@@ -306,6 +306,175 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
   end
 
+  # ── Client ID Metadata Documents - CIMD (draft-ietf-oauth-client-id-metadata-document-01) ──
+  #
+  # The authorization endpoint resolves a CIMD `client_id` URL through the
+  # configured fetcher + cache instead of the host `:load_client` registry. A
+  # STUB fetcher (no socket / no SSRF) serves a canned document, and the
+  # per-node `AttestoPhoenix.ClientIdMetadata.Cache.ETS` is the cache; the
+  # assertions cover the §11 integration cases - a CIMD `client_id` issues a
+  # code, a `redirect_uri` not in the document is rejected, and a non-same-origin
+  # `redirect_uri` is rejected when same-origin is enforced.
+  describe "CIMD client_id resolution" do
+    alias AttestoPhoenix.ClientIdMetadata.Cache.ETS, as: CimdETS
+
+    @cimd_client_id "https://app.example/clients/metadata.json"
+    @cimd_redirect_uri "https://app.example/cb"
+
+    defmodule StubFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      def script(url, result) do
+        Agent.update(__MODULE__, &Map.put(&1, url, result))
+      end
+
+      @impl true
+      def fetch(url, _opts) do
+        Agent.get(__MODULE__, &Map.fetch!(&1, url))
+      end
+    end
+
+    setup do
+      {:ok, _} =
+        start_supervised(%{id: StubFetcher, start: {Agent, :start_link, [fn -> %{} end, [name: StubFetcher]]}})
+
+      :ok
+    end
+
+    defp cimd_config(overrides \\ []) do
+      Keyword.merge(
+        [enabled: true, fetcher: StubFetcher, cache: CimdETS],
+        overrides
+      )
+    end
+
+    defp cimd_doc(extra \\ %{}) do
+      Map.merge(
+        %{
+          "client_id" => @cimd_client_id,
+          "redirect_uris" => [@cimd_redirect_uri],
+          "token_endpoint_auth_method" => "none",
+          "grant_types" => ["authorization_code"],
+          "response_types" => ["code"]
+        },
+        extra
+      )
+    end
+
+    # A unique CIMD client_id per test so the node-wide ETS cache never carries
+    # an entry from one test into another.
+    defp unique_cimd_client_id do
+      "https://app.example/clients/#{System.unique_integer([:positive])}/metadata.json"
+    end
+
+    defp script_doc(client_id, doc) do
+      body = JSON.encode!(Map.put(doc, "client_id", client_id))
+      StubFetcher.script(client_id, {:ok, %{body: body, cache_control: []}})
+    end
+
+    test "resolves a CIMD client_id and issues a code" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc())
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => @cimd_redirect_uri}))
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert location(conn) =~ @cimd_redirect_uri
+      assert is_binary(query["code"])
+
+      # The issued code is bound to the CIMD URL as the client_id.
+      record = TestStore.peek(query["code"])
+      assert record.data.client_id == client_id
+    end
+
+    test "rejects a redirect_uri not in the document (direct error)" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc())
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "https://app.example/not-registered"
+          })
+        )
+
+      # Non-redirectable: the supplied redirect_uri is not in the document, so a
+      # direct error (never a redirect back to the untrusted URI).
+      assert conn.status == 400
+      refute get_resp_header(conn, "location") |> Enum.any?(&(&1 =~ "not-registered"))
+    end
+
+    test "rejects a non-same-origin redirect_uri when same-origin is enforced" do
+      client_id = unique_cimd_client_id()
+      # The document registers a redirect_uri on a DIFFERENT origin than the
+      # client_id URL. Exact-match passes, but the same-origin tightening
+      # (default on) rejects it.
+      cross_origin = "https://other.example/cb"
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [cross_origin]}))
+      put_config(client_id_metadata: cimd_config(require_same_origin_redirect_uri: true))
+
+      conn =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => cross_origin}))
+
+      assert conn.status == 400
+    end
+
+    test "permits a non-same-origin redirect_uri when same-origin is disabled" do
+      client_id = unique_cimd_client_id()
+      cross_origin = "https://other.example/cb"
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [cross_origin]}))
+      put_config(client_id_metadata: cimd_config(require_same_origin_redirect_uri: false))
+
+      conn =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => cross_origin}))
+
+      assert conn.status == 302
+      assert location(conn) =~ cross_origin
+    end
+
+    test "an unresolvable CIMD client_id is a non-redirectable error" do
+      client_id = unique_cimd_client_id()
+      StubFetcher.script(client_id, {:error, {:status, 404}})
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => @cimd_redirect_uri}))
+
+      assert conn.status == 400
+      assert get_resp_header(conn, "location") == []
+    end
+
+    test "an opaque client_id still flows through :load_client when CIMD is enabled" do
+      put_config(client_id_metadata: cimd_config())
+
+      # The opaque @client_id is not a URL, so CIMD never applies; the host
+      # registry resolves it exactly as before.
+      conn = call(valid_params())
+
+      assert conn.status == 302
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    test "a CIMD client_id is ignored (host registry) when the feature is disabled" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc())
+      put_config(client_id_metadata: cimd_config(enabled: false))
+
+      # With CIMD disabled the URL is treated as an opaque client_id; the host
+      # registry has no such client, so it is a non-redirectable error.
+      conn =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => @cimd_redirect_uri}))
+
+      assert conn.status == 400
+    end
+  end
+
   describe "PAR-required policy" do
     test "rejects direct authorization requests when PAR is required" do
       put_config(

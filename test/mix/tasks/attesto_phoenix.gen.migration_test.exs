@@ -33,7 +33,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
   end
 
   describe "run/1" do
-    test "generates a migration creating all five stores", %{tmp_dir: tmp_dir} do
+    test "generates a migration creating all six stores", %{tmp_dir: tmp_dir} do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
@@ -44,12 +44,25 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       #   * AttestoPhoenix.Schema.DPoPNonce                   -> dpop_nonces
       #   * AttestoPhoenix.Schema.DPoPReplay                  -> dpop_replays
       #   * AttestoPhoenix.Schema.PushedAuthorizationRequest  -> attesto_pushed_authorization_requests
+      #   * AttestoPhoenix.Schema.ClientIdMetadata            -> attesto_client_id_metadata
       assert source =~ ~s|use Ecto.Migration|
       assert source =~ ~s|create table(:attesto_authorization_codes|
       assert source =~ ~s|create table(:attesto_refresh_tokens|
       assert source =~ ~s|create table(:dpop_nonces|
       assert source =~ ~s|create table(:dpop_replays|
       assert source =~ ~s|create table(:attesto_pushed_authorization_requests|
+      assert source =~ ~s|create table(:attesto_client_id_metadata|
+    end
+
+    test "client_id_metadata keys on url as PK with a jsonb metadata column", %{tmp_dir: tmp_dir} do
+      run!([], tmp_dir)
+      source = generated_migration(tmp_dir)
+
+      # ClientIdMetadata declares @primary_key {:url, :string}, so url is the
+      # PRIMARY KEY; metadata is jsonb (:map); expires_at is indexed for sweeps.
+      assert source =~ ~s|add :url, :string, size: 255, primary_key: true, null: false|
+      assert source =~ ~s|add :metadata, :map, null: false|
+      assert source =~ ~s|create index(:attesto_client_id_metadata, [:expires_at])|
     end
 
     test "pushed_authorization_requests keys on request_uri as PK with a jsonb params column", %{tmp_dir: tmp_dir} do
@@ -150,7 +163,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|def up do|
       assert source =~ ~s|def down do|
       # down drops every table the up created.
-      for table <- ~w(attesto_authorization_codes attesto_refresh_tokens dpop_nonces dpop_replays) do
+      for table <-
+            ~w(attesto_authorization_codes attesto_refresh_tokens dpop_nonces dpop_replays attesto_pushed_authorization_requests attesto_client_id_metadata) do
         assert source =~ ~s|drop table(:#{table})|
       end
     end

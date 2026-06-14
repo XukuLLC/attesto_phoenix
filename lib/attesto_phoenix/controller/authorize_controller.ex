@@ -109,6 +109,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias Attesto.Secret
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
+  alias AttestoPhoenix.ClientIdMetadata
   alias AttestoPhoenix.Store.PAR.ETS
 
   require Logger
@@ -185,16 +186,41 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # same class; `Attesto.AuthorizationRequest` would classify it identically,
   # but it is caught here too so a missing `client_id` never reaches
   # `:load_client`.
+  #
+  # CIMD (`draft-ietf-oauth-client-id-metadata-document-01`): when the feature
+  # is enabled and the presented `client_id` is a CIMD URL, the client is
+  # dereferenced from that URL rather than looked up in the host registry. An
+  # unresolvable or invalid CIMD `client_id` is the same non-redirectable class
+  # as an unknown registry client (the document - and so its trusted
+  # redirect_uris - never materialized), so it is reported as a direct error.
+  # The resolved CIMD client is wrapped as `{:cimd, metadata}` so the request
+  # validation, jwks, and `client_id` helpers read the document directly instead
+  # of the host's per-client callbacks.
   defp load_client(config, params) do
     case params["client_id"] do
       client_id when is_binary(client_id) and client_id != "" ->
-        case Callback.invoke(Config.load_client_fun(config), [client_id]) do
-          {:ok, client} -> {:ok, client}
-          _other -> {:error, {:direct, :invalid_client_id}}
+        if ClientIdMetadata.cimd_client_id?(client_id, config) do
+          load_cimd_client(config, client_id)
+        else
+          load_registered_client(config, client_id)
         end
 
       _ ->
         {:error, {:direct, :invalid_client_id}}
+    end
+  end
+
+  defp load_registered_client(config, client_id) do
+    case Callback.invoke(Config.load_client_fun(config), [client_id]) do
+      {:ok, client} -> {:ok, client}
+      _other -> {:error, {:direct, :invalid_client_id}}
+    end
+  end
+
+  defp load_cimd_client(config, client_id) do
+    case ClientIdMetadata.resolve(client_id, config) do
+      {:ok, metadata} -> {:ok, {:cimd, metadata}}
+      {:error, _reason} -> {:error, {:direct, :invalid_client_id}}
     end
   end
 
@@ -224,10 +250,42 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
              request_object_audience: config.issuer,
              request_object_policy: config.request_object_policy
            ),
+         :ok <- require_same_origin_redirect_uri(config, client, request),
          :ok <- require_par_if_configured(config, request, par_resolved?) do
       {:ok, request}
     end
   end
+
+  # draft-ietf-oauth-client-id-metadata-document-01 §2 (MAY, enforced by
+  # default): the request `redirect_uri` must be same-origin (scheme + host +
+  # port) with the CIMD `client_id` URL, on top of the exact-match against the
+  # document's `redirect_uris` the core already performed. A non-same-origin
+  # `redirect_uri` is not a trusted URI for this client, so its failure is
+  # non-redirectable - a direct error, like an unregistered redirect_uri. Only
+  # applies to CIMD clients; a registered client has no `client_id` URL to be
+  # same-origin with.
+  defp require_same_origin_redirect_uri(config, {:cimd, metadata}, request) do
+    same_origin_required? =
+      config
+      |> Config.client_id_metadata()
+      |> Keyword.get(:require_same_origin_redirect_uri, true)
+
+    cond do
+      not same_origin_required? ->
+        :ok
+
+      ClientIdMetadata.same_origin_redirect_uri?(
+        ClientIdMetadata.client_id(metadata),
+        request.redirect_uri
+      ) ->
+        :ok
+
+      true ->
+        {:error, {:direct, :redirect_uri_not_registered}}
+    end
+  end
+
+  defp require_same_origin_redirect_uri(_config, _client, _request), do: :ok
 
   defp resolve_request_uri(config, %{"request_uri" => request_uri} = params)
        when is_binary(request_uri) and request_uri != "" do
@@ -310,6 +368,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp require_par_if_configured(_config, _request, true), do: :ok
 
   defp par_store(config), do: config_field(config, :par_store, ETS)
+
+  # The request-object (JAR) verification keys for the client. For a CIMD client
+  # the keys are the document's `jwks` / `jwks_uri` (RFC 9101 §6.2); for a
+  # registered client they are the host's `:client_jwks` callback.
+  defp client_jwks(_config, {:cimd, metadata}), do: ClientIdMetadata.jwks(metadata)
 
   defp client_jwks(config, client) do
     case Config.client_jwks_fun(config) do
@@ -600,6 +663,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # (`:invalid_subject`), which is reported as server_error.
   defp subject_id(subject) when is_map(subject), do: Map.get(subject, :subject)
   defp subject_id(_subject), do: nil
+
+  # The CIMD client's `client_id` is the URL the document is bound to; a
+  # registered client's is the host's `:client_id` callback.
+  defp client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
 
   defp client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)

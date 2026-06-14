@@ -52,7 +52,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   alias Attesto.RequestObject
   alias AttestoPhoenix.AuthorizationServer.PAR.Request
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
-  alias AttestoPhoenix.{Callback, Config, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, OAuthError}
   alias AttestoPhoenix.Store.PAR.ETS
 
   @typedoc """
@@ -233,6 +233,11 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # `:client_id` callback. When no `:client_id` callback is configured the
   # identifier cannot be derived from the opaque client struct (`nil`), matching
   # the resolution used everywhere else in the library.
+  # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-01`) is
+  # identified by the URL its document is bound to; a registered client by the
+  # host's `:client_id` callback.
+  defp client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
+
   defp client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
@@ -307,6 +312,11 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
 
   # Resolve the client's trusted JWK set, mirroring the authorize controller's
   # resolution (the host's `:client_jwks` callback, returning a JWKS or `nil`).
+  # A CIMD client's request-object verification keys are the document's
+  # `jwks` / `jwks_uri` (RFC 9101 §6.2); a registered client's are the host's
+  # `:client_jwks` callback.
+  defp client_jwks(_config, {:cimd, metadata}), do: ClientIdMetadata.jwks(metadata)
+
   defp client_jwks(config, client) do
     case Config.client_jwks_fun(config) do
       nil ->

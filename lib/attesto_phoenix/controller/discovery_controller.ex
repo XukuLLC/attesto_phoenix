@@ -183,8 +183,17 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       # JAR support. Both members are nil-dropped by the core builder when JAR
       # is unsupported / not required.
       request_object_signing_alg_values_supported: jar_alg_values,
-      require_signed_request_object: RequestObjectMetadata.require_signed(config)
+      require_signed_request_object: RequestObjectMetadata.require_signed(config),
+      # draft-ietf-oauth-client-id-metadata-document-01 §6: advertise that the
+      # server dereferences an HTTPS `client_id` URL to a client metadata
+      # document, but only when the feature is enabled. nil otherwise so the
+      # core builder drops the member entirely.
+      client_id_metadata_document_supported: client_id_metadata_document_supported(config)
     ]
+  end
+
+  defp client_id_metadata_document_supported(%Config{} = config) do
+    if Config.client_id_metadata_enabled?(config), do: true
   end
 
   defp token_endpoint_auth_methods_supported(%Config{token_endpoint_auth_methods_supported: methods})

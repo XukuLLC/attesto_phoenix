@@ -2,6 +2,7 @@ defmodule AttestoPhoenix.ConfigTest do
   use ExUnit.Case, async: true
 
   alias Attesto.RequestObject.Policy
+  alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.Config
 
   # A behaviour module that implements every ClientStore callback the resolver
@@ -383,6 +384,41 @@ defmodule AttestoPhoenix.ConfigTest do
       built = config(request_object_policy: policy, client_store: FullStore)
 
       assert built.request_object_policy == policy
+    end
+  end
+
+  describe ":client_id_metadata (CIMD §9)" do
+    test "defaults to the feature-off keyword list when unset" do
+      cimd = Config.client_id_metadata(config())
+
+      assert cimd[:enabled] == false
+      assert cimd[:fetcher] == Req
+      assert cimd[:cache] == AttestoPhoenix.ClientIdMetadata.Cache.Ecto
+      assert cimd[:allow_loopback] == false
+      assert cimd[:max_document_bytes] == 5_120
+      assert cimd[:request_timeout_ms] == 5_000
+      assert cimd[:cache_ttl_bounds] == {60, 86_400}
+      assert cimd[:require_same_origin_redirect_uri] == true
+      assert cimd[:allowed_hosts] == nil
+      assert cimd[:blocked_hosts] == []
+    end
+
+    test "merges host overrides over the defaults, leaving unset members defaulted" do
+      cimd =
+        config(client_id_metadata: [enabled: true, allow_loopback: true])
+        |> Config.client_id_metadata()
+
+      assert cimd[:enabled] == true
+      assert cimd[:allow_loopback] == true
+      # Unset members keep their defaults.
+      assert cimd[:max_document_bytes] == 5_120
+      assert cimd[:cache] == AttestoPhoenix.ClientIdMetadata.Cache.Ecto
+    end
+
+    test "client_id_metadata_enabled?/1 reflects the :enabled member" do
+      refute Config.client_id_metadata_enabled?(config())
+      refute Config.client_id_metadata_enabled?(config(client_id_metadata: []))
+      assert Config.client_id_metadata_enabled?(config(client_id_metadata: [enabled: true]))
     end
   end
 end

@@ -5,7 +5,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   Generates an Ecto migration that creates the persistence backing the
   Ecto-based stores ship with `attesto_phoenix`.
 
-  The migration creates five tables, named to match the runtime schemas
+  The migration creates six tables, named to match the runtime schemas
   exactly so a by-the-docs deploy installs tables the Ecto-backed stores can
   use without modification:
 
@@ -43,6 +43,15 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       validated authorization request `params` and the reference `expires_at`, so
       a `request_uri` pushed to one node is resolvable on every node (FAPI 2.0
       requires PAR).
+
+    * `attesto_client_id_metadata` - the Client ID Metadata Document cache
+      (`AttestoPhoenix.Schema.ClientIdMetadata`,
+      `draft-ietf-oauth-client-id-metadata-document-01`). Each row caches one
+      *validated* CIMD document under its `client_id` URL (the PRIMARY KEY), as a
+      jsonb `metadata` map plus the `expires_at` derived from the response's HTTP
+      freshness directives (RFC 9111). Keeps every authorization request from
+      re-fetching the URL and, being shared, makes the cache coherent across a
+      cluster and bounds the outbound fetch fan-out.
 
   ## Usage
 
@@ -221,6 +230,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     #   * AttestoPhoenix.Schema.DPoPReplay                  -> "dpop_replays"
     #   * AttestoPhoenix.Schema.DPoPNonce                   -> "dpop_nonces"
     #   * AttestoPhoenix.Schema.PushedAuthorizationRequest  -> "attesto_pushed_authorization_requests"
+    #   * AttestoPhoenix.Schema.ClientIdMetadata            -> "attesto_client_id_metadata"
     #
     # The optional --table-prefix is the only thing the host may vary; the base
     # names are not host-configurable because the schemas hardcode them.
@@ -232,6 +242,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       dpop_nonces: table_name(prefix, "dpop_nonces"),
       dpop_replays: table_name(prefix, "dpop_replays"),
       pushed_authorization_requests: table_name(prefix, "attesto_pushed_authorization_requests"),
+      client_id_metadata: table_name(prefix, "attesto_client_id_metadata"),
       hash_size: @hash_column_size,
       jti_size: @jti_column_size,
       nonce_size: @nonce_column_size,
@@ -435,9 +446,29 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
       # Expiry sweeps scan by expires_at; resolution hits the primary key.
       create index(:<%= @pushed_authorization_requests %>, [:expires_at])
+
+      # Client ID Metadata Document cache
+      # (draft-ietf-oauth-client-id-metadata-document-01), backing
+      # AttestoPhoenix.Schema.ClientIdMetadata /
+      # AttestoPhoenix.ClientIdMetadata.Cache.Ecto. The CIMD client_id URL is the
+      # PRIMARY KEY, so the cache lookup (get/1) hits the primary key and a
+      # re-fetch upserts the single row. The validated document lives in a jsonb
+      # metadata column; expires_at is the freshness derived from the response's
+      # Cache-Control/Expires (RFC 9111), re-checked on read and indexed for
+      # sweeps. Only validated documents are ever written here.
+      create table(:<%= @client_id_metadata %>, primary_key: false) do
+        add :url, :string, size: <%= @identifier_size %>, primary_key: true, null: false
+        add :metadata, :map, null: false
+        add :expires_at, :utc_datetime, null: false
+        add :inserted_at, :utc_datetime, null: false
+      end
+
+      # Expiry sweeps scan by expires_at; lookups hit the primary key.
+      create index(:<%= @client_id_metadata %>, [:expires_at])
     end
 
     def down do
+      drop table(:<%= @client_id_metadata %>)
       drop table(:<%= @pushed_authorization_requests %>)
       drop table(:<%= @dpop_replays %>)
       drop table(:<%= @dpop_nonces %>)

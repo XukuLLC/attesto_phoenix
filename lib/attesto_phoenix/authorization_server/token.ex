@@ -47,7 +47,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   alias Attesto.{AuthorizationCode, IDToken, RefreshToken}
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
-  alias AttestoPhoenix.{Callback, Config, Event, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Event, OAuthError}
 
   require Logger
 
@@ -106,7 +106,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp require_registered_grant_type(%Request{} = request) do
     %{config: config, client: client, grant_type: grant_type} = request
 
-    case Callback.invoke(Config.client_grant_types_fun(config), [client], nil) do
+    case Callback.invoke(Config.client_grant_types_fun(config), [host_client(client)], nil) do
       grant_types when is_list(grant_types) ->
         if grant_type in grant_types do
           :ok
@@ -433,7 +433,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp issue_refresh_token?(config, client, scope) do
     case Callback.config_callback(config, :issue_refresh_token?) do
       nil -> @offline_access_scope in scope
-      callback -> invoke(callback, [client, scope]) == true
+      callback -> invoke(callback, [host_client(client), scope]) == true
     end
   end
 
@@ -521,7 +521,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       callback ->
         requested = id_token_claim(grant.claims, "claims")
 
-        case invoke(callback, [client, grant.subject, scope, requested]) do
+        case invoke(callback, [host_client(client), grant.subject, scope, requested]) do
           map when is_map(map) and map_size(map) > 0 -> map
           _ -> nil
         end
@@ -584,7 +584,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `:authorize_scope` callback takes the client and the requested scope and
   # returns the granted scope or `{:error, :invalid_scope}` (RFC 6749 §5.2).
   defp authorize_scope(config, client, requested) do
-    case invoke(Config.authorize_scope_fun(config), [client, requested]) do
+    case invoke(Config.authorize_scope_fun(config), [host_client(client), requested]) do
       {:ok, scope} when is_list(scope) -> {:ok, scope}
       {:error, _reason} -> {:error, error(@error_invalid_scope, "scope not permitted")}
       _ -> {:error, error(@error_invalid_request, "scope policy unavailable")}
@@ -677,7 +677,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp build_principal(config, client, subject, scope) do
-    case invoke(Config.build_principal_fun(config), [client, subject, scope]) do
+    case invoke(Config.build_principal_fun(config), [host_client(client), subject, scope]) do
       %{} = principal -> {:ok, principal}
       _ -> {:error, :no_principal_builder}
     end
@@ -747,13 +747,28 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # ── Configured-callback access ───────────────────────────────────────────
 
-  # The client's identifier (RFC 6749 §2.2). Read defensively so this module
-  # works today and lights up when a host supplies `:client_id`. When absent
-  # the identifier is unknown (`nil`), which is correct for audit and is never
-  # used as a credential.
+  # The client's identifier (RFC 6749 §2.2). A CIMD client
+  # (`draft-ietf-oauth-client-id-metadata-document-01`) is identified by the URL
+  # its document is bound to, read from the document rather than the host's
+  # `:client_id` callback. For a registered client, read the host callback
+  # defensively so this module works today and lights up when a host supplies
+  # `:client_id`; when absent the identifier is unknown (`nil`), which is correct
+  # for audit and is never used as a credential.
+  defp client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
+
   defp client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
+
+  # Host *policy* callbacks (`:authorize_scope`, `:build_principal`,
+  # `:build_id_token_claims`, `:issue_refresh_token?`, `:client_grant_types`) are
+  # written for the host's own client shape. A CIMD client is handed to them as
+  # its bare, string-keyed metadata map (shaped like a `:load_client` result,
+  # `draft-ietf-oauth-client-id-metadata-document-01` §7), with the internal
+  # `{:cimd, _}` tag stripped, so a CIMD-aware host reads it like any client map.
+  # A registered client passes through untouched.
+  defp host_client({:cimd, metadata}), do: metadata
+  defp host_client(client), do: client
 
   # The `Attesto.CodeStore` / `Attesto.RefreshStore` backing each stateful
   # grant. Resolved from the configuration so the host owns persistence; this

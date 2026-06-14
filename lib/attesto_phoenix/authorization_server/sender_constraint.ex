@@ -160,6 +160,11 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   `:client_requires_dpop?` callback.
   """
   @spec client_requires_dpop?(Config.t(), term()) :: boolean()
+  # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-01`) is governed
+  # by its metadata document, not the host's per-client sender-constraint policy,
+  # so the host callback does not apply: it does not require DPoP.
+  def client_requires_dpop?(%Config{}, {:cimd, _metadata}), do: false
+
   def client_requires_dpop?(%Config{} = config, client) do
     Callback.invoke(Config.client_requires_dpop_fun(config), [client], false) == true
   end
@@ -171,6 +176,10 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   `:client_requires_mtls?` callback.
   """
   @spec client_requires_mtls?(Config.t(), term()) :: boolean()
+  # A CIMD client is governed by its document, not the host's per-client policy,
+  # so the host callback does not apply: it does not require mTLS.
+  def client_requires_mtls?(%Config{}, {:cimd, _metadata}), do: false
+
   def client_requires_mtls?(%Config{} = config, client) do
     Callback.invoke(Config.client_requires_mtls_fun(config), [client], false) == true
   end
@@ -264,6 +273,11 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   end
 
   defp issue_nonce(_config), do: ""
+
+  # A CIMD client holds no symmetric secret, so it is public by construction (it
+  # leans on PKCE / DPoP downstream); a registered client defers to the host's
+  # `:client_public?` discriminator.
+  defp client_public?(_config, {:cimd, _metadata}), do: true
 
   defp client_public?(config, client) do
     Callback.invoke(Config.client_public_fun(config), [client], false) == true

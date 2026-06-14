@@ -4,11 +4,27 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
   import Plug.Test
 
   alias Attesto.RequestObject.Policy
+  alias AttestoPhoenix.ClientIdMetadata.Cache.ETS, as: CimdCache
   alias AttestoPhoenix.Controller.PARController
   alias AttestoPhoenix.Store.PAR.ETS
 
   @endpoint_path "/oauth/par"
   @client %{id: "confidential-1", secret: "s3cr3t"}
+
+  # A stub CIMD fetcher serving canned documents keyed by URL (no socket / no
+  # SSRF), used by the CIMD private_key_jwt PAR test.
+  defmodule CimdFetcher do
+    @moduledoc false
+    @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+    @impl true
+    def fetch(url, _opts) do
+      case Agent.get(__MODULE__, &Map.get(&1, url)) do
+        nil -> {:error, {:status, 404}}
+        body -> {:ok, %{body: body, cache_control: []}}
+      end
+    end
+  end
 
   defmodule StubKeystore do
     @moduledoc false
@@ -226,6 +242,51 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["client_id"] == "confidential-1"
     refute Map.has_key?(stored, "client_assertion")
     refute Map.has_key?(stored, "client_assertion_type")
+  end
+
+  # CIMD (draft-ietf-oauth-client-id-metadata-document-01): a CIMD client may
+  # push an authorization request, but only via private_key_jwt - the PAR
+  # endpoint refuses the public-client (`none`) path (`allow_public: false`), and
+  # a CIMD client carries no symmetric secret. The pushed request is validated
+  # against the document's own `redirect_uris` (RFC 9700), not the host
+  # `:client_redirect_uris` callback.
+  test "stores a pushed request from a CIMD client authenticated with private_key_jwt" do
+    cimd_client_id = "https://app.example/clients/par.json"
+    client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+    doc = %{
+      "client_id" => cimd_client_id,
+      "redirect_uris" => ["https://app.example/cb"],
+      "token_endpoint_auth_method" => "private_key_jwt",
+      "jwks" => %{"keys" => [public_jwk(client_key)]}
+    }
+
+    {:ok, _} =
+      start_supervised(%{
+        id: CimdFetcher,
+        start: {Agent, :start_link, [fn -> %{cimd_client_id => JSON.encode!(doc)} end, [name: CimdFetcher]]}
+      })
+
+    put_config(client_id_metadata: [enabled: true, fetcher: CimdFetcher, cache: CimdCache])
+
+    params =
+      Map.merge(auth_params(), %{
+        "client_id" => cimd_client_id,
+        "redirect_uri" => "https://app.example/cb",
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, cimd_client_id)
+      })
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+    assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
+    assert stored["client_id"] == cimd_client_id
+    assert stored["redirect_uri"] == "https://app.example/cb"
   end
 
   test "stores the verified DPoP proof thumbprint for sender-constrained PAR" do

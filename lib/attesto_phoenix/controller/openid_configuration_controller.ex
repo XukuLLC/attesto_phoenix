@@ -230,8 +230,16 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       # Host catalogs: advertised only when the host configures a non-empty list
       # (the core builder drops the nil the helper returns for `[]`).
       acr_values_supported: presence(config.acr_values_supported),
-      ui_locales_supported: presence(config.ui_locales_supported)
+      ui_locales_supported: presence(config.ui_locales_supported),
+      # draft-ietf-oauth-client-id-metadata-document-01 §6: advertise CIMD
+      # support only when the feature is enabled; nil otherwise so the shared
+      # Attesto.Discovery builder drops the member.
+      client_id_metadata_document_supported: client_id_metadata_document_supported(config)
     ]
+  end
+
+  defp client_id_metadata_document_supported(%Config{} = config) do
+    if Config.client_id_metadata_enabled?(config), do: true
   end
 
   defp token_endpoint_auth_methods_supported(%Config{token_endpoint_auth_methods_supported: methods})

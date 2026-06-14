@@ -16,7 +16,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
 
   alias Attesto.AuthorizationRequest
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
-  alias AttestoPhoenix.{Callback, Config}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config}
 
   @doc """
   Validate `params` as an authorization request for `client`, resolving the
@@ -45,12 +45,20 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   end
 
   @doc """
-  The client's registered redirect URIs (RFC 6749 §3.1.2.3), resolved through
-  the host's `:client_redirect_uris` callback. An absent callback or a
-  non-list return resolves to `[]`, which rejects every request with an
-  unregistered redirect URI (fail closed).
+  The client's registered redirect URIs (RFC 6749 §3.1.2.3).
+
+  For a CIMD client (`{:cimd, metadata}`,
+  `draft-ietf-oauth-client-id-metadata-document-01`) the document *is* the
+  registration, so the registered set is the document's own `redirect_uris`
+  (RFC 9700) and the host's per-client callback is never consulted. For a
+  registered client the set is resolved through the host's
+  `:client_redirect_uris` callback; an absent callback or a non-list return
+  resolves to `[]`, which rejects every request with an unregistered redirect
+  URI (fail closed).
   """
   @spec registered_redirect_uris(Config.t(), term()) :: [String.t()]
+  def registered_redirect_uris(_config, {:cimd, metadata}), do: ClientIdMetadata.redirect_uris(metadata)
+
   def registered_redirect_uris(config, client) do
     case Callback.invoke(Config.client_redirect_uris_fun(config), [client], []) do
       uris when is_list(uris) -> uris
@@ -70,6 +78,11 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   host's deliberate opt-out, PKCE is required.
   """
   @spec require_pkce?(Config.t(), term()) :: boolean()
+  # A CIMD client is public (`none` + PKCE) or `private_key_jwt`; PKCE is
+  # mandatory for it regardless of the host's `:require_pkce` flag, and the host
+  # sender-constraint callbacks do not apply to the document.
+  def require_pkce?(_config, {:cimd, _metadata}), do: true
+
   def require_pkce?(config, client) do
     client_public?(config, client) or
       SenderConstraint.client_requires_dpop?(config, client) or
@@ -85,6 +98,10 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   classification).
   """
   @spec client_public?(Config.t(), term()) :: boolean()
+  # A CIMD client holds no symmetric secret (document validation strips it), so
+  # it is public by construction.
+  def client_public?(_config, {:cimd, _metadata}), do: true
+
   def client_public?(config, client) do
     case Config.client_public_fun(config) do
       nil -> true
