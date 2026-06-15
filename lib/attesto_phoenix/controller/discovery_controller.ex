@@ -15,11 +15,12 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   §4.2), and the DPoP algorithms (`dpop_signing_alg_values_supported`, RFC
   9449) - is derived by the core builder from the protocol configuration.
 
-  The capability members reflect exactly what the controllers wire, never
-  an aspirational superset: `grant_types_supported` lists the grants the token
-  endpoint dispatches (`authorization_code`, `refresh_token`,
-  `client_credentials`, and OAuth token exchange);
-  `token_endpoint_auth_methods_supported` lists the client-authentication
+  The capability members reflect exactly what the server supports:
+  `grant_types_supported` is read from `AttestoPhoenix.Config.grant_types_supported/1`
+  (every grant the token endpoint dispatches by default — `authorization_code`,
+  `refresh_token`, `client_credentials`, and OAuth token exchange — narrowed when
+  the host configures `:grant_types_supported`, and the token endpoint enforces
+  the same set); `token_endpoint_auth_methods_supported` lists the client-authentication
   methods it accepts (`client_secret_basic`, `client_secret_post`,
   `private_key_jwt`, and `none` for PKCE-using public clients). The PAR
   endpoint is advertised separately as `pushed_authorization_request_endpoint`.
@@ -78,19 +79,6 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   # Attesto.AuthorizationRequest so the OAuth metadata matches the OpenID
   # configuration and never drifts from what the request validator accepts.
   @response_modes_supported AuthorizationRequest.supported_response_modes()
-
-  # RFC 8414 §2 `grant_types_supported`: the grant types the token endpoint
-  # (`AttestoPhoenix.Controller.TokenController`) actually dispatches -
-  # `authorization_code` (RFC 6749 §4.1), `refresh_token` (RFC 6749 §6), and
-  # `client_credentials` (RFC 6749 §4.4). Any other `grant_type` is rejected
-  # with `unsupported_grant_type`, so only these three are advertised. Fixed by
-  # what the controller wires, not configured.
-  @grant_types_supported [
-    "authorization_code",
-    "refresh_token",
-    "client_credentials",
-    "urn:ietf:params:oauth:grant-type:token-exchange"
-  ]
 
   # RFC 8414 §2 `token_endpoint_auth_methods_supported`: the client
   # authentication methods the token endpoint actually accepts. The controller
@@ -175,7 +163,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       authorization_endpoint: Config.authorize_endpoint_url(config),
       response_types_supported: @response_types_supported,
       response_modes_supported: @response_modes_supported,
-      grant_types_supported: @grant_types_supported,
+      grant_types_supported: Config.grant_types_supported(config),
       token_endpoint_auth_methods_supported: token_endpoint_auth_methods_supported(config),
       token_endpoint_auth_signing_alg_values_supported: config.client_auth_signing_algs,
       authorization_response_iss_parameter_supported: authorization_response_iss_parameter_supported(config),

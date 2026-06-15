@@ -6,6 +6,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-06-14
+
+### Security
+
+- **Token exchange can no longer broaden scope (RFC 8693 §2.1).** The
+  token-exchange grant validated the requested `scope` only against the host's
+  `:authorize_scope` policy, which is never handed the subject token — so the
+  library could not, and did not, enforce that the issued token's scope stays
+  within the subject token's. A client registered for a broad scope set could
+  exchange a narrowly-scoped subject token for a broader one. The token endpoint
+  now rejects (`invalid_scope`) any requested scope not present in the subject
+  token's scope, before delegating to `:authorize_scope` — an exchange can only
+  preserve or narrow scope. (`:authorize_scope` may still narrow further.)
+
+- **The token endpoint now enforces `grant_types_supported`.** Previously the
+  only grant gate was the optional per-client `:client_grant_types` callback
+  (unset ⇒ every grant allowed), while discovery advertised a hardcoded grant
+  superset including token-exchange — so a host that didn't lock every client
+  down had an advertised, working token-exchange grant it never opted into. The
+  token endpoint now rejects (`unsupported_grant_type`) any `grant_type` outside
+  the configured set, as a global backstop independent of per-client policy.
+
+### Changed
+
+- **`grant_types_supported` is now driven by host config, not a hardcoded list.**
+  Both discovery documents (RFC 8414 and OpenID configuration) and the new token
+  endpoint gate read `AttestoPhoenix.Config.grant_types_supported/1`, which
+  defaults to every implemented grant (so existing deployments are unchanged) and
+  is narrowed by configuring `:grant_types_supported` — dropping a grant (e.g.
+  token-exchange) now disables it across discovery, the token endpoint, and
+  dynamic registration at once, instead of only registration.
+
 ## [0.9.2] - 2026-06-14
 
 ### Fixed

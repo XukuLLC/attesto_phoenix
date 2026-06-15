@@ -129,6 +129,17 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
                ]
     end
 
+    test "advertises only the host-configured grant types when :grant_types_supported is narrowed" do
+      # The advertised set is the same value the token endpoint enforces, so a
+      # host that drops token-exchange to disable it sees discovery reflect it.
+      host = host_config(grant_types_supported: ["authorization_code", "refresh_token"])
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["grant_types_supported"] == ["authorization_code", "refresh_token"]
+      refute "urn:ietf:params:oauth:grant-type:token-exchange" in body["grant_types_supported"]
+    end
+
     test "advertises only the client-auth methods the token endpoint accepts (RFC 8414)" do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 

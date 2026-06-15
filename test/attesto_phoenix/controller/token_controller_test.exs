@@ -1019,6 +1019,61 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert claims["sub"] == "oc_subject"
       assert claims["scope"] == "documents.read"
     end
+
+    test "rejects a requested scope beyond the subject token (RFC 8693 §2.1)" do
+      enable_minting()
+
+      {:ok, %{access_token: subject_token}} =
+        Attesto.Token.mint(attesto_config(), %{
+          kind: "client",
+          sub: "oc_subject",
+          scopes: ["documents.read"],
+          claims: %{"client_id" => "subject-client"}
+        })
+
+      conn =
+        post_token(%{
+          "grant_type" => "urn:ietf:params:oauth:grant-type:token-exchange",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "subject_token_type" => "urn:ietf:params:oauth:token-type:access_token",
+          "subject_token" => subject_token,
+          # The subject token carries only documents.read; also asking for
+          # documents.write would broaden authority, which §2.1 forbids.
+          "scope" => "documents.read documents.write"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_scope"
+    end
+
+    test "rejects a grant_type the host removed from :grant_types_supported (RFC 8414 §2)" do
+      enable_minting()
+      put_config(grant_types_supported: ["authorization_code", "refresh_token", "client_credentials"])
+
+      {:ok, %{access_token: subject_token}} =
+        Attesto.Token.mint(attesto_config(), %{
+          kind: "client",
+          sub: "oc_subject",
+          scopes: ["documents.read"],
+          claims: %{"client_id" => "subject-client"}
+        })
+
+      conn =
+        post_token(%{
+          "grant_type" => "urn:ietf:params:oauth:grant-type:token-exchange",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "subject_token_type" => "urn:ietf:params:oauth:token-type:access_token",
+          "subject_token" => subject_token,
+          "scope" => "documents.read"
+        })
+
+      # token-exchange is dropped from the advertised set, so the endpoint rejects
+      # it before any per-client check or dispatch.
+      assert conn.status == 400
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
   end
 
   # FIX 5 - INITIAL REFRESH-TOKEN ISSUANCE (RFC 6749 §4.1.4 / §6).

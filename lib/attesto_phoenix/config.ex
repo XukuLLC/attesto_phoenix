@@ -155,8 +155,11 @@ defmodule AttestoPhoenix.Config do
       `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
       deployment so a `request_uri` resolves on every node (FAPI 2.0 requires
       PAR).
-    * `:grant_types_supported` - grant types advertised/accepted by dynamic
-      client registration.
+    * `:grant_types_supported` - the grant types the server supports. Advertised
+      as `grant_types_supported` (RFC 8414 §2), enforced by the token endpoint (a
+      `grant_type` outside the set is rejected), and the accepted set for dynamic
+      registration. Defaults to every implemented grant; narrow it to disable one
+      (e.g. drop token-exchange) everywhere at once. See `grant_types_supported/1`.
     * `:token_endpoint_auth_methods_supported` - client authentication methods
       advertised/accepted by dynamic client registration and by the token/PAR
       endpoints when configured. When unset, all package-supported methods are
@@ -858,6 +861,32 @@ defmodule AttestoPhoenix.Config do
   """
   @spec introspection_endpoint_url(t()) :: String.t()
   def introspection_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, introspection_path(config))
+
+  # Every grant type the token endpoint implements: RFC 6749 authorization_code /
+  # refresh_token / client_credentials and RFC 8693 token-exchange. This is the
+  # default advertised + accepted set; `:grant_types_supported` narrows it.
+  @default_grant_types_supported [
+    "authorization_code",
+    "refresh_token",
+    "client_credentials",
+    "urn:ietf:params:oauth:grant-type:token-exchange"
+  ]
+
+  @doc """
+  The grant types the authorization server supports.
+
+  Advertised as `grant_types_supported` (RFC 8414 §2) by both discovery documents
+  and enforced by the token endpoint — a `grant_type` outside this set is rejected
+  as `unsupported_grant_type` before dispatch. Defaults to every grant the token
+  endpoint implements (#{inspect(@default_grant_types_supported)}); configure
+  `:grant_types_supported` to narrow it, e.g. drop
+  `urn:ietf:params:oauth:grant-type:token-exchange` to disable token exchange
+  across discovery, the token endpoint, and dynamic registration at once.
+  """
+  @spec grant_types_supported(t()) :: [String.t()]
+  def grant_types_supported(%__MODULE__{grant_types_supported: list}) when is_list(list) and list != [], do: list
+
+  def grant_types_supported(%__MODULE__{}), do: @default_grant_types_supported
 
   @doc """
   Absolute URL of the dynamic client registration endpoint: the issuer merged

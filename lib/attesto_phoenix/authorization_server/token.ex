@@ -92,9 +92,23 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp run(%Request{} = request) do
-    case require_registered_grant_type(request) do
-      :ok -> dispatch(request)
-      {:error, %OAuthError{}} = err -> err
+    with :ok <- require_supported_grant_type(request),
+         :ok <- require_registered_grant_type(request) do
+      dispatch(request)
+    end
+  end
+
+  # RFC 8414 §2 / RFC 6749 §5.2: the server gates the token endpoint on the grant
+  # types it advertises (`AttestoPhoenix.Config.grant_types_supported/1`). A host
+  # that narrows `:grant_types_supported` (e.g. to disable token exchange) has the
+  # narrowing ENFORCED here, not merely reflected in discovery - an un-advertised
+  # grant is rejected before any per-client check or dispatch. This is the global
+  # backstop; `require_registered_grant_type/1` is the per-client restriction.
+  defp require_supported_grant_type(%Request{config: config, grant_type: grant_type}) do
+    if grant_type in Config.grant_types_supported(config) do
+      :ok
+    else
+      {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
     end
   end
 
@@ -218,8 +232,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   # RFC 8693: exchange a valid Attesto access token for a new, host-authorized
-  # access token. Scope policy still belongs to `:authorize_scope`; when no
-  # `scope` is requested the subject token's existing scope is carried forward.
+  # access token. The exchanged token MUST NOT carry authority the subject token
+  # lacks (§2.1), so a requested scope beyond the subject token's scope is
+  # rejected BEFORE the host `:authorize_scope` policy runs - token exchange can
+  # only preserve or narrow scope, never broaden it. When no `scope` is requested
+  # the subject token's existing scope is carried forward. `:authorize_scope` may
+  # then narrow further (client policy), but cannot re-widen past the subject's.
   defp dispatch(%Request{grant_type: @grant_token_exchange} = request) do
     %{config: config, client: client, params: params} = request
 
@@ -228,6 +246,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
          {:ok, claims} <- verify_subject_token(config, subject_token, binding),
          requested = requested_exchange_scope(params, claims),
+         :ok <- require_scope_within_subject_token(requested, claims),
          {:ok, scope} <- authorize_scope(config, client, requested),
          {:ok, response} <- mint_exchanged_token(config, claims, scope, token_type, binding) do
       response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
@@ -575,9 +594,25 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp requested_exchange_scope(params, claims) do
     case parse_requested_scope(params) do
-      [] -> claims |> Map.get("scope", "") |> String.split(" ", trim: true)
+      [] -> subject_token_scope(claims)
       scopes -> scopes
     end
+  end
+
+  # RFC 8693 §2.1: the issued token's scope must be within the subject token's
+  # authorization. The host `:authorize_scope` callback never sees the subject
+  # token, so it cannot enforce this - the library must, before delegating. Any
+  # requested scope not present in the subject token's scope fails the exchange
+  # (`invalid_scope`), so an exchange can only carry forward or narrow scope.
+  defp require_scope_within_subject_token(requested, claims) do
+    case requested -- subject_token_scope(claims) do
+      [] -> :ok
+      _exceeded -> {:error, error(@error_invalid_scope, "requested scope exceeds the subject token")}
+    end
+  end
+
+  defp subject_token_scope(claims) do
+    claims |> Map.get("scope", "") |> String.split(" ", trim: true)
   end
 
   # RFC 6749 §3.3: scope resolution is host policy. The documented
