@@ -38,7 +38,17 @@ endpoints (all found by an internal multi-agent security review).
   letting a front-channel attacker strip or substitute the code's DPoP key
   binding. It now reads the value off the verified request
   (`Attesto.AuthorizationRequest.dpop_jkt`, requires attesto 0.7.1), so a signed
-  request object's value is authoritative.
+  request object's value is authoritative. The PAR-resolved path continues to use
+  the PAR-verified thumbprint stored at the top level (a pushed request object is
+  re-merged at `/authorize`, which would otherwise drop it).
+
+- **The dynamic client registration endpoint now enforces TLS.**
+  `RegistrationController.create/2` returns a freshly minted plaintext
+  `client_secret` and `delete/2` reads a registration-access-token bearer
+  credential; neither gated on TLS, so under the default `require_https: true`
+  they served those credentials over cleartext. Both now refuse plain HTTP first,
+  like every other credential-bearing endpoint. (Found by adversarial
+  verification of the revocation fix — same class, uncovered sibling.)
 
 - **The revocation endpoint equalizes client-auth timing.** A lookup failure
   skipped `verify_client_secret`, leaving a timing oracle for client-id

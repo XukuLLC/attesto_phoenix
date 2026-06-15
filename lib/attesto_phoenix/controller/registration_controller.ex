@@ -74,7 +74,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   import Plug.Conn
 
   alias Attesto.{Secret, SecureCompare}
-  alias AttestoPhoenix.{Callback, Config, Event}
+  alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
 
   # RFC 7234 §5.2: a credential-bearing response must never be cached.
   @cache_control_no_store "no-store"
@@ -140,7 +140,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     config = config(conn)
     metadata = registration_metadata(conn)
 
-    with :ok <- check_content_type(conn),
+    with :ok <- check_https(conn, config),
+         :ok <- check_content_type(conn),
          {:ok, validated} <- validate_metadata(metadata, config),
          {:ok, issued} <- issue_client(validated, config),
          {:ok, _stored} <- persist(issued, config) do
@@ -167,7 +168,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     conn = put_no_store_headers(conn)
     config = config(conn)
 
-    with {:ok, token} <- registration_bearer_token(conn),
+    with :ok <- check_https(conn, config),
+         {:ok, token} <- registration_bearer_token(conn),
          {:ok, client} <- Callback.invoke(Config.load_client_fun(config), [client_id]),
          :ok <- verify_registration_access_token(config, client, token),
          :ok <- unregister_client(config, client) do
@@ -605,6 +607,17 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   end
 
   # ── Rendering (RFC 7591 §3.2.2) ──────────────────────────────────────────
+
+  # RFC 6749 §3.1 / §10.1: registration mints and returns a plaintext
+  # client_secret (create) and reads a registration-access-token bearer
+  # credential (delete); neither may cross a plain-HTTP hop, so refuse cleartext
+  # under `require_https`, exactly as the token/PAR/revocation endpoints do.
+  defp check_https(conn, config) do
+    case RequestContext.check_https(conn, config) do
+      :ok -> :ok
+      {:error, :insecure_transport} -> {:error, error("invalid_request", "the request must be made over TLS")}
+    end
+  end
 
   defp render_error(conn, %{error: code} = err) do
     conn

@@ -40,8 +40,11 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
   end
 
   defp post_register(config, metadata, content_type \\ "application/json") do
+    # The endpoint requires TLS (config.require_https defaults true): it returns a
+    # plaintext client_secret, which must never cross a plain-HTTP hop.
     :post
     |> conn(@endpoint_path, metadata)
+    |> Map.put(:scheme, :https)
     |> put_req_header("content-type", content_type)
     |> Map.put(:body_params, metadata)
     |> put_private(:attesto_phoenix_config, config)
@@ -52,6 +55,7 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     conn =
       :delete
       |> conn(@endpoint_path <> "/" <> client_id)
+      |> Map.put(:scheme, :https)
       |> put_private(:attesto_phoenix_config, config)
 
     conn =
@@ -136,6 +140,36 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
       assert get_resp_header(conn, "cache-control") == ["no-store"]
       assert get_resp_header(conn, "pragma") == ["no-cache"]
+    end
+  end
+
+  describe "transport security (RFC 6749 §3.1 / §10.1)" do
+    test "refuses a plain-HTTP registration and mints no secret" do
+      # require_https defaults true; a plain-HTTP register would return the minted
+      # client_secret in cleartext, so it must be refused before issuance.
+      conn =
+        :post
+        |> conn(@endpoint_path, %{})
+        |> put_req_header("content-type", "application/json")
+        |> Map.put(:body_params, %{"redirect_uris" => ["https://client.example/callback"]})
+        |> put_private(:attesto_phoenix_config, config([]))
+        |> RegistrationController.create(%{})
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_request"
+      refute Map.has_key?(body(conn), "client_secret")
+    end
+
+    test "refuses a plain-HTTP delete (registration-access-token would cross cleartext)" do
+      conn =
+        :delete
+        |> conn(@endpoint_path <> "/some-client")
+        |> put_req_header("authorization", "Bearer reg-token")
+        |> put_private(:attesto_phoenix_config, config([]))
+        |> RegistrationController.delete(%{"client_id" => "some-client"})
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_request"
     end
   end
 

@@ -584,6 +584,56 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert TestStore.peek(code).data.dpop_jkt == jkt
     end
 
+    test "preserves a PAR-verified DPoP thumbprint when the pushed request used a signed request object" do
+      # Regression guard: PAR stores the proof-verified thumbprint at the TOP
+      # LEVEL of the pushed params AND retains the signed `request` JWT. validate/2
+      # re-merges the request object (replacing the param map with the object's),
+      # so the top-level dpop_jkt is dropped from `request.dpop_jkt` - the
+      # controller must read the PAR-verified value directly or the code is minted
+      # UNBOUND (the DPoP sender-constraint silently lost).
+      request_uri = "urn:ietf:params:oauth:request_uri:par-jar-dpop"
+      jkt = Attesto.Secret.hash("par-jar-proof-key")
+
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_kty, pub} = JOSE.JWK.to_public_map(request_key)
+      client_jwk = Map.merge(pub, %{"kid" => "rk", "alg" => "ES256"})
+
+      put_config(
+        require_pushed_authorization_requests: true,
+        par_store: PARStore,
+        client_jwks: fn _client -> %{"keys" => [client_jwk]} end
+      )
+
+      now = System.system_time(:second)
+
+      claims = %{
+        "iss" => @client_id,
+        "aud" => "https://issuer.example.com",
+        "client_id" => @client_id,
+        "redirect_uri" => @redirect_uri,
+        "response_type" => "code",
+        "scope" => "openid",
+        "code_challenge" => @code_challenge,
+        "code_challenge_method" => "S256",
+        "nbf" => now,
+        "exp" => now + 300
+      }
+
+      header = %{"alg" => "ES256", "kid" => "rk", "typ" => "oauth-authz-req+jwt"}
+      {_header, request} = request_key |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+
+      # Exactly what par.ex stores: object params re-tagged with "request", plus
+      # the proof-verified thumbprint at the top level.
+      stored = %{"client_id" => @client_id, "request" => request, "dpop_jkt" => jkt}
+      :ok = PARStore.put(request_uri, stored, 60)
+
+      conn = call(%{"client_id" => @client_id, "request_uri" => request_uri})
+
+      assert conn.status == 302
+      code = location_query(conn)["code"]
+      assert TestStore.peek(code).data.dpop_jkt == jkt
+    end
+
     test "uses the bound client and ignores other front-channel params when the client_id matches" do
       request_uri = "urn:ietf:params:oauth:request_uri:bound-client"
 

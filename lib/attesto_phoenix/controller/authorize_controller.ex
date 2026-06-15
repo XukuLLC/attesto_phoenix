@@ -156,7 +156,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          {:ok, request} <- validate_request(config, client, params, par_resolved?) do
       conn
       |> stash_par_request_uri(par_request_uri, par_resolved?)
-      |> run_flow(config, client, request, request.dpop_jkt)
+      |> run_flow(config, client, request, authorize_dpop_jkt(request, params, par_resolved?))
     else
       {:error, :insecure_transport} ->
         # RFC 6749 §3.1 / §10.1: the authorization endpoint requires TLS. The
@@ -561,6 +561,26 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # this id, and code-reuse detection replays it to revoke the descendant
   # family. Generated with the same secret generator the codes themselves use.
   defp generate_family_id, do: Secret.generate()
+
+  # RFC 9449 §10: the DPoP key thumbprint the issued code is sender-constrained
+  # to. Two sources, by path:
+  #
+  #   * PAR-resolved: the PAR endpoint already verified the presented proof and
+  #     stored the thumbprint at the TOP LEVEL of the pushed params (and rejects a
+  #     submitted `dpop_jkt` that disagrees with the proof). But `validate/2`
+  #     re-merges any pushed `request` object and replaces the params with the
+  #     signed object's - dropping that top-level value - so read the
+  #     PAR-verified thumbprint straight from the stored params. It is trusted:
+  #     PAR put it there after proof verification.
+  #
+  #   * Direct: read it off the VERIFIED request (`request.dpop_jkt`, sourced from
+  #     the effective post-merge params), so a signed request object's value is
+  #     authoritative and an unsigned outer-query value is ignored.
+  defp authorize_dpop_jkt(request, params, true), do: dpop_jkt_from_params(params) || request.dpop_jkt
+  defp authorize_dpop_jkt(request, _params, false), do: request.dpop_jkt
+
+  defp dpop_jkt_from_params(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
+  defp dpop_jkt_from_params(_params), do: nil
 
   # OIDC Core §3.1.3.6 / §2: the claims the token endpoint needs to mint the ID
   # token. The request `nonce` (OIDC Core §3.1.2.1) MUST be reflected into the
