@@ -26,7 +26,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     @moduledoc false
     @behaviour AttestoPhoenix.PARStore
 
+    @impl true
     defdelegate put(request_uri, params, ttl_seconds), to: ETS
+
+    @impl true
     defdelegate fetch(request_uri), to: ETS
 
     @impl true

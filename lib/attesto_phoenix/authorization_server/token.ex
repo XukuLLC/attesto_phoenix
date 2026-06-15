@@ -53,6 +53,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # RFC 6749 §5.2 error codes.
   @error_invalid_request "invalid_request"
+  @error_invalid_client "invalid_client"
   @error_invalid_grant "invalid_grant"
   @error_invalid_scope "invalid_scope"
   @error_unsupported_grant_type "unsupported_grant_type"
@@ -60,6 +61,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 8693 token exchange.
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
   @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
+
+  # RFC 6749 §4.4 / RFC 8693 §2.1: grants that require a confidential client.
+  # client_credentials authenticates the client AS the principal, and a token
+  # exchange mints fresh authority off a presented token; neither is safe for a
+  # public (`:none`) client that proved possession of no client credential, so
+  # both reject the public-client path regardless of any per-client policy.
+  @confidential_only_grants ["client_credentials", @grant_token_exchange]
 
   # OIDC Core §3.1.2.1 / §11: the scope values that trigger ID-Token issuance
   # and initial refresh-token issuance respectively.
@@ -93,10 +101,24 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp run(%Request{} = request) do
     with :ok <- require_supported_grant_type(request),
+         :ok <- require_confidential_client(request),
          :ok <- require_registered_grant_type(request) do
       dispatch(request)
     end
   end
+
+  # RFC 6749 §4.4 / RFC 8693: a public client (auth method `:none`) presented no
+  # client credential, so it may not run a confidential-only grant. Rejected as
+  # invalid_client (RFC 6749 §5.2: client authentication required but absent),
+  # independent of the optional per-client `:client_grant_types` policy - the
+  # library does not depend on the host wiring that callback to keep a public
+  # client out of client_credentials / token-exchange.
+  defp require_confidential_client(%Request{grant_type: grant_type, client_auth_method: :none})
+       when grant_type in @confidential_only_grants do
+    {:error, error(@error_invalid_client, "#{grant_type} requires a confidential client")}
+  end
+
+  defp require_confidential_client(%Request{}), do: :ok
 
   # RFC 8414 §2 / RFC 6749 §5.2: the server gates the token endpoint on the grant
   # types it advertises (`AttestoPhoenix.Config.grant_types_supported/1`). A host

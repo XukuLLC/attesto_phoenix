@@ -6,6 +6,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-06-14
+
+### Security
+
+Adversarial-review hardening of the token, authorization, and revocation
+endpoints (all found by an internal multi-agent security review).
+
+- **Public clients can no longer run confidential-only grants.** The token
+  endpoint gated grants only on the optional per-client `:client_grant_types`
+  callback (unset ⇒ all grants allowed), so a public (`none`) client that proved
+  possession of no credential could run `client_credentials` (RFC 6749 §4.4) or
+  RFC 8693 token-exchange. The resolved client-auth method is now threaded into
+  the request, and both grants reject the `:none` path with `invalid_client`,
+  independent of any host policy.
+
+- **The revocation endpoint now enforces TLS.** `RevocationController` never
+  called `check_https`, so under the default `require_https: true` a plain-HTTP
+  `POST /oauth/revoke` carrying the client secret + refresh token was still
+  processed — leaking both over cleartext. It now gates on TLS first, like every
+  other credential-bearing endpoint.
+
+- **DPoP proofs are replay-protected at the token endpoint (RFC 9449 §11.1).**
+  `SenderConstraint.bind_dpop` never wired `:replay_check`, so a captured
+  token-endpoint proof's `jti` was never recorded and the proof was replayable
+  within its acceptance window. The proof's `jti` is now recorded (via the same
+  default `Attesto.DPoP.ReplayCache` the PAR endpoint uses).
+
+- **The direct (non-PAR) authorization endpoint honors a signed `dpop_jkt`.** It
+  read `dpop_jkt` from the raw outer query, ignoring the signed request object —
+  letting a front-channel attacker strip or substitute the code's DPoP key
+  binding. It now reads the value off the verified request
+  (`Attesto.AuthorizationRequest.dpop_jkt`, requires attesto 0.7.1), so a signed
+  request object's value is authoritative.
+
+- **The revocation endpoint equalizes client-auth timing.** A lookup failure
+  skipped `verify_client_secret`, leaving a timing oracle for client-id
+  enumeration. It now runs a dummy verify against an `:unknown_client` sentinel
+  so the unknown-client and wrong-secret paths match in observable timing,
+  matching the shared `AttestoPhoenix.ClientAuthentication` core.
+
+- **CIMD SSRF guard covers Teredo and ORCHIDv2.** Added `2001:0000::/32` (Teredo)
+  and `2001:20::/28` (ORCHIDv2) to the RFC 6890 special-use IPv6 table the
+  fetcher screens against.
+
 ## [0.9.3] - 2026-06-14
 
 ### Security

@@ -82,6 +82,9 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       [
         config: config,
         client: @client,
+        # Confidential by default; client_credentials/token-exchange require it.
+        # Tests of the public-client gate override this with :none.
+        client_auth_method: :client_secret_basic,
         grant_type: "client_credentials",
         params: %{},
         sender_constraint_input: %{

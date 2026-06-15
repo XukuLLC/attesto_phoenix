@@ -43,7 +43,10 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       repo: StubRepo,
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _client, _given -> false end,
-      load_principal: fn _ -> {:error, :not_found} end
+      load_principal: fn _ -> {:error, :not_found} end,
+      # The token endpoint records each DPoP proof's jti (RFC 9449 §11.1); these
+      # data tests don't run the cache, so stub the check to a no-op.
+      replay_check: fn _jti, _ttl -> :ok end
     ]
   end
 

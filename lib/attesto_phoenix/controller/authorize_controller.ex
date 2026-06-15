@@ -156,7 +156,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          {:ok, request} <- validate_request(config, client, params, par_resolved?) do
       conn
       |> stash_par_request_uri(par_request_uri, par_resolved?)
-      |> run_flow(config, client, request, dpop_jkt_from_params(params))
+      |> run_flow(config, client, request, request.dpop_jkt)
     else
       {:error, :insecure_transport} ->
         # RFC 6749 §3.1 / §10.1: the authorization endpoint requires TLS. The
@@ -561,15 +561,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # this id, and code-reuse detection replays it to revoke the descendant
   # family. Generated with the same secret generator the codes themselves use.
   defp generate_family_id, do: Secret.generate()
-
-  # RFC 9449 §10 / FAPI2 Security Profile: a DPoP proof at PAR establishes the
-  # key thumbprint the authorization code must later be redeemed with. PAR
-  # stores that verified thumbprint in the pushed request params as `dpop_jkt`;
-  # direct authorization requests may also carry the extension parameter. The
-  # core code grant validates the thumbprint format and enforces the match at
-  # token redemption.
-  defp dpop_jkt_from_params(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
-  defp dpop_jkt_from_params(_params), do: nil
 
   # OIDC Core §3.1.3.6 / §2: the claims the token endpoint needs to mint the ID
   # token. The request `nonce` (OIDC Core §3.1.2.1) MUST be reflected into the

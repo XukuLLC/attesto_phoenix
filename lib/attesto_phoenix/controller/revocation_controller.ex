@@ -65,6 +65,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
+  alias AttestoPhoenix.RequestContext
 
   # Dispatch through the action plug so the module is a complete `Plug`
   # (`init/1` + `call/2`): the router invokes it as a plug, selecting the
@@ -127,11 +128,24 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     # RFC 6749 §5.1: success and error responses alike carry no-store.
     conn = put_no_store_headers(conn)
 
-    with {:ok, client_id, client_secret} <- client_credentials(conn, params),
+    with :ok <- RequestContext.check_https(conn, config),
+         {:ok, client_id, client_secret} <- client_credentials(conn, params),
          {:ok, _client} <- authenticate_client(config, client_id, client_secret),
          {:ok, token} <- fetch_token(params) do
       revoke_token(conn, config, client_id, token, params)
     else
+      {:error, :insecure_transport} ->
+        # RFC 6749 §3.1 / §10.1: the client secret and refresh token in this
+        # request must never cross a plain-HTTP hop; a credential that did is
+        # treated as compromised and the request refused, exactly as every other
+        # credential-bearing endpoint does (see `AttestoPhoenix.RequestContext`).
+        send_oauth_error(
+          conn,
+          @http_bad_request,
+          @error_invalid_request,
+          "the request must be made over TLS"
+        )
+
       {:error, :invalid_request} ->
         # RFC 7009 §2.1 / RFC 6749 §5.2: the required `token` parameter is
         # missing or otherwise malformed.
@@ -240,13 +254,25 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   defp authenticate_client(config, client_id, client_secret) when is_binary(client_id) and is_binary(client_secret) do
     # RFC 6749 §5.2: an unknown or revoked client, and a wrong secret, all
-    # surface to the caller as the same `invalid_client` so the endpoint is
-    # not an existence oracle for client ids.
-    with {:ok, client} <- Callback.invoke(Config.load_client_fun(config), [client_id]),
-         true <- Callback.invoke(Config.verify_client_secret_fun(config), [client, client_secret]) do
-      {:ok, client}
-    else
-      _failed -> {:error, :invalid_client}
+    # surface to the caller as the same `invalid_client` so the endpoint is not
+    # an existence oracle for client ids. To keep that true in OBSERVABLE TIMING
+    # too (RFC 6749 §2.3 / OWASP), a lookup failure still runs a dummy
+    # `verify_client_secret` against `:unknown_client` so its latency matches the
+    # wrong-secret path - the same equalization the shared
+    # `AttestoPhoenix.ClientAuthentication` core applies.
+    verify_client_secret = Config.verify_client_secret_fun(config)
+
+    case Callback.invoke(Config.load_client_fun(config), [client_id]) do
+      {:ok, client} ->
+        if Callback.invoke(verify_client_secret, [client, client_secret]) == true do
+          {:ok, client}
+        else
+          {:error, :invalid_client}
+        end
+
+      _unknown ->
+        _ = Callback.invoke(verify_client_secret, [:unknown_client, client_secret])
+        {:error, :invalid_client}
     end
   end
 

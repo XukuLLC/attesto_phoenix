@@ -11,6 +11,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
 
     * `:config` - the validated `%AttestoPhoenix.Config{}` carrying host policy.
     * `:client` - the authenticated client (RFC 6749 §2.3), opaque to the core.
+    * `:client_auth_method` - HOW the client authenticated
+      (`:client_secret_basic` / `:client_secret_post` / `:private_key_jwt`, or
+      `:none` for the public-client path). The core gates confidential-only
+      grants (`client_credentials`, token-exchange) on this, rejecting `:none`.
     * `:grant_type` - the requested grant type string (RFC 6749 §1.3).
     * `:params` - the request body parameters.
     * `:sender_constraint_input` - the conn-free sender-constraint facts
@@ -29,6 +33,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
   @type t :: %__MODULE__{
           config: Config.t(),
           client: term(),
+          client_auth_method: :client_secret_basic | :client_secret_post | :private_key_jwt | :none,
           grant_type: String.t(),
           params: map(),
           sender_constraint_input: SenderConstraint.input(),
@@ -36,10 +41,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
           request_client_id: String.t() | nil
         }
 
-  @enforce_keys [:config, :client, :grant_type, :params, :sender_constraint_input]
+  @enforce_keys [:config, :client, :client_auth_method, :grant_type, :params, :sender_constraint_input]
   defstruct [
     :config,
     :client,
+    :client_auth_method,
     :grant_type,
     :params,
     :sender_constraint_input,

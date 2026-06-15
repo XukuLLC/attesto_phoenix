@@ -99,18 +99,18 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   defp create_checked(config, conn, params) do
     case authenticate_client(config, conn, params) do
-      {:ok, client} ->
-        create_authenticated(config, conn, params, client)
+      {:ok, client, method} ->
+        create_authenticated(config, conn, params, client, method)
 
       {:error, %OAuthError{} = err} ->
         deny(config, conn, params, nil, err)
     end
   end
 
-  defp create_authenticated(config, conn, params, client) do
+  defp create_authenticated(config, conn, params, client, method) do
     case fetch_grant_type(params) do
       {:ok, grant_type} ->
-        issue(config, conn, params, client, grant_type)
+        issue(config, conn, params, client, method, grant_type)
 
       {:error, %OAuthError{} = err} ->
         # A valid client without a grant_type: the core never runs, so the
@@ -120,8 +120,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
     end
   end
 
-  defp issue(config, conn, params, client, grant_type) do
-    request = build_request(config, conn, params, client, grant_type)
+  defp issue(config, conn, params, client, method, grant_type) do
+    request = build_request(config, conn, params, client, method, grant_type)
 
     case Token.issue(config, request) do
       {:ok, response, events} ->
@@ -143,10 +143,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # `Token.Request`. The sender-constraint input (RFC 9449 / RFC 8705) is parsed
   # off the conn here; the core reads only this data. `client_ip` and the
   # request-derived `client_id` are carried for the audit events the core builds.
-  defp build_request(config, conn, params, client, grant_type) do
+  defp build_request(config, conn, params, client, method, grant_type) do
     %Request{
       config: config,
       client: client,
+      client_auth_method: method,
       grant_type: grant_type,
       params: params,
       sender_constraint_input: sender_constraint_input(config, conn),
@@ -205,7 +206,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
            config,
            policy
          ) do
-      {:ok, %ClientAuthentication.Result{client: client}} -> {:ok, client}
+      {:ok, %ClientAuthentication.Result{client: client, method: method}} -> {:ok, client, method}
       {:error, %OAuthError{}} = err -> err
     end
   end

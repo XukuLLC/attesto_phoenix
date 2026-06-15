@@ -105,6 +105,13 @@ defmodule AttestoPhoenix.ClientIdMetadata.Fetcher.Req do
     {{0xFC00, 0, 0, 0, 0, 0, 0, 0}, 7},
     {{0xFE80, 0, 0, 0, 0, 0, 0, 0}, 10},
     {{0xFF00, 0, 0, 0, 0, 0, 0, 0}, 8},
+    # Teredo 2001:0000::/32 (RFC 4380) and ORCHIDv2 2001:20::/28 (RFC 7343), both
+    # in the RFC 6890 special-purpose registry. Teredo embeds a client IPv4 in
+    # its low bits, but the fetch dials the FULL IPv6 address (Teredo is not
+    # routed to the embedded IPv4), so blocking the prefix outright is the right
+    # guard - it never reaches a destination the IPv4 table would screen.
+    {{0x2001, 0x0000, 0, 0, 0, 0, 0, 0}, 32},
+    {{0x2001, 0x0020, 0, 0, 0, 0, 0, 0}, 28},
     {{0x2001, 0xDB8, 0, 0, 0, 0, 0, 0}, 32}
   ]
 

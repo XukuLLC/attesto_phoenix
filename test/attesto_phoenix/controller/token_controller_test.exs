@@ -20,6 +20,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   import Plug.Test
 
   alias Attesto.CodeStore.ETS
+  alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.Controller.TokenController
 
   @endpoint_path "/oauth/token"
@@ -718,7 +719,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         post_token(%{
           "grant_type" => "client_credentials",
-          "client_id" => "public-1",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
           "scope" => "admin"
         })
 
@@ -727,7 +729,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert_receive {:event,
                       %AttestoPhoenix.Event{
                         name: :token_denied,
-                        client_id: "public-1",
+                        client_id: "confidential-1",
                         grant_type: "client_credentials",
                         scope: "admin",
                         result: "invalid_scope"
@@ -753,7 +755,23 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error_description"] == "client authentication failed"
     end
 
-    test "a public client is admitted secretless and gets a token" do
+    test "a public client is admitted secretless on the authorization-code path" do
+      # RFC 6749 §2.1: a public client is identified by client_id with no secret.
+      # Admission is proven on a grant a public client MAY use - authorization_code
+      # with PKCE - since client_credentials is confidential-only (see below).
+      enable_minting()
+      put_config(code_store: start_code_store("oc_sub-1", ["read"]))
+
+      conn = post_auth_code()
+
+      assert conn.status == 200
+      assert is_binary(body(conn)["access_token"])
+    end
+
+    test "a public client is rejected on client_credentials (RFC 6749 §4.4)" do
+      # client_credentials authenticates the client AS the principal, so it is
+      # confidential-only. A public client (no credential) must not mint with it,
+      # regardless of whether the host wired :client_grant_types.
       enable_minting()
 
       conn =
@@ -763,9 +781,9 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
           "scope" => "read"
         })
 
-      assert conn.status == 200
-      assert is_binary(body(conn)["access_token"])
-      assert body(conn)["token_type"] == "Bearer"
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+      assert body(conn)["error_description"] =~ "confidential"
     end
 
     test "fails closed when :client_public? is not configured" do
@@ -801,7 +819,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         post_token(%{
           "grant_type" => "client_credentials",
-          "client_id" => "public-1",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
           "scope" => "read"
         })
 
@@ -825,7 +844,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         post_token(%{
           "grant_type" => "client_credentials",
-          "client_id" => "public-1"
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t"
         })
 
       assert conn.status == 400
@@ -835,6 +855,28 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   end
 
   # FIX 3 - DPoP NONCE (RFC 9449 §8/§9).
+  describe "DPoP proof replay (RFC 9449 §11.1)" do
+    test "a replayed DPoP proof is rejected at the token endpoint" do
+      enable_minting()
+      start_supervised!({ReplayCache, []})
+      # The base setup stubs :replay_check to always allow; use the real,
+      # jti-recording cache here so the replay is actually rejected.
+      put_config(dpop_enabled: true, replay_check: &ReplayCache.check_and_record/2)
+
+      # One proof, presented twice. The first use mints a DPoP-bound token; the
+      # replay carries the same `jti`, which the endpoint must record and reject.
+      proof = dpop_proof(nonce: nil)
+
+      first = post_dpop("client_credentials", proof)
+      assert first.status == 200
+      assert body(first)["token_type"] == "DPoP"
+
+      second = post_dpop("client_credentials", proof)
+      assert second.status == 400
+      assert body(second)["error"] == "invalid_dpop_proof"
+    end
+  end
+
   describe "DPoP nonce enforcement (RFC 9449 §8)" do
     test "a required-but-absent nonce yields use_dpop_nonce with a fresh DPoP-Nonce header" do
       enable_minting()
@@ -1074,6 +1116,24 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert conn.status == 400
       assert body(conn)["error"] == "unsupported_grant_type"
     end
+
+    test "a public client is rejected on token-exchange (confidential-only)" do
+      enable_minting()
+
+      # A public client proved possession of no client credential, so it may not
+      # mint fresh authority off a presented token. Rejected before the subject
+      # token is even examined (RFC 8693 / RFC 6749 §4.4 class).
+      conn =
+        post_token(%{
+          "grant_type" => "urn:ietf:params:oauth:grant-type:token-exchange",
+          "client_id" => "public-1",
+          "subject_token_type" => "urn:ietf:params:oauth:token-type:access_token",
+          "subject_token" => "irrelevant"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+    end
   end
 
   # FIX 5 - INITIAL REFRESH-TOKEN ISSUANCE (RFC 6749 §4.1.4 / §6).
@@ -1084,7 +1144,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         post_token(%{
           "grant_type" => "client_credentials",
-          "client_id" => "public-1",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
           "scope" => "read offline_access"
         })
 
@@ -1957,7 +2018,15 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # POST with a DPoP header over an https-effective conn (so the proof's
   # https-only htu matches and DPoP binding is reachable).
   defp post_dpop(grant_type, proof) do
-    params = %{"grant_type" => grant_type, "client_id" => "public-1", "scope" => "read"}
+    # client_credentials is confidential-only (RFC 6749 §4.4), so authenticate as
+    # the confidential client; DPoP sender-constrains the issued token on top.
+    params = %{
+      "grant_type" => grant_type,
+      "client_id" => "confidential-1",
+      "client_secret" => "s3cr3t",
+      "scope" => "read"
+    }
+
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
     %{base | scheme: :https, host: "issuer.example", port: 443}

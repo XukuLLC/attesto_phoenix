@@ -52,8 +52,11 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
         @client_id -> {:ok, %{id: @client_id}}
         _other -> {:error, :not_found}
       end,
-      verify_client_secret: fn %{id: @client_id}, presented ->
-        presented == @client_secret
+      verify_client_secret: fn
+        %{id: @client_id}, presented -> presented == @client_secret
+        # The endpoint runs a dummy verify against :unknown_client on a lookup
+        # failure to equalize timing (RFC 6749 §2.3); it must always fail.
+        :unknown_client, _presented -> false
       end,
       load_principal: fn _subject -> {:error, :not_found} end
     ]
@@ -68,8 +71,9 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   defp build_conn(params, opts) do
     config = Keyword.get(opts, :config) || build_config([])
 
-    :post
-    |> conn("/oauth/revoke", params)
+    # The endpoint requires TLS (config.require_https defaults true): a client
+    # secret + refresh token must never cross a plain-HTTP hop.
+    %{conn(:post, "/oauth/revoke", params) | scheme: :https}
     |> put_private(:attesto_phoenix_config, config)
     |> put_private(:attesto_phoenix_refresh_store, StubStore)
     |> maybe_basic_auth(opts)

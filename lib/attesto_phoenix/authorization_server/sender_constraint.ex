@@ -58,6 +58,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   verbatim alongside the error.
   """
 
+  alias Attesto.DPoP.ReplayCache
   alias Attesto.MTLS
   alias AttestoPhoenix.{Callback, Config, OAuthError}
 
@@ -196,7 +197,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
     verify_opts =
       [
         http_method: http_method(input),
-        http_uri: http_uri(input)
+        http_uri: http_uri(input),
+        # RFC 9449 §11.1: record the proof's `jti` so a captured token-endpoint
+        # proof cannot be replayed within its acceptance window. The token
+        # endpoint is the one place RFC 9449 §11.1 makes the server responsible
+        # for the replay check itself (there is no later resource-server check to
+        # rely on), so it must be wired here, exactly as the PAR endpoint does.
+        replay_check: replay_check(config)
       ]
       |> put_optional_kw(:nonce_check, nonce_check(config))
 
@@ -255,6 +262,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   end
 
   defp nonce_check(_config), do: nil
+
+  # RFC 9449 §11.1: the host may supply a `:replay_check` (`(jti, exp) -> :ok |
+  # {:error, _}`); otherwise the package's `Attesto.DPoP.ReplayCache` records the
+  # `jti` and rejects a repeat. Mirrors the PAR endpoint's resolution so the two
+  # DPoP entry points share one replay store.
+  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
+  defp replay_check(%Config{replay_check: callback}), do: callback
 
   # RFC 9449 §8: issue a fresh server nonce and return it in the error's
   # `:headers` so the controller can replay the `DPoP-Nonce` header verbatim,
