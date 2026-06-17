@@ -1011,6 +1011,53 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert conn.status == 200
       assert body(conn)["token_type"] == "DPoP"
     end
+
+    test "a DPoP-bound code with neither client auth nor a proof reports the holder-of-key failure" do
+      # FAPI2 ensure-holder-of-key-required sends a token request for a
+      # sender-constrained code with NO client authentication AND no DPoP proof.
+      # The holder-of-key failure (invalid_request) must take precedence over the
+      # client-auth failure (invalid_client), which would otherwise mask it.
+      enable_minting()
+      {_proof, jkt} = dpop_proof_and_jkt([])
+      code_store = start_dpop_code_store("oc_sub-1", ["openid"], jkt)
+      put_config(code_store: code_store, dpop_enabled: true)
+
+      code = Process.get(:auth_code)
+
+      conn =
+        post_token(%{
+          "grant_type" => "authorization_code",
+          "code" => code,
+          "code_verifier" => @code_verifier,
+          "redirect_uri" => @redirect_uri
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_request"
+      assert body(conn)["error_description"] =~ "DPoP"
+
+      # The code was only READ, not consumed - still live for a legitimate retry.
+      assert Attesto.AuthorizationCode.dpop_bound?(code_store, code)
+    end
+
+    test "a plain (non-DPoP) code with no client auth still reports invalid_client" do
+      # The holder-of-key precedence applies ONLY to DPoP-bound codes; a plain
+      # (e.g. OIDC) code redeemed without client auth still surfaces invalid_client.
+      enable_minting()
+      code_store = start_code_store("oc_sub-1", ["read"])
+      put_config(code_store: code_store)
+
+      conn =
+        post_token(%{
+          "grant_type" => "authorization_code",
+          "code" => Process.get(:auth_code),
+          "code_verifier" => @code_verifier,
+          "redirect_uri" => @redirect_uri
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+    end
   end
 
   # FIX 4 - REVOCATION via load_client (the documented control is the lookup).

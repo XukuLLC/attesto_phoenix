@@ -96,6 +96,28 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   end
 
   @doc """
+  Reads the live (unconsumed) record for `code_hash` WITHOUT consuming it.
+
+  Returns `{:ok, entry}` for a present, not-yet-consumed code, or `:error`
+  otherwise. Unlike `take/1` this is a plain SELECT - it does NOT mark the code
+  consumed - so it is safe for read-only pre-checks at the token endpoint (e.g.
+  a holder-of-key / DPoP requirement, RFC 9449 §10) without burning single use.
+  """
+  @impl Attesto.CodeStore
+  @spec get(Attesto.CodeStore.code_hash()) :: {:ok, Attesto.CodeStore.entry()} | :error
+  def get(code_hash) when is_binary(code_hash) do
+    query =
+      from a in Authorization,
+        where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
+        select: a
+
+    case repo().one(query) do
+      nil -> :error
+      row -> {:ok, Authorization.to_record(row)}
+    end
+  end
+
+  @doc """
   Marks a successfully redeemed code as reuse-trackable.
 
   `Attesto.AuthorizationCode.redeem/4` calls this after every validation step

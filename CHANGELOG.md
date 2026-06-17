@@ -6,6 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-06-16
+
+### Fixed
+
+- **Holder-of-key (DPoP) failures are now surfaced ahead of the client-auth
+  error (FAPI2 `ensure-holder-of-key-required`).** A token request redeeming a
+  sender-constrained (DPoP-bound) authorization code WITHOUT a DPoP proof is a
+  holder-of-key failure; FAPI2 expects it reported as
+  `invalid_request`/`invalid_grant`/`invalid_dpop_proof`. When such a request
+  ALSO lacked client authentication, the client-auth check masked it with
+  `invalid_client`. The token endpoint now reads the code (via the store's
+  non-consuming `Attesto.CodeStore.get/1`) and, when it is DPoP-bound and no
+  proof is presented, returns `invalid_request "DPoP proof required"` — even
+  before the client-auth failure. The code is NOT consumed, so a legitimate
+  retry is unaffected. Only DPoP-bound codes are affected; a plain (e.g. OIDC)
+  code still surfaces `invalid_client`. Requires attesto 0.7.2.
+
+### Added
+
+- **`AttestoPhoenix.Store.EctoCodeStore.get/1`** — the non-consuming read
+  (`Attesto.CodeStore.get/1`) for the Ecto-backed code store, a plain SELECT of
+  the live (unconsumed) row.
+
 ## [0.9.4] - 2026-06-14
 
 ### Security

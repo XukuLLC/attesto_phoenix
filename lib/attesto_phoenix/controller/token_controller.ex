@@ -103,9 +103,32 @@ defmodule AttestoPhoenix.Controller.TokenController do
         create_authenticated(config, conn, params, client, method)
 
       {:error, %OAuthError{} = err} ->
-        deny(config, conn, params, nil, err)
+        # A holder-of-key (DPoP) failure on a sender-constrained code takes
+        # precedence over the client-auth error; otherwise fall back to it.
+        deny(config, conn, params, nil, holder_of_key_error(config, conn, params) || err)
     end
   end
+
+  # RFC 9449 §10 / FAPI2 "ensure holder-of-key required": a sender-constrained
+  # (DPoP-bound) authorization code redeemed WITHOUT a DPoP proof is a
+  # holder-of-key failure. FAPI2 expects it reported as
+  # invalid_request/invalid_grant/invalid_dpop_proof - and it must surface even
+  # when the request ALSO lacks client authentication (the suite's test sends
+  # neither), where the client-auth check would otherwise mask it with
+  # invalid_client. The code is READ (`get/1`), never consumed, so a legitimate
+  # retry is unaffected. Only DPoP-bound codes match; a plain (e.g. OIDC) code
+  # still surfaces the client-auth error. Returns `nil` when it does not apply.
+  defp holder_of_key_error(config, conn, %{"grant_type" => "authorization_code", "code" => code})
+       when is_binary(code) do
+    store = Callback.config_callback(config, :code_store)
+
+    if is_atom(store) and not is_nil(store) and is_nil(first_dpop_proof(conn)) and
+         Attesto.AuthorizationCode.dpop_bound?(store, code) do
+      error(@error_invalid_request, "DPoP proof required for a sender-constrained authorization code")
+    end
+  end
+
+  defp holder_of_key_error(_config, _conn, _params), do: nil
 
   defp create_authenticated(config, conn, params, client, method) do
     case fetch_grant_type(params) do
