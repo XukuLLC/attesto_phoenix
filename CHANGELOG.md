@@ -6,6 +6,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-18
+
+### Added
+
+- **Identity Assertion JWT Authorization Grant (ID-JAG / `jwt-bearer`)** — the
+  resource server's half of
+  `draft-ietf-oauth-identity-assertion-authz-grant-04`, the grant behind MCP
+  Enterprise-Managed Authorization (EMA). A token request with
+  `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and an `assertion`
+  (an ID-JAG signed by a trusted enterprise IdP) is exchanged for a normal
+  access token — no redirect, no consent.
+  - **Off by default**, gated by `jwt_bearer: [enabled: true, ...]`. When
+    enabled, `urn:ietf:params:oauth:grant-type:jwt-bearer` is advertised in
+    `grant_types_supported` (both discovery documents) and accepted at the token
+    endpoint; existing deployments are unaffected.
+  - **Trusted issuers** (`jwt_bearer: [issuers: %{...}]`): each issuer supplies
+    static `:jwks`, a cached `:jwks_uri` (fetched through the SSRF-guarded CIMD
+    fetcher + cache), or a custom `:jwks_resolver`; with `:allowed_algs` and an
+    optional `:audience` override. Assertions from unconfigured issuers are
+    denied.
+  - **Validation** via `Attesto.IdentityAssertion`: `typ=oauth-id-jag+jwt`,
+    signature against the issuer JWKS, `iss`/`aud`/`exp`/`iat` (with skew), the
+    required `client_id` binding to the authenticated client, and `jti` replay
+    (reusing the configured `:replay_check`). Every failure is RFC 6749 §5.2
+    `invalid_grant`; a missing `assertion` is `invalid_request`.
+  - **Subject resolution** via a new `:resolve_jwt_bearer_subject` callback
+    (also installable as `resolve_jwt_bearer_subject/1` on
+    `AttestoPhoenix.PrincipalStore`): maps the validated claims to a local
+    principal subject, or denies. Required at boot when the grant is enabled.
+  - The grant requires client authentication (confidential clients only) and
+    honours per-client `grant_types`. The assertion's `scope` claim is the
+    granted-scope ceiling; `:authorize_scope` narrows from there. A refresh
+    token is issued only on `offline_access` + a configured `:refresh_store`.
+  - See [the ID-JAG guide](guides/identity_assertion_grant.md). Requires
+    `attesto ~> 0.8`.
+
 ## [0.9.5] - 2026-06-16
 
 ### Fixed

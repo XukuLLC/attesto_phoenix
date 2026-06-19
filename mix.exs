@@ -20,7 +20,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "0.9.5"
+  @version "0.10.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -73,7 +73,7 @@ defmodule AttestoPhoenix.MixProject do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, "~> 0.7.2"}
+      {:attesto, "~> 0.8"}
     end
   end
 
@@ -153,6 +153,7 @@ defmodule AttestoPhoenix.MixProject do
         "guides/proxy_canonical_host.md",
         "guides/replay_nonce_production.md",
         "guides/error_envelope.md",
+        "guides/identity_assertion_grant.md",
         "notebooks/attesto_phoenix_demo.livemd",
         "CHANGELOG.md",
         "LICENSE"

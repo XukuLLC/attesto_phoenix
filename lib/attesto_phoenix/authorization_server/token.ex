@@ -45,6 +45,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   """
 
   alias Attesto.{AuthorizationCode, IDToken, RefreshToken}
+  alias AttestoPhoenix.AuthorizationServer.JwtBearer
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Event, OAuthError}
@@ -62,12 +63,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
   @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
 
+  # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
+  # JWT-bearer authorization grant (MCP Enterprise-Managed Authorization).
+  @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
+
   # RFC 6749 §4.4 / RFC 8693 §2.1: grants that require a confidential client.
-  # client_credentials authenticates the client AS the principal, and a token
-  # exchange mints fresh authority off a presented token; neither is safe for a
-  # public (`:none`) client that proved possession of no client credential, so
-  # both reject the public-client path regardless of any per-client policy.
-  @confidential_only_grants ["client_credentials", @grant_token_exchange]
+  # client_credentials authenticates the client AS the principal, a token
+  # exchange mints fresh authority off a presented token, and the jwt-bearer
+  # ID-JAG grant binds the assertion to an authenticated `client_id` (the
+  # assertion's `client_id` claim MUST match it); none is safe for a public
+  # (`:none`) client that proved possession of no client credential, so all
+  # reject the public-client path regardless of any per-client policy.
+  @confidential_only_grants ["client_credentials", @grant_token_exchange, @grant_jwt_bearer]
 
   # OIDC Core §3.1.2.1 / §11: the scope values that trigger ID-Token issuance
   # and initial refresh-token issuance respectively.
@@ -279,9 +286,77 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
+  # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
+  # JWT-bearer authorization grant. The client presents an Identity Assertion JWT
+  # (signed by a trusted enterprise IdP, asserting one user for this resource
+  # application) in the `assertion` parameter and receives a normal access token.
+  # `AttestoPhoenix.AuthorizationServer.JwtBearer` validates the assertion
+  # (signature against the trusted issuer's JWKS, claims, `jti` replay) and maps
+  # its `client_id` claim to the authenticated client, then resolves the local
+  # subject via the host `:resolve_jwt_bearer_subject` callback. The assertion's
+  # `scope` claim, when present, is the ceiling on what may be granted (draft
+  # §6.1); the host `:authorize_scope` policy narrows from there.
+  defp dispatch(%Request{grant_type: @grant_jwt_bearer} = request) do
+    %{config: config, client: client, params: params} = request
+
+    with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
+           jwt_bearer_authorize(config, client, params),
+         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         requested = jwt_bearer_requested_scope(params, ceiling),
+         :ok <- require_scope_within_ceiling(requested, ceiling),
+         {:ok, scope} <- authorize_scope(config, client, requested),
+         {:ok, response} <- mint(config, client, subject, scope, token_type, binding) do
+      grant = %{subject: subject, family_id: nil}
+      events = [token_issued_event(request, scope, @grant_jwt_bearer)]
+      maybe_issue_refresh_token(request, grant, scope, binding, response, events, @grant_jwt_bearer)
+    end
+  end
+
   # RFC 6749 §5.2.
   defp dispatch(%Request{grant_type: grant_type}) do
     {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
+  end
+
+  # Validate the ID-JAG and map the handler's reasons to RFC 6749 §5.2 errors: a
+  # missing `assertion` parameter is a malformed request (`invalid_request`);
+  # every assertion/trust/replay/subject failure collapses to `invalid_grant`
+  # (draft §6.1) so the wire never learns which issuers are trusted or why a
+  # subject was denied. The authenticated client's identifier is passed so the
+  # handler can enforce the `client_id`-claim binding.
+  defp jwt_bearer_authorize(config, client, params) do
+    case JwtBearer.authorize(config, client_id(config, client), params) do
+      {:ok, result} ->
+        {:ok, result}
+
+      {:error, :missing_assertion} ->
+        {:error, error(@error_invalid_request, "assertion is required")}
+
+      {:error, _reason} ->
+        {:error, error(@error_invalid_grant, "the identity assertion is invalid")}
+    end
+  end
+
+  # When the client requests no scope, default to the assertion's scope ceiling
+  # (mirrors token exchange); an absent ceiling leaves the request empty so the
+  # host `:authorize_scope` policy alone decides.
+  defp jwt_bearer_requested_scope(params, ceiling) do
+    case parse_requested_scope(params) do
+      [] when is_list(ceiling) -> ceiling
+      requested -> requested
+    end
+  end
+
+  # draft §6.1: the granted scope MUST be within the assertion's `scope` claim
+  # when it carries one. The host `:authorize_scope` callback never sees the
+  # assertion, so the library enforces the ceiling before delegating. An absent
+  # ceiling (`nil`) imposes no bound.
+  defp require_scope_within_ceiling(_requested, nil), do: :ok
+
+  defp require_scope_within_ceiling(requested, ceiling) when is_list(ceiling) do
+    case requested -- ceiling do
+      [] -> :ok
+      _exceeded -> {:error, error(@error_invalid_scope, "requested scope exceeds the assertion")}
+    end
   end
 
   # ── Grant-state delegation (Attesto core) ────────────────────────────────
@@ -409,7 +484,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # that token request. An mTLS-bound request issues no DPoP binding on the
   # refresh token. The plaintext token is added to the RFC 6749 §5.1 body;
   # only its hash is persisted (see `Attesto.RefreshToken`).
-  defp maybe_issue_refresh_token(request, grant, scope, binding, response, events) do
+  defp maybe_issue_refresh_token(request, grant, scope, binding, response, events, grant_type \\ "authorization_code") do
     %{config: config, client: client} = request
 
     if refresh_store = grant_store(config, :refresh_store) do
@@ -421,7 +496,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
           binding,
           refresh_store,
           response,
-          events
+          events,
+          grant_type
         )
       else
         {:ok, response, events}
@@ -431,7 +507,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp issue_initial_refresh_token(request, grant, scope, binding, refresh_store, response, events) do
+  defp issue_initial_refresh_token(request, grant, scope, binding, refresh_store, response, events, grant_type) do
     %{config: config, client: client} = request
 
     context =
@@ -455,7 +531,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case RefreshToken.issue(refresh_store, context, issue_opts) do
       {:ok, %{token: token}} ->
         response = Map.put(response, :refresh_token, token)
-        issued = refresh_issued_event(request, scope, "authorization_code")
+        issued = refresh_issued_event(request, scope, grant_type)
         {:ok, response, events ++ [issued]}
 
       {:error, reason} ->

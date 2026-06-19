@@ -350,6 +350,9 @@ resolve on the node that later handles `/authorize`.
   shared-store requirements for clustered DPoP replay and nonce handling.
 - [Error envelope hooks](guides/error_envelope.md) - using `:send_error` and
   related callbacks to keep a host application's API error format.
+- [Identity Assertion grant (ID-JAG / MCP EMA)](guides/identity_assertion_grant.md) -
+  enabling the `jwt-bearer` grant, configuring trusted issuers, and wiring the
+  subject-resolution callback.
 - [Livebook demo](notebooks/attesto_phoenix_demo.livemd) - a self-contained
   Phoenix/Bandit resource-server demo using `Req` + `req_dpop`.
 

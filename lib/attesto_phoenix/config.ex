@@ -425,6 +425,7 @@ defmodule AttestoPhoenix.Config do
     :client_requires_dpop?,
     :client_grant_types,
     :issue_refresh_token?,
+    :resolve_jwt_bearer_subject,
     :code_store,
     :refresh_store,
     :par_store,
@@ -465,6 +466,7 @@ defmodule AttestoPhoenix.Config do
     mtls_enabled: false,
     registration_enabled: false,
     client_id_metadata: [],
+    jwt_bearer: [],
     basic_realm: "OAuth"
   ]
 
@@ -519,6 +521,7 @@ defmodule AttestoPhoenix.Config do
           client_requires_dpop?: callback() | nil,
           client_grant_types: callback() | nil,
           issue_refresh_token?: callback() | nil,
+          resolve_jwt_bearer_subject: callback() | nil,
           code_store: module() | nil,
           refresh_store: module() | nil,
           par_store: module() | nil,
@@ -558,7 +561,8 @@ defmodule AttestoPhoenix.Config do
           dpop_nonce_required: boolean(),
           mtls_enabled: boolean(),
           registration_enabled: boolean(),
-          client_id_metadata: keyword()
+          client_id_metadata: keyword(),
+          jwt_bearer: keyword()
         }
 
   # Required plain values: enforced for presence as struct fields.
@@ -592,7 +596,8 @@ defmodule AttestoPhoenix.Config do
       config
       | client_auth_signing_algs: config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs(),
         request_object_policy: config.request_object_policy || %Policy{},
-        client_id_metadata: normalize_client_id_metadata(config.client_id_metadata)
+        client_id_metadata: normalize_client_id_metadata(config.client_id_metadata),
+        jwt_bearer: normalize_jwt_bearer(config.jwt_bearer)
     }
   end
 
@@ -618,6 +623,31 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_client_id_metadata(opts) when is_list(opts) do
     Keyword.merge(@client_id_metadata_defaults, opts)
+  end
+
+  # The Identity Assertion JWT Authorization Grant (ID-JAG / jwt-bearer)
+  # defaults the host's `:jwt_bearer` keyword is merged over
+  # (`draft-ietf-oauth-identity-assertion-authz-grant-04`). The whole feature is
+  # off by default; a host enables it with `enabled: true` and a non-empty
+  # `:issuers` map (or a `:jwks_resolver`). `:jwks_fetcher`/`:jwks_cache` are the
+  # SSRF-guarded remote-JWKS seam (reused from CIMD) for any issuer configured by
+  # `:jwks_uri`. The merged list is what `jwt_bearer/1` returns and what the
+  # grant handler reads.
+  @jwt_bearer_defaults [
+    enabled: false,
+    issuers: %{},
+    assertion_max_lifetime_seconds: 300,
+    jwks_resolver: nil,
+    jwks_fetcher: Req,
+    jwks_cache: AttestoPhoenix.ClientIdMetadata.Cache.Ecto,
+    jwks_cache_ttl_bounds: {300, 86_400},
+    fetch_opts: []
+  ]
+
+  defp normalize_jwt_bearer(nil), do: @jwt_bearer_defaults
+
+  defp normalize_jwt_bearer(opts) when is_list(opts) do
+    Keyword.merge(@jwt_bearer_defaults, opts)
   end
 
   @doc """
@@ -657,6 +687,34 @@ defmodule AttestoPhoenix.Config do
   @spec client_id_metadata_enabled?(t()) :: boolean()
   def client_id_metadata_enabled?(%__MODULE__{} = config) do
     config |> client_id_metadata() |> Keyword.get(:enabled, false) == true
+  end
+
+  @doc """
+  Returns the merged, defaulted Identity Assertion JWT Authorization Grant
+  (ID-JAG / `jwt-bearer`) options.
+
+  This is the host's `:jwt_bearer` keyword merged over the library defaults
+  (`draft-ietf-oauth-identity-assertion-authz-grant-04`), so every recognized
+  member (`:enabled`, `:issuers`, `:assertion_max_lifetime_seconds`,
+  `:jwks_resolver`, `:jwks_fetcher`, `:jwks_cache`, `:jwks_cache_ttl_bounds`,
+  `:fetch_opts`) is always present.
+  `AttestoPhoenix.AuthorizationServer.JwtBearer` reads the feature's
+  configuration through this helper.
+  """
+  @spec jwt_bearer(t()) :: keyword()
+  def jwt_bearer(%__MODULE__{jwt_bearer: opts}), do: opts
+
+  @doc """
+  Returns `true` iff the Identity Assertion JWT Authorization Grant (ID-JAG /
+  `jwt-bearer`) is enabled.
+
+  The feature is off unless the host sets `jwt_bearer: [enabled: true, ...]`.
+  When enabled, `urn:ietf:params:oauth:grant-type:jwt-bearer` is added to
+  `grant_types_supported/1` (so both discovery and the token endpoint honour it).
+  """
+  @spec jwt_bearer_enabled?(t()) :: boolean()
+  def jwt_bearer_enabled?(%__MODULE__{} = config) do
+    config |> jwt_bearer() |> Keyword.get(:enabled, false) == true
   end
 
   @doc """
@@ -883,10 +941,22 @@ defmodule AttestoPhoenix.Config do
   `urn:ietf:params:oauth:grant-type:token-exchange` to disable token exchange
   across discovery, the token endpoint, and dynamic registration at once.
   """
-  @spec grant_types_supported(t()) :: [String.t()]
-  def grant_types_supported(%__MODULE__{grant_types_supported: list}) when is_list(list) and list != [], do: list
+  # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
+  # JWT-bearer authorization grant, advertised + accepted only when the feature
+  # is enabled (`jwt_bearer: [enabled: true]`).
+  @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
 
-  def grant_types_supported(%__MODULE__{}), do: @default_grant_types_supported
+  @spec grant_types_supported(t()) :: [String.t()]
+  def grant_types_supported(%__MODULE__{grant_types_supported: list} = config) when is_list(list) and list != [],
+    do: maybe_add_jwt_bearer(list, config)
+
+  def grant_types_supported(%__MODULE__{} = config), do: maybe_add_jwt_bearer(@default_grant_types_supported, config)
+
+  defp maybe_add_jwt_bearer(list, %__MODULE__{} = config) do
+    if jwt_bearer_enabled?(config) and @grant_jwt_bearer not in list,
+      do: list ++ [@grant_jwt_bearer],
+      else: list
+  end
 
   @doc """
   Absolute URL of the dynamic client registration endpoint: the issuer merged
@@ -957,6 +1027,7 @@ defmodule AttestoPhoenix.Config do
     client_grant_types: {:client_store, :client_grant_types, 1},
     load_principal: {:principal_store, :load_principal, 1},
     build_principal: {:principal_store, :build_principal, 3},
+    resolve_jwt_bearer_subject: {:principal_store, :resolve_jwt_bearer_subject, 1},
     authenticate_resource_owner: {:consent_policy, :authenticate_resource_owner, 3},
     consent: {:consent_policy, :consent, 3},
     authorize_scope: {:scope_policy, :authorize_scope, 2},
@@ -1067,6 +1138,38 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
+  # draft-ietf-oauth-identity-assertion-authz-grant-04: when the jwt-bearer grant
+  # is enabled the host MUST configure both how to TRUST an assertion (a
+  # non-empty `:issuers` map, or a custom `:jwks_resolver`) and how to RESOLVE its
+  # subject to a local principal (`:resolve_jwt_bearer_subject`). Fail closed at
+  # boot rather than reject every assertion at runtime. (`jti` replay reuses the
+  # configured `:replay_check`, falling back to the bundled ETS cache like DPoP.)
+  defp validate_jwt_bearer!(%__MODULE__{} = config) do
+    if jwt_bearer_enabled?(config) do
+      opts = jwt_bearer(config)
+      issuers = Keyword.get(opts, :issuers, %{})
+
+      if (not is_map(issuers) or map_size(issuers) == 0) and is_nil(Keyword.get(opts, :jwks_resolver)) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: jwt_bearer requires a non-empty :issuers map " <>
+                "(issuer => [jwks: ... | jwks_uri: ...]) or a :jwks_resolver function " <>
+                "when :enabled is true, or set jwt_bearer: [enabled: false]."
+      end
+
+      if is_nil(resolve_jwt_bearer_subject_fun(config)) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :resolve_jwt_bearer_subject is required when the " <>
+                "jwt_bearer grant is enabled. Add a " <>
+                "`resolve_jwt_bearer_subject: &MyApp.AuthZ.resolve_jwt_bearer_subject/1` " <>
+                "callback (or a :principal_store module implementing " <>
+                "resolve_jwt_bearer_subject/1) so the asserted subject maps to a local " <>
+                "principal."
+      end
+    end
+
+    :ok
+  end
+
   defp validate!(%__MODULE__{} = config) do
     Enum.each(@required, fn key ->
       if is_nil(Map.fetch!(config, key)) do
@@ -1103,6 +1206,7 @@ defmodule AttestoPhoenix.Config do
               "`registration_enabled: false` so no registration endpoint is mounted."
     end
 
+    validate_jwt_bearer!(config)
     validate_behaviour_modules!(config)
     validate_request_object_policy!(config)
 
