@@ -269,8 +269,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # RFC 9728 §5.1: when the resource advertises protected-resource metadata,
   # every `WWW-Authenticate` challenge carries a `resource_metadata` pointer so a
   # refused client can discover the authorization server. Omitted when unset.
-  defp resource_metadata_param(%Config{resource_metadata: url}) when is_binary(url),
-    do: [{"resource_metadata", url}]
+  defp resource_metadata_param(%Config{resource_metadata: url}) when is_binary(url), do: [{"resource_metadata", url}]
 
   defp resource_metadata_param(_config), do: []
 

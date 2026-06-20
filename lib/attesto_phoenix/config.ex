@@ -1221,7 +1221,7 @@ defmodule AttestoPhoenix.Config do
     # minted `aud` may differ per request, but `config.audience` remains the
     # required default/fallback and the RS verification audience, so it must be
     # present regardless.)
-    unless absolute_resource_url?(config.audience) do
+    if !absolute_resource_url?(config.audience) do
       raise ArgumentError,
             "AttestoPhoenix.Config: :audience is required and must be an absolute https URL with a " <>
               "host (no fragment). It is the access-token `aud`, the audience the " <>

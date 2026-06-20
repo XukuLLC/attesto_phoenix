@@ -39,9 +39,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
   # The client principal kind. Its `sub_prefix` ("oc_") is the namespace every
   # client subject MUST carry; `:build_principal` is what applies it.
   @sub_prefix "oc_"
-  @client_kind Attesto.PrincipalKind.new("client", @sub_prefix,
-                 required_claims: [{"client_id", :non_empty_string}]
-               )
+  @client_kind Attesto.PrincipalKind.new("client", @sub_prefix, required_claims: [{"client_id", :non_empty_string}])
 
   defmodule Keystore do
     @moduledoc false

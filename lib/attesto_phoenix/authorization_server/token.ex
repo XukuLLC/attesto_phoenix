@@ -407,8 +407,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     if resource == config.audience or resource in jwt_bearer_allowed_resources(config) do
       {:ok, resource}
     else
-      {:error,
-       error(@error_invalid_target, "the requested resource is not served by this authorization server")}
+      {:error, error(@error_invalid_target, "the requested resource is not served by this authorization server")}
     end
   end
 

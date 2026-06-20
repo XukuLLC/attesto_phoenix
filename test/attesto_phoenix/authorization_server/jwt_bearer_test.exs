@@ -280,6 +280,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       # fail closed rather than fall back to config.audience as if unset.
       for blank <- ["", [""], ["https://a.example", ""]] do
         params = %{"assertion" => assertion(), "resource" => blank}
+
         assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config(), params),
                "expected :invalid_target for resource=#{inspect(blank)}"
       end
