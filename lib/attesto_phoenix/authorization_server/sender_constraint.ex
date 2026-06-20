@@ -73,11 +73,12 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @typedoc "The resolved sender-constraint binding."
   @type binding :: {:dpop, String.t()} | {:mtls, String.t()} | :none
 
-  # RFC 6749 §5.2 / RFC 9449 §5 error codes.
-  @error_invalid_request "invalid_request"
-  @error_invalid_client "invalid_client"
-  @error_invalid_dpop_proof "invalid_dpop_proof"
-  @error_use_dpop_nonce "use_dpop_nonce"
+  # RFC 6749 §5.2 / RFC 9449 §5 error codes, held as the atoms
+  # `OAuthError.new/3` requires (no string round-trip that could raise).
+  @error_invalid_request :invalid_request
+  @error_invalid_client :invalid_client
+  @error_invalid_dpop_proof :invalid_dpop_proof
+  @error_use_dpop_nonce :use_dpop_nonce
 
   # RFC 9449 §7.1 / RFC 6750: access-token presentation type.
   @token_type_dpop "DPoP"
@@ -305,16 +306,17 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   defp put_optional_kw(kw, _key, nil), do: kw
   defp put_optional_kw(kw, key, value), do: Keyword.put(kw, key, value)
 
+  # `code` is a compile-time RFC 6749 §5.2 / RFC 9449 §5 error-code atom, passed
+  # straight to `OAuthError.new/3` (which requires an atom). No string-to-atom
+  # round-trip that could raise before the atom exists.
   defp error(code, description) do
-    OAuthError.new(error_code(code), description, status: 400)
+    OAuthError.new(code, description, status: 400)
   end
 
   defp error(code, description, opts) do
-    OAuthError.new(error_code(code), description,
+    OAuthError.new(code, description,
       status: Keyword.get(opts, :status, 400),
       headers: Keyword.get(opts, :headers, [])
     )
   end
-
-  defp error_code(code) when is_binary(code), do: String.to_existing_atom(code)
 end

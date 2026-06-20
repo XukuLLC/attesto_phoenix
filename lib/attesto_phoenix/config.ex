@@ -49,6 +49,12 @@ defmodule AttestoPhoenix.Config do
     * `:www_authenticate` - `(conn, challenge_string -> conn)`. Optional
       transport hook used by `AttestoPhoenix.OAuthError` to write the
       `WWW-Authenticate` challenge header.
+    * `:resource_metadata` - absolute URL of this resource's protected-resource
+      metadata document (RFC 9728). When set, `AttestoPhoenix.Plug.Authenticate`
+      advertises it as a `resource_metadata` auth-param on every
+      `WWW-Authenticate` challenge it renders (RFC 9728 §5.1), so a client that
+      is refused with 401 can discover which authorization server issues tokens
+      for this resource. Omitted from the challenge when unset.
     * `:basic_realm` - realm string for token-endpoint Basic auth challenges.
       Default `"OAuth"`.
     * `:htu` - `(conn -> canonical_url_string)`. Overrides how the DPoP `htu`
@@ -81,7 +87,16 @@ defmodule AttestoPhoenix.Config do
       or a zero-arity callback returning that list, passed into the core token
       configuration.
     * `:build_principal` - `(client, subject, scope -> map)`. Builds the
-      principal map passed to `Attesto.Token.mint/3`.
+      principal map passed to `Attesto.Token.mint/3`. The returned `:sub` MUST
+      be namespaced with the matching `Attesto.PrincipalKind` `sub_prefix`:
+      `Attesto.Token` rejects an unprefixed subject at mint time
+      (`:invalid_sub`). This matters most for the `client_credentials` grant
+      (RFC 6749 §4.4), where the principal subject is the OAuth `client_id` -
+      and Dynamic Client Registration (RFC 7591 §3.2.1) issues that id
+      *unprefixed* (the host's `:register_client` chooses it; the library
+      imposes no namespace). `:build_principal` is the sole seam that applies
+      the prefix; the prefix is mint-time defense-in-depth (an issued token's
+      `sub` is unambiguous across principal kinds), not a substitute for it.
     * `:build_userinfo_claims` - `(subject, granted_scopes, requested_claims ->
       claims_map)`. Produces the claim values the UserInfo endpoint
       (OpenID Connect Core §5.3) returns for the authenticated subject. The
@@ -405,6 +420,7 @@ defmodule AttestoPhoenix.Config do
     :send_error,
     :no_store,
     :www_authenticate,
+    :resource_metadata,
     :htu,
     :cert_der,
     :register_client,
@@ -500,6 +516,7 @@ defmodule AttestoPhoenix.Config do
           send_error: callback() | nil,
           no_store: callback() | nil,
           www_authenticate: callback() | nil,
+          resource_metadata: String.t() | nil,
           basic_realm: String.t(),
           htu: callback() | nil,
           cert_der: callback() | nil,
@@ -637,6 +654,12 @@ defmodule AttestoPhoenix.Config do
     enabled: false,
     issuers: %{},
     assertion_max_lifetime_seconds: 300,
+    # RFC 8707 §2.2: resources (besides this server's own `:audience`) for which
+    # the jwt-bearer grant may mint a token via the `resource` indicator. Empty
+    # by default - fail closed, so an authenticated client cannot mint a token
+    # audienced to an arbitrary resource; a multi-resource deployment lists the
+    # resource identifiers it serves here.
+    allowed_resources: [],
     jwks_resolver: nil,
     jwks_fetcher: Req,
     jwks_cache: AttestoPhoenix.ClientIdMetadata.Cache.Ecto,
@@ -696,8 +719,8 @@ defmodule AttestoPhoenix.Config do
   This is the host's `:jwt_bearer` keyword merged over the library defaults
   (`draft-ietf-oauth-identity-assertion-authz-grant-04`), so every recognized
   member (`:enabled`, `:issuers`, `:assertion_max_lifetime_seconds`,
-  `:jwks_resolver`, `:jwks_fetcher`, `:jwks_cache`, `:jwks_cache_ttl_bounds`,
-  `:fetch_opts`) is always present.
+  `:allowed_resources`, `:jwks_resolver`, `:jwks_fetcher`, `:jwks_cache`,
+  `:jwks_cache_ttl_bounds`, `:fetch_opts`) is always present.
   `AttestoPhoenix.AuthorizationServer.JwtBearer` reads the feature's
   configuration through this helper.
   """
@@ -1188,6 +1211,29 @@ defmodule AttestoPhoenix.Config do
       end
     end)
 
+    # :audience is the access-token `aud` minted by the token endpoint and the
+    # audience the protected-resource verifier requires (RFC 9068 §3 `aud`;
+    # RFC 7519 §4.1.3). It is neither an @enforce_keys struct field nor a
+    # required capability, so a nil value does not fail at boot — instead the
+    # first mint emits a token with `aud: nil` and every protected-resource
+    # verification rejects it as `:invalid_audience`, a late, whole-deployment
+    # failure. Fail fast here instead. (With RFC 8707 resource handling the
+    # minted `aud` may differ per request, but `config.audience` remains the
+    # required default/fallback and the RS verification audience, so it must be
+    # present regardless.)
+    unless absolute_resource_url?(config.audience) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :audience is required and must be an absolute https URL with a " <>
+              "host (no fragment). It is the access-token `aud`, the audience the " <>
+              "protected-resource verifier requires (a mismatch is rejected " <>
+              ":invalid_audience), and the RFC 9728 resource identifier served at " <>
+              "/.well-known/oauth-protected-resource — a blank/non-URL value boots but then " <>
+              "500s that endpoint. Set `audience: \"https://api.example.com\"`. " <>
+              "Got: #{inspect(config.audience)}."
+    end
+
+    validate_resource_metadata!(config)
+
     if config.mtls_enabled and is_nil(config.cert_der) do
       raise ArgumentError,
             "AttestoPhoenix.Config: :cert_der is required when :mtls_enabled is true. " <>
@@ -1223,6 +1269,43 @@ defmodule AttestoPhoenix.Config do
 
     config
   end
+
+  # RFC 9728 §5.1: when set, :resource_metadata is rendered as a quoted
+  # `resource_metadata` auth-param pointing at the metadata document, so it must
+  # be an absolute URL with a host and no fragment (a relative/malformed value
+  # would emit an unusable challenge). `URI.new/1` rejects RFC 3986-invalid input
+  # (whitespace, controls, bad percent-encoding). Fail fast at build time.
+  defp validate_resource_metadata!(config) do
+    rm = config.resource_metadata
+
+    if is_nil(rm) or absolute_resource_url?(rm) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :resource_metadata, when set, must be an absolute https URL with a " <>
+              "host and no fragment (the RFC 9728 protected-resource metadata document advertised " <>
+              "in the WWW-Authenticate challenge); got #{inspect(rm)}."
+    end
+  end
+
+  # RFC 9728 §1.2/§2: the protected-resource identifier (and its metadata URL) is
+  # an `https` URL with a host and no fragment, with valid RFC 3986 §2.1
+  # percent-encoding. `URI.new/1` (unlike `URI.parse/1`) rejects whitespace/
+  # control characters; the leading check rejects a `%` that is not the start of a
+  # `%HH` triplet (which `URI.new/1` still admits). (The RFC 8707 jwt-bearer
+  # request `resource` permits any scheme per §2.1 and is validated separately in
+  # `AttestoPhoenix.AuthorizationServer.Token`.)
+  defp absolute_resource_url?(url) when is_binary(url) do
+    case URI.new(url) do
+      {:ok, %URI{scheme: "https", host: host, fragment: nil}} when is_binary(host) and host != "" ->
+        not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, url)
+
+      _ ->
+        false
+    end
+  end
+
+  defp absolute_resource_url?(_), do: false
 
   # ── Boot-time discovery-document safety guard ────────────────────────────
   #

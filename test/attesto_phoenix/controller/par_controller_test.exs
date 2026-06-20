@@ -83,6 +83,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
 
     put_config(
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: StubKeystore,
       repo: StubRepo,
       load_client: fn

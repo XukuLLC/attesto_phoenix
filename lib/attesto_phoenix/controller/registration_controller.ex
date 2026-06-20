@@ -424,7 +424,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
       scope when is_binary(scope) ->
         requested = String.split(scope, " ", trim: true)
-        catalog = config.scopes_supported || []
+        catalog = List.wrap(config.scopes_supported)
 
         case Enum.reject(requested, &(&1 in catalog)) do
           [] ->

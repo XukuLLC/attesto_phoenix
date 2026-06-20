@@ -46,6 +46,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   defp build_config(overrides) do
     base = [
       issuer: "https://issuer.test",
+      audience: "https://api.example.com",
       keystore: __MODULE__.Keystore,
       repo: __MODULE__.Repo,
       load_client: fn

@@ -73,6 +73,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
   defp required_fields do
     [
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: StubKeystore,
       repo: StubRepo,
       load_client: fn _ -> {:error, :not_found} end,

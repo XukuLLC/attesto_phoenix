@@ -35,6 +35,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
     config = %Config{
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: StubKeystore,
       repo: StubRepo,
       load_client: fn

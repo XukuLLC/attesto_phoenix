@@ -25,6 +25,7 @@ defmodule AttestoPhoenix.EventTest do
   defp config(on_event) do
     Config.new(
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: __MODULE__.Keystore,
       repo: __MODULE__.Repo,
       load_client: fn _ -> {:error, :not_found} end,

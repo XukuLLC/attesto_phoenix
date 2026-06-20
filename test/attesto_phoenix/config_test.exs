@@ -101,6 +101,7 @@ defmodule AttestoPhoenix.ConfigTest do
       issuer: "https://issuer.example",
       keystore: __MODULE__.Keystore,
       repo: __MODULE__.Repo,
+      audience: "https://api.example.com",
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end
@@ -117,7 +118,8 @@ defmodule AttestoPhoenix.ConfigTest do
     base = [
       issuer: "https://issuer.example",
       keystore: __MODULE__.Keystore,
-      repo: __MODULE__.Repo
+      repo: __MODULE__.Repo,
+      audience: "https://api.example.com"
     ]
 
     Config.new(Keyword.merge(base, overrides))
@@ -332,6 +334,76 @@ defmodule AttestoPhoenix.ConfigTest do
       assert_raise ArgumentError, ~r/:register_client is required/, fn ->
         config(registration_enabled: true)
       end
+    end
+  end
+
+  describe ":audience boot gate (RFC 9068 §3 aud)" do
+    # The required-key/capability checks all pass here; only :audience is
+    # missing, so this isolates the audience gate from the other boot checks.
+    # (A function, not a module attribute: the opts carry anonymous callbacks,
+    # which cannot be escaped into an @attribute.)
+    defp audience_required_opts do
+      [
+        issuer: "https://issuer.example",
+        keystore: __MODULE__.Keystore,
+        repo: __MODULE__.Repo,
+        load_client: fn _ -> {:error, :not_found} end,
+        verify_client_secret: fn _, _ -> false end,
+        load_principal: fn _ -> {:error, :not_found} end
+      ]
+    end
+
+    test "raises when :audience is nil even though every other required key is set" do
+      assert_raise ArgumentError, ~r/:audience is required/, fn ->
+        Config.new(audience_required_opts())
+      end
+    end
+
+    test "raises when :audience is blank, non-https, non-URL, or non-binary (not just nil)" do
+      for bad <- [
+            "",
+            "api",
+            "/relative",
+            "http://a.example",
+            "https://a.example#frag",
+            "https://a.example/%ZZ",
+            ["https://a.example"],
+            :aud,
+            123
+          ] do
+        assert_raise ArgumentError, ~r/:audience is required and must be an absolute https URL/, fn ->
+          Config.new(Keyword.put(audience_required_opts(), :audience, bad))
+        end
+      end
+    end
+
+    test ":resource_metadata, when set, must be an absolute https URL with a host and no fragment" do
+      base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+
+      for bad <- ["", "/relative", "not-a-url", "http://api.example", "https://api.example#frag", 123] do
+        assert_raise ArgumentError, ~r/:resource_metadata, when set, must be an absolute https URL/, fn ->
+          Config.new(Keyword.put(base, :resource_metadata, bad))
+        end
+      end
+
+      cfg = Config.new(Keyword.put(base, :resource_metadata, "https://api.example/.well-known/x"))
+      assert cfg.resource_metadata == "https://api.example/.well-known/x"
+    end
+
+    test "the diagnostic names :invalid_audience so the late failure is explained" do
+      message =
+        assert_raise(ArgumentError, fn -> Config.new(audience_required_opts()) end).message
+
+      assert message =~ ":invalid_audience"
+    end
+
+    test "succeeds with a string :audience and carries it into to_attesto_config/1" do
+      cfg = Config.new(Keyword.put(audience_required_opts(), :audience, "https://api.example.com"))
+
+      assert cfg.audience == "https://api.example.com"
+
+      assert Config.to_attesto_config(cfg, principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")]).audience ==
+               "https://api.example.com"
     end
   end
 

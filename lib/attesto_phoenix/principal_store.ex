@@ -30,9 +30,18 @@ defmodule AttestoPhoenix.PrincipalStore do
 
   @doc """
   Build the principal map passed to `Attesto.Token.mint/3` for an
-  authorization-code grant. Receives the resolved client, the subject
-  identifier, and the granted scope. The returned map carries at least
-  `:subject` and any host-owned claims.
+  authorization-code or `client_credentials` grant. Receives the resolved
+  client, the subject identifier, and the granted scope. The returned map
+  carries at least `:sub` and any host-owned claims.
+
+  The returned `:sub` MUST be namespaced with the matching
+  `Attesto.PrincipalKind` `sub_prefix` - `Attesto.Token` rejects an unprefixed
+  subject at mint time (`:invalid_sub`). For the `client_credentials` grant
+  (RFC 6749 §4.4) the subject handed in is the OAuth `client_id`, and Dynamic
+  Client Registration (RFC 7591 §3.2.1) issues that id *unprefixed*: this
+  callback is the sole place the kind prefix is applied. The prefix is mint-time
+  defense-in-depth (a token's `sub` stays unambiguous across principal kinds),
+  so namespacing here is mandatory rather than cosmetic.
   """
   @callback build_principal(
               client :: term(),

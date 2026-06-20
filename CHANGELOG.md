@@ -4,11 +4,38 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] - 2026-06-20
 
-## [0.10.0] - 2026-06-18
 
 ### Added
+
+- **`GET /.well-known/oauth-protected-resource` endpoint
+  (`AttestoPhoenix.Controller.ProtectedResourceController`).** Serves the RFC 9728
+  protected-resource metadata document (`resource`, `authorization_servers`,
+  `scopes_supported`, `bearer_methods_supported`), derived from the same issuer,
+  audience, and scope configuration the RFC 8414 discovery document uses. Mounted
+  by `attesto_routes/1` at the host root (RFC 8615); it is the discovery target of
+  the `resource_metadata` `WWW-Authenticate` challenge the protected-resource
+  plugs emit, so a resource server is discovery-complete without the caller
+  hand-rolling the document.
+
+- **`AttestoPhoenix.Config` `:resource_metadata`.** Absolute URL of this
+  resource's RFC 9728 protected-resource metadata document. When set,
+  `AttestoPhoenix.Plug.Authenticate` and the UserInfo endpoint advertise it as a
+  `resource_metadata` auth-param on every `WWW-Authenticate` challenge they
+  render (RFC 9728 §5.1), so a client refused with 401/403 can discover which
+  authorization server issues tokens for this resource. Configured once on the
+  Config; omitted from the challenge when unset.
+
+- **`AttestoPhoenix.Config.new/1` now validates `:audience` at boot.** It must be a non-empty **absolute https URL** with a host and no fragment, not merely present. It
+  is the access-token `aud` (RFC 9068 §3), the audience the protected-resource
+  verifier requires (a mismatch is `:invalid_audience`), and the RFC 9728 resource
+  identifier served at `/.well-known/oauth-protected-resource` — so a nil, blank,
+  or non-URL value would either fail late (every token rejected `:invalid_audience`)
+  or 500 the protected-resource metadata endpoint. `new/1` now raises
+  `ArgumentError` instead. With RFC 8707 resource handling the minted `aud` may
+  differ per request, but `config.audience` remains the required default/fallback
+  and RS verification audience.
 
 - **Identity Assertion JWT Authorization Grant (ID-JAG / `jwt-bearer`)** — the
   resource server's half of
@@ -37,10 +64,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     principal subject, or denies. Required at boot when the grant is enabled.
   - The grant requires client authentication (confidential clients only) and
     honours per-client `grant_types`. The assertion's `scope` claim is the
-    granted-scope ceiling; `:authorize_scope` narrows from there. A refresh
-    token is issued only on `offline_access` + a configured `:refresh_store`.
+    granted-scope ceiling; `:authorize_scope` narrows from there.
+  - **No refresh token is issued** for this grant: access is re-derived from a
+    fresh assertion on each request (RFC 7523 §4), so it cannot outlive the
+    enterprise IdP's policy/deprovisioning window.
+  - **RFC 8707 `resource` indicator → access-token `aud`** (via
+    `Attesto.Token.mint/3`'s `:audience` option, requiring `attesto ~> 0.8`): a
+    single valid resource becomes the minted `aud` (§2.2); an absent resource
+    falls back to `config.audience`. The resource is authorized fail-closed
+    (§2.2) — it must be `config.audience` or an explicitly configured
+    `jwt_bearer: [allowed_resources: [...]]` entry — so an authenticated client
+    cannot mint a token audienced to a resource the server does not serve. An
+    invalid (non-absolute-URI / fragment / bad percent-encoding), multiple, or
+    unauthorized resource is rejected `invalid_target` (§2.1).
   - See [the ID-JAG guide](guides/identity_assertion_grant.md). Requires
     `attesto ~> 0.8`.
+
+### Changed
+
+- Made OAuth error-code resolution (RFC 6749 §5.2) total by construction. The
+  `@error_*` codes in the token core, token controller, introspection
+  controller, and sender-constraint module are now compile-time atoms passed
+  straight to `OAuthError.new/3`, replacing a private `String.to_existing_atom/1`
+  round-trip that could raise `ArgumentError` and turn a clean §5.2 error body
+  into a 500 if a code string were ever emitted before its atom existed.
+
+### Documentation
+
+- **Documented and test-proved the DCR → `client_credentials` subject seam.**
+  Dynamic Client Registration (RFC 7591 §3.2.1) issues an *unprefixed*
+  `client_id`, while a minted principal's `sub` MUST carry its
+  `Attesto.PrincipalKind` `sub_prefix` (`:invalid_sub` otherwise). The host's
+  `:build_principal` callback is the sole seam that reconciles the two by
+  namespacing `:sub`; the `:build_principal` doc on `AttestoPhoenix.Config` and
+  the `c:AttestoPhoenix.PrincipalStore.build_principal/3` behaviour doc now state
+  this mandate and cite the prefix as mint-time defense-in-depth. A new
+  end-to-end test registers a confidential `client_credentials` client through
+  the registration endpoint, issues a token with the bare DCR id, and verifies
+  `sub == prefix <> client_id` and `client_id == client_id`, with a negative
+  control proving a non-prefixing `:build_principal` is rejected as the
+  RFC 6749 §5.2 `invalid_request`.
+
 
 ## [0.9.5] - 2026-06-16
 
@@ -53,7 +117,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `invalid_request`/`invalid_grant`/`invalid_dpop_proof`. When such a request
   ALSO lacked client authentication, the client-auth check masked it with
   `invalid_client`. The token endpoint now reads the code (via the store's
-  non-consuming `Attesto.CodeStore.get/1`) and, when it is DPoP-bound and no
+  non-consuming `c:Attesto.CodeStore.get/1`) and, when it is DPoP-bound and no
   proof is presented, returns `invalid_request "DPoP proof required"` — even
   before the client-auth failure. The code is NOT consumed, so a legitimate
   retry is unaffected. Only DPoP-bound codes are affected; a plain (e.g. OIDC)
@@ -62,7 +126,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **`AttestoPhoenix.Store.EctoCodeStore.get/1`** — the non-consuming read
-  (`Attesto.CodeStore.get/1`) for the Ecto-backed code store, a plain SELECT of
+  (`c:Attesto.CodeStore.get/1`) for the Ecto-backed code store, a plain SELECT of
   the live (unconsumed) row.
 
 ## [0.9.4] - 2026-06-14

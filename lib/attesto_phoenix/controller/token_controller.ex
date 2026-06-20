@@ -59,8 +59,9 @@ defmodule AttestoPhoenix.Controller.TokenController do
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
 
-  # RFC 6749 §5.2 error codes the framing layer raises before the core runs.
-  @error_invalid_request "invalid_request"
+  # RFC 6749 §5.2 error code the framing layer raises before the core runs,
+  # held as the atom `OAuthError.new/3` requires (no string round-trip).
+  @error_invalid_request :invalid_request
 
   # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
   # to the core as data.
@@ -320,11 +321,9 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   # The single error value the controller raises at the framing edge is an
   # `%AttestoPhoenix.OAuthError{}` (the shape the core and the
-  # `ClientAuthentication` core also return). The string `@error_*` codes are
-  # the RFC 6749 §5.2 wire values; they convert to the matching atom code here.
-  defp error(code, description), do: OAuthError.new(error_code(code), description, status: 400)
-
-  defp error_code(code) when is_binary(code), do: String.to_existing_atom(code)
+  # `ClientAuthentication` core also return). `code` is a compile-time
+  # RFC 6749 §5.2 error-code atom passed straight to `OAuthError.new/3`.
+  defp error(code, description), do: OAuthError.new(code, description, status: 400)
 
   defp optional_param(params, key) do
     case params[key] do

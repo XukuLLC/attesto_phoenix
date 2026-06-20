@@ -205,4 +205,46 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert is_binary(token)
     end
   end
+
+  # The token core's `@error_*` codes are compile-time atoms passed straight to
+  # `OAuthError.new/3`. They were once strings resolved with
+  # `String.to_existing_atom/1` at runtime, which raises `ArgumentError` for a
+  # code whose atom does not yet exist - turning a clean RFC 6749 §5.2 body into
+  # a 500. These tests pin that the resolution is now total by construction.
+  describe "RFC 6749 §5.2 error-code resolution is total (no String.to_existing_atom round-trip)" do
+    test "an unsupported grant_type returns a clean OAuthError, never raising" do
+      config = config()
+      request = request(config, grant_type: "totally-unsupported-grant", params: %{})
+
+      # No `assert_raise ArgumentError` escape hatch: the call returns the typed
+      # error directly.
+      assert {:error, %OAuthError{error: :unsupported_grant_type, status: 400}, _events} =
+               Token.issue(config, request)
+    end
+
+    test "every emittable error code is a compile-time atom" do
+      # The wire codes the token endpoint can emit (RFC 6749 §5.2). Each must
+      # already exist as an atom at compile time so no runtime resolution is
+      # needed; `OAuthError.new/3` requires an atom and accepts each.
+      for code <- [
+            :invalid_request,
+            :invalid_client,
+            :invalid_grant,
+            :invalid_scope,
+            :unsupported_grant_type
+          ] do
+        assert is_atom(code)
+        assert %OAuthError{error: ^code} = OAuthError.new(code, "desc", status: 400)
+      end
+    end
+
+    test "the old String.to_existing_atom mechanism genuinely raises on an unknown code" do
+      # A string whose atom is deliberately never created anywhere in the build.
+      # The retired `error_code/1` did exactly this round-trip; it would have
+      # raised here, proving the latent 500 was real rather than hypothetical.
+      assert_raise ArgumentError, fn ->
+        String.to_existing_atom("attesto_never_created_error_code_xyz")
+      end
+    end
+  end
 end

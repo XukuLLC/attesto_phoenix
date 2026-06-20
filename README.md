@@ -19,9 +19,9 @@ primitives, and the token-lifecycle building blocks.
 `attesto_phoenix` wires those primitives into a running server:
 
 - HTTP endpoints (authorization, token, PAR, revocation, discovery, JWKS,
-  UserInfo, optional dynamic registration) mounted into your router with one
-  macro. The authorization endpoint supports the default query response mode
-  and the JARM JWT response modes.
+  UserInfo, protected-resource metadata, optional dynamic registration) mounted
+  into your router with one macro. The authorization endpoint supports the
+  default query response mode and the JARM JWT response modes.
 - Protected-resource plugs that verify Bearer JWTs and enforce DPoP / mTLS
   sender-constraint binding.
 - Ecto-backed implementations of every mutable store the OAuth/OIDC flows need
@@ -32,6 +32,26 @@ primitives, and the token-lifecycle building blocks.
 It deliberately does **not** own your client registry, principal store, secret
 hashing, scope catalog, or audit log. Those are application policy and are
 supplied through a small set of neutral configuration callbacks.
+
+## What you can build with it
+
+- **An API that AI assistants can connect to.** Assistant connectors — ChatGPT,
+  Claude — authorize through OAuth: PKCE, dynamic client registration, pushed
+  authorization requests, sender-constrained tokens, and protected-resource
+  discovery. `attesto_phoenix` mounts that whole surface with one router macro,
+  so your app can expose tools and data to an assistant without hand-rolling an
+  OAuth server.
+- **Your own authorization server.** Issue short-lived, scoped JWT access tokens
+  and OIDC ID tokens for first-party apps and machine clients, instead of
+  outsourcing to a hosted identity provider.
+- **A resource server that resists stolen tokens.** Verify access tokens locally
+  — signature, issuer, audience, and DPoP / mTLS sender-constraint — with no
+  token database or introspection call on the hot path, so a leaked bearer token
+  alone can't call the API.
+
+The standards each use case rests on are catalogued below and in
+[the `attesto` core README](https://github.com/XukuLLC/attesto#rfc-coverage);
+you don't need to track them to use the library.
 
 ## Positioning vs. attesto core
 
@@ -68,7 +88,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.8"}
+    {:attesto_phoenix, "~> 0.10"}
   ]
 end
 ```
@@ -79,7 +99,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.8"},
+    {:attesto_phoenix, "~> 0.10"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
@@ -210,6 +230,7 @@ end
 - `GET  /.well-known/oauth-authorization-server` (RFC 8414 metadata)
 - `GET  /.well-known/openid-configuration` (OIDC Discovery metadata)
 - `GET  /.well-known/jwks.json` (RFC 7517 JWK Set)
+- `GET  /.well-known/oauth-protected-resource` (RFC 9728 metadata)
 - `GET  /oauth/authorize`
 - `POST /oauth/token`
 - `POST /oauth/par` (RFC 9126)
@@ -222,8 +243,8 @@ end
 Discovery and JWKS are public; the token and revocation endpoints authenticate
 the client via your `:load_client` / `:verify_client_secret` callbacks.
 The token endpoint also accepts `private_key_jwt` when `:client_jwks` is wired,
-and supports authorization-code, refresh-token, client-credentials, and OAuth
-token-exchange grants. The PAR endpoint accepts the same confidential-client
+and supports authorization-code, refresh-token, client-credentials, OAuth
+token-exchange, and JWT-assertion (`jwt-bearer`) grants. The PAR endpoint accepts the same confidential-client
 secret methods plus `private_key_jwt`, then stores the authorization request
 behind a one-time `request_uri`.
 
@@ -269,6 +290,11 @@ assigns:
 `AttestoPhoenix.Plug.RequireScopes` enforces route-level scope authorization
 using `Attesto.Scope` grant-form algebra. It accepts either a single scope
 string or a list of required scopes.
+
+When `:resource_metadata` is set on the config, a 401 challenge carries the
+RFC 9728 `resource_metadata` pointer to the `/.well-known/oauth-protected-resource`
+document (mounted by `attesto_routes/1`), so a client refused without a valid
+token can discover which authorization server issues tokens for the resource.
 
 For first-party web flows, keep cookie semantics in your app and pass a generic
 credential extractor to the plug:

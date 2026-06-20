@@ -113,6 +113,21 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert body(conn)["error"] == "invalid_token"
     end
 
+    test "the 401 challenge carries the RFC 9728 resource_metadata pointer when configured" do
+      metadata_url = "https://api.example/.well-known/oauth-protected-resource"
+
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.put(:resource_metadata, metadata_url)
+      |> put_config()
+
+      conn = get_userinfo("not-a-jwt")
+
+      assert conn.status == 401
+      assert [challenge] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ ~s(resource_metadata="#{metadata_url}")
+    end
+
     test "returns 401 when a previously issued access token has been revoked" do
       :attesto_phoenix
       |> Application.fetch_env!(AttestoPhoenix.Config)

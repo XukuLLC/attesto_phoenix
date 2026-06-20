@@ -52,12 +52,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   require Logger
 
-  # RFC 6749 §5.2 error codes.
-  @error_invalid_request "invalid_request"
-  @error_invalid_client "invalid_client"
-  @error_invalid_grant "invalid_grant"
-  @error_invalid_scope "invalid_scope"
-  @error_unsupported_grant_type "unsupported_grant_type"
+  # RFC 6749 §5.2 error codes, held as the atoms `OAuthError.new/3` requires so
+  # there is no string round-trip that could raise before the atom exists.
+  @error_invalid_request :invalid_request
+  @error_invalid_client :invalid_client
+  @error_invalid_grant :invalid_grant
+  @error_invalid_scope :invalid_scope
+  @error_unsupported_grant_type :unsupported_grant_type
+
+  # RFC 8707 §2.1: the error code for a `resource` indicator the server cannot
+  # honour (syntactically invalid, or more than one distinct value for a single
+  # access token).
+  @error_invalid_target :invalid_target
 
   # RFC 8693 token exchange.
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -302,13 +308,19 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
            jwt_bearer_authorize(config, client, params),
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, audience} <- jwt_bearer_resource_audience(config, params),
          requested = jwt_bearer_requested_scope(params, ceiling),
          :ok <- require_scope_within_ceiling(requested, ceiling),
          {:ok, scope} <- authorize_scope(config, client, requested),
-         {:ok, response} <- mint(config, client, subject, scope, token_type, binding) do
-      grant = %{subject: subject, family_id: nil}
-      events = [token_issued_event(request, scope, @grant_jwt_bearer)]
-      maybe_issue_refresh_token(request, grant, scope, binding, response, events, @grant_jwt_bearer)
+         {:ok, response} <-
+           mint(config, client, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
+      # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: this
+      # grant issues NO refresh token. Access is re-derived from a fresh
+      # assertion on each request; a refresh token would outlive the enterprise
+      # IdP's policy/deprovisioning window, letting a client keep minting access
+      # after the IdP has revoked the user's entitlement. The client re-presents
+      # a fresh ID-JAG instead of refreshing.
+      {:ok, response, [token_issued_event(request, scope, @grant_jwt_bearer)]}
     end
   end
 
@@ -358,6 +370,120 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       _exceeded -> {:error, error(@error_invalid_scope, "requested scope exceeds the assertion")}
     end
   end
+
+  # RFC 8707 §2: the `resource` indicator scopes the access token to a protected
+  # resource. When present, the minted access token's `aud` MUST be that
+  # resource identifier (§2.2); when absent, the mint falls back to
+  # `config.audience`. The indicator MUST be an absolute URI with no fragment
+  # (§2.1). A single valid resource yields that audience (returned as `{:ok,
+  # uri}`); an absent resource yields `{:ok, nil}` (the config-audience default).
+  # A syntactically invalid resource, or more than one distinct resource value
+  # for this single access token (this grant mints exactly one), is rejected
+  # with `invalid_target` (§2.1) - the AS cannot address one access token to two
+  # resources, and silently picking one would mis-audience the token.
+  #
+  # Note on duplicate keys: standard form/query decoding collapses a repeated
+  # `resource=a&resource=b` to a single (last) value before the controller
+  # builds `params`, so the multiple-resource rejection below fires for the
+  # explicit array form (`resource[]=a&resource[]=b`); a repeated scalar key
+  # yields one effective resource, which is honoured (the token is still
+  # audienced to a requested resource).
+  defp jwt_bearer_resource_audience(config, params) do
+    with {:ok, resource} <- requested_resource(params) do
+      authorize_resource(config, resource)
+    end
+  end
+
+  # RFC 8707 §2.2 / draft §6: an authenticated jwt-bearer client MUST NOT be able
+  # to mint a token audienced to an arbitrary resource. A requested resource is
+  # honoured only when it is this server's own `audience` or an explicitly
+  # allow-listed resource (`jwt_bearer: [allowed_resources: [...]]`); any other
+  # resource is rejected `invalid_target` so the AS never issues a token for a
+  # resource it does not serve. An absent resource (`nil`) falls back to
+  # `config.audience`.
+  defp authorize_resource(_config, nil), do: {:ok, nil}
+
+  defp authorize_resource(config, resource) do
+    if resource == config.audience or resource in jwt_bearer_allowed_resources(config) do
+      {:ok, resource}
+    else
+      {:error,
+       error(@error_invalid_target, "the requested resource is not served by this authorization server")}
+    end
+  end
+
+  defp jwt_bearer_allowed_resources(config) do
+    config |> Config.jwt_bearer() |> Keyword.get(:allowed_resources, []) |> List.wrap()
+  end
+
+  defp requested_resource(params) do
+    case Map.get(params, "resource") do
+      # Absent: no resource indicator, fall back to config.audience.
+      nil -> {:ok, nil}
+      # Present (scalar or array): every submitted value must be a valid
+      # indicator. A blank/non-binary value - including a present-but-empty
+      # `resource=` - is malformed and fails closed rather than being treated as
+      # absent.
+      value when is_binary(value) -> single_resource_audience([value])
+      values when is_list(values) -> single_resource_audience(values)
+      _ -> {:error, error(@error_invalid_target, "resource is invalid")}
+    end
+  end
+
+  defp single_resource_audience(values) do
+    cond do
+      values == [] ->
+        {:error, error(@error_invalid_target, "resource is present but empty")}
+
+      Enum.any?(values, &(not (is_binary(&1) and &1 != ""))) ->
+        {:error, error(@error_invalid_target, "resource must be a non-empty absolute URI")}
+
+      true ->
+        validated_single_resource(Enum.uniq(values))
+    end
+  end
+
+  defp validated_single_resource([resource]) do
+    if valid_resource_indicator?(resource) do
+      {:ok, resource}
+    else
+      {:error, error(@error_invalid_target, "resource is not an absolute URI without a fragment")}
+    end
+  end
+
+  defp validated_single_resource(_multiple) do
+    {:error, error(@error_invalid_target, "a single access token cannot target multiple resources")}
+  end
+
+  # RFC 8707 §2: a resource indicator is an absolute URI (RFC 3986 §4.3 - a
+  # scheme and a hier-part) and MUST NOT carry a fragment (§4.1). `URI.parse/1`
+  # never errors, so absoluteness is checked structurally: a non-empty scheme
+  # and a host or path component.
+  defp valid_resource_indicator?(value) when is_binary(value) do
+    not invalid_percent_encoding?(value) and absolute_uri_no_fragment?(value)
+  end
+
+  # RFC 3986 §2.1: a `%` is valid only as the lead of a `%HH` triplet. `URI.new/1`
+  # still admits a bare/invalid `%`, so reject it explicitly before building the
+  # URI (else `resource=https://api.example/%ZZ` could mint a malformed `aud`).
+  defp invalid_percent_encoding?(value), do: Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value)
+
+  # RFC 8707 §2.1: a resource indicator is an absolute URI (any scheme) with no
+  # fragment. `URI.new/1` (unlike `URI.parse/1`) rejects whitespace/controls.
+  defp absolute_uri_no_fragment?(value) do
+    case URI.new(value) do
+      {:ok, %URI{scheme: scheme, fragment: nil} = uri} when is_binary(scheme) and scheme != "" ->
+        is_binary(uri.host) or (is_binary(uri.path) and uri.path != "")
+
+      _ ->
+        false
+    end
+  end
+
+  # The `Attesto.Token.mint/3` opt carrying the RFC 8707 resource audience; an
+  # absent resource adds no opt, so `mint/3` keeps its `config.audience`.
+  defp audience_opts(nil), do: []
+  defp audience_opts(audience) when is_binary(audience), do: [audience: audience]
 
   # ── Grant-state delegation (Attesto core) ────────────────────────────────
 
@@ -726,14 +852,17 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # ── Token minting (Attesto.Token) ────────────────────────────────────────
 
-  defp mint(config, client, subject, scope, token_type, binding, extra_claims \\ %{}) do
+  # `mint_extra_opts` is appended to the sender-constraint mint opts; today it
+  # carries only the RFC 8707 `:audience` override (jwt-bearer grant), so the
+  # `aud` of any other grant's token is unaffected.
+  defp mint(config, client, subject, scope, token_type, binding, extra_claims \\ %{}, mint_extra_opts \\ []) do
     with {:ok, principal} <- build_principal(config, client, subject, scope),
          principal = merge_principal_claims(principal, extra_claims),
          {:ok, minted} <-
            Attesto.Token.mint(
              attesto_config(config),
              principal,
-             SenderConstraint.mint_opts(binding)
+             SenderConstraint.mint_opts(binding) ++ mint_extra_opts
            ) do
       {:ok,
        %{
@@ -1010,9 +1139,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # ── Errors (RFC 6749 §5.2) ───────────────────────────────────────────────
 
-  defp error(code, description), do: OAuthError.new(error_code(code), description, status: 400)
-
-  defp error_code(code) when is_binary(code), do: String.to_existing_atom(code)
+  # `code` is a compile-time RFC 6749 §5.2 error-code atom (the `@error_*`
+  # attributes); it is passed straight to `OAuthError.new/3`, which requires an
+  # atom. No string-to-atom resolution, so this can never raise on an unknown
+  # code the way `String.to_existing_atom/1` would.
+  defp error(code, description), do: OAuthError.new(code, description, status: 400)
 
   # RFC 6749 §5.2: redemption/rotation failures all map to invalid_grant; the
   # specific internal reason is not exposed to the client. Reuse detection is

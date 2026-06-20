@@ -168,6 +168,32 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_denied, result: :insecure_transport}}
   end
 
+  test "surfaces the configured RFC 9728 resource_metadata pointer on a 401 challenge", %{config: config} do
+    url = @issuer <> "/.well-known/oauth-protected-resource"
+    config = %{config | resource_metadata: url}
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert conn.halted
+    assert conn.status == 401
+    [challenge] = get_resp_header(conn, "www-authenticate")
+    assert challenge =~ ~s(resource_metadata="#{url}")
+  end
+
+  test "omits the resource_metadata pointer when the Config does not set it", %{config: config} do
+    conn =
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert conn.status == 401
+    [challenge] = get_resp_header(conn, "www-authenticate")
+    refute challenge =~ "resource_metadata"
+  end
+
   test "uses configured error transport for core verifier failures", %{config: config} do
     config = %{
       config

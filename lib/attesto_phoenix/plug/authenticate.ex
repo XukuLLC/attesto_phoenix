@@ -139,6 +139,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     |> put_optional(:send_error, config.send_error)
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)
+    |> put_optional(:resource_metadata, config.resource_metadata)
     |> put_optional(:replay_check, replay_check(config))
     |> put_optional(:nonce_check, nonce_check(config))
     |> put_optional(:nonce_issue, nonce_issue(config))
@@ -231,7 +232,8 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     [
       send_error: config.send_error,
       www_authenticate: config.www_authenticate,
-      no_store: config.no_store
+      no_store: config.no_store,
+      resource_metadata: config.resource_metadata
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Keyword.merge(extra)

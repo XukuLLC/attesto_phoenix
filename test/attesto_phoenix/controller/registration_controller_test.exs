@@ -27,6 +27,7 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
   defp config(overrides) do
     base = %{
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: :unused,
       repo: :unused,
       load_client: fn _id -> {:error, :not_found} end,

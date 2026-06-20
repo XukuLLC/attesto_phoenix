@@ -60,6 +60,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
   defp valid_config(overrides) do
     base = [
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: FakeKeystore,
       repo: RecordingRepo,
       load_client: fn _ -> {:error, :not_found} end,

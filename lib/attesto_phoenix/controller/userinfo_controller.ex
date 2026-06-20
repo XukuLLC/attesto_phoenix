@@ -125,7 +125,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
         conn
 
       access_token_revoked?(config, conn.assigns[@claims_key]) ->
-        invalid_token(conn, scheme_of(conn.assigns[@claims_key]))
+        invalid_token(conn, scheme_of(conn.assigns[@claims_key]), config)
 
       true ->
         respond(conn, config)
@@ -153,7 +153,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
       |> put_no_store_headers()
       |> json(userinfo)
     else
-      insufficient_scope(conn, scheme_of(claims))
+      insufficient_scope(conn, scheme_of(claims), config)
     end
   end
 
@@ -211,11 +211,12 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   defp access_token_revoked?(_config, _claims), do: false
 
-  defp invalid_token(conn, scheme) do
+  defp invalid_token(conn, scheme, config) do
     challenge =
-      challenge(scheme, [
-        {"error", "invalid_token"}
-      ])
+      challenge(
+        scheme,
+        [{"error", "invalid_token"}] ++ resource_metadata_param(config)
+      )
 
     conn
     |> put_no_store_headers()
@@ -226,13 +227,16 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   # RFC 6750 §3.1: a valid token that lacks the required scope is answered 403
   # `insufficient_scope` with the `scope` auth-param naming what is needed.
-  defp insufficient_scope(conn, scheme) do
+  defp insufficient_scope(conn, scheme, config) do
     challenge =
-      challenge(scheme, [
-        {"error", "insufficient_scope"},
-        {"error_description", "The UserInfo endpoint requires the openid scope."},
-        {"scope", @openid_scope}
-      ])
+      challenge(
+        scheme,
+        [
+          {"error", "insufficient_scope"},
+          {"error_description", "The UserInfo endpoint requires the openid scope."},
+          {"scope", @openid_scope}
+        ] ++ resource_metadata_param(config)
+      )
 
     conn
     |> put_no_store_headers()
@@ -262,6 +266,14 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     |> String.replace("\"", "\\\"")
   end
 
+  # RFC 9728 §5.1: when the resource advertises protected-resource metadata,
+  # every `WWW-Authenticate` challenge carries a `resource_metadata` pointer so a
+  # refused client can discover the authorization server. Omitted when unset.
+  defp resource_metadata_param(%Config{resource_metadata: url}) when is_binary(url),
+    do: [{"resource_metadata", url}]
+
+  defp resource_metadata_param(_config), do: []
+
   defp put_no_store_headers(conn) do
     conn
     |> put_resp_header("cache-control", @cache_control_no_store)
@@ -280,6 +292,9 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     |> put_optional(:nonce_check, nonce_check(config))
     |> put_optional(:nonce_issue, nonce_issue(config))
     |> put_optional(:cert_der, cert_der(config))
+    # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it
+    # must also carry the protected-resource metadata pointer when configured.
+    |> put_optional(:resource_metadata, config.resource_metadata)
     # RFC 9449 §4.3: derive the DPoP `htu` the same way every other endpoint
     # does — via RequestContext.canonical_url, which honours a configured
     # `:htu` but otherwise gates `X-Forwarded-*`/Host on the trusted-proxy

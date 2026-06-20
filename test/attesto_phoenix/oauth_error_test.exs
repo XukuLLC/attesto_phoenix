@@ -22,6 +22,7 @@ defmodule AttestoPhoenix.OAuthErrorTest do
   defp config(overrides \\ []) do
     [
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: __MODULE__.FakeKeystore,
       repo: __MODULE__.FakeRepo,
       load_client: fn _ -> {:error, :not_found} end,

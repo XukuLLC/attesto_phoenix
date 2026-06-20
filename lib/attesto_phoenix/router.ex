@@ -12,6 +12,9 @@ defmodule AttestoPhoenix.Router do
       (OpenID Connect Discovery 1.0 §4).
     * `GET /.well-known/jwks.json` - the JSON Web Key Set of the verification
       keys (RFC 7517 §5; the discovery document's `jwks_uri` per RFC 8414 §2).
+    * `GET /.well-known/oauth-protected-resource` - protected-resource metadata
+      (RFC 9728 §3), the discovery target of the §5.1 `WWW-Authenticate`
+      challenge the resource-server plugs emit.
     * `GET /oauth/authorize` - the authorization endpoint (RFC 6749 §3.1;
       OpenID Connect Core 1.0 §3.1.2).
     * `POST /oauth/token` - the token endpoint (RFC 6749 §3.2).
@@ -90,6 +93,7 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.JWKSController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
+  alias AttestoPhoenix.Controller.ProtectedResourceController
   alias AttestoPhoenix.Controller.RegistrationController
   alias AttestoPhoenix.Controller.RevocationController
   alias AttestoPhoenix.Controller.TokenController
@@ -102,6 +106,13 @@ defmodule AttestoPhoenix.Router do
   # document to the `/.well-known/openid-configuration` URI, also anchored at
   # the host root under RFC 8615 and therefore NOT subject to the `:prefix`.
   @openid_configuration_path "/.well-known/openid-configuration"
+
+  # RFC 9728 §3 pins the protected-resource metadata document to the
+  # `/.well-known/oauth-protected-resource` URI, anchored at the host root under
+  # RFC 8615 and therefore NOT subject to the `:prefix`. It is the discovery
+  # target of the RFC 9728 §5.1 `WWW-Authenticate: Bearer ..., resource_metadata`
+  # challenge the protected-resource plugs emit.
+  @protected_resource_path "/.well-known/oauth-protected-resource"
 
   # The OAuth endpoints live under the host-chosen `:prefix`. These are the
   # path tails appended to it. They derive from the SAME tail constants
@@ -123,6 +134,7 @@ defmodule AttestoPhoenix.Router do
   # expansion does not scatter controller module references through the
   # callers' router source.
   @discovery_controller DiscoveryController
+  @protected_resource_controller ProtectedResourceController
   @openid_configuration_controller OpenIDConfigurationController
   @jwks_controller JWKSController
   @authorize_controller AuthorizeController
@@ -150,6 +162,7 @@ defmodule AttestoPhoenix.Router do
     registration? = Keyword.get(opts, :registration, false)
 
     discovery_path = @discovery_path
+    protected_resource_path = @protected_resource_path
     openid_configuration_path = @openid_configuration_path
     jwks_path = @jwks_path
     authorize_path = @authorize_path
@@ -160,6 +173,7 @@ defmodule AttestoPhoenix.Router do
     register_path = @register_path
     userinfo_path = @userinfo_path
     discovery_controller = @discovery_controller
+    protected_resource_controller = @protected_resource_controller
     openid_configuration_controller = @openid_configuration_controller
     jwks_controller = @jwks_controller
     authorize_controller = @authorize_controller
@@ -215,6 +229,12 @@ defmodule AttestoPhoenix.Router do
         get(unquote(discovery_path), unquote(discovery_controller), :show)
         get(unquote(openid_configuration_path), unquote(openid_configuration_controller), :show)
         get(unquote(jwks_path), unquote(jwks_controller), :show)
+
+        # RFC 9728 §3: the protected-resource metadata document is unauthenticated
+        # public metadata served at its registered well-known URI at the host
+        # root (RFC 8615), so a client following the RFC 9728 §5.1
+        # `WWW-Authenticate` challenge can discover the authorization server.
+        get(unquote(protected_resource_path), unquote(protected_resource_controller), :show)
 
         # RFC 6749 §3.1 / OpenID Connect Core 1.0 §3.1.2: the authorization
         # endpoint accepts both GET and POST under the host-chosen prefix. It

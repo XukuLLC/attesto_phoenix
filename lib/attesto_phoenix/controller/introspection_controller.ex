@@ -62,7 +62,8 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
 
-  @error_invalid_request "invalid_request"
+  # RFC 6749 §5.2 error code, held as the atom `OAuthError.new/3` requires.
+  @error_invalid_request :invalid_request
 
   @doc """
   Handle `POST /oauth/introspect` (RFC 7662 §2.1).
@@ -218,7 +219,9 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   defp error_body(code, nil), do: %{error: code}
   defp error_body(code, description), do: %{error: code, error_description: description}
 
-  defp error(code, description), do: OAuthError.new(String.to_existing_atom(code), description, status: 400)
+  # `code` is a compile-time RFC 6749 §5.2 error-code atom, passed straight to
+  # `OAuthError.new/3` (no string-to-atom round-trip that could raise).
+  defp error(code, description), do: OAuthError.new(code, description, status: 400)
 
   defp put_no_store_headers(conn) do
     conn

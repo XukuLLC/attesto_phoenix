@@ -95,6 +95,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
 
     Config.new(
       issuer: "https://issuer.example",
+      audience: "https://api.example.com",
       keystore: __MODULE__.StubKeystore,
       repo: __MODULE__.StubRepo,
       load_client: fn _ -> {:error, :not_found} end,

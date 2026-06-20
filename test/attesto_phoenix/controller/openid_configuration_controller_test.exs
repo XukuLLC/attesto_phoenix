@@ -27,6 +27,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       Keyword.merge(
         [
           issuer: @issuer,
+          audience: "https://api.example.com",
           keystore: StubKeystore,
           repo: __MODULE__.StubRepo,
           load_client: fn _ -> {:error, :not_found} end,

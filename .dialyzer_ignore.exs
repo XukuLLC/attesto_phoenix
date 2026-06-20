@@ -31,22 +31,22 @@
 #     never raise a FunctionClauseError, if the validation surface gains a new
 #     reason atom.
 #
-#   * authorization_server/token.ex - two fail-closed clauses the current grant
-#     pipeline's success typing renders unreachable, kept for robustness:
-#       - `issue/2` matches a 3-tuple `{:error, %OAuthError{}, events}` from
-#         `run/1` (the documented shape for an error that carries the events
-#         accumulated before it). Today's grant handlers return 2-tuple errors,
-#         so dialyzer flags the clause; it stays so a future handler that emits
-#         events before failing keeps them rather than dropping them.
-#       - `access_token_claims/1` has a `_grant` catch-all returning `%{}` for a
-#         grant whose `:claims` is absent or not a map. Dialyzer narrows the
-#         grant to always carry a map `:claims`; the catch-all stays fail-closed
-#         so a grant minted without claims yields no access-token claims rather
-#         than raising.
+#   * authorization_server/token.ex - `access_token_claims/1` has a `_grant`
+#     catch-all returning `%{}` for a grant whose `:claims` is absent or not a
+#     map. Dialyzer narrows the grant to always carry a map `:claims`; the
+#     catch-all stays fail-closed so a grant minted without claims yields no
+#     access-token claims rather than raising.
+#
+#   * config.ex - a fail-closed boot-validation guard whose checked value
+#     dialyzer's success typing narrows to always satisfy the check (so it flags
+#     the raise branch as unreachable). The guard stays so a runtime value that
+#     violates the declared field type raises a clear ArgumentError at
+#     `new/1`/`validate!/1` rather than failing late. The validations are
+#     covered by config_test.exs.
 [
   {"lib/attesto_phoenix/controller/registration_controller.ex", :pattern_match_cov},
   {"lib/attesto_phoenix/request_context.ex", :pattern_match},
   {"lib/attesto_phoenix/controller/authorize_controller.ex", :pattern_match_cov},
-  {"lib/attesto_phoenix/authorization_server/token.ex", :pattern_match},
-  {"lib/attesto_phoenix/authorization_server/token.ex", :pattern_match_cov}
+  {"lib/attesto_phoenix/authorization_server/token.ex", :pattern_match_cov},
+  {"lib/attesto_phoenix/config.ex", :pattern_match}
 ]

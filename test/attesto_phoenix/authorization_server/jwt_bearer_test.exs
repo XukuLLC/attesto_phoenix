@@ -149,6 +149,15 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     Token.issue(config, request(config, params, req_overrides))
   end
 
+  # Read the minted access token's `aud`. The token is signed by the suite's
+  # keystore, so the signature-verifying peek suffices (we assert on `aud`, not
+  # on `aud`-equality, which `verify/3` would itself enforce against
+  # config.audience and so could not observe an RFC 8707 resource override).
+  defp access_token_aud(config, %{access_token: token}) do
+    {:ok, claims} = Attesto.Token.peek_signed_claims(Config.to_attesto_config(config), token)
+    claims["aud"]
+  end
+
   describe "happy path" do
     test "a valid assertion issues an access token" do
       config = config()
@@ -176,21 +185,104 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert response.scope == "mcp:read"
     end
 
-    test "offline_access issues a refresh token when a refresh_store is configured" do
+    # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: this
+    # grant issues NO refresh token - access is re-derived from a fresh
+    # assertion each time. A refresh token would outlive enterprise IdP
+    # policy/deprovisioning. This holds even when a `refresh_store` is wired and
+    # the assertion carries `offline_access` (the signal that triggers refresh
+    # issuance for the authorization_code grant).
+    test "never issues a refresh token, even with offline_access and a refresh_store" do
       config = config(refresh_store: __MODULE__.StubRefreshStore)
       params = %{"assertion" => assertion(%{"scope" => "openid offline_access"})}
 
       assert {:ok, response, events} = issue(config, params)
-      assert is_binary(response.refresh_token)
-      assert Enum.any?(events, &(&1.name == :refresh_issued))
+      refute Map.has_key?(response, :refresh_token)
+      refute Enum.any?(events, &(&1.name == :refresh_issued))
+      assert Enum.any?(events, &(&1.name == :token_issued))
     end
+  end
 
-    test "no refresh token without offline_access" do
-      config = config(refresh_store: __MODULE__.StubRefreshStore)
-      params = %{"assertion" => assertion(%{"scope" => "mcp:read"})}
+  describe "RFC 8707 resource indicator → access-token aud" do
+    test "an allow-listed resource sets the access token aud to that resource" do
+      resource = "https://api.example/mcp"
+      config = config(jwt_bearer: [allowed_resources: [resource]])
+      params = %{"assertion" => assertion(), "resource" => resource}
 
       assert {:ok, response, _} = issue(config, params)
-      refute Map.has_key?(response, :refresh_token)
+      assert access_token_aud(config, response) == resource
+    end
+
+    test "the server's own audience is always an allowed resource" do
+      config = config()
+      params = %{"assertion" => assertion(), "resource" => @as_issuer}
+
+      assert {:ok, response, _} = issue(config, params)
+      assert access_token_aud(config, response) == @as_issuer
+    end
+
+    test "a resource that is neither config.audience nor allow-listed is invalid_target" do
+      # RFC 8707 §2.2: an authenticated client must not mint a token audienced to
+      # an arbitrary resource the AS does not serve.
+      config = config(jwt_bearer: [allowed_resources: ["https://known.example/api"]])
+      params = %{"assertion" => assertion(), "resource" => "https://attacker.example/api"}
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
+    end
+
+    test "an absent resource falls back to config.audience" do
+      config = config()
+
+      assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+      assert access_token_aud(config, response) == @as_issuer
+    end
+
+    test "a resource with a fragment is invalid_target" do
+      config = config()
+      params = %{"assertion" => assertion(), "resource" => "https://api.example/mcp#frag"}
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
+    end
+
+    test "a relative (non-absolute) resource URI is invalid_target" do
+      config = config()
+      params = %{"assertion" => assertion(), "resource" => "/mcp"}
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
+    end
+
+    test "multiple distinct resource values for one access token is invalid_target" do
+      config = config()
+      params = %{"assertion" => assertion(), "resource" => ["https://a.example", "https://b.example"]}
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
+    end
+
+    test "a single resource repeated (one distinct value) is honoured" do
+      resource = "https://api.example/mcp"
+      config = config(jwt_bearer: [allowed_resources: [resource]])
+      params = %{"assertion" => assertion(), "resource" => [resource, resource]}
+
+      assert {:ok, response, _} = issue(config, params)
+      assert access_token_aud(config, response) == resource
+    end
+
+    test "a resource with invalid percent-encoding is invalid_target (not a malformed aud)" do
+      # RFC 3986 §2.1: even with a matching allow-list entry, a bad `%HH` triplet
+      # must be rejected rather than minted into the access token aud.
+      config = config(jwt_bearer: [allowed_resources: ["https://api.example/%ZZ"]])
+      params = %{"assertion" => assertion(), "resource" => "https://api.example/%ZZ"}
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
+    end
+
+    test "a present-but-empty resource is invalid_target, not silently absent" do
+      # RFC 8707 §2.1: `resource=` is malformed (not an absolute URI) and must
+      # fail closed rather than fall back to config.audience as if unset.
+      for blank <- ["", [""], ["https://a.example", ""]] do
+        params = %{"assertion" => assertion(), "resource" => blank}
+        assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config(), params),
+               "expected :invalid_target for resource=#{inspect(blank)}"
+      end
     end
   end
 
