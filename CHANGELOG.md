@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-06-20
+
+### Added
+
+- **`AttestoPhoenix.Config` `:bearer_methods_supported`** — the RFC 6750
+  access-token presentation methods the resource server accepts, advertised as
+  `bearer_methods_supported` in the RFC 9728 protected-resource metadata document
+  (`/.well-known/oauth-protected-resource`). Previously the
+  `ProtectedResourceController` hardcoded `["header", "body"]`, forcing a
+  header-only deployment to advertise the form-body method (RFC 6750 §2.2) it
+  rejects — a metadata-accuracy/interoperability defect, since a conformant
+  client could select a rejected method (RFC 9728 §2 / RFC 6750 §3). The field is
+  now configurable (each element one of `"header"`, `"body"`, or `"query"`;
+  validated non-empty at config build), mirroring `:scopes_supported`. Defaults
+  to `["header", "body"]` — exactly the surface `AttestoPhoenix.Plug.Authenticate`
+  accepts (the `Authorization` header, §2.1, and a POST form-body `access_token`,
+  §2.2) — so the default document is accurate for the bundled plug; a header-only
+  resource server sets `["header"]`.
+
 ## [0.10.0] - 2026-06-20
 
 

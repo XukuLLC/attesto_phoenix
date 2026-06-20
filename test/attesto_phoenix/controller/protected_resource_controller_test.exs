@@ -86,9 +86,17 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceControllerTest do
       # An AS that is also the protected resource issues its own tokens, so the
       # issuer is the authorization server for this resource.
       assert body["authorization_servers"] == [@issuer]
-      # RFC 6750 §2.1/§2.2: the Authorization header and the POST form-body token.
+      # RFC 6750 §2.1/§2.2: the default (matching AttestoPhoenix.Plug.Authenticate)
+      # advertises both the Authorization header and the POST form-body token.
       assert body["bearer_methods_supported"] == ["header", "body"]
       assert body["scopes_supported"] == ["openid", "profile", "api.read"]
+    end
+
+    test "advertises only the host-configured bearer_methods_supported (RFC 9728 §2)" do
+      # A header-only resource server must not advertise the body method it rejects.
+      body = call_show(host_config(bearer_methods_supported: ["header"]), protocol_config()) |> decode_body()
+
+      assert body["bearer_methods_supported"] == ["header"]
     end
 
     test "resource follows the protocol audience (the resource identifier)" do

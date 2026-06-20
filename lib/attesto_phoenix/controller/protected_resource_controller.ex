@@ -28,9 +28,12 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
       RFC 8414 metadata to run the flow.
     * `scopes_supported` - the host's `:scopes_supported`, the same list the
       RFC 8414 document advertises, so the two never drift.
-    * `bearer_methods_supported` - `["header"]`: `AttestoPhoenix.Plug.Authenticate`
-      reads the access token from the `Authorization` header (RFC 6750 §2.1),
-      so that is the only presentation method advertised.
+    * `bearer_methods_supported` - the host's `:bearer_methods_supported`
+      (`AttestoPhoenix.Config`), the RFC 6750 token-presentation methods the
+      resource server accepts. Defaults to `["header", "body"]`, matching
+      `AttestoPhoenix.Plug.Authenticate` (the `Authorization` header, §2.1, and a
+      POST form-body `access_token`, §2.2); a header-only resource server sets
+      `["header"]` so the document describes exactly what it accepts.
 
   The response carries no secrets and is identical for every caller, so it is
   served unauthenticated, and RFC 9728 §3.1 permits caching, so a public,
@@ -66,13 +69,6 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
   # mirrors the RFC 8414 discovery document's cache window.
   @cache_max_age_seconds 3600
 
-  # RFC 9728 §2 `bearer_methods_supported`: the RFC 6750 methods the auth plug
-  # accepts — the `Authorization` header (§2.1) and, on a POST, a form-encoded
-  # `access_token` body parameter (§2.2, the fallback the core plug's
-  # `form_body_authorization` accepts, used by the OIDC UserInfo POST flow). The
-  # deprecated URI query method (§2.3) is not accepted and is not advertised.
-  @bearer_methods_supported ["header", "body"]
-
   @doc """
   Render the RFC 9728 protected-resource metadata document as JSON.
 
@@ -100,7 +96,12 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
     [
       authorization_servers: [config.issuer],
       scopes_supported: presence(config.scopes_supported),
-      bearer_methods_supported: @bearer_methods_supported
+      # RFC 9728 §2 `bearer_methods_supported`: the RFC 6750 token-presentation
+      # methods the resource server accepts, from `AttestoPhoenix.Config`
+      # `:bearer_methods_supported` (default `["header", "body"]`, matching
+      # `AttestoPhoenix.Plug.Authenticate`). A header-only deployment configures
+      # `["header"]` so the document advertises exactly what it accepts.
+      bearer_methods_supported: config.bearer_methods_supported
     ]
   end
 

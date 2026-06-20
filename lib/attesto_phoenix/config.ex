@@ -200,6 +200,15 @@ defmodule AttestoPhoenix.Config do
       For an OpenID Provider the reserved `openid` scope (OpenID Connect Core
       §3.1.2.1) is added to the OpenID Provider Metadata automatically by the
       core builder; it need not be listed here.
+    * `:bearer_methods_supported` - the RFC 6750 access-token presentation
+      methods the resource server accepts, advertised as
+      `bearer_methods_supported` in the RFC 9728 protected-resource metadata
+      document (`/.well-known/oauth-protected-resource`). Each element is one of
+      `"header"` (§2.1), `"body"` (§2.2), or `"query"` (§2.3, permitted but
+      discouraged by RFC 6750). Defaults to `["header", "body"]`, which matches
+      `AttestoPhoenix.Plug.Authenticate`. A host whose resource server accepts
+      the token by `Authorization` header only sets `["header"]` so the metadata
+      describes exactly what it accepts.
     * `:authorization_endpoint` - absolute URL of the host-owned authorization
       endpoint (RFC 6749 §3.1 / OpenID Connect Discovery §3). The authorization
       endpoint runs the host's login/consent UI, so the library does not mount
@@ -462,6 +471,7 @@ defmodule AttestoPhoenix.Config do
     :userinfo_path,
     oauth_path_prefix: "/oauth",
     scopes_supported: [],
+    bearer_methods_supported: ["header", "body"],
     claims_supported: [],
     acr_values_supported: [],
     ui_locales_supported: [],
@@ -561,6 +571,7 @@ defmodule AttestoPhoenix.Config do
           registration_path: String.t() | nil,
           userinfo_path: String.t() | nil,
           scopes_supported: [String.t()],
+          bearer_methods_supported: [String.t()],
           claims_supported: [String.t()],
           acr_values_supported: [String.t()],
           ui_locales_supported: [String.t()],
@@ -1233,6 +1244,7 @@ defmodule AttestoPhoenix.Config do
     end
 
     validate_resource_metadata!(config)
+    validate_bearer_methods_supported!(config)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
       raise ArgumentError,
@@ -1285,6 +1297,24 @@ defmodule AttestoPhoenix.Config do
             "AttestoPhoenix.Config: :resource_metadata, when set, must be an absolute https URL with a " <>
               "host and no fragment (the RFC 9728 protected-resource metadata document advertised " <>
               "in the WWW-Authenticate challenge); got #{inspect(rm)}."
+    end
+  end
+
+  # RFC 6750 §2: the access-token presentation methods. `"query"` (§2.3) is
+  # permitted in RFC 9728 metadata but discouraged by RFC 6750 itself.
+  @bearer_methods ["header", "body", "query"]
+
+  # RFC 9728 §2 `bearer_methods_supported` describes what the resource server
+  # actually accepts, so it must be a non-empty list of valid RFC 6750 methods:
+  # an empty list or an unknown method would advertise a contract the resource
+  # cannot honour (a conformant client could select a rejected method).
+  defp validate_bearer_methods_supported!(%{bearer_methods_supported: methods}) do
+    if is_list(methods) and methods != [] and Enum.all?(methods, &(&1 in @bearer_methods)) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :bearer_methods_supported must be a non-empty list of " <>
+              "RFC 6750 token-presentation methods (#{inspect(@bearer_methods)}); got #{inspect(methods)}."
     end
   end
 

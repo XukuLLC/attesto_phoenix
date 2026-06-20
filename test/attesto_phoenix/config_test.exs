@@ -390,6 +390,25 @@ defmodule AttestoPhoenix.ConfigTest do
       assert cfg.resource_metadata == "https://api.example/.well-known/x"
     end
 
+    test ":bearer_methods_supported defaults to header+body and is configurable" do
+      base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+
+      assert Config.new(base).bearer_methods_supported == ["header", "body"]
+
+      assert Config.new(Keyword.put(base, :bearer_methods_supported, ["header"])).bearer_methods_supported ==
+               ["header"]
+    end
+
+    test ":bearer_methods_supported rejects an empty list or an unknown method (RFC 6750 §2)" do
+      base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+
+      for bad <- [[], ["cookie"], ["header", "cookie"], "header", nil] do
+        assert_raise ArgumentError, ~r/:bearer_methods_supported must be a non-empty list/, fn ->
+          Config.new(Keyword.put(base, :bearer_methods_supported, bad))
+        end
+      end
+    end
+
     test "the diagnostic names :invalid_audience so the late failure is explained" do
       message =
         assert_raise(ArgumentError, fn -> Config.new(audience_required_opts()) end).message
