@@ -399,11 +399,13 @@ defmodule AttestoPhoenix.ConfigTest do
                ["header"]
     end
 
-    test ":bearer_methods_supported rejects an empty list or an unknown method (RFC 6750 §2)" do
+    test ":bearer_methods_supported rejects empty, duplicate, query, or unknown methods (RFC 6750 §2)" do
       base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
 
-      for bad <- [[], ["cookie"], ["header", "cookie"], "header", nil] do
-        assert_raise ArgumentError, ~r/:bearer_methods_supported must be a non-empty list/, fn ->
+      # "query" (§2.3) is rejected: AttestoPhoenix.Plug.Authenticate never accepts
+      # a query-presented token, so advertising it would be inaccurate.
+      for bad <- [[], ["query"], ["cookie"], ["header", "cookie"], ["header", "header"], "header", nil] do
+        assert_raise ArgumentError, ~r/:bearer_methods_supported must be a non-empty list of distinct/, fn ->
           Config.new(Keyword.put(base, :bearer_methods_supported, bad))
         end
       end

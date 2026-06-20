@@ -203,12 +203,14 @@ defmodule AttestoPhoenix.Config do
     * `:bearer_methods_supported` - the RFC 6750 access-token presentation
       methods the resource server accepts, advertised as
       `bearer_methods_supported` in the RFC 9728 protected-resource metadata
-      document (`/.well-known/oauth-protected-resource`). Each element is one of
-      `"header"` (§2.1), `"body"` (§2.2), or `"query"` (§2.3, permitted but
-      discouraged by RFC 6750). Defaults to `["header", "body"]`, which matches
-      `AttestoPhoenix.Plug.Authenticate`. A host whose resource server accepts
-      the token by `Authorization` header only sets `["header"]` so the metadata
-      describes exactly what it accepts.
+      document (`/.well-known/oauth-protected-resource`). A non-empty list of
+      distinct methods, each `"header"` (§2.1) or `"body"` (§2.2) - the methods
+      `AttestoPhoenix.Plug.Authenticate` accepts. The §2.3 `"query"` method is
+      rejected: the plug never accepts a query-presented token, so advertising it
+      would name a method the library cannot honour (and RFC 6750 §2.3 says it
+      SHOULD NOT be used). Defaults to `["header", "body"]`, matching the plug;
+      a host whose resource server accepts the token by `Authorization` header
+      only sets `["header"]` so the metadata describes exactly what it accepts.
     * `:authorization_endpoint` - absolute URL of the host-owned authorization
       endpoint (RFC 6749 §3.1 / OpenID Connect Discovery §3). The authorization
       endpoint runs the host's login/consent UI, so the library does not mount
@@ -1300,21 +1302,28 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  # RFC 6750 §2: the access-token presentation methods. `"query"` (§2.3) is
-  # permitted in RFC 9728 metadata but discouraged by RFC 6750 itself.
-  @bearer_methods ["header", "body", "query"]
+  # RFC 6750 §2.1/§2.2: the access-token presentation methods
+  # `AttestoPhoenix.Plug.Authenticate` actually accepts. The §2.3 URI query
+  # method is deliberately excluded: the plug never accepts a query-presented
+  # token, so advertising `"query"` would name a method the library cannot
+  # honour - the same metadata-accuracy defect this field fixes, inverted - and
+  # RFC 6750 §2.3 itself says the query method SHOULD NOT be used.
+  @bearer_methods ["header", "body"]
 
-  # RFC 9728 §2 `bearer_methods_supported` describes what the resource server
-  # actually accepts, so it must be a non-empty list of valid RFC 6750 methods:
-  # an empty list or an unknown method would advertise a contract the resource
-  # cannot honour (a conformant client could select a rejected method).
+  # RFC 9728 §2 `bearer_methods_supported` must describe exactly what the resource
+  # server accepts, so it must be a non-empty list of DISTINCT methods drawn from
+  # `@bearer_methods`. An empty list, a duplicate, or an unaccepted method (e.g.
+  # `"query"`, `"cookie"`) would advertise a contract the resource cannot honour
+  # (a conformant client could select a rejected method).
   defp validate_bearer_methods_supported!(%{bearer_methods_supported: methods}) do
-    if is_list(methods) and methods != [] and Enum.all?(methods, &(&1 in @bearer_methods)) do
+    if is_list(methods) and methods != [] and methods == Enum.uniq(methods) and
+         Enum.all?(methods, &(&1 in @bearer_methods)) do
       :ok
     else
       raise ArgumentError,
-            "AttestoPhoenix.Config: :bearer_methods_supported must be a non-empty list of " <>
-              "RFC 6750 token-presentation methods (#{inspect(@bearer_methods)}); got #{inspect(methods)}."
+            "AttestoPhoenix.Config: :bearer_methods_supported must be a non-empty list of distinct " <>
+              "RFC 6750 token-presentation methods accepted by AttestoPhoenix.Plug.Authenticate " <>
+              "(#{inspect(@bearer_methods)}); got #{inspect(methods)}."
     end
   end
 

@@ -16,12 +16,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   header-only deployment to advertise the form-body method (RFC 6750 §2.2) it
   rejects — a metadata-accuracy/interoperability defect, since a conformant
   client could select a rejected method (RFC 9728 §2 / RFC 6750 §3). The field is
-  now configurable (each element one of `"header"`, `"body"`, or `"query"`;
-  validated non-empty at config build), mirroring `:scopes_supported`. Defaults
-  to `["header", "body"]` — exactly the surface `AttestoPhoenix.Plug.Authenticate`
-  accepts (the `Authorization` header, §2.1, and a POST form-body `access_token`,
-  §2.2) — so the default document is accurate for the bundled plug; a header-only
-  resource server sets `["header"]`.
+  now configurable (a non-empty list of distinct methods, each `"header"` or
+  `"body"` — exactly the surface `AttestoPhoenix.Plug.Authenticate` accepts:
+  the `Authorization` header (§2.1) and a POST form-body `access_token` (§2.2);
+  validated at config build), mirroring `:scopes_supported`. The §2.3 `"query"`
+  method is rejected — the plug never accepts a query-presented token, so
+  advertising it would be the same inaccuracy inverted (and RFC 6750 §2.3 says it
+  SHOULD NOT be used). Defaults to `["header", "body"]`; a header-only resource
+  server sets `["header"]`.
 
 ## [0.10.0] - 2026-06-20
 
