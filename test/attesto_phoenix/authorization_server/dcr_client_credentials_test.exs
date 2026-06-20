@@ -321,7 +321,9 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
 
     test "a wrong client_secret is rejected at the token endpoint (invalid_client)" do
       {client_id, _secret} = register_confidential_client()
-      config = controller_token_config(client_id, "the-real-secret", prefixing_build_principal(client_id))
+      # Installs the server config in application env (the token endpoint resolves
+      # it there); the returned struct is unused on this rejection path.
+      _config = controller_token_config(client_id, "the-real-secret", prefixing_build_principal(client_id))
 
       conn =
         :post
