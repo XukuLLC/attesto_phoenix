@@ -33,7 +33,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
   end
 
   describe "run/1" do
-    test "generates a migration creating all six stores", %{tmp_dir: tmp_dir} do
+    test "generates a migration creating all seven stores", %{tmp_dir: tmp_dir} do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
@@ -45,6 +45,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       #   * AttestoPhoenix.Schema.DPoPReplay                  -> dpop_replays
       #   * AttestoPhoenix.Schema.PushedAuthorizationRequest  -> attesto_pushed_authorization_requests
       #   * AttestoPhoenix.Schema.ClientIdMetadata            -> attesto_client_id_metadata
+      #   * AttestoPhoenix.Schema.ConsentGrant                -> attesto_consent_grants
       assert source =~ ~s|use Ecto.Migration|
       assert source =~ ~s|create table(:attesto_authorization_codes|
       assert source =~ ~s|create table(:attesto_refresh_tokens|
@@ -52,6 +53,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|create table(:dpop_replays|
       assert source =~ ~s|create table(:attesto_pushed_authorization_requests|
       assert source =~ ~s|create table(:attesto_client_id_metadata|
+      assert source =~ ~s|create table(:attesto_consent_grants|
     end
 
     test "client_id_metadata keys on url as PK with a jsonb metadata column", %{tmp_dir: tmp_dir} do
@@ -164,7 +166,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|def down do|
       # down drops every table the up created.
       for table <-
-            ~w(attesto_authorization_codes attesto_refresh_tokens dpop_nonces dpop_replays attesto_pushed_authorization_requests attesto_client_id_metadata) do
+            ~w(attesto_authorization_codes attesto_refresh_tokens dpop_nonces dpop_replays attesto_pushed_authorization_requests attesto_client_id_metadata attesto_consent_grants) do
         assert source =~ ~s|drop table(:#{table})|
       end
     end

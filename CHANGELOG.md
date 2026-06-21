@@ -4,6 +4,36 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-06-21
+
+### Added
+
+- **Single-use, request-bound consent grants (RFC 6749 §4.1.1).** A new
+  authorization-server correctness primitive that ties one consent decision to
+  the *exact* authorization request the resource owner saw, so an Authorize
+  click cannot approve a different client, redirect URI, scope set, or PKCE
+  challenge than the one displayed. Opt-in and additive — a host that does not
+  wire it is unaffected.
+  - `AttestoPhoenix.ConsentGrantStore` — the store behaviour (`mint/2`,
+    `consume/2`). `consume/2` is a single atomic conditional `UPDATE`, so a grant
+    token works exactly once, for exactly the request it was granted for, even
+    under concurrent presentation.
+  - `AttestoPhoenix.ConsentGrant` — the canonical request binding
+    (`subject + client_id + redirect_uri + sorted scope set + code_challenge`).
+  - `AttestoPhoenix.Store.EctoConsentGrantStore` +
+    `AttestoPhoenix.Schema.ConsentGrant` — the Postgres-backed implementation,
+    swept by `AttestoPhoenix.Store.Sweeper`.
+  - `AttestoPhoenix.Config` `:consent_grant_store` — the opt-in callback (no
+    default). The host's consent UI mints a grant when the user authorizes; the
+    `:consent` callback consumes it before a code is issued.
+  - `mix attesto_phoenix.gen.migration` emits the `attesto_consent_grants`
+    table; `mix attesto_phoenix.install` wires `EctoConsentGrantStore`.
+
+### Fixed
+
+- **Docs:** `AttestoPhoenix.ConsentGrantStore` referred to `consume/3` in two
+  places; the callback is `consume/2`.
+
 ## [0.11.0] - 2026-06-20
 
 ### Added

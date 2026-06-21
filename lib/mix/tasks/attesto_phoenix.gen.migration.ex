@@ -5,7 +5,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   Generates an Ecto migration that creates the persistence backing the
   Ecto-based stores ship with `attesto_phoenix`.
 
-  The migration creates six tables, named to match the runtime schemas
+  The migration creates seven tables, named to match the runtime schemas
   exactly so a by-the-docs deploy installs tables the Ecto-backed stores can
   use without modification:
 
@@ -52,6 +52,15 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       freshness directives (RFC 9111). Keeps every authorization request from
       re-fetching the URL and, being shared, makes the cache coherent across a
       cluster and bounds the outbound fetch fan-out.
+
+    * `attesto_consent_grants` - the single-use, request-bound consent grant
+      store (`AttestoPhoenix.Schema.ConsentGrant` / `EctoConsentGrantStore`,
+      RFC 6749 §4.1.1). Each row records one consent decision keyed on an
+      unguessable `token` (the PRIMARY KEY), with a `binding_hash` over the exact
+      request the user saw and a short `expires_at`; `consumed_at` marks single
+      use. The host consent screen mints a row; the host's `:consent` callback
+      consumes it before a code is issued, so one consent click cannot approve a
+      different client/redirect/scope/challenge.
 
   ## Usage
 
@@ -231,6 +240,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     #   * AttestoPhoenix.Schema.DPoPNonce                   -> "dpop_nonces"
     #   * AttestoPhoenix.Schema.PushedAuthorizationRequest  -> "attesto_pushed_authorization_requests"
     #   * AttestoPhoenix.Schema.ClientIdMetadata            -> "attesto_client_id_metadata"
+    #   * AttestoPhoenix.Schema.ConsentGrant                -> "attesto_consent_grants"
     #
     # The optional --table-prefix is the only thing the host may vary; the base
     # names are not host-configurable because the schemas hardcode them.
@@ -243,6 +253,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       dpop_replays: table_name(prefix, "dpop_replays"),
       pushed_authorization_requests: table_name(prefix, "attesto_pushed_authorization_requests"),
       client_id_metadata: table_name(prefix, "attesto_client_id_metadata"),
+      consent_grants: table_name(prefix, "attesto_consent_grants"),
       hash_size: @hash_column_size,
       jti_size: @jti_column_size,
       nonce_size: @nonce_column_size,
@@ -465,9 +476,32 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
       # Expiry sweeps scan by expires_at; lookups hit the primary key.
       create index(:<%= @client_id_metadata %>, [:expires_at])
+
+      # Single-use, request-bound consent grants (RFC 6749 section 4.1.1),
+      # backing AttestoPhoenix.Schema.ConsentGrant /
+      # AttestoPhoenix.Store.EctoConsentGrantStore. One row per consent decision,
+      # keyed on an unguessable token (the PRIMARY KEY) so the conditional consume
+      # UPDATE and the disambiguation read both hit the primary key. binding_hash
+      # ties the grant to the exact request the user saw; consumed_at marks single
+      # use; expires_at bounds the short consent window and is re-checked on
+      # consume. The default index name attesto_consent_grants_pkey matches the
+      # schema's unique_constraint(:token, name: :attesto_consent_grants_pkey).
+      create table(:<%= @consent_grants %>, primary_key: false) do
+        add :token, :string, size: <%= @identifier_size %>, primary_key: true, null: false
+        add :binding_hash, :string, size: <%= @hash_size %>, null: false
+        add :subject, :string, size: <%= @identifier_size %>, null: false
+        add :consumed_at, :utc_datetime_usec
+        add :expires_at, :utc_datetime_usec, null: false
+
+        timestamps(type: :utc_datetime_usec)
+      end
+
+      # Expiry sweeps scan by expires_at; consume hits the primary key.
+      create index(:<%= @consent_grants %>, [:expires_at])
     end
 
     def down do
+      drop table(:<%= @consent_grants %>)
       drop table(:<%= @client_id_metadata %>)
       drop table(:<%= @pushed_authorization_requests %>)
       drop table(:<%= @dpop_replays %>)

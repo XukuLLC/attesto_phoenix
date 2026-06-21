@@ -170,6 +170,16 @@ defmodule AttestoPhoenix.Config do
       `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
       deployment so a `request_uri` resolves on every node (FAPI 2.0 requires
       PAR).
+    * `:consent_grant_store` - module implementing
+      `AttestoPhoenix.ConsentGrantStore`, the single-use request-bound consent
+      primitive (RFC 6749 §4.1.1). The host consent screen mints a grant when
+      the resource owner authorizes; the host's `:consent` callback consumes it
+      before a code is issued, so one consent click cannot approve a different
+      client/redirect/scope/challenge. The library ships the Ecto-backed
+      `AttestoPhoenix.Store.EctoConsentGrantStore`; there is no default, because
+      the library never renders a consent screen — a host wires this only when
+      it adopts the consent primitive. Read it back with
+      `consent_grant_store/1`.
     * `:grant_types_supported` - the grant types the server supports. Advertised
       as `grant_types_supported` (RFC 8414 §2), enforced by the token endpoint (a
       `grant_type` outside the set is rejected), and the accepted set for dynamic
@@ -456,6 +466,7 @@ defmodule AttestoPhoenix.Config do
     :code_store,
     :refresh_store,
     :par_store,
+    :consent_grant_store,
     :grant_types_supported,
     :token_endpoint_auth_methods_supported,
     :authorization_endpoint,
@@ -554,6 +565,7 @@ defmodule AttestoPhoenix.Config do
           code_store: module() | nil,
           refresh_store: module() | nil,
           par_store: module() | nil,
+          consent_grant_store: module() | nil,
           grant_types_supported: [String.t()] | nil,
           token_endpoint_auth_methods_supported: [String.t()] | nil,
           require_pushed_authorization_requests: boolean(),
@@ -752,6 +764,18 @@ defmodule AttestoPhoenix.Config do
   def jwt_bearer_enabled?(%__MODULE__{} = config) do
     config |> jwt_bearer() |> Keyword.get(:enabled, false) == true
   end
+
+  @doc """
+  Returns the configured single-use consent-grant store module, or `nil`.
+
+  The store implements `AttestoPhoenix.ConsentGrantStore` (the RFC 6749 §4.1.1
+  request-bound consent primitive). There is no default: the library renders no
+  consent screen, so a host wires `:consent_grant_store` only when it adopts the
+  primitive (typically `AttestoPhoenix.Store.EctoConsentGrantStore`). A host's
+  consent UI and its `:consent` callback read it through this helper.
+  """
+  @spec consent_grant_store(t()) :: module() | nil
+  def consent_grant_store(%__MODULE__{consent_grant_store: store}), do: store
 
   @doc """
   Derives the `Attesto.Config` consumed by the protocol layer from this config.

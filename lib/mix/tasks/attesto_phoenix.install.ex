@@ -214,6 +214,12 @@ if Code.ensure_loaded?(Igniter) do
           # PAR reference store (RFC 9126). Ecto-backed so a request_uri pushed to
           # one node resolves on every node; FAPI 2.0 requires PAR.
           par_store: AttestoPhoenix.Store.EctoPARStore,
+          # Single-use, request-bound consent grants (RFC 6749 §4.1.1). The host
+          # consent screen mints a grant when the user authorizes; the host's
+          # :consent callback consumes it before a code is issued, so one consent
+          # click cannot approve a different client/redirect/scope/challenge. The
+          # backing table is created by `mix attesto_phoenix.gen.migration`.
+          consent_grant_store: AttestoPhoenix.Store.EctoConsentGrantStore,
           # Periodic expiry sweep of the Ecto stores (AttestoPhoenix.Store.Sweeper).
           sweep_interval_ms: 60_000,
           # Sender-constraint and transport defaults (additive; reproduce the

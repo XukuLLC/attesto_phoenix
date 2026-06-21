@@ -88,7 +88,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.10"}
+    {:attesto_phoenix, "~> 0.11"}
   ]
 end
 ```
@@ -99,7 +99,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.10"},
+    {:attesto_phoenix, "~> 0.11"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
@@ -319,10 +319,13 @@ an external client compatibility check.
 
 ## Database migration
 
-The library owns five operational tables backing the attesto store behaviours:
-`attesto_authorization_codes`, `attesto_refresh_tokens`, `dpop_nonces`,
-`dpop_replays`, and `attesto_pushed_authorization_requests`. It does **not** own
-a clients table (that is yours, behind `:load_client`).
+The generated migration owns the operational tables backing the attesto store
+behaviours: `attesto_authorization_codes`, `attesto_refresh_tokens`,
+`dpop_nonces`, `dpop_replays`, and `attesto_pushed_authorization_requests`, plus
+two feature tables — `attesto_client_id_metadata` (the CIMD client-metadata
+cache) and `attesto_consent_grants` (the single-use, request-bound consent-grant
+primitive). It does **not** own a clients table (that is yours, behind
+`:load_client`).
 
 Generate the migration into your app:
 
