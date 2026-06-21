@@ -5,7 +5,8 @@ defmodule AttestoPhoenix.ConsentGrantStore do
   A consent grant is the authorization-server correctness primitive that ties a
   single consent decision to the *exact* authorization request the resource
   owner saw, so that one Authorize click cannot approve a different client,
-  redirect URI, scope set, or PKCE challenge than the one displayed. It is
+  redirect URI, scope set, PKCE challenge, or PKCE method than the one
+  displayed. It is
   deliberately the primitive only: this library renders no consent screen,
   decides no "when is consent required" policy, and chooses no client-display
   wording. Those are host concerns. The host's consent UI mints a grant when the
@@ -13,11 +14,12 @@ defmodule AttestoPhoenix.ConsentGrantStore do
   consumes it before a code is issued.
 
   The grant is bound to a hash over the canonical request fields
-  (`subject + client_id + redirect_uri + sorted scope set + code_challenge`,
-  built by `AttestoPhoenix.ConsentGrant.binding/2`). `mint/2` records a fresh
-  row keyed on an unguessable token; `consume/2` atomically claims it iff the
-  recomputed binding matches and the grant is unexpired and unconsumed, so a
-  token works exactly once for exactly the request it was granted for.
+  (`subject + client_id + redirect_uri + sorted scope set + code_challenge +
+  code_challenge_method`, built by `AttestoPhoenix.ConsentGrant.binding/2`).
+  `mint/2` records a fresh row keyed on an unguessable token; `consume/2`
+  atomically claims it iff the recomputed binding matches and the grant is
+  unexpired and unconsumed, so a token works exactly once for exactly the
+  request it was granted for.
 
   ## Why server-side consumption is mandatory
 
@@ -51,8 +53,8 @@ defmodule AttestoPhoenix.ConsentGrantStore do
 
     * `:not_found` - no grant for the token (never minted, swept, or a typo).
     * `:binding_mismatch` - a grant exists but the live request differs from the
-      one consented to (different client/redirect/scope/challenge): the precise
-      attack this primitive defends against.
+      one consented to (different client/redirect/scope/challenge/method): the
+      precise attack this primitive defends against.
     * `:expired` - the grant existed but its TTL elapsed.
     * `:consumed` - the grant was already spent (single use; a replay).
   """

@@ -2,8 +2,8 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStoreTest do
   @moduledoc """
   Behaviour-conformance tests for the Postgres-backed consent-grant store
   (RFC 6749 §4.1.1): single use, request binding (order-agnostic scope set,
-  mismatch on a differing client/redirect/scope/challenge), TTL expiry, and
-  double-consume.
+  mismatch on a differing client/redirect/scope/challenge/method), TTL expiry,
+  and double-consume.
 
   The store reads its repo from the `:attesto_phoenix` application environment,
   which `AttestoPhoenix.DataCase` points at the sandboxed test repo.
@@ -104,6 +104,31 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStoreTest do
     test "a differing code_challenge is a binding mismatch" do
       {:ok, token} = Store.mint(cg_binding(code_challenge: "challenge-xyz"), @ttl)
       assert {:error, :binding_mismatch} = Store.consume(token, cg_binding(code_challenge: "challenge-other"))
+    end
+
+    test "a S256 grant is refused against an otherwise identical plain request" do
+      {:ok, token} = Store.mint(cg_binding(code_challenge: "same-challenge", code_challenge_method: "S256"), @ttl)
+
+      assert {:error, :binding_mismatch} =
+               Store.consume(token, cg_binding(code_challenge: "same-challenge", code_challenge_method: "plain"))
+
+      assert :ok = Store.consume(token, cg_binding(code_challenge: "same-challenge", code_challenge_method: "S256"))
+    end
+
+    test "a plain grant is refused against an otherwise identical S256 request" do
+      {:ok, token} = Store.mint(cg_binding(code_challenge: "same-challenge", code_challenge_method: "plain"), @ttl)
+
+      assert {:error, :binding_mismatch} =
+               Store.consume(token, cg_binding(code_challenge: "same-challenge", code_challenge_method: "S256"))
+
+      assert :ok = Store.consume(token, cg_binding(code_challenge: "same-challenge", code_challenge_method: "plain"))
+    end
+
+    test "a request with no PKCE challenge still consumes when both PKCE fields are absent" do
+      binding = cg_binding(code_challenge: nil, code_challenge_method: nil)
+      {:ok, token} = Store.mint(binding, @ttl)
+
+      assert :ok = Store.consume(token, binding)
     end
 
     test "a differing subject is a binding mismatch" do

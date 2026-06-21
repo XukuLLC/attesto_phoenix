@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.2] - 2026-06-21
+
+### Fixed
+
+- **Consent grants now bind the PKCE `code_challenge_method`.**
+  `AttestoPhoenix.ConsentGrant.binding/2` and `binding_hash/1` now include
+  `code_challenge_method` alongside `code_challenge`, so a grant consented for
+  an `S256` authorization request cannot be reused for an otherwise-identical
+  `plain` request with the same challenge value. Missing PKCE fields continue to
+  canonicalize as empty strings.
+
+### Compatibility
+
+- The consent-grant hash input changed. Any consent grant minted before this
+  upgrade will not match after the upgrade. Consent grants are single-use and
+  short-TTL, so the practical effect is limited to an in-flight authorization
+  started across the upgrade re-prompting once.
+
 ## [0.13.1] - 2026-06-21
 
 ### Added

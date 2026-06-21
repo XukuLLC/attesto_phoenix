@@ -5,10 +5,11 @@ defmodule AttestoPhoenix.Schema.ConsentGrant do
   Backs `AttestoPhoenix.Store.EctoConsentGrantStore`. The host consent screen
   mints one row per Authorize click, keyed on an unguessable `token` and
   carrying a `binding_hash` over the exact request the user saw (subject +
-  client_id + redirect_uri + the requested scope set + code_challenge, built by
-  `AttestoPhoenix.ConsentGrant`). The authorization-server `:consent` callback
-  recomputes the hash from the live request, looks the row up by token, verifies
-  the hash matches, and consumes it (single use) before a code is issued.
+  client_id + redirect_uri + the requested scope set + code_challenge +
+  code_challenge_method, built by `AttestoPhoenix.ConsentGrant`). The
+  authorization-server `:consent` callback recomputes the hash from the live
+  request, looks the row up by token, verifies the hash matches, and consumes it
+  (single use) before a code is issued.
 
   ## Columns
 

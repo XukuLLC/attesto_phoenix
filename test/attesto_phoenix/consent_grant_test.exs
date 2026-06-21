@@ -3,7 +3,8 @@ defmodule AttestoPhoenix.ConsentGrantTest do
   Pure (no-DB) tests for the consent binding and its canonical hash
   (RFC 6749 §4.1.1): the binding built from an `%Attesto.AuthorizationRequest{}`,
   order-agnostic scope-set hashing (RFC 6749 §3.3), and a hash that changes when
-  the client, redirect URI, scope set, subject, or PKCE challenge differs.
+  the client, redirect URI, scope set, subject, PKCE challenge, or PKCE method
+  differs.
   """
 
   use ExUnit.Case, async: true
@@ -32,13 +33,15 @@ defmodule AttestoPhoenix.ConsentGrantTest do
                client_id: "client-1",
                redirect_uri: "https://rp.example/cb",
                scope: ["openid", "profile"],
-               code_challenge: "challenge-xyz"
+               code_challenge: "challenge-xyz",
+               code_challenge_method: "S256"
              }
     end
 
-    test "carries a nil code_challenge through unchanged" do
-      binding = ConsentGrant.binding(request(code_challenge: nil), @subject)
+    test "carries absent PKCE fields through unchanged" do
+      binding = ConsentGrant.binding(request(code_challenge: nil, code_challenge_method: nil), @subject)
       assert binding.code_challenge == nil
+      assert binding.code_challenge_method == nil
     end
 
     test "wraps a nil scope into an empty list" do
@@ -108,6 +111,13 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       refute ConsentGrant.binding_hash(base) == ConsentGrant.binding_hash(other)
     end
 
+    test "a different code_challenge_method changes the hash" do
+      base = ConsentGrant.binding(request(code_challenge_method: "S256"), @subject)
+      other = ConsentGrant.binding(request(code_challenge_method: "plain"), @subject)
+
+      refute ConsentGrant.binding_hash(base) == ConsentGrant.binding_hash(other)
+    end
+
     test "an absent code_challenge hashes as the empty string, distinct from any present one" do
       absent = ConsentGrant.binding(request(code_challenge: nil), @subject)
       empty = ConsentGrant.binding(request(code_challenge: ""), @subject)
@@ -116,6 +126,15 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       # nil and "" both canonicalise to "", so they collide by design...
       assert ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(empty)
       # ...but a real challenge is distinct.
+      refute ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(present)
+    end
+
+    test "an absent code_challenge_method hashes as the empty string, distinct from any present one" do
+      absent = ConsentGrant.binding(request(code_challenge_method: nil), @subject)
+      empty = ConsentGrant.binding(request(code_challenge_method: ""), @subject)
+      present = ConsentGrant.binding(request(code_challenge_method: "S256"), @subject)
+
+      assert ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(empty)
       refute ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(present)
     end
   end
