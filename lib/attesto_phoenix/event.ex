@@ -47,7 +47,9 @@ defmodule AttestoPhoenix.Event do
   The closed set of authorization-server lifecycle events.
 
   * `:token_issued` - an access (and optionally refresh) token was issued in
-    response to a successful grant (RFC 6749 §5.1).
+    response to a successful grant (RFC 6749 §5.1). Its `:metadata` includes
+    `:token_type`, `:sender_constraint`, and `:cnf` so a host can audit whether
+    the issued access token is plain Bearer, DPoP-bound, or mTLS-bound.
   * `:token_denied` - a token request was rejected (RFC 6749 §5.2).
   * `:code_issued` - an authorization code was issued at the authorization
     endpoint in response to a successful authorization request (RFC 6749
@@ -118,9 +120,12 @@ defmodule AttestoPhoenix.Event do
   * `:grant_type` - the grant type of the request (RFC 6749 §1.3).
   * `:result` - for denial events, a machine-readable reason term (typically an
     RFC 6749 §5.2 error code such as `:invalid_client` or `:invalid_grant`).
-  * `:metadata` - a host-opaque map of request metadata (for example
-    client IP or request identifiers). The library does not interpret this
-    field; it is a pass-through for the caller.
+  * `:metadata` - a host-opaque map of request metadata (for example client IP
+    or request identifiers). For token issuance-like events (`:token_issued`,
+    `:refresh_issued`, and `:refresh_rotated`) this map also carries the access
+    token's sender-constraint audit fields: `:token_type` (`"Bearer"` or
+    `"DPoP"`), `:sender_constraint` (`:none`, `:dpop`, or `:mtls`), and `:cnf`
+    (`%{"jkt" => thumbprint}`, `%{"x5t#S256" => thumbprint}`, or `nil`).
   """
   @type t :: %__MODULE__{
           name: name(),

@@ -11,12 +11,18 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   """
   use ExUnit.Case, async: false
 
+  alias Attesto.CodeStore.ETS
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Config, Event, OAuthError}
 
   # A throwaway RSA keypair for the minting paths.
   @signing_pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
+  @code_verifier "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+  @code_challenge "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+  @redirect_uri "https://client.example/cb"
+  @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
+  @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
 
   defmodule Keystore do
     @moduledoc false
@@ -77,6 +83,59 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   defp ensure_sub("oc_" <> _ = sub), do: sub
   defp ensure_sub(sub), do: "oc_" <> to_string(sub)
 
+  defp start_code_store(subject, scope) do
+    case start_supervised(ETS) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    ETS.reset()
+
+    {:ok, code} =
+      Attesto.AuthorizationCode.issue(ETS, %{
+        client_id: "client-1",
+        redirect_uri: @redirect_uri,
+        scope: scope,
+        subject: subject,
+        code_challenge: @code_challenge,
+        code_challenge_method: "S256"
+      })
+
+    Process.put(:auth_code, code)
+    ETS
+  end
+
+  defp start_refresh_store do
+    case start_supervised(Attesto.RefreshStore.ETS) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    Attesto.RefreshStore.ETS.reset()
+    Attesto.RefreshStore.ETS
+  end
+
+  defp dpop_proof_and_jkt do
+    jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+    {_, public_map} = JOSE.JWK.to_public_map(jwk)
+
+    payload = %{
+      "htm" => "POST",
+      "htu" => "https://issuer.example/oauth/token",
+      "iat" => System.system_time(:second),
+      "jti" => 16 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    }
+
+    header = %{"alg" => "ES256", "typ" => "dpop+jwt", "jwk" => public_map}
+    {_, compact} = jwk |> JOSE.JWT.sign(header, payload) |> JOSE.JWS.compact()
+    {compact, Attesto.DPoP.compute_jkt(public_map)}
+  end
+
+  defp self_signed_cert_der do
+    %{cert: der} = :public_key.pkix_test_root_cert(~c"CN=attesto-test", [])
+    der
+  end
+
   defp request(config, overrides) do
     fields =
       [
@@ -121,9 +180,73 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                name: :token_issued,
                client_id: "client-1",
                grant_type: "client_credentials",
-               scope: "read write",
-               metadata: %{client_ip: "203.0.113.7"}
+               scope: "read write"
              } = event
+
+      assert event.metadata == %{
+               client_ip: "203.0.113.7",
+               token_type: "Bearer",
+               sender_constraint: :none,
+               cnf: nil
+             }
+    end
+
+    test "a DPoP-bound token_issued event carries the token type and jkt" do
+      {proof, jkt} = dpop_proof_and_jkt()
+
+      config =
+        config(
+          dpop_enabled: true,
+          replay_check: fn _key, _ttl -> :ok end
+        )
+
+      request =
+        request(config,
+          params: %{"scope" => "read"},
+          sender_constraint_input: %{
+            dpop_proof: proof,
+            mtls_cert_der: nil,
+            http_uri: "https://issuer.example/oauth/token",
+            http_method: "POST"
+          }
+        )
+
+      assert {:ok, response, [%Event{name: :token_issued} = event]} = Token.issue(config, request)
+      assert response.token_type == "DPoP"
+
+      assert event.metadata == %{
+               client_ip: "203.0.113.7",
+               token_type: "DPoP",
+               sender_constraint: :dpop,
+               cnf: %{"jkt" => jkt}
+             }
+    end
+
+    test "an mTLS-bound token_issued event carries the bearer type and certificate thumbprint" do
+      der = self_signed_cert_der()
+      {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
+      config = config(mtls_enabled: true, cert_der: fn _conn -> der end)
+
+      request =
+        request(config,
+          params: %{"scope" => "read"},
+          sender_constraint_input: %{
+            dpop_proof: nil,
+            mtls_cert_der: der,
+            http_uri: "https://issuer.example/oauth/token",
+            http_method: "POST"
+          }
+        )
+
+      assert {:ok, response, [%Event{name: :token_issued} = event]} = Token.issue(config, request)
+      assert response.token_type == "Bearer"
+
+      assert event.metadata == %{
+               client_ip: "203.0.113.7",
+               token_type: "Bearer",
+               sender_constraint: :mtls,
+               cnf: %{"x5t#S256" => thumbprint}
+             }
     end
 
     test "the core emits nothing itself: a configured :on_event is not invoked" do
@@ -133,6 +256,148 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, _response, [_event]} = Token.issue(config, request)
       refute_received {:event, _}
+    end
+  end
+
+  describe "authorization_code grant (RFC 6749 §4.1)" do
+    test "a token_issued event carries bearer sender metadata" do
+      code_store = start_code_store("oc_user-1", ["openid"])
+      config = config(code_store: code_store)
+
+      request =
+        request(config,
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, response, [%Event{name: :token_issued} = event]} = Token.issue(config, request)
+      assert response.token_type == "Bearer"
+
+      assert event.grant_type == "authorization_code"
+
+      assert event.metadata == %{
+               client_ip: "203.0.113.7",
+               token_type: "Bearer",
+               sender_constraint: :none,
+               cnf: nil
+             }
+    end
+
+    test "a refresh_issued event carries bearer sender metadata" do
+      code_store = start_code_store("oc_user-1", ["read", "offline_access"])
+      refresh_store = start_refresh_store()
+      config = config(code_store: code_store, refresh_store: refresh_store)
+
+      request =
+        request(config,
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, response, events} = Token.issue(config, request)
+      assert is_binary(response.refresh_token)
+
+      assert [
+               %Event{name: :token_issued},
+               %Event{name: :refresh_issued, grant_type: "authorization_code"} = event
+             ] = events
+
+      assert event.metadata == %{
+               client_ip: "203.0.113.7",
+               token_type: "Bearer",
+               sender_constraint: :none,
+               cnf: nil
+             }
+    end
+  end
+
+  describe "refresh_token grant (RFC 6749 §6)" do
+    test "a DPoP refresh_rotated event carries the token type and jkt" do
+      {proof, jkt} = dpop_proof_and_jkt()
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1",
+          dpop_jkt: jkt
+        })
+
+      config =
+        config(
+          refresh_store: refresh_store,
+          dpop_enabled: true,
+          replay_check: fn _key, _ttl -> :ok end
+        )
+
+      public_client = Map.put(@client, :public?, true)
+
+      request =
+        request(config,
+          client: public_client,
+          client_auth_method: :none,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => refresh_token},
+          sender_constraint_input: %{
+            dpop_proof: proof,
+            mtls_cert_der: nil,
+            http_uri: "https://issuer.example/oauth/token",
+            http_method: "POST"
+          }
+        )
+
+      assert {:ok, response, [%Event{name: :refresh_rotated} = event]} = Token.issue(config, request)
+      assert response.token_type == "DPoP"
+      assert is_binary(response.refresh_token)
+
+      assert event.metadata == %{
+               client_ip: "203.0.113.7",
+               token_type: "DPoP",
+               sender_constraint: :dpop,
+               cnf: %{"jkt" => jkt}
+             }
+    end
+  end
+
+  describe "token exchange grant (RFC 8693)" do
+    test "a token_exchange token_issued event carries bearer sender metadata" do
+      config = config()
+      subject_request = request(config, params: %{"scope" => "read write"})
+      assert {:ok, subject_response, [%Event{name: :token_issued}]} = Token.issue(config, subject_request)
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, response, [%Event{name: :token_issued} = event]} =
+               Token.issue(config, exchange_request)
+
+      assert response.token_type == "Bearer"
+      assert response.issued_token_type == @subject_token_type_access_token
+      assert response.scope == "read"
+      assert event.grant_type == "token_exchange"
+
+      assert event.metadata == %{
+               client_ip: "203.0.113.7",
+               token_type: "Bearer",
+               sender_constraint: :none,
+               cnf: nil
+             }
     end
   end
 

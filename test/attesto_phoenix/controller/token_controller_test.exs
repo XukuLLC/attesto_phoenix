@@ -885,6 +885,30 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   # FIX 3 - DPoP NONCE (RFC 9449 §8/§9).
   describe "DPoP proof replay (RFC 9449 §11.1)" do
+    test "emits token_issued with DPoP binding metadata" do
+      capture_events()
+      enable_minting()
+      put_config(dpop_enabled: true)
+
+      {proof, jkt} = dpop_proof_and_jkt([])
+
+      conn = post_dpop("client_credentials", proof)
+
+      assert conn.status == 200
+      assert body(conn)["token_type"] == "DPoP"
+
+      assert_receive {:event,
+                      %AttestoPhoenix.Event{
+                        name: :token_issued,
+                        grant_type: "client_credentials",
+                        metadata: metadata
+                      }}
+
+      assert metadata.token_type == "DPoP"
+      assert metadata.sender_constraint == :dpop
+      assert metadata.cnf == %{"jkt" => jkt}
+    end
+
     test "a replayed DPoP proof is rejected at the token endpoint" do
       enable_minting()
       start_supervised!({ReplayCache, []})

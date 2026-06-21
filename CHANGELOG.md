@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.3] - 2026-06-21
+
+### Added
+
+- **Token issuance events now include sender-constraint audit metadata.**
+  `:token_issued` events, plus the related `:refresh_issued` and
+  `:refresh_rotated` issuance events, now preserve the mint-time sender
+  constraint in `event.metadata`: `:token_type` (`"Bearer"` or `"DPoP"`),
+  `:sender_constraint` (`:none`, `:dpop`, or `:mtls`), and `:cnf`
+  (`%{"jkt" => thumbprint}`, `%{"x5t#S256" => thumbprint}`, or `nil`). Existing
+  `:client_ip` metadata is unchanged.
+
 ## [0.13.2] - 2026-06-21
 
 ### Fixed

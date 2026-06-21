@@ -205,7 +205,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          # response additionally carries an ID Token.
          {:ok, response} <- maybe_mint_id_token(config, client, grant, scope, code, response) do
       :ok = record_code_access_token(config, grant, response)
-      issued = token_issued_event(request, scope, "authorization_code")
+      issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
 
       # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
       # client can refresh without re-running the authorization flow. The
@@ -219,7 +219,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # failure ANYWHERE above (mint, refresh persistence, a host-callback fault)
       # leaves the code spent-but-unfinalized: the client's retry is a clean
       # `invalid_grant`, never a false reuse that would revoke the family.
-      case maybe_issue_refresh_token(request, grant, scope, binding, response, [issued]) do
+      case maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued]) do
         {:ok, response, events} ->
           :ok = AuthorizationCode.finalize(grant_store(config, :code_store), code, grant)
           {:ok, response, events}
@@ -249,7 +249,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, response} <-
            mint(config, client, rotated.context.subject, scope, token_type, binding) do
       response = Map.put(response, :refresh_token, rotated.token)
-      {:ok, response, [refresh_rotated_event(request, scope, "refresh_token")]}
+      {:ok, response, [refresh_rotated_event(request, scope, "refresh_token", token_type, binding)]}
     end
   end
 
@@ -262,7 +262,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          subject = client_id(config, client),
          {:ok, scope} <- authorize_scope(config, client, parse_requested_scope(params)),
          {:ok, response} <- mint(config, client, subject, scope, token_type, binding) do
-      {:ok, response, [token_issued_event(request, scope, "client_credentials")]}
+      {:ok, response, [token_issued_event(request, scope, "client_credentials", token_type, binding)]}
     end
   end
 
@@ -285,7 +285,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, scope} <- authorize_scope(config, client, requested),
          {:ok, response} <- mint_exchanged_token(config, claims, scope, token_type, binding) do
       response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
-      {:ok, response, [token_issued_event(request, scope, "token_exchange")]}
+      {:ok, response, [token_issued_event(request, scope, "token_exchange", token_type, binding)]}
     else
       {:error, %OAuthError{} = err} -> {:error, err}
       {:error, _reason} -> {:error, error(@error_invalid_grant, "subject token is invalid")}
@@ -320,7 +320,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # IdP's policy/deprovisioning window, letting a client keep minting access
       # after the IdP has revoked the user's entitlement. The client re-presents
       # a fresh ID-JAG instead of refreshing.
-      {:ok, response, [token_issued_event(request, scope, @grant_jwt_bearer)]}
+      {:ok, response, [token_issued_event(request, scope, @grant_jwt_bearer, token_type, binding)]}
     end
   end
 
@@ -609,7 +609,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # that token request. An mTLS-bound request issues no DPoP binding on the
   # refresh token. The plaintext token is added to the RFC 6749 §5.1 body;
   # only its hash is persisted (see `Attesto.RefreshToken`).
-  defp maybe_issue_refresh_token(request, grant, scope, binding, response, events, grant_type \\ "authorization_code") do
+  defp maybe_issue_refresh_token(
+         request,
+         grant,
+         scope,
+         token_type,
+         binding,
+         response,
+         events,
+         grant_type \\ "authorization_code"
+       ) do
     %{config: config, client: client} = request
 
     if refresh_store = grant_store(config, :refresh_store) do
@@ -618,7 +627,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
           request,
           grant,
           scope,
-          binding,
+          {token_type, binding},
           refresh_store,
           response,
           events,
@@ -632,8 +641,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp issue_initial_refresh_token(request, grant, scope, binding, refresh_store, response, events, grant_type) do
+  defp issue_initial_refresh_token(request, grant, scope, sender, refresh_store, response, events, grant_type) do
     %{config: config, client: client} = request
+    {token_type, binding} = sender
 
     context =
       %{subject: grant.subject, scope: scope}
@@ -656,7 +666,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case RefreshToken.issue(refresh_store, context, issue_opts) do
       {:ok, %{token: token}} ->
         response = Map.put(response, :refresh_token, token)
-        issued = refresh_issued_event(request, scope, grant_type)
+        issued = refresh_issued_event(request, scope, grant_type, token_type, binding)
         {:ok, response, events ++ [issued]}
 
       {:error, reason} ->
@@ -1049,25 +1059,51 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # ── Audit events (returned as data; the controller emits) ────────────────
 
-  defp token_issued_event(request, scope, grant_type) do
-    issued_like_event(request, :token_issued, scope, grant_type)
+  defp token_issued_event(request, scope, grant_type, token_type, binding) do
+    issued_like_event(request, :token_issued, scope, grant_type, token_type, binding)
   end
 
-  defp refresh_rotated_event(request, scope, grant_type) do
-    issued_like_event(request, :refresh_rotated, scope, grant_type)
+  defp refresh_rotated_event(request, scope, grant_type, token_type, binding) do
+    issued_like_event(request, :refresh_rotated, scope, grant_type, token_type, binding)
   end
 
-  defp refresh_issued_event(request, scope, grant_type) do
-    issued_like_event(request, :refresh_issued, scope, grant_type)
+  defp refresh_issued_event(request, scope, grant_type, token_type, binding) do
+    issued_like_event(request, :refresh_issued, scope, grant_type, token_type, binding)
   end
 
-  defp issued_like_event(request, name, scope, grant_type) do
+  defp issued_like_event(request, name, scope, grant_type, token_type, binding) do
     Event.new(name, %{
       client_id: client_id(request.config, request.client),
       scope: Enum.join(List.wrap(scope), " "),
       grant_type: grant_type,
-      metadata: %{client_ip: request.client_ip}
+      metadata:
+        %{client_ip: request.client_ip}
+        |> Map.merge(sender_constraint_metadata(token_type, binding))
     })
+  end
+
+  defp sender_constraint_metadata(token_type, :none) do
+    %{
+      token_type: token_type,
+      sender_constraint: :none,
+      cnf: nil
+    }
+  end
+
+  defp sender_constraint_metadata(token_type, {:dpop, jkt}) do
+    %{
+      token_type: token_type,
+      sender_constraint: :dpop,
+      cnf: %{"jkt" => jkt}
+    }
+  end
+
+  defp sender_constraint_metadata(token_type, {:mtls, x5t}) do
+    %{
+      token_type: token_type,
+      sender_constraint: :mtls,
+      cnf: %{"x5t#S256" => x5t}
+    }
   end
 
   # RFC 6749 §5.2: the audit event for a denied grant. The error code is the
