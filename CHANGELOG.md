@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-06-21
+
+### Changed
+
+- **Protected-resource bearer credentials default to header-only.**
+  `:bearer_methods_supported` now defaults to `["header"]`, and
+  `AttestoPhoenix.Plug.Authenticate` passes that setting through to the core
+  verifier. Resource servers that intentionally accept RFC 6750 §2.2 form-body
+  `access_token` credentials can configure `["header", "body"]`; the runtime
+  verifier and RFC 9728 metadata now use the same setting. Requires
+  `attesto ~> 0.9`.
+
 ## [0.12.0] - 2026-06-21
 
 ### Added

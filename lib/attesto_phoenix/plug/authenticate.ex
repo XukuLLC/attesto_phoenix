@@ -136,6 +136,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   defp configured_core_opts(config, claims_key) do
     [config: attesto_config(config), claims_key: claims_key]
+    |> Keyword.put(:bearer_methods, config.bearer_methods_supported)
     |> put_optional(:send_error, config.send_error)
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)

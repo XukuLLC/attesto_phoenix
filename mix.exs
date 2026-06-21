@@ -20,7 +20,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "0.12.0"
+  @version "0.13.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -68,12 +68,13 @@ defmodule AttestoPhoenix.MixProject do
   # and a path dep cannot be packaged ("only Hex packages can be dependencies"),
   # so a Mix.env-based switch would break publishing from a dev checkout. The
   # default - including every publish - resolves the published version
-  # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
+  # constraint; local development sets ATTESTO_PATH=1 to use the sibling. This
+  # branch requires attesto 0.9.0 for header-only bearer-method defaults.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, "~> 0.8"}
+      {:attesto, "~> 0.9"}
     end
   end
 

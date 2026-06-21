@@ -390,13 +390,13 @@ defmodule AttestoPhoenix.ConfigTest do
       assert cfg.resource_metadata == "https://api.example/.well-known/x"
     end
 
-    test ":bearer_methods_supported defaults to header+body and is configurable" do
+    test ":bearer_methods_supported defaults to header-only and is configurable" do
       base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
 
-      assert Config.new(base).bearer_methods_supported == ["header", "body"]
+      assert Config.new(base).bearer_methods_supported == ["header"]
 
-      assert Config.new(Keyword.put(base, :bearer_methods_supported, ["header"])).bearer_methods_supported ==
-               ["header"]
+      assert Config.new(Keyword.put(base, :bearer_methods_supported, ["header", "body"])).bearer_methods_supported ==
+               ["header", "body"]
     end
 
     test ":bearer_methods_supported rejects empty, duplicate, query, or unknown methods (RFC 6750 §2)" do

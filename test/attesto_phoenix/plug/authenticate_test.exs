@@ -92,6 +92,35 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
   end
 
+  test "rejects a form-body access_token by default", %{config: config} do
+    token = mint(config, scope: "openid read:reports")
+
+    conn =
+      %{"access_token" => token}
+      |> form_post()
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert conn.halted
+    assert conn.status == 401
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_token"
+    assert_receive {:event, %AttestoPhoenix.Event{name: :auth_denied, result: :invalid_token}}
+  end
+
+  test "accepts a form-body access_token only when the config advertises body", %{config: config} do
+    config = %{config | bearer_methods_supported: ["header", "body"]}
+    token = mint(config, scope: "openid read:reports")
+
+    conn =
+      %{"access_token" => token}
+      |> form_post()
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    refute conn.halted
+    assert conn.assigns.attesto_claims["sub"] == @subject
+    assert conn.assigns.attesto_context.scope == ["openid", "read:reports"]
+    assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
+  end
+
   test "a missing principal is rendered as invalid_token without exposing lookup detail", %{
     config: config
   } do
@@ -294,6 +323,12 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
   defp self_signed_cert_der do
     %{cert: der} = :public_key.pkix_test_root_cert(~c"CN=attesto-phoenix-plug-test", [])
     der
+  end
+
+  defp form_post(params) do
+    :post
+    |> conn("/reports", params)
+    |> put_req_header("content-type", "application/x-www-form-urlencoded")
   end
 
   defp peek_claims(config, token) do

@@ -88,7 +88,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.11"}
+    {:attesto_phoenix, "~> 0.13"}
   ]
 end
 ```
@@ -99,7 +99,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.11"},
+    {:attesto_phoenix, "~> 0.13"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
@@ -286,6 +286,11 @@ assigns:
   `:load_principal`
 - `conn.assigns.attesto_context` - a neutral `%{subject, client_id, scope,
   claims, cnf, principal}` map
+
+Bearer credentials default to the `Authorization` header only, matching
+`bearer_methods_supported: ["header"]` in protected-resource metadata. Configure
+`bearer_methods_supported: ["header", "body"]` only for resource servers that
+intentionally accept RFC 6750 form-body `access_token` credentials.
 
 `AttestoPhoenix.Plug.RequireScopes` enforces route-level scope authorization
 using `Attesto.Scope` grant-form algebra. It accepts either a single scope

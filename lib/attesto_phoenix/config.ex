@@ -218,9 +218,9 @@ defmodule AttestoPhoenix.Config do
       `AttestoPhoenix.Plug.Authenticate` accepts. The §2.3 `"query"` method is
       rejected: the plug never accepts a query-presented token, so advertising it
       would name a method the library cannot honour (and RFC 6750 §2.3 says it
-      SHOULD NOT be used). Defaults to `["header", "body"]`, matching the plug;
-      a host whose resource server accepts the token by `Authorization` header
-      only sets `["header"]` so the metadata describes exactly what it accepts.
+      SHOULD NOT be used). Defaults to `["header"]`; add `"body"` only for a
+      resource server that intentionally accepts RFC 6750 §2.2 form-body
+      `access_token` credentials and wants to advertise that method.
     * `:authorization_endpoint` - absolute URL of the host-owned authorization
       endpoint (RFC 6749 §3.1 / OpenID Connect Discovery §3). The authorization
       endpoint runs the host's login/consent UI, so the library does not mount
@@ -484,7 +484,7 @@ defmodule AttestoPhoenix.Config do
     :userinfo_path,
     oauth_path_prefix: "/oauth",
     scopes_supported: [],
-    bearer_methods_supported: ["header", "body"],
+    bearer_methods_supported: ["header"],
     claims_supported: [],
     acr_values_supported: [],
     ui_locales_supported: [],

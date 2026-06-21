@@ -30,10 +30,10 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
       RFC 8414 document advertises, so the two never drift.
     * `bearer_methods_supported` - the host's `:bearer_methods_supported`
       (`AttestoPhoenix.Config`), the RFC 6750 token-presentation methods the
-      resource server accepts. Defaults to `["header", "body"]`, matching
-      `AttestoPhoenix.Plug.Authenticate` (the `Authorization` header, §2.1, and a
-      POST form-body `access_token`, §2.2); a header-only resource server sets
-      `["header"]` so the document describes exactly what it accepts.
+      resource server accepts. Defaults to `["header"]`, matching
+      `AttestoPhoenix.Plug.Authenticate`; add `"body"` only when the resource
+      server intentionally accepts RFC 6750 §2.2 form-body `access_token`
+      credentials.
 
   The response carries no secrets and is identical for every caller, so it is
   served unauthenticated, and RFC 9728 §3.1 permits caching, so a public,
@@ -98,9 +98,8 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
       scopes_supported: presence(config.scopes_supported),
       # RFC 9728 §2 `bearer_methods_supported`: the RFC 6750 token-presentation
       # methods the resource server accepts, from `AttestoPhoenix.Config`
-      # `:bearer_methods_supported` (default `["header", "body"]`, matching
-      # `AttestoPhoenix.Plug.Authenticate`). A header-only deployment configures
-      # `["header"]` so the document advertises exactly what it accepts.
+      # `:bearer_methods_supported` (default `["header"]`, matching
+      # `AttestoPhoenix.Plug.Authenticate`).
       bearer_methods_supported: config.bearer_methods_supported
     ]
   end
