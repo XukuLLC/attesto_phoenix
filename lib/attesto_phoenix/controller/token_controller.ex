@@ -54,6 +54,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, Event, OAuthError, RequestContext}
   alias AttestoPhoenix.ClientAuthentication.Policy
+  alias Plug.Conn.Unfetched
 
   # RFC 7234 §5.2: token responses and errors must never be cached.
   @cache_control_no_store "no-store"
@@ -62,6 +63,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # RFC 6749 §5.2 error code the framing layer raises before the core runs,
   # held as the atom `OAuthError.new/3` requires (no string round-trip).
   @error_invalid_request :invalid_request
+
+  # RFC 6749 §2.3.1 / §4.4.2 place token request credentials and requested
+  # scope in the form body. Query-string credentials leak through access logs
+  # and caches, so reject them before client authentication or grant dispatch.
+  @query_credential_params ~w(grant_type client_id client_secret scope)
 
   # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
   # to the core as data.
@@ -88,6 +94,16 @@ defmodule AttestoPhoenix.Controller.TokenController do
     config = resolve_config()
     conn = put_no_store_headers(conn)
 
+    case reject_query_credentials(conn) do
+      :ok ->
+        create_transport_checked(config, conn, params)
+
+      {:error, %OAuthError{} = err} ->
+        deny(config, conn, request_body_params(conn, params), nil, err)
+    end
+  end
+
+  defp create_transport_checked(config, conn, params) do
     case RequestContext.check_https(conn, config) do
       :ok ->
         create_checked(config, conn, params)
@@ -97,6 +113,27 @@ defmodule AttestoPhoenix.Controller.TokenController do
         deny(config, conn, params, nil, error(@error_invalid_request, "TLS required"))
     end
   end
+
+  defp reject_query_credentials(conn) do
+    case Enum.find(@query_credential_params, &Map.has_key?(query_params(conn), &1)) do
+      nil ->
+        :ok
+
+      key ->
+        {:error, error(@error_invalid_request, "#{key} must be sent in the request body, not the query string")}
+    end
+  end
+
+  defp query_params(%Plug.Conn{query_params: %Unfetched{}} = conn) do
+    conn
+    |> fetch_query_params()
+    |> Map.fetch!(:query_params)
+  end
+
+  defp query_params(%Plug.Conn{query_params: params}) when is_map(params), do: params
+
+  defp request_body_params(%Plug.Conn{body_params: params}, _fallback) when is_map(params), do: params
+  defp request_body_params(_conn, fallback), do: fallback
 
   defp create_checked(config, conn, params) do
     case authenticate_client(config, conn, params) do

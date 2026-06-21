@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] - 2026-06-21
+
+### Added
+
+- **Optional OpenApiSpex token endpoint helpers.**
+  `AttestoPhoenix.OpenAPI.TokenEndpoint` now exposes reusable OpenAPI values for
+  `POST /oauth/token`: `operation/1`, `schemas/0`, `request_body/0`, and
+  `responses/0`. The documented surface covers RFC 6749 §4.4
+  `client_credentials` form requests, body client authentication,
+  `private_key_jwt`, optional DPoP proof headers, Bearer and DPoP token success
+  responses, OAuth error responses, and RFC 9449 `invalid_dpop_proof` /
+  `use_dpop_nonce` with `DPoP-Nonce`. The `:open_api_spex` dependency is
+  optional and the module compiles only when OpenApiSpex is available.
+
+### Changed
+
+- **Token endpoint rejects credential-bearing query strings.**
+  `AttestoPhoenix.Controller.TokenController` now rejects `grant_type`,
+  `client_id`, `client_secret`, or `scope` when any appears in the query string,
+  before TLS validation, client authentication, or grant dispatch. The response
+  is the normal RFC 6749 §5.2 `400 invalid_request` JSON envelope. The same
+  fields remain accepted in the form body.
+
+### Fixed
+
+- **Optional `Req` dependency remains optional for consumers.**
+  `AttestoPhoenix.ClientIdMetadata.Fetcher.Req` is now compile-guarded on `Req`
+  being loaded, matching the existing optional dependency declaration and
+  allowing a consumer that does not enable CIMD fetching to compile
+  `attesto_phoenix` with `--warnings-as-errors` without depending on `:req`.
+
 ## [0.13.0] - 2026-06-21
 
 ### Changed

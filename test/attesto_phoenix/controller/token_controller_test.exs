@@ -614,6 +614,35 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
   end
 
+  describe "query-string credential hardening" do
+    test "rejects token request credential fields in the query before client authentication" do
+      put_config(load_client: fn _id -> flunk("client lookup must not run for query credentials") end)
+
+      params = client_credentials_params()
+
+      for key <- ~w(grant_type client_id client_secret scope) do
+        conn = post_token_with_query("#{key}=from-query", params)
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_request"
+
+        assert body(conn)["error_description"] ==
+                 "#{key} must be sent in the request body, not the query string"
+      end
+    end
+
+    test "accepts client_credentials fields in the request body" do
+      enable_minting()
+
+      conn = post_token(client_credentials_params())
+
+      assert conn.status == 200
+      assert is_binary(body(conn)["access_token"])
+      assert body(conn)["token_type"] == "Bearer"
+      assert body(conn)["scope"] == "read"
+    end
+  end
+
   describe "response framing" do
     test "every response carries no-store cache headers (RFC 7234 §5.2)" do
       conn = post_token(%{"grant_type" => "client_credentials"})
@@ -2157,9 +2186,24 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     der
   end
 
+  defp client_credentials_params do
+    %{
+      "grant_type" => "client_credentials",
+      "client_id" => "confidential-1",
+      "client_secret" => "s3cr3t",
+      "scope" => "read"
+    }
+  end
+
   defp post_token(params) do
     :post
     |> conn(@endpoint_path, params)
+    |> TokenController.create(params)
+  end
+
+  defp post_token_with_query(query, params) do
+    :post
+    |> conn(@endpoint_path <> "?" <> query, params)
     |> TokenController.create(params)
   end
 

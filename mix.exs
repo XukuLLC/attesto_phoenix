@@ -9,6 +9,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Controller.RevocationController
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
+  alias AttestoPhoenix.OpenAPI.TokenEndpoint
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Schema.DPoPNonce
   alias AttestoPhoenix.Schema.DPoPReplay
@@ -20,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "0.13.0"
+  @version "0.13.1"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -89,6 +90,8 @@ defmodule AttestoPhoenix.MixProject do
       {:ecto_sql, "~> 3.10"},
       # Controllers + the attesto_routes/1 router macro.
       {:phoenix, "~> 1.7"},
+      # Optional OpenAPI structs for hosts that publish an OpenApiSpex spec.
+      {:open_api_spex, "~> 3.0", optional: true},
       # Plug behaviours for the protected-resource plugs (also a Phoenix
       # transitive dependency).
       {:plug, "~> 1.15"},
@@ -183,6 +186,9 @@ defmodule AttestoPhoenix.MixProject do
           PARController,
           RegistrationController,
           UserinfoController
+        ],
+        OpenAPI: [
+          TokenEndpoint
         ],
         Stores: [
           EctoCodeStore,
