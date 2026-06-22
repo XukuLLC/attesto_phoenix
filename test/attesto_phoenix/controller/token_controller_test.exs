@@ -714,6 +714,46 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
   end
 
+  describe "DPoP proof framing (RFC 9449 §4.3)" do
+    test "rejects a token request carrying more than one DPoP header before client authentication" do
+      put_config(load_client: fn _id -> flunk("client lookup must not run for a multi-proof request") end)
+
+      params = client_credentials_params()
+
+      conn =
+        :post
+        |> conn(@endpoint_path, params)
+        |> put_token_content_type()
+        |> with_extra_req_headers([{"dpop", dpop_proof([])}, {"dpop", dpop_proof([])}])
+        |> TokenController.create(params)
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_dpop_proof"
+      assert body(conn)["error_description"] == "Multiple DPoP proof JWTs in request"
+    end
+
+    test "a denial with an unfetched request body falls back to the action params (no Unfetched crash)" do
+      # In the real Plug pipeline a denied/unsupported Content-Type leaves
+      # `body_params` an `%Unfetched{}` struct (Plug.Test pre-parses it, so this
+      # is constructed explicitly). The struct IS a map, so the denial path must
+      # not treat it as parsed params and then access keys on it.
+      put_config(load_client: fn _id -> flunk("client lookup must not run for an unsupported Content-Type") end)
+
+      params = client_credentials_params()
+
+      conn =
+        :post
+        |> conn(@endpoint_path, params)
+        |> put_token_content_type("text/plain")
+        |> Map.put(:body_params, %Plug.Conn.Unfetched{aspect: :body_params})
+        |> TokenController.create(params)
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_request"
+      assert body(conn)["error_description"] =~ "unsupported token request Content-Type"
+    end
+  end
+
   describe "response framing" do
     test "every response carries no-store cache headers (RFC 7234 §5.2)" do
       conn = post_token(%{"grant_type" => "client_credentials"})
@@ -2371,6 +2411,12 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   defp put_token_content_type(conn, content_type \\ @form_content_type) do
     put_req_header(conn, "content-type", content_type)
+  end
+
+  # Prepend raw request headers without `put_req_header/3`'s de-duplication, so a
+  # conn can carry more than one header of the same name (e.g. two `DPoP` proofs).
+  defp with_extra_req_headers(conn, headers) when is_list(headers) do
+    %{conn | req_headers: headers ++ conn.req_headers}
   end
 
   defp body(conn), do: JSON.decode!(conn.resp_body)

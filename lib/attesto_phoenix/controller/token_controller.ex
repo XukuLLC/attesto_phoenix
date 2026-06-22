@@ -61,9 +61,10 @@ defmodule AttestoPhoenix.Controller.TokenController do
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
 
-  # RFC 6749 §5.2 error code the framing layer raises before the core runs,
-  # held as the atom `OAuthError.new/3` requires (no string round-trip).
+  # RFC 6749 §5.2 / RFC 9449 §5 error codes the framing layer raises before the
+  # core runs, held as the atoms `OAuthError.new/3` requires (no string round-trip).
   @error_invalid_request :invalid_request
+  @error_invalid_dpop_proof :invalid_dpop_proof
 
   # RFC 6749 §2.3.1 / §4.4.2 place token request credentials and requested
   # scope in the form body. Query-string credentials leak through access logs
@@ -97,7 +98,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
     conn = put_no_store_headers(conn)
 
     with :ok <- require_token_content_type(conn),
-         :ok <- reject_query_credentials(conn) do
+         :ok <- reject_query_credentials(conn),
+         :ok <- reject_multiple_dpop_proofs(conn) do
       create_transport_checked(config, conn, params)
     else
       {:error, %OAuthError{} = err} ->
@@ -142,6 +144,20 @@ defmodule AttestoPhoenix.Controller.TokenController do
     end
   end
 
+  # RFC 9449 §4.3: a token request carries at most one DPoP proof JWT. More than
+  # one `DPoP` header field is rejected outright rather than processed - the
+  # server must not silently pick one proof when several are presented (a header
+  # smuggled past an intermediary could otherwise select an attacker's proof).
+  defp reject_multiple_dpop_proofs(conn) do
+    case get_req_header(conn, @dpop_request_header) do
+      [_, _ | _] ->
+        {:error, error(@error_invalid_dpop_proof, "Multiple DPoP proof JWTs in request")}
+
+      _ ->
+        :ok
+    end
+  end
+
   defp create_transport_checked(config, conn, params) do
     case RequestContext.check_https(conn, config) do
       :ok ->
@@ -161,8 +177,12 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   defp query_params(%Plug.Conn{query_params: params}) when is_map(params), do: params
 
+  # An unparsed body (e.g. a denied unsupported Content-Type) leaves
+  # `body_params` an `%Unfetched{}` struct. A struct IS a map, so the
+  # `is_map/1` clause below would let it through and a later key access would
+  # raise `Unfetched`; fall back to the action params instead.
+  defp request_body_params(%Plug.Conn{body_params: %Unfetched{}}, fallback), do: fallback
   defp request_body_params(%Plug.Conn{body_params: params}, _fallback) when is_map(params), do: params
-  defp request_body_params(_conn, fallback), do: fallback
 
   defp create_checked(config, conn, params) do
     case authenticate_client(config, conn, params) do
@@ -326,8 +346,10 @@ defmodule AttestoPhoenix.Controller.TokenController do
     |> Kernel.++([{"www-authenticate", challenge}])
   end
 
-  defp client_auth_challenge(%Config{} = config, scheme) do
-    challenge_scheme(scheme) <> ~s( realm="#{escape_auth_param(config.basic_realm || "OAuth")}")
+  defp client_auth_challenge(%Config{basic_realm: realm}, scheme) do
+    # `:basic_realm` is typed `String.t()` and defaults to "OAuth", so it is
+    # always a binary - no nil fallback is needed (and dialyzer flags one as dead).
+    challenge_scheme(scheme) <> ~s( realm="#{escape_auth_param(realm)}")
   end
 
   defp challenge_scheme(scheme) do
