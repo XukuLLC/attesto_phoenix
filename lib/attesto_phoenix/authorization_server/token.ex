@@ -619,8 +619,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     %{config: config, client: client} = request
     {token_type, binding} = sender
 
+    # RFC 8707: carry the code's bound resource set onto the initial refresh
+    # token so a refreshed access token stays audienced to the same resources.
     context =
-      %{subject: grant.subject, scope: scope}
+      %{subject: grant.subject, scope: scope, resource: grant.resource}
       |> put_optional(:client_id, client_id(config, client))
       |> put_optional(:dpop_jkt, SenderConstraint.refresh_binding_jkt(config, client, binding))
 

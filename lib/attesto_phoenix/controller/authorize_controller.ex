@@ -106,6 +106,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias Attesto.AuthorizationCode
   alias Attesto.AuthorizationRequest
   alias Attesto.JARM
+  alias Attesto.ResourceIndicator
   alias Attesto.Secret
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
@@ -117,6 +118,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # RFC 6749 §4.1.2.1 error codes reported by redirect.
   @error_access_denied "access_denied"
   @error_server_error "server_error"
+
+  # RFC 8707 §2 / RFC 6749 §5.2: a requested `resource` the server does not serve.
+  @error_invalid_target "invalid_target"
 
   # RFC 9126 §2.3: the PAR `request_uri` is no longer usable. Reported at
   # completion (by redirect, the request is already validated) when the
@@ -513,6 +517,32 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # (OAuth 2.0 Security BCP §4.13, §4.14). On success, redirect back to the
   # client with `code` (and `state`).
   defp issue_and_redirect(conn, config, client, request, subject, dpop_jkt) do
+    case authorize_request_resource(config, client, request) do
+      :ok ->
+        issue_and_redirect_authorized(conn, config, client, request, subject, dpop_jkt)
+
+      {:error, :invalid_target} ->
+        # RFC 8707 §2.2: the client requested a resource this server does not
+        # serve. A redirectable error (RFC 6749 §4.1.2.1) since the client is
+        # already trusted at this point.
+        emit_failure(conn, config, @error_invalid_target)
+        emit_error(conn, config, request, @error_invalid_target)
+    end
+  end
+
+  # RFC 8707 §2.2: every requested resource must be one this server serves for
+  # the client (`Config.allowed_resources/2`), else the AS would bind — and the
+  # token endpoint later mint — a token audienced to a resource it does not
+  # serve. The indicators were syntactically validated (§2.1) when the request
+  # was parsed.
+  defp authorize_request_resource(config, client, request) do
+    case ResourceIndicator.authorize(request.resource, Config.allowed_resources(config, client)) do
+      {:ok, _resources} -> :ok
+      {:error, :invalid_target} -> {:error, :invalid_target}
+    end
+  end
+
+  defp issue_and_redirect_authorized(conn, config, client, request, subject, dpop_jkt) do
     # RFC 9126 §2.2: claim the PAR `request_uri` as the atomic single-use gate
     # BEFORE issuing the code, so two concurrent completions (on any node) cannot
     # each mint a code from one pushed request - exactly one wins the claim.
@@ -526,6 +556,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
             code_challenge_method: request.code_challenge_method,
             subject: subject_id(subject),
             scope: request.scope,
+            # RFC 8707 §2.2: bind the authorized resource indicator(s) to the
+            # code so the token endpoint mints `aud` from what the user actually
+            # authorized at this endpoint.
+            resource: request.resource,
             family_id: generate_family_id(),
             claims: code_claims(request, subject)
           }
