@@ -83,6 +83,13 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   defp ensure_sub("oc_" <> _ = sub), do: sub
   defp ensure_sub(sub), do: "oc_" <> to_string(sub)
 
+  # Decode the unverified JWT payload's `aud` claim (string or array).
+  defp aud!(jwt) when is_binary(jwt) do
+    [_header, payload | _] = String.split(jwt, ".")
+    {:ok, json} = Base.url_decode64(payload, padding: false)
+    JSON.decode!(json)["aud"]
+  end
+
   defp start_code_store(subject, scope) do
     case start_supervised(ETS) do
       {:ok, _pid} -> :ok
@@ -189,6 +196,40 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :none,
                cnf: nil
              }
+    end
+
+    test "RFC 8707: an allow-listed resource sets the access token aud to that resource" do
+      resource = "https://api.example/mcp"
+      config = config(resource_indicators: [allowed_resources: [resource]])
+      request = request(config, params: %{"scope" => "read", "resource" => resource})
+
+      assert {:ok, response, _} = Token.issue(config, request)
+      assert aud!(response.access_token) == resource
+    end
+
+    test "RFC 8707: multiple allow-listed resources mint an aud array" do
+      a = "https://a.example/api"
+      b = "https://b.example/api"
+      config = config(resource_indicators: [allowed_resources: [a, b]])
+      request = request(config, params: %{"scope" => "read", "resource" => [a, b]})
+
+      assert {:ok, response, _} = Token.issue(config, request)
+      assert aud!(response.access_token) == [a, b]
+    end
+
+    test "RFC 8707: a resource the server does not serve is invalid_target" do
+      config = config()
+      request = request(config, params: %{"scope" => "read", "resource" => "https://evil.example/api"})
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} = Token.issue(config, request)
+    end
+
+    test "RFC 8707: without a resource the aud falls back to config.audience" do
+      config = config()
+      request = request(config, params: %{"scope" => "read"})
+
+      assert {:ok, response, _} = Token.issue(config, request)
+      assert aud!(response.access_token) == "https://issuer.example"
     end
 
     test "a DPoP-bound token_issued event carries the token type and jkt" do

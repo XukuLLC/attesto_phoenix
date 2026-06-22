@@ -506,6 +506,7 @@ defmodule AttestoPhoenix.Config do
     registration_enabled: false,
     client_id_metadata: [],
     jwt_bearer: [],
+    resource_indicators: [],
     basic_realm: "OAuth"
   ]
 
@@ -604,7 +605,8 @@ defmodule AttestoPhoenix.Config do
           mtls_enabled: boolean(),
           registration_enabled: boolean(),
           client_id_metadata: keyword(),
-          jwt_bearer: keyword()
+          jwt_bearer: keyword(),
+          resource_indicators: keyword()
         }
 
   # Required plain values: enforced for presence as struct fields.
@@ -639,7 +641,8 @@ defmodule AttestoPhoenix.Config do
       | client_auth_signing_algs: config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs(),
         request_object_policy: config.request_object_policy || %Policy{},
         client_id_metadata: normalize_client_id_metadata(config.client_id_metadata),
-        jwt_bearer: normalize_jwt_bearer(config.jwt_bearer)
+        jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
+        resource_indicators: normalize_resource_indicators(config.resource_indicators)
     }
   end
 
@@ -679,12 +682,6 @@ defmodule AttestoPhoenix.Config do
     enabled: false,
     issuers: %{},
     assertion_max_lifetime_seconds: 300,
-    # RFC 8707 §2.2: resources (besides this server's own `:audience`) for which
-    # the jwt-bearer grant may mint a token via the `resource` indicator. Empty
-    # by default - fail closed, so an authenticated client cannot mint a token
-    # audienced to an arbitrary resource; a multi-resource deployment lists the
-    # resource identifiers it serves here.
-    allowed_resources: [],
     jwks_resolver: nil,
     jwks_fetcher: Req,
     jwks_cache: AttestoPhoenix.ClientIdMetadata.Cache.Ecto,
@@ -696,6 +693,22 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_jwt_bearer(opts) when is_list(opts) do
     Keyword.merge(@jwt_bearer_defaults, opts)
+  end
+
+  # RFC 8707 Resource Indicators. `:allowed_resources` is the grant-agnostic
+  # allowlist of resource identifiers (besides this server's own `:audience`)
+  # the authorization server is willing to mint a token for. `:allowed_resources_for`
+  # is an optional per-client callback `(client) -> [resource]` whose result is
+  # unioned with the static list, so a deployment can scope which resources each
+  # client may target. Both empty/absent by default - fail closed: with no
+  # allowlist and no requested `resource`, issuance keeps the single configured
+  # `:audience` (RFC 8707 backward-compatible default).
+  @resource_indicators_defaults [allowed_resources: [], allowed_resources_for: nil]
+
+  defp normalize_resource_indicators(nil), do: @resource_indicators_defaults
+
+  defp normalize_resource_indicators(opts) when is_list(opts) do
+    Keyword.merge(@resource_indicators_defaults, opts)
   end
 
   @doc """
@@ -744,13 +757,47 @@ defmodule AttestoPhoenix.Config do
   This is the host's `:jwt_bearer` keyword merged over the library defaults
   (`draft-ietf-oauth-identity-assertion-authz-grant-04`), so every recognized
   member (`:enabled`, `:issuers`, `:assertion_max_lifetime_seconds`,
-  `:allowed_resources`, `:jwks_resolver`, `:jwks_fetcher`, `:jwks_cache`,
-  `:jwks_cache_ttl_bounds`, `:fetch_opts`) is always present.
+  `:jwks_resolver`, `:jwks_fetcher`, `:jwks_cache`, `:jwks_cache_ttl_bounds`,
+  `:fetch_opts`) is always present.
   `AttestoPhoenix.AuthorizationServer.JwtBearer` reads the feature's
   configuration through this helper.
   """
   @spec jwt_bearer(t()) :: keyword()
   def jwt_bearer(%__MODULE__{jwt_bearer: opts}), do: opts
+
+  @doc """
+  Returns the merged, defaulted RFC 8707 Resource Indicators options
+  (`:allowed_resources`, `:allowed_resources_for`).
+  """
+  @spec resource_indicators(t()) :: keyword()
+  def resource_indicators(%__MODULE__{resource_indicators: opts}), do: opts
+
+  @doc """
+  The set of resource identifiers this authorization server will mint a token
+  for, for `client` (RFC 8707 §2.2).
+
+  Composes the server's own `:audience` (always served), the static
+  `resource_indicators: [allowed_resources: [...]]` list, and the per-client
+  `:allowed_resources_for` callback's result. A requested `resource` is honored
+  only when it appears here; anything else is `invalid_target`.
+  """
+  @spec allowed_resources(t(), term()) :: [String.t()]
+  def allowed_resources(%__MODULE__{} = config, client) do
+    opts = resource_indicators(config)
+    static = opts |> Keyword.get(:allowed_resources, []) |> List.wrap()
+    per_client = per_client_allowed_resources(opts, client)
+
+    (List.wrap(config.audience) ++ static ++ per_client)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+  end
+
+  defp per_client_allowed_resources(opts, client) do
+    case Keyword.get(opts, :allowed_resources_for) do
+      nil -> []
+      callback -> callback |> Callback.invoke([client], []) |> List.wrap()
+    end
+  end
 
   @doc """
   Returns `true` iff the Identity Assertion JWT Authorization Grant (ID-JAG /

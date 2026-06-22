@@ -44,7 +44,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   `invalid_request` without leaking detail; the underlying reason is logged.
   """
 
-  alias Attesto.{AuthorizationCode, IDToken, RefreshToken}
+  alias Attesto.{AuthorizationCode, IDToken, RefreshToken, ResourceIndicator}
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
@@ -198,7 +198,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             access_token_claims(grant)
+             access_token_claims(grant),
+             # RFC 8707 §2.2: the access token's `aud` is the resource set the
+             # user authorized (bound to the code), not a value re-submitted at
+             # redemption.
+             audience_opts(grant.resource)
            ),
          # OIDC Core §3.1.3.3: when the request was an OpenID Connect
          # Authentication Request (granted scope contains `openid`), the token
@@ -236,6 +240,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, presented} <- require_param(params, "refresh_token"),
          requested = parse_requested_scope(params),
+         {:ok, resource} <- refresh_requested_resource(params),
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
          {:ok, rotated} <-
            rotate_refresh(
@@ -243,11 +248,21 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              client,
              presented,
              requested,
+             resource,
              SenderConstraint.refresh_binding_jkt(config, client, binding)
            ),
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
          {:ok, response} <-
-           mint(config, client, rotated.context.subject, scope, token_type, binding) do
+           mint(
+             config,
+             client,
+             rotated.context.subject,
+             scope,
+             token_type,
+             binding,
+             %{},
+             audience_opts(rotated.context.resource)
+           ) do
       response = Map.put(response, :refresh_token, rotated.token)
       {:ok, response, [refresh_rotated_event(request, scope, "refresh_token", token_type, binding)]}
     end
@@ -261,7 +276,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with {:ok, binding, token_type} <- resolve_sender_constraint(request),
          subject = client_id(config, client),
          {:ok, scope} <- authorize_scope(config, client, parse_requested_scope(params)),
-         {:ok, response} <- mint(config, client, subject, scope, token_type, binding) do
+         {:ok, audience} <- request_resource_audience(config, client, params),
+         {:ok, response} <-
+           mint(config, client, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
       {:ok, response, [token_issued_event(request, scope, "client_credentials", token_type, binding)]}
     end
   end
@@ -283,7 +300,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          requested = requested_exchange_scope(params, claims),
          :ok <- require_scope_within_subject_token(requested, claims),
          {:ok, scope} <- authorize_scope(config, client, requested),
-         {:ok, response} <- mint_exchanged_token(config, claims, scope, token_type, binding) do
+         {:ok, audience} <- request_resource_audience(config, client, params),
+         {:ok, response} <- mint_exchanged_token(config, claims, scope, token_type, binding, audience) do
       response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
       {:ok, response, [token_issued_event(request, scope, "token_exchange", token_type, binding)]}
     else
@@ -308,7 +326,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
            jwt_bearer_authorize(config, client, params),
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
-         {:ok, audience} <- jwt_bearer_resource_audience(config, params),
+         {:ok, audience} <- request_resource_audience(config, client, params),
          requested = jwt_bearer_requested_scope(params, ceiling),
          :ok <- require_scope_within_ceiling(requested, ceiling),
          {:ok, scope} <- authorize_scope(config, client, requested),
@@ -371,118 +389,53 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # RFC 8707 §2: the `resource` indicator scopes the access token to a protected
-  # resource. When present, the minted access token's `aud` MUST be that
-  # resource identifier (§2.2); when absent, the mint falls back to
-  # `config.audience`. The indicator MUST be an absolute URI with no fragment
-  # (§2.1). A single valid resource yields that audience (returned as `{:ok,
-  # uri}`); an absent resource yields `{:ok, nil}` (the config-audience default).
-  # A syntactically invalid resource, or more than one distinct resource value
-  # for this single access token (this grant mints exactly one), is rejected
-  # with `invalid_target` (§2.1) - the AS cannot address one access token to two
-  # resources, and silently picking one would mis-audience the token.
+  # RFC 8707 §2: the request-time `resource` indicator(s) scope the issued access
+  # token to the named protected resource(s) by setting its `aud`. Validation
+  # (§2.1 absolute-URI syntax) and parsing live in the conn-free core primitive
+  # `Attesto.ResourceIndicator`; authorization (§2.2) is against the set of
+  # resources this server will mint for `client` (`Config.allowed_resources/2`:
+  # the server's own `:audience` plus any configured / per-client allow-listed
+  # resources). Returns `{:ok, [resource]}` (possibly `[]` when none was
+  # requested - the `config.audience` default), or `invalid_target`.
   #
-  # Note on duplicate keys: standard form/query decoding collapses a repeated
-  # `resource=a&resource=b` to a single (last) value before the controller
-  # builds `params`, so the multiple-resource rejection below fires for the
-  # explicit array form (`resource[]=a&resource[]=b`); a repeated scalar key
-  # yields one effective resource, which is honoured (the token is still
-  # audienced to a requested resource).
-  defp jwt_bearer_resource_audience(config, params) do
-    with {:ok, resource} <- requested_resource(params) do
-      authorize_resource(config, resource)
+  # This is the request-time path, used by grants whose resource arrives on the
+  # token request (`client_credentials`, token exchange, jwt-bearer). The
+  # `authorization_code` and `refresh_token` grants instead mint `aud` from the
+  # resource set BOUND to the grant at authorization time.
+  defp request_resource_audience(config, client, params) do
+    with {:ok, resources} <- validate_resource_param(params) do
+      authorize_resources(config, client, resources)
     end
   end
 
-  # RFC 8707 §2.2 / draft §6: an authenticated jwt-bearer client MUST NOT be able
-  # to mint a token audienced to an arbitrary resource. A requested resource is
-  # honoured only when it is this server's own `audience` or an explicitly
-  # allow-listed resource (`jwt_bearer: [allowed_resources: [...]]`); any other
-  # resource is rejected `invalid_target` so the AS never issues a token for a
-  # resource it does not serve. An absent resource (`nil`) falls back to
-  # `config.audience`.
-  defp authorize_resource(_config, nil), do: {:ok, nil}
+  defp validate_resource_param(params) do
+    case ResourceIndicator.validate(Map.get(params, "resource")) do
+      {:ok, resources} ->
+        {:ok, resources}
 
-  defp authorize_resource(config, resource) do
-    if resource == config.audience or resource in jwt_bearer_allowed_resources(config) do
-      {:ok, resource}
-    else
-      {:error, error(@error_invalid_target, "the requested resource is not served by this authorization server")}
+      {:error, :invalid_target} ->
+        {:error, error(@error_invalid_target, "resource is not a valid absolute-URI indicator (RFC 8707 §2.1)")}
     end
   end
 
-  defp jwt_bearer_allowed_resources(config) do
-    config |> Config.jwt_bearer() |> Keyword.get(:allowed_resources, []) |> List.wrap()
-  end
+  # RFC 8707 §2.2: a client may only target a resource this server serves for it;
+  # any other resource is `invalid_target` so the AS never mints a token for a
+  # resource it does not serve (and a client cannot mis-audience a token to a
+  # sibling resource it was not granted).
+  defp authorize_resources(config, client, resources) do
+    case ResourceIndicator.authorize(resources, Config.allowed_resources(config, client)) do
+      {:ok, resources} ->
+        {:ok, resources}
 
-  defp requested_resource(params) do
-    case Map.get(params, "resource") do
-      # Absent: no resource indicator, fall back to config.audience.
-      nil -> {:ok, nil}
-      # Present (scalar or array): every submitted value must be a valid
-      # indicator. A blank/non-binary value - including a present-but-empty
-      # `resource=` - is malformed and fails closed rather than being treated as
-      # absent.
-      value when is_binary(value) -> single_resource_audience([value])
-      values when is_list(values) -> single_resource_audience(values)
-      _ -> {:error, error(@error_invalid_target, "resource is invalid")}
+      {:error, :invalid_target} ->
+        {:error, error(@error_invalid_target, "the requested resource is not served by this authorization server")}
     end
   end
 
-  defp single_resource_audience(values) do
-    cond do
-      values == [] ->
-        {:error, error(@error_invalid_target, "resource is present but empty")}
-
-      Enum.any?(values, &(not (is_binary(&1) and &1 != ""))) ->
-        {:error, error(@error_invalid_target, "resource must be a non-empty absolute URI")}
-
-      true ->
-        validated_single_resource(Enum.uniq(values))
-    end
-  end
-
-  defp validated_single_resource([resource]) do
-    if valid_resource_indicator?(resource) do
-      {:ok, resource}
-    else
-      {:error, error(@error_invalid_target, "resource is not an absolute URI without a fragment")}
-    end
-  end
-
-  defp validated_single_resource(_multiple) do
-    {:error, error(@error_invalid_target, "a single access token cannot target multiple resources")}
-  end
-
-  # RFC 8707 §2: a resource indicator is an absolute URI (RFC 3986 §4.3 - a
-  # scheme and a hier-part) and MUST NOT carry a fragment (§4.1). `URI.parse/1`
-  # never errors, so absoluteness is checked structurally: a non-empty scheme
-  # and a host or path component.
-  defp valid_resource_indicator?(value) when is_binary(value) do
-    not invalid_percent_encoding?(value) and absolute_uri_no_fragment?(value)
-  end
-
-  # RFC 3986 §2.1: a `%` is valid only as the lead of a `%HH` triplet. `URI.new/1`
-  # still admits a bare/invalid `%`, so reject it explicitly before building the
-  # URI (else `resource=https://api.example/%ZZ` could mint a malformed `aud`).
-  defp invalid_percent_encoding?(value), do: Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value)
-
-  # RFC 8707 §2.1: a resource indicator is an absolute URI (any scheme) with no
-  # fragment. `URI.new/1` (unlike `URI.parse/1`) rejects whitespace/controls.
-  defp absolute_uri_no_fragment?(value) do
-    case URI.new(value) do
-      {:ok, %URI{scheme: scheme, fragment: nil} = uri} when is_binary(scheme) and scheme != "" ->
-        is_binary(uri.host) or (is_binary(uri.path) and uri.path != "")
-
-      _ ->
-        false
-    end
-  end
-
-  # The `Attesto.Token.mint/3` opt carrying the RFC 8707 resource audience; an
-  # absent resource adds no opt, so `mint/3` keeps its `config.audience`.
-  defp audience_opts(nil), do: []
-  defp audience_opts(audience) when is_binary(audience), do: [audience: audience]
+  # The `Attesto.Token.mint/3` opt carrying the RFC 8707 resource audience(s); an
+  # empty set adds no opt, so `mint/3` keeps its `config.audience` default.
+  defp audience_opts([]), do: []
+  defp audience_opts(resources) when is_list(resources), do: [audience: resources]
 
   # ── Grant-state delegation (Attesto core) ────────────────────────────────
 
@@ -574,10 +527,31 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     :ok
   end
 
-  defp rotate_refresh(config, client, presented, requested, jkt) do
+  # The request-time `resource` on a refresh narrows the bound set (the core
+  # enforces subset-only). An absent parameter (`{:ok, []}` from the validator)
+  # becomes `nil` so the full granted set is kept; a present-but-malformed value
+  # is `invalid_target`.
+  defp refresh_requested_resource(params) do
+    case ResourceIndicator.validate(Map.get(params, "resource")) do
+      {:ok, []} ->
+        {:ok, nil}
+
+      {:ok, resources} ->
+        {:ok, resources}
+
+      {:error, :invalid_target} ->
+        {:error, error(@error_invalid_target, "resource is not a valid absolute-URI indicator (RFC 8707 §2.1)")}
+    end
+  end
+
+  defp rotate_refresh(config, client, presented, requested, resource, jkt) do
     opts =
       [client_id: client_id(config, client)]
       |> put_optional_kw(:scope, requested)
+      # RFC 8707: a present `resource` narrows the bound set (subset-only); absent
+      # (`nil`) keeps the full granted set so the refreshed token stays audienced
+      # to the resources the original grant authorized.
+      |> put_optional_kw(:resource, resource)
       |> put_optional_kw(:dpop_jkt, jkt)
       |> Keyword.put(:rotation_grace_seconds, config.refresh_token_rotation_grace_seconds)
 
@@ -864,7 +838,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `mint_extra_opts` is appended to the sender-constraint mint opts; today it
   # carries only the RFC 8707 `:audience` override (jwt-bearer grant), so the
   # `aud` of any other grant's token is unaffected.
-  defp mint(config, client, subject, scope, token_type, binding, extra_claims \\ %{}, mint_extra_opts \\ []) do
+  defp mint(config, client, subject, scope, token_type, binding, extra_claims, mint_extra_opts) do
     with {:ok, principal} <- build_principal(config, client, subject, scope),
          principal = merge_principal_claims(principal, extra_claims),
          {:ok, minted} <-
@@ -916,7 +890,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp mint_exchanged_token(config, claims, scope, token_type, binding) do
+  defp mint_exchanged_token(config, claims, scope, token_type, binding, audience) do
     attesto_config = attesto_config(config)
     kind_claim = attesto_config.principal_kind_claim
 
@@ -928,7 +902,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     }
 
     with {:ok, minted} <-
-           Attesto.Token.mint(attesto_config, principal, SenderConstraint.mint_opts(binding)) do
+           Attesto.Token.mint(
+             attesto_config,
+             principal,
+             SenderConstraint.mint_opts(binding) ++ audience_opts(audience)
+           ) do
       {:ok,
        %{
          access_token: minted.access_token,
@@ -1181,6 +1159,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # also invalid_grant on the wire (the family is already revoked in the
   # store), so a captured-token replay learns nothing.
   defp grant_error(:invalid_scope), do: error(@error_invalid_scope, "requested scope exceeds the grant")
+
+  # RFC 8707 §2: a refresh `resource` that is not a subset of the resources the
+  # original grant was bound to cannot be honored (narrowing only, never widen).
+  defp grant_error(:invalid_target), do: error(@error_invalid_target, "the requested resource is not within the grant")
 
   defp grant_error(_reason), do: error(@error_invalid_grant, "authorization grant is invalid or expired")
 end

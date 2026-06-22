@@ -205,7 +205,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   describe "RFC 8707 resource indicator → access-token aud" do
     test "an allow-listed resource sets the access token aud to that resource" do
       resource = "https://api.example/mcp"
-      config = config(jwt_bearer: [allowed_resources: [resource]])
+      config = config(resource_indicators: [allowed_resources: [resource]])
       params = %{"assertion" => assertion(), "resource" => resource}
 
       assert {:ok, response, _} = issue(config, params)
@@ -223,7 +223,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     test "a resource that is neither config.audience nor allow-listed is invalid_target" do
       # RFC 8707 §2.2: an authenticated client must not mint a token audienced to
       # an arbitrary resource the AS does not serve.
-      config = config(jwt_bearer: [allowed_resources: ["https://known.example/api"]])
+      config = config(resource_indicators: [allowed_resources: ["https://known.example/api"]])
       params = %{"assertion" => assertion(), "resource" => "https://attacker.example/api"}
 
       assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
@@ -250,16 +250,26 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
     end
 
-    test "multiple distinct resource values for one access token is invalid_target" do
-      config = config()
-      params = %{"assertion" => assertion(), "resource" => ["https://a.example", "https://b.example"]}
+    test "multiple allow-listed resources mint an aud array (RFC 8707 §2.2)" do
+      a = "https://a.example/api"
+      b = "https://b.example/api"
+      config = config(resource_indicators: [allowed_resources: [a, b]])
+      params = %{"assertion" => assertion(), "resource" => [a, b]}
+
+      assert {:ok, response, _} = issue(config, params)
+      assert access_token_aud(config, response) == [a, b]
+    end
+
+    test "a multi-resource request including one the server does not serve is invalid_target" do
+      config = config(resource_indicators: [allowed_resources: ["https://a.example/api"]])
+      params = %{"assertion" => assertion(), "resource" => ["https://a.example/api", "https://evil.example"]}
 
       assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
     end
 
     test "a single resource repeated (one distinct value) is honoured" do
       resource = "https://api.example/mcp"
-      config = config(jwt_bearer: [allowed_resources: [resource]])
+      config = config(resource_indicators: [allowed_resources: [resource]])
       params = %{"assertion" => assertion(), "resource" => [resource, resource]}
 
       assert {:ok, response, _} = issue(config, params)
@@ -269,7 +279,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     test "a resource with invalid percent-encoding is invalid_target (not a malformed aud)" do
       # RFC 3986 §2.1: even with a matching allow-list entry, a bad `%HH` triplet
       # must be rejected rather than minted into the access token aud.
-      config = config(jwt_bearer: [allowed_resources: ["https://api.example/%ZZ"]])
+      config = config(resource_indicators: [allowed_resources: ["https://api.example/%ZZ"]])
       params = %{"assertion" => assertion(), "resource" => "https://api.example/%ZZ"}
 
       assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
