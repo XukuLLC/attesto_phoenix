@@ -166,7 +166,13 @@ config :my_app, AttestoPhoenix.Config,
   dpop_enabled: true,
   dpop_nonce_required: false,
   mtls_enabled: false,                 # if true, also set :cert_der
-  registration_enabled: false          # if true, also set registration callbacks
+  registration_enabled: false,         # if true, also set registration callbacks
+
+  # RFC 8707 resource indicators (optional; see below)
+  resource_indicators: [
+    allowed_resources: ["https://api.example.com/a", "https://api.example.com/b"],
+    allowed_resources_for: {MyApp.OAuth, :resources_for}  # optional per-client (client -> [uri])
+  ]
 ```
 
 Build the validated struct wherever you need it:
@@ -178,6 +184,34 @@ config = AttestoPhoenix.Config.from_otp_app(:my_app)
 Required keys are validated at build time; a missing key (or a missing
 dependency such as `:cert_der` when mTLS is enabled) raises immediately so
 misconfiguration fails fast.
+
+### Resource indicators (RFC 8707)
+
+When one authorization server fronts more than one protected resource (say an
+admin API and an end-user API, or several MCP endpoints), a single fixed `aud`
+cannot separate a token meant for one from a token meant for another — only
+scope would, and scope is application policy, not a cryptographic boundary.
+RFC 8707 fixes that: a client names the resource it wants with a `resource`
+parameter, and the AS mints the token's `aud` to that identifier, so a token
+issued for resource A is structurally invalid at sibling resource B.
+
+It works across every grant. A client sends `resource` on the authorization
+request (bound to the code) or the token request (`client_credentials`, token
+exchange, jwt-bearer); the token endpoint mints `aud` from it, refresh carries
+and may narrow it (subset-only), and token exchange cannot widen `aud` beyond
+the subject token's. One or more resources are allowed (a multi-resource grant
+mints a JWT `aud` array). A requested resource the server does not serve is
+rejected with `invalid_target`.
+
+`resource_indicators[:allowed_resources]` lists the resource identifiers this
+server is willing to mint for (besides its own `:audience`, always served);
+`:allowed_resources_for` is an optional `(client -> [uri])` callback for
+per-client scoping. With neither set and no `resource` requested, issuance keeps
+the single configured `:audience` — so single-resource deployments need no
+change. This is the issuer half of the RFC 9728 ↔ RFC 8707 chain: a resource
+advertises its identifier via protected-resource metadata, the client echoes it
+as `resource`, the AS mints that `aud`, and the resource server validates it
+(see `attesto_mcp` for the resource-server half).
 
 ### Host policy modules
 
