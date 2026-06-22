@@ -171,6 +171,8 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
                subject: "subject-1",
                scope: ["read", "write"],
                resource: [],
+               acr: nil,
+               auth_time: nil,
                client_id: "client-1",
                dpop_jkt: nil,
                claims: %{"k" => "v"}
@@ -228,6 +230,8 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
                  subject: "subject-1",
                  scope: ["read"],
                  resource: [],
+                 acr: nil,
+                 auth_time: nil,
                  client_id: "client-1",
                  dpop_jkt: "thumb-xyz",
                  claims: %{"tenant" => "t1"}
@@ -246,6 +250,8 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
           subject: "subject-1",
           scope: ["read", "write"],
           resource: ["https://api.example/mcp"],
+          acr: "phr",
+          auth_time: 1_700_000_000,
           client_id: "client-1",
           dpop_jkt: "thumb-xyz",
           claims: %{"tenant" => "t1"}

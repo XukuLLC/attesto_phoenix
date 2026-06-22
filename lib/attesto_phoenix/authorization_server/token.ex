@@ -202,8 +202,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              access_token_claims(grant),
              # RFC 8707 §2.2: the access token's `aud` is the resource set the
              # user authorized (bound to the code), optionally narrowed by a
-             # request-time `resource` — never widened by one.
-             audience_opts(audience)
+             # request-time `resource` — never widened by one. RFC 9470: carry
+             # the authentication context (`acr`/`auth_time`) the code recorded
+             # at authorize onto the access token for step-up enforcement.
+             audience_opts(audience) ++ auth_context_opts(grant.claims)
            ),
          # OIDC Core §3.1.3.3: when the request was an OpenID Connect
          # Authentication Request (granted scope contains `openid`), the token
@@ -262,7 +264,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              token_type,
              binding,
              %{},
-             audience_opts(rotated.context.resource)
+             # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
+             # (never re-stamped on rotation), so the refreshed access token
+             # reports the real authentication event.
+             audience_opts(rotated.context.resource) ++ context_auth_context_opts(rotated.context)
            ) do
       response = Map.put(response, :refresh_token, rotated.token)
       {:ok, response, [refresh_rotated_event(request, scope, "refresh_token", token_type, binding)]}
@@ -458,6 +463,32 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp audience_opts([]), do: []
   defp audience_opts(resources) when is_list(resources), do: [audience: resources]
 
+  # RFC 9470 / OIDC Core §2: the `Attesto.Token.mint/3` opts carrying the
+  # authentication context (`acr` / `auth_time`) onto the access token, read from
+  # the source map (an authorization code's `claims`, where the authorize
+  # controller's code_claims/2 recorded the host-asserted values; string keys).
+  # Absent values add no opt, so a flow that never established an auth context
+  # (machine grants) mints no acr/auth_time and fails closed against step-up.
+  defp auth_context_opts(source) when is_map(source) do
+    []
+    |> put_optional_kw(:acr, valid_acr(Map.get(source, "acr")))
+    |> put_optional_kw(:auth_time, valid_auth_time(Map.get(source, "auth_time")))
+  end
+
+  defp auth_context_opts(_source), do: []
+
+  # As above but from a refresh-token context map (atom keys `:acr`/`:auth_time`).
+  defp context_auth_context_opts(context) when is_map(context) do
+    []
+    |> put_optional_kw(:acr, valid_acr(Map.get(context, :acr)))
+    |> put_optional_kw(:auth_time, valid_auth_time(Map.get(context, :auth_time)))
+  end
+
+  defp valid_acr(acr) when is_binary(acr) and acr != "", do: acr
+  defp valid_acr(_acr), do: nil
+  defp valid_auth_time(t) when is_integer(t) and t >= 0, do: t
+  defp valid_auth_time(_t), do: nil
+
   # ── Grant-state delegation (Attesto core) ────────────────────────────────
 
   # PKCE enforcement is challenge-based and belongs to the code, not the request:
@@ -642,9 +673,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     # RFC 8707: carry the code's bound resource set onto the initial refresh
     # token so a refreshed access token stays audienced to the same resources.
+    # RFC 9470: seed the original acr/auth_time (from the code's claims) onto the
+    # refresh family so refreshes preserve the real authentication event.
     context =
       %{subject: grant.subject, scope: scope, resource: grant.resource}
       |> put_optional(:client_id, client_id(config, client))
+      |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
+      |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
       |> put_optional(:dpop_jkt, SenderConstraint.refresh_binding_jkt(config, client, binding))
 
     # OAuth 2.0 Security BCP §4.13: mint the initial token into the code's

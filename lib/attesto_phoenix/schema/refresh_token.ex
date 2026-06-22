@@ -81,6 +81,11 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     field :subject, :string
     field :scope, {:array, :string}, default: []
     field :resource, {:array, :string}, default: []
+    # RFC 9470 / OIDC Core §2: the ORIGINAL authentication context, carried
+    # across rotation so a refresh-minted access token reports the real auth
+    # event (auth_time is never re-stamped). `auth_time` is unix seconds.
+    field :acr, :string
+    field :auth_time, :integer
     field :cnf, :map
     field :claims, :map, default: %{}
     field :consumed, :boolean, default: false
@@ -102,6 +107,8 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     :subject,
     :scope,
     :resource,
+    :acr,
+    :auth_time,
     :cnf,
     :claims,
     :consumed,
@@ -170,6 +177,8 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       subject: Map.get(data, :subject),
       scope: Map.get(data, :scope, []),
       resource: Map.get(data, :resource, []),
+      acr: Map.get(data, :acr),
+      auth_time: Map.get(data, :auth_time),
       client_id: Map.get(data, :client_id),
       cnf: cnf_from_context(data),
       claims: Map.get(data, :claims, %{}),
@@ -201,6 +210,8 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
         subject: row.subject,
         scope: row.scope || [],
         resource: row.resource || [],
+        acr: row.acr,
+        auth_time: row.auth_time,
         client_id: row.client_id,
         dpop_jkt: jkt_from_cnf(row.cnf),
         claims: row.claims || %{}
@@ -286,6 +297,8 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       subject: value(context, :subject),
       scope: value(context, :scope) || [],
       resource: value(context, :resource) || [],
+      acr: value(context, :acr),
+      auth_time: value(context, :auth_time),
       client_id: value(context, :client_id),
       dpop_jkt: value(context, :dpop_jkt),
       claims: value(context, :claims) || %{}

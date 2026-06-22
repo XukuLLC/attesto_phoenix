@@ -381,6 +381,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         # RFC 8707 resource indicator(s) bound to the grant; carried through
         # rotation (subset-only narrowing) so the refreshed token's `aud` matches.
         add :resource, {:array, :string}, null: false, default: []
+        # RFC 9470 / OIDC Core: original authentication context, carried across
+        # rotation so a refreshed access token reports the real auth event
+        # (auth_time is never re-stamped). auth_time is unix seconds.
+        add :acr, :string
+        add :auth_time, :bigint
         add :cnf, :map
         add :claims, :map, null: false, default: %{}
         # consumed is flipped false -> true by the atomic rotation claim

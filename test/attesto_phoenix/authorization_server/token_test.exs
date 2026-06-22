@@ -90,6 +90,12 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     JSON.decode!(json)["aud"]
   end
 
+  defp claim!(jwt, key) when is_binary(jwt) do
+    [_header, payload | _] = String.split(jwt, ".")
+    {:ok, json} = Base.url_decode64(payload, padding: false)
+    JSON.decode!(json)[key]
+  end
+
   defp start_code_store(subject, scope) do
     case start_supervised(ETS) do
       {:ok, _pid} -> :ok
@@ -106,6 +112,31 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
         subject: subject,
         code_challenge: @code_challenge,
         code_challenge_method: "S256"
+      })
+
+    Process.put(:auth_code, code)
+    ETS
+  end
+
+  # A code carrying the RFC 9470 authentication context the authorize controller
+  # would have recorded (acr/auth_time in the code's claims).
+  defp start_code_store_with_auth_context(subject, scope, acr, auth_time) do
+    case start_supervised(ETS) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    ETS.reset()
+
+    {:ok, code} =
+      Attesto.AuthorizationCode.issue(ETS, %{
+        client_id: "client-1",
+        redirect_uri: @redirect_uri,
+        scope: scope,
+        subject: subject,
+        code_challenge: @code_challenge,
+        code_challenge_method: "S256",
+        claims: %{"acr" => acr, "auth_time" => auth_time}
       })
 
     Process.put(:auth_code, code)
@@ -406,6 +437,61 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :dpop,
                cnf: %{"jkt" => jkt}
              }
+    end
+
+    test "RFC 9470: a refresh preserves the ORIGINAL auth_time (never re-stamped)" do
+      original_auth_time = 1_600_000_000
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1",
+          acr: "phr",
+          auth_time: original_auth_time
+        })
+
+      config = config(refresh_store: refresh_store)
+      request = request(config, grant_type: "refresh_token", params: %{"refresh_token" => refresh_token})
+
+      assert {:ok, response, _} = Token.issue(config, request)
+      # The refreshed access token reports the original authentication event,
+      # not "now" — a refresh cannot launder a one-time strong auth into
+      # perpetual freshness.
+      assert claim!(response.access_token, "acr") == "phr"
+      assert claim!(response.access_token, "auth_time") == original_auth_time
+    end
+  end
+
+  describe "RFC 9470 step-up authentication context" do
+    test "the authorization_code grant mints acr/auth_time from the code's claims" do
+      auth_time = 1_700_000_000
+      code_store = start_code_store_with_auth_context("oc_user-1", ["read"], "phr", auth_time)
+      config = config(code_store: code_store)
+
+      request =
+        request(config,
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, response, _} = Token.issue(config, request)
+      assert claim!(response.access_token, "acr") == "phr"
+      assert claim!(response.access_token, "auth_time") == auth_time
+    end
+
+    test "a machine grant (client_credentials) mints no acr/auth_time" do
+      config = config()
+      request = request(config, params: %{"scope" => "read"})
+
+      assert {:ok, response, _} = Token.issue(config, request)
+      refute claim!(response.access_token, "acr")
+      refute claim!(response.access_token, "auth_time")
     end
   end
 
