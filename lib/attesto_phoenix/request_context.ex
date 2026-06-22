@@ -199,8 +199,22 @@ defmodule AttestoPhoenix.RequestContext do
   def from_trusted_proxy?(%Plug.Conn{remote_ip: remote_ip}, %Config{trusted_proxies: proxies}) do
     # A connection with no resolved peer address is never trusted: there is no
     # IP to test against the allowlist, so it fails closed.
-    is_tuple(remote_ip) and Enum.any?(List.wrap(proxies), &peer_matches?(remote_ip, &1))
+    ip = normalize_peer_ip(remote_ip)
+    is_tuple(ip) and Enum.any?(List.wrap(proxies), &peer_matches?(ip, &1))
   end
+
+  # A dual-stack IPv6 listener (e.g. an app bound on `::` behind a reverse proxy
+  # that reaches it over an IPv4 bridge network, the common Docker / Kamal
+  # topology) surfaces the proxy's IPv4 peer as an IPv4-mapped IPv6 address
+  # `::ffff:a.b.c.d` (`{0, 0, 0, 0, 0, 0xFFFF, g, h}`). Fold it back to its IPv4
+  # 4-tuple so it matches an IPv4 CIDR allowlist (e.g. `172.16.0.0/12`); without
+  # this the 8-tuple peer never matches a 4-tuple network and a legitimately
+  # proxied HTTPS request is misread as plain HTTP and refused.
+  defp normalize_peer_ip({0, 0, 0, 0, 0, 0xFFFF, g, h}) do
+    {Bitwise.bsr(g, 8), Bitwise.band(g, 0xFF), Bitwise.bsr(h, 8), Bitwise.band(h, 0xFF)}
+  end
+
+  defp normalize_peer_ip(ip), do: ip
 
   # ----- effective scheme -----
 

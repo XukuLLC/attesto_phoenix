@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2] - 2026-06-22
+
+### Fixed
+
+- `AttestoPhoenix.RequestContext` now folds an IPv4-mapped IPv6 peer address
+  (`::ffff:a.b.c.d`) back to its IPv4 tuple before testing it against
+  `:trusted_proxies`. A dual-stack listener bound on `::` (the common Docker /
+  Kamal topology, where a TLS-terminating reverse proxy reaches the app over an
+  IPv4 bridge network) surfaces the proxy peer as `::ffff:172.x.y.z`, which an
+  IPv4 CIDR allowlist (e.g. `172.16.0.0/12`) never matched — so the proxy was
+  treated as untrusted, `X-Forwarded-Proto: https` was ignored, and a
+  legitimately TLS-terminated request to the token / protected-resource
+  endpoint was misread as plain HTTP and refused with `invalid_request`
+  ("TLS required"). The fold makes the forwarded-header trust gate work behind
+  such a proxy without widening the allowlist to IPv6.
+
 ## [0.14.1] - 2026-06-22
 
 ### Fixed

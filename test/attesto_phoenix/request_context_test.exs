@@ -110,6 +110,22 @@ defmodule AttestoPhoenix.RequestContextTest do
              )
     end
 
+    test "IPv4-mapped IPv6 peer matches an IPv4 CIDR (dual-stack listener behind a proxy)" do
+      # A `::` listener surfaces the proxy's 172.18.0.5 peer as ::ffff:172.18.0.5.
+      cfg = config(trusted_proxies: ["172.16.0.0/12"])
+
+      assert RequestContext.from_trusted_proxy?(
+               build_conn(:get, "/", remote_ip: {0, 0, 0, 0, 0, 0xFFFF, 0xAC12, 0x0005}),
+               cfg
+             )
+
+      # ::ffff:10.0.0.1 is outside 172.16.0.0/12 once folded to IPv4.
+      refute RequestContext.from_trusted_proxy?(
+               build_conn(:get, "/", remote_ip: {0, 0, 0, 0, 0, 0xFFFF, 0x0A00, 0x0001}),
+               cfg
+             )
+    end
+
     test "IPv6 CIDR subnet match" do
       cfg = config(trusted_proxies: ["fd00::/8"])
 
