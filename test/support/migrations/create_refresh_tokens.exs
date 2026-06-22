@@ -21,6 +21,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateRefreshTokens do
       add(:client_id, :string)
       add(:subject, :string, null: false)
       add(:scope, {:array, :string}, null: false, default: [])
+      add(:resource, {:array, :string}, null: false, default: [])
       add(:cnf, :map)
       add(:claims, :map, null: false, default: %{})
       add(:consumed, :boolean, null: false, default: false)

@@ -322,6 +322,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :client_id, :string, size: <%= @identifier_size %>, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
         add :scope, {:array, :string}, null: false, default: []
+        # RFC 8707 resource indicator(s) bound at authorization time; the token
+        # endpoint mints the access token `aud` from this set.
+        add :resource, {:array, :string}, null: false, default: []
         add :redirect_uri, :text, null: false
         # PKCE binding (RFC 7636, section 4.3). Stored so the token endpoint can
         # verify the code_verifier presented at redemption.
@@ -375,6 +378,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :client_id, :string, size: <%= @identifier_size %>
         add :subject, :string, size: <%= @identifier_size %>, null: false
         add :scope, {:array, :string}, null: false, default: []
+        # RFC 8707 resource indicator(s) bound to the grant; carried through
+        # rotation (subset-only narrowing) so the refreshed token's `aud` matches.
+        add :resource, {:array, :string}, null: false, default: []
         add :cnf, :map
         add :claims, :map, null: false, default: %{}
         # consumed is flipped false -> true by the atomic rotation claim

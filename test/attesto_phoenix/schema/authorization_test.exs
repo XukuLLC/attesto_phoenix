@@ -181,6 +181,7 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
                client_id: "client-123",
                subject: "subject-abc",
                scope: ["read", "write"],
+               resource: [],
                redirect_uri: "https://rp.example/cb",
                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
                code_challenge_method: "S256",

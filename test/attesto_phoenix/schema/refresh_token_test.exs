@@ -170,6 +170,7 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
       assert record.data == %{
                subject: "subject-1",
                scope: ["read", "write"],
+               resource: [],
                client_id: "client-1",
                dpop_jkt: nil,
                claims: %{"k" => "v"}
@@ -226,6 +227,7 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
                context: %{
                  subject: "subject-1",
                  scope: ["read"],
+                 resource: [],
                  client_id: "client-1",
                  dpop_jkt: "thumb-xyz",
                  claims: %{"tenant" => "t1"}
@@ -243,6 +245,7 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
         data: %{
           subject: "subject-1",
           scope: ["read", "write"],
+          resource: ["https://api.example/mcp"],
           client_id: "client-1",
           dpop_jkt: "thumb-xyz",
           claims: %{"tenant" => "t1"}

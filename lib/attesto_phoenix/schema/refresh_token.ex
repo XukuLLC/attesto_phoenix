@@ -80,6 +80,7 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     field :client_id, :string
     field :subject, :string
     field :scope, {:array, :string}, default: []
+    field :resource, {:array, :string}, default: []
     field :cnf, :map
     field :claims, :map, default: %{}
     field :consumed, :boolean, default: false
@@ -100,6 +101,7 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     :client_id,
     :subject,
     :scope,
+    :resource,
     :cnf,
     :claims,
     :consumed,
@@ -167,6 +169,7 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       generation: Map.fetch!(record, :generation),
       subject: Map.get(data, :subject),
       scope: Map.get(data, :scope, []),
+      resource: Map.get(data, :resource, []),
       client_id: Map.get(data, :client_id),
       cnf: cnf_from_context(data),
       claims: Map.get(data, :claims, %{}),
@@ -197,6 +200,7 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       data: %{
         subject: row.subject,
         scope: row.scope || [],
+        resource: row.resource || [],
         client_id: row.client_id,
         dpop_jkt: jkt_from_cnf(row.cnf),
         claims: row.claims || %{}
@@ -281,6 +285,7 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     %{
       subject: value(context, :subject),
       scope: value(context, :scope) || [],
+      resource: value(context, :resource) || [],
       client_id: value(context, :client_id),
       dpop_jkt: value(context, :dpop_jkt),
       claims: value(context, :claims) || %{}

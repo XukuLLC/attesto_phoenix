@@ -93,6 +93,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
           client_id: String.t() | nil,
           subject: String.t() | nil,
           scope: [String.t()] | nil,
+          resource: [String.t()] | nil,
           redirect_uri: String.t() | nil,
           code_challenge: String.t() | nil,
           code_challenge_method: String.t() | nil,
@@ -125,6 +126,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
     field :client_id, :string
     field :subject, :string
     field :scope, {:array, :string}, default: []
+    field :resource, {:array, :string}, default: []
     field :redirect_uri, :string
     field :code_challenge, :string
     # No default: a code issued without a PKCE challenge (the host relaxed PKCE
@@ -159,6 +161,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
   # S256, see validate_inclusion below); when absent the columns are NULL.
   @optional [
     :scope,
+    :resource,
     :cnf,
     :nonce,
     :claims,
@@ -219,6 +222,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
       client_id: Map.get(data, :client_id),
       subject: Map.get(data, :subject),
       scope: Map.get(data, :scope, []),
+      resource: Map.get(data, :resource, []),
       redirect_uri: Map.get(data, :redirect_uri),
       code_challenge: Map.get(data, :code_challenge),
       code_challenge_method: code_challenge_method_for(data),
@@ -255,6 +259,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
         client_id: row.client_id,
         subject: row.subject,
         scope: row.scope || [],
+        resource: row.resource || [],
         redirect_uri: row.redirect_uri,
         code_challenge: row.code_challenge,
         code_challenge_method: row.code_challenge_method,
