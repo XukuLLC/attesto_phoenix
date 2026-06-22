@@ -53,15 +53,26 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   @app :attesto_phoenix
   @successor_aad "attesto_phoenix:refresh_successor:v1"
 
+  # Namespace (first key of Postgres' two-argument advisory-lock form) for the
+  # per-family rotation/revocation serialization locks, so they cannot collide
+  # with advisory locks any other subsystem takes. Arbitrary but stable.
+  @advisory_lock_namespace 0x4154_5246
+
   @doc """
   Persists a new (unconsumed) refresh-token record.
 
   Returns `{:error, :family_revoked}` when the record's `:family_id` has
   already been revoked, and the row is NOT written. The revocation check and
-  the insert run in one transaction so a concurrent `revoke_family/1` cannot
-  slip between them and leave a live successor in a revoked family (sticky
-  revocation, RFC 6749 §10.4). The opaque store record is flattened onto the
-  schema columns by `AttestoPhoenix.Schema.RefreshToken.from_store_record/2`.
+  the insert run in one transaction holding a per-family advisory lock (shared
+  with `revoke_family/1`), so a concurrent revocation cannot interleave and
+  leave a live successor in a revoked family (sticky revocation, RFC 6749
+  §10.4). A plain `FOR UPDATE` on the existing rows would not suffice: under
+  `READ COMMITTED` a revoking `UPDATE` that began before this insert committed
+  would not see the just-inserted successor (a phantom), leaving it live. The
+  advisory lock serializes the two operations outright, so a revocation that
+  loses the race still runs its `UPDATE` on a fresh snapshot that includes the
+  new row. The opaque store record is flattened onto the schema columns by
+  `AttestoPhoenix.Schema.RefreshToken.from_store_record/2`.
   """
   @impl Attesto.RefreshStore
   @spec insert(Attesto.RefreshStore.entry()) :: :ok | {:error, :family_revoked}
@@ -69,6 +80,8 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       when is_binary(token_hash) and is_binary(family_id) do
     result =
       repo().transaction(fn ->
+        lock_family!(family_id)
+
         if family_revoked?(family_id) do
           # Sticky revocation: refuse a successor whose claim won before the
           # revocation landed (RFC 6749 §10.4 family revocation).
@@ -173,15 +186,34 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   The rows are kept (their `:family_revoked` flag is set) rather than deleted,
   so the revocation is sticky: a successor `insert/1` serialized after this call
-  is refused (see `insert/1`). Idempotent: re-revoking is a no-op re-set, and
-  revoking an unknown family updates nothing and returns `:ok`.
+  is refused (see `insert/1`). The revocation runs in a transaction holding the
+  same per-family advisory lock as `insert/1`, so a concurrent successor insert
+  cannot slip a live row past it: a revocation that wins the lock is seen by the
+  later insert (refused); one that loses runs its `UPDATE` after the insert has
+  committed, on a fresh snapshot that includes the new row. Idempotent:
+  re-revoking is a no-op re-set, and revoking an unknown family updates nothing
+  and returns `:ok`.
   """
   @impl Attesto.RefreshStore
   @spec revoke_family(Attesto.RefreshStore.family_id()) :: :ok
   def revoke_family(family_id) when is_binary(family_id) do
-    query = from r in RefreshToken, where: r.family_id == ^family_id
-    repo().update_all(query, set: [family_revoked: true])
+    repo().transaction(fn ->
+      lock_family!(family_id)
+      query = from r in RefreshToken, where: r.family_id == ^family_id
+      repo().update_all(query, set: [family_revoked: true])
+    end)
+
     :ok
+  end
+
+  # RFC 6749 §10.4 sticky revocation depends on `insert/1` and `revoke_family/1`
+  # never interleaving for one family. A Postgres advisory transaction lock keyed
+  # on the family id serializes them (held until the surrounding transaction
+  # ends). `hashtext/1` maps the family id to the int4 key the two-argument
+  # advisory-lock form takes; the constant first key namespaces these locks to
+  # this store so they cannot collide with another subsystem's advisory locks.
+  defp lock_family!(family_id) do
+    repo().query!("SELECT pg_advisory_xact_lock($1::int4, hashtext($2))", [@advisory_lock_namespace, family_id])
   end
 
   # No row was claimable: either the token is unknown, or it was already

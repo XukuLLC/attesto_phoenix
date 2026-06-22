@@ -21,6 +21,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Requires `attesto ~> 0.11`.
 
+### Fixed
+
+- **Refresh-family revocation race (security).** `AttestoPhoenix.Store.EctoRefreshStore`
+  now serializes `insert/1` and `revoke_family/1` for a given family with a
+  Postgres advisory transaction lock. Previously, under `READ COMMITTED`, a
+  successor insert could interleave with a concurrent family revocation and
+  leave a live token in a revoked family (a `FOR UPDATE` on existing rows would
+  not catch the just-inserted successor — a phantom). Sticky family revocation
+  (RFC 6749 §10.4 / OAuth 2.0 Security BCP) now holds under concurrency.
+
 ## [0.15.0] - 2026-06-22
 
 ### Added

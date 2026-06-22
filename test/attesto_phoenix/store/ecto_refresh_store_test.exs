@@ -26,6 +26,9 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
         data: %{
           subject: "sub-1",
           scope: ["read"],
+          resource: [],
+          acr: nil,
+          auth_time: nil,
           client_id: "client-1",
           dpop_jkt: nil,
           claims: %{"k" => "v"}
@@ -122,6 +125,9 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
         context: %{
           subject: "sub-1",
           scope: ["read"],
+          resource: [],
+          acr: nil,
+          auth_time: nil,
           client_id: "client-1",
           dpop_jkt: nil,
           claims: %{"k" => "v"}
