@@ -24,6 +24,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   alias AttestoPhoenix.Controller.TokenController
 
   @endpoint_path "/oauth/token"
+  @form_content_type "application/x-www-form-urlencoded"
+  @json_content_type "application/json"
 
   # PKCE (RFC 7636) verifier/challenge pair: challenge = b64url(sha256(verifier)).
   @code_verifier "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
@@ -183,6 +185,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client"
+      assert www_authenticate(conn) == []
     end
 
     test "rejects an unknown client without revealing its absence" do
@@ -199,7 +202,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error_description"] == "client authentication failed"
     end
 
-    test "rejects a wrong client secret" do
+    test "rejects a wrong client_secret_post secret as 400 without a challenge" do
       conn =
         post_token(%{
           "grant_type" => "client_credentials",
@@ -210,6 +213,23 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client"
       assert body(conn)["error_description"] == "client authentication failed"
+      assert www_authenticate(conn) == []
+    end
+
+    test "rejects a wrong Basic secret as 401 with a Basic challenge" do
+      credentials = Base.encode64("confidential-1:wrong")
+
+      conn =
+        :post
+        |> conn(@endpoint_path, %{"grant_type" => "client_credentials"})
+        |> put_token_content_type()
+        |> put_req_header("authorization", "Basic " <> credentials)
+        |> TokenController.create(%{"grant_type" => "client_credentials"})
+
+      assert conn.status == 401
+      assert body(conn)["error"] == "invalid_client"
+      assert body(conn)["error_description"] == "client authentication failed"
+      assert www_authenticate(conn) == [~s(Basic realm="OAuth")]
     end
 
     test "rejects a revoked client (RFC 7009)" do
@@ -232,6 +252,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         :post
         |> conn(@endpoint_path, %{"grant_type" => "unsupported"})
+        |> put_token_content_type()
         |> put_req_header("authorization", "Basic " <> credentials)
         |> TokenController.create(%{"grant_type" => "unsupported"})
 
@@ -255,6 +276,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         :post
         |> conn(@endpoint_path, %{"grant_type" => "unsupported"})
+        |> put_token_content_type()
         |> put_req_header("authorization", "Basic " <> credentials)
         |> TokenController.create(%{"grant_type" => "unsupported"})
 
@@ -272,6 +294,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         :post
         |> conn(@endpoint_path, params)
+        |> put_token_content_type()
         |> put_req_header("authorization", "Basic " <> credentials)
         |> TokenController.create(params)
 
@@ -288,6 +311,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         :post
         |> conn(@endpoint_path, params)
+        |> put_token_content_type()
         |> put_req_header("authorization", "Basic " <> credentials)
         |> TokenController.create(params)
 
@@ -309,6 +333,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         :post
         |> conn(@endpoint_path, params)
+        |> put_token_content_type()
         |> put_req_header("authorization", "Basic " <> credentials)
         |> TokenController.create(params)
 
@@ -457,11 +482,13 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         :post
         |> conn(@endpoint_path, %{"grant_type" => "client_credentials"})
+        |> put_token_content_type()
         |> put_req_header("authorization", "Basic " <> credentials)
         |> TokenController.create(%{"grant_type" => "client_credentials"})
 
-      assert conn.status == 400
+      assert conn.status == 401
       assert body(conn)["error"] == "invalid_client"
+      assert www_authenticate(conn) == [~s(Basic realm="OAuth")]
     end
 
     test "allows private_key_jwt when configured for private_key_jwt only" do
@@ -507,22 +534,26 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn =
         :post
         |> conn(@endpoint_path, %{"grant_type" => "client_credentials"})
+        |> put_token_content_type()
         |> put_req_header("authorization", "Basic not-base64!!")
         |> TokenController.create(%{"grant_type" => "client_credentials"})
 
-      assert conn.status == 400
+      assert conn.status == 401
       assert body(conn)["error"] == "invalid_client"
+      assert www_authenticate(conn) == [~s(Basic realm="OAuth")]
     end
 
-    test "rejects an unsupported authorization scheme" do
+    test "rejects an unsupported authorization scheme with a matching challenge" do
       conn =
         :post
         |> conn(@endpoint_path, %{"grant_type" => "client_credentials"})
+        |> put_token_content_type()
         |> put_req_header("authorization", "Bearer abc")
         |> TokenController.create(%{"grant_type" => "client_credentials"})
 
-      assert conn.status == 400
+      assert conn.status == 401
       assert body(conn)["error"] == "invalid_client"
+      assert www_authenticate(conn) == [~s(Bearer realm="OAuth")]
     end
   end
 
@@ -643,6 +674,46 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
   end
 
+  describe "content-type enforcement" do
+    test "rejects multipart token requests before client authentication" do
+      put_config(load_client: fn _id -> flunk("client lookup must not run for unsupported Content-Type") end)
+
+      conn = post_token_with_content_type(client_credentials_params(), "multipart/form-data; boundary=abc")
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_request"
+      assert body(conn)["error_description"] == "unsupported token request Content-Type: multipart/form-data"
+    end
+
+    test "rejects text/plain token requests before client authentication" do
+      put_config(load_client: fn _id -> flunk("client lookup must not run for unsupported Content-Type") end)
+
+      conn = post_token_with_content_type(client_credentials_params(), "text/plain")
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_request"
+      assert body(conn)["error_description"] == "unsupported token request Content-Type: text/plain"
+    end
+
+    test "accepts application/x-www-form-urlencoded token requests" do
+      enable_minting()
+
+      conn = post_token_with_content_type(client_credentials_params(), @form_content_type)
+
+      assert conn.status == 200
+      assert is_binary(body(conn)["access_token"])
+    end
+
+    test "accepts application/json token requests" do
+      enable_minting()
+
+      conn = post_token_with_content_type(client_credentials_params(), @json_content_type <> "; charset=utf-8")
+
+      assert conn.status == 200
+      assert is_binary(body(conn)["access_token"])
+    end
+  end
+
   describe "response framing" do
     test "every response carries no-store cache headers (RFC 7234 §5.2)" do
       conn = post_token(%{"grant_type" => "client_credentials"})
@@ -692,9 +763,52 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
                         metadata: metadata
                       }}
 
+      assert metadata.client_id == "confidential-1"
+      assert metadata.reason == :invalid_client
       assert metadata.error == "invalid_client"
       assert metadata.http_status == 400
-      assert metadata.sender_constraint == %{dpop_present: false, mtls_cert_present: false}
+      assert metadata.token_type == "Bearer"
+      assert metadata.sender_constraint == :none
+      assert metadata.cnf == nil
+    end
+
+    test "emits token_denied with attempted DPoP metadata for unknown clients" do
+      capture_events()
+      proof = dpop_proof([])
+
+      params = %{
+        "grant_type" => "client_credentials",
+        "client_id" => "does-not-exist",
+        "client_secret" => "whatever",
+        "scope" => "read"
+      }
+
+      %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
+
+      conn =
+        %{base | scheme: :https, host: "issuer.example", port: 443}
+        |> put_token_content_type()
+        |> put_req_header("dpop", proof)
+        |> TokenController.create(params)
+
+      assert conn.status == 400
+
+      assert_receive {:event,
+                      %AttestoPhoenix.Event{
+                        name: :token_denied,
+                        client_id: "does-not-exist",
+                        grant_type: "client_credentials",
+                        scope: "read",
+                        result: "invalid_client",
+                        metadata: metadata
+                      }}
+
+      assert metadata.client_id == "does-not-exist"
+      assert metadata.reason == :invalid_client
+      assert metadata.error == "invalid_client"
+      assert metadata.token_type == "DPoP"
+      assert metadata.sender_constraint == :dpop
+      assert metadata.cnf == nil
     end
 
     test "emits token_denied when a valid client omits grant_type" do
@@ -740,18 +854,12 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
                       }}
     end
 
-    test "emits token_denied for invalid scope decisions" do
+    test "emits token_denied for invalid scope decisions with sender-constraint metadata" do
       capture_events()
       enable_minting()
       put_config(authorize_scope: fn _client, _requested -> {:error, :invalid_scope} end)
 
-      conn =
-        post_token(%{
-          "grant_type" => "client_credentials",
-          "client_id" => "confidential-1",
-          "client_secret" => "s3cr3t",
-          "scope" => "admin"
-        })
+      conn = post_dpop("client_credentials", dpop_proof([]))
 
       assert conn.status == 400
 
@@ -760,9 +868,17 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
                         name: :token_denied,
                         client_id: "confidential-1",
                         grant_type: "client_credentials",
-                        scope: "admin",
-                        result: "invalid_scope"
+                        scope: "read",
+                        result: "invalid_scope",
+                        metadata: metadata
                       }}
+
+      assert metadata.client_id == "confidential-1"
+      assert metadata.reason == :invalid_scope
+      assert metadata.error == "invalid_scope"
+      assert metadata.token_type == "DPoP"
+      assert metadata.sender_constraint == :dpop
+      assert metadata.cnf == nil
     end
   end
 
@@ -2130,6 +2246,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
     %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
     |> put_req_header("dpop", proof)
     |> TokenController.create(params)
   end
@@ -2139,6 +2256,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
     %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
     |> put_req_header("dpop", proof)
     |> TokenController.create(params)
   end
@@ -2154,6 +2272,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
     %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
     |> put_req_header("authorization", "Basic " <> Base.encode64("confidential-1:s3cr3t"))
     |> put_req_header("dpop", proof)
     |> TokenController.create(params)
@@ -2169,6 +2288,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
     %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
     |> put_req_header("authorization", "Basic " <> Base.encode64("confidential-1:s3cr3t"))
     |> put_req_header("dpop", proof)
     |> TokenController.create(params)
@@ -2185,6 +2305,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
     %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
     |> put_req_header("dpop", proof)
     |> TokenController.create(params)
   end
@@ -2222,23 +2343,39 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   defp post_token(params) do
     :post
     |> conn(@endpoint_path, params)
+    |> put_token_content_type()
     |> TokenController.create(params)
   end
 
   defp post_token_with_query(query, params) do
     :post
     |> conn(@endpoint_path <> "?" <> query, params)
+    |> put_token_content_type()
     |> TokenController.create(params)
   end
 
   defp post_token_with_basic_auth(params) do
     :post
     |> conn(@endpoint_path, params)
+    |> put_token_content_type()
     |> put_req_header("authorization", "Basic " <> Base.encode64("confidential-1:s3cr3t"))
     |> TokenController.create(params)
   end
 
+  defp post_token_with_content_type(params, content_type) do
+    :post
+    |> conn(@endpoint_path, params)
+    |> put_token_content_type(content_type)
+    |> TokenController.create(params)
+  end
+
+  defp put_token_content_type(conn, content_type \\ @form_content_type) do
+    put_req_header(conn, "content-type", content_type)
+  end
+
   defp body(conn), do: JSON.decode!(conn.resp_body)
+
+  defp www_authenticate(conn), do: get_resp_header(conn, "www-authenticate")
 
   defp client_assertion(jwk, client_id, overrides \\ %{}) do
     now = System.system_time(:second)

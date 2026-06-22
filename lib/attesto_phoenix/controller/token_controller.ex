@@ -50,10 +50,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   import Plug.Conn
 
+  alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, Event, OAuthError, RequestContext}
-  alias AttestoPhoenix.ClientAuthentication.Policy
+  alias AttestoPhoenix.ClientAuthentication.{ErrorContext, Policy}
   alias Plug.Conn.Unfetched
 
   # RFC 7234 §5.2: token responses and errors must never be cached.
@@ -68,6 +69,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # scope in the form body. Query-string credentials leak through access logs
   # and caches, so reject them before client authentication or grant dispatch.
   @query_credential_params ~w(grant_type client_id client_secret scope)
+  @accepted_content_types ~w(application/x-www-form-urlencoded application/json)
 
   # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
   # to the core as data.
@@ -94,12 +96,49 @@ defmodule AttestoPhoenix.Controller.TokenController do
     config = resolve_config()
     conn = put_no_store_headers(conn)
 
-    case reject_query_credentials(conn) do
-      :ok ->
-        create_transport_checked(config, conn, params)
-
+    with :ok <- require_token_content_type(conn),
+         :ok <- reject_query_credentials(conn) do
+      create_transport_checked(config, conn, params)
+    else
       {:error, %OAuthError{} = err} ->
         deny(config, conn, request_body_params(conn, params), nil, err)
+    end
+  end
+
+  defp require_token_content_type(conn) do
+    case token_content_type(conn) do
+      content_type when content_type in @accepted_content_types ->
+        :ok
+
+      nil ->
+        {:error, error(@error_invalid_request, "missing Content-Type")}
+
+      content_type ->
+        {:error, error(@error_invalid_request, "unsupported token request Content-Type: #{content_type}")}
+    end
+  end
+
+  defp token_content_type(conn) do
+    case get_req_header(conn, "content-type") do
+      [content_type | _] ->
+        content_type
+        |> String.split(";", parts: 2)
+        |> hd()
+        |> String.trim()
+        |> String.downcase()
+
+      [] ->
+        nil
+    end
+  end
+
+  defp reject_query_credentials(conn) do
+    case Enum.find(@query_credential_params, &Map.has_key?(query_params(conn), &1)) do
+      nil ->
+        :ok
+
+      key ->
+        {:error, error(@error_invalid_request, "#{key} must be sent in the request body, not the query string")}
     end
   end
 
@@ -111,16 +150,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
       {:error, :insecure_transport} ->
         # RFC 6749 §3.2 / §10.1: the token endpoint requires TLS.
         deny(config, conn, params, nil, error(@error_invalid_request, "TLS required"))
-    end
-  end
-
-  defp reject_query_credentials(conn) do
-    case Enum.find(@query_credential_params, &Map.has_key?(query_params(conn), &1)) do
-      nil ->
-        :ok
-
-      key ->
-        {:error, error(@error_invalid_request, "#{key} must be sent in the request body, not the query string")}
     end
   end
 
@@ -261,15 +290,54 @@ defmodule AttestoPhoenix.Controller.TokenController do
       assertion_signing_algs: config.client_auth_signing_algs
     }
 
-    case ClientAuthentication.authenticate(
+    case ClientAuthentication.authenticate_with_context(
            get_req_header(conn, "authorization"),
            params,
            config,
            policy
          ) do
-      {:ok, %ClientAuthentication.Result{client: client, method: method}} -> {:ok, client, method}
-      {:error, %OAuthError{}} = err -> err
+      {:ok, %ClientAuthentication.Result{client: client, method: method}} ->
+        {:ok, client, method}
+
+      {:error, %OAuthError{} = err, %ErrorContext{} = context} ->
+        {:error, token_endpoint_client_auth_error(config, err, context)}
     end
+  end
+
+  # RFC 6749 §5.2: `invalid_client` caused by an `Authorization`-header client
+  # authentication attempt is rendered as 401 with a matching challenge. Body
+  # credentials and absent credentials stay the ordinary 400 `invalid_client`.
+  defp token_endpoint_client_auth_error(config, %OAuthError{error: :invalid_client} = err, %ErrorContext{
+         authorization_scheme: scheme
+       })
+       when is_binary(scheme) do
+    %{
+      err
+      | status: 401,
+        headers: put_www_authenticate(err.headers, client_auth_challenge(config, scheme))
+    }
+  end
+
+  defp token_endpoint_client_auth_error(_config, %OAuthError{} = err, _context), do: err
+
+  defp put_www_authenticate(headers, challenge) do
+    headers
+    |> Enum.reject(fn {key, _value} -> String.downcase(key) == "www-authenticate" end)
+    |> Kernel.++([{"www-authenticate", challenge}])
+  end
+
+  defp client_auth_challenge(%Config{} = config, scheme) do
+    challenge_scheme(scheme) <> ~s( realm="#{escape_auth_param(config.basic_realm || "OAuth")}")
+  end
+
+  defp challenge_scheme(scheme) do
+    if String.downcase(scheme) == "basic", do: "Basic", else: scheme
+  end
+
+  defp escape_auth_param(value) do
+    value
+    |> String.replace("\\", "\\\\")
+    |> String.replace("\"", "\\\"")
   end
 
   defp fetch_grant_type(%{"grant_type" => gt}) when is_binary(gt) and gt != "", do: {:ok, gt}
@@ -291,21 +359,24 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # grant or client-auth failure, and the client may be unauthenticated.
   defp deny(config, conn, params, client, %OAuthError{} = err) do
     code = Atom.to_string(err.error)
+    client_id = denial_client_id(config, conn, params, client)
 
     Event.emit(config, :token_denied, %{
-      client_id: denial_client_id(config, conn, params, client),
+      client_id: client_id,
       scope: optional_param(params, "scope"),
       grant_type: optional_param(params, "grant_type"),
       result: code,
       metadata:
         %{
           client_ip: RequestContext.client_ip(conn, config),
+          client_id: client_id,
+          reason: err.error,
           error: code,
           error_description: err.error_description,
-          http_status: err.status,
-          sender_constraint: sender_constraint_context(config, conn)
+          http_status: err.status
         }
-        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+        |> Map.merge(sender_constraint_audit_metadata(config, conn))
+        |> Enum.reject(fn {key, value} -> key != :cnf and is_nil(value) end)
         |> Map.new()
     })
 
@@ -336,11 +407,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
     end
   end
 
-  defp sender_constraint_context(config, conn) do
-    %{
-      dpop_present: get_req_header(conn, @dpop_request_header) != [],
-      mtls_cert_present: is_binary(RequestContext.cert_der(conn, config))
-    }
+  defp sender_constraint_audit_metadata(config, conn) do
+    SenderConstraint.audit_metadata(config, sender_constraint_input(config, conn))
   end
 
   # ── Rendering (RFC 6749 §5.2) ────────────────────────────────────────────

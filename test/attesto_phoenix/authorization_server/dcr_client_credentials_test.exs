@@ -300,6 +300,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       conn =
         :post
         |> conn("/oauth/token", %{"grant_type" => "client_credentials"})
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
         |> put_req_header("authorization", "Basic " <> Base.encode64("#{client_id}:#{secret}"))
         |> TokenController.create(%{"grant_type" => "client_credentials"})
 
@@ -326,11 +327,13 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       conn =
         :post
         |> conn("/oauth/token", %{"grant_type" => "client_credentials"})
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
         |> put_req_header("authorization", "Basic " <> Base.encode64("#{client_id}:wrong-secret"))
         |> TokenController.create(%{"grant_type" => "client_credentials"})
 
-      # RFC 6749 §5.2: invalid_client is 400 (or 401 with a challenge).
-      assert conn.status in [400, 401]
+      # RFC 6749 §5.2: header-auth invalid_client is 401 with a challenge.
+      assert conn.status == 401
+      assert get_resp_header(conn, "www-authenticate") == [~s(Basic realm="OAuth")]
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
     end
   end
