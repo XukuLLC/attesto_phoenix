@@ -173,6 +173,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   defp validation_code_atom("invalid_request"), do: :invalid_request
   defp validation_code_atom("invalid_request_object"), do: :invalid_request_object
   defp validation_code_atom("invalid_scope"), do: :invalid_scope
+  # RFC 8707 §2: a malformed `resource` indicator pushed via PAR.
+  defp validation_code_atom("invalid_target"), do: :invalid_target
   defp validation_code_atom("unsupported_response_type"), do: :unsupported_response_type
   defp validation_code_atom("request_not_supported"), do: :request_not_supported
   defp validation_code_atom("request_uri_not_supported"), do: :request_uri_not_supported

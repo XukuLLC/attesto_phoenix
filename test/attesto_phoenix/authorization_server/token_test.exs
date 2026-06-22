@@ -440,6 +440,39 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                cnf: nil
              }
     end
+
+    test "RFC 8707: token exchange cannot widen audience beyond the subject token" do
+      a = "https://api.example/a"
+      b = "https://api.example/b"
+      config = config(resource_indicators: [allowed_resources: [a, b]])
+
+      # Subject token audienced to the AS audience + resource A (so it verifies
+      # AND carries A); it was never granted resource B.
+      subject_request =
+        request(config, params: %{"scope" => "read", "resource" => ["https://issuer.example", a]})
+
+      assert {:ok, subject_response, _} = Token.issue(config, subject_request)
+
+      exchange = fn resource ->
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read",
+            "resource" => resource
+          }
+        )
+      end
+
+      # A is within the subject token's aud → honored.
+      assert {:ok, ok_response, _} = Token.issue(config, exchange.(a))
+      assert aud!(ok_response.access_token) == a
+
+      # B is an allow-listed server resource but NOT in the subject token's aud,
+      # so exchanging for it would widen authority — refused.
+      assert {:error, %OAuthError{error: :invalid_target}, _} = Token.issue(config, exchange.(b))
+    end
   end
 
   describe "denials (RFC 6749 §5.2)" do

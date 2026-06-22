@@ -190,6 +190,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              SenderConstraint.binding_jkt(binding)
            ),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
+         {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
            mint(
              config,
@@ -200,9 +201,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              binding,
              access_token_claims(grant),
              # RFC 8707 §2.2: the access token's `aud` is the resource set the
-             # user authorized (bound to the code), not a value re-submitted at
-             # redemption.
-             audience_opts(grant.resource)
+             # user authorized (bound to the code), optionally narrowed by a
+             # request-time `resource` — never widened by one.
+             audience_opts(audience)
            ),
          # OIDC Core §3.1.3.3: when the request was an OpenID Connect
          # Authentication Request (granted scope contains `openid`), the token
@@ -301,6 +302,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          :ok <- require_scope_within_subject_token(requested, claims),
          {:ok, scope} <- authorize_scope(config, client, requested),
          {:ok, audience} <- request_resource_audience(config, client, params),
+         :ok <- require_resource_within_subject_token(audience, claims),
          {:ok, response} <- mint_exchanged_token(config, claims, scope, token_type, binding, audience) do
       response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
       {:ok, response, [token_issued_event(request, scope, "token_exchange", token_type, binding)]}
@@ -429,6 +431,25 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
       {:error, :invalid_target} ->
         {:error, error(@error_invalid_target, "the requested resource is not served by this authorization server")}
+    end
+  end
+
+  # RFC 8707: a `resource` presented at authorization-code redemption may NARROW
+  # the set the code was bound to (a subset the user already authorized) but never
+  # widen it — a requested resource outside the bound set is `invalid_target`, and
+  # a malformed one is rejected (§2.1). Absent, the full bound set is used.
+  defp resolve_code_resource(grant, params) do
+    case ResourceIndicator.validate(Map.get(params, "resource")) do
+      {:ok, []} ->
+        {:ok, grant.resource}
+
+      {:ok, requested} ->
+        if Enum.all?(requested, &(&1 in grant.resource)),
+          do: {:ok, requested},
+          else: {:error, error(@error_invalid_target, "the requested resource is not within the grant")}
+
+      {:error, :invalid_target} ->
+        {:error, error(@error_invalid_target, "resource is not a valid absolute-URI indicator (RFC 8707 §2.1)")}
     end
   end
 
@@ -818,6 +839,23 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       [] -> :ok
       _exceeded -> {:error, error(@error_invalid_scope, "requested scope exceeds the subject token")}
     end
+  end
+
+  # RFC 8693 §2.1 + RFC 8707: token exchange MUST NOT carry authority the subject
+  # token lacks. Just as scope is ceilinged to the subject token's scope, a
+  # requested `resource` is ceilinged to the subject token's own `aud` - a token
+  # confined to resource A cannot be exchanged for a token audienced to sibling
+  # resource B, even if B is otherwise an allow-listed server resource. An absent
+  # `resource` (`[]`) requests no resource-specific audience and is unconstrained
+  # here (the exchanged token keeps `config.audience`).
+  defp require_resource_within_subject_token([], _claims), do: :ok
+
+  defp require_resource_within_subject_token(requested, claims) do
+    subject_aud = List.wrap(Map.get(claims, "aud"))
+
+    if Enum.all?(requested, &(&1 in subject_aud)),
+      do: :ok,
+      else: {:error, error(@error_invalid_target, "requested resource exceeds the subject token's audience")}
   end
 
   defp subject_token_scope(claims) do
