@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **RFC 9470 Step-Up Authentication.** The token endpoint mints the
+  authentication context (`acr` / `auth_time`) onto access tokens so a resource
+  server can enforce a step-up requirement: `authorization_code` mints them from
+  the redeemed code's claims, and the refresh family persists and replays the
+  ORIGINAL `acr` / `auth_time` (never re-stamped on rotation). A machine grant
+  establishes no auth context and so fails closed against any step-up
+  requirement. New `acr` / `auth_time` columns on `attesto_refresh_tokens`
+  (migration generator + schema).
+
+### Changed
+
+- Requires `attesto ~> 0.11`.
+
 ## [0.15.0] - 2026-06-22
 
 ### Added
