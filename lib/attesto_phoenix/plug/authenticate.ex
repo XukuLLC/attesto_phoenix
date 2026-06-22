@@ -30,6 +30,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   alias Attesto.Plug.Authenticate, as: CoreAuthenticate
   alias Attesto.Plug.OAuthError
   alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
+  alias AttestoPhoenix.Store.NonceStore
 
   @claims_key :attesto_claims
   @principal_key :attesto_principal
@@ -167,18 +168,25 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   defp replay_check(%Config{dpop_enabled: false}), do: nil
   defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  defp replay_check(%Config{replay_check: callback}), do: callback
+  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
+  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
+  # function. Adapt every callback form into a closure before handing it over.
+  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
 
-  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store}) when is_atom(store) and not is_nil(store) do
+  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store} = config)
+       when is_atom(store) and not is_nil(store) do
     fn nonce ->
-      if store.valid?(nonce), do: :ok, else: {:error, :use_dpop_nonce}
+      if NonceStore.valid?(config, store, nonce), do: :ok, else: {:error, :use_dpop_nonce}
     end
   end
 
   defp nonce_check(_config), do: nil
 
-  defp nonce_issue(%Config{dpop_nonce_required: true, nonce_store: store}) when is_atom(store) and not is_nil(store) do
-    &store.issue/0
+  # Thread the resolved config so a persistent store never has to re-resolve its
+  # repo from a guessed otp_app.
+  defp nonce_issue(%Config{dpop_nonce_required: true, nonce_store: store} = config)
+       when is_atom(store) and not is_nil(store) do
+    fn -> NonceStore.issue(config, store) end
   end
 
   defp nonce_issue(_config), do: nil
