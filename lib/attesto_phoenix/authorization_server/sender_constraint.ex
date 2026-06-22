@@ -317,7 +317,12 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
             {:ok, {:mtls, x5t}, @token_type_bearer}
 
           {:error, _reason} ->
-            {:error, error(@error_invalid_client, "invalid client certificate")}
+            # The presented bytes are not a parseable X.509 certificate, so there
+            # is nothing to bind a token to (RFC 8705 §3 binds the SHA-256 of a
+            # certificate's DER). This is a malformed request parameter, not a
+            # client-authentication failure (the client may have authenticated by
+            # secret), so it surfaces as `invalid_request`.
+            {:error, error(@error_invalid_request, "invalid client certificate")}
         end
 
       _ ->

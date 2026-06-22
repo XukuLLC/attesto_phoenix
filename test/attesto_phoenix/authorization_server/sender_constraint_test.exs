@@ -254,10 +254,12 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
                )
     end
 
-    test "an unparseable certificate is rejected with invalid_client" do
+    test "an unparseable certificate is rejected with invalid_request" do
       config = base_config(mtls_enabled: true)
 
-      assert {:error, %OAuthError{error: :invalid_client}} =
+      # Non-X.509 bytes are a malformed request parameter (there is no
+      # certificate to bind), not a client-authentication failure.
+      assert {:error, %OAuthError{error: :invalid_request, error_description: "invalid client certificate"}} =
                SenderConstraint.resolve(config, input(mtls_cert_der: "not-a-cert"), @plain)
     end
   end

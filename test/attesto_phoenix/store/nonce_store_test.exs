@@ -27,14 +27,16 @@ defmodule AttestoPhoenix.Store.NonceStoreTest do
     def valid?(%Config{issuer: issuer}, nonce), do: nonce == "live:#{issuer}"
   end
 
-  # A config-free store (the ETS shape): no config-aware arities, so the
-  # dispatcher must use the behaviour entrypoints.
+  # A config-free store implementing the `Attesto.DPoP.NonceStore` behaviour
+  # EXACTLY - only `issue/1` and `valid?/1`, with no arity-0 convenience. The
+  # dispatcher must call `issue/1` (not `issue/0`); a regression to `store.issue()`
+  # would crash here.
   defmodule ConfigFree do
     @moduledoc false
     @behaviour Attesto.DPoP.NonceStore
 
     @impl true
-    def issue(ttl \\ 300), do: "free-issued:#{ttl}"
+    def issue(ttl), do: "free-issued:#{ttl}"
 
     @impl true
     def valid?(nonce), do: nonce == "free-live"

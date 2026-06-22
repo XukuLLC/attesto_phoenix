@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1] - 2026-06-22
+
+### Fixed
+
+- `AttestoPhoenix.Store.NonceStore` now calls the `Attesto.DPoP.NonceStore`
+  behaviour callback `issue/1` (with an explicit TTL) on its config-free
+  fallback, instead of an arity-0 `issue/0` that the behaviour does not
+  guarantee. A third-party nonce store implementing the behaviour exactly
+  (`issue/1` only, without an arity-0 convenience) is now dispatched correctly
+  rather than crashing in the fallback. The bundled ETS and Ecto stores are
+  unaffected. Doc corrected to stop referring to a non-existent `issue/0`.
+- The token endpoint now rejects a request carrying more than one `DPoP` header
+  outright with `invalid_dpop_proof` (RFC 9449 §4.3), rather than silently
+  selecting one proof — closing a header-smuggling vector where an intermediary
+  could inject an attacker's proof.
+- An unparseable client certificate at the token endpoint now returns
+  `invalid_request` ("invalid client certificate") rather than `invalid_client`:
+  non-X.509 bytes are a malformed request parameter (there is nothing to bind a
+  token to), not a client-authentication failure.
+- The token-endpoint denial path no longer raises when the request body was
+  never parsed (e.g. a rejected/unsupported `Content-Type` leaves `body_params`
+  an `%Plug.Conn.Unfetched{}` struct). It now falls back to the action params
+  instead of treating the struct as parsed params and raising on key access.
+
 ## [0.14.0] - 2026-06-22
 
 ### Security
