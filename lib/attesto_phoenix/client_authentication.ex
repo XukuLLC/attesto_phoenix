@@ -54,7 +54,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
   ## Return value
 
   `authenticate/4` returns `{:ok, %Result{client, client_id, method}}` or
-  `{:error, %AttestoPhoenix.OAuthError{}}`. It reads only data: the
+  `{:error, %AttestoPhoenix.OAuthError{}}`. `authenticate_with_context/4`
+  keeps the same successful return and adds transport context to errors for
+  endpoints that must distinguish `Authorization`-header authentication attempts
+  while rendering. Both functions read only data: the
   `Authorization` header values and the parsed body params. It never touches a
   conn and never emits an event - the caller renders the result/error and
   emits whatever audit event it owns.
@@ -131,9 +134,29 @@ defmodule AttestoPhoenix.ClientAuthentication do
     defstruct [:client, :client_id, :method]
   end
 
+  defmodule ErrorContext do
+    @moduledoc """
+    Transport facts known while classifying client authentication.
+
+    `:authorization_scheme` is the request-header authentication scheme the
+    client attempted, `"Basic"` for a present but unusable scheme token, or
+    `nil` when no `Authorization` header was present. It is intentionally
+    detached from the error code: callers decide whether a particular OAuth
+    error should be rendered with a challenge.
+    """
+
+    @type t :: %__MODULE__{
+            authorization_scheme: String.t() | nil
+          }
+
+    defstruct [:authorization_scheme]
+  end
+
   # RFC 6749 §5.2 error codes.
   @error_invalid_request "invalid_request"
   @error_invalid_client "invalid_client"
+
+  @auth_scheme_re ~r/\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
 
   # Generic, non-revealing message for any failure on the client
   # authentication path (RFC 6749 §2.3): an attacker must not be able to tell
@@ -153,6 +176,34 @@ defmodule AttestoPhoenix.ClientAuthentication do
           {:ok, Result.t()} | {:error, OAuthError.t()}
   def authenticate(authorization_headers, params, %Config{} = config, %Policy{} = policy)
       when is_list(authorization_headers) and is_map(params) do
+    case authenticate_with_context(authorization_headers, params, config, policy) do
+      {:ok, %Result{} = result} -> {:ok, result}
+      {:error, %OAuthError{} = err, %ErrorContext{}} -> {:error, err}
+    end
+  end
+
+  @doc """
+  Authenticates the client and preserves client-authentication transport context
+  on errors.
+
+  The successful return matches `authenticate/4`. Error returns add an
+  `%ErrorContext{}` naming the `Authorization` scheme when the request attempted
+  header authentication; token-endpoint callers use it to apply RFC 6749 §5.2
+  401 challenge rules without re-reading the conn.
+  """
+  @spec authenticate_with_context([String.t()], map(), Config.t(), Policy.t()) ::
+          {:ok, Result.t()} | {:error, OAuthError.t(), ErrorContext.t()}
+  def authenticate_with_context(authorization_headers, params, %Config{} = config, %Policy{} = policy)
+      when is_list(authorization_headers) and is_map(params) do
+    context = error_context(authorization_headers)
+
+    case do_authenticate(authorization_headers, params, config, policy) do
+      {:ok, %Result{} = result} -> {:ok, result}
+      {:error, %OAuthError{} = err} -> {:error, err, context}
+    end
+  end
+
+  defp do_authenticate(authorization_headers, params, config, policy) do
     case fetch_client_credentials(authorization_headers, params, policy) do
       {:ok, :none, client_id} ->
         # RFC 6749 §2.1: identified but unauthenticated. Permitted only for
@@ -180,6 +231,32 @@ defmodule AttestoPhoenix.ClientAuthentication do
         err
     end
   end
+
+  defp error_context(headers) do
+    %ErrorContext{authorization_scheme: authorization_scheme(headers)}
+  end
+
+  defp authorization_scheme([]), do: nil
+
+  defp authorization_scheme([header | _]) when is_binary(header) do
+    scheme =
+      header
+      |> String.trim_leading()
+      |> String.split(~r/\s+/, parts: 2)
+      |> List.first()
+      |> valid_authorization_scheme()
+
+    scheme || "Basic"
+  end
+
+  defp authorization_scheme([_header | _]), do: "Basic"
+  defp authorization_scheme(_headers), do: nil
+
+  defp valid_authorization_scheme(scheme) when is_binary(scheme) and scheme != "" do
+    if Regex.match?(@auth_scheme_re, scheme), do: scheme
+  end
+
+  defp valid_authorization_scheme(_scheme), do: nil
 
   # RFC 6749 §2.3: a client MUST NOT use more than one authentication method.
   #

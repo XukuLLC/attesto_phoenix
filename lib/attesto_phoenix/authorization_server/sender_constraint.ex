@@ -122,6 +122,32 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   end
 
   @doc """
+  Sender-constraint audit metadata derivable from a token request.
+
+  This records the sender-constraint method attempted at the request boundary
+  using the same precedence as `resolve/3`, without verifying a DPoP proof or
+  certificate. It is intended for denial events, including failures that happen
+  before a binding can be resolved.
+  """
+  @spec audit_metadata(Config.t(), input()) :: %{
+          token_type: String.t(),
+          sender_constraint: :none | :dpop | :mtls,
+          cnf: nil
+        }
+  def audit_metadata(%Config{} = config, input) do
+    cond do
+      config.dpop_enabled and dpop_present?(input) ->
+        %{token_type: @token_type_dpop, sender_constraint: :dpop, cnf: nil}
+
+      config.mtls_enabled and mtls_cert_present?(input) ->
+        %{token_type: @token_type_bearer, sender_constraint: :mtls, cnf: nil}
+
+      true ->
+        %{token_type: @token_type_bearer, sender_constraint: :none, cnf: nil}
+    end
+  end
+
+  @doc """
   The `Attesto.Token.mint/3` confirmation opt for a resolved `binding`
   (RFC 9449 / RFC 8705).
 

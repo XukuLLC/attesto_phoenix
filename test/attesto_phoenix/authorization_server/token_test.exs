@@ -414,15 +414,14 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert event.grant_type == "password"
       assert event.scope == "read"
       assert event.result == "unsupported_grant_type"
+      assert event.metadata.client_id == "client-1"
+      assert event.metadata.reason == :unsupported_grant_type
       assert event.metadata.error == "unsupported_grant_type"
       assert event.metadata.http_status == 400
       assert event.metadata.client_ip == "203.0.113.7"
-      # The sender-constraint context is derived from the request input data,
-      # never from a conn.
-      assert event.metadata.sender_constraint == %{
-               dpop_present: false,
-               mtls_cert_present: false
-             }
+      assert event.metadata.token_type == "Bearer"
+      assert event.metadata.sender_constraint == :none
+      assert event.metadata.cnf == nil
     end
 
     test "an invalid scope decision (RFC 6749 §5.2) surfaces invalid_scope" do
@@ -433,6 +432,11 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert event.name == :token_denied
       assert event.result == "invalid_scope"
       assert event.scope == "admin"
+      assert event.metadata.client_id == "client-1"
+      assert event.metadata.reason == :invalid_scope
+      assert event.metadata.token_type == "Bearer"
+      assert event.metadata.sender_constraint == :none
+      assert event.metadata.cnf == nil
     end
 
     test "the request-derived client_id is the denial fallback when no :client_id callback" do

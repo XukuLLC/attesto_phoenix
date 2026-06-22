@@ -77,7 +77,8 @@ if Code.ensure_loaded?(OpenApiSpex) do
     end
 
     @doc """
-    Returns the token request body for `application/x-www-form-urlencoded`.
+    Returns the token request body for the media types accepted by the token
+    controller.
     """
     @spec request_body() :: RequestBody.t()
     def request_body do
@@ -85,7 +86,8 @@ if Code.ensure_loaded?(OpenApiSpex) do
         description: "OAuth 2.0 token request body (RFC 6749 §3.2).",
         required: true,
         content: %{
-          @form_urlencoded => %MediaType{schema: schema_ref(@request_schema)}
+          @form_urlencoded => %MediaType{schema: schema_ref(@request_schema)},
+          @json => %MediaType{schema: schema_ref(@request_schema)}
         }
       }
     end

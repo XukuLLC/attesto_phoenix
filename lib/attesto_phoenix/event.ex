@@ -50,7 +50,10 @@ defmodule AttestoPhoenix.Event do
     response to a successful grant (RFC 6749 §5.1). Its `:metadata` includes
     `:token_type`, `:sender_constraint`, and `:cnf` so a host can audit whether
     the issued access token is plain Bearer, DPoP-bound, or mTLS-bound.
-  * `:token_denied` - a token request was rejected (RFC 6749 §5.2).
+  * `:token_denied` - a token request was rejected (RFC 6749 §5.2). Its
+    `:metadata` includes `:client_id` when known, `:reason` as the structured
+    OAuth error atom, and the sender-constraint audit fields `:token_type`,
+    `:sender_constraint`, and `:cnf`.
   * `:code_issued` - an authorization code was issued at the authorization
     endpoint in response to a successful authorization request (RFC 6749
     §4.1.2).
@@ -122,10 +125,12 @@ defmodule AttestoPhoenix.Event do
     RFC 6749 §5.2 error code such as `:invalid_client` or `:invalid_grant`).
   * `:metadata` - a host-opaque map of request metadata (for example client IP
     or request identifiers). For token issuance-like events (`:token_issued`,
-    `:refresh_issued`, and `:refresh_rotated`) this map also carries the access
-    token's sender-constraint audit fields: `:token_type` (`"Bearer"` or
-    `"DPoP"`), `:sender_constraint` (`:none`, `:dpop`, or `:mtls`), and `:cnf`
-    (`%{"jkt" => thumbprint}`, `%{"x5t#S256" => thumbprint}`, or `nil`).
+    `:refresh_issued`, and `:refresh_rotated`) and token denials
+    (`:token_denied`), this map also carries sender-constraint audit fields:
+    `:token_type` (`"Bearer"` or `"DPoP"`), `:sender_constraint` (`:none`,
+    `:dpop`, or `:mtls`), and `:cnf` (`%{"jkt" => thumbprint}`,
+    `%{"x5t#S256" => thumbprint}`, or `nil`). Denials additionally carry
+    `:reason` as the OAuth error atom and `:client_id` when known.
   """
   @type t :: %__MODULE__{
           name: name(),

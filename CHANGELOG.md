@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.5] - 2026-06-21
+
+### Added
+
+- `:token_denied` events now carry richer audit metadata: `:client_id` when
+  known, structured `:reason` as the OAuth error atom, and sender-constraint
+  fields mirroring issuance events (`:token_type`, `:sender_constraint`, and
+  `:cnf`).
+- `AttestoPhoenix.AuthorizationServer.SenderConstraint.audit_metadata/2` exposes
+  the shared sender-constraint audit classification used by token denial events.
+
+### Changed
+
+- `AttestoPhoenix.Controller.TokenController` now rejects token requests whose
+  `Content-Type` is not `application/x-www-form-urlencoded` or
+  `application/json` before client authentication. Unsupported media types
+  return `400 invalid_request` naming the rejected Content-Type.
+
+### Fixed
+
+- Token endpoint `invalid_client` responses from `Authorization`-header client
+  authentication now follow RFC 6749 §5.2: Basic/header failures return `401`
+  with a matching `WWW-Authenticate` challenge, while body credentials and
+  absent credentials remain `400` without a challenge.
+
 ## [0.13.4] - 2026-06-21
 
 ### Added

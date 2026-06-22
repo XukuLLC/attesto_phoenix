@@ -29,6 +29,9 @@ defmodule AttestoPhoenix.OpenAPI.TokenEndpointTest do
 
     assert %MediaType{schema: %Reference{"$ref": "#/components/schemas/AttestoTokenClientCredentialsRequest"}} =
              operation.requestBody.content[@form_urlencoded]
+
+    assert %MediaType{schema: %Reference{"$ref": "#/components/schemas/AttestoTokenClientCredentialsRequest"}} =
+             operation.requestBody.content[@json]
   end
 
   test "client_credentials request schema documents form credentials and scope" do

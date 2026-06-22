@@ -1113,34 +1113,30 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # the request-supplied fallback.
   defp denied_event(request, %OAuthError{} = err) do
     code = Atom.to_string(err.error)
+    client_id = denial_client_id(request)
 
     Event.new(:token_denied, %{
-      client_id: denial_client_id(request),
+      client_id: client_id,
       scope: optional_param(request.params, "scope"),
       grant_type: request.grant_type,
       result: code,
       metadata:
         %{
           client_ip: request.client_ip,
+          client_id: client_id,
+          reason: err.error,
           error: code,
           error_description: err.error_description,
-          http_status: err.status,
-          sender_constraint: sender_constraint_context(request)
+          http_status: err.status
         }
-        |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+        |> Map.merge(SenderConstraint.audit_metadata(request.config, request.sender_constraint_input))
+        |> Enum.reject(fn {key, value} -> key != :cnf and is_nil(value) end)
         |> Map.new()
     })
   end
 
   defp denial_client_id(request) do
     client_id(request.config, request.client) || request.request_client_id
-  end
-
-  defp sender_constraint_context(%Request{sender_constraint_input: input}) do
-    %{
-      dpop_present: is_binary(Map.get(input, :dpop_proof)),
-      mtls_cert_present: is_binary(Map.get(input, :mtls_cert_der))
-    }
   end
 
   # ── Request helpers ──────────────────────────────────────────────────────
