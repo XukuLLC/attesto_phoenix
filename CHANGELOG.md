@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.4] - 2026-06-21
+
+### Added
+
+- `AttestoPhoenix.ConsentGrant.binding_from_params/2` builds the same canonical
+  consent-grant binding as `binding/2` from raw string-keyed OAuth params, so
+  consent-screen mint actions and live `/authorize` consume callbacks no longer
+  need duplicate host-side binding reconstruction.
+
 ## [0.13.3] - 2026-06-21
 
 ### Added

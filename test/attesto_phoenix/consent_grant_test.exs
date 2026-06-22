@@ -26,6 +26,20 @@ defmodule AttestoPhoenix.ConsentGrantTest do
     struct!(base, overrides)
   end
 
+  defp params(overrides \\ %{}) do
+    Map.merge(
+      %{
+        "response_type" => "code",
+        "client_id" => "client-1",
+        "redirect_uri" => "https://rp.example/cb",
+        "scope" => "openid profile",
+        "code_challenge" => "challenge-xyz",
+        "code_challenge_method" => "S256"
+      },
+      overrides
+    )
+  end
+
   describe "binding/2" do
     test "maps the request fields and subject into the binding" do
       assert ConsentGrant.binding(request(), @subject) == %{
@@ -47,6 +61,59 @@ defmodule AttestoPhoenix.ConsentGrantTest do
     test "wraps a nil scope into an empty list" do
       binding = ConsentGrant.binding(request(scope: nil), @subject)
       assert binding.scope == []
+    end
+  end
+
+  describe "binding_from_params/2" do
+    test "maps raw string-keyed params into the same binding as a validated request" do
+      assert ConsentGrant.binding_from_params(params(), @subject) ==
+               ConsentGrant.binding(request(), @subject)
+    end
+
+    test "hashes byte-identically to binding/2 for the equivalent request" do
+      from_params = ConsentGrant.binding_from_params(params(), @subject)
+      from_request = ConsentGrant.binding(request(), @subject)
+
+      assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
+    end
+
+    test "scope order remains insignificant across raw params and validated request" do
+      from_params = ConsentGrant.binding_from_params(params(%{"scope" => "email openid profile"}), @subject)
+      from_request = ConsentGrant.binding(request(scope: ["openid", "profile", "email"]), @subject)
+
+      assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
+    end
+
+    test "absent PKCE params hash identically through both builders" do
+      from_params =
+        params(%{})
+        |> Map.drop(["code_challenge", "code_challenge_method"])
+        |> ConsentGrant.binding_from_params(@subject)
+
+      from_request = ConsentGrant.binding(request(code_challenge: nil, code_challenge_method: nil), @subject)
+
+      assert from_params.code_challenge == nil
+      assert from_params.code_challenge_method == nil
+      assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
+    end
+
+    test "missing scope becomes the same empty list as a nil request scope" do
+      from_params =
+        params(%{})
+        |> Map.delete("scope")
+        |> ConsentGrant.binding_from_params(@subject)
+
+      from_request = ConsentGrant.binding(request(scope: nil), @subject)
+
+      assert from_params.scope == []
+      assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
+    end
+
+    test "unknown params do not affect the canonical hash" do
+      base = ConsentGrant.binding_from_params(params(), @subject)
+      extra = ConsentGrant.binding_from_params(params(%{"future_param" => "ignored"}), @subject)
+
+      assert ConsentGrant.binding_hash(base) == ConsentGrant.binding_hash(extra)
     end
   end
 

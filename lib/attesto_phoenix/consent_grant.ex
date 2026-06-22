@@ -5,10 +5,12 @@ defmodule AttestoPhoenix.ConsentGrant do
 
   A consent grant must approve *exactly* the authorization request the resource
   owner saw — the same client, redirect URI, scope set, PKCE challenge, and
-  PKCE method — and nothing else. This module builds that binding from an
-  `%Attesto.AuthorizationRequest{}` (the validated front-channel request) plus
-  the authenticated subject, and hashes it canonically so the grant and consume
-  sides agree on one digest.
+  PKCE method — and nothing else. This module builds that binding from either
+  raw authorization params (`binding_from_params/2`, used by the consent-screen
+  mint action) or from a validated `%Attesto.AuthorizationRequest{}` (`binding/2`,
+  used by the live `/authorize` consume side). Both builders feed the same
+  canonical field list and therefore yield the same `binding_hash/1` for the
+  equivalent request.
 
   ## Canonical binding
 
@@ -53,6 +55,10 @@ defmodule AttestoPhoenix.ConsentGrant do
           code_challenge_method: String.t() | nil
         }
 
+  @binding_fields ~w(client_id redirect_uri scope code_challenge code_challenge_method)a
+  @canonical_fields [:subject] ++ @binding_fields
+  @required_hash_fields ~w(subject client_id redirect_uri)a
+
   @doc """
   Builds the consent binding for `request` consented to by `subject`.
 
@@ -64,14 +70,31 @@ defmodule AttestoPhoenix.ConsentGrant do
   """
   @spec binding(Attesto.AuthorizationRequest.t(), String.t()) :: binding()
   def binding(%Attesto.AuthorizationRequest{} = request, subject) when is_binary(subject) do
-    %{
-      subject: subject,
-      client_id: request.client_id,
-      redirect_uri: request.redirect_uri,
-      scope: List.wrap(request.scope),
-      code_challenge: request.code_challenge,
-      code_challenge_method: request.code_challenge_method
-    }
+    request
+    |> Map.from_struct()
+    |> canonical_binding(subject)
+  end
+
+  @doc """
+  Builds the consent binding from raw OAuth authorization params and `subject`.
+
+  Use this on the consent-screen mint side, where the host has the raw
+  string-keyed params that reached `/authorize` / the consent action rather than
+  the validated `%Attesto.AuthorizationRequest{}`. The consume side should keep
+  using `binding/2`.
+
+  `params` is read by string keys (`"client_id"`, `"redirect_uri"`, `"scope"`,
+  `"code_challenge"`, and `"code_challenge_method"`). Missing `"scope"` becomes
+  `[]`; a present scope string is split on spaces; missing PKCE fields become
+  `nil`. Unknown params are ignored. For the equivalent validated request,
+  `binding_hash(binding_from_params(params, subject)) ==
+  binding_hash(binding(request, subject))`.
+  """
+  @spec binding_from_params(map(), String.t()) :: binding()
+  def binding_from_params(params, subject) when is_map(params) and is_binary(subject) do
+    params
+    |> params_binding_source()
+    |> canonical_binding(subject)
   end
 
   @doc """
@@ -85,17 +108,39 @@ defmodule AttestoPhoenix.ConsentGrant do
   """
   @spec binding_hash(binding()) :: String.t()
   def binding_hash(%{} = binding) do
-    canonical =
-      [
-        Map.fetch!(binding, :subject),
-        Map.fetch!(binding, :client_id),
-        Map.fetch!(binding, :redirect_uri),
-        binding |> Map.get(:scope) |> List.wrap() |> Enum.sort() |> Enum.join(" "),
-        Map.get(binding, :code_challenge) || "",
-        Map.get(binding, :code_challenge_method) || ""
-      ]
-      |> Enum.map_join("\n", &to_string/1)
+    canonical = Enum.map_join(@canonical_fields, "\n", &canonical_hash_value(binding, &1))
 
     :sha256 |> :crypto.hash(canonical) |> Base.url_encode64(padding: false)
+  end
+
+  defp params_binding_source(params) do
+    Map.new(@binding_fields, fn field ->
+      {field, Map.get(params, Atom.to_string(field))}
+    end)
+  end
+
+  defp canonical_binding(%{} = source, subject) do
+    source
+    |> Map.take(@binding_fields)
+    |> Map.new(fn {field, value} -> {field, normalize_binding_value(field, value)} end)
+    |> Map.put(:subject, subject)
+  end
+
+  defp normalize_binding_value(:scope, nil), do: []
+  defp normalize_binding_value(:scope, scope) when is_binary(scope), do: String.split(scope, " ", trim: true)
+  defp normalize_binding_value(:scope, scope), do: List.wrap(scope)
+
+  defp normalize_binding_value(_field, value), do: value
+
+  defp canonical_hash_value(binding, :scope) do
+    binding |> Map.get(:scope) |> List.wrap() |> Enum.sort() |> Enum.join(" ")
+  end
+
+  defp canonical_hash_value(binding, field) when field in @required_hash_fields do
+    binding |> Map.fetch!(field) |> to_string()
+  end
+
+  defp canonical_hash_value(binding, field) do
+    binding |> Map.get(field) || ""
   end
 end
