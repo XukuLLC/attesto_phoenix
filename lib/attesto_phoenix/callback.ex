@@ -34,6 +34,22 @@ defmodule AttestoPhoenix.Callback do
   def invoke(callback, args, _default), do: invoke(callback, args)
 
   @doc """
+  Adapt a configured `callback` (any accepted form) into a plain 2-arity
+  function.
+
+  A DPoP replay-check callback (`(jti, ttl_seconds) -> :ok | {:error, term}`)
+  is handed to `Attesto.DPoP.verify_proof/2`, which requires a literal 2-arity
+  function (or `nil`) and rejects a `{module, function}` / `{module, function,
+  extra_args}` tuple. A host cannot put an anonymous function in config, so it
+  configures `:replay_check` as an MFA tuple; this wraps any callback form in a
+  closure that routes through `invoke/2`, so the core verifier always receives
+  the bare function it demands. A callback that is already a function is wrapped
+  transparently.
+  """
+  @spec to_fun2(callback()) :: (any(), any() -> any())
+  def to_fun2(callback), do: fn a, b -> invoke(callback, [a, b]) end
+
+  @doc """
   Read a configured callback off the config struct by `key`.
 
   This is the single reader the controllers, plugs, and core modules share for

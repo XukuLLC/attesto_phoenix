@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-06-22
+
+### Security
+
+- `AttestoPhoenix.AuthorizationServer.SenderConstraint.resolve/3` now resolves a
+  client's REQUIRED sender constraint before any opportunistic binding, so a
+  required constraint can no longer be satisfied by presenting a DIFFERENT
+  valid one. Previously the first opportunistically-present constraint was
+  bound before the client's requirement was checked: a DPoP-required client
+  that presented a client certificate (and no proof) was issued an
+  mTLS-bound token, and symmetrically an mTLS-required client presenting a DPoP
+  proof was DPoP-bound — defeating the per-client policy. Now a DPoP-required
+  client is bound only by a DPoP proof (a certificate-only request is rejected
+  with `DPoP proof required`), an mTLS-required client only by a certificate (a
+  proof-only request is rejected with `client certificate required`), and a
+  client requiring neither keeps the existing opportunistic precedence
+  (DPoP over mTLS, else Bearer).
+
+### Fixed
+
+- The token-endpoint and resource-server DPoP paths now accept a
+  `{module, function}` / `{module, function, extra_args}` MFA `:replay_check`.
+  The configured callback was passed verbatim to `Attesto.DPoP.verify_proof/2`,
+  which requires a bare 2-arity function, so a host configuring an MFA replay
+  store (the only form config can hold) crashed with an `ArgumentError` on every
+  DPoP request. All four DPoP verify sites — token endpoint, PAR, UserInfo, and
+  the `Authenticate` plug — now adapt the callback via
+  `AttestoPhoenix.Callback.to_fun2/1`.
+- `dpop_nonce_required: true` no longer crashes when `AttestoPhoenix.Config` is
+  configured under the host's own otp_app. The DPoP paths now thread the live
+  request config into nonce issuance and validation instead of letting the
+  nonce store re-resolve config from a hardcoded `:attesto_phoenix` otp_app
+  (which raised when the host configured the library elsewhere). A persistent
+  nonce store such as `AttestoPhoenix.Store.EctoNonceStore` receives the
+  resolved config and never has to guess an otp_app.
+
+### Added
+
+- `AttestoPhoenix.Callback.to_fun2/1` adapts any configured callback form into
+  the bare 2-arity function the DPoP verifier requires for `:replay_check`.
+- `AttestoPhoenix.Store.NonceStore` dispatches to the configured
+  `Attesto.DPoP.NonceStore`, threading the live `%AttestoPhoenix.Config{}` to a
+  store's config-aware `issue/2` / `valid?/2` entrypoints when present and
+  falling back to the behaviour arities for config-free stores.
+
 ## [0.13.5] - 2026-06-21
 
 ### Added

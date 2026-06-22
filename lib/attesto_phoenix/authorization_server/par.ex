@@ -227,7 +227,10 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   defp submitted_dpop_jkt(_params), do: nil
 
   defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  defp replay_check(%Config{replay_check: callback}), do: callback
+  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
+  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
+  # function. Adapt every callback form into a closure before handing it over.
+  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
 
   # The client's identifier (RFC 6749 §2.2), resolved through the host's
   # `:client_id` callback. When no `:client_id` callback is configured the

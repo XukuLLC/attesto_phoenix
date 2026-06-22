@@ -34,6 +34,51 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
     @moduledoc false
   end
 
+  # A replay store configured as a `{module, function}` MFA - the form a host
+  # supplies in config (which cannot hold a literal anonymous function). Backed
+  # by a named ETS table so a repeated `jti` is detected as a replay.
+  defmodule MfaReplay do
+    @moduledoc false
+
+    def setup do
+      if :ets.whereis(__MODULE__) == :undefined,
+        do: :ets.new(__MODULE__, [:named_table, :public, :set])
+
+      :ets.delete_all_objects(__MODULE__)
+      :ok
+    end
+
+    def check_and_record(jti, _ttl_seconds) do
+      if :ets.insert_new(__MODULE__, {jti}), do: :ok, else: {:error, :replay}
+    end
+  end
+
+  # A nonce store that mimics a persistent (repo-backed) store: its config-FREE
+  # behaviour entrypoints RAISE - exactly as `EctoNonceStore` does when it has
+  # to guess an otp_app it was not configured under. So a passing test proves
+  # the DPoP path threaded the live `%Config{}` to the config-aware `issue/2` /
+  # `valid?/2`, never re-resolving config behind the scenes.
+  defmodule ThreadedNonceStore do
+    @moduledoc false
+    @behaviour Attesto.DPoP.NonceStore
+
+    @impl true
+    def issue(_ttl_seconds), do: raise("config-free issue/1 must not be called; config must be threaded")
+
+    @impl true
+    def valid?(_nonce), do: raise("config-free valid?/1 must not be called; config must be threaded")
+
+    @spec issue(Config.t(), pos_integer()) :: String.t()
+    def issue(%Config{} = _config, ttl_seconds) when is_integer(ttl_seconds) and ttl_seconds > 0 do
+      nonce = "threaded-nonce"
+      Process.put(:threaded_nonce, nonce)
+      nonce
+    end
+
+    @spec valid?(Config.t(), String.t()) :: boolean()
+    def valid?(%Config{} = _config, nonce), do: is_binary(nonce) and Process.get(:threaded_nonce) == nonce
+  end
+
   # The `%Config{}` enforced keys the sender-constraint core never reads;
   # supplied as inert stubs so a valid struct can be built for these data tests.
   defp required_fields do
@@ -243,6 +288,127 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
 
       assert {:ok, :none, "Bearer"} =
                SenderConstraint.resolve(config, input([]), @dpop_required)
+    end
+  end
+
+  describe "a required sender-constraint cannot be satisfied by a different type (security)" do
+    test "a DPoP-required client presenting a certificate but no proof is refused, not mTLS-bound" do
+      config = base_config(dpop_enabled: true, mtls_enabled: true)
+
+      assert {:error, %OAuthError{error: :invalid_request, error_description: "DPoP proof required"}} =
+               SenderConstraint.resolve(
+                 config,
+                 input(mtls_cert_der: self_signed_cert_der()),
+                 @dpop_required
+               )
+    end
+
+    test "a DPoP-required client presenting a valid proof binds DPoP" do
+      {proof, jkt} = dpop_proof_and_jkt()
+      config = base_config(dpop_enabled: true, mtls_enabled: true)
+
+      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @dpop_required)
+    end
+
+    test "a DPoP-required client's proof binds DPoP even when a certificate is also presented" do
+      {proof, jkt} = dpop_proof_and_jkt()
+      config = base_config(dpop_enabled: true, mtls_enabled: true)
+
+      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+               SenderConstraint.resolve(
+                 config,
+                 input(dpop_proof: proof, mtls_cert_der: self_signed_cert_der()),
+                 @dpop_required
+               )
+    end
+
+    test "an mTLS-required client presenting a DPoP proof but no certificate is refused, not DPoP-bound" do
+      {proof, _jkt} = dpop_proof_and_jkt()
+      config = base_config(dpop_enabled: true, mtls_enabled: true)
+
+      assert {:error, %OAuthError{error: :invalid_client, error_description: "client certificate required"}} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @mtls_required)
+    end
+
+    test "an mTLS-required client presenting a certificate binds mTLS" do
+      der = self_signed_cert_der()
+      {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
+      config = base_config(dpop_enabled: true, mtls_enabled: true)
+
+      assert {:ok, {:mtls, ^thumbprint}, "Bearer"} =
+               SenderConstraint.resolve(config, input(mtls_cert_der: der), @mtls_required)
+    end
+
+    test "an mTLS-required client's certificate binds mTLS even when a DPoP proof is also presented" do
+      {proof, _jkt} = dpop_proof_and_jkt()
+      der = self_signed_cert_der()
+      {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
+      config = base_config(dpop_enabled: true, mtls_enabled: true)
+
+      assert {:ok, {:mtls, ^thumbprint}, "Bearer"} =
+               SenderConstraint.resolve(
+                 config,
+                 input(dpop_proof: proof, mtls_cert_der: der),
+                 @mtls_required
+               )
+    end
+  end
+
+  describe "MFA-tuple replay_check (token endpoint, RFC 9449 §11.1)" do
+    setup do
+      MfaReplay.setup()
+      :ok
+    end
+
+    test "an MFA `{module, function}` replay_check binds DPoP without an ArgumentError" do
+      {proof, jkt} = dpop_proof_and_jkt()
+      config = base_config(dpop_enabled: true, replay_check: {MfaReplay, :check_and_record})
+
+      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
+    end
+
+    test "a replayed proof is rejected through the MFA replay_check" do
+      {proof, _jkt} = dpop_proof_and_jkt()
+      config = base_config(dpop_enabled: true, replay_check: {MfaReplay, :check_and_record})
+
+      assert {:ok, {:dpop, _jkt}, "DPoP"} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
+
+      assert {:error, %OAuthError{error: :invalid_dpop_proof}} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
+    end
+  end
+
+  describe "nonce issuance threads the live config (never re-resolving an otp_app)" do
+    test "a required-but-absent nonce challenge issues via the config-aware store entrypoint" do
+      {proof, _jkt} = dpop_proof_and_jkt(nonce: nil)
+
+      config =
+        base_config(
+          dpop_enabled: true,
+          dpop_nonce_required: true,
+          nonce_store: ThreadedNonceStore
+        )
+
+      assert {:error, %OAuthError{error: :use_dpop_nonce, headers: [{"dpop-nonce", "threaded-nonce"}]}} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
+    end
+
+    test "a retry presenting the threaded nonce is validated via the config-aware store entrypoint" do
+      config =
+        base_config(
+          dpop_enabled: true,
+          dpop_nonce_required: true,
+          nonce_store: ThreadedNonceStore
+        )
+
+      nonce = ThreadedNonceStore.issue(config, 300)
+      {proof, jkt} = dpop_proof_and_jkt(nonce: nonce)
+
+      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
     end
   end
 

@@ -78,6 +78,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.RequestContext
+  alias AttestoPhoenix.Store.NonceStore
 
   # The conn assign `Attesto.Plug.Authenticate` writes the verified claims
   # under (its default `:claims_key`).
@@ -327,15 +328,19 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # single-node ETS replay cache, matching the token endpoint default.
   defp replay_check(%Config{dpop_enabled: false}), do: nil
   defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  defp replay_check(%Config{replay_check: callback}), do: callback
+  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
+  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
+  # function. Adapt every callback form into a closure before handing it over.
+  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
 
   # RFC 9449 §8/§9: demand a server-issued nonce only when the host requires it
   # and has wired a nonce store. The callback receives the proof's `nonce`
   # (possibly `nil`) and returns `:ok` only for a currently-valid nonce, else
   # `{:error, :use_dpop_nonce}`; this mirrors the token endpoint exactly.
-  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store}) when is_atom(store) and not is_nil(store) do
+  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store} = config)
+       when is_atom(store) and not is_nil(store) do
     fn nonce ->
-      if store.valid?(nonce), do: :ok, else: {:error, :use_dpop_nonce}
+      if NonceStore.valid?(config, store, nonce), do: :ok, else: {:error, :use_dpop_nonce}
     end
   end
 
@@ -343,9 +348,11 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   # RFC 9449 §8: the `use_dpop_nonce` challenge carries a fresh nonce for the
   # client to echo; `Attesto.Plug.Authenticate` requires `:nonce_issue`
-  # whenever `:nonce_check` is set.
-  defp nonce_issue(%Config{dpop_nonce_required: true, nonce_store: store}) when is_atom(store) and not is_nil(store) do
-    &store.issue/0
+  # whenever `:nonce_check` is set. Thread the resolved config so a persistent
+  # store never has to re-resolve its repo from a guessed otp_app.
+  defp nonce_issue(%Config{dpop_nonce_required: true, nonce_store: store} = config)
+       when is_atom(store) and not is_nil(store) do
+    fn -> NonceStore.issue(config, store) end
   end
 
   defp nonce_issue(_config), do: nil

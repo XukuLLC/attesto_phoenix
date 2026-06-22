@@ -36,10 +36,25 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
 
   ## Precedence and fail-closed policy
 
-  DPoP takes precedence when a proof is presented (RFC 9449 §5); otherwise an
-  mTLS certificate binds the token to its thumbprint; otherwise the token is an
-  unbound Bearer - but only if the client does not *require* a sender
-  constraint.
+  The client's *required* sender constraint is resolved first, and only the
+  matching constraint type can satisfy it:
+
+    * A client that requires DPoP (RFC 9449) is bound only by a DPoP proof. A
+      request that omits the proof - even one presenting a client certificate -
+      is refused (`DPoP proof required`), never silently mTLS-bound.
+    * A client that requires mTLS (RFC 8705 §3) is bound only by a client
+      certificate. A request that omits the certificate - even one presenting a
+      DPoP proof - is refused (`client certificate required`), never silently
+      DPoP-bound.
+
+  A client's required constraint therefore cannot be satisfied by presenting a
+  *different* valid constraint: the per-client policy is enforced on its own
+  terms before any opportunistic binding is considered.
+
+  Only when the client requires neither constraint does opportunistic
+  precedence apply: DPoP takes precedence when a proof is presented
+  (RFC 9449 §5); otherwise an mTLS certificate binds the token to its
+  thumbprint; otherwise the token is an unbound Bearer.
 
   RFC 8705 §3: a client configured to require certificate-bound tokens MUST NOT
   be silently downgraded to a Bearer token when it calls without a certificate.
@@ -61,6 +76,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   alias Attesto.DPoP.ReplayCache
   alias Attesto.MTLS
   alias AttestoPhoenix.{Callback, Config, OAuthError}
+  alias AttestoPhoenix.Store.NonceStore
 
   @typedoc "The sender-constraint facts the controller derives from the request."
   @type input :: %{
@@ -96,25 +112,60 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @spec resolve(Config.t(), input(), term()) ::
           {:ok, binding(), String.t()} | {:error, OAuthError.t()}
   def resolve(%Config{} = config, input, client) do
+    # Resolve the client's REQUIRED constraint first: a per-client policy must
+    # be enforced on its own terms, so a client cannot satisfy its required
+    # constraint by presenting a DIFFERENT (valid) one. Only a client that
+    # requires neither falls through to opportunistic binding.
+    cond do
+      client_requires_dpop?(config, client) ->
+        resolve_required_dpop(config, input)
+
+      client_requires_mtls?(config, client) ->
+        resolve_required_mtls(config, input)
+
+      true ->
+        resolve_opportunistic(config, input)
+    end
+  end
+
+  # RFC 9449: a DPoP-required client is bound only by a DPoP proof. A request
+  # that omits the proof - even one presenting a client certificate - is refused
+  # rather than mTLS-bound, so the required constraint cannot be satisfied by a
+  # different type. A presented proof is verified and binds DPoP (or surfaces a
+  # DPoP-specific error / nonce challenge from `bind_dpop/2`).
+  defp resolve_required_dpop(config, input) do
+    if config.dpop_enabled and dpop_present?(input) do
+      bind_dpop(config, input)
+    else
+      # The token request omits a required proof entirely; return a standard
+      # OAuth token-endpoint error so FAPI clients can classify the grant
+      # attempt without relying on DPoP-specific error vocabulary.
+      {:error, error(@error_invalid_request, "DPoP proof required")}
+    end
+  end
+
+  # RFC 8705 §3: an mTLS-required client is bound only by a client certificate.
+  # A request that omits the certificate - even one presenting a DPoP proof - is
+  # refused rather than DPoP-bound, so the required constraint cannot be
+  # satisfied by a different type.
+  defp resolve_required_mtls(config, input) do
+    if config.mtls_enabled and mtls_cert_present?(input) do
+      bind_mtls(input)
+    else
+      {:error, error(@error_invalid_client, "client certificate required")}
+    end
+  end
+
+  # The client requires neither constraint: bind whichever single constraint it
+  # opportunistically presents. DPoP takes precedence over a presented
+  # certificate (RFC 9449 §5); absent both, the token is an unbound Bearer.
+  defp resolve_opportunistic(config, input) do
     cond do
       config.dpop_enabled and dpop_present?(input) ->
         bind_dpop(config, input)
 
       config.mtls_enabled and mtls_cert_present?(input) ->
         bind_mtls(input)
-
-      client_requires_dpop?(config, client) ->
-        # RFC 9449 defines `invalid_dpop_proof` for presented DPoP proof
-        # failures. When the token request omits a required proof entirely,
-        # return a standard OAuth token-endpoint error so FAPI clients can
-        # classify the grant attempt without relying on DPoP-specific error
-        # vocabulary.
-        {:error, error(@error_invalid_request, "DPoP proof required")}
-
-      client_requires_mtls?(config, client) ->
-        # No DPoP proof and no client certificate, yet this client must be
-        # certificate-bound: refuse rather than issue an unbound token.
-        {:error, error(@error_invalid_client, "client certificate required")}
 
       true ->
         {:ok, :none, @token_type_bearer}
@@ -282,9 +333,10 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   # `:ok` only for a currently-valid nonce, else `{:error, :use_dpop_nonce}`
   # so the controller answers with a fresh `DPoP-Nonce`. When nonces are not
   # required, no callback is supplied and the engine enforces none.
-  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store}) when is_atom(store) and not is_nil(store) do
+  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store} = config)
+       when is_atom(store) and not is_nil(store) do
     fn nonce ->
-      if store.valid?(nonce), do: :ok, else: {:error, :use_dpop_nonce}
+      if NonceStore.valid?(config, store, nonce), do: :ok, else: {:error, :use_dpop_nonce}
     end
   end
 
@@ -295,7 +347,10 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   # `jti` and rejects a repeat. Mirrors the PAR endpoint's resolution so the two
   # DPoP entry points share one replay store.
   defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  defp replay_check(%Config{replay_check: callback}), do: callback
+  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
+  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
+  # function. Adapt every callback form into a closure before handing it over.
+  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
 
   # RFC 9449 §8: issue a fresh server nonce and return it in the error's
   # `:headers` so the controller can replay the `DPoP-Nonce` header verbatim,
@@ -309,8 +364,8 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
     )
   end
 
-  defp issue_nonce(%Config{nonce_store: store}) when is_atom(store) and not is_nil(store) do
-    store.issue()
+  defp issue_nonce(%Config{nonce_store: store} = config) when is_atom(store) and not is_nil(store) do
+    NonceStore.issue(config, store)
   end
 
   defp issue_nonce(_config), do: ""

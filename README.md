@@ -88,7 +88,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.13"}
+    {:attesto_phoenix, "~> 0.14"}
   ]
 end
 ```
@@ -99,7 +99,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 0.13"},
+    {:attesto_phoenix, "~> 0.14"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
