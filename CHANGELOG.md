@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-06-22
+
+### Added
+
+- **RFC 8707 Resource Indicators across every grant.** `client_credentials`,
+  token exchange, and jwt-bearer validate (§2.1) and authorize (§2.2) the
+  request-time `resource` and mint the access-token `aud` from it;
+  `authorization_code` binds the resource authorized at the authorize endpoint
+  and mints `aud` from it (optionally narrowed at redemption, never widened);
+  `refresh_token` carries and subset-narrows it. Multiple allow-listed resources
+  mint a JWT `aud` array; an unserved resource is `invalid_target`.
+- Grant-agnostic `resource_indicators: [allowed_resources, allowed_resources_for]`
+  config and `Config.allowed_resources/2` (server `:audience` + static list +
+  optional per-client callback), replacing the jwt-bearer-only
+  `jwt_bearer: [allowed_resources]`.
+- A `resource` column persisted on the authorization-code and refresh-token
+  stores (migration generator + schemas).
+
+### Security
+
+- Token exchange now ceilings a requested `resource` to the subject token's own
+  `aud` (RFC 8693 §2.1 / RFC 8707): a token confined to resource A can no longer
+  be exchanged for one audienced to a sibling resource B.
+
+### Changed
+
+- Requires `attesto ~> 0.10`.
+
 ## [0.14.2] - 2026-06-22
 
 ### Fixed
