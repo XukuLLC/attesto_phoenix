@@ -482,6 +482,9 @@ defmodule AttestoPhoenix.Config do
     :introspection_path,
     :registration_path,
     :userinfo_path,
+    :device_authorization_path,
+    :device_verification_path,
+    :device_code_store,
     oauth_path_prefix: "/oauth",
     scopes_supported: [],
     bearer_methods_supported: ["header"],
@@ -507,6 +510,7 @@ defmodule AttestoPhoenix.Config do
     client_id_metadata: [],
     jwt_bearer: [],
     resource_indicators: [],
+    device_authorization: [],
     basic_realm: "OAuth"
   ]
 
@@ -642,7 +646,8 @@ defmodule AttestoPhoenix.Config do
         request_object_policy: config.request_object_policy || %Policy{},
         client_id_metadata: normalize_client_id_metadata(config.client_id_metadata),
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
-        resource_indicators: normalize_resource_indicators(config.resource_indicators)
+        resource_indicators: normalize_resource_indicators(config.resource_indicators),
+        device_authorization: normalize_device_authorization(config.device_authorization)
     }
   end
 
@@ -710,6 +715,23 @@ defmodule AttestoPhoenix.Config do
   defp normalize_resource_indicators(opts) when is_list(opts) do
     Keyword.merge(@resource_indicators_defaults, opts)
   end
+
+  # RFC 8628 device authorization grant. `enabled: true` adds `device_code` to
+  # `grant_types_supported/1`, advertises the `device_authorization_endpoint`,
+  # and lights up the routes. `:verification_uri` is the URL shown to the user
+  # (defaults to the issuer-derived device-verification path). `:code_ttl_seconds`
+  # and `:poll_interval_seconds` are the §3.2 `expires_in` / `interval`. Off by
+  # default — a host opts in and supplies a `:device_code_store`.
+  @device_authorization_defaults [
+    enabled: false,
+    code_ttl_seconds: 600,
+    poll_interval_seconds: 5,
+    user_code_length: 8,
+    verification_uri: nil
+  ]
+
+  defp normalize_device_authorization(nil), do: @device_authorization_defaults
+  defp normalize_device_authorization(opts) when is_list(opts), do: Keyword.merge(@device_authorization_defaults, opts)
 
   @doc """
   Reads the config for `otp_app` under `key` (default `AttestoPhoenix`) from the
@@ -812,6 +834,41 @@ defmodule AttestoPhoenix.Config do
     config |> jwt_bearer() |> Keyword.get(:enabled, false) == true
   end
 
+  @doc "The merged, defaulted RFC 8628 device-authorization options."
+  @spec device_authorization(t()) :: keyword()
+  def device_authorization(%__MODULE__{device_authorization: opts}), do: opts
+
+  @doc """
+  Returns `true` iff the RFC 8628 device authorization grant is enabled
+  (`device_authorization: [enabled: true]`). When enabled, `device_code` is
+  added to `grant_types_supported/1` and the `device_authorization_endpoint` is
+  advertised.
+  """
+  @spec device_authorization_enabled?(t()) :: boolean()
+  def device_authorization_enabled?(%__MODULE__{} = config) do
+    config |> device_authorization() |> Keyword.get(:enabled, false) == true
+  end
+
+  @doc "The configured `Attesto.DeviceCodeStore` module, or `nil`."
+  @spec device_code_store(t()) :: module() | nil
+  def device_code_store(%__MODULE__{device_code_store: store}), do: store
+
+  @doc """
+  The RFC 8628 §3.2 verification URI shown to the user: the configured
+  `device_authorization: [verification_uri: ...]` override, otherwise the
+  issuer-derived device-verification endpoint URL.
+  """
+  @spec device_verification_uri(t()) :: String.t()
+  def device_verification_uri(%__MODULE__{} = config) do
+    config
+    |> device_authorization()
+    |> Keyword.get(:verification_uri)
+    |> case do
+      uri when is_binary(uri) and uri != "" -> uri
+      _ -> device_verification_endpoint_url(config)
+    end
+  end
+
   @doc """
   Returns the configured single-use consent-grant store module, or `nil`.
 
@@ -891,10 +948,40 @@ defmodule AttestoPhoenix.Config do
   @introspection_tail "/introspect"
   @registration_tail "/register"
   @userinfo_tail "/userinfo"
+  @device_authorization_tail "/device_authorization"
+  @device_verification_tail "/device_verification"
 
   @doc false
   @spec authorize_tail() :: String.t()
   def authorize_tail, do: @authorize_tail
+
+  @doc false
+  @spec device_authorization_tail() :: String.t()
+  def device_authorization_tail, do: @device_authorization_tail
+
+  @doc false
+  @spec device_verification_tail() :: String.t()
+  def device_verification_tail, do: @device_verification_tail
+
+  @doc "The resolved request path of the device-authorization endpoint (RFC 8628)."
+  @spec device_authorization_path(t()) :: String.t()
+  def device_authorization_path(%__MODULE__{device_authorization_path: override} = config),
+    do: resolve_path(override, config, @device_authorization_tail)
+
+  @doc "The resolved request path of the device-verification page (RFC 8628 §3.3)."
+  @spec device_verification_path(t()) :: String.t()
+  def device_verification_path(%__MODULE__{device_verification_path: override} = config),
+    do: resolve_path(override, config, @device_verification_tail)
+
+  @doc "Absolute URL of the device-authorization endpoint (advertised as `device_authorization_endpoint`, RFC 8628 §4)."
+  @spec device_authorization_endpoint_url(t()) :: String.t()
+  def device_authorization_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, device_authorization_path(config))
+
+  @doc "Absolute URL of the device-verification page."
+  @spec device_verification_endpoint_url(t()) :: String.t()
+  def device_verification_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, device_verification_path(config))
 
   @doc false
   @spec token_tail() :: String.t()
@@ -1052,16 +1139,24 @@ defmodule AttestoPhoenix.Config do
   # JWT-bearer authorization grant, advertised + accepted only when the feature
   # is enabled (`jwt_bearer: [enabled: true]`).
   @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
+  @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
 
   @spec grant_types_supported(t()) :: [String.t()]
   def grant_types_supported(%__MODULE__{grant_types_supported: list} = config) when is_list(list) and list != [],
-    do: maybe_add_jwt_bearer(list, config)
+    do: list |> maybe_add_jwt_bearer(config) |> maybe_add_device_code(config)
 
-  def grant_types_supported(%__MODULE__{} = config), do: maybe_add_jwt_bearer(@default_grant_types_supported, config)
+  def grant_types_supported(%__MODULE__{} = config),
+    do: @default_grant_types_supported |> maybe_add_jwt_bearer(config) |> maybe_add_device_code(config)
 
   defp maybe_add_jwt_bearer(list, %__MODULE__{} = config) do
     if jwt_bearer_enabled?(config) and @grant_jwt_bearer not in list,
       do: list ++ [@grant_jwt_bearer],
+      else: list
+  end
+
+  defp maybe_add_device_code(list, %__MODULE__{} = config) do
+    if device_authorization_enabled?(config) and @grant_device_code not in list,
+      do: list ++ [@grant_device_code],
       else: list
   end
 

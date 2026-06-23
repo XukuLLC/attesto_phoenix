@@ -88,6 +88,7 @@ defmodule AttestoPhoenix.Router do
   # `/.well-known/` path segment at the host root. RFC 7517 §5 defines the JWK
   # Set document the metadata's `jwks_uri` points at.
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Controller.DeviceAuthorizationController
   alias AttestoPhoenix.Controller.DiscoveryController
   alias AttestoPhoenix.Controller.IntrospectionController
   alias AttestoPhoenix.Controller.JWKSController
@@ -129,6 +130,7 @@ defmodule AttestoPhoenix.Router do
   @introspect_path @oauth_prefix <> AttestoPhoenix.Config.introspection_tail()
   @register_path @oauth_prefix <> AttestoPhoenix.Config.registration_tail()
   @userinfo_path @oauth_prefix <> AttestoPhoenix.Config.userinfo_tail()
+  @device_authorization_path @oauth_prefix <> AttestoPhoenix.Config.device_authorization_tail()
 
   # Controllers that back each endpoint. Named here once so the macro
   # expansion does not scatter controller module references through the
@@ -144,6 +146,7 @@ defmodule AttestoPhoenix.Router do
   @introspection_controller IntrospectionController
   @registration_controller RegistrationController
   @userinfo_controller UserinfoController
+  @device_authorization_controller DeviceAuthorizationController
 
   @doc false
   defmacro __using__(_opts) do
@@ -160,6 +163,7 @@ defmodule AttestoPhoenix.Router do
     prefix = Keyword.get(opts, :prefix, "")
     pipelines = opts |> Keyword.get(:pipeline, []) |> List.wrap()
     registration? = Keyword.get(opts, :registration, false)
+    device? = Keyword.get(opts, :device, false)
 
     discovery_path = @discovery_path
     protected_resource_path = @protected_resource_path
@@ -183,6 +187,8 @@ defmodule AttestoPhoenix.Router do
     introspection_controller = @introspection_controller
     registration_controller = @registration_controller
     userinfo_controller = @userinfo_controller
+    device_authorization_path = @device_authorization_path
+    device_authorization_controller = @device_authorization_controller
 
     # `pipe_through/1` is a compile-time `Phoenix.Router` macro: it must be
     # expanded once per pipeline as it is written into the scope, not iterated
@@ -213,6 +219,20 @@ defmodule AttestoPhoenix.Router do
             unquote(prefix <> register_path <> "/:client_id"),
             unquote(registration_controller),
             :delete
+          )
+        end
+      end
+
+    # RFC 8628 §3.1: the device authorization endpoint is emitted only when the
+    # host opts in (`device: true`), so a deployment that does not offer the
+    # device grant exposes no device endpoint at all.
+    device_route =
+      if device? do
+        quote do
+          post(
+            unquote(prefix <> device_authorization_path),
+            unquote(device_authorization_controller),
+            :create
           )
         end
       end
@@ -257,6 +277,7 @@ defmodule AttestoPhoenix.Router do
         post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
 
         unquote(registration_route)
+        unquote(device_route)
 
         # OpenID Connect Core 1.0 §5.3.1: the UserInfo endpoint accepts both
         # GET and POST, and is a bearer-authenticated protected resource

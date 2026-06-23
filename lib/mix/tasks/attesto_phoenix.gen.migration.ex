@@ -27,6 +27,14 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       token can be detected and the whole family revoked (RFC 6819, section
       5.2.2.3 - refresh token rotation / replay detection).
 
+    * `attesto_device_codes` - the device authorization grant store
+      (`AttestoPhoenix.Schema.DeviceCode`, RFC 8628). One row per device code,
+      keyed on `device_code_hash` (the poll key) and `user_code` (the
+      verification key), carrying the bound `scope`/`resource`/`dpop_jkt`, the
+      `status` state machine (pending → approved|denied → consumed), the
+      approved `subject`/`granted_scope`/`granted_claims`, and `last_polled_at`
+      for the section 3.5 poll-interval guard.
+
     * `dpop_nonces` - server-issued DPoP nonces
       (`AttestoPhoenix.Schema.DPoPNonce`, RFC 9449, section 8). Each row is a
       single-use nonce carrying `issued_at`, `expires_at`, and the `used_at`
@@ -249,6 +257,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       prefix: prefix,
       authorization_codes: table_name(prefix, "attesto_authorization_codes"),
       refresh_tokens: table_name(prefix, "attesto_refresh_tokens"),
+      device_codes: table_name(prefix, "attesto_device_codes"),
       dpop_nonces: table_name(prefix, "dpop_nonces"),
       dpop_replays: table_name(prefix, "dpop_replays"),
       pushed_authorization_requests: table_name(prefix, "attesto_pushed_authorization_requests"),
@@ -415,6 +424,42 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Family-wide revocation scans by family_id.
       create index(:<%= @refresh_tokens %>, [:family_id])
       create index(:<%= @refresh_tokens %>, [:expires_at])
+
+      # Device authorization grant (RFC 8628), backing
+      # AttestoPhoenix.Schema.DeviceCode / AttestoPhoenix.Store.EctoDeviceCodeStore.
+      # A device code is a mutable row moving pending -> approved|denied ->
+      # consumed; each transition is one guarded atomic UPDATE in the store. Only
+      # the device_code hash is stored; user_code is the normalized verification
+      # key. last_polled_at enforces the section 3.5 minimum poll interval.
+      create table(:<%= @device_codes %>, primary_key: false) do
+        add :id, :binary_id, primary_key: true
+        add :device_code_hash, :string, size: <%= @hash_size %>, null: false
+        add :user_code, :string, size: <%= @identifier_size %>, null: false
+        add :client_id, :string, size: <%= @identifier_size %>, null: false
+        add :scope, {:array, :string}, null: false, default: []
+        # RFC 8707 resource indicator(s) bound at the device-authorization endpoint.
+        add :resource, {:array, :string}, null: false, default: []
+        # RFC 9449 section 10 DPoP holder-of-key pre-binding (NULL for unbound).
+        add :dpop_jkt, :string, size: <%= @identifier_size %>
+        # pending | approved | denied | consumed (the state machine).
+        add :status, :string, size: 16, null: false, default: "pending"
+        # Bound at approval (NULL until the user authorizes).
+        add :subject, :string, size: <%= @identifier_size %>
+        add :granted_scope, {:array, :string}
+        add :granted_claims, :map
+        # Unix-second-truncated timestamp of the last accepted poll (NULL before
+        # the first); the atomic slow_down guard compares against it.
+        add :last_polled_at, :utc_datetime
+        add :expires_at, :utc_datetime, null: false
+
+        timestamps(updated_at: false, type: :utc_datetime)
+      end
+
+      # The device polls by device_code_hash and the verification page resolves by
+      # user_code; both are unique single-use lookup keys.
+      create unique_index(:<%= @device_codes %>, [:device_code_hash])
+      create unique_index(:<%= @device_codes %>, [:user_code])
+      create index(:<%= @device_codes %>, [:expires_at])
 
       # Server-issued DPoP nonces (RFC 9449, section 8), backing
       # AttestoPhoenix.Schema.DPoPNonce / AttestoPhoenix.Store.EctoNonceStore.
