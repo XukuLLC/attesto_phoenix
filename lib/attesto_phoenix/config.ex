@@ -280,6 +280,13 @@ defmodule AttestoPhoenix.Config do
     * `:dpop_nonce_required` - require server-issued DPoP nonces. Default `false`.
     * `:mtls_enabled` - enable mTLS (RFC 8705) `cnf` binding. Default `false`.
     * `:registration_enabled` - enable `/oauth/register`. Default `false`.
+    * `:registration_default_scope` - the scope assigned to a dynamically
+      registered client (RFC 7591 §2) when its request omits `scope`, echoed
+      back in the §3.2.1 response. `:scopes_supported` assigns the full catalog;
+      a list assigns that explicit subset (validated against `:scopes_supported`
+      at boot). Default `nil` - a scopeless registration stays scopeless
+      (fail-closed). Setting this lets a scopeless DCR client (e.g. an MCP/agent
+      client) register with a usable scope without each host reinventing it.
     * `:client_id_metadata` - Client ID Metadata Document support - CIMD
       (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG). A
       keyword list configuring whether (and how) the authorization server
@@ -496,6 +503,7 @@ defmodule AttestoPhoenix.Config do
     :client_backchannel_logout_session_required,
     oauth_path_prefix: "/oauth",
     scopes_supported: [],
+    registration_default_scope: nil,
     bearer_methods_supported: ["header"],
     claims_supported: [],
     acr_values_supported: [],
@@ -600,6 +608,7 @@ defmodule AttestoPhoenix.Config do
           registration_path: String.t() | nil,
           userinfo_path: String.t() | nil,
           scopes_supported: [String.t()],
+          registration_default_scope: [String.t()] | :scopes_supported | nil,
           bearer_methods_supported: [String.t()],
           claims_supported: [String.t()],
           acr_values_supported: [String.t()],
@@ -1062,6 +1071,36 @@ defmodule AttestoPhoenix.Config do
   """
   @spec consent_grant_store(t()) :: module() | nil
   def consent_grant_store(%__MODULE__{consent_grant_store: store}), do: store
+
+  @doc """
+  The scope a dynamically registered client is assigned when its registration
+  request omits `scope` (RFC 7591 §2: the authorization server MAY register a
+  default scope). Resolves the `:registration_default_scope` setting to a
+  concrete list:
+
+    * `:scopes_supported` — every scope in `scopes_supported`.
+    * a list of scope strings — that explicit default (the registration layer
+      still rejects any member outside `scopes_supported`).
+    * `nil` (the default) — no defaulting; a scopeless registration stays
+      scopeless (fail-closed).
+
+  Returns the resolved list, or `nil` when no default applies.
+  """
+  @spec registration_default_scope(t()) :: [String.t()] | nil
+  def registration_default_scope(%__MODULE__{registration_default_scope: setting} = config) do
+    case setting do
+      :scopes_supported -> scope_list_or_nil(config.scopes_supported)
+      list when is_list(list) -> scope_list_or_nil(list)
+      _ -> nil
+    end
+  end
+
+  defp scope_list_or_nil(list) do
+    case Enum.filter(list, &is_binary/1) do
+      [] -> nil
+      scopes -> scopes
+    end
+  end
 
   @doc """
   Derives the `Attesto.Config` consumed by the protocol layer from this config.
@@ -1558,6 +1597,28 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
+  # A configured explicit default registration scope must be within the catalog
+  # the server advertises — otherwise a scopeless DCR client would be assigned a
+  # scope the server does not support. (`:scopes_supported` is a subset of itself
+  # by construction.)
+  defp validate_registration_default_scope!(%__MODULE__{registration_default_scope: list} = config)
+       when is_list(list) do
+    catalog = List.wrap(config.scopes_supported)
+
+    case Enum.reject(list, &(&1 in catalog)) do
+      [] ->
+        :ok
+
+      unknown ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :registration_default_scope contains scope(s) " <>
+                "#{inspect(unknown)} not in :scopes_supported. The default assigned to a " <>
+                "scopeless dynamic registration must be a subset of the advertised catalog."
+    end
+  end
+
+  defp validate_registration_default_scope!(%__MODULE__{}), do: :ok
+
   defp validate_jwt_bearer!(%__MODULE__{} = config) do
     if jwt_bearer_enabled?(config) do
       opts = jwt_bearer(config)
@@ -1645,6 +1706,7 @@ defmodule AttestoPhoenix.Config do
     end
 
     validate_logout!(config)
+    validate_registration_default_scope!(config)
     validate_jwt_bearer!(config)
     validate_behaviour_modules!(config)
     validate_request_object_policy!(config)

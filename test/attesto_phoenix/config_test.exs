@@ -337,6 +337,28 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe ":registration_default_scope (RFC 7591 §2)" do
+    test "resolves :scopes_supported to the full catalog" do
+      config = config(scopes_supported: ["read", "write"], registration_default_scope: :scopes_supported)
+      assert Config.registration_default_scope(config) == ["read", "write"]
+    end
+
+    test "resolves an explicit list" do
+      config = config(scopes_supported: ["read", "write"], registration_default_scope: ["read"])
+      assert Config.registration_default_scope(config) == ["read"]
+    end
+
+    test "defaults to nil (no defaulting, fail-closed)" do
+      assert Config.registration_default_scope(config(scopes_supported: ["read"])) == nil
+    end
+
+    test "rejects an explicit default scope outside :scopes_supported at boot" do
+      assert_raise ArgumentError, ~r/:registration_default_scope contains scope/, fn ->
+        config(scopes_supported: ["read"], registration_default_scope: ["read", "admin"])
+      end
+    end
+  end
+
   describe ":audience boot gate (RFC 9068 §3 aud)" do
     # The required-key/capability checks all pass here; only :audience is
     # missing, so this isolates the audience gate from the other boot checks.

@@ -136,6 +136,42 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       refute Map.has_key?(body(conn), "scope")
     end
 
+    test "assigns the configured default scope when omitted (RFC 7591 §2) and echoes it" do
+      conn =
+        post_register(
+          config(registration_default_scope: ["read"]),
+          %{"grant_types" => ["client_credentials"]}
+        )
+
+      assert conn.status == 201
+      # echoed back so the client learns what it got (§3.2.1) ...
+      assert body(conn)["scope"] == "read"
+      # ... and persisted on the stored client (register_client echoes attrs here)
+      assert body(conn)["scope"] == "read"
+    end
+
+    test "registration_default_scope: :scopes_supported assigns the full catalog" do
+      conn =
+        post_register(
+          config(registration_default_scope: :scopes_supported),
+          %{"grant_types" => ["client_credentials"]}
+        )
+
+      assert conn.status == 201
+      assert body(conn)["scope"] == "read write"
+    end
+
+    test "an explicit requested scope still wins over the default" do
+      conn =
+        post_register(
+          config(registration_default_scope: :scopes_supported),
+          %{"grant_types" => ["client_credentials"], "scope" => "read"}
+        )
+
+      assert conn.status == 201
+      assert body(conn)["scope"] == "read"
+    end
+
     test "every response carries no-store cache headers (RFC 7234 §5.2)" do
       conn = post_register(config([]), %{"grant_types" => ["client_credentials"]})
 

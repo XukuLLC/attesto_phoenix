@@ -57,6 +57,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
   alias AttestoPhoenix.ClientAuthentication.{ErrorContext, Policy}
   alias Plug.Conn.Unfetched
 
+  require Logger
+
   # RFC 7234 §5.2: token responses and errors must never be cached.
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
@@ -436,6 +438,18 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # ── Rendering (RFC 6749 §5.2) ────────────────────────────────────────────
 
   defp render_error(conn, %OAuthError{} = err) do
+    # RFC 6749 §5.2 keeps the wire body terse (a code, an optional description),
+    # which makes an opaque `invalid_request` / `invalid_scope` 400 hard to
+    # diagnose from the response alone. Surface the resolved code + description in
+    # the log at the single render boundary so a host operator can tell e.g.
+    # `invalid_scope` from `invalid_grant` without reading the source — at
+    # `:debug`, so a 4xx under load is never prod log noise (the structured
+    # `:token_denied` event carries the same reason for hosts that want it louder).
+    Logger.debug(fn ->
+      "token endpoint denied (#{err.status}): #{err.error}" <>
+        if(err.error_description, do: " — #{err.error_description}", else: "")
+    end)
+
     conn
     |> merge_resp_headers(err.headers)
     |> put_status(err.status)

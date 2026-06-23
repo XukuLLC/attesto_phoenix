@@ -433,11 +433,17 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   # RFC 7591 §2 / RFC 6749 §3.3: the requested scope is a space-delimited
   # string; every requested scope must be in the server's catalog
-  # (`:scopes_supported`). Absent, the client registers with no scope.
+  # (`:scopes_supported`). Absent, the server MAY assign a default scope
+  # (RFC 7591 §2) — `:registration_default_scope`, echoed back in the §3.2.1
+  # response so the client learns what it got; with no default configured the
+  # client registers with no scope (fail-closed).
   defp validate_scope(metadata, config) do
     case Map.get(metadata, "scope") do
       nil ->
-        {:ok, nil}
+        case Config.registration_default_scope(config) do
+          nil -> {:ok, nil}
+          scopes -> {:ok, Enum.join(scopes, " ")}
+        end
 
       scope when is_binary(scope) ->
         requested = String.split(scope, " ", trim: true)

@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-06-23
+
+### Added
+
+- **Dynamic-registration default scope (RFC 7591 §2).** A new
+  `:registration_default_scope` config assigns a scope to a client that
+  registers without one — `:scopes_supported` for the full catalog, or an
+  explicit list (validated against `:scopes_supported` at boot) — echoed back in
+  the §3.2.1 response so the client learns what it got. Default `nil` keeps the
+  prior fail-closed behavior (a scopeless registration stays scopeless). This
+  lets a scopeless DCR client (e.g. an MCP/agent client) register with a usable
+  scope as protocol behavior, rather than each host's `authorize_scope` fallback
+  reinventing it.
+
+### Changed
+
+- **Token-endpoint error diagnostics.** `POST /oauth/token` now logs the
+  resolved RFC 6749 §5.2 error code + description at `:debug` at the single
+  render boundary, so a host operator can tell e.g. `invalid_scope` from
+  `invalid_grant` behind an otherwise-opaque 400 without reading the source. The
+  level is `:debug` so a 4xx under load is never prod log noise; the structured
+  `:token_denied` event still carries the same reason for hosts that want it
+  louder.
+
 ## [0.18.0] - 2026-06-23
 
 ### Added

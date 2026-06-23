@@ -16,6 +16,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
@@ -178,6 +179,21 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     put_config(base)
     :ok
+  end
+
+  describe "error diagnostics (DX)" do
+    test "logs the denial code + description at debug so an opaque 400 is diagnosable" do
+      log =
+        capture_log([level: :debug], fn ->
+          conn =
+            post_token(%{"grant_type" => "client_credentials", "client_id" => "does-not-exist", "client_secret" => "x"})
+
+          assert conn.status == 400
+        end)
+
+      assert log =~ "token endpoint denied"
+      assert log =~ "invalid_client"
+    end
   end
 
   describe "client authentication (RFC 6749 §2.3)" do
