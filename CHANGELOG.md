@@ -65,8 +65,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `refresh_token` carries and subset-narrows it. Multiple allow-listed resources
   mint a JWT `aud` array; an unserved resource is `invalid_target`.
 - Grant-agnostic `resource_indicators: [allowed_resources, allowed_resources_for]`
-  config and `Config.allowed_resources/2` (server `:audience` + static list +
-  optional per-client callback), replacing the jwt-bearer-only
+  config and `AttestoPhoenix.Config.allowed_resources/2` (server `:audience` +
+  static list + optional per-client callback), replacing the jwt-bearer-only
   `jwt_bearer: [allowed_resources]`.
 - A `resource` column persisted on the authorization-code and refresh-token
   stores (migration generator + schemas).
