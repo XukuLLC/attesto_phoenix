@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **RFC 8628 Device Authorization Grant.** A `device: true` option on
+  `attesto_routes/1` mounts `POST /oauth/device_authorization` and the
+  `GET`/`POST /oauth/device_verification` page; the token endpoint gains a
+  `device_code` grant dispatch (the §3.5 polling errors render with their own
+  codes, not collapsed to `invalid_grant`). A PUBLIC (`:none`) client MUST
+  present a DPoP proof at the device-authorization endpoint (a device-issued
+  bearer token has no PKCE/redirect backstop), and the bound RFC 8707 `resource`
+  / RFC 9470 `acr`+`auth_time` thread through to the minted token. New
+  `device_authorization` config block + `:device_code_store`, the
+  `AttestoPhoenix.Store.EctoDeviceCodeStore` (every transition a single guarded
+  atomic UPDATE) + `attesto_device_codes` table, the
+  `:authenticate_device_user` / `:render_device_verification` host callbacks,
+  and `device_authorization_endpoint` advertised in discovery when enabled.
+
+### Changed
+
+- Requires `attesto ~> 0.12`.
+
 ## [0.16.0] - 2026-06-22
 
 ### Added
