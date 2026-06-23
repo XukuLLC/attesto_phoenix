@@ -200,6 +200,11 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
       # RFC 8628 §4: advertised only when the device grant is enabled.
       device_authorization_endpoint: device_authorization_endpoint(config),
+      # OpenID Connect RP-Initiated Logout 1.0 §3 / Back-Channel Logout 1.0
+      # §2.1: advertised only when logout is enabled (nil-dropped otherwise).
+      end_session_endpoint: end_session_endpoint(config),
+      backchannel_logout_supported: backchannel_logout_supported(config),
+      backchannel_logout_session_supported: backchannel_logout_session_supported(config),
       scopes_supported: config.scopes_supported,
       claims_supported: presence(config.claims_supported),
       registration_endpoint: registration_endpoint(config),
@@ -305,6 +310,18 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   defp device_authorization_endpoint(%Config{} = config) do
     if Config.device_authorization_enabled?(config), do: Config.device_authorization_endpoint_url(config)
+  end
+
+  defp end_session_endpoint(%Config{} = config) do
+    if Config.logout_enabled?(config), do: Config.end_session_endpoint_url(config)
+  end
+
+  defp backchannel_logout_supported(%Config{} = config) do
+    if Config.backchannel_logout_supported?(config), do: true
+  end
+
+  defp backchannel_logout_session_supported(%Config{} = config) do
+    if Config.backchannel_logout_session_supported?(config), do: true
   end
 
   # RFC 7591 §3: advertise the dynamic client registration endpoint only when

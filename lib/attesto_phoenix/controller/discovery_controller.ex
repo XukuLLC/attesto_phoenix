@@ -173,6 +173,11 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       # RFC 8628 §4: advertised only when the device authorization grant is
       # enabled (nil-dropped by the core builder otherwise).
       device_authorization_endpoint: device_authorization_endpoint(config),
+      # OpenID Connect RP-Initiated Logout 1.0 §3 / Back-Channel Logout 1.0
+      # §2.1: advertised only when logout is enabled (nil-dropped otherwise).
+      end_session_endpoint: end_session_endpoint(config),
+      backchannel_logout_supported: backchannel_logout_supported(config),
+      backchannel_logout_session_supported: backchannel_logout_session_supported(config),
       introspection_endpoint: Config.introspection_endpoint_url(config),
       introspection_endpoint_auth_methods_supported: introspection_auth_methods(config),
       registration_endpoint: registration_endpoint(config),
@@ -255,6 +260,18 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   defp authorization_response_iss_parameter_supported(%Config{}), do: nil
 
   defp pushed_authorization_request_endpoint(%Config{} = config), do: Config.par_endpoint_url(config)
+
+  defp end_session_endpoint(%Config{} = config) do
+    if Config.logout_enabled?(config), do: Config.end_session_endpoint_url(config)
+  end
+
+  defp backchannel_logout_supported(%Config{} = config) do
+    if Config.backchannel_logout_supported?(config), do: true
+  end
+
+  defp backchannel_logout_session_supported(%Config{} = config) do
+    if Config.backchannel_logout_session_supported?(config), do: true
+  end
 
   defp device_authorization_endpoint(%Config{} = config) do
     if Config.device_authorization_enabled?(config), do: Config.device_authorization_endpoint_url(config)

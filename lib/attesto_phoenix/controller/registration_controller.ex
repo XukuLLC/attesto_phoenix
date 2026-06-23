@@ -114,17 +114,26 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # host store so consent screens keep the client's identity. These are
   # display/identity strings; the controller validates only that each is a
   # string (their trust level is the host's, never the library's).
+  # `backchannel_logout_uri` (OpenID Connect Back-Channel Logout 1.0 §3) is a
+  # registered client URL, carried through like the other display-string members.
   @display_string_metadata ~w(client_name client_uri logo_uri tos_uri policy_uri
-                              jwks_uri software_id software_version software_statement)
+                              jwks_uri software_id software_version software_statement
+                              backchannel_logout_uri)
 
   # RFC 7591 §2 `contacts`: an array of strings (e.g. email addresses) carried
-  # through to the host store.
-  @string_array_metadata ~w(contacts)
+  # through to the host store. `post_logout_redirect_uris` (OpenID Connect
+  # RP-Initiated Logout 1.0 §3) is the registered set the end-session endpoint
+  # exact-matches the request `post_logout_redirect_uri` against.
+  @string_array_metadata ~w(contacts post_logout_redirect_uris)
 
   # RFC 7591 §2 `jwks`: the client's inline public JWK Set. It is carried
   # through to the host store so authorization and token endpoints can verify
   # request objects and private_key_jwt assertions without resolving jwks_uri.
   @map_metadata ~w(jwks)
+
+  # `backchannel_logout_session_required` (OpenID Connect Back-Channel Logout
+  # 1.0 §3): whether the client's logout token must carry `sid`.
+  @boolean_metadata ~w(backchannel_logout_session_required)
 
   @doc """
   Dynamic client registration action (RFC 7591 §3.1).
@@ -270,7 +279,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp passthrough_specs do
     Enum.map(@display_string_metadata, &{&1, :string}) ++
       Enum.map(@string_array_metadata, &{&1, :string_array}) ++
-      Enum.map(@map_metadata, &{&1, :map})
+      Enum.map(@map_metadata, &{&1, :map}) ++
+      Enum.map(@boolean_metadata, &{&1, :boolean})
   end
 
   defp validate_passthrough_member(metadata, key, kind) do
@@ -302,6 +312,13 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   defp validate_passthrough_value(key, :map, _value) do
     {:error, error(@error_invalid_client_metadata, "#{key} must be an object (RFC 7591 §2)")}
+  end
+
+  defp validate_passthrough_value(_key, :boolean, value) when is_boolean(value), do: {:ok, value}
+
+  defp validate_passthrough_value(key, :boolean, _value) do
+    {:error,
+     error(@error_invalid_client_metadata, "#{key} must be a boolean (OpenID Connect Back-Channel Logout 1.0 §3)")}
   end
 
   # RFC 7591 §2 / RFC 6749 §2.3.1: the token-endpoint auth method must be one

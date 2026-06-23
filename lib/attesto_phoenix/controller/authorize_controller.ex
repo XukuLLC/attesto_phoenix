@@ -48,7 +48,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       without UI, or an `{:error, _}` to explicitly classify why interaction is
       required (OIDC Core §3.1.2.6). The `subject` is a map carrying at least
       `:subject` (the subject identifier, OIDC Core §2 `sub`) and optionally
-      `:auth_time`, `:acr`, and `:amr` (OIDC Core §2), threaded into the code's
+      `:auth_time`, `:acr`, and `:amr` (OIDC Core §2), plus `:sid` (the host's
+      session id, OIDC Back-Channel Logout 1.0 §2.1 — supply it to make the
+      session reachable by the end-session endpoint), threaded into the code's
       claims so the token endpoint can mint the ID token.
 
       `auth_opts` is a map carrying the OIDC Core §3.1.2.1 authentication
@@ -640,6 +642,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     |> put_optional("auth_time", auth_time)
     |> put_optional("acr", Map.get(subject, :acr))
     |> put_optional("amr", Map.get(subject, :amr))
+    # OIDC Back-Channel Logout 1.0 §2.1: the host's session id rides into the
+    # code's claims so the token endpoint can stamp `sid` on the ID Token and
+    # record a back-channel-logout session for the Relying Party.
+    |> put_optional("sid", Map.get(subject, :sid))
   end
 
   # ── Host callbacks (login / consent) ─────────────────────────────────────

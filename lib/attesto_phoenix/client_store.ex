@@ -97,11 +97,37 @@ defmodule AttestoPhoenix.ClientStore do
   """
   @callback client_grant_types(client()) :: [String.t()] | nil
 
+  @doc """
+  The client's registered `post_logout_redirect_uris` (OpenID Connect
+  RP-Initiated Logout 1.0 §2). The end-session endpoint exact-matches the
+  request `post_logout_redirect_uri` against this set; a client exposing none
+  has no validated return URI (fail closed — the OP renders its own page).
+  """
+  @callback client_post_logout_redirect_uris(client()) :: [String.t()]
+
+  @doc """
+  The client's registered `backchannel_logout_uri` (OpenID Connect Back-Channel
+  Logout 1.0 §2.2), or `nil` when the client is not back-channel-logout capable.
+  When present, the OP records a logout session at ID-Token mint and POSTs a
+  `logout_token` here when the session ends.
+  """
+  @callback client_backchannel_logout_uri(client()) :: String.t() | nil
+
+  @doc """
+  Whether this client's `logout_token` MUST carry a `sid` claim
+  (`backchannel_logout_session_required`, Back-Channel Logout 1.0 §2.2).
+  Defaults to `false` when the callback is not exposed.
+  """
+  @callback client_backchannel_logout_session_required(client()) :: boolean()
+
   @optional_callbacks client_id: 1,
                       client_jwks: 1,
                       client_redirect_uris: 1,
                       client_public?: 1,
                       client_requires_mtls?: 1,
                       client_requires_dpop?: 1,
-                      client_grant_types: 1
+                      client_grant_types: 1,
+                      client_post_logout_redirect_uris: 1,
+                      client_backchannel_logout_uri: 1,
+                      client_backchannel_logout_session_required: 1
 end

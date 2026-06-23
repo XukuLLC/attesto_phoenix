@@ -22,6 +22,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   alias Attesto.CodeStore.ETS
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.Controller.TokenController
+  alias Plug.Conn.Unfetched
 
   @endpoint_path "/oauth/token"
   @form_content_type "application/x-www-form-urlencoded"
@@ -745,7 +746,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         :post
         |> conn(@endpoint_path, params)
         |> put_token_content_type("text/plain")
-        |> Map.put(:body_params, %Plug.Conn.Unfetched{aspect: :body_params})
+        |> Map.put(:body_params, %Unfetched{aspect: :body_params})
         |> TokenController.create(params)
 
       assert conn.status == 400

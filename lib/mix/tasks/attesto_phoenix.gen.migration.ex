@@ -5,7 +5,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   Generates an Ecto migration that creates the persistence backing the
   Ecto-based stores ship with `attesto_phoenix`.
 
-  The migration creates seven tables, named to match the runtime schemas
+  The migration creates nine tables, named to match the runtime schemas
   exactly so a by-the-docs deploy installs tables the Ecto-backed stores can
   use without modification:
 
@@ -34,6 +34,14 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       `status` state machine (pending → approved|denied → consumed), the
       approved `subject`/`granted_scope`/`granted_claims`, and `last_polled_at`
       for the section 3.5 poll-interval guard.
+
+    * `attesto_logout_sessions` - the Back-Channel Logout session store
+      (`AttestoPhoenix.Schema.LogoutSession`, OpenID Connect Back-Channel Logout
+      1.0). One row per `(session, Relying Party)` pair, recorded at ID-Token
+      mint and read at the end-session endpoint to deliver a `logout_token`.
+      Upserted on `(sid, client_id)`; carries the `subject`, the RP's
+      `backchannel_logout_uri`/`session_required`, and the `expires_at` that
+      bounds an abandoned session.
 
     * `dpop_nonces` - server-issued DPoP nonces
       (`AttestoPhoenix.Schema.DPoPNonce`, RFC 9449, section 8). Each row is a
@@ -258,6 +266,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       authorization_codes: table_name(prefix, "attesto_authorization_codes"),
       refresh_tokens: table_name(prefix, "attesto_refresh_tokens"),
       device_codes: table_name(prefix, "attesto_device_codes"),
+      logout_sessions: table_name(prefix, "attesto_logout_sessions"),
       dpop_nonces: table_name(prefix, "dpop_nonces"),
       dpop_replays: table_name(prefix, "dpop_replays"),
       pushed_authorization_requests: table_name(prefix, "attesto_pushed_authorization_requests"),
@@ -461,6 +470,35 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       create unique_index(:<%= @device_codes %>, [:user_code])
       create index(:<%= @device_codes %>, [:expires_at])
 
+      # Back-Channel Logout session store (OpenID Connect Back-Channel Logout
+      # 1.0), backing AttestoPhoenix.Schema.LogoutSession /
+      # AttestoPhoenix.Store.EctoLogoutSessionStore. One row per (session, RP)
+      # pair, recorded at ID-Token mint and enumerated at the end-session
+      # endpoint to deliver a logout_token. Upserted on (sid, client_id); read by
+      # sid (session-scoped logout) or subject (all the subject's sessions).
+      create table(:<%= @logout_sessions %>, primary_key: false) do
+        add :id, :binary_id, primary_key: true
+        add :sid, :string, size: <%= @identifier_size %>, null: false
+        add :subject, :string, size: <%= @identifier_size %>, null: false
+        add :client_id, :string, size: <%= @identifier_size %>, null: false
+        add :backchannel_logout_uri, :text, null: false
+        # The RP's backchannel_logout_session_required: whether its logout token
+        # MUST carry sid (Back-Channel Logout 1.0 section 2.2).
+        add :session_required, :boolean, null: false, default: false
+        add :expires_at, :utc_datetime, null: false
+
+        timestamps(updated_at: false, type: :utc_datetime)
+      end
+
+      # Upsert key: re-issuing an ID Token for a session the RP already holds
+      # refreshes the row rather than duplicating it. The default index name
+      # attesto_logout_sessions_sid_client_id_index matches the schema's
+      # unique_constraint([:sid, :client_id], name: ...).
+      create unique_index(:<%= @logout_sessions %>, [:sid, :client_id])
+      # Fan-out reads by sid or subject; sweeps scan by expires_at.
+      create index(:<%= @logout_sessions %>, [:subject])
+      create index(:<%= @logout_sessions %>, [:expires_at])
+
       # Server-issued DPoP nonces (RFC 9449, section 8), backing
       # AttestoPhoenix.Schema.DPoPNonce / AttestoPhoenix.Store.EctoNonceStore.
       # Each nonce is single-use: issued_at + the consume cutoff bound freshness,
@@ -562,6 +600,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       drop table(:<%= @pushed_authorization_requests %>)
       drop table(:<%= @dpop_replays %>)
       drop table(:<%= @dpop_nonces %>)
+      drop table(:<%= @logout_sessions %>)
       drop table(:<%= @device_codes %>)
       drop table(:<%= @refresh_tokens %>)
       drop table(:<%= @authorization_codes %>)

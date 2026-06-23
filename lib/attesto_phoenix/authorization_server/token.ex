@@ -823,6 +823,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
         case IDToken.mint(attesto_config(config), grant.subject, client_id, opts) do
           {:ok, id_token} ->
+            maybe_record_logout_session(config, client, grant, client_id)
             {:ok, Map.put(response, :id_token, id_token)}
 
           {:error, reason} ->
@@ -837,6 +838,38 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         Logger.error("id token mint failed: missing client_id")
         {:error, error(@error_invalid_request, "unable to issue token")}
     end
+  end
+
+  # OIDC Back-Channel Logout 1.0 §2: record that this Relying Party now holds a
+  # session for the subject, so the end-session endpoint can later POST it a
+  # `logout_token`. Recorded only when logout is wired (store present), the
+  # session carries a `sid`, and the client registered a `backchannel_logout_uri`
+  # — a plain (non-back-channel) RP records nothing. Idempotent on `(sid,
+  # client_id)`, so a refresh re-mint refreshes the row rather than duplicating
+  # it. Best-effort: a store failure never blocks token issuance (the session is
+  # simply not back-channel-reachable), so it is logged and swallowed.
+  defp maybe_record_logout_session(config, client, grant, client_id) do
+    with true <- Config.backchannel_logout_supported?(config),
+         store when not is_nil(store) <- Config.logout_session_store(config),
+         sid when is_binary(sid) and sid != "" <- id_token_claim(grant.claims, "sid"),
+         bc_uri when is_binary(bc_uri) <- Config.client_backchannel_logout_uri(config, host_client(client)) do
+      now = System.system_time(:second)
+
+      store.record(%{
+        sid: sid,
+        subject: grant.subject,
+        client_id: client_id,
+        backchannel_logout_uri: bc_uri,
+        session_required: Config.client_backchannel_logout_session_required(config, host_client(client)),
+        expires_at: now + Config.logout_session_ttl_seconds(config)
+      })
+    else
+      _ -> :ok
+    end
+  rescue
+    e ->
+      Logger.warning("logout session record failed: #{inspect(e)}")
+      :ok
   end
 
   # OIDC Core §3.1.3.6 / §3.3.2.11: bind the ID Token to the artifacts of this
@@ -855,6 +888,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     |> put_optional_kw(:auth_time, id_token_claim(claims, "auth_time"))
     |> put_optional_kw(:acr, id_token_claim(claims, "acr"))
     |> put_optional_kw(:amr, id_token_claim(claims, "amr"))
+    # OIDC Back-Channel Logout 1.0 §2.1: stamp the session id the authorization
+    # endpoint recorded, so a later logout token can target this session.
+    |> put_optional_kw(:sid, id_token_claim(claims, "sid"))
     # OIDC Core §5.4/§5.5: host userinfo / claims-param-requested claims ride
     # in as `Attesto.IDToken.mint/4`'s `:extra_claims`, where the protocol
     # claims stay authoritative (a collision is rejected, never shadowed).

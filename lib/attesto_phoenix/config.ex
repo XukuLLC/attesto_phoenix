@@ -487,6 +487,13 @@ defmodule AttestoPhoenix.Config do
     :device_authorization_path,
     :device_verification_path,
     :device_code_store,
+    :end_session_path,
+    :logout_session_store,
+    :terminate_session,
+    :render_logged_out,
+    :client_post_logout_redirect_uris,
+    :client_backchannel_logout_uri,
+    :client_backchannel_logout_session_required,
     oauth_path_prefix: "/oauth",
     scopes_supported: [],
     bearer_methods_supported: ["header"],
@@ -513,6 +520,7 @@ defmodule AttestoPhoenix.Config do
     jwt_bearer: [],
     resource_indicators: [],
     device_authorization: [],
+    logout: [],
     basic_realm: "OAuth"
   ]
 
@@ -612,7 +620,8 @@ defmodule AttestoPhoenix.Config do
           registration_enabled: boolean(),
           client_id_metadata: keyword(),
           jwt_bearer: keyword(),
-          resource_indicators: keyword()
+          resource_indicators: keyword(),
+          logout: keyword()
         }
 
   # Required plain values: enforced for presence as struct fields.
@@ -649,7 +658,8 @@ defmodule AttestoPhoenix.Config do
         client_id_metadata: normalize_client_id_metadata(config.client_id_metadata),
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
         resource_indicators: normalize_resource_indicators(config.resource_indicators),
-        device_authorization: normalize_device_authorization(config.device_authorization)
+        device_authorization: normalize_device_authorization(config.device_authorization),
+        logout: normalize_logout(config.logout)
     }
   end
 
@@ -736,6 +746,24 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_device_authorization(nil), do: @device_authorization_defaults
   defp normalize_device_authorization(opts) when is_list(opts), do: Keyword.merge(@device_authorization_defaults, opts)
+
+  # OpenID Connect RP-Initiated Logout 1.0 + Back-Channel Logout 1.0.
+  # `enabled: true` mounts the end-session endpoint (the host MUST ALSO pass
+  # `logout: true` to `attesto_routes/1`) and advertises `end_session_endpoint`
+  # + `backchannel_logout_supported` / `backchannel_logout_session_supported`.
+  # `:session_ttl_seconds` bounds how long a recorded back-channel-logout
+  # session lives before the sweeper reaps it (mirror the host session
+  # lifetime). `:http_client` POSTs each `logout_token` to an RP's
+  # `backchannel_logout_uri`. Off by default — a host opts in and supplies a
+  # `:logout_session_store` + `:terminate_session` callback.
+  @logout_defaults [
+    enabled: false,
+    session_ttl_seconds: 86_400,
+    http_client: AttestoPhoenix.BackChannelLogout.Req
+  ]
+
+  defp normalize_logout(nil), do: @logout_defaults
+  defp normalize_logout(opts) when is_list(opts), do: Keyword.merge(@logout_defaults, opts)
 
   @doc """
   Reads the config for `otp_app` under `key` (default `AttestoPhoenix`) from the
@@ -873,6 +901,156 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
+  @doc "The merged, defaulted OpenID Connect logout (RP-Initiated + Back-Channel) options."
+  @spec logout(t()) :: keyword()
+  def logout(%__MODULE__{logout: opts}), do: opts
+
+  @doc """
+  Returns `true` iff OpenID Connect logout is enabled (`logout: [enabled: true]`).
+  When enabled, the `end_session_endpoint` is advertised and (with a
+  `:logout_session_store` wired) Back-Channel Logout is supported. The host MUST
+  ALSO pass `logout: true` to `attesto_routes/1` to mount the endpoint.
+  """
+  @spec logout_enabled?(t()) :: boolean()
+  def logout_enabled?(%__MODULE__{} = config) do
+    config |> logout() |> Keyword.get(:enabled, false) == true
+  end
+
+  @doc "The configured `Attesto.LogoutSessionStore` module (Back-Channel Logout), or `nil`."
+  @spec logout_session_store(t()) :: module() | nil
+  def logout_session_store(%__MODULE__{logout_session_store: store}), do: store
+
+  @doc "How long a recorded back-channel-logout session lives before it is swept, in seconds."
+  @spec logout_session_ttl_seconds(t()) :: pos_integer()
+  def logout_session_ttl_seconds(%__MODULE__{} = config) do
+    config |> logout() |> Keyword.get(:session_ttl_seconds, 86_400)
+  end
+
+  @doc "The module that POSTs a `logout_token` to a Relying Party's `backchannel_logout_uri`."
+  @spec backchannel_logout_http(t()) :: module()
+  def backchannel_logout_http(%__MODULE__{} = config) do
+    config |> logout() |> Keyword.get(:http_client, AttestoPhoenix.BackChannelLogout.Req)
+  end
+
+  @doc """
+  Returns `true` iff Back-Channel Logout is supported — logout is enabled AND a
+  `:logout_session_store` is wired (advertised as `backchannel_logout_supported`,
+  Back-Channel Logout 1.0 §2.1).
+  """
+  @spec backchannel_logout_supported?(t()) :: boolean()
+  def backchannel_logout_supported?(%__MODULE__{} = config) do
+    logout_enabled?(config) and not is_nil(logout_session_store(config))
+  end
+
+  @doc """
+  Returns `true` iff the OP includes `sid` in its logout tokens (advertised as
+  `backchannel_logout_session_supported`, Back-Channel Logout 1.0 §2.1). attesto
+  always asserts `sid` when the session supplies one, so this tracks
+  `backchannel_logout_supported?/1`.
+  """
+  @spec backchannel_logout_session_supported?(t()) :: boolean()
+  def backchannel_logout_session_supported?(%__MODULE__{} = config), do: backchannel_logout_supported?(config)
+
+  @doc """
+  The Relying Party's registered `post_logout_redirect_uris` (RP-Initiated
+  Logout 1.0 §2): the `:client_post_logout_redirect_uris` callback's result, or
+  `[]` when the host wires none (so an unvalidatable `post_logout_redirect_uri`
+  is always refused).
+  """
+  @spec client_post_logout_redirect_uris(t(), term()) :: [String.t()]
+  def client_post_logout_redirect_uris(%__MODULE__{} = config, client) do
+    case resolve_callback(config, :client_post_logout_redirect_uris) do
+      nil -> []
+      cb -> cb |> Callback.invoke([client], []) |> List.wrap() |> Enum.filter(&is_binary/1)
+    end
+  end
+
+  @doc """
+  The Relying Party's registered `backchannel_logout_uri` (Back-Channel Logout
+  1.0 §2.2), or `nil` when the client is not back-channel-logout capable (so no
+  logout session is recorded and no token is fanned out to it).
+
+  The URI is also fail-closed against server-side request forgery: the OP POSTs
+  a `logout_token` to it, so a non-`https` URL, one carrying userinfo/a fragment,
+  or one whose host is a loopback / private / link-local / unique-local literal
+  (e.g. `127.0.0.1`, `10.x`, `169.254.169.254`, `localhost`) is treated as
+  absent. A registered URL that resolves to an internal address only via DNS is a
+  residual risk the host's egress controls own.
+  """
+  @spec client_backchannel_logout_uri(t(), term()) :: String.t() | nil
+  def client_backchannel_logout_uri(%__MODULE__{} = config, client) do
+    with cb when not is_nil(cb) <- resolve_callback(config, :client_backchannel_logout_uri),
+         uri when is_binary(uri) and uri != "" <- Callback.invoke(cb, [client], nil),
+         true <- safe_backchannel_uri?(uri) do
+      uri
+    else
+      _ -> nil
+    end
+  end
+
+  # Back-Channel Logout 1.0 §3 requires `backchannel_logout_uri` to be https. We
+  # additionally reject userinfo/fragment and obviously-internal literal hosts so
+  # the fan-out POST cannot be aimed at loopback, RFC 1918, link-local (incl. the
+  # cloud metadata address), or ULA ranges.
+  defp safe_backchannel_uri?(uri) do
+    case URI.new(uri) do
+      {:ok, %URI{scheme: "https", host: host, userinfo: nil, fragment: nil}}
+      when is_binary(host) and host != "" ->
+        not blocked_logout_host?(host)
+
+      _ ->
+        false
+    end
+  end
+
+  defp blocked_logout_host?(host) do
+    down = String.downcase(host)
+
+    cond do
+      down in ~w(localhost) -> true
+      String.ends_with?(down, ".localhost") -> true
+      true -> blocked_literal_ip?(host)
+    end
+  end
+
+  defp blocked_literal_ip?(host) do
+    host
+    |> String.trim_leading("[")
+    |> String.trim_trailing("]")
+    |> String.to_charlist()
+    |> :inet.parse_address()
+    |> blocked_parsed_ip?()
+  end
+
+  defp blocked_parsed_ip?({:ok, ip}), do: internal_ip?(ip)
+  defp blocked_parsed_ip?(_other), do: false
+
+  # IPv4 loopback / RFC 1918 private / link-local (incl. 169.254.169.254) / 0.0.0.0.
+  defp internal_ip?({127, _, _, _}), do: true
+  defp internal_ip?({10, _, _, _}), do: true
+  defp internal_ip?({192, 168, _, _}), do: true
+  defp internal_ip?({169, 254, _, _}), do: true
+  defp internal_ip?({172, b, _, _}) when b in 16..31, do: true
+  defp internal_ip?({0, _, _, _}), do: true
+  # IPv6 loopback / unspecified / unique-local (fc00::/7) / link-local (fe80::/10).
+  defp internal_ip?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
+  defp internal_ip?({0, 0, 0, 0, 0, 0, 0, 0}), do: true
+  defp internal_ip?({a, _, _, _, _, _, _, _}) when a >= 0xFC00 and a <= 0xFDFF, do: true
+  defp internal_ip?({a, _, _, _, _, _, _, _}) when a >= 0xFE80 and a <= 0xFEBF, do: true
+  defp internal_ip?(_ip), do: false
+
+  @doc """
+  The Relying Party's `backchannel_logout_session_required` (Back-Channel Logout
+  1.0 §2.2): whether its logout token MUST carry `sid`. Defaults to `false`.
+  """
+  @spec client_backchannel_logout_session_required(t(), term()) :: boolean()
+  def client_backchannel_logout_session_required(%__MODULE__{} = config, client) do
+    case resolve_callback(config, :client_backchannel_logout_session_required) do
+      nil -> false
+      cb -> Callback.invoke(cb, [client], false) == true
+    end
+  end
+
   @doc """
   Returns the configured single-use consent-grant store module, or `nil`.
 
@@ -954,6 +1132,7 @@ defmodule AttestoPhoenix.Config do
   @userinfo_tail "/userinfo"
   @device_authorization_tail "/device_authorization"
   @device_verification_tail "/device_verification"
+  @end_session_tail "/end_session"
 
   @doc false
   @spec authorize_tail() :: String.t()
@@ -986,6 +1165,19 @@ defmodule AttestoPhoenix.Config do
   @spec device_verification_endpoint_url(t()) :: String.t()
   def device_verification_endpoint_url(%__MODULE__{} = config),
     do: endpoint_url(config, device_verification_path(config))
+
+  @doc false
+  @spec end_session_tail() :: String.t()
+  def end_session_tail, do: @end_session_tail
+
+  @doc "The resolved request path of the end-session endpoint (RP-Initiated Logout 1.0)."
+  @spec end_session_path(t()) :: String.t()
+  def end_session_path(%__MODULE__{end_session_path: override} = config),
+    do: resolve_path(override, config, @end_session_tail)
+
+  @doc "Absolute URL of the end-session endpoint (advertised as `end_session_endpoint`, RP-Initiated Logout 1.0 §2)."
+  @spec end_session_endpoint_url(t()) :: String.t()
+  def end_session_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, end_session_path(config))
 
   @doc false
   @spec token_tail() :: String.t()
@@ -1227,6 +1419,9 @@ defmodule AttestoPhoenix.Config do
     client_id: {:client_store, :client_id, 1},
     client_jwks: {:client_store, :client_jwks, 1},
     client_redirect_uris: {:client_store, :client_redirect_uris, 1},
+    client_post_logout_redirect_uris: {:client_store, :client_post_logout_redirect_uris, 1},
+    client_backchannel_logout_uri: {:client_store, :client_backchannel_logout_uri, 1},
+    client_backchannel_logout_session_required: {:client_store, :client_backchannel_logout_session_required, 1},
     client_public?: {:client_store, :client_public?, 1},
     client_requires_mtls?: {:client_store, :client_requires_mtls?, 1},
     client_requires_dpop?: {:client_store, :client_requires_dpop?, 1},
@@ -1350,6 +1545,19 @@ defmodule AttestoPhoenix.Config do
   # subject to a local principal (`:resolve_jwt_bearer_subject`). Fail closed at
   # boot rather than reject every assertion at runtime. (`jti` replay reuses the
   # configured `:replay_check`, falling back to the bundled ETS cache like DPoP.)
+  # Logout must never fail open: an enabled end-session endpoint with no host
+  # `:terminate_session` callback could report "logged out" without clearing the
+  # session. Refuse to build such a config.
+  defp validate_logout!(%__MODULE__{} = config) do
+    if logout_enabled?(config) and is_nil(config.terminate_session) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :terminate_session is required when logout is enabled " <>
+              "(logout: [enabled: true]). Add a `terminate_session: &MyApp.AuthZ.terminate_session/2` " <>
+              "callback that clears the host's browser session — the library must not serve an " <>
+              "end-session endpoint that cannot actually log the user out. Or disable logout."
+    end
+  end
+
   defp validate_jwt_bearer!(%__MODULE__{} = config) do
     if jwt_bearer_enabled?(config) do
       opts = jwt_bearer(config)
@@ -1436,6 +1644,7 @@ defmodule AttestoPhoenix.Config do
               "`registration_enabled: false` so no registration endpoint is mounted."
     end
 
+    validate_logout!(config)
     validate_jwt_bearer!(config)
     validate_behaviour_modules!(config)
     validate_request_object_policy!(config)
@@ -1449,6 +1658,7 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:userinfo_path, config.userinfo_path)
     validate_optional_path!(:device_authorization_path, config.device_authorization_path)
     validate_optional_path!(:device_verification_path, config.device_verification_path)
+    validate_optional_path!(:end_session_path, config.end_session_path)
 
     validate_discovery_endpoints!(config)
     validate_advertised_paths_consistent!(config)

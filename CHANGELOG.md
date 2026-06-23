@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-06-23
+
+### Added
+
+- **OpenID Connect Logout (RP-Initiated Logout 1.0 + Back-Channel Logout 1.0).**
+  A `logout: true` option on `attesto_routes/1` mounts `GET`/`POST
+  /oauth/end_session` (`AttestoPhoenix.Controller.EndSessionController`), gated
+  by a `logout: [enabled: true]` config block. The endpoint verifies the
+  `id_token_hint`, validates `post_logout_redirect_uri` against the client's
+  registered set (exact match — no open redirect), and either redirects with
+  `state` or hands off to the host's logged-out page.
+  - The **host is the session authority**: a REQUIRED `:terminate_session`
+    callback clears the browser session and returns the confirmed
+    `%{sid, subject}` that scopes the Back-Channel fan-out — so a replayed or
+    stolen `id_token_hint` cannot force-log-out an arbitrary session.
+    `AttestoPhoenix.Config` raises at boot if logout is enabled without it (no
+    fail-open logout). `:render_logged_out` is an optional page renderer.
+  - Back-Channel fan-out: a `logout_token` is POSTed to every RP holding the
+    terminated session, recorded at ID-Token mint
+    (`AttestoPhoenix.Schema.LogoutSession` + `EctoLogoutSessionStore`, a new
+    `attesto_logout_sessions` table) and taken atomically
+    (`DELETE ... RETURNING`) so concurrent logouts cannot double-deliver.
+    Delivery (`AttestoPhoenix.BackChannelLogout` / `.Req`) is best-effort and
+    SSRF-guarded: a `backchannel_logout_uri` is honored only when it is `https`
+    with no userinfo/fragment and a non-internal host (loopback / RFC 1918 /
+    link-local / ULA literals are refused).
+  - The authorization endpoint threads the host's `:sid` (from the authenticate
+    subject map) into the ID Token, and dynamic registration accepts
+    `post_logout_redirect_uris`, `backchannel_logout_uri`, and
+    `backchannel_logout_session_required`. Discovery advertises
+    `end_session_endpoint` + `backchannel_logout_supported` +
+    `backchannel_logout_session_supported` when enabled. The sweeper reaps
+    expired logout-session rows.
+
+- Requires `attesto ~> 0.13`.
+
 ## [0.17.0] - 2026-06-23
 
 ### Added
