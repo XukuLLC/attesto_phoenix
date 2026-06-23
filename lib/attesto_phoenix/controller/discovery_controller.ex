@@ -170,6 +170,9 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       scopes_supported: presence(config.scopes_supported),
       require_pushed_authorization_requests: require_pushed_authorization_requests(config),
       pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
+      # RFC 8628 §4: advertised only when the device authorization grant is
+      # enabled (nil-dropped by the core builder otherwise).
+      device_authorization_endpoint: device_authorization_endpoint(config),
       introspection_endpoint: Config.introspection_endpoint_url(config),
       introspection_endpoint_auth_methods_supported: introspection_auth_methods(config),
       registration_endpoint: registration_endpoint(config),
@@ -252,6 +255,10 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   defp authorization_response_iss_parameter_supported(%Config{}), do: nil
 
   defp pushed_authorization_request_endpoint(%Config{} = config), do: Config.par_endpoint_url(config)
+
+  defp device_authorization_endpoint(%Config{} = config) do
+    if Config.device_authorization_enabled?(config), do: Config.device_authorization_endpoint_url(config)
+  end
 
   # RFC 7591 §3: advertise the dynamic client registration endpoint only
   # when registration is enabled; otherwise omit the member entirely. The URL

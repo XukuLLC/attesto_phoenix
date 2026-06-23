@@ -198,6 +198,8 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       introspection_endpoint_auth_methods_supported: introspection_auth_methods(config),
       require_pushed_authorization_requests: require_pushed_authorization_requests(config),
       pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
+      # RFC 8628 §4: advertised only when the device grant is enabled.
+      device_authorization_endpoint: device_authorization_endpoint(config),
       scopes_supported: config.scopes_supported,
       claims_supported: presence(config.claims_supported),
       registration_endpoint: registration_endpoint(config),
@@ -300,6 +302,10 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   defp revocation_endpoint(%Config{} = config), do: Config.revocation_endpoint_url(config)
 
   defp pushed_authorization_request_endpoint(%Config{} = config), do: Config.par_endpoint_url(config)
+
+  defp device_authorization_endpoint(%Config{} = config) do
+    if Config.device_authorization_enabled?(config), do: Config.device_authorization_endpoint_url(config)
+  end
 
   # RFC 7591 §3: advertise the dynamic client registration endpoint only when
   # registration is enabled; otherwise omit the member entirely. The URL is

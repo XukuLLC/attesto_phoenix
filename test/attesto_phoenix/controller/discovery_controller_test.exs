@@ -89,6 +89,19 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
                ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
     end
 
+    test "advertises device_authorization_endpoint + device_code grant only when enabled (RFC 8628)" do
+      # Off by default.
+      off = call_show(host_config(), protocol_config()) |> decode_body()
+      refute Map.has_key?(off, "device_authorization_endpoint")
+      refute "urn:ietf:params:oauth:grant-type:device_code" in off["grant_types_supported"]
+
+      # On when the host enables the grant.
+      enabled = host_config(device_authorization: [enabled: true], device_code_store: StubKeystore)
+      on = call_show(enabled, protocol_config()) |> decode_body()
+      assert on["device_authorization_endpoint"] == "#{@issuer}/oauth/device_authorization"
+      assert "urn:ietf:params:oauth:grant-type:device_code" in on["grant_types_supported"]
+    end
+
     test "advertises the JARM authorization signing algorithms (RFC 8414 / §5.4)" do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 
