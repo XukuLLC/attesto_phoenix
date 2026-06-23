@@ -495,6 +495,80 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     end
   end
 
+  describe "device authorization grant (RFC 8628 §3.4 / §3.5)" do
+    setup do
+      start_supervised!(Attesto.DeviceCodeStore.ETS)
+      Attesto.DeviceCodeStore.ETS.reset()
+      :ok
+    end
+
+    defp device_config(overrides \\ []) do
+      config(
+        [
+          device_code_store: Attesto.DeviceCodeStore.ETS,
+          device_authorization: [enabled: true, poll_interval_seconds: 0],
+          authorize_scope: fn _client, requested -> {:ok, requested} end
+        ] ++ overrides
+      )
+    end
+
+    defp issue_device_code(scope \\ ["read"]) do
+      {:ok, issued} =
+        Attesto.DeviceCode.issue(Attesto.DeviceCodeStore.ETS, %{client_id: "client-1", scope: scope})
+
+      issued
+    end
+
+    defp device_request(config, device_code) do
+      request(config,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+        params: %{"device_code" => device_code}
+      )
+    end
+
+    test "pending → authorization_pending (NOT invalid_grant)" do
+      config = device_config()
+      %{device_code: dc} = issue_device_code()
+
+      assert {:error, %OAuthError{error: :authorization_pending}, _} = Token.issue(config, device_request(config, dc))
+    end
+
+    test "denied → access_denied" do
+      config = device_config()
+      %{device_code: dc, user_code: uc} = issue_device_code()
+      :ok = Attesto.DeviceCode.deny(Attesto.DeviceCodeStore.ETS, uc)
+
+      assert {:error, %OAuthError{error: :access_denied}, _} = Token.issue(config, device_request(config, dc))
+    end
+
+    test "an unknown device_code → invalid_grant" do
+      config = device_config()
+      assert {:error, %OAuthError{error: :invalid_grant}, _} = Token.issue(config, device_request(config, "nope"))
+    end
+
+    test "approved → mints an access token with the granted scope" do
+      config = device_config()
+      %{device_code: dc, user_code: uc} = issue_device_code(["read"])
+      :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
+
+      assert {:ok, response, [%Event{name: :token_issued, grant_type: "device_code"}]} =
+               Token.issue(config, device_request(config, dc))
+
+      assert is_binary(response.access_token)
+      assert response.scope == "read"
+      assert claim!(response.access_token, "sub") == "oc_user-1"
+    end
+
+    test "a consumed device_code cannot be redeemed twice" do
+      config = device_config()
+      %{device_code: dc, user_code: uc} = issue_device_code()
+      :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
+
+      assert {:ok, _, _} = Token.issue(config, device_request(config, dc))
+      assert {:error, %OAuthError{error: :invalid_grant}, _} = Token.issue(config, device_request(config, dc))
+    end
+  end
+
   describe "token exchange grant (RFC 8693)" do
     test "a token_exchange token_issued event carries bearer sender metadata" do
       config = config()

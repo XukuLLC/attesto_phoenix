@@ -44,7 +44,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   `invalid_request` without leaking detail; the underlying reason is logged.
   """
 
-  alias Attesto.{AuthorizationCode, IDToken, RefreshToken, ResourceIndicator}
+  alias Attesto.{AuthorizationCode, DeviceCode, IDToken, RefreshToken, ResourceIndicator}
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
@@ -72,6 +72,17 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
   # JWT-bearer authorization grant (MCP Enterprise-Managed Authorization).
   @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
+
+  # RFC 8628 §3.4: the device authorization grant token request.
+  @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
+
+  # RFC 8628 §3.5: the polling errors that MUST be rendered with their own error
+  # codes (NOT collapsed to invalid_grant) — clients depend on distinguishing
+  # authorization_pending / slow_down from a terminal failure.
+  @error_authorization_pending :authorization_pending
+  @error_slow_down :slow_down
+  @error_expired_token :expired_token
+  @error_access_denied :access_denied
 
   # RFC 6749 §4.4 / RFC 8693 §2.1: grants that require a confidential client.
   # client_credentials authenticates the client AS the principal, a token
@@ -286,6 +297,38 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, response} <-
            mint(config, client, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
       {:ok, response, [token_issued_event(request, scope, "client_credentials", token_type, binding)]}
+    end
+  end
+
+  # RFC 8628 §3.4 / §3.5: device authorization grant. The device polls with its
+  # `device_code`; the store's polling state machine returns the user's decision
+  # (or the §3.5 pending/slow_down/expired/denied signals, mapped to their exact
+  # error codes by `device_grant_error/1`). On approval the bound subject/scope/
+  # resource/acr+auth_time mint a token exactly as the authorization-code grant
+  # does; a refresh token follows the host `:issue_refresh_token?` gate.
+  defp dispatch(%Request{grant_type: @grant_device_code} = request) do
+    %{config: config, client: client, params: params} = request
+
+    with {:ok, device_code} <- require_param(params, "device_code"),
+         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, grant} <- redeem_device_code(config, client, device_code, SenderConstraint.binding_jkt(binding)),
+         {:ok, scope} <- authorize_scope(config, client, grant.scope),
+         {:ok, audience} <- resolve_code_resource(grant, params),
+         {:ok, response} <-
+           mint(
+             config,
+             client,
+             grant.subject,
+             scope,
+             token_type,
+             binding,
+             %{},
+             # RFC 8707 aud from the bound resource set; RFC 9470 acr/auth_time
+             # the verification page recorded onto the approved code.
+             audience_opts(audience) ++ auth_context_opts(grant.claims)
+           ) do
+      issued = token_issued_event(request, scope, "device_code", token_type, binding)
+      maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued], "device_code")
     end
   end
 
@@ -531,6 +574,36 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
+  # RFC 8628 §3.4/§3.5: poll the device-code store for the authenticated client's
+  # `device_code`, carrying the DPoP holder-of-key the token request demonstrated
+  # (matched against any pre-bound key). The §3.5 polling signals map to their
+  # own wire error codes; only a genuinely bad/unknown code is `invalid_grant`.
+  defp redeem_device_code(config, client, device_code, jkt) do
+    store = Config.device_code_store(config)
+    interval = config |> Config.device_authorization() |> Keyword.get(:poll_interval_seconds, 5)
+
+    params =
+      %{client_id: client_id(config, client)}
+      |> put_optional(:dpop_jkt, jkt)
+
+    case DeviceCode.redeem(store, device_code, params, interval: interval) do
+      {:ok, grant} -> {:ok, grant}
+      {:error, reason} -> {:error, device_grant_error(reason)}
+    end
+  end
+
+  # RFC 8628 §3.5: render each polling outcome with its OWN error code. The
+  # client distinguishes "keep polling" (authorization_pending / slow_down) from
+  # a terminal failure (expired_token / access_denied) — collapsing them to
+  # invalid_grant would break the polling loop.
+  defp device_grant_error(:authorization_pending),
+    do: error(@error_authorization_pending, "the authorization request is still pending")
+
+  defp device_grant_error(:slow_down), do: error(@error_slow_down, "polling too frequently; slow down")
+  defp device_grant_error(:expired_token), do: error(@error_expired_token, "the device code has expired")
+  defp device_grant_error(:access_denied), do: error(@error_access_denied, "the user denied the request")
+  defp device_grant_error(_reason), do: error(@error_invalid_grant, "the device code is invalid")
+
   # Revoke the refresh-token family linked to a replayed code (OAuth 2.0
   # Security BCP §4.13.2) through the configured `:refresh_store`. The reuse
   # `meta` carries a `family_id` (not a token), so the family-level
@@ -691,9 +764,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # `revoke_reused_family/2`). When the code carried no `family_id`,
     # `put_optional_kw/3` drops the option, a fresh family is generated, and
     # reuse detection simply has no family to revoke.
+    # `Map.get/2` (not `grant.family_id`) so this path is shared with grants
+    # whose struct has no `family_id` (the RFC 8628 device grant): a single-use
+    # device code has no code-reuse family to link, so the absent id yields a
+    # fresh family — exactly the intended behavior.
     issue_opts =
       [ttl: config.refresh_token_ttl]
-      |> put_optional_kw(:family_id, grant.family_id)
+      |> put_optional_kw(:family_id, Map.get(grant, :family_id))
 
     case RefreshToken.issue(refresh_store, context, issue_opts) do
       {:ok, %{token: token}} ->
