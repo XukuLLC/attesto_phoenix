@@ -27,6 +27,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.{Callback, Config, OAuthError}
 
+  @error_invalid_request :invalid_request
   @error_invalid_scope :invalid_scope
   @error_invalid_target :invalid_target
   @error_invalid_dpop_proof :invalid_dpop_proof
@@ -36,12 +37,13 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   defmodule Request do
     @moduledoc "Plain-data device-authorization request the controller builds from the conn."
     @enforce_keys [:client]
-    defstruct [:client, :client_auth_method, :client_ip, params: %{}, dpop_input: %{}]
+    defstruct [:client, :client_auth_method, :client_ip, :request_client_id, params: %{}, dpop_input: %{}]
 
     @type t :: %__MODULE__{
             client: term(),
             client_auth_method: atom() | nil,
             client_ip: String.t() | nil,
+            request_client_id: String.t() | nil,
             params: map(),
             dpop_input: map()
           }
@@ -59,12 +61,23 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
     %{client: client, params: params} = request
 
     with {:ok, store} <- require_store(config),
+         {:ok, client_id} <- resolve_client_id(config, request),
          {:ok, scope} <- parse_scope(params),
          {:ok, resource} <- resolve_resource(config, client, params),
          {:ok, dpop_jkt} <- resolve_dpop(config, request),
          :ok <- require_dpop_for_public(request, dpop_jkt),
-         {:ok, issued} <- issue(store, config, client, scope, resource, dpop_jkt) do
+         {:ok, issued} <- issue(store, config, client_id, scope, resource, dpop_jkt) do
       {:ok, response_body(config, issued)}
+    end
+  end
+
+  # The bound client_id is the host `:client_id` callback's value, falling back
+  # to the client id the request authenticated with (so a host that does not wire
+  # a `:client_id` callback still works). Absent both, the request is malformed.
+  defp resolve_client_id(config, %Request{client: client, request_client_id: presented}) do
+    case Callback.invoke(Config.client_id_fun(config), [client], nil) || presented do
+      id when is_binary(id) and id != "" -> {:ok, id}
+      _ -> {:error, error(@error_invalid_client, "the client could not be identified")}
     end
   end
 
@@ -150,17 +163,23 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
 
   defp require_dpop_for_public(_request, _dpop_jkt), do: :ok
 
-  defp issue(store, config, client, scope, resource, dpop_jkt) do
+  defp issue(store, config, client_id, scope, resource, dpop_jkt) do
     opts = Config.device_authorization(config)
 
     attrs =
-      %{client_id: client_id(config, client), scope: scope, resource: resource}
+      %{client_id: client_id, scope: scope, resource: resource}
       |> put_optional(:dpop_jkt, dpop_jkt)
 
-    DeviceCode.issue(store, attrs,
-      ttl: Keyword.get(opts, :code_ttl_seconds),
-      user_code_length: Keyword.get(opts, :user_code_length)
-    )
+    case DeviceCode.issue(store, attrs,
+           ttl: Keyword.get(opts, :code_ttl_seconds),
+           user_code_length: Keyword.get(opts, :user_code_length)
+         ) do
+      {:ok, issued} -> {:ok, issued}
+      # Could not allocate a unique user_code after retries — a transient
+      # capacity condition, not a client error.
+      {:error, :user_code_unavailable} -> {:error, error(@error_server_error, "could not allocate a user code; retry")}
+      {:error, _reason} -> {:error, error(@error_invalid_request, "invalid device authorization request")}
+    end
   end
 
   defp response_body(config, %{device_code: device_code, user_code: user_code}) do
@@ -177,8 +196,6 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
       interval: Keyword.get(opts, :poll_interval_seconds)
     }
   end
-
-  defp client_id(config, client), do: Callback.invoke(Config.client_id_fun(config), [client], nil)
 
   defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
   defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)

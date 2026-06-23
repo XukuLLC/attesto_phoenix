@@ -28,6 +28,7 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationControllerTest do
       load_principal: fn _ -> {:error, :not_found} end,
       device_code_store: Store,
       device_authorization: [enabled: true],
+      require_https: false,
       # Host login: a fixed signed-in user.
       authenticate_device_user: fn _conn -> {:ok, %{subject: "user-1", claims: %{"acr" => "phr"}}} end,
       # Host renderer: echo the stage as JSON so the test can assert on it.

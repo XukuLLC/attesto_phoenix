@@ -719,10 +719,12 @@ defmodule AttestoPhoenix.Config do
   end
 
   # RFC 8628 device authorization grant. `enabled: true` adds `device_code` to
-  # `grant_types_supported/1`, advertises the `device_authorization_endpoint`,
-  # and lights up the routes. `:verification_uri` is the URL shown to the user
-  # (defaults to the issuer-derived device-verification path). `:code_ttl_seconds`
-  # and `:poll_interval_seconds` are the §3.2 `expires_in` / `interval`. Off by
+  # `grant_types_supported/1` and advertises the `device_authorization_endpoint`
+  # — the host MUST ALSO pass `device: true` to `attesto_routes/1` to mount the
+  # endpoints, or discovery will advertise a route that is not served.
+  # `:verification_uri` is the URL shown to the user (defaults to the
+  # issuer-derived device-verification path). `:code_ttl_seconds` and
+  # `:poll_interval_seconds` are the §3.2 `expires_in` / `interval`. Off by
   # default — a host opts in and supplies a `:device_code_store`.
   @device_authorization_defaults [
     enabled: false,
@@ -1445,6 +1447,8 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:revocation_path, config.revocation_path)
     validate_optional_path!(:registration_path, config.registration_path)
     validate_optional_path!(:userinfo_path, config.userinfo_path)
+    validate_optional_path!(:device_authorization_path, config.device_authorization_path)
+    validate_optional_path!(:device_verification_path, config.device_verification_path)
 
     validate_discovery_endpoints!(config)
     validate_advertised_paths_consistent!(config)

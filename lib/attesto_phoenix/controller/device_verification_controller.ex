@@ -27,24 +27,43 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   pre-filled — approval requires an explicit user POST carrying
   `decision=approve`. The controller never approves from a GET or from the URL
   alone, closing the one-click remote-phishing vector.
+
+  ## Host responsibility: CSRF + session (REQUIRED)
+
+  The approve/deny POST is a state-changing, session-authenticated action. The
+  library performs the store transition but does NOT own the browser session or
+  CSRF token, so the host MUST mount these routes behind a pipeline that
+  enforces CSRF protection (`protect_from_forgery`) and a same-site session —
+  otherwise a logged-in victim's browser can be made to POST an attacker's
+  `user_code` and approve the attacker's device (a confused-deputy / device
+  login CSRF). The controller additionally requires HTTPS (a credential-bearing
+  authorization action must not cross a plain-HTTP hop).
   """
 
   use Phoenix.Controller, formats: [:html, :json]
 
   alias Attesto.DeviceCode
-  alias AttestoPhoenix.{Callback, Config}
+  alias AttestoPhoenix.{Callback, Config, RequestContext}
 
   @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def verify(conn, params) do
     config = resolve_config()
 
     with :ok <- require_enabled(config),
+         :ok <- check_https(conn, config),
          {:ok, store} <- require_store(config),
          {:ok, conn, subject} <- authenticate(conn, config) do
       handle(conn, config, store, subject, params)
     else
       {:halt, conn} -> conn
       {:error, status, body} -> conn |> put_status(status) |> json(body)
+    end
+  end
+
+  defp check_https(conn, config) do
+    case RequestContext.check_https(conn, config) do
+      :ok -> :ok
+      {:error, :insecure_transport} -> {:error, 400, %{error: "invalid_request", error_description: "TLS required"}}
     end
   end
 
@@ -65,7 +84,10 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   defp approve(conn, config, store, subject, user_code) do
     approval = %{
       subject: Map.get(subject, :subject) || Map.get(subject, :sub),
-      scope: pending_scope(store, user_code),
+      # The granted scope is the subject's narrowed scope when the host
+      # login/consent layer supplied one, otherwise the originally requested
+      # scope bound to the device code — never broader than what was requested.
+      scope: Map.get(subject, :scope) || pending_scope(store, user_code),
       claims: Map.get(subject, :claims, %{})
     }
 

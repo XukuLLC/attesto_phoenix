@@ -51,6 +51,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
   @swept_tables [
     "attesto_authorization_codes",
     "attesto_refresh_tokens",
+    "attesto_device_codes",
     "dpop_nonces",
     "dpop_replays",
     "attesto_pushed_authorization_requests",
@@ -140,6 +141,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       start_recorder(%{
         "attesto_authorization_codes" => 3,
         "attesto_refresh_tokens" => 1,
+        "attesto_device_codes" => 6,
         "dpop_nonces" => 0,
         "dpop_replays" => 7,
         "attesto_pushed_authorization_requests" => 2,
@@ -155,6 +157,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       assert result == %{
                "attesto_authorization_codes" => 3,
                "attesto_refresh_tokens" => 1,
+               "attesto_device_codes" => 6,
                "dpop_nonces" => 0,
                "dpop_replays" => 7,
                "attesto_pushed_authorization_requests" => 2,

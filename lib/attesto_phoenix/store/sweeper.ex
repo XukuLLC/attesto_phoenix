@@ -84,6 +84,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
   # construction.
   @authorization_codes "attesto_authorization_codes"
   @refresh_tokens "attesto_refresh_tokens"
+  @device_codes "attesto_device_codes"
   @dpop_nonces "dpop_nonces"
   @dpop_replays "dpop_replays"
   @pushed_authorization_requests "attesto_pushed_authorization_requests"
@@ -163,6 +164,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
     %{
       @authorization_codes => delete_expired(repo, expired_query(@authorization_codes, now), prefix),
       @refresh_tokens => delete_expired(repo, expired_query(@refresh_tokens, now), prefix),
+      @device_codes => delete_expired(repo, expired_query(@device_codes, now), prefix),
       @dpop_nonces => delete_expired(repo, expired_query(@dpop_nonces, now), prefix),
       @dpop_replays => delete_expired(repo, expired_query(@dpop_replays, now), prefix),
       @pushed_authorization_requests =>
@@ -178,6 +180,8 @@ defmodule AttestoPhoenix.Store.Sweeper do
   defp expired_query(@authorization_codes, now), do: from(r in @authorization_codes, where: r.expires_at < ^now)
 
   defp expired_query(@refresh_tokens, now), do: from(r in @refresh_tokens, where: r.expires_at < ^now)
+
+  defp expired_query(@device_codes, now), do: from(r in @device_codes, where: r.expires_at < ^now)
 
   defp expired_query(@dpop_nonces, now), do: from(r in @dpop_nonces, where: r.expires_at < ^now)
 

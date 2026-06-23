@@ -37,11 +37,30 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
-         {:ok, client, method} <- authenticate_client(config, conn, params),
-         {:ok, response} <- DeviceAuthorization.request(config, build_request(config, conn, client, method, params)) do
+         :ok <- reject_query_credentials(conn),
+         {:ok, result} <- authenticate_client(config, conn, params),
+         {:ok, response} <- DeviceAuthorization.request(config, build_request(config, conn, result, params)) do
       json(conn, response)
     else
       {:error, %OAuthError{} = err} -> render_error(conn, err)
+    end
+  end
+
+  # RFC 6749 §2.3.1: credentials and request params belong in the form body.
+  # Query-string credentials leak through access logs, caches, and browser
+  # history, so reject them before client authentication (as the token endpoint
+  # does), since Phoenix merges query and body params for the action.
+  @query_credential_params ~w(client_id client_secret scope)
+  defp reject_query_credentials(conn) do
+    conn = fetch_query_params(conn)
+
+    case Enum.find(@query_credential_params, &Map.has_key?(conn.query_params, &1)) do
+      nil ->
+        :ok
+
+      key ->
+        {:error,
+         OAuthError.new(:invalid_request, "#{key} must be sent in the request body, not the query string", status: 400)}
     end
   end
 
@@ -71,15 +90,16 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
     }
 
     case ClientAuthentication.authenticate_with_context(get_req_header(conn, "authorization"), params, config, policy) do
-      {:ok, %ClientAuthentication.Result{client: client, method: method}} -> {:ok, client, method}
+      {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}
       {:error, %OAuthError{} = err, _context} -> {:error, err}
     end
   end
 
-  defp build_request(config, conn, client, method, params) do
+  defp build_request(config, conn, %ClientAuthentication.Result{} = result, params) do
     %Request{
-      client: client,
-      client_auth_method: method,
+      client: result.client,
+      client_auth_method: result.method,
+      request_client_id: result.client_id,
       client_ip: RequestContext.client_ip(conn, config),
       params: params,
       dpop_input: %{

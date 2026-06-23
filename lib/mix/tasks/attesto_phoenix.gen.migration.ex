@@ -562,6 +562,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       drop table(:<%= @pushed_authorization_requests %>)
       drop table(:<%= @dpop_replays %>)
       drop table(:<%= @dpop_nonces %>)
+      drop table(:<%= @device_codes %>)
       drop table(:<%= @refresh_tokens %>)
       drop table(:<%= @authorization_codes %>)
     end

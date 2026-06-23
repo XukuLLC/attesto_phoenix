@@ -30,13 +30,23 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   @app :attesto_phoenix
 
   @impl Attesto.DeviceCodeStore
-  @spec put(Attesto.DeviceCodeStore.entry()) :: :ok
+  @spec put(Attesto.DeviceCodeStore.entry()) :: :ok | {:error, :user_code_taken}
   def put(%{device_code_hash: hash, user_code: user_code} = record) when is_binary(hash) and is_binary(user_code) do
     record
     |> DeviceCode.from_record()
-    |> repo().insert!()
+    |> repo().insert()
+    |> case do
+      {:ok, _row} ->
+        :ok
 
-    :ok
+      {:error, changeset} ->
+        # A user_code collision is expected (≈34.6-bit code) — signal a retry. A
+        # device_code_hash collision is CSPRNG-grade impossible, so re-raise it
+        # as the caller bug it would be.
+        if Keyword.has_key?(changeset.errors, :user_code),
+          do: {:error, :user_code_taken},
+          else: raise(Ecto.InvalidChangesetError, action: :insert, changeset: changeset)
+    end
   end
 
   @impl Attesto.DeviceCodeStore
@@ -88,10 +98,14 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   @impl Attesto.DeviceCodeStore
   @spec consume(Attesto.DeviceCodeStore.device_code_hash(), map()) ::
           {:ok, Attesto.DeviceCodeStore.entry()} | :error
-  def consume(hash, _opts) when is_binary(hash) do
+  def consume(hash, opts) when is_binary(hash) do
+    now = opts |> Map.get(:now, System.system_time(:second)) |> DateTime.from_unix!() |> DateTime.truncate(:second)
+
+    # Guard on approval AND unexpiry, so a code that expires between the core's
+    # poll-time check and this transition cannot mint.
     query =
       from d in DeviceCode,
-        where: d.device_code_hash == ^hash and d.status == :approved,
+        where: d.device_code_hash == ^hash and d.status == :approved and d.expires_at > ^now,
         select: d
 
     case repo().update_all(query, set: [status: :consumed]) do
