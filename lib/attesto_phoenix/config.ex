@@ -457,6 +457,8 @@ defmodule AttestoPhoenix.Config do
     :client_redirect_uris,
     :authenticate_resource_owner,
     :consent,
+    :authenticate_device_user,
+    :render_device_verification,
     :client_public?,
     :client_requires_mtls?,
     :client_requires_dpop?,

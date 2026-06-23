@@ -89,6 +89,7 @@ defmodule AttestoPhoenix.Router do
   # Set document the metadata's `jwks_uri` points at.
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
+  alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
   alias AttestoPhoenix.Controller.IntrospectionController
   alias AttestoPhoenix.Controller.JWKSController
@@ -131,6 +132,7 @@ defmodule AttestoPhoenix.Router do
   @register_path @oauth_prefix <> AttestoPhoenix.Config.registration_tail()
   @userinfo_path @oauth_prefix <> AttestoPhoenix.Config.userinfo_tail()
   @device_authorization_path @oauth_prefix <> AttestoPhoenix.Config.device_authorization_tail()
+  @device_verification_path @oauth_prefix <> AttestoPhoenix.Config.device_verification_tail()
 
   # Controllers that back each endpoint. Named here once so the macro
   # expansion does not scatter controller module references through the
@@ -147,6 +149,7 @@ defmodule AttestoPhoenix.Router do
   @registration_controller RegistrationController
   @userinfo_controller UserinfoController
   @device_authorization_controller DeviceAuthorizationController
+  @device_verification_controller DeviceVerificationController
 
   @doc false
   defmacro __using__(_opts) do
@@ -188,7 +191,9 @@ defmodule AttestoPhoenix.Router do
     registration_controller = @registration_controller
     userinfo_controller = @userinfo_controller
     device_authorization_path = @device_authorization_path
+    device_verification_path = @device_verification_path
     device_authorization_controller = @device_authorization_controller
+    device_verification_controller = @device_verification_controller
 
     # `pipe_through/1` is a compile-time `Phoenix.Router` macro: it must be
     # expanded once per pipeline as it is written into the scope, not iterated
@@ -233,6 +238,22 @@ defmodule AttestoPhoenix.Router do
             unquote(prefix <> device_authorization_path),
             unquote(device_authorization_controller),
             :create
+          )
+
+          # RFC 8628 §3.3: the user-facing verification page. GET shows the
+          # confirm prompt (and pre-fills `?user_code=` from
+          # `verification_uri_complete`); POST carries the explicit approve/deny
+          # decision (no approval is ever derived from a GET / the URL alone).
+          get(
+            unquote(prefix <> device_verification_path),
+            unquote(device_verification_controller),
+            :verify
+          )
+
+          post(
+            unquote(prefix <> device_verification_path),
+            unquote(device_verification_controller),
+            :verify
           )
         end
       end
