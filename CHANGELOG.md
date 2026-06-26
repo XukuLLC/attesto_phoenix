@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-06-26
+
+### Fixed
+
+- **Authorization-endpoint direct-error HTML showed the wrong code.** A
+  non-redirectable `/authorize` error rendered to a browser (`Accept:
+  text/html`) hardcoded `invalid_request` in the page, while the JSON body
+  correctly carried the resolved code. A browser hitting an expired/unknown PAR
+  `request_uri` therefore saw `invalid_request` instead of `invalid_request_uri`
+  (which a conformance check reading the rendered page rejects). The HTML page
+  now renders the same resolved code as the JSON body.
+
 ## [0.19.0] - 2026-06-23
 
 ### Added

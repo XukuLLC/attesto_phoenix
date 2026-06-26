@@ -928,15 +928,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `Accept` header still receives the error rather than a 406.
   defp render_direct_error(conn, _config, reason) do
     description = direct_error_description(reason)
+    code = direct_error_code(reason)
 
     if accepts_html?(conn) do
       conn
       |> put_resp_content_type("text/html")
-      |> send_resp(:bad_request, direct_error_html(description))
+      |> send_resp(:bad_request, direct_error_html(code, description))
     else
       body =
         JSON.encode!(%{
-          error: direct_error_code(reason),
+          error: code,
           error_description: description
         })
 
@@ -952,7 +953,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     |> Enum.any?(fn value -> String.contains?(String.downcase(value), "text/html") end)
   end
 
-  defp direct_error_html(description) do
+  defp direct_error_html(code, description) do
+    escaped_code = html_escape(code)
     escaped_description = html_escape(description)
 
     """
@@ -1005,7 +1007,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       </head>
       <body>
         <main>
-          <code>invalid_request</code>
+          <code>#{escaped_code}</code>
           <h1>Authorization request error</h1>
           <p>#{escaped_description}</p>
         </main>

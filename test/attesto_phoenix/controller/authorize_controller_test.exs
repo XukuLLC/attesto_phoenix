@@ -738,6 +738,28 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert conn.status == 400
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_request_uri"
     end
+
+    test "an unknown/expired PAR request_uri renders the invalid_request_uri code in the HTML error page" do
+      # A browser (Accept: text/html) hitting an expired request_uri must see the
+      # SAME error code as the JSON body. The HTML page previously hardcoded
+      # `invalid_request`, which the FAPI2 par-attempt-to-use-expired-request_uri
+      # conformance test (reading the rendered page) rejects.
+      put_config(require_pushed_authorization_requests: true, par_store: PARStore)
+
+      conn =
+        build_conn()
+        |> Map.put(:scheme, :https)
+        |> put_req_header("accept", "text/html")
+        |> AuthorizeController.authorize(%{
+          "client_id" => @client_id,
+          "request_uri" => "urn:ietf:params:oauth:request_uri:does-not-exist"
+        })
+
+      assert conn.status == 400
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+      assert conn.resp_body =~ "<code>invalid_request_uri</code>"
+      refute conn.resp_body =~ "<code>invalid_request</code>"
+    end
   end
 
   # ── Direct (non-redirectable) errors (OIDC Core §3.1.2.6) ─────────────────
