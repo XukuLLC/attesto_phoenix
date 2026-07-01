@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-07-01
+
+### Changed
+
+- **End-session endpoint now content-negotiates its responses.** The
+  browser-facing `/oauth/end_session` errors (`invalid post_logout_redirect_uri`,
+  `invalid id_token_hint`, ...) and the default logged-out response rendered
+  JSON to every caller; a browser (`Accept: text/html`) now gets a minimal
+  human-readable HTML page instead, while non-browser callers keep the JSON
+  body — matching the authorization endpoint's direct-error handling. A wired
+  `:render_logged_out` callback still takes precedence.
+
 ## [0.19.1] - 2026-06-26
 
 ### Fixed

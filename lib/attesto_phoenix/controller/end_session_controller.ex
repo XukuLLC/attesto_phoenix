@@ -83,7 +83,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
          {:ok, redirect} <- confirm_redirect(config, request) do
       logout(conn, config, request, redirect)
     else
-      {:error, status, body} -> conn |> put_status(status) |> json(body)
+      {:error, status, body} -> render_error(conn, status, body)
     end
   end
 
@@ -135,7 +135,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
     case terminate_session(conn, config, context) do
       {:error, status, body} ->
-        conn |> put_status(status) |> json(body)
+        render_error(conn, status, body)
 
       {:halt, conn} ->
         conn
@@ -174,9 +174,91 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   defp finish(conn, config, :no_redirect, context) do
     case config.render_logged_out do
-      nil -> conn |> put_status(200) |> json(%{status: "logged_out"})
+      nil -> render_logged_out_default(conn)
       callback -> Callback.invoke(callback, [conn, context])
     end
+  end
+
+  # ── Response rendering (content-negotiated) ──────────────────────────────
+
+  # The end-session endpoint is browser-facing (RP-Initiated Logout §2: the RP
+  # redirects the user agent here), so a browser (`Accept: text/html`) gets a
+  # human-readable page and any other caller keeps the JSON body — mirroring the
+  # authorization endpoint's direct-error handling.
+  defp render_error(conn, status, %{error_description: description} = body) do
+    if accepts_html?(conn) do
+      conn |> put_resp_content_type("text/html") |> send_resp(status, error_html(description))
+    else
+      conn |> put_status(status) |> json(body)
+    end
+  end
+
+  defp render_error(conn, status, body) do
+    conn |> put_status(status) |> json(body)
+  end
+
+  defp render_logged_out_default(conn) do
+    if accepts_html?(conn) do
+      conn |> put_resp_content_type("text/html") |> send_resp(200, logged_out_html())
+    else
+      conn |> put_status(200) |> json(%{status: "logged_out"})
+    end
+  end
+
+  defp accepts_html?(conn) do
+    conn
+    |> get_req_header("accept")
+    |> Enum.any?(fn value -> String.contains?(String.downcase(value), "text/html") end)
+  end
+
+  defp error_html(description) do
+    page("Logout error", ~s(<code>invalid_request</code>), esc(description))
+  end
+
+  defp logged_out_html do
+    page("Signed out", "", "You are now signed out.")
+  end
+
+  defp page(title, badge, body_html) do
+    """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>#{esc(title)}</title>
+        <style>
+          body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f7f8fa; color: #1f2933; }
+          main { width: min(560px, calc(100vw - 32px)); padding: 32px;
+            border: 1px solid #d8dee6; border-radius: 8px; background: white;
+            box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08); }
+          h1 { margin: 0 0 12px; font-size: 24px; line-height: 1.2; }
+          p { margin: 0; line-height: 1.5; }
+          code { display: inline-block; margin-bottom: 16px; padding: 4px 8px;
+            border-radius: 4px; background: #eef2f7; font-size: 14px; }
+        </style>
+      </head>
+      <body>
+        <main>
+          #{badge}
+          <h1>#{esc(title)}</h1>
+          <p>#{body_html}</p>
+        </main>
+      </body>
+    </html>
+    """
+  end
+
+  defp esc(value) do
+    value
+    |> to_string()
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+    |> String.replace("\"", "&quot;")
+    |> String.replace("'", "&#39;")
   end
 
   # ── Back-Channel Logout fan-out (Back-Channel Logout 1.0 §2.5) ────────────

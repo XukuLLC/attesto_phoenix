@@ -102,6 +102,13 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
     |> Controller.end_session(params)
   end
 
+  defp call_html(method, params) do
+    method
+    |> conn("/oauth/end_session", params)
+    |> put_req_header("accept", "text/html,application/xhtml+xml")
+    |> Controller.end_session(params)
+  end
+
   defp body(conn), do: JSON.decode!(conn.resp_body)
 
   defp logout_payload(jwt) do
@@ -142,6 +149,16 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       assert conn.status == 200
       assert body(conn)["logged_out"] == true
       assert conn.private[:terminated] == true
+    end
+
+    test "a browser (Accept: text/html) gets an HTML error page, not JSON", %{hint: hint} do
+      conn =
+        call_html(:get, %{"id_token_hint" => hint, "post_logout_redirect_uri" => "https://evil.example/steal"})
+
+      assert conn.status == 400
+      assert conn |> get_resp_header("content-type") |> List.first() =~ "text/html"
+      assert conn.resp_body =~ "<html"
+      assert conn.resp_body =~ "invalid post_logout_redirect_uri"
     end
 
     test "a tampered hint is a 400", %{hint: hint} do
