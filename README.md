@@ -40,7 +40,10 @@ supplied through a small set of neutral configuration callbacks.
   authorization requests, sender-constrained tokens, and protected-resource
   discovery. `attesto_phoenix` mounts that whole surface with one router macro,
   so your app can expose tools and data to an assistant without hand-rolling an
-  OAuth server.
+  OAuth server. Pair it with
+  [`attesto_mcp`](https://github.com/XukuLLC/attesto_mcp) to protect the MCP
+  endpoint itself as an OAuth resource server — the `WWW-Authenticate` challenge
+  and protected-resource metadata (RFC 9728) that assistant clients discover.
 - **Your own authorization server.** Issue short-lived, scoped JWT access tokens
   and OIDC ID tokens for first-party apps and machine clients, instead of
   outsourcing to a hosted identity provider.
