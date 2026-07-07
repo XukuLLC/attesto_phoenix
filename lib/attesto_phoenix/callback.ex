@@ -50,6 +50,18 @@ defmodule AttestoPhoenix.Callback do
   def to_fun2(callback), do: fn a, b -> invoke(callback, [a, b]) end
 
   @doc """
+  The 1-arity sibling of `to_fun2/1`.
+
+  `Attesto.Plug.Authenticate`'s `:cert_der` option requires a literal
+  `(conn -> der | nil)` function and rejects an MFA tuple, but a host configures
+  `:cert_der` as a `{module, function}` callback. This wraps any callback form in
+  a closure that routes through `invoke/2`, so the core plug always receives the
+  bare function it demands.
+  """
+  @spec to_fun1(callback()) :: (any() -> any())
+  def to_fun1(callback), do: fn a -> invoke(callback, [a]) end
+
+  @doc """
   Read a configured callback off the config struct by `key`.
 
   This is the single reader the controllers, plugs, and core modules share for

@@ -359,7 +359,10 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   # RFC 8705 §3: the client-certificate DER extractor, supplied only when the
   # host enabled mTLS (its presence is validated by `AttestoPhoenix.Config`).
-  defp cert_der(%Config{mtls_enabled: true, cert_der: cert_der}), do: cert_der
+  # The host configures `:cert_der` as a `{module, function}` MFA, but
+  # `Attesto.Plug.Authenticate` demands a bare 1-arity function — adapt it, the
+  # same way `replay_check/1` adapts its callback.
+  defp cert_der(%Config{mtls_enabled: true, cert_der: cert_der}), do: Callback.to_fun1(cert_der)
   defp cert_der(_config), do: nil
 
   # ── Configuration resolution ─────────────────────────────────────────────
