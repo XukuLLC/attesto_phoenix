@@ -28,6 +28,10 @@ defmodule AttestoPhoenix.Router do
       management cleanup (RFC 7592 §2), mounted with registration.
     * `GET` and `POST /oauth/userinfo` - the UserInfo endpoint (OpenID Connect
       Core 1.0 §5.3); a bearer-authenticated protected resource (RFC 6750 §2.1).
+    * `GET` and `POST /oauth/end_session` - the end-session endpoint (OpenID
+      Connect RP-Initiated Logout 1.0 §2), mounted only with `logout: true`.
+    * `GET /oauth/check_session` - the `check_session_iframe` (OpenID Connect
+      Session Management 1.0 §3.3), mounted only with `session_management: true`.
 
   The macro emits nothing but `Phoenix.Router` route entries pointing at this
   library's controllers; it holds no policy of its own. Every behavioral
@@ -75,6 +79,14 @@ defmodule AttestoPhoenix.Router do
       host has wired the registration callbacks in `AttestoPhoenix.Config`;
       this option only controls whether the routes exist, so a deployment that
       never offers registration presents no registration surface at all.
+    * `:device` - when `true`, mounts the RFC 8628 device-authorization
+      endpoint and verification page. Defaults to `false`.
+    * `:logout` - when `true`, mounts `GET`/`POST /oauth/end_session` (OpenID
+      Connect RP-Initiated Logout 1.0). Defaults to `false`.
+    * `:session_management` - when `true`, mounts `GET /oauth/check_session`
+      (OpenID Connect Session Management 1.0 §3.3). Defaults to `false`. The
+      page answers 404 unless the host also enables
+      `session_management: [enabled: true]` in `AttestoPhoenix.Config`.
 
   The library never inspects `:registration` to make a policy decision: it is
   a route-existence toggle. Authorization-server metadata advertised at the
@@ -88,6 +100,7 @@ defmodule AttestoPhoenix.Router do
   # `/.well-known/` path segment at the host root. RFC 7517 §5 defines the JWK
   # Set document the metadata's `jwks_uri` points at.
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Controller.CheckSessionController
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
@@ -135,6 +148,7 @@ defmodule AttestoPhoenix.Router do
   @device_authorization_path @oauth_prefix <> AttestoPhoenix.Config.device_authorization_tail()
   @device_verification_path @oauth_prefix <> AttestoPhoenix.Config.device_verification_tail()
   @end_session_path @oauth_prefix <> AttestoPhoenix.Config.end_session_tail()
+  @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
 
   # Controllers that back each endpoint. Named here once so the macro
   # expansion does not scatter controller module references through the
@@ -153,6 +167,7 @@ defmodule AttestoPhoenix.Router do
   @device_authorization_controller DeviceAuthorizationController
   @device_verification_controller DeviceVerificationController
   @end_session_controller EndSessionController
+  @check_session_controller CheckSessionController
 
   @doc false
   defmacro __using__(_opts) do
@@ -171,6 +186,7 @@ defmodule AttestoPhoenix.Router do
     registration? = Keyword.get(opts, :registration, false)
     device? = Keyword.get(opts, :device, false)
     logout? = Keyword.get(opts, :logout, false)
+    session_management? = Keyword.get(opts, :session_management, false)
 
     discovery_path = @discovery_path
     protected_resource_path = @protected_resource_path
@@ -200,6 +216,8 @@ defmodule AttestoPhoenix.Router do
     device_verification_controller = @device_verification_controller
     end_session_path = @end_session_path
     end_session_controller = @end_session_controller
+    check_session_path = @check_session_path
+    check_session_controller = @check_session_controller
 
     # `pipe_through/1` is a compile-time `Phoenix.Router` macro: it must be
     # expanded once per pipeline as it is written into the scope, not iterated
@@ -284,6 +302,20 @@ defmodule AttestoPhoenix.Router do
         end
       end
 
+    # OpenID Connect Session Management 1.0 §3.3: the check_session_iframe is
+    # emitted only when the host opts in (`session_management: true`), so a
+    # deployment without session management exposes no iframe endpoint at all.
+    session_management_route =
+      if session_management? do
+        quote do
+          get(
+            unquote(prefix <> check_session_path),
+            unquote(check_session_controller),
+            :show
+          )
+        end
+      end
+
     quote do
       scope "/" do
         unquote_splicing(pipe_through_calls)
@@ -326,6 +358,7 @@ defmodule AttestoPhoenix.Router do
         unquote(registration_route)
         unquote(device_route)
         unquote(logout_route)
+        unquote(session_management_route)
 
         # OpenID Connect Core 1.0 §5.3.1: the UserInfo endpoint accepts both
         # GET and POST, and is a bearer-authenticated protected resource

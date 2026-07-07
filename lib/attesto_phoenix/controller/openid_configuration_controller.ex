@@ -201,10 +201,16 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       # RFC 8628 §4: advertised only when the device grant is enabled.
       device_authorization_endpoint: device_authorization_endpoint(config),
       # OpenID Connect RP-Initiated Logout 1.0 §3 / Back-Channel Logout 1.0
-      # §2.1: advertised only when logout is enabled (nil-dropped otherwise).
+      # §2.1 / Front-Channel Logout 1.0 §3: advertised only when logout is
+      # enabled (nil-dropped otherwise).
       end_session_endpoint: end_session_endpoint(config),
       backchannel_logout_supported: backchannel_logout_supported(config),
       backchannel_logout_session_supported: backchannel_logout_session_supported(config),
+      frontchannel_logout_supported: frontchannel_logout_supported(config),
+      frontchannel_logout_session_supported: frontchannel_logout_session_supported(config),
+      # OpenID Connect Session Management 1.0 §3.3: the check_session_iframe,
+      # advertised only when session management is enabled.
+      check_session_iframe: check_session_iframe(config),
       scopes_supported: config.scopes_supported,
       claims_supported: presence(config.claims_supported),
       registration_endpoint: registration_endpoint(config),
@@ -322,6 +328,18 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   defp backchannel_logout_session_supported(%Config{} = config) do
     if Config.backchannel_logout_session_supported?(config), do: true
+  end
+
+  defp frontchannel_logout_supported(%Config{} = config) do
+    if Config.frontchannel_logout_supported?(config), do: true
+  end
+
+  defp frontchannel_logout_session_supported(%Config{} = config) do
+    if Config.frontchannel_logout_session_supported?(config), do: true
+  end
+
+  defp check_session_iframe(%Config{} = config) do
+    if Config.session_management_enabled?(config), do: Config.check_session_iframe_url(config)
   end
 
   # RFC 7591 §3: advertise the dynamic client registration endpoint only when

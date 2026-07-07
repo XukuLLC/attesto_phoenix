@@ -1152,6 +1152,61 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
   end
 
+  # ── Session Management (OIDC Session Management 1.0 §2 / §3.2) ─────────────
+
+  describe "session_state" do
+    test "a successful response carries session_state and sets the browser-state cookie" do
+      put_config(session_management: [enabled: true])
+
+      conn = call(valid_params())
+      query = location_query(conn)
+
+      assert is_binary(query["code"])
+      session_state = query["session_state"]
+      assert is_binary(session_state)
+      refute session_state =~ " "
+
+      # The cookie is minted on this response (the login event) with the
+      # attributes the cross-site, JS-read iframe context requires.
+      cookie = conn.resp_cookies["attesto_op_browser_state"]
+      assert %{value: opbs, http_only: false, secure: true, same_site: "None"} = cookie
+
+      # The value verifies against the §3.2 recipe over the redirect_uri origin.
+      [_hash, salt] = String.split(session_state, ".", parts: 2)
+
+      assert session_state ==
+               Attesto.SessionState.compute(@client_id, "https://client.example.com", opbs, salt)
+    end
+
+    test "an existing browser-state cookie is reused, not rotated" do
+      put_config(session_management: [enabled: true])
+
+      conn =
+        build_conn()
+        |> Map.put(:scheme, :https)
+        |> put_req_header("cookie", "attesto_op_browser_state=existing-state")
+        |> AuthorizeController.authorize(valid_params())
+
+      session_state = location_query(conn)["session_state"]
+      [_hash, salt] = String.split(session_state, ".", parts: 2)
+
+      assert session_state ==
+               Attesto.SessionState.compute(@client_id, "https://client.example.com", "existing-state", salt)
+
+      # No re-mint: the response sets no fresh cookie value.
+      refute Map.has_key?(conn.resp_cookies, "attesto_op_browser_state")
+    end
+
+    test "disabled session management adds no session_state and no cookie" do
+      conn = call(valid_params())
+      query = location_query(conn)
+
+      assert is_binary(query["code"])
+      refute Map.has_key?(query, "session_state")
+      refute Map.has_key?(conn.resp_cookies, "attesto_op_browser_state")
+    end
+  end
+
   # ── family_id (OAuth 2.0 Security BCP §4.13 / §4.14) ───────────────────────
 
   describe "family_id" do

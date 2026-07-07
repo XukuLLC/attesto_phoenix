@@ -7,6 +7,7 @@ defmodule AttestoPhoenix.RouterTest do
   use ExUnit.Case, async: true
 
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Controller.CheckSessionController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
   alias AttestoPhoenix.Controller.UserinfoController
@@ -48,6 +49,15 @@ defmodule AttestoPhoenix.RouterTest do
 
     scope "/" do
       attesto_routes(pipeline: :oauth_server)
+    end
+  end
+
+  defmodule LogoutRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(logout: true, session_management: true)
     end
   end
 
@@ -138,6 +148,22 @@ defmodule AttestoPhoenix.RouterTest do
     test "with a pipeline pipes the mounted routes through the named pipeline" do
       info = Phoenix.Router.route_info(PipelineRouter, "POST", "/oauth/token", "localhost")
       assert info.pipe_through == [:oauth_server]
+    end
+
+    test "does not mount the end-session or check-session endpoints by default" do
+      refute find_route(DefaultRouter, :get, "/oauth/end_session")
+      refute find_route(DefaultRouter, :get, "/oauth/check_session")
+    end
+
+    test "mounts the end-session endpoint (GET + POST) with logout: true" do
+      assert find_route(LogoutRouter, :get, "/oauth/end_session")
+      assert find_route(LogoutRouter, :post, "/oauth/end_session")
+    end
+
+    test "mounts the check-session iframe with session_management: true" do
+      route = find_route(LogoutRouter, :get, "/oauth/check_session")
+      assert route
+      assert route.plug == CheckSessionController
     end
   end
 end

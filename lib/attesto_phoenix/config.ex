@@ -501,6 +501,9 @@ defmodule AttestoPhoenix.Config do
     :client_post_logout_redirect_uris,
     :client_backchannel_logout_uri,
     :client_backchannel_logout_session_required,
+    :client_frontchannel_logout_uri,
+    :client_frontchannel_logout_session_required,
+    :check_session_path,
     oauth_path_prefix: "/oauth",
     scopes_supported: [],
     registration_default_scope: nil,
@@ -529,6 +532,7 @@ defmodule AttestoPhoenix.Config do
     resource_indicators: [],
     device_authorization: [],
     logout: [],
+    session_management: [],
     basic_realm: "OAuth"
   ]
 
@@ -630,7 +634,8 @@ defmodule AttestoPhoenix.Config do
           client_id_metadata: keyword(),
           jwt_bearer: keyword(),
           resource_indicators: keyword(),
-          logout: keyword()
+          logout: keyword(),
+          session_management: keyword()
         }
 
   # Required plain values: enforced for presence as struct fields.
@@ -668,7 +673,8 @@ defmodule AttestoPhoenix.Config do
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
         resource_indicators: normalize_resource_indicators(config.resource_indicators),
         device_authorization: normalize_device_authorization(config.device_authorization),
-        logout: normalize_logout(config.logout)
+        logout: normalize_logout(config.logout),
+        session_management: normalize_session_management(config.session_management)
     }
   end
 
@@ -756,15 +762,16 @@ defmodule AttestoPhoenix.Config do
   defp normalize_device_authorization(nil), do: @device_authorization_defaults
   defp normalize_device_authorization(opts) when is_list(opts), do: Keyword.merge(@device_authorization_defaults, opts)
 
-  # OpenID Connect RP-Initiated Logout 1.0 + Back-Channel Logout 1.0.
-  # `enabled: true` mounts the end-session endpoint (the host MUST ALSO pass
-  # `logout: true` to `attesto_routes/1`) and advertises `end_session_endpoint`
-  # + `backchannel_logout_supported` / `backchannel_logout_session_supported`.
-  # `:session_ttl_seconds` bounds how long a recorded back-channel-logout
-  # session lives before the sweeper reaps it (mirror the host session
-  # lifetime). `:http_client` POSTs each `logout_token` to an RP's
-  # `backchannel_logout_uri`. Off by default — a host opts in and supplies a
-  # `:logout_session_store` + `:terminate_session` callback.
+  # OpenID Connect RP-Initiated Logout 1.0 + Back-Channel Logout 1.0 +
+  # Front-Channel Logout 1.0. `enabled: true` mounts the end-session endpoint
+  # (the host MUST ALSO pass `logout: true` to `attesto_routes/1`) and
+  # advertises `end_session_endpoint` + `backchannel_logout_supported` /
+  # `backchannel_logout_session_supported` and `frontchannel_logout_supported` /
+  # `frontchannel_logout_session_supported`. `:session_ttl_seconds` bounds how
+  # long a recorded logout session lives before the sweeper reaps it (mirror
+  # the host session lifetime). `:http_client` POSTs each `logout_token` to an
+  # RP's `backchannel_logout_uri`. Off by default — a host opts in and supplies
+  # a `:logout_session_store` + `:terminate_session` callback.
   @logout_defaults [
     enabled: false,
     session_ttl_seconds: 86_400,
@@ -773,6 +780,23 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_logout(nil), do: @logout_defaults
   defp normalize_logout(opts) when is_list(opts), do: Keyword.merge(@logout_defaults, opts)
+
+  # OpenID Connect Session Management 1.0. `enabled: true` advertises the
+  # `check_session_iframe` (the host MUST ALSO pass `session_management: true`
+  # to `attesto_routes/1` to mount it), returns `session_state` on authorization
+  # responses, and maintains the JavaScript-readable OP browser-state cookie
+  # (set at the authorization endpoint, cleared at the end-session endpoint).
+  # `:browser_state_cookie` names that cookie; `:browser_state_cookie_max_age`
+  # bounds its lifetime (mirror the host session lifetime). Off by default.
+  @session_management_defaults [
+    enabled: false,
+    browser_state_cookie: "attesto_op_browser_state",
+    browser_state_cookie_max_age: 86_400
+  ]
+
+  defp normalize_session_management(nil), do: @session_management_defaults
+
+  defp normalize_session_management(opts) when is_list(opts), do: Keyword.merge(@session_management_defaults, opts)
 
   @doc """
   Reads the config for `otp_app` under `key` (default `AttestoPhoenix`) from the
@@ -1061,6 +1085,106 @@ defmodule AttestoPhoenix.Config do
   end
 
   @doc """
+  Returns `true` iff Front-Channel Logout is supported — logout is enabled AND a
+  `:logout_session_store` is wired (advertised as `frontchannel_logout_supported`,
+  Front-Channel Logout 1.0 §3). The store is what lets the end-session endpoint
+  enumerate the RPs whose `frontchannel_logout_uri` the logout page must render.
+  """
+  @spec frontchannel_logout_supported?(t()) :: boolean()
+  def frontchannel_logout_supported?(%__MODULE__{} = config) do
+    logout_enabled?(config) and not is_nil(logout_session_store(config))
+  end
+
+  @doc """
+  Returns `true` iff the OP passes `iss`/`sid` query parameters on the rendered
+  `frontchannel_logout_uri` (advertised as `frontchannel_logout_session_supported`,
+  Front-Channel Logout 1.0 §3). attesto always includes both whenever the
+  session's `sid` is known, so this tracks `frontchannel_logout_supported?/1`.
+  """
+  @spec frontchannel_logout_session_supported?(t()) :: boolean()
+  def frontchannel_logout_session_supported?(%__MODULE__{} = config), do: frontchannel_logout_supported?(config)
+
+  @doc """
+  The Relying Party's registered `frontchannel_logout_uri` (Front-Channel
+  Logout 1.0 §2), or `nil` when the client is not front-channel-logout capable
+  (so no iframe is rendered for it on the logout page).
+
+  The URI is rendered as an `<iframe src>` on the OP's HTTPS logout page, so a
+  non-`https` URL (which browsers would block as mixed content, and which §2
+  only permits for confidential clients), one carrying userinfo, or one with no
+  host is treated as absent (fail closed).
+  """
+  @spec client_frontchannel_logout_uri(t(), term()) :: String.t() | nil
+  def client_frontchannel_logout_uri(%__MODULE__{} = config, client) do
+    with cb when not is_nil(cb) <- resolve_callback(config, :client_frontchannel_logout_uri),
+         uri when is_binary(uri) and uri != "" <- Callback.invoke(cb, [client], nil),
+         true <- safe_frontchannel_uri?(uri) do
+      uri
+    else
+      _ -> nil
+    end
+  end
+
+  # Front-Channel Logout 1.0 §2: the frontchannel_logout_uri SHOULD be https
+  # (and the OP's logout page is https, so an http iframe would be blocked as
+  # mixed content anyway). Loaded by the End-User's browser — not an OP-side
+  # request — so no internal-address screening applies, unlike the back-channel
+  # POST target.
+  defp safe_frontchannel_uri?(uri) do
+    case URI.new(uri) do
+      {:ok, %URI{scheme: "https", host: host, userinfo: nil}} when is_binary(host) and host != "" -> true
+      _ -> false
+    end
+  end
+
+  @doc """
+  The Relying Party's `frontchannel_logout_session_required` (Front-Channel
+  Logout 1.0 §2): whether the rendered logout URI must carry `iss` and `sid`
+  query parameters. Defaults to `false`.
+  """
+  @spec client_frontchannel_logout_session_required(t(), term()) :: boolean()
+  def client_frontchannel_logout_session_required(%__MODULE__{} = config, client) do
+    case resolve_callback(config, :client_frontchannel_logout_session_required) do
+      nil -> false
+      cb -> Callback.invoke(cb, [client], false) == true
+    end
+  end
+
+  @doc "The merged, defaulted OpenID Connect Session Management 1.0 options."
+  @spec session_management(t()) :: keyword()
+  def session_management(%__MODULE__{session_management: opts}), do: opts
+
+  @doc """
+  Returns `true` iff OpenID Connect Session Management 1.0 is enabled
+  (`session_management: [enabled: true]`). When enabled, the discovery document
+  advertises `check_session_iframe`, the authorization endpoint returns
+  `session_state` on authorization responses, and the OP browser-state cookie
+  is maintained. The host MUST ALSO pass `session_management: true` to
+  `attesto_routes/1` to mount the iframe endpoint.
+  """
+  @spec session_management_enabled?(t()) :: boolean()
+  def session_management_enabled?(%__MODULE__{} = config) do
+    config |> session_management() |> Keyword.get(:enabled, false) == true
+  end
+
+  @doc """
+  The name of the JavaScript-readable OP browser-state cookie (Session
+  Management 1.0 §3.2). The `check_session_iframe` script reads it, so it is
+  set without `HttpOnly` (and with `SameSite=None; Secure`, since the iframe is
+  embedded cross-site).
+  """
+  @spec browser_state_cookie(t()) :: String.t()
+  def browser_state_cookie(%__MODULE__{} = config) do
+    config |> session_management() |> Keyword.get(:browser_state_cookie, "attesto_op_browser_state")
+  end
+
+  @doc "The OP browser-state cookie lifetime, in seconds."
+  @spec browser_state_cookie_max_age(t()) :: pos_integer()
+  def browser_state_cookie_max_age(%__MODULE__{} = config) do
+    config |> session_management() |> Keyword.get(:browser_state_cookie_max_age, 86_400)
+  end
+
+  @doc """
   Returns the configured single-use consent-grant store module, or `nil`.
 
   The store implements `AttestoPhoenix.ConsentGrantStore` (the RFC 6749 §4.1.1
@@ -1172,6 +1296,7 @@ defmodule AttestoPhoenix.Config do
   @device_authorization_tail "/device_authorization"
   @device_verification_tail "/device_verification"
   @end_session_tail "/end_session"
+  @check_session_tail "/check_session"
 
   @doc false
   @spec authorize_tail() :: String.t()
@@ -1217,6 +1342,19 @@ defmodule AttestoPhoenix.Config do
   @doc "Absolute URL of the end-session endpoint (advertised as `end_session_endpoint`, RP-Initiated Logout 1.0 §2)."
   @spec end_session_endpoint_url(t()) :: String.t()
   def end_session_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, end_session_path(config))
+
+  @doc false
+  @spec check_session_tail() :: String.t()
+  def check_session_tail, do: @check_session_tail
+
+  @doc "The resolved request path of the check-session iframe (Session Management 1.0 §3.3)."
+  @spec check_session_path(t()) :: String.t()
+  def check_session_path(%__MODULE__{check_session_path: override} = config),
+    do: resolve_path(override, config, @check_session_tail)
+
+  @doc "Absolute URL of the check-session iframe (advertised as `check_session_iframe`, Session Management 1.0 §3.3)."
+  @spec check_session_iframe_url(t()) :: String.t()
+  def check_session_iframe_url(%__MODULE__{} = config), do: endpoint_url(config, check_session_path(config))
 
   @doc false
   @spec token_tail() :: String.t()
@@ -1461,6 +1599,8 @@ defmodule AttestoPhoenix.Config do
     client_post_logout_redirect_uris: {:client_store, :client_post_logout_redirect_uris, 1},
     client_backchannel_logout_uri: {:client_store, :client_backchannel_logout_uri, 1},
     client_backchannel_logout_session_required: {:client_store, :client_backchannel_logout_session_required, 1},
+    client_frontchannel_logout_uri: {:client_store, :client_frontchannel_logout_uri, 1},
+    client_frontchannel_logout_session_required: {:client_store, :client_frontchannel_logout_session_required, 1},
     client_public?: {:client_store, :client_public?, 1},
     client_requires_mtls?: {:client_store, :client_requires_mtls?, 1},
     client_requires_dpop?: {:client_store, :client_requires_dpop?, 1},
@@ -1721,6 +1861,7 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:device_authorization_path, config.device_authorization_path)
     validate_optional_path!(:device_verification_path, config.device_verification_path)
     validate_optional_path!(:end_session_path, config.end_session_path)
+    validate_optional_path!(:check_session_path, config.check_session_path)
 
     validate_discovery_endpoints!(config)
     validate_advertised_paths_consistent!(config)

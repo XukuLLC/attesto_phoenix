@@ -2,7 +2,8 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
   @moduledoc """
   Ecto/Postgres implementation of `Attesto.LogoutSessionStore`.
 
-  One row per `(session, Relying Party)` pair, backing the schema
+  One row per `(session, Relying Party)` pair — carrying the RP's back-channel
+  and/or front-channel logout URI — backing the schema
   `AttestoPhoenix.Schema.LogoutSession`:
 
     * `record/1` upserts on `(sid, client_id)` — re-issuing an ID Token for a
@@ -32,7 +33,16 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
     entry
     |> LogoutSession.from_record()
     |> repo().insert(
-      on_conflict: {:replace, [:subject, :backchannel_logout_uri, :session_required, :expires_at]},
+      on_conflict:
+        {:replace,
+         [
+           :subject,
+           :backchannel_logout_uri,
+           :session_required,
+           :frontchannel_logout_uri,
+           :frontchannel_session_required,
+           :expires_at
+         ]},
       conflict_target: [:sid, :client_id]
     )
 

@@ -35,13 +35,15 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       approved `subject`/`granted_scope`/`granted_claims`, and `last_polled_at`
       for the section 3.5 poll-interval guard.
 
-    * `attesto_logout_sessions` - the Back-Channel Logout session store
+    * `attesto_logout_sessions` - the logout session store
       (`AttestoPhoenix.Schema.LogoutSession`, OpenID Connect Back-Channel Logout
-      1.0). One row per `(session, Relying Party)` pair, recorded at ID-Token
-      mint and read at the end-session endpoint to deliver a `logout_token`.
+      1.0 + Front-Channel Logout 1.0). One row per `(session, Relying Party)`
+      pair, recorded at ID-Token mint and read at the end-session endpoint to
+      deliver a `logout_token` and/or render the RP's `frontchannel_logout_uri`.
       Upserted on `(sid, client_id)`; carries the `subject`, the RP's
-      `backchannel_logout_uri`/`session_required`, and the `expires_at` that
-      bounds an abandoned session.
+      `backchannel_logout_uri`/`session_required` and
+      `frontchannel_logout_uri`/`frontchannel_session_required`, and the
+      `expires_at` that bounds an abandoned session.
 
     * `dpop_nonces` - server-issued DPoP nonces
       (`AttestoPhoenix.Schema.DPoPNonce`, RFC 9449, section 8). Each row is a
@@ -470,21 +472,27 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       create unique_index(:<%= @device_codes %>, [:user_code])
       create index(:<%= @device_codes %>, [:expires_at])
 
-      # Back-Channel Logout session store (OpenID Connect Back-Channel Logout
-      # 1.0), backing AttestoPhoenix.Schema.LogoutSession /
+      # Logout session store (OpenID Connect Back-Channel Logout 1.0 +
+      # Front-Channel Logout 1.0), backing AttestoPhoenix.Schema.LogoutSession /
       # AttestoPhoenix.Store.EctoLogoutSessionStore. One row per (session, RP)
       # pair, recorded at ID-Token mint and enumerated at the end-session
-      # endpoint to deliver a logout_token. Upserted on (sid, client_id); read by
-      # sid (session-scoped logout) or subject (all the subject's sessions).
+      # endpoint to deliver a logout_token (back-channel) and/or render the RP's
+      # frontchannel_logout_uri in an iframe (front-channel); at least one of the
+      # two URIs is present. Upserted on (sid, client_id); read by sid
+      # (session-scoped logout) or subject (all the subject's sessions).
       create table(:<%= @logout_sessions %>, primary_key: false) do
         add :id, :binary_id, primary_key: true
         add :sid, :string, size: <%= @identifier_size %>, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
         add :client_id, :string, size: <%= @identifier_size %>, null: false
-        add :backchannel_logout_uri, :text, null: false
+        add :backchannel_logout_uri, :text
         # The RP's backchannel_logout_session_required: whether its logout token
         # MUST carry sid (Back-Channel Logout 1.0 section 2.2).
         add :session_required, :boolean, null: false, default: false
+        add :frontchannel_logout_uri, :text
+        # The RP's frontchannel_logout_session_required: whether the rendered
+        # logout URI must carry iss/sid (Front-Channel Logout 1.0 section 2).
+        add :frontchannel_session_required, :boolean, null: false, default: false
         add :expires_at, :utc_datetime, null: false
 
         timestamps(updated_at: false, type: :utc_datetime)

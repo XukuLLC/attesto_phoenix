@@ -196,6 +196,26 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       assert [] = Store.targets(%{sid: @sid})
     end
 
+    test "a row recorded for a front-channel-only RP produces no back-channel POST", %{hint: hint} do
+      now = System.system_time(:second)
+
+      :ok =
+        Store.record(%{
+          sid: @sid,
+          subject: @subject,
+          client_id: "rp-fc",
+          frontchannel_logout_uri: "https://rp-fc.example/fc",
+          expires_at: now + 3600
+        })
+
+      conn = call(:get, %{"id_token_hint" => hint})
+      assert conn.status == 200
+
+      refute_received {:bc_post, _uri, _token}
+      # the row is still consumed exactly once
+      assert [] = Store.targets(%{sid: @sid})
+    end
+
     test "logout enabled without :terminate_session fails config validation (no fail-open)", %{config: _config} do
       base = Application.get_env(:attesto_phoenix, @config_key)
       no_terminate = Keyword.delete(base, :terminate_session)
@@ -214,6 +234,141 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
 
       conn = call(:get, %{})
       assert conn.status == 404
+    end
+  end
+
+  defp record_front_channel(client_id, uri, opts \\ []) do
+    now = System.system_time(:second)
+
+    :ok =
+      %{
+        sid: @sid,
+        subject: @subject,
+        client_id: client_id,
+        frontchannel_logout_uri: uri,
+        frontchannel_session_required: Keyword.get(opts, :session_required, true),
+        expires_at: now + 3600
+      }
+      |> Map.merge(Map.new(Keyword.get(opts, :extra, [])))
+      |> Store.record()
+  end
+
+  describe "front-channel logout (Front-Channel Logout 1.0 §3)" do
+    test "a browser gets a page with a hidden iframe per RP, carrying iss AND sid", %{hint: hint} do
+      record_front_channel("rp-fc-1", "https://rp-fc-1.example/fc")
+      record_front_channel("rp-fc-2", "https://rp-fc-2.example/fc?x=1")
+
+      conn = call_html(:get, %{"id_token_hint" => hint})
+
+      assert conn.status == 200
+      assert conn |> get_resp_header("content-type") |> List.first() =~ "text/html"
+      assert conn |> get_resp_header("cache-control") |> List.first() == "no-store"
+
+      # Front-Channel Logout 1.0 §2: iss and sid ride together as query params.
+      encoded_iss = URI.encode_www_form(@issuer)
+      assert conn.resp_body =~ ~s(<iframe src="https://rp-fc-1.example/fc?iss=#{encoded_iss}&amp;sid=#{@sid}")
+      assert conn.resp_body =~ ~s(<iframe src="https://rp-fc-2.example/fc?x=1&amp;iss=#{encoded_iss}&amp;sid=#{@sid}")
+
+      # the rows are consumed by the render
+      assert [] = Store.targets(%{sid: @sid})
+    end
+
+    test "with a validated post_logout_redirect_uri the page continues there (JS + meta refresh + link)",
+         %{hint: hint} do
+      record_front_channel("rp-fc", "https://rp-fc.example/fc")
+
+      conn =
+        call_html(:get, %{
+          "id_token_hint" => hint,
+          "post_logout_redirect_uri" => "https://rp.example/after",
+          "state" => "abc123"
+        })
+
+      # The iframe page IS the response; the redirect happens from the page,
+      # after the iframes load, so both notifications and the RP return happen.
+      assert conn.status == 200
+      continue = "https://rp.example/after?state=abc123"
+      assert conn.resp_body =~ ~s(data-continue="#{continue}")
+      assert conn.resp_body =~ ~s(<meta http-equiv="refresh" content="7;url=#{continue}">)
+      assert conn.resp_body =~ ~s(<a href="#{continue}">)
+      assert conn.resp_body =~ "window.location.replace"
+    end
+
+    test "with no return URI the iframe page itself is the logged-out page", %{hint: hint} do
+      record_front_channel("rp-fc", "https://rp-fc.example/fc")
+
+      conn = call_html(:get, %{"id_token_hint" => hint})
+
+      assert conn.status == 200
+      assert conn.resp_body =~ "You are now signed out."
+      assert conn.resp_body =~ ~s(<iframe src="https://rp-fc.example/fc?)
+      refute conn.resp_body =~ "data-continue"
+      refute conn.resp_body =~ "http-equiv=\"refresh\""
+    end
+
+    test "a non-browser caller cannot run iframes: plain completion, targets skipped", %{hint: hint} do
+      record_front_channel("rp-fc", "https://rp-fc.example/fc")
+
+      conn =
+        call(:get, %{
+          "id_token_hint" => hint,
+          "post_logout_redirect_uri" => "https://rp.example/after",
+          "state" => "xyz"
+        })
+
+      assert conn.status in 302..303
+      assert conn |> get_resp_header("location") |> List.first() == "https://rp.example/after?state=xyz"
+    end
+
+    test "a session with both channels POSTs the logout_token AND renders the iframe", %{hint: hint} do
+      record_front_channel("rp-both", "https://rp-both.example/fc",
+        extra: [backchannel_logout_uri: "https://rp-both.example/bc", session_required: true]
+      )
+
+      conn = call_html(:get, %{"id_token_hint" => hint})
+
+      assert conn.status == 200
+      assert_received {:bc_post, "https://rp-both.example/bc", token}
+      claims = logout_payload(token)
+      assert claims["aud"] == "rp-both"
+      assert conn.resp_body =~ ~s(<iframe src="https://rp-both.example/fc?)
+    end
+
+    test "no front-channel RPs in the session: the browser gets the plain redirect", %{hint: hint} do
+      conn =
+        call_html(:get, %{
+          "id_token_hint" => hint,
+          "post_logout_redirect_uri" => "https://rp.example/after",
+          "state" => "xyz"
+        })
+
+      assert conn.status in 302..303
+      assert conn |> get_resp_header("location") |> List.first() == "https://rp.example/after?state=xyz"
+    end
+  end
+
+  describe "session management browser state (Session Management 1.0 §3.2)" do
+    test "logout expires the OP browser-state cookie when session management is enabled", %{hint: hint} do
+      base = Application.get_env(:attesto_phoenix, @config_key)
+
+      Application.put_env(
+        :attesto_phoenix,
+        @config_key,
+        Keyword.put(base, :session_management, enabled: true)
+      )
+
+      conn = call(:get, %{"id_token_hint" => hint})
+
+      assert conn.status == 200
+      cookie = conn.resp_cookies["attesto_op_browser_state"]
+      assert cookie.max_age == 0
+    end
+
+    test "without session management no browser-state cookie is touched", %{hint: hint} do
+      conn = call(:get, %{"id_token_hint" => hint})
+
+      assert conn.status == 200
+      refute Map.has_key?(conn.resp_cookies, "attesto_op_browser_state")
     end
   end
 end

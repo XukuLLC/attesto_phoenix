@@ -339,6 +339,65 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client_metadata"
     end
+
+    test "carries the logout metadata (Back-Channel §3 + Front-Channel §2 + RP-Initiated §3) through" do
+      test_pid = self()
+
+      config =
+        config(
+          register_client: fn attrs ->
+            send(test_pid, {:persisted, attrs})
+            {:ok, attrs}
+          end
+        )
+
+      conn =
+        post_register(config, %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/callback"],
+          "post_logout_redirect_uris" => ["https://client.example/post_logout"],
+          "backchannel_logout_uri" => "https://client.example/bc_logout",
+          "backchannel_logout_session_required" => true,
+          "frontchannel_logout_uri" => "https://client.example/fc_logout",
+          "frontchannel_logout_session_required" => true
+        })
+
+      payload = body(conn)
+
+      assert conn.status == 201
+      assert payload["post_logout_redirect_uris"] == ["https://client.example/post_logout"]
+      assert payload["backchannel_logout_uri"] == "https://client.example/bc_logout"
+      assert payload["backchannel_logout_session_required"] == true
+      assert payload["frontchannel_logout_uri"] == "https://client.example/fc_logout"
+      assert payload["frontchannel_logout_session_required"] == true
+
+      assert_receive {:persisted, attrs}
+      assert attrs["frontchannel_logout_uri"] == "https://client.example/fc_logout"
+      assert attrs["frontchannel_logout_session_required"] == true
+      assert attrs["backchannel_logout_uri"] == "https://client.example/bc_logout"
+    end
+
+    test "rejects a non-boolean frontchannel_logout_session_required" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["client_credentials"],
+          "frontchannel_logout_session_required" => "yes"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
+
+    test "rejects a non-string frontchannel_logout_uri" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["client_credentials"],
+          "frontchannel_logout_uri" => 42
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
   end
 
   describe "persistence (host-owned)" do

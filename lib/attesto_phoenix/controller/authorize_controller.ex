@@ -110,8 +110,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias Attesto.JARM
   alias Attesto.ResourceIndicator
   alias Attesto.Secret
+  alias Attesto.SessionState
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
-  alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
+  alias AttestoPhoenix.{BrowserState, Callback, Config, Event, RequestContext}
   alias AttestoPhoenix.ClientIdMetadata
   alias AttestoPhoenix.Store.PAR.ETS
 
@@ -738,18 +739,40 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # RFC 6749 §4.1.2: success. The code and (when present) `state` are the
   # response parameters; under JARM `iss` rides inside the JWT (JARM §2.1), under
   # the query mode it is the RFC 9207 `iss` parameter (added in emit_response/6).
+  # With Session Management enabled, the OIDC Session Management 1.0 §2
+  # `session_state` parameter rides alongside them.
   defp emit_success(conn, config, request, code) do
     # The PAR `request_uri` has already been claimed (consumed) atomically in
     # `issue_and_redirect/6` before the code was issued (RFC 9126 §2.2), so the
     # success response is just the redirect.
+    {conn, session_state} = maybe_session_state(conn, config, request)
+
     emit_response(
       conn,
       config,
       request.redirect_uri,
       request.response_mode,
       request.client_id,
-      drop_nil(%{"code" => code, "state" => request.state})
+      drop_nil(%{"code" => code, "state" => request.state, "session_state" => session_state})
     )
+  end
+
+  # OIDC Session Management 1.0 §2: a successful Authentication Response MUST
+  # carry `session_state` when the OP supports session management. The value is
+  # computed over the client_id, the redirect_uri's browser origin, and the OP
+  # browser-state cookie — minted here when the browser carries none yet (this
+  # response IS the login event §3.2 keys on). Returns the (possibly
+  # cookie-setting) conn and the value, or nil when the feature is off or the
+  # redirect_uri yields no usable origin (already validated as registered, so
+  # that is defensive only).
+  defp maybe_session_state(conn, config, request) do
+    with true <- Config.session_management_enabled?(config),
+         {:ok, origin} <- SessionState.origin(request.redirect_uri) do
+      {conn, browser_state} = BrowserState.ensure(conn, config)
+      {conn, SessionState.compute(request.client_id, origin, browser_state)}
+    else
+      _ -> {conn, nil}
+    end
   end
 
   # Stash the PAR reference (only when it actually resolved a stored request) so

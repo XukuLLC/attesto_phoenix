@@ -20,6 +20,12 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
     @moduledoc false
   end
 
+  # A module reference is all the logout-metadata advertisement reads (the
+  # store is only exercised by the end-session endpoint itself).
+  defmodule StubStore do
+    @moduledoc false
+  end
+
   # Build the host-facing AttestoPhoenix.Config. Only the members the OpenID
   # Provider Metadata document sources from it are varied by the tests.
   defp host_config(overrides \\ []) do
@@ -90,6 +96,53 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       # OpenID Connect Core §5.3).
       assert body["authorization_endpoint"] == @authorization_endpoint
       assert body["userinfo_endpoint"] == @userinfo_endpoint
+    end
+
+    test "advertises the logout and session-management metadata when enabled" do
+      host =
+        host_config(
+          logout: [enabled: true],
+          terminate_session: fn conn, _ctx -> {:ok, conn} end,
+          logout_session_store: __MODULE__.StubStore,
+          session_management: [enabled: true]
+        )
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      # RP-Initiated Logout 1.0 §3 + Back-Channel Logout 1.0 §2.1 +
+      # Front-Channel Logout 1.0 §3 + Session Management 1.0 §3.3.
+      assert body["end_session_endpoint"] == "#{@issuer}/oauth/end_session"
+      assert body["backchannel_logout_supported"] == true
+      assert body["backchannel_logout_session_supported"] == true
+      assert body["frontchannel_logout_supported"] == true
+      assert body["frontchannel_logout_session_supported"] == true
+      assert body["check_session_iframe"] == "#{@issuer}/oauth/check_session"
+    end
+
+    test "omits the logout and session-management metadata when disabled" do
+      body = call_show(host_config(), protocol_config()) |> decode_body()
+
+      refute Map.has_key?(body, "end_session_endpoint")
+      refute Map.has_key?(body, "backchannel_logout_supported")
+      refute Map.has_key?(body, "backchannel_logout_session_supported")
+      refute Map.has_key?(body, "frontchannel_logout_supported")
+      refute Map.has_key?(body, "frontchannel_logout_session_supported")
+      refute Map.has_key?(body, "check_session_iframe")
+    end
+
+    test "logout without a logout_session_store advertises neither logout channel's support flags" do
+      host =
+        host_config(
+          logout: [enabled: true],
+          terminate_session: fn conn, _ctx -> {:ok, conn} end
+        )
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["end_session_endpoint"] == "#{@issuer}/oauth/end_session"
+      refute Map.has_key?(body, "backchannel_logout_supported")
+      refute Map.has_key?(body, "frontchannel_logout_supported")
+      refute Map.has_key?(body, "frontchannel_logout_session_supported")
     end
 
     test "scopes_supported includes the reserved openid scope (OIDC Core §3.1.2.1)" do

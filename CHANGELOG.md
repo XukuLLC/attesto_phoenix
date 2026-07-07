@@ -4,6 +4,61 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **OpenID Connect Front-Channel Logout 1.0 (OP side).**
+  - The end-session endpoint renders every front-channel-capable RP's
+    registered `frontchannel_logout_uri` in a hidden iframe on the logout page
+    (with `iss`/`sid` whenever the session's `sid` is known), then completes
+    the RP-Initiated flow from the page itself: with a validated
+    `post_logout_redirect_uri` it continues there once the iframes have loaded
+    (JavaScript with a bounded timeout, plus a meta-refresh and a visible link
+    as no-JS fallbacks); with no return URI the page is the logged-out page.
+    The iframes and the back-channel `logout_token` POSTs are driven by the
+    same atomically-taken logout-session rows, so a session is fanned out
+    exactly once. A non-browser caller cannot run iframes, so front-channel
+    targets are skipped (logged) and the response is unchanged.
+  - The token endpoint records a logout session at ID-Token mint for any
+    client that registered a `frontchannel_logout_uri` and/or a
+    `backchannel_logout_uri` (previously back-channel only).
+    `AttestoPhoenix.Schema.LogoutSession` / `EctoLogoutSessionStore` carry the
+    new `frontchannel_logout_uri` / `frontchannel_session_required` columns,
+    `backchannel_logout_uri` is now nullable, and the migration template
+    reflects the new shape.
+  - Client registry: new `:client_frontchannel_logout_uri` /
+    `:client_frontchannel_logout_session_required` Config callbacks (and
+    optional `AttestoPhoenix.ClientStore` callbacks). A non-`https`
+    `frontchannel_logout_uri` is treated as absent (browsers block it as
+    mixed content on the https logout page), a deliberate tightening of the
+    spec's http-for-confidential-clients allowance.
+  - Dynamic registration passes `frontchannel_logout_uri` (string) and
+    `frontchannel_logout_session_required` (boolean) through to the host
+    store (Front-Channel Logout 1.0 §2).
+  - Discovery advertises `frontchannel_logout_supported` /
+    `frontchannel_logout_session_supported` when logout is enabled and a
+    `:logout_session_store` is wired.
+- **OpenID Connect Session Management 1.0 (OP side).**
+  - `session_management: [enabled: true]` turns the feature on;
+    `attesto_routes(session_management: true)` mounts
+    `GET /oauth/check_session`, the §3.3 `check_session_iframe` served by the
+    new `AttestoPhoenix.Controller.CheckSessionController` (a static page
+    whose script recomputes `session_state` with `crypto.subtle` from the
+    message's `client_id`, the sender's `MessageEvent.origin`, the OP
+    browser-state cookie, and the received salt, replying
+    `unchanged`/`changed`/`error`).
+  - Successful authorization responses carry the §2 `session_state`
+    parameter, computed by `Attesto.SessionState` over the `redirect_uri`'s
+    browser origin. (Deliberate deviation: the SHOULD-level `session_state` on
+    authorization **error** responses is not emitted.)
+  - `AttestoPhoenix.BrowserState` owns the JavaScript-readable OP
+    browser-state cookie (`SameSite=None; Secure`, not `HttpOnly`): minted at
+    the authorization endpoint when absent (login), expired at the
+    end-session endpoint (logout), so a post-logout recomputation yields
+    `changed`.
+  - Discovery advertises `check_session_iframe` when the feature is enabled.
+
 ## [1.0.0] - 2026-07-04
 
 First stable release; the public API is now under semantic versioning. No

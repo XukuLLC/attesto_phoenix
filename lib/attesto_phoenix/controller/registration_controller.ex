@@ -114,11 +114,12 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # host store so consent screens keep the client's identity. These are
   # display/identity strings; the controller validates only that each is a
   # string (their trust level is the host's, never the library's).
-  # `backchannel_logout_uri` (OpenID Connect Back-Channel Logout 1.0 §3) is a
-  # registered client URL, carried through like the other display-string members.
+  # `backchannel_logout_uri` (OpenID Connect Back-Channel Logout 1.0 §3) and
+  # `frontchannel_logout_uri` (OpenID Connect Front-Channel Logout 1.0 §2) are
+  # registered client URLs, carried through like the other display-string members.
   @display_string_metadata ~w(client_name client_uri logo_uri tos_uri policy_uri
                               jwks_uri software_id software_version software_statement
-                              backchannel_logout_uri)
+                              backchannel_logout_uri frontchannel_logout_uri)
 
   # RFC 7591 §2 `contacts`: an array of strings (e.g. email addresses) carried
   # through to the host store. `post_logout_redirect_uris` (OpenID Connect
@@ -133,7 +134,9 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   # `backchannel_logout_session_required` (OpenID Connect Back-Channel Logout
   # 1.0 §3): whether the client's logout token must carry `sid`.
-  @boolean_metadata ~w(backchannel_logout_session_required)
+  # `frontchannel_logout_session_required` (OpenID Connect Front-Channel Logout
+  # 1.0 §2): whether the rendered logout URI must carry `iss`/`sid`.
+  @boolean_metadata ~w(backchannel_logout_session_required frontchannel_logout_session_required)
 
   @doc """
   Dynamic client registration action (RFC 7591 §3.1).
@@ -317,8 +320,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp validate_passthrough_value(_key, :boolean, value) when is_boolean(value), do: {:ok, value}
 
   defp validate_passthrough_value(key, :boolean, _value) do
-    {:error,
-     error(@error_invalid_client_metadata, "#{key} must be a boolean (OpenID Connect Back-Channel Logout 1.0 §3)")}
+    {:error, error(@error_invalid_client_metadata, "#{key} must be a boolean")}
   end
 
   # RFC 7591 §2 / RFC 6749 §2.3.1: the token-endpoint auth method must be one

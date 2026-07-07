@@ -57,6 +57,32 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     def verification_pems, do: [signing_pem()]
   end
 
+  # A logout session store that forwards each recorded entry to the test
+  # process, so a test can assert exactly what the token endpoint recorded at
+  # ID-Token mint (Back-Channel Logout 1.0 §2 / Front-Channel Logout 1.0 §3).
+  defmodule RecordingLogoutStore do
+    @moduledoc false
+    @behaviour Attesto.LogoutSessionStore
+
+    @impl true
+    def record(entry) do
+      if pid = Application.get_env(:attesto_phoenix, :test_logout_record_pid) do
+        send(pid, {:logout_recorded, entry})
+      end
+
+      :ok
+    end
+
+    @impl true
+    def targets(_criteria), do: []
+
+    @impl true
+    def delete(_criteria), do: :ok
+
+    @impl true
+    def take_targets(_criteria), do: []
+  end
+
   # A reuse-tracking `Attesto.CodeStore` (OAuth 2.0 Security BCP §4.13). Unlike
   # the bundled `Attesto.CodeStore.ETS`, it implements the OPTIONAL
   # reuse-tracking pair: `take/1` returns `{:error, :consumed, meta}` for a code
@@ -1761,6 +1787,55 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       # present when the exchange supplies the artifacts to bind.
       assert is_binary(claims["at_hash"])
       assert is_binary(claims["c_hash"])
+    end
+
+    test "records a logout session at ID-Token mint for a front-channel-capable client" do
+      enable_minting()
+      Application.put_env(:attesto_phoenix, :test_logout_record_pid, self())
+      on_exit(fn -> Application.delete_env(:attesto_phoenix, :test_logout_record_pid) end)
+
+      openid_code_store = start_openid_code_store(["openid"], %{"nonce" => "n-1", "sid" => "sess-fc-1"})
+
+      put_config(
+        code_store: openid_code_store,
+        logout: [enabled: true],
+        terminate_session: fn conn, _ctx -> {:ok, conn} end,
+        logout_session_store: RecordingLogoutStore,
+        client_frontchannel_logout_uri: fn _client -> "https://rp.example/fc" end,
+        client_frontchannel_logout_session_required: fn _client -> true end
+      )
+
+      conn = post_auth_code()
+
+      assert conn.status == 200
+      assert is_binary(body(conn)["id_token"])
+
+      assert_received {:logout_recorded, entry}
+      assert entry.sid == "sess-fc-1"
+      assert entry.client_id == "public-1"
+      assert entry.frontchannel_logout_uri == "https://rp.example/fc"
+      assert entry.frontchannel_session_required == true
+      assert entry.backchannel_logout_uri == nil
+    end
+
+    test "records nothing for a client with neither logout URI" do
+      enable_minting()
+      Application.put_env(:attesto_phoenix, :test_logout_record_pid, self())
+      on_exit(fn -> Application.delete_env(:attesto_phoenix, :test_logout_record_pid) end)
+
+      openid_code_store = start_openid_code_store(["openid"], %{"nonce" => "n-1", "sid" => "sess-fc-2"})
+
+      put_config(
+        code_store: openid_code_store,
+        logout: [enabled: true],
+        terminate_session: fn conn, _ctx -> {:ok, conn} end,
+        logout_session_store: RecordingLogoutStore
+      )
+
+      conn = post_auth_code()
+
+      assert conn.status == 200
+      refute_received {:logout_recorded, _entry}
     end
 
     test "carries auth_time/acr/amr from the code's claims into the id_token" do

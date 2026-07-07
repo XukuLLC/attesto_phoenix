@@ -840,29 +840,40 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # OIDC Back-Channel Logout 1.0 §2: record that this Relying Party now holds a
-  # session for the subject, so the end-session endpoint can later POST it a
-  # `logout_token`. Recorded only when logout is wired (store present), the
-  # session carries a `sid`, and the client registered a `backchannel_logout_uri`
-  # — a plain (non-back-channel) RP records nothing. Idempotent on `(sid,
-  # client_id)`, so a refresh re-mint refreshes the row rather than duplicating
-  # it. Best-effort: a store failure never blocks token issuance (the session is
-  # simply not back-channel-reachable), so it is logged and swallowed.
+  # OIDC Back-Channel Logout 1.0 §2 / Front-Channel Logout 1.0 §3: record that
+  # this Relying Party now holds a session for the subject, so the end-session
+  # endpoint can later POST it a `logout_token` and/or render its
+  # `frontchannel_logout_uri` in an iframe on the logout page. Recorded only
+  # when logout is wired (store present), the session carries a `sid`, and the
+  # client registered at least one logout URI — a plain (non-logout-capable) RP
+  # records nothing. Idempotent on `(sid, client_id)`, so a refresh re-mint
+  # refreshes the row rather than duplicating it. Best-effort: a store failure
+  # never blocks token issuance (the session is simply not logout-reachable),
+  # so it is logged and swallowed.
   defp maybe_record_logout_session(config, client, grant, client_id) do
-    with true <- Config.backchannel_logout_supported?(config),
+    with true <- Config.logout_enabled?(config),
          store when not is_nil(store) <- Config.logout_session_store(config),
-         sid when is_binary(sid) and sid != "" <- id_token_claim(grant.claims, "sid"),
-         bc_uri when is_binary(bc_uri) <- Config.client_backchannel_logout_uri(config, host_client(client)) do
-      now = System.system_time(:second)
+         sid when is_binary(sid) and sid != "" <- id_token_claim(grant.claims, "sid") do
+      bc_uri = Config.client_backchannel_logout_uri(config, host_client(client))
+      fc_uri = Config.client_frontchannel_logout_uri(config, host_client(client))
 
-      store.record(%{
-        sid: sid,
-        subject: grant.subject,
-        client_id: client_id,
-        backchannel_logout_uri: bc_uri,
-        session_required: Config.client_backchannel_logout_session_required(config, host_client(client)),
-        expires_at: now + Config.logout_session_ttl_seconds(config)
-      })
+      if is_binary(bc_uri) or is_binary(fc_uri) do
+        now = System.system_time(:second)
+
+        store.record(%{
+          sid: sid,
+          subject: grant.subject,
+          client_id: client_id,
+          backchannel_logout_uri: bc_uri,
+          session_required: Config.client_backchannel_logout_session_required(config, host_client(client)),
+          frontchannel_logout_uri: fc_uri,
+          frontchannel_session_required:
+            Config.client_frontchannel_logout_session_required(config, host_client(client)),
+          expires_at: now + Config.logout_session_ttl_seconds(config)
+        })
+      else
+        :ok
+      end
     else
       _ -> :ok
     end

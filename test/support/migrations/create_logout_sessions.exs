@@ -1,11 +1,12 @@
 defmodule AttestoPhoenix.TestRepo.Migrations.CreateLogoutSessions do
   @moduledoc """
-  Test-suite migration for the Back-Channel Logout session table
-  (OpenID Connect Back-Channel Logout 1.0).
+  Test-suite migration for the logout session table (OpenID Connect
+  Back-Channel Logout 1.0 + Front-Channel Logout 1.0).
 
   Mirrors the table a host application generates via the migration task. One row
-  per `(session, Relying Party)` pair, upserted on `(sid, client_id)` and read by
-  `sid` or `subject` at the end-session endpoint.
+  per `(session, Relying Party)` pair — carrying the RP's back-channel and/or
+  front-channel logout URI — upserted on `(sid, client_id)` and read by `sid` or
+  `subject` at the end-session endpoint.
   """
 
   use Ecto.Migration
@@ -16,8 +17,10 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateLogoutSessions do
       add(:sid, :string, null: false)
       add(:subject, :string, null: false)
       add(:client_id, :string, null: false)
-      add(:backchannel_logout_uri, :text, null: false)
+      add(:backchannel_logout_uri, :text)
       add(:session_required, :boolean, null: false, default: false)
+      add(:frontchannel_logout_uri, :text)
+      add(:frontchannel_session_required, :boolean, null: false, default: false)
       add(:expires_at, :utc_datetime, null: false)
 
       timestamps(updated_at: false, type: :utc_datetime)

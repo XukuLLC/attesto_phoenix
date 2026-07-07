@@ -1,12 +1,13 @@
 defmodule AttestoPhoenix.Controller.EndSessionController do
   @moduledoc """
   End-session endpoint (OpenID Connect RP-Initiated Logout 1.0 §2 +
-  Back-Channel Logout 1.0).
+  Back-Channel Logout 1.0 + Front-Channel Logout 1.0).
 
   Where a Relying Party sends the End-User's browser to log out. This
   controller owns the protocol — it verifies the `id_token_hint`, validates the
   `post_logout_redirect_uri` against the RP's registered set, fans a
-  `logout_token` out to every other RP holding the session, and either
+  `logout_token` out to every other RP holding the session, renders each
+  front-channel RP's `frontchannel_logout_uri` in an iframe, and either
   redirects to the validated return URI or hands off to the host's logged-out
   page — while the host owns the browser session and the HTML through two
   callbacks:
@@ -61,17 +62,45 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   at mint time, see `Attesto.LogoutSessionStore`). The take is atomic so
   concurrent logouts cannot double-deliver. Delivery is best-effort: a slow or
   failing RP is logged, never allowed to stall the user's logout. Requires a
-  `:logout_session_store`; without one, only RP-Initiated (front-channel) logout
-  runs.
+  `:logout_session_store`; without one, only RP-Initiated logout runs.
+
+  ## Front-Channel Logout (Front-Channel Logout 1.0 §3)
+
+  The same atomically-taken rows also drive front-channel logout: for every RP
+  in the session that registered a `frontchannel_logout_uri`, a browser caller
+  (`Accept: text/html`) gets a logout page embedding each URI in a hidden
+  iframe — with `iss` and `sid` query parameters whenever the session's `sid`
+  is known (see `Attesto.FrontChannelLogout`) — before the flow completes. When
+  the request carried a validated `post_logout_redirect_uri`, the page
+  continues there via JavaScript once the iframes have loaded (bounded by a
+  short timeout, with a meta-refresh and a visible link as fallbacks) so the
+  RP-Initiated redirect still happens; with no return URI the page itself is
+  the logged-out page. Front-channel delivery is inherently best-effort (the
+  browser loads the iframes); a non-browser caller cannot run iframes, so
+  front-channel targets are skipped (logged) and the response is unchanged.
+
+  ## Session Management (Session Management 1.0 §3.2)
+
+  When Session Management is enabled, a completed logout also expires the
+  JavaScript-readable OP browser-state cookie, so an RP polling the
+  `check_session_iframe` observes `changed`.
   """
 
   use Phoenix.Controller, formats: [:html, :json]
 
   alias Attesto.EndSession
+  alias Attesto.FrontChannelLogout
   alias Attesto.LogoutToken
-  alias AttestoPhoenix.{Callback, Config, RequestContext}
+  alias AttestoPhoenix.{BrowserState, Callback, Config, RequestContext}
 
   require Logger
+
+  # Front-Channel Logout 1.0 §3: the logout page waits for the RP iframes to
+  # load before continuing to the post-logout redirect. The JS continues as
+  # soon as every iframe fired `load`, capped by this timeout so an unreachable
+  # RP can never stall the user's logout; the meta-refresh is the no-JS fallback.
+  @front_channel_timeout_ms 5_000
+  @front_channel_meta_refresh_seconds 7
 
   @spec end_session(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def end_session(conn, params) do
@@ -143,9 +172,22 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       {:ok, conn, session} ->
         # The fan-out scope is the host-confirmed session, NOT the request's
         # id_token_hint — a replayed token cannot force-log-out another session.
-        fan_out_back_channel(config, session)
-        finish(conn, config, redirect, context)
+        # The rows are taken once (atomically) and drive BOTH notification
+        # channels: the back-channel POSTs and the front-channel iframes.
+        targets = take_logout_targets(config, session)
+        deliver_back_channel(config, session, targets)
+
+        conn
+        |> expire_browser_state(config)
+        |> finish(config, redirect, context, front_channel_uris(config, targets))
     end
+  end
+
+  # Session Management 1.0 §3.2: the OP browser state changes on logout, so an
+  # RP polling the check_session_iframe observes `changed`. A no-op unless the
+  # host enabled Session Management.
+  defp expire_browser_state(conn, config) do
+    if Config.session_management_enabled?(config), do: BrowserState.expire(conn, config), else: conn
   end
 
   # The host is the session authority. A missing callback is fail-closed: a
@@ -168,14 +210,33 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     end
   end
 
-  defp finish(conn, _config, redirect, _context) when is_binary(redirect) do
-    redirect(conn, external: redirect)
+  # With no front-channel RPs to notify, complete exactly as before: redirect
+  # to the validated return URI or hand off to the host's logged-out page.
+  defp finish(conn, config, redirect, context, []) do
+    case redirect do
+      target when is_binary(target) ->
+        redirect(conn, external: target)
+
+      :no_redirect ->
+        case config.render_logged_out do
+          nil -> render_logged_out_default(conn)
+          callback -> Callback.invoke(callback, [conn, context])
+        end
+    end
   end
 
-  defp finish(conn, config, :no_redirect, context) do
-    case config.render_logged_out do
-      nil -> render_logged_out_default(conn)
-      callback -> Callback.invoke(callback, [conn, context])
+  # Front-Channel Logout 1.0 §3: a browser gets the iframe-rendering logout
+  # page (which then continues the RP-Initiated flow itself). A non-browser
+  # caller cannot run iframes, so the front-channel targets are skipped —
+  # logged, since those RPs will not learn of the logout — and the response is
+  # the plain completion.
+  defp finish(conn, config, redirect, context, frame_uris) do
+    if accepts_html?(conn) do
+      render_front_channel_page(conn, redirect, frame_uris)
+    else
+      Logger.warning("front-channel logout skipped for non-browser caller: #{length(frame_uris)} RP(s) not notified")
+
+      finish(conn, config, redirect, context, [])
     end
   end
 
@@ -204,6 +265,112 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       conn |> put_status(200) |> json(%{status: "logged_out"})
     end
   end
+
+  # Front-Channel Logout 1.0 §3: render every front-channel RP's logout URI in
+  # a hidden iframe, then complete the RP-Initiated flow. With a validated
+  # return URI the page continues there once the iframes have loaded (JS,
+  # capped by the timeout above), with a meta-refresh and a
+  # visible link as no-JS fallbacks; with no return URI the page itself is the
+  # logged-out page. The response is never cached: it is a one-shot
+  # notification fan-out.
+  defp render_front_channel_page(conn, redirect, frame_uris) do
+    conn
+    |> put_resp_header("cache-control", "no-store")
+    |> put_resp_content_type("text/html")
+    |> send_resp(200, front_channel_html(redirect, frame_uris))
+  end
+
+  defp front_channel_html(redirect, frame_uris) do
+    iframes =
+      Enum.map_join(frame_uris, "\n    ", fn uri ->
+        ~s(<iframe src="#{esc(uri)}" aria-hidden="true" tabindex="-1"></iframe>)
+      end)
+
+    {title, message} =
+      case redirect do
+        target when is_binary(target) -> {"Signing out…", "Completing sign-out…"}
+        :no_redirect -> {"Signed out", "You are now signed out."}
+      end
+
+    """
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>#{esc(title)}</title>
+        #{meta_refresh(redirect)}
+        <style>
+          body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            background: #f7f8fa; color: #1f2933; }
+          main { width: min(560px, calc(100vw - 32px)); padding: 32px;
+            border: 1px solid #d8dee6; border-radius: 8px; background: white;
+            box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08); }
+          h1 { margin: 0 0 12px; font-size: 24px; line-height: 1.2; }
+          p { margin: 0; line-height: 1.5; }
+          iframe { position: absolute; width: 0; height: 0; border: 0; visibility: hidden; }
+        </style>
+      </head>
+      <body#{continue_attribute(redirect)}>
+        <main>
+          <h1>#{esc(title)}</h1>
+          <p>#{esc(message)}</p>
+          #{continue_link(redirect)}
+        </main>
+        #{iframes}
+        #{continue_script(redirect)}
+      </body>
+    </html>
+    """
+  end
+
+  # The continuation target rides in an HTML-escaped attribute (the browser
+  # unescapes it before getAttribute returns), so the URL never lands inside a
+  # script string where it could break out.
+  defp continue_attribute(redirect) when is_binary(redirect), do: ~s( data-continue="#{esc(redirect)}")
+  defp continue_attribute(:no_redirect), do: ""
+
+  defp meta_refresh(redirect) when is_binary(redirect) do
+    ~s(<meta http-equiv="refresh" content="#{@front_channel_meta_refresh_seconds};url=#{esc(redirect)}">)
+  end
+
+  defp meta_refresh(:no_redirect), do: ""
+
+  defp continue_link(redirect) when is_binary(redirect) do
+    ~s(<p><a href="#{esc(redirect)}">Continue</a></p>)
+  end
+
+  defp continue_link(:no_redirect), do: ""
+
+  # Continue to the post-logout redirect once every iframe fired `load`, capped
+  # by the timeout so an unreachable RP never stalls the user's logout.
+  defp continue_script(redirect) when is_binary(redirect) do
+    """
+    <script>
+      (function () {
+        var frames = document.querySelectorAll("iframe");
+        var remaining = frames.length;
+        var continued = false;
+        function go() {
+          if (continued) { return; }
+          continued = true;
+          window.location.replace(document.body.getAttribute("data-continue"));
+        }
+        function loaded() {
+          remaining -= 1;
+          if (remaining <= 0) { setTimeout(go, 100); }
+        }
+        for (var i = 0; i < frames.length; i++) {
+          frames[i].addEventListener("load", loaded);
+        }
+        setTimeout(go, #{@front_channel_timeout_ms});
+      })();
+    </script>
+    """
+  end
+
+  defp continue_script(:no_redirect), do: ""
 
   defp accepts_html?(conn) do
     conn
@@ -261,24 +428,36 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     |> String.replace("'", "&#39;")
   end
 
-  # ── Back-Channel Logout fan-out (Back-Channel Logout 1.0 §2.5) ────────────
+  # ── Logout fan-out (Back-Channel Logout 1.0 §2.5 + Front-Channel 1.0 §3) ──
 
-  # POST a signed logout_token to every RP holding the host-confirmed session.
-  # The rows are taken atomically (enumerated-and-deleted in one statement), so a
-  # session is logged out exactly once even under concurrent end-session calls.
-  # `session` is the `%{sid|subject}` the host attested it terminated.
-  defp fan_out_back_channel(config, session) do
+  # Atomically take (enumerate-and-delete in one statement) the RP rows of the
+  # host-confirmed session, so a session is logged out exactly once even under
+  # concurrent end-session calls. `session` is the `%{sid|subject}` the host
+  # attested it terminated. Best-effort: a store failure is logged, never
+  # allowed to block the user's logout.
+  defp take_logout_targets(config, session) do
     store = Config.logout_session_store(config)
     criteria = logout_criteria(session)
 
     if not is_nil(store) and map_size(criteria) > 0 do
-      http = Config.backchannel_logout_http(config)
-      attesto_config = Config.to_attesto_config(config)
-
-      criteria
-      |> store.take_targets()
-      |> Enum.each(&deliver(attesto_config, http, session, &1))
+      store.take_targets(criteria)
+    else
+      []
     end
+  rescue
+    e ->
+      Logger.warning("logout session take failed: #{inspect(e)}")
+      []
+  end
+
+  # POST a signed logout_token to every back-channel-capable RP in the taken set.
+  defp deliver_back_channel(config, session, targets) do
+    http = Config.backchannel_logout_http(config)
+    attesto_config = Config.to_attesto_config(config)
+
+    targets
+    |> Enum.filter(&is_binary(&1.backchannel_logout_uri))
+    |> Enum.each(&deliver(attesto_config, http, session, &1))
   rescue
     e -> Logger.warning("back-channel logout fan-out failed: #{inspect(e)}")
   end
@@ -296,6 +475,17 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       {:error, reason} ->
         Logger.warning("back-channel logout to #{target.client_id} failed: #{inspect(reason)}")
         :error
+    end
+  end
+
+  # The exact iframe URIs the logout page renders: each front-channel-capable
+  # RP's registered frontchannel_logout_uri, with iss/sid appended whenever the
+  # session's sid is known (Front-Channel Logout 1.0 §2 — both or neither).
+  defp front_channel_uris(config, targets) do
+    attesto_config = Config.to_attesto_config(config)
+
+    for target <- targets, is_binary(target.frontchannel_logout_uri) do
+      FrontChannelLogout.logout_uri(attesto_config, target.frontchannel_logout_uri, target.sid)
     end
   end
 

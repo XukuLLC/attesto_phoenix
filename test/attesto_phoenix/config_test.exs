@@ -625,4 +625,79 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.token_path(built) == "/custom/token"
     end
   end
+
+  describe "front-channel logout client metadata (Front-Channel Logout 1.0 §2)" do
+    test "an https frontchannel_logout_uri is returned" do
+      built = config(client_frontchannel_logout_uri: fn client -> client.fc end)
+
+      assert Config.client_frontchannel_logout_uri(built, %{fc: "https://rp.example/fc"}) ==
+               "https://rp.example/fc"
+    end
+
+    test "a non-https or malformed frontchannel_logout_uri is treated as absent (fail closed)" do
+      built = config(client_frontchannel_logout_uri: fn client -> client.fc end)
+
+      # http would be blocked as mixed content on the https logout page.
+      assert Config.client_frontchannel_logout_uri(built, %{fc: "http://rp.example/fc"}) == nil
+      assert Config.client_frontchannel_logout_uri(built, %{fc: "https://user@rp.example/fc"}) == nil
+      assert Config.client_frontchannel_logout_uri(built, %{fc: "not a uri"}) == nil
+      assert Config.client_frontchannel_logout_uri(built, %{fc: nil}) == nil
+    end
+
+    test "no callback wired means no front-channel URI" do
+      assert Config.client_frontchannel_logout_uri(config(), %{}) == nil
+    end
+
+    test "frontchannel_logout_session_required defaults to false and honors the callback" do
+      assert Config.client_frontchannel_logout_session_required(config(), %{}) == false
+
+      built = config(client_frontchannel_logout_session_required: fn _client -> true end)
+      assert Config.client_frontchannel_logout_session_required(built, %{}) == true
+    end
+
+    test "frontchannel_logout_supported? requires logout enabled AND a session store" do
+      refute Config.frontchannel_logout_supported?(config())
+
+      enabled =
+        config(
+          logout: [enabled: true],
+          terminate_session: fn conn, _ctx -> {:ok, conn} end
+        )
+
+      refute Config.frontchannel_logout_supported?(enabled)
+
+      with_store =
+        config(
+          logout: [enabled: true],
+          terminate_session: fn conn, _ctx -> {:ok, conn} end,
+          logout_session_store: EmptyModule
+        )
+
+      assert Config.frontchannel_logout_supported?(with_store)
+      assert Config.frontchannel_logout_session_supported?(with_store)
+    end
+  end
+
+  describe "session management options (Session Management 1.0)" do
+    test "off by default, with defaulted cookie name and lifetime" do
+      built = config()
+
+      refute Config.session_management_enabled?(built)
+      assert Config.browser_state_cookie(built) == "attesto_op_browser_state"
+      assert Config.browser_state_cookie_max_age(built) == 86_400
+    end
+
+    test "enabling merges over the defaults" do
+      built = config(session_management: [enabled: true, browser_state_cookie: "opbs"])
+
+      assert Config.session_management_enabled?(built)
+      assert Config.browser_state_cookie(built) == "opbs"
+      assert Config.browser_state_cookie_max_age(built) == 86_400
+    end
+
+    test "the check-session iframe URL derives from the issuer and prefix" do
+      assert Config.check_session_iframe_url(config()) ==
+               "https://issuer.example/oauth/check_session"
+    end
+  end
 end

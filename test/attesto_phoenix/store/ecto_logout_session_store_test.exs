@@ -54,6 +54,73 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStoreTest do
     assert target.backchannel_logout_uri == "https://rp.example/new"
   end
 
+  test "round-trips the front-channel fields (Front-Channel Logout 1.0 §2)" do
+    record(%{
+      sid: "s-fc",
+      client_id: "rp-fc",
+      frontchannel_logout_uri: "https://rp.example/fc",
+      frontchannel_session_required: true
+    })
+
+    assert [target] = Store.targets(%{sid: "s-fc"})
+    assert target.frontchannel_logout_uri == "https://rp.example/fc"
+    assert target.frontchannel_session_required == true
+    assert target.backchannel_logout_uri == "https://rp.example/bc"
+  end
+
+  test "a front-channel-only record needs no backchannel_logout_uri" do
+    now = System.system_time(:second)
+
+    :ok =
+      Store.record(%{
+        sid: "s-fc-only",
+        subject: "usr-1",
+        client_id: "rp-fc-only",
+        frontchannel_logout_uri: "https://rp.example/fc",
+        expires_at: now + 3600
+      })
+
+    assert [target] = Store.targets(%{sid: "s-fc-only"})
+    assert target.backchannel_logout_uri == nil
+    assert target.frontchannel_logout_uri == "https://rp.example/fc"
+    assert target.frontchannel_session_required == false
+  end
+
+  test "an upsert can drop one channel and add the other" do
+    record(%{sid: "s-swap", client_id: "rp-swap"})
+
+    now = System.system_time(:second)
+
+    :ok =
+      Store.record(%{
+        sid: "s-swap",
+        subject: "usr-1",
+        client_id: "rp-swap",
+        backchannel_logout_uri: nil,
+        frontchannel_logout_uri: "https://rp.example/fc",
+        expires_at: now + 3600
+      })
+
+    assert [target] = Store.targets(%{sid: "s-swap"})
+    assert target.backchannel_logout_uri == nil
+    assert target.frontchannel_logout_uri == "https://rp.example/fc"
+  end
+
+  test "a record with neither logout URI is refused (nothing to notify)" do
+    now = System.system_time(:second)
+
+    :ok =
+      Store.record(%{
+        sid: "s-none",
+        subject: "usr-1",
+        client_id: "rp-none",
+        backchannel_logout_uri: nil,
+        expires_at: now + 3600
+      })
+
+    assert [] = Store.targets(%{sid: "s-none"})
+  end
+
   test "targets by sid spans every RP holding that session" do
     record(%{sid: "s3", client_id: "rp-a"})
     record(%{sid: "s3", client_id: "rp-b"})
