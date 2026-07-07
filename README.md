@@ -5,9 +5,15 @@
 [![Elixir CI](https://github.com/XukuLLC/attesto_phoenix/actions/workflows/elixir.yml/badge.svg)](https://github.com/XukuLLC/attesto_phoenix/actions/workflows/elixir.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/XukuLLC/attesto_phoenix/blob/main/LICENSE)
 [![Elixir](https://img.shields.io/badge/elixir-%E2%89%A5%201.18-purple)](https://elixir-lang.org)
+[![OpenID Certified](https://img.shields.io/badge/OpenID-Certified-F78C40)](https://openid.net/certification/certified-openid-connect-implementations/)
 
 An opinionated Phoenix/Ecto OAuth 2.0 / OIDC authorization server on top of
 [attesto](https://hex.pm/packages/attesto).
+
+An authorization server built from `attesto` + `attesto_phoenix` is
+[OpenID Certified](https://openid.net/certification/certified-openid-connect-implementations/)
+(Attesto 1.0.0, Xuku LLC) to the **Basic OP**, **RP-Initiated Logout OP**, and
+**Back-Channel Logout OP** profiles.
 
 **attesto brings the protocol, attesto_phoenix brings transport + persistence;
 you bring principals, keys, and policy.**
