@@ -191,6 +191,10 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       token_endpoint_auth_methods_supported: token_endpoint_auth_methods_supported(config),
       token_endpoint_auth_signing_alg_values_supported: config.client_auth_signing_algs,
       authorization_response_iss_parameter_supported: authorization_response_iss_parameter_supported(config),
+      # RFC 8705 §3.3: advertise certificate-bound access token support only when
+      # mTLS `cnf` binding is enabled; nil-dropped otherwise so a non-mTLS OP
+      # stays silent (FAPI / FAPI-CIBA read this from the provider metadata).
+      tls_client_certificate_bound_access_tokens: tls_client_certificate_bound_access_tokens(config),
       authorization_endpoint: config.authorization_endpoint,
       userinfo_endpoint: config.userinfo_endpoint,
       revocation_endpoint: revocation_endpoint(config),
@@ -264,6 +268,11 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   defp introspection_auth_methods(config) do
     Enum.reject(token_endpoint_auth_methods_supported(config), &(&1 == "none"))
   end
+
+  # RFC 8705 §3.3: `true` iff the OP mTLS-binds access tokens (nil-dropped
+  # otherwise by the shared metadata builder).
+  defp tls_client_certificate_bound_access_tokens(%Config{mtls_enabled: true}), do: true
+  defp tls_client_certificate_bound_access_tokens(%Config{}), do: nil
 
   defp put_fapi_metadata(metadata, %Config{} = config) do
     metadata
