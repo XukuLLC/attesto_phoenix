@@ -81,13 +81,15 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
   end
 
   # FAPI-CIBA §5.2.2: the backchannel authentication endpoint accepts confidential
-  # clients only (`private_key_jwt` / mTLS), so `allow_public: false`; the client
-  # assertion MUST be audienced to the issuer identifier, derived from trusted
-  # `Config` (never the request `Host`).
+  # clients only (`private_key_jwt` / mTLS), so `allow_public: false`. The client
+  # assertion `aud` may be the issuer identifier OR the token endpoint URL
+  # (RFC 7523 §3 / FAPI-CIBA §7.1 — the suite audiences its second client to the
+  # token endpoint), both derived from trusted `Config` (never the request
+  # `Host`). Mirrors the token endpoint.
   defp authenticate_client(config, conn, params) do
     policy = %Policy{
       allow_public: false,
-      assertion_audiences: [config.issuer],
+      assertion_audiences: [config.issuer, Config.token_endpoint_url(config)],
       assertion_max_lifetime: @client_assertion_max_lifetime,
       assertion_signing_algs: config.client_auth_signing_algs
     }
