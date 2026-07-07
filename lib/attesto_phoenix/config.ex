@@ -264,6 +264,13 @@ defmodule AttestoPhoenix.Config do
       (authorization-server mix-up defense, mandated by FAPI 2.0); set `false`
       only for a deployment that must omit it.
     * `:require_https` - enforce HTTPS on the endpoints. Default `true`.
+      Setting `false` additionally admits plain-`http` `:issuer`, `:audience`,
+      and `:resource_metadata` URLs whose host is the loopback interface
+      (`Attesto.LoopbackHost.loopback?/1`: `localhost`, `*.localhost`,
+      `127.0.0.0/8`, `::1`) - the local-development case
+      (`issuer: "http://localhost:4000"`) where TLS adds no transport
+      security (the RFC 8252 §8.3 loopback reasoning). A non-loopback `http`
+      URL is rejected regardless of this flag.
     * `:trusted_proxies` - list of trusted proxy CIDRs/IPs controlling whether
       `X-Forwarded-*` headers are honored. Default `[]` (no forwarded trust).
     * `:access_token_ttl` - access-token lifetime, seconds. Default `900`.
@@ -1127,7 +1134,10 @@ defmodule AttestoPhoenix.Config do
       audience: config.audience,
       keystore: config.keystore,
       default_lifetime_seconds: config.access_token_ttl,
-      token_endpoint_path: token_path(config)
+      token_endpoint_path: token_path(config),
+      # Propagated so Attesto.Config's issuer validation grants the same
+      # loopback-http development carve-out this config was built under.
+      require_https: config.require_https
     ]
     |> Keyword.merge(resolved_principal_kinds(config))
     |> Keyword.merge(extra)
@@ -1673,7 +1683,7 @@ defmodule AttestoPhoenix.Config do
     # minted `aud` may differ per request, but `config.audience` remains the
     # required default/fallback and the RS verification audience, so it must be
     # present regardless.)
-    if !absolute_resource_url?(config.audience) do
+    if !absolute_resource_url?(config.audience, config.require_https) do
       raise ArgumentError,
             "AttestoPhoenix.Config: :audience is required and must be an absolute https URL with a " <>
               "host (no fragment). It is the access-token `aud`, the audience the " <>
@@ -1681,6 +1691,7 @@ defmodule AttestoPhoenix.Config do
               ":invalid_audience), and the RFC 9728 resource identifier served at " <>
               "/.well-known/oauth-protected-resource — a blank/non-URL value boots but then " <>
               "500s that endpoint. Set `audience: \"https://api.example.com\"`. " <>
+              "Plain http is admitted only for a loopback host with `require_https: false`. " <>
               "Got: #{inspect(config.audience)}."
     end
 
@@ -1736,13 +1747,14 @@ defmodule AttestoPhoenix.Config do
   defp validate_resource_metadata!(config) do
     rm = config.resource_metadata
 
-    if is_nil(rm) or absolute_resource_url?(rm) do
+    if is_nil(rm) or absolute_resource_url?(rm, config.require_https) do
       :ok
     else
       raise ArgumentError,
             "AttestoPhoenix.Config: :resource_metadata, when set, must be an absolute https URL with a " <>
               "host and no fragment (the RFC 9728 protected-resource metadata document advertised " <>
-              "in the WWW-Authenticate challenge); got #{inspect(rm)}."
+              "in the WWW-Authenticate challenge). Plain http is admitted only for a loopback " <>
+              "host with `require_https: false`. Got #{inspect(rm)}."
     end
   end
 
@@ -1775,20 +1787,26 @@ defmodule AttestoPhoenix.Config do
   # an `https` URL with a host and no fragment, with valid RFC 3986 §2.1
   # percent-encoding. `URI.new/1` (unlike `URI.parse/1`) rejects whitespace/
   # control characters; the leading check rejects a `%` that is not the start of a
-  # `%HH` triplet (which `URI.new/1` still admits). (The RFC 8707 jwt-bearer
+  # `%HH` triplet (which `URI.new/1` still admits). Under `require_https: false` a
+  # plain-`http` URL is admitted when its host is loopback - the local-development
+  # carve-out `Attesto.Config` grants the issuer. (The RFC 8707 jwt-bearer
   # request `resource` permits any scheme per §2.1 and is validated separately in
   # `AttestoPhoenix.AuthorizationServer.Token`.)
-  defp absolute_resource_url?(url) when is_binary(url) do
+  defp absolute_resource_url?(url, require_https) when is_binary(url) do
     case URI.new(url) do
-      {:ok, %URI{scheme: "https", host: host, fragment: nil}} when is_binary(host) and host != "" ->
-        not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, url)
+      {:ok, %URI{scheme: scheme, host: host, fragment: nil}} when is_binary(host) and host != "" ->
+        scheme_ok =
+          scheme == "https" or
+            (scheme == "http" and not require_https and Attesto.LoopbackHost.loopback?(host))
+
+        scheme_ok and not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, url)
 
       _ ->
         false
     end
   end
 
-  defp absolute_resource_url?(_), do: false
+  defp absolute_resource_url?(_, _require_https), do: false
 
   # ── Boot-time discovery-document safety guard ────────────────────────────
   #

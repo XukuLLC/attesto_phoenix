@@ -450,6 +450,65 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe "require_https: false loopback http development carve-out" do
+    defp loopback_dev_opts(overrides) do
+      audience_required_opts()
+      |> Keyword.merge(
+        issuer: "http://localhost:4000",
+        audience: "http://localhost:4000/mcp",
+        require_https: false
+      )
+      |> Keyword.merge(overrides)
+    end
+
+    test "admits a loopback http :issuer, :audience, and :resource_metadata" do
+      cfg =
+        Config.new(
+          loopback_dev_opts(resource_metadata: "http://localhost:4000/.well-known/oauth-protected-resource/mcp")
+        )
+
+      assert cfg.issuer == "http://localhost:4000"
+      assert cfg.audience == "http://localhost:4000/mcp"
+      assert cfg.resource_metadata == "http://localhost:4000/.well-known/oauth-protected-resource/mcp"
+    end
+
+    test "admits the other loopback host forms" do
+      for host <- ["127.0.0.1", "[::1]", "app.localhost"] do
+        cfg = Config.new(loopback_dev_opts(issuer: "http://#{host}:4000", audience: "http://#{host}:4000/mcp"))
+        assert cfg.audience == "http://#{host}:4000/mcp"
+      end
+    end
+
+    test "under the default require_https: true a loopback http :audience is still rejected" do
+      assert_raise ArgumentError, ~r/:audience is required and must be an absolute https URL/, fn ->
+        Config.new(loopback_dev_opts(issuer: "https://issuer.example", require_https: true))
+      end
+    end
+
+    test "a NON-loopback http :audience is rejected even with require_https: false" do
+      assert_raise ArgumentError, ~r/:audience is required and must be an absolute https URL/, fn ->
+        Config.new(loopback_dev_opts(audience: "http://api.example.com/mcp"))
+      end
+    end
+
+    test "a NON-loopback http :resource_metadata is rejected even with require_https: false" do
+      assert_raise ArgumentError, ~r/:resource_metadata, when set, must be an absolute https URL/, fn ->
+        Config.new(loopback_dev_opts(resource_metadata: "http://api.example.com/.well-known/x"))
+      end
+    end
+
+    test "to_attesto_config/2 propagates require_https so the Attesto issuer validation matches" do
+      cfg = Config.new(loopback_dev_opts([]))
+
+      attesto =
+        Config.to_attesto_config(cfg, principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")])
+
+      assert attesto.require_https == false
+      assert attesto.issuer == "http://localhost:4000"
+      assert Attesto.Config.token_endpoint_url(attesto) == "http://localhost:4000/oauth/token"
+    end
+  end
+
   describe ":client_auth_signing_algs" do
     test "defaults to the FAPI 2 set when unset" do
       assert config().client_auth_signing_algs == Attesto.SigningAlg.fapi_algs()
