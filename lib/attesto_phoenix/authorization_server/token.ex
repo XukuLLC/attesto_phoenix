@@ -76,6 +76,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 8628 §3.4: the device authorization grant token request.
   @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
 
+  # OpenID Connect CIBA Core 1.0 §10.1: the CIBA grant token request.
+  @grant_ciba "urn:openid:params:grant-type:ciba"
+
   # RFC 8628 §3.5: the polling errors that MUST be rendered with their own error
   # codes (NOT collapsed to invalid_grant) — clients depend on distinguishing
   # authorization_pending / slow_down from a terminal failure.
@@ -91,7 +94,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # assertion's `client_id` claim MUST match it); none is safe for a public
   # (`:none`) client that proved possession of no client credential, so all
   # reject the public-client path regardless of any per-client policy.
-  @confidential_only_grants ["client_credentials", @grant_token_exchange, @grant_jwt_bearer]
+  # CIBA (CIBA Core §7.1 / FAPI-CIBA §5.2.2) is confidential-clients-only: the
+  # backchannel authentication request was made by an authenticated confidential
+  # client, and the token request must be by that same client.
+  @confidential_only_grants ["client_credentials", @grant_token_exchange, @grant_jwt_bearer, @grant_ciba]
 
   # OIDC Core §3.1.2.1 / §11: the scope values that trigger ID-Token issuance
   # and initial refresh-token issuance respectively.
@@ -329,6 +335,56 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
            ) do
       issued = token_issued_event(request, scope, "device_code", token_type, binding)
       maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued], "device_code")
+    end
+  end
+
+  # OpenID Connect CIBA Core 1.0 §10.1/§11: the CIBA grant token request. The
+  # client polls (or is pinged, then polls) with its `auth_req_id`; the store's
+  # state machine returns the user's decision (or the §11 pending/slow_down/
+  # expired/denied signals, mapped to their exact error codes by
+  # `ciba_grant_error/1`). On approval the bound subject/scope/resource and the
+  # authentication context (`acr`/`auth_time`) mint a token exactly as the
+  # device grant does, PLUS an ID Token (§10.1: the CIBA token response always
+  # carries one - the scope always includes `openid`); a refresh token follows
+  # the host `:issue_refresh_token?` gate.
+  defp dispatch(%Request{grant_type: @grant_ciba} = request) do
+    %{config: config, client: client, params: params} = request
+
+    with {:ok, auth_req_id} <- require_param(params, "auth_req_id"),
+         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, grant} <- redeem_ciba(config, client, auth_req_id, SenderConstraint.binding_jkt(binding)),
+         {:ok, scope} <- authorize_scope(config, client, grant.scope),
+         {:ok, audience} <- resolve_code_resource(grant, params),
+         {:ok, response} <-
+           mint(
+             config,
+             client,
+             grant.subject,
+             scope,
+             token_type,
+             binding,
+             %{},
+             # RFC 8707 aud from the bound resource set; RFC 9470 acr/auth_time
+             # the CIBA approval recorded (on the Grant struct, not in claims).
+             audience_opts(audience) ++ ciba_auth_context_opts(grant)
+           ),
+         # CIBA Core §10.1: the token response carries an ID Token (no nonce -
+         # CIBA has none - and no c_hash - there is no authorization code).
+         {:ok, response} <- maybe_mint_ciba_id_token(config, client, grant, scope, response) do
+      issued = token_issued_event(request, scope, "ciba", token_type, binding)
+      # RFC 9470: fold the Grant's struct-level acr/auth_time into its `claims`
+      # so the shared refresh-issuance path (which reads them from `claims`)
+      # seeds the refresh family with the real authentication event.
+      maybe_issue_refresh_token(
+        request,
+        ciba_refresh_grant(grant),
+        scope,
+        token_type,
+        binding,
+        response,
+        [issued],
+        "ciba"
+      )
     end
   end
 
@@ -603,6 +659,118 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp device_grant_error(:expired_token), do: error(@error_expired_token, "the device code has expired")
   defp device_grant_error(:access_denied), do: error(@error_access_denied, "the user denied the request")
   defp device_grant_error(_reason), do: error(@error_invalid_grant, "the device code is invalid")
+
+  # CIBA Core §10.1/§11: redeem the authenticated client's `auth_req_id`,
+  # carrying the DPoP holder-of-key the token request demonstrated (matched
+  # against any key pre-bound at issue). The §11 polling signals map to their
+  # own wire error codes; only a bad/unknown/wrong-client request is
+  # `invalid_grant`.
+  defp redeem_ciba(config, client, auth_req_id, jkt) do
+    store = Config.ciba_store(config)
+
+    params =
+      %{client_id: client_id(config, client)}
+      |> put_optional(:dpop_jkt, jkt)
+
+    case Attesto.CIBA.redeem(store, auth_req_id, params, []) do
+      {:ok, grant} -> {:ok, grant}
+      {:error, reason} -> {:error, ciba_grant_error(reason)}
+    end
+  end
+
+  # CIBA Core §11: render each redemption outcome with its OWN error code so the
+  # client distinguishes "keep polling" (authorization_pending / slow_down) from
+  # a terminal failure (expired_token / access_denied). A push-mode request
+  # redeemed at the token endpoint is `unauthorized_client` (§11); everything
+  # else (unknown / wrong-client / wrong-DPoP / consumed) is `invalid_grant`.
+  defp ciba_grant_error(:authorization_pending),
+    do: error(@error_authorization_pending, "the authentication request is still pending")
+
+  defp ciba_grant_error(:slow_down), do: error(@error_slow_down, "polling too frequently; slow down")
+  defp ciba_grant_error(:expired_token), do: error(@error_expired_token, "the authentication request has expired")
+  defp ciba_grant_error(:access_denied), do: error(@error_access_denied, "the user denied the request")
+
+  defp ciba_grant_error(:unauthorized_client),
+    do: error(:unauthorized_client, "a push-mode request must not be redeemed at the token endpoint")
+
+  defp ciba_grant_error(_reason), do: error(@error_invalid_grant, "the authentication request is invalid")
+
+  # RFC 9470: fold the CIBA Grant's struct-level acr/auth_time into its `claims`
+  # so the shared refresh-issuance path (`issue_initial_refresh_token`, which
+  # reads them from `claims`) seeds the refresh family with the real
+  # authentication event, exactly as the authorization-code grant does.
+  defp ciba_refresh_grant(grant) do
+    claims =
+      grant.claims
+      |> put_optional("acr", valid_acr(grant.acr))
+      |> put_optional("auth_time", valid_auth_time(grant.auth_time))
+
+    %{grant | claims: claims}
+  end
+
+  # RFC 9470 / OIDC Core §2: the CIBA Grant carries the satisfied `acr` and the
+  # `auth_time` of the out-of-band authentication as struct fields (not in a
+  # claims map like the authorization code), so read them directly onto the
+  # access token. Absent values add no opt (fail closed against step-up).
+  defp ciba_auth_context_opts(%{acr: acr, auth_time: auth_time}) do
+    []
+    |> put_optional_kw(:acr, valid_acr(acr))
+    |> put_optional_kw(:auth_time, valid_auth_time(auth_time))
+  end
+
+  # CIBA Core §10.1: the token response from a CIBA grant always carries an ID
+  # Token (the request scope always contains `openid`, CIBA §7.1). It carries
+  # `sub`/`acr`/`auth_time` and `at_hash`, but no `nonce` (CIBA has none) and no
+  # `c_hash` (there is no authorization code). Gated on `openid` defensively.
+  defp maybe_mint_ciba_id_token(config, client, grant, scope, response) do
+    if @openid_scope in scope do
+      mint_ciba_id_token(config, client, grant, scope, response)
+    else
+      {:ok, response}
+    end
+  end
+
+  defp mint_ciba_id_token(config, client, grant, scope, response) do
+    case client_id(config, client) do
+      client_id when is_binary(client_id) and client_id != "" ->
+        opts =
+          [access_token: response.access_token]
+          # FAPI-CIBA §5.2.2: `acr` REQUIRED in the ID Token when the client
+          # requested `acr_values` (the approval recorded the satisfied value).
+          |> put_optional_kw(:acr, valid_acr(grant.acr))
+          |> put_optional_kw(:auth_time, valid_auth_time(grant.auth_time))
+          |> put_optional_kw(:extra_claims, ciba_id_token_extra_claims(config, client, grant, scope))
+
+        case IDToken.mint(attesto_config(config), grant.subject, client_id, opts) do
+          {:ok, id_token} ->
+            {:ok, Map.put(response, :id_token, id_token)}
+
+          {:error, reason} ->
+            Logger.error("ciba id token mint failed: #{inspect(reason)}")
+            {:error, error(@error_invalid_request, "unable to issue token")}
+        end
+
+      _ ->
+        Logger.error("ciba id token mint failed: missing client_id")
+        {:error, error(@error_invalid_request, "unable to issue token")}
+    end
+  end
+
+  # OIDC Core §5.4/§5.5: host-sourced extra ID Token claims (e.g. `email`),
+  # sourced from the `:build_id_token_claims` callback. CIBA carries no OIDC
+  # `claims` request parameter, so the requested-claims argument is nil.
+  defp ciba_id_token_extra_claims(config, client, grant, scope) do
+    case Config.build_id_token_claims_fun(config) do
+      nil ->
+        nil
+
+      callback ->
+        case invoke(callback, [host_client(client), grant.subject, scope, nil]) do
+          map when is_map(map) and map_size(map) > 0 -> map
+          _ -> nil
+        end
+    end
+  end
 
   # Revoke the refresh-token family linked to a replayed code (OAuth 2.0
   # Security BCP §4.13.2) through the configured `:refresh_store`. The reuse

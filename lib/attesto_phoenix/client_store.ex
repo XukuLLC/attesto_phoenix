@@ -136,6 +136,18 @@ defmodule AttestoPhoenix.ClientStore do
   """
   @callback client_frontchannel_logout_session_required(client()) :: boolean()
 
+  @doc """
+  The client's registered OpenID Connect CIBA metadata (CIBA Core §4), as a map
+  with `:token_delivery_mode` (`:poll` | `:ping` | `:push`),
+  `:client_notification_endpoint` (the ping-mode
+  `backchannel_client_notification_endpoint`), `:request_signing_alg` (the
+  registered `backchannel_authentication_request_signing_alg`), and
+  `:user_code_parameter` (the `backchannel_user_code_parameter` boolean). A
+  client not registered for CIBA returns `%{}` (or `nil`), which the backchannel
+  authentication endpoint treats as `unauthorized_client`.
+  """
+  @callback client_ciba_registration(client()) :: map() | nil
+
   @optional_callbacks client_id: 1,
                       client_jwks: 1,
                       client_redirect_uris: 1,
@@ -147,5 +159,6 @@ defmodule AttestoPhoenix.ClientStore do
                       client_backchannel_logout_uri: 1,
                       client_backchannel_logout_session_required: 1,
                       client_frontchannel_logout_uri: 1,
-                      client_frontchannel_logout_session_required: 1
+                      client_frontchannel_logout_session_required: 1,
+                      client_ciba_registration: 1
 end

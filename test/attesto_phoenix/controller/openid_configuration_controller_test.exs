@@ -119,6 +119,27 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       assert body["check_session_iframe"] == "#{@issuer}/oauth/check_session"
     end
 
+    test "advertises the CIBA metadata + grant only when enabled (CIBA Core §4)" do
+      off = call_show(host_config(), protocol_config()) |> decode_body()
+      refute Map.has_key?(off, "backchannel_authentication_endpoint")
+      refute "urn:openid:params:grant-type:ciba" in off["grant_types_supported"]
+
+      host =
+        host_config(
+          ciba: [enabled: true, delivery_modes: [:poll, :ping], request_signing_algs: ["PS256", "ES256"]],
+          ciba_store: __MODULE__.StubStore,
+          authenticate_ciba_user: fn _ -> {:ok, "user"} end
+        )
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["backchannel_authentication_endpoint"] == "#{@issuer}/oauth/bc-authorize"
+      assert body["backchannel_token_delivery_modes_supported"] == ["poll", "ping"]
+      assert body["backchannel_authentication_request_signing_alg_values_supported"] == ["PS256", "ES256"]
+      assert body["backchannel_user_code_parameter_supported"] == false
+      assert "urn:openid:params:grant-type:ciba" in body["grant_types_supported"]
+    end
+
     test "omits the logout and session-management metadata when disabled" do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 
