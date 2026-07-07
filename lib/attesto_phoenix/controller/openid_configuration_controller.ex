@@ -200,6 +200,15 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
       # RFC 8628 §4: advertised only when the device grant is enabled.
       device_authorization_endpoint: device_authorization_endpoint(config),
+      # OpenID Connect CIBA Core 1.0 §4: the backchannel authentication endpoint
+      # and its capability metadata, advertised only when CIBA is enabled
+      # (nil-dropped otherwise). FAPI-CIBA reads these from the OpenID Provider
+      # Metadata document.
+      backchannel_authentication_endpoint: backchannel_authentication_endpoint(config),
+      backchannel_token_delivery_modes_supported: backchannel_token_delivery_modes_supported(config),
+      backchannel_authentication_request_signing_alg_values_supported:
+        backchannel_authentication_request_signing_alg_values_supported(config),
+      backchannel_user_code_parameter_supported: backchannel_user_code_parameter_supported(config),
       # OpenID Connect RP-Initiated Logout 1.0 §3 / Back-Channel Logout 1.0
       # §2.1 / Front-Channel Logout 1.0 §3: advertised only when logout is
       # enabled (nil-dropped otherwise).
@@ -316,6 +325,24 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   defp device_authorization_endpoint(%Config{} = config) do
     if Config.device_authorization_enabled?(config), do: Config.device_authorization_endpoint_url(config)
+  end
+
+  defp backchannel_authentication_endpoint(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Config.backchannel_authentication_endpoint_url(config)
+  end
+
+  # CIBA Core §4: the delivery modes advertised as wire strings (FAPI-CIBA
+  # keeps these to "poll"/"ping"). Nil when CIBA is disabled.
+  defp backchannel_token_delivery_modes_supported(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Enum.map(Config.ciba_delivery_modes(config), &Atom.to_string/1)
+  end
+
+  defp backchannel_authentication_request_signing_alg_values_supported(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Keyword.get(Config.ciba(config), :request_signing_algs)
+  end
+
+  defp backchannel_user_code_parameter_supported(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Keyword.get(Config.ciba(config), :user_code_parameter_supported, false)
   end
 
   defp end_session_endpoint(%Config{} = config) do

@@ -173,6 +173,15 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       # RFC 8628 §4: advertised only when the device authorization grant is
       # enabled (nil-dropped by the core builder otherwise).
       device_authorization_endpoint: device_authorization_endpoint(config),
+      # OpenID Connect CIBA Core 1.0 §4: the backchannel authentication endpoint
+      # and its capability metadata, advertised only when CIBA is enabled so a
+      # FAPI-CIBA client reading RFC 8414 (not OpenID Discovery) sees the same
+      # CIBA support (all nil-dropped by the core builder otherwise).
+      backchannel_authentication_endpoint: backchannel_authentication_endpoint(config),
+      backchannel_token_delivery_modes_supported: backchannel_token_delivery_modes_supported(config),
+      backchannel_authentication_request_signing_alg_values_supported:
+        backchannel_authentication_request_signing_alg_values_supported(config),
+      backchannel_user_code_parameter_supported: backchannel_user_code_parameter_supported(config),
       # OpenID Connect RP-Initiated Logout 1.0 §3 / Back-Channel Logout 1.0
       # §2.1: advertised only when logout is enabled (nil-dropped otherwise).
       end_session_endpoint: end_session_endpoint(config),
@@ -275,6 +284,25 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
 
   defp device_authorization_endpoint(%Config{} = config) do
     if Config.device_authorization_enabled?(config), do: Config.device_authorization_endpoint_url(config)
+  end
+
+  defp backchannel_authentication_endpoint(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Config.backchannel_authentication_endpoint_url(config)
+  end
+
+  # CIBA Core §4: the delivery modes advertised as wire strings, the accepted
+  # signed-request algs, and whether a user_code is supported. Nil when CIBA is
+  # disabled so the core builder drops each member.
+  defp backchannel_token_delivery_modes_supported(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Enum.map(Config.ciba_delivery_modes(config), &Atom.to_string/1)
+  end
+
+  defp backchannel_authentication_request_signing_alg_values_supported(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Keyword.get(Config.ciba(config), :request_signing_algs)
+  end
+
+  defp backchannel_user_code_parameter_supported(%Config{} = config) do
+    if Config.ciba_enabled?(config), do: Keyword.get(Config.ciba(config), :user_code_parameter_supported, false)
   end
 
   # RFC 7591 §3: advertise the dynamic client registration endpoint only

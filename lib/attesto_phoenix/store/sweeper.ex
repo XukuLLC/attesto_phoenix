@@ -1,9 +1,9 @@
 defmodule AttestoPhoenix.Store.Sweeper do
   @moduledoc """
   Optional periodic housekeeping `GenServer` that deletes expired rows from the
-  Ecto-backed authorization-code, refresh-token, DPoP-nonce, DPoP-replay,
-  pushed-authorization-request, client-id-metadata-cache, and consent-grant
-  tables.
+  Ecto-backed authorization-code, refresh-token, device-code, CIBA-request,
+  logout-session, DPoP-nonce, DPoP-replay, pushed-authorization-request,
+  client-id-metadata-cache, and consent-grant tables.
 
   Each of these tables carries an `expires_at` column whose semantics are fixed
   by the relevant RFC:
@@ -29,6 +29,9 @@ defmodule AttestoPhoenix.Store.Sweeper do
     * back-channel-logout sessions - OpenID Connect Back-Channel Logout 1.0 (a
       recorded `(session, RP)` delivery row past its `expires_at` belongs to an
       abandoned session and is no longer a logout target).
+    * CIBA authentication requests - OpenID Connect CIBA Core 1.0 §7.3 (an
+      `auth_req_id` past its `expires_at` yields `expired_token` and can mint
+      nothing; `redeem/4` already re-checks expiry on read).
 
   ## Correctness vs. housekeeping
 
@@ -88,6 +91,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
   @authorization_codes "attesto_authorization_codes"
   @refresh_tokens "attesto_refresh_tokens"
   @device_codes "attesto_device_codes"
+  @ciba_requests "attesto_ciba_requests"
   @logout_sessions "attesto_logout_sessions"
   @dpop_nonces "dpop_nonces"
   @dpop_replays "dpop_replays"
@@ -169,6 +173,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
       @authorization_codes => delete_expired(repo, expired_query(@authorization_codes, now), prefix),
       @refresh_tokens => delete_expired(repo, expired_query(@refresh_tokens, now), prefix),
       @device_codes => delete_expired(repo, expired_query(@device_codes, now), prefix),
+      @ciba_requests => delete_expired(repo, expired_query(@ciba_requests, now), prefix),
       @logout_sessions => delete_expired(repo, expired_query(@logout_sessions, now), prefix),
       @dpop_nonces => delete_expired(repo, expired_query(@dpop_nonces, now), prefix),
       @dpop_replays => delete_expired(repo, expired_query(@dpop_replays, now), prefix),
@@ -187,6 +192,8 @@ defmodule AttestoPhoenix.Store.Sweeper do
   defp expired_query(@refresh_tokens, now), do: from(r in @refresh_tokens, where: r.expires_at < ^now)
 
   defp expired_query(@device_codes, now), do: from(r in @device_codes, where: r.expires_at < ^now)
+
+  defp expired_query(@ciba_requests, now), do: from(r in @ciba_requests, where: r.expires_at < ^now)
 
   defp expired_query(@logout_sessions, now), do: from(r in @logout_sessions, where: r.expires_at < ^now)
 

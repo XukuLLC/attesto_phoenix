@@ -466,6 +466,11 @@ defmodule AttestoPhoenix.Config do
     :consent,
     :authenticate_device_user,
     :render_device_verification,
+    :authenticate_ciba_user,
+    :notify_ciba_user,
+    :client_ciba_registration,
+    :ciba_store,
+    :backchannel_authentication_path,
     :client_public?,
     :client_requires_mtls?,
     :client_requires_dpop?,
@@ -531,6 +536,8 @@ defmodule AttestoPhoenix.Config do
     jwt_bearer: [],
     resource_indicators: [],
     device_authorization: [],
+    ciba: [],
+    ciba_ping_http_client: AttestoPhoenix.CIBAPing.Req,
     logout: [],
     session_management: [],
     basic_realm: "OAuth"
@@ -634,6 +641,14 @@ defmodule AttestoPhoenix.Config do
           client_id_metadata: keyword(),
           jwt_bearer: keyword(),
           resource_indicators: keyword(),
+          device_code_store: module() | nil,
+          authenticate_ciba_user: callback() | nil,
+          notify_ciba_user: callback() | nil,
+          client_ciba_registration: callback() | nil,
+          ciba_store: module() | nil,
+          ciba_ping_http_client: module(),
+          ciba: keyword(),
+          backchannel_authentication_path: String.t() | nil,
           logout: keyword(),
           session_management: keyword()
         }
@@ -673,6 +688,7 @@ defmodule AttestoPhoenix.Config do
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
         resource_indicators: normalize_resource_indicators(config.resource_indicators),
         device_authorization: normalize_device_authorization(config.device_authorization),
+        ciba: normalize_ciba(config.ciba),
         logout: normalize_logout(config.logout),
         session_management: normalize_session_management(config.session_management)
     }
@@ -761,6 +777,34 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_device_authorization(nil), do: @device_authorization_defaults
   defp normalize_device_authorization(opts) when is_list(opts), do: Keyword.merge(@device_authorization_defaults, opts)
+
+  # OpenID Connect CIBA Core 1.0. `enabled: true` adds
+  # `urn:openid:params:grant-type:ciba` to `grant_types_supported/1` and
+  # advertises the `backchannel_authentication_endpoint` + CIBA capability
+  # metadata — the host MUST ALSO pass `ciba: true` to `attesto_routes/1` to
+  # mount the endpoint, and supply a `:ciba_store` + `:authenticate_ciba_user`
+  # callback. `:delivery_modes` are the advertised + enforced
+  # `backchannel_token_delivery_modes_supported` (FAPI-CIBA §5.2.1 forbids
+  # `:push`). `:require_signed_request` (FAPI-CIBA §5.2.2: signed authentication
+  # requests are mandatory) and `:request_signing_algs` bound the accepted
+  # `request` JWTs. `:expires_in_seconds` / `:max_expires_in_seconds` /
+  # `:interval_seconds` are the §7.3 `expires_in` / clamp / `interval`. Off by
+  # default.
+  @ciba_defaults [
+    enabled: false,
+    delivery_modes: [:poll, :ping],
+    expires_in_seconds: 120,
+    max_expires_in_seconds: 600,
+    interval_seconds: 5,
+    require_signed_request: true,
+    request_signing_algs: ["PS256", "ES256"],
+    binding_message_max_length: 128,
+    require_binding_message: false,
+    user_code_parameter_supported: false
+  ]
+
+  defp normalize_ciba(nil), do: @ciba_defaults
+  defp normalize_ciba(opts) when is_list(opts), do: Keyword.merge(@ciba_defaults, opts)
 
   # OpenID Connect RP-Initiated Logout 1.0 + Back-Channel Logout 1.0 +
   # Front-Channel Logout 1.0. `enabled: true` mounts the end-session endpoint
@@ -938,6 +982,55 @@ defmodule AttestoPhoenix.Config do
       _ -> device_verification_endpoint_url(config)
     end
   end
+
+  @doc "The merged, defaulted OpenID Connect CIBA options."
+  @spec ciba(t()) :: keyword()
+  def ciba(%__MODULE__{ciba: opts}), do: opts
+
+  @doc """
+  Returns `true` iff OpenID Connect CIBA is enabled (`ciba: [enabled: true]`).
+  When enabled, `urn:openid:params:grant-type:ciba` is added to
+  `grant_types_supported/1` and the `backchannel_authentication_endpoint` +
+  CIBA capability metadata are advertised. The host MUST ALSO pass
+  `ciba: true` to `attesto_routes/1` to mount the endpoint.
+  """
+  @spec ciba_enabled?(t()) :: boolean()
+  def ciba_enabled?(%__MODULE__{} = config) do
+    config |> ciba() |> Keyword.get(:enabled, false) == true
+  end
+
+  @doc "The configured `Attesto.CIBAStore` module, or `nil`."
+  @spec ciba_store(t()) :: module() | nil
+  def ciba_store(%__MODULE__{ciba_store: store}), do: store
+
+  @doc "The advertised + enforced CIBA `backchannel_token_delivery_modes_supported` (atoms)."
+  @spec ciba_delivery_modes(t()) :: [:poll | :ping | :push]
+  def ciba_delivery_modes(%__MODULE__{} = config) do
+    config |> ciba() |> Keyword.get(:delivery_modes, [:poll, :ping])
+  end
+
+  @doc "The module implementing `AttestoPhoenix.CIBAPing` for ping-mode delivery."
+  @spec ciba_ping_http_client(t()) :: module()
+  def ciba_ping_http_client(%__MODULE__{ciba_ping_http_client: mod}), do: mod
+
+  @doc """
+  The client's registered CIBA metadata (CIBA Core §4), resolved from the host
+  `:client_ciba_registration` callback (or the `AttestoPhoenix.ClientStore`
+  behaviour), as a map with `:token_delivery_mode` (`:poll` | `:ping` | `:push`),
+  `:client_notification_endpoint`, `:request_signing_alg`, and
+  `:user_code_parameter`. A client the host does not register for CIBA resolves
+  to `%{}` (the core then treats it as `unauthorized_client`).
+  """
+  @spec client_ciba_registration(t(), term()) :: map()
+  def client_ciba_registration(%__MODULE__{} = config, client) do
+    case resolve_callback(config, :client_ciba_registration) do
+      nil -> %{}
+      cb -> cb |> Callback.invoke([client], %{}) |> normalize_ciba_registration()
+    end
+  end
+
+  defp normalize_ciba_registration(map) when is_map(map), do: map
+  defp normalize_ciba_registration(_other), do: %{}
 
   @doc "The merged, defaulted OpenID Connect logout (RP-Initiated + Back-Channel) options."
   @spec logout(t()) :: keyword()
@@ -1311,6 +1404,7 @@ defmodule AttestoPhoenix.Config do
   @userinfo_tail "/userinfo"
   @device_authorization_tail "/device_authorization"
   @device_verification_tail "/device_verification"
+  @backchannel_authentication_tail "/bc-authorize"
   @end_session_tail "/end_session"
   @check_session_tail "/check_session"
 
@@ -1345,6 +1439,20 @@ defmodule AttestoPhoenix.Config do
   @spec device_verification_endpoint_url(t()) :: String.t()
   def device_verification_endpoint_url(%__MODULE__{} = config),
     do: endpoint_url(config, device_verification_path(config))
+
+  @doc false
+  @spec backchannel_authentication_tail() :: String.t()
+  def backchannel_authentication_tail, do: @backchannel_authentication_tail
+
+  @doc "The resolved request path of the CIBA backchannel authentication endpoint (CIBA Core §7)."
+  @spec backchannel_authentication_path(t()) :: String.t()
+  def backchannel_authentication_path(%__MODULE__{backchannel_authentication_path: override} = config),
+    do: resolve_path(override, config, @backchannel_authentication_tail)
+
+  @doc "Absolute URL of the CIBA backchannel authentication endpoint (advertised as `backchannel_authentication_endpoint`, CIBA Core §4)."
+  @spec backchannel_authentication_endpoint_url(t()) :: String.t()
+  def backchannel_authentication_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, backchannel_authentication_path(config))
 
   @doc false
   @spec end_session_tail() :: String.t()
@@ -1529,13 +1637,18 @@ defmodule AttestoPhoenix.Config do
   # is enabled (`jwt_bearer: [enabled: true]`).
   @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
   @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
+  @grant_ciba "urn:openid:params:grant-type:ciba"
 
   @spec grant_types_supported(t()) :: [String.t()]
   def grant_types_supported(%__MODULE__{grant_types_supported: list} = config) when is_list(list) and list != [],
-    do: list |> maybe_add_jwt_bearer(config) |> maybe_add_device_code(config)
+    do: list |> maybe_add_jwt_bearer(config) |> maybe_add_device_code(config) |> maybe_add_ciba(config)
 
   def grant_types_supported(%__MODULE__{} = config),
-    do: @default_grant_types_supported |> maybe_add_jwt_bearer(config) |> maybe_add_device_code(config)
+    do:
+      @default_grant_types_supported
+      |> maybe_add_jwt_bearer(config)
+      |> maybe_add_device_code(config)
+      |> maybe_add_ciba(config)
 
   defp maybe_add_jwt_bearer(list, %__MODULE__{} = config) do
     if jwt_bearer_enabled?(config) and @grant_jwt_bearer not in list,
@@ -1546,6 +1659,12 @@ defmodule AttestoPhoenix.Config do
   defp maybe_add_device_code(list, %__MODULE__{} = config) do
     if device_authorization_enabled?(config) and @grant_device_code not in list,
       do: list ++ [@grant_device_code],
+      else: list
+  end
+
+  defp maybe_add_ciba(list, %__MODULE__{} = config) do
+    if ciba_enabled?(config) and @grant_ciba not in list,
+      do: list ++ [@grant_ciba],
       else: list
   end
 
@@ -1621,6 +1740,7 @@ defmodule AttestoPhoenix.Config do
     client_requires_mtls?: {:client_store, :client_requires_mtls?, 1},
     client_requires_dpop?: {:client_store, :client_requires_dpop?, 1},
     client_grant_types: {:client_store, :client_grant_types, 1},
+    client_ciba_registration: {:client_store, :client_ciba_registration, 1},
     load_principal: {:principal_store, :load_principal, 1},
     build_principal: {:principal_store, :build_principal, 3},
     resolve_jwt_bearer_subject: {:principal_store, :resolve_jwt_bearer_subject, 1},
@@ -1750,6 +1870,30 @@ defmodule AttestoPhoenix.Config do
               "(logout: [enabled: true]). Add a `terminate_session: &MyApp.AuthZ.terminate_session/2` " <>
               "callback that clears the host's browser session — the library must not serve an " <>
               "end-session endpoint that cannot actually log the user out. Or disable logout."
+    end
+  end
+
+  # CIBA is opt-in and cannot function without persistence for the mutable
+  # authentication-request record and a way to resolve the request's hint to an
+  # end-user (CIBA §7.1: the user MUST be identified before the auth_req_id is
+  # issued). Fail closed at build time rather than serve a backchannel endpoint
+  # that can only ever error.
+  defp validate_ciba!(%__MODULE__{} = config) do
+    if ciba_enabled?(config) do
+      if is_nil(ciba_store(config)) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :ciba_store is required when CIBA is enabled " <>
+                "(ciba: [enabled: true]). Add a `ciba_store: MyApp.EctoCIBAStore` implementing " <>
+                "Attesto.CIBAStore (or AttestoPhoenix.Store.EctoCIBAStore). Or disable CIBA."
+      end
+
+      if is_nil(config.authenticate_ciba_user) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :authenticate_ciba_user is required when CIBA is enabled " <>
+                "(ciba: [enabled: true]). Add an `authenticate_ciba_user: &MyApp.AuthZ.authenticate_ciba_user/1` " <>
+                "callback that resolves the request's login hint to a subject (and checks any user_code) — " <>
+                "the library cannot identify the end-user a backchannel request names. Or disable CIBA."
+      end
     end
   end
 
@@ -1889,6 +2033,7 @@ defmodule AttestoPhoenix.Config do
     end
 
     validate_logout!(config)
+    validate_ciba!(config)
     validate_session_management!(config)
     validate_registration_default_scope!(config)
     validate_jwt_bearer!(config)
@@ -1904,6 +2049,7 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:userinfo_path, config.userinfo_path)
     validate_optional_path!(:device_authorization_path, config.device_authorization_path)
     validate_optional_path!(:device_verification_path, config.device_verification_path)
+    validate_optional_path!(:backchannel_authentication_path, config.backchannel_authentication_path)
     validate_optional_path!(:end_session_path, config.end_session_path)
     validate_optional_path!(:check_session_path, config.check_session_path)
 

@@ -102,6 +102,24 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       assert "urn:ietf:params:oauth:grant-type:device_code" in on["grant_types_supported"]
     end
 
+    test "advertises backchannel_authentication_endpoint + CIBA grant only when enabled (CIBA Core §4)" do
+      off = call_show(host_config(), protocol_config()) |> decode_body()
+      refute Map.has_key?(off, "backchannel_authentication_endpoint")
+      refute "urn:openid:params:grant-type:ciba" in off["grant_types_supported"]
+
+      enabled =
+        host_config(
+          ciba: [enabled: true],
+          ciba_store: StubKeystore,
+          authenticate_ciba_user: fn _ -> {:ok, "user"} end
+        )
+
+      on = call_show(enabled, protocol_config()) |> decode_body()
+      assert on["backchannel_authentication_endpoint"] == "#{@issuer}/oauth/bc-authorize"
+      assert on["backchannel_token_delivery_modes_supported"] == ["poll", "ping"]
+      assert "urn:openid:params:grant-type:ciba" in on["grant_types_supported"]
+    end
+
     test "advertises the JARM authorization signing algorithms (RFC 8414 / §5.4)" do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 

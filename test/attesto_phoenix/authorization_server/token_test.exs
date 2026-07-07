@@ -569,6 +569,126 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     end
   end
 
+  describe "CIBA grant (OpenID Connect CIBA Core 1.0 §10.1 / §11)" do
+    setup do
+      start_supervised!(Attesto.CIBAStore.ETS)
+      Attesto.CIBAStore.ETS.reset()
+      :ok
+    end
+
+    defp ciba_config(overrides \\ []) do
+      config(
+        [
+          ciba_store: Attesto.CIBAStore.ETS,
+          ciba: [enabled: true, interval_seconds: 0],
+          # Required by config validation when CIBA is enabled (the token
+          # endpoint itself never calls it - it is the backchannel endpoint's).
+          authenticate_ciba_user: fn _request -> {:ok, "user-1"} end,
+          authorize_scope: fn _client, requested -> {:ok, requested} end
+        ] ++ overrides
+      )
+    end
+
+    defp issue_ciba(scope \\ ["openid"], opts \\ []) do
+      req = %Attesto.CIBA.Request{
+        client_id: "client-1",
+        delivery_mode: :poll,
+        hint: {:login_hint, "alice@example.test"},
+        scope: scope
+      }
+
+      {:ok, issued} = Attesto.CIBA.issue(Attesto.CIBAStore.ETS, req, %{subject: "user-1"}, opts)
+      issued
+    end
+
+    defp ciba_request(config, auth_req_id) do
+      request(config,
+        grant_type: "urn:openid:params:grant-type:ciba",
+        params: %{"auth_req_id" => auth_req_id}
+      )
+    end
+
+    test "pending → authorization_pending (NOT invalid_grant)" do
+      config = ciba_config()
+      %{auth_req_id: arid} = issue_ciba()
+
+      assert {:error, %OAuthError{error: :authorization_pending}, _} = Token.issue(config, ciba_request(config, arid))
+    end
+
+    test "denied → access_denied" do
+      config = ciba_config()
+      %{auth_req_id: arid} = issue_ciba()
+      {:ok, _} = Attesto.CIBA.deny(Attesto.CIBAStore.ETS, arid)
+
+      assert {:error, %OAuthError{error: :access_denied}, _} = Token.issue(config, ciba_request(config, arid))
+    end
+
+    test "expired → expired_token" do
+      config = ciba_config()
+      # Issue with a 1s lifetime already elapsed at redemption.
+      %{auth_req_id: arid} = issue_ciba(["openid"], expires_in: 1, now: System.system_time(:second) - 10)
+
+      assert {:error, %OAuthError{error: :expired_token}, _} = Token.issue(config, ciba_request(config, arid))
+    end
+
+    test "an unknown auth_req_id → invalid_grant" do
+      config = ciba_config()
+      assert {:error, %OAuthError{error: :invalid_grant}, _} = Token.issue(config, ciba_request(config, "nope"))
+    end
+
+    test "approved → mints an access token AND an ID Token carrying acr/auth_time" do
+      config = ciba_config()
+      %{auth_req_id: arid} = issue_ciba(["openid", "profile"])
+      auth_time = System.system_time(:second)
+
+      {:ok, _} =
+        Attesto.CIBA.approve(Attesto.CIBAStore.ETS, arid, %{
+          subject: "user-1",
+          acr: "urn:mace:incommon:iap:silver",
+          scope: ["openid", "profile"],
+          auth_time: auth_time
+        })
+
+      assert {:ok, response, [%Event{name: :token_issued, grant_type: "ciba"}]} =
+               Token.issue(config, ciba_request(config, arid))
+
+      assert is_binary(response.access_token)
+      assert is_binary(response.id_token)
+      assert response.scope == "openid profile"
+      # OIDC Core §2: the ID Token carries the authenticated subject + auth ctx.
+      assert claim!(response.id_token, "sub") == "user-1"
+      assert claim!(response.id_token, "acr") == "urn:mace:incommon:iap:silver"
+      assert claim!(response.id_token, "auth_time") == auth_time
+      # RFC 9470: the access token carries acr for step-up enforcement.
+      assert claim!(response.access_token, "acr") == "urn:mace:incommon:iap:silver"
+    end
+
+    test "a consumed auth_req_id cannot be redeemed twice (single use)" do
+      config = ciba_config()
+      %{auth_req_id: arid} = issue_ciba()
+      {:ok, _} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, arid, %{subject: "user-1", scope: ["openid"]})
+
+      assert {:ok, _, _} = Token.issue(config, ciba_request(config, arid))
+      assert {:error, %OAuthError{error: :invalid_grant}, _} = Token.issue(config, ciba_request(config, arid))
+    end
+
+    test "a different client cannot redeem another client's auth_req_id → invalid_grant" do
+      config = ciba_config()
+      %{auth_req_id: arid} = issue_ciba()
+      {:ok, _} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, arid, %{subject: "user-1", scope: ["openid"]})
+
+      # A request authenticated as a different client (client_id "client-2").
+      other =
+        request(config,
+          grant_type: "urn:openid:params:grant-type:ciba",
+          params: %{"auth_req_id" => arid},
+          client: %{id: "client-2", public?: false}
+        )
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} = Token.issue(config, other)
+    end
+  end
+
   describe "token exchange grant (RFC 8693)" do
     test "a token_exchange token_issued event carries bearer sender metadata" do
       config = config()

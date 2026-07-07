@@ -81,6 +81,10 @@ defmodule AttestoPhoenix.Router do
       never offers registration presents no registration surface at all.
     * `:device` - when `true`, mounts the RFC 8628 device-authorization
       endpoint and verification page. Defaults to `false`.
+    * `:ciba` - when `true`, mounts `POST /oauth/bc-authorize`, the OpenID
+      Connect CIBA backchannel authentication endpoint. Defaults to `false`.
+      The endpoint still fails closed at request time unless the host also
+      enables `ciba: [enabled: true]` in `AttestoPhoenix.Config`.
     * `:logout` - when `true`, mounts `GET`/`POST /oauth/end_session` (OpenID
       Connect RP-Initiated Logout 1.0). Defaults to `false`.
     * `:session_management` - when `true`, mounts `GET /oauth/check_session`
@@ -100,6 +104,7 @@ defmodule AttestoPhoenix.Router do
   # `/.well-known/` path segment at the host root. RFC 7517 §5 defines the JWK
   # Set document the metadata's `jwks_uri` points at.
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Controller.BackchannelAuthenticationController
   alias AttestoPhoenix.Controller.CheckSessionController
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
   alias AttestoPhoenix.Controller.DeviceVerificationController
@@ -147,6 +152,7 @@ defmodule AttestoPhoenix.Router do
   @userinfo_path @oauth_prefix <> AttestoPhoenix.Config.userinfo_tail()
   @device_authorization_path @oauth_prefix <> AttestoPhoenix.Config.device_authorization_tail()
   @device_verification_path @oauth_prefix <> AttestoPhoenix.Config.device_verification_tail()
+  @backchannel_authentication_path @oauth_prefix <> AttestoPhoenix.Config.backchannel_authentication_tail()
   @end_session_path @oauth_prefix <> AttestoPhoenix.Config.end_session_tail()
   @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
 
@@ -166,6 +172,7 @@ defmodule AttestoPhoenix.Router do
   @userinfo_controller UserinfoController
   @device_authorization_controller DeviceAuthorizationController
   @device_verification_controller DeviceVerificationController
+  @backchannel_authentication_controller BackchannelAuthenticationController
   @end_session_controller EndSessionController
   @check_session_controller CheckSessionController
 
@@ -185,6 +192,7 @@ defmodule AttestoPhoenix.Router do
     pipelines = opts |> Keyword.get(:pipeline, []) |> List.wrap()
     registration? = Keyword.get(opts, :registration, false)
     device? = Keyword.get(opts, :device, false)
+    ciba? = Keyword.get(opts, :ciba, false)
     logout? = Keyword.get(opts, :logout, false)
     session_management? = Keyword.get(opts, :session_management, false)
 
@@ -214,6 +222,8 @@ defmodule AttestoPhoenix.Router do
     device_verification_path = @device_verification_path
     device_authorization_controller = @device_authorization_controller
     device_verification_controller = @device_verification_controller
+    backchannel_authentication_path = @backchannel_authentication_path
+    backchannel_authentication_controller = @backchannel_authentication_controller
     end_session_path = @end_session_path
     end_session_controller = @end_session_controller
     check_session_path = @check_session_path
@@ -278,6 +288,22 @@ defmodule AttestoPhoenix.Router do
             unquote(prefix <> device_verification_path),
             unquote(device_verification_controller),
             :verify
+          )
+        end
+      end
+
+    # OpenID Connect CIBA Core 1.0 §7.1: the backchannel authentication endpoint
+    # is emitted only when the host opts in (`ciba: true`), so a deployment that
+    # does not offer CIBA exposes no backchannel endpoint at all. POST only -
+    # CIBA has no user-facing GET route (the authentication device is the host's
+    # own app/UI, unlike the device grant's verification page).
+    ciba_route =
+      if ciba? do
+        quote do
+          post(
+            unquote(prefix <> backchannel_authentication_path),
+            unquote(backchannel_authentication_controller),
+            :create
           )
         end
       end
@@ -357,6 +383,7 @@ defmodule AttestoPhoenix.Router do
 
         unquote(registration_route)
         unquote(device_route)
+        unquote(ciba_route)
         unquote(logout_route)
         unquote(session_management_route)
 
