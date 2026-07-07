@@ -155,6 +155,7 @@ defmodule AttestoPhoenix.MixProject do
       extras: [
         "README.md",
         "guides/examples.md",
+        "guides/local_https.md",
         "guides/consumer_migration.md",
         "guides/proxy_canonical_host.md",
         "guides/replay_nonce_production.md",

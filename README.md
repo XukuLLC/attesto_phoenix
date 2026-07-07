@@ -417,10 +417,40 @@ nonces, replay, and PAR); the Ecto variants exist for clustered correctness.
 `par_store: AttestoPhoenix.Store.EctoPARStore` or a pushed `request_uri` will not
 resolve on the node that later handles `/authorize`.
 
+## Local HTTPS for development
+
+attesto requires an **https** issuer (RFC 8414 §2), so a plain `http://localhost`
+dev server can't drive the OAuth / MCP flow — and there is deliberately no
+"disable https" switch. Instead, serve a locally-trusted
+[mkcert](https://github.com/FiloSottile/mkcert) certificate so `https://localhost`
+works with no tunnel and no downgrade.
+
+Generate the certificate once:
+
+```bash
+mix attesto_phoenix.gen.dev_https
+```
+
+Then wire it into `config/dev.exs` in one line:
+
+```elixir
+config :my_app, MyAppWeb.Endpoint,
+  https: AttestoPhoenix.DevTLS.https_opts(port: 4443)
+```
+
+Point your issuer at `https://localhost:4443` and discovery, DPoP, and the RFC
+8707 resource identifiers all line up. `AttestoPhoenix.DevTLS.https_opts/1`
+raises (pointing back at the generator) if the certificate is missing — it never
+falls back to http. See the [Local HTTPS guide](guides/local_https.md) for the
+full walkthrough and the tunnel-vs-mkcert tradeoff.
+
 ## Guides and examples
 
 - [Example configurations](guides/examples.md) - confidential and public-client
   configuration sketches.
+- [Local HTTPS for development](guides/local_https.md) - serve a locally-trusted
+  mkcert certificate so the OAuth / MCP flow runs over `https://localhost` with no
+  tunnel and no downgrade.
 - [Consumer migration](guides/consumer_migration.md) - moving from a custom or
   legacy OAuth route surface while keeping historical migrations compiling.
 - [Proxy and canonical host](guides/proxy_canonical_host.md) - issuer,

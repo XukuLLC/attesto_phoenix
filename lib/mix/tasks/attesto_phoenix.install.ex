@@ -427,6 +427,11 @@ if Code.ensure_loaded?(Igniter) do
            (RFC 8615). To enable dynamic client registration (RFC 7591), set
            `registration_enabled: true`, wire :register_client, and pass
            `registration: true` to `attesto_routes/1` in your router.
+
+        5. For local development, attesto needs an https issuer. Serve a
+           locally-trusted mkcert cert with `mix attesto_phoenix.gen.dev_https`,
+           then set `https: AttestoPhoenix.DevTLS.https_opts(port: 4443)` on your
+           dev endpoint (see the Local HTTPS guide).
       """)
     end
   end
