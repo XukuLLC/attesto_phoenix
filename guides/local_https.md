@@ -105,6 +105,16 @@ Point your MCP client (mcp-remote, Claude Desktop, etc.) at the concrete MCP
 transport URL on the same https origin — the OAuth dance then runs entirely over
 trusted https with no tunnel.
 
+**Node clients (mcp-remote) need one extra step.** `mkcert -install` trusts the
+CA in the system/browser stores, but Node ships its own root store, so a
+Node-based MCP client rejects the cert until you point Node at the mkcert CA:
+
+```sh
+export NODE_EXTRA_CA_CERTS="$(mkcert -CAROOT)/rootCA.pem"
+```
+
+(`curl` succeeds without this because it uses the system store; Node does not.)
+
 ## Notes and caveats
 
 - **Not a replacement for a tunnel when you need a public URL.** mkcert only
