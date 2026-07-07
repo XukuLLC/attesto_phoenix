@@ -302,12 +302,15 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # assertion MUST be audienced to the issuer identifier (FAPI 2.0 Security
   # Profile §5.3.2.1), derived from trusted `Config` (never the request `Host`) -
   # the concrete endpoint URL is NOT accepted as `aud`, so a confused-deputy
-  # assertion minted for a different endpoint is rejected. The assertion lives at
-  # most `@client_assertion_max_lifetime` seconds (RFC 7523 §3).
+  # RFC 7523 §3: the assertion `aud` MUST identify the authorization server — the
+  # issuer identifier OR the token endpoint URL are both valid audiences. Accept
+  # either (FAPI 2.0 audiences to the issuer; FAPI-CIBA ID1 audiences the
+  # token-endpoint assertion to the token endpoint URL). The assertion lives at
+  # most `@client_assertion_max_lifetime` seconds.
   defp authenticate_client(config, conn, params) do
     policy = %Policy{
       allow_public: true,
-      assertion_audiences: [config.issuer],
+      assertion_audiences: [config.issuer, Config.token_endpoint_url(config)],
       assertion_max_lifetime: @client_assertion_max_lifetime,
       assertion_signing_algs: config.client_auth_signing_algs
     }
