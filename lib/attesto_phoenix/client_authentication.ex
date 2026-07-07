@@ -46,8 +46,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
       `false`, a body `client_id` without a secret is rejected with
       `invalid_client` "client authentication required".
     * `:assertion_audiences` - the acceptable `aud` values for a
-      `private_key_jwt` assertion (RFC 7523 §3 / FAPI 2: the issuer
-      identifier, not the endpoint URL).
+      `private_key_jwt` assertion (RFC 7523 §3: the authorization server
+      identifier, commonly the issuer or token endpoint URL).
     * `:assertion_max_lifetime` - the maximum assertion lifetime, in seconds,
       and the replay-record TTL (RFC 7523 §3).
 

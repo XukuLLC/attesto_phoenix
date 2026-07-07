@@ -299,9 +299,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # `AttestoPhoenix.ClientAuthentication`, shared with the PAR endpoint. The
   # token endpoint's policy: a body `client_id` without a secret is the
   # public-client path (RFC 6749 §2.1), so `allow_public: true`; the client
-  # assertion MUST be audienced to the issuer identifier (FAPI 2.0 Security
-  # Profile §5.3.2.1), derived from trusted `Config` (never the request `Host`) -
-  # the concrete endpoint URL is NOT accepted as `aud`, so a confused-deputy
+  # assertion audience is derived from trusted `Config` (never the request `Host`).
   # RFC 7523 §3: the assertion `aud` MUST identify the authorization server — the
   # issuer identifier OR the token endpoint URL are both valid audiences. Accept
   # either (FAPI 2.0 audiences to the issuer; FAPI-CIBA ID1 audiences the

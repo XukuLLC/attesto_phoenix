@@ -447,10 +447,10 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
-    test "rejects a private_key_jwt assertion audienced to the token endpoint URL (FAPI: issuer only)" do
-      # FAPI 2.0 §5.3.2.1: the client-assertion `aud` must be the issuer
-      # identifier; the concrete endpoint URL is not accepted. Client auth fails
-      # before grant dispatch, so the error is invalid_client.
+    test "accepts private_key_jwt assertion audience set to the token endpoint URL" do
+      # RFC 7523 §3 allows the assertion audience to identify the authorization
+      # server by token endpoint URL; some FAPI-CIBA suites use that spelling.
+      # Client auth succeeds, so the intentionally unsupported grant is what fails.
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
 
@@ -468,7 +468,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
           "client_assertion" => assertion
         })
 
-      assert body(conn)["error"] == "invalid_client"
+      assert body(conn)["error"] == "unsupported_grant_type"
     end
 
     test "rejects private_key_jwt assertion audience that is neither the issuer nor the endpoint" do
