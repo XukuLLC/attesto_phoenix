@@ -679,20 +679,36 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe "session management options (Session Management 1.0)" do
-    test "off by default, with defaulted cookie name and lifetime" do
+    test "off by default, with defaulted (__Host-) cookie name and lifetime" do
       built = config()
 
       refute Config.session_management_enabled?(built)
-      assert Config.browser_state_cookie(built) == "attesto_op_browser_state"
+      assert Config.browser_state_cookie(built) == "__Host-attesto_op_browser_state"
       assert Config.browser_state_cookie_max_age(built) == 86_400
     end
 
     test "enabling merges over the defaults" do
-      built = config(session_management: [enabled: true, browser_state_cookie: "opbs"])
+      secret = :crypto.strong_rand_bytes(32)
+
+      built =
+        config(session_management: [enabled: true, browser_state_cookie: "opbs", browser_state_secret: secret])
 
       assert Config.session_management_enabled?(built)
       assert Config.browser_state_cookie(built) == "opbs"
       assert Config.browser_state_cookie_max_age(built) == 86_400
+      assert Config.browser_state_secret(built) == secret
+    end
+
+    test "enabling without a browser_state_secret is rejected" do
+      assert_raise ArgumentError, ~r/:browser_state_secret is required/, fn ->
+        config(session_management: [enabled: true])
+      end
+    end
+
+    test "a too-short browser_state_secret is rejected" do
+      assert_raise ArgumentError, ~r/at least 32 bytes/, fn ->
+        config(session_management: [enabled: true, browser_state_secret: "short"])
+      end
     end
 
     test "the check-session iframe URL derives from the issuer and prefix" do

@@ -31,7 +31,7 @@ defmodule AttestoPhoenix.Controller.CheckSessionControllerTest do
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _c, _s -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
-      session_management: [enabled: true]
+      session_management: [enabled: true, browser_state_secret: :crypto.strong_rand_bytes(32)]
     ]
 
     Application.put_env(:attesto_phoenix, @config_key, base)
@@ -67,8 +67,8 @@ defmodule AttestoPhoenix.Controller.CheckSessionControllerTest do
     assert conn.resp_body =~ ~s("changed")
     assert conn.resp_body =~ ~s("error")
 
-    # The default browser-state cookie name is embedded for the script.
-    assert conn.resp_body =~ ~s("attesto_op_browser_state")
+    # The default (__Host- prefixed) browser-state cookie name is embedded.
+    assert conn.resp_body =~ ~s("__Host-attesto_op_browser_state")
   end
 
   test "the page is cacheable (it embeds no per-user state)" do
@@ -80,7 +80,11 @@ defmodule AttestoPhoenix.Controller.CheckSessionControllerTest do
     Application.put_env(
       :attesto_phoenix,
       @config_key,
-      Keyword.put(base, :session_management, enabled: true, browser_state_cookie: "my_opbs")
+      Keyword.put(base, :session_management,
+        enabled: true,
+        browser_state_cookie: "my_opbs",
+        browser_state_secret: :crypto.strong_rand_bytes(32)
+      )
     )
 
     conn = call()

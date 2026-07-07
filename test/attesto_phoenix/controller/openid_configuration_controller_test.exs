@@ -104,7 +104,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
           logout: [enabled: true],
           terminate_session: fn conn, _ctx -> {:ok, conn} end,
           logout_session_store: __MODULE__.StubStore,
-          session_management: [enabled: true]
+          session_management: [enabled: true, browser_state_secret: :crypto.strong_rand_bytes(32)]
         )
 
       body = call_show(host, protocol_config()) |> decode_body()

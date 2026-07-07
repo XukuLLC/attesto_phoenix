@@ -44,6 +44,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   @redirect_uri "https://client.example.com/callback"
   @client_id "test-client"
 
+  # OP-only HMAC key for the login-bound, OP-owned browser-state value
+  # (Session Management 1.0 §3.2). Required whenever session management is on.
+  @browser_state_secret :crypto.strong_rand_bytes(32)
+
+  # The default browser-state cookie is `__Host-` prefixed so a sibling/parent-
+  # domain origin cannot inject or shadow it.
+  @browser_state_cookie "__Host-attesto_op_browser_state"
+
+  # The login binding the controller derives from the authenticate stub's
+  # subject + auth_time (+ sid): "subject\nauth_time\nsid".
+  @established_binding "user-42\n1700000000\n"
+  @reauth_binding "user-42\n1700009999\n"
+
   defmodule TestStore do
     @moduledoc false
     @behaviour Attesto.CodeStore
@@ -1155,8 +1168,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   # ── Session Management (OIDC Session Management 1.0 §2 / §3.2) ─────────────
 
   describe "session_state" do
-    test "a successful response carries session_state and sets the browser-state cookie" do
-      put_config(session_management: [enabled: true])
+    test "a successful response carries session_state and sets the __Host- browser-state cookie" do
+      put_config(session_management: [enabled: true, browser_state_secret: @browser_state_secret])
 
       conn = call(valid_params())
       query = location_query(conn)
@@ -1166,35 +1179,102 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert is_binary(session_state)
       refute session_state =~ " "
 
-      # The cookie is minted on this response (the login event) with the
-      # attributes the cross-site, JS-read iframe context requires.
-      cookie = conn.resp_cookies["attesto_op_browser_state"]
-      assert %{value: opbs, http_only: false, secure: true, same_site: "None"} = cookie
+      # The cookie is minted on this response (the login event) under the
+      # __Host- name with the attributes __Host- + the cross-site JS-read iframe
+      # require: Secure, Path=/, no Domain, SameSite=None, not HttpOnly.
+      cookie = conn.resp_cookies[@browser_state_cookie]
+      assert %{value: opbs, http_only: false, secure: true, same_site: "None", path: "/"} = cookie
+      assert Map.get(cookie, :domain) == nil
 
-      # The value verifies against the §3.2 recipe over the redirect_uri origin.
+      # The value is OP-owned: it verifies under the OP secret for this login.
+      assert Attesto.SessionState.browser_state_valid?(@browser_state_secret, opbs, @established_binding)
+
+      # And it verifies against the §3.2 recipe over the redirect_uri origin.
       [_hash, salt] = String.split(session_state, ".", parts: 2)
 
       assert session_state ==
                Attesto.SessionState.compute(@client_id, "https://client.example.com", opbs, salt)
     end
 
-    test "an existing browser-state cookie is reused, not rotated" do
-      put_config(session_management: [enabled: true])
+    test "an OP-minted cookie for the same login is reused, not rotated (unchanged)" do
+      put_config(session_management: [enabled: true, browser_state_secret: @browser_state_secret])
+
+      # A value THIS OP minted for the established login is reused untouched, so
+      # a stable session recomputes `unchanged`.
+      opbs = Attesto.SessionState.mint_browser_state(@browser_state_secret, @established_binding)
 
       conn =
         build_conn()
         |> Map.put(:scheme, :https)
-        |> put_req_header("cookie", "attesto_op_browser_state=existing-state")
+        |> put_req_header("cookie", "#{@browser_state_cookie}=#{opbs}")
         |> AuthorizeController.authorize(valid_params())
 
       session_state = location_query(conn)["session_state"]
       [_hash, salt] = String.split(session_state, ".", parts: 2)
 
       assert session_state ==
-               Attesto.SessionState.compute(@client_id, "https://client.example.com", "existing-state", salt)
+               Attesto.SessionState.compute(@client_id, "https://client.example.com", opbs, salt)
 
       # No re-mint: the response sets no fresh cookie value.
-      refute Map.has_key?(conn.resp_cookies, "attesto_op_browser_state")
+      refute Map.has_key?(conn.resp_cookies, @browser_state_cookie)
+    end
+
+    test "a re-auth with a newer auth_time rotates the browser state (Finding 1: changed)" do
+      put_config(session_management: [enabled: true, browser_state_secret: @browser_state_secret])
+
+      # Cookie bound to the ESTABLISHED-login auth_time.
+      opbs = Attesto.SessionState.mint_browser_state(@browser_state_secret, @established_binding)
+
+      # max_age=0 forces the stub to re-authenticate and return a NEWER
+      # auth_time; the login binding changes, so the OP browser state MUST
+      # rotate even though it is the same user agent + subject.
+      conn =
+        build_conn()
+        |> Map.put(:scheme, :https)
+        |> put_req_header("cookie", "#{@browser_state_cookie}=#{opbs}")
+        |> AuthorizeController.authorize(valid_params(%{"max_age" => "0"}))
+
+      fresh = conn.resp_cookies[@browser_state_cookie]
+      assert is_binary(fresh.value)
+      refute fresh.value == opbs
+      assert Attesto.SessionState.browser_state_valid?(@browser_state_secret, fresh.value, @reauth_binding)
+
+      # The RP that earlier held a session_state over the OLD value now
+      # recomputes `changed`: the response's session_state is over the fresh
+      # value, and the old value no longer produces the same hash.
+      session_state = location_query(conn)["session_state"]
+      [_hash, salt] = String.split(session_state, ".", parts: 2)
+
+      assert session_state ==
+               Attesto.SessionState.compute(@client_id, "https://client.example.com", fresh.value, salt)
+
+      refute session_state ==
+               Attesto.SessionState.compute(@client_id, "https://client.example.com", opbs, salt)
+    end
+
+    test "an injected cookie the OP never minted is rejected and rotated (Finding 2)" do
+      put_config(session_management: [enabled: true, browser_state_secret: @browser_state_secret])
+
+      # An attacker-known value set by a sibling/parent-domain origin. The OP
+      # never minted it, so its MAC cannot verify: it is not trusted.
+      conn =
+        build_conn()
+        |> Map.put(:scheme, :https)
+        |> put_req_header("cookie", "#{@browser_state_cookie}=attacker-known-value")
+        |> AuthorizeController.authorize(valid_params())
+
+      fresh = conn.resp_cookies[@browser_state_cookie]
+      assert is_binary(fresh.value)
+      refute fresh.value == "attacker-known-value"
+      assert Attesto.SessionState.browser_state_valid?(@browser_state_secret, fresh.value, @established_binding)
+
+      # The injected value can no longer forge `unchanged`: the response's
+      # session_state is over the OP-minted value, not the attacker's.
+      session_state = location_query(conn)["session_state"]
+      [_hash, salt] = String.split(session_state, ".", parts: 2)
+
+      refute session_state ==
+               Attesto.SessionState.compute(@client_id, "https://client.example.com", "attacker-known-value", salt)
     end
 
     test "disabled session management adds no session_state and no cookie" do
@@ -1203,7 +1283,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert is_binary(query["code"])
       refute Map.has_key?(query, "session_state")
-      refute Map.has_key?(conn.resp_cookies, "attesto_op_browser_state")
+      refute Map.has_key?(conn.resp_cookies, @browser_state_cookie)
     end
   end
 

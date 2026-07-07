@@ -787,11 +787,16 @@ defmodule AttestoPhoenix.Config do
   # responses, and maintains the JavaScript-readable OP browser-state cookie
   # (set at the authorization endpoint, cleared at the end-session endpoint).
   # `:browser_state_cookie` names that cookie; `:browser_state_cookie_max_age`
-  # bounds its lifetime (mirror the host session lifetime). Off by default.
+  # bounds its lifetime (mirror the host session lifetime). `:browser_state_secret`
+  # is the OP-only HMAC key that makes the browser-state value OP-owned and
+  # login-bound (required when enabled — see `validate_session_management!/1`).
+  # The default cookie name carries the `__Host-` prefix so a sibling/parent-
+  # domain origin cannot inject or shadow it. Off by default.
   @session_management_defaults [
     enabled: false,
-    browser_state_cookie: "attesto_op_browser_state",
-    browser_state_cookie_max_age: 86_400
+    browser_state_cookie: "__Host-attesto_op_browser_state",
+    browser_state_cookie_max_age: 86_400,
+    browser_state_secret: nil
   ]
 
   defp normalize_session_management(nil), do: @session_management_defaults
@@ -1175,13 +1180,24 @@ defmodule AttestoPhoenix.Config do
   """
   @spec browser_state_cookie(t()) :: String.t()
   def browser_state_cookie(%__MODULE__{} = config) do
-    config |> session_management() |> Keyword.get(:browser_state_cookie, "attesto_op_browser_state")
+    config |> session_management() |> Keyword.get(:browser_state_cookie, "__Host-attesto_op_browser_state")
   end
 
   @doc "The OP browser-state cookie lifetime, in seconds."
   @spec browser_state_cookie_max_age(t()) :: pos_integer()
   def browser_state_cookie_max_age(%__MODULE__{} = config) do
     config |> session_management() |> Keyword.get(:browser_state_cookie_max_age, 86_400)
+  end
+
+  @doc """
+  The OP-only HMAC key for the browser-state value (Session Management 1.0
+  §3.2). It makes the value OP-owned (an injected/forged cookie cannot verify)
+  and login-bound (a re-auth / account switch rotates it). Required when session
+  management is enabled — validated at build time by `new/1`.
+  """
+  @spec browser_state_secret(t()) :: binary() | nil
+  def browser_state_secret(%__MODULE__{} = config) do
+    config |> session_management() |> Keyword.get(:browser_state_secret)
   end
 
   @doc """
@@ -1759,6 +1775,33 @@ defmodule AttestoPhoenix.Config do
 
   defp validate_registration_default_scope!(%__MODULE__{}), do: :ok
 
+  # Session Management must never fail open: with no OP secret the browser-state
+  # value would be a bare random string an injected/parent-domain cookie could
+  # forge (and a login-state change could not rotate). Refuse to build a config
+  # that enables session management without a usable HMAC key. 32 bytes matches
+  # the SHA-256 block/output security level the value's MAC targets.
+  @min_browser_state_secret_bytes 32
+
+  defp validate_session_management!(%__MODULE__{} = config) do
+    if session_management_enabled?(config) do
+      secret = browser_state_secret(config)
+
+      if not (is_binary(secret) and byte_size(secret) >= @min_browser_state_secret_bytes) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :browser_state_secret is required when session management " <>
+                "is enabled (session_management: [enabled: true]) and must be at least " <>
+                "#{@min_browser_state_secret_bytes} bytes. It is the OP-only HMAC key that makes the " <>
+                "OP browser-state cookie OP-owned (an injected/forged cookie cannot forge " <>
+                "`unchanged`) and login-bound (a re-auth/account switch rotates it). Set " <>
+                "`session_management: [enabled: true, browser_state_secret: <secret>]` with a value " <>
+                "from e.g. `:crypto.strong_rand_bytes(32)` (or a Base64 string of it), or disable " <>
+                "session management."
+      end
+    end
+
+    :ok
+  end
+
   defp validate_jwt_bearer!(%__MODULE__{} = config) do
     if jwt_bearer_enabled?(config) do
       opts = jwt_bearer(config)
@@ -1846,6 +1889,7 @@ defmodule AttestoPhoenix.Config do
     end
 
     validate_logout!(config)
+    validate_session_management!(config)
     validate_registration_default_scope!(config)
     validate_jwt_bearer!(config)
     validate_behaviour_modules!(config)

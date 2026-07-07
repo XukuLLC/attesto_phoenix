@@ -354,13 +354,18 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       Application.put_env(
         :attesto_phoenix,
         @config_key,
-        Keyword.put(base, :session_management, enabled: true)
+        Keyword.put(base, :session_management,
+          enabled: true,
+          browser_state_secret: :crypto.strong_rand_bytes(32)
+        )
       )
 
       conn = call(:get, %{"id_token_hint" => hint})
 
       assert conn.status == 200
-      cookie = conn.resp_cookies["attesto_op_browser_state"]
+      # The __Host- cookie is expired; because it carries no Domain, expiring the
+      # host cookie fully clears it (no parent-domain shadow can survive).
+      cookie = conn.resp_cookies["__Host-attesto_op_browser_state"]
       assert cookie.max_age == 0
     end
 
@@ -368,7 +373,7 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       conn = call(:get, %{"id_token_hint" => hint})
 
       assert conn.status == 200
-      refute Map.has_key?(conn.resp_cookies, "attesto_op_browser_state")
+      refute Map.has_key?(conn.resp_cookies, "__Host-attesto_op_browser_state")
     end
   end
 end

@@ -571,7 +571,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
           {:ok, code} ->
             emit_code_issued(conn, config, client, request.scope)
-            emit_success(conn, config, request, code)
+            emit_success(conn, config, request, subject, code)
 
           {:error, reason} ->
             # Issuance failing on a validated request is a server/config fault,
@@ -741,11 +741,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # the query mode it is the RFC 9207 `iss` parameter (added in emit_response/6).
   # With Session Management enabled, the OIDC Session Management 1.0 §2
   # `session_state` parameter rides alongside them.
-  defp emit_success(conn, config, request, code) do
+  defp emit_success(conn, config, request, subject, code) do
     # The PAR `request_uri` has already been claimed (consumed) atomically in
     # `issue_and_redirect/6` before the code was issued (RFC 9126 §2.2), so the
     # success response is just the redirect.
-    {conn, session_state} = maybe_session_state(conn, config, request)
+    {conn, session_state} = maybe_session_state(conn, config, request, subject)
 
     emit_response(
       conn,
@@ -760,19 +760,34 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # OIDC Session Management 1.0 §2: a successful Authentication Response MUST
   # carry `session_state` when the OP supports session management. The value is
   # computed over the client_id, the redirect_uri's browser origin, and the OP
-  # browser-state cookie — minted here when the browser carries none yet (this
-  # response IS the login event §3.2 keys on). Returns the (possibly
-  # cookie-setting) conn and the value, or nil when the feature is off or the
-  # redirect_uri yields no usable origin (already validated as registered, so
-  # that is defensive only).
-  defp maybe_session_state(conn, config, request) do
+  # browser-state cookie — minted (or rotated) here bound to this response's
+  # login state (§3.2 keys the OP browser state on the End-User login state).
+  # Returns the (possibly cookie-setting) conn and the value, or nil when the
+  # feature is off or the redirect_uri yields no usable origin (already
+  # validated as registered, so that is defensive only).
+  defp maybe_session_state(conn, config, request, subject) do
     with true <- Config.session_management_enabled?(config),
          {:ok, origin} <- SessionState.origin(request.redirect_uri) do
-      {conn, browser_state} = BrowserState.ensure(conn, config)
+      {conn, browser_state} = BrowserState.ensure(conn, config, login_binding(subject))
       {conn, SessionState.compute(request.client_id, origin, browser_state)}
     else
       _ -> {conn, nil}
     end
+  end
+
+  # A stable fingerprint of the current authorization's resolved End-User login
+  # state, used to rotate the OP browser state when that state changes (§3.2).
+  # (subject, auth_time, sid) is exactly what already flows into the ID token,
+  # so an account switch (new `sub`), a `prompt=login` / `max_age=0` re-auth
+  # (newer `auth_time`), or a new host session (`sid`) each produces a different
+  # binding and forces a fresh browser-state value. The binding is HMAC'd into
+  # the cookie by `Attesto.SessionState`, so it is never exposed in cleartext.
+  defp login_binding(subject) do
+    Enum.map_join(
+      [subject_id(subject), Map.get(subject, :auth_time), Map.get(subject, :sid)],
+      "\n",
+      &to_string/1
+    )
   end
 
   # Stash the PAR reference (only when it actually resolved a stored request) so
