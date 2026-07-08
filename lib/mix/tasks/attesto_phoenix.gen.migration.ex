@@ -500,7 +500,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :binding_message, :string
         # Ping/push only: the client-generated bearer secret the notification POST
         # carries (NULL for poll). A single-flow-scoped, short-lived secret.
-        add :client_notification_token, :string
+        # `:text`, not `:string(255)`: CIBA Core §7.3 sets no length bound and a
+        # client may present a long high-entropy token (the conformance client does).
+        add :client_notification_token, :text
         # The hint-resolved end-user the OP set out to authenticate (CIBA §7.1:
         # identified BEFORE the auth_req_id is issued). Bound at issue.
         add :hint_subject, :string, size: <%= @identifier_size %>, null: false
