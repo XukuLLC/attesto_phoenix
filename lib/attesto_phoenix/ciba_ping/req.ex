@@ -44,7 +44,11 @@ defmodule AttestoPhoenix.CIBAPing.Req do
       redirect: false,
       retry: false,
       receive_timeout: @timeout_ms,
-      decode_body: false
+      decode_body: false,
+      # FAPI transport: the notification is a server-to-server FAPI channel, so
+      # offer TLS 1.3 (FAPI 1.0 Advanced §8.5 / FAPI-CIBA), preferring it while
+      # still allowing 1.2 for endpoints that don't yet support 1.3.
+      connect_options: [transport_opts: [versions: [:"tlsv1.3", :"tlsv1.2"]]]
     ]
     |> Req.new()
     |> Req.request()
