@@ -1,5 +1,8 @@
 defmodule AttestoPhoenix.DevTLSTest do
-  use ExUnit.Case, async: true
+  # NOT async: the cwd-relative resolution test uses `File.cd!/2`, which changes
+  # the whole BEAM process's working directory. A concurrent async test (or a
+  # lazy compile) running in that window resolves paths against the wrong cwd.
+  use ExUnit.Case, async: false
 
   alias AttestoPhoenix.DevTLS
 
