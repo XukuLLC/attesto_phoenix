@@ -12,7 +12,7 @@ An opinionated Phoenix/Ecto OAuth 2.0 / OIDC authorization server on top of
 
 An authorization server built from `attesto` + `attesto_phoenix` is
 [OpenID Certified](https://openid.net/certification/certified-openid-connect-implementations/)
-(Xuku LLC) to **FAPI 2.0 Security Profile Final — OP**, **FAPI 2.0 Message
+to **FAPI 2.0 Security Profile Final — OP**, **FAPI 2.0 Message
 Signing Final — OP**, **OpenID Connect Basic — OP**, **RP-Initiated Logout —
 OP**, and **Back-Channel Logout — OP** — the first Elixir provider with FAPI 2.0
 certification.
@@ -27,9 +27,12 @@ primitives, and the token-lifecycle building blocks.
 `attesto_phoenix` wires those primitives into a running server:
 
 - HTTP endpoints (authorization, token, PAR, revocation, discovery, JWKS,
-  UserInfo, protected-resource metadata, optional dynamic registration) mounted
-  into your router with one macro. The authorization endpoint supports the
-  default query response mode and the JARM JWT response modes.
+  UserInfo, protected-resource metadata, optional dynamic registration, plus the
+  opt-in CIBA backchannel-authentication, device-authorization, end-session
+  (RP-Initiated Logout), and check-session endpoints) mounted into your router
+  with one macro. The authorization endpoint supports the default query response
+  mode and the JARM JWT response modes; Back-Channel and Front-Channel Logout run
+  alongside the end-session flow.
 - Protected-resource plugs that verify Bearer JWTs and enforce DPoP / mTLS
   sender-constraint binding.
 - Ecto-backed implementations of every mutable store the OAuth/OIDC flows need
@@ -284,6 +287,11 @@ end
 - `DELETE /oauth/register/:client_id` (RFC 7592, with registration)
 - `GET  /oauth/userinfo`
 - `POST /oauth/userinfo`
+- `POST /oauth/bc-authorize` (CIBA, only with `attesto_routes(ciba: true)`)
+- `POST /oauth/device_authorization` (RFC 8628, only with `device: true`)
+- `GET  /oauth/device_verification` and `POST /oauth/device_verification` (device user-code entry, with `device: true`)
+- `GET  /oauth/end_session` and `POST /oauth/end_session` (RP-Initiated Logout, only with `logout: true`)
+- `GET  /oauth/check_session` (Session Management `check_session_iframe`, only with `session_management: true`)
 
 Discovery and JWKS are public; the token and revocation endpoints authenticate
 the client via your `:load_client` / `:verify_client_secret` callbacks.
@@ -303,6 +311,47 @@ The authorization endpoint also emits JARM responses when the validated request
 uses `response_mode=jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`.
 Discovery advertises the supported response modes and the server signing
 algorithms used for authorization response JWTs.
+
+### Backchannel authentication (CIBA)
+
+For **decoupled authentication** — where the device consuming the API is not the
+device the user approves on, such as a call-center agent's console, a POS
+terminal, or an AI agent acting on a user's behalf — mount CIBA with
+`attesto_routes(ciba: true)` and enable it in `AttestoPhoenix.Config`
+(`ciba: [enabled: true]`). The client calls `POST /oauth/bc-authorize` to start a
+flow the user approves out of band on their own phone, then collects the tokens
+at the token endpoint: in `poll` mode the client polls until the user approves,
+and in `ping` mode the AS calls the client's notification endpoint when the
+tokens are ready. Signed authentication requests follow the FAPI-CIBA profile.
+
+### Device Authorization Grant (RFC 8628)
+
+For **sign-in on input-constrained devices** — a smart TV, a CLI, an IoT box with
+no browser or keyboard — mount the device grant with `attesto_routes(device:
+true)`. `POST /oauth/device_authorization` returns a `device_code` and a short
+human-typable `user_code`; the user enters that code on a second device at the
+verification page (`/oauth/device_verification`), while the device polls the
+token endpoint with the `device_code` until the user approves.
+
+### Logout and session management
+
+**Single-logout across relying parties and browser-session change detection.**
+An ID Token minted for a session records the RPs to notify, and the end-session
+flow fans out to them:
+
+- **RP-Initiated Logout** (certified) — `GET`/`POST /oauth/end_session`, mounted
+  with `attesto_routes(logout: true)`. An RP redirects the browser here to end
+  the OP session and return to a registered `post_logout_redirect_uri`.
+- **Back-Channel Logout** (certified) — the OP delivers a signed logout token
+  server-to-server to every RP that registered a `backchannel_logout_uri`, so
+  sessions end even when the user's browser never returns to those RPs.
+- **Front-Channel Logout** — the end-session page renders each RP's
+  `frontchannel_logout_uri` in an iframe, so browser-reachable RPs clear their
+  session within the same logout navigation.
+- **Session Management** — `GET /oauth/check_session` serves the
+  `check_session_iframe` and the authorization endpoint returns `session_state`,
+  letting an RP detect a change to the OP login session without a full redirect.
+  Mount with `attesto_routes(session_management: true)`.
 
 ## Protecting resources
 
