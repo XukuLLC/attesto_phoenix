@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-08
+
+### Added
+
+- **OpenID Connect CIBA (Client-Initiated Backchannel Authentication) — the
+  Phoenix layer.** The backchannel authentication endpoint (`/bc-authorize`),
+  poll and ping token delivery, the §10.2 ping notification deliverer, and an
+  Ecto-backed CIBA request store. Certified **FAPI-CIBA ID1** in both **poll**
+  and **ping** delivery modes.
+- **Local HTTPS for development.** `AttestoPhoenix.DevTLS.https_opts/1` wires a
+  mkcert certificate into a Phoenix dev endpoint in one line, and
+  `mix attesto_phoenix.gen.dev_https` generates it — so an app can develop
+  against attesto's required `https` issuer with no tunnel and no downgrade. New
+  `guides/local_https.md`; the installer points at it.
+
+### Changed
+
+- Discovery advertises `tls_client_certificate_bound_access_tokens` when mTLS is
+  enabled (RFC 8705 §3.3).
+- The token endpoint and the CIBA backchannel endpoint accept the issuer
+  identifier, the token-endpoint URL, **or** the endpoint's own URL as a
+  `private_key_jwt` client-assertion audience (RFC 7523 §3).
+- The CIBA `client_notification_token` is stored as `:text` (CIBA §7.3 sets no
+  length bound); requires a fresh migration via `mix attesto_phoenix.gen.migration`.
+- The CIBA ping notification channel offers TLS 1.3 (FAPI transport).
+
+### Fixed
+
+- The UserInfo endpoint now adapts a `{module, function}` `:cert_der` callback to
+  the bare function `Attesto.Plug.Authenticate` requires, so mTLS
+  certificate-bound tokens are correctly enforced at the resource server (a
+  presented certificate that does not match the token's `cnf.x5t#S256` is
+  rejected).
+
 ## [1.1.0] - 2026-07-07
 
 ### Added
