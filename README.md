@@ -10,6 +10,8 @@
 An opinionated Phoenix/Ecto OAuth 2.0 / OIDC authorization server on top of
 [attesto](https://hex.pm/packages/attesto).
 
+<a href="https://openid.net/certification/certified-openid-connect-implementations/"><img src="https://openid.net/wordpress-content/uploads/2016/04/oid-l-certification-mark-l-rgb-150dpi-90mm.png" alt="OpenID Certified" width="180" align="right"></a>
+
 An authorization server built from `attesto` + `attesto_phoenix` is
 [OpenID Certified](https://openid.net/certification/certified-openid-connect-implementations/)
 to **FAPI 2.0 Security Profile Final — OP**, **FAPI 2.0 Message
