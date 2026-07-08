@@ -15,9 +15,10 @@ An opinionated Phoenix/Ecto OAuth 2.0 / OIDC authorization server on top of
 An authorization server built from `attesto` + `attesto_phoenix` is
 [OpenID Certified](https://openid.net/certification/certified-openid-connect-implementations/)
 to **FAPI 2.0 Security Profile Final — OP**, **FAPI 2.0 Message
-Signing Final — OP**, **FAPI-CIBA — OP**, **OpenID Connect Basic — OP**,
-**RP-Initiated Logout — OP**, and **Back-Channel Logout — OP** — the first
-Elixir provider with FAPI 2.0 certification.
+Signing Final — OP**, **FAPI-CIBA — OP**, **OpenID Connect Basic — OP** and
+**Config — OP**, **RP-Initiated**, **Back-Channel**, and **Front-Channel
+Logout — OP**, and **Session Management — OP** — the first Elixir provider with
+FAPI 2.0 certification.
 
 [![FAPI 2.0 Certified](https://img.shields.io/badge/FAPI_2.0-Certified-F78C40)](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)
 [![FAPI-CIBA Certified](https://img.shields.io/badge/FAPI--CIBA-Certified-F78C40)](https://openid.net/certification/certified-fapi-ciba-openid-providers-profiles/)
