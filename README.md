@@ -6,7 +6,6 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/XukuLLC/attesto_phoenix/blob/main/LICENSE)
 [![Elixir](https://img.shields.io/badge/elixir-%E2%89%A5%201.18-purple)](https://elixir-lang.org)
 [![OpenID Certified](https://img.shields.io/badge/OpenID-Certified-F78C40)](https://openid.net/certification/certified-openid-connect-implementations/)
-[![FAPI 2.0 Certified](https://img.shields.io/badge/FAPI_2.0-Certified-F78C40)](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)
 
 An opinionated Phoenix/Ecto OAuth 2.0 / OIDC authorization server on top of
 [attesto](https://hex.pm/packages/attesto).
@@ -17,6 +16,8 @@ to **FAPI 2.0 Security Profile Final — OP**, **FAPI 2.0 Message
 Signing Final — OP**, **OpenID Connect Basic — OP**, **RP-Initiated Logout —
 OP**, and **Back-Channel Logout — OP** — the first Elixir provider with FAPI 2.0
 certification.
+
+[![FAPI 2.0 Certified](https://img.shields.io/badge/FAPI_2.0-Certified-F78C40)](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)
 
 **attesto brings the protocol, attesto_phoenix brings transport + persistence;
 you bring principals, keys, and policy.**
