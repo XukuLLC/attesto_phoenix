@@ -22,6 +22,9 @@ FAPI 2.0 certification.
 
 [![FAPI 2.0 Certified](https://img.shields.io/badge/FAPI_2.0-Certified-F78C40)](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)
 [![FAPI-CIBA Certified](https://img.shields.io/badge/FAPI--CIBA-Certified-F78C40)](https://openid.net/certification/certified-fapi-ciba-openid-providers-profiles/)
+[![OpenID Connect Certified](https://img.shields.io/badge/OpenID_Connect-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-profiles/)
+[![Logout Profiles Certified](https://img.shields.io/badge/Logout_Profiles-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
+[![Session Management Certified](https://img.shields.io/badge/Session_Management-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
 
 **attesto brings the protocol, attesto_phoenix brings transport + persistence;
 you bring principals, keys, and policy.**
