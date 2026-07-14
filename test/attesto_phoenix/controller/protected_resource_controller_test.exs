@@ -8,6 +8,7 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceControllerTest do
   alias Attesto.PrincipalKind
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.ProtectedResourceController
+  alias Plug.Conn.WrapperError
 
   @issuer "https://issuer.example"
   @audience "https://api.example.com"
@@ -132,6 +133,135 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceControllerTest do
         conn(:get, "/.well-known/oauth-protected-resource")
         |> put_private(:attesto_phoenix_config, host_config())
         |> ProtectedResourceController.show(%{})
+      end
+    end
+  end
+
+  # The RFC 9728 §3.1 path-inserted form: `attesto_routes/1` stages the
+  # inserted resource path under `conn.private[:attesto_prm_inserted_path]`,
+  # and the controller must serve the same document as the root URI - or fail
+  # closed when the configured resource identifier's path disagrees (§3.3).
+  describe "show/2 at the path-inserted well-known URI" do
+    defp call_show_inserted(host, protocol, inserted_path) do
+      conn(:get, "/.well-known/oauth-protected-resource" <> inserted_path)
+      |> put_private(:attesto_phoenix_config, host)
+      |> put_private(:attesto_protocol_config, protocol)
+      |> put_private(:attesto_prm_inserted_path, inserted_path)
+      |> ProtectedResourceController.show(%{})
+    end
+
+    test "serves the same document as the root URI when the resource path matches" do
+      protocol = protocol_config("https://api.example.com/mcp")
+
+      root = call_show(host_config(), protocol)
+      inserted = call_show_inserted(host_config(), protocol, "/mcp")
+
+      assert inserted.status == 200
+      # Decoded-equal to the root document, same cache-control (RFC 9728 §3.1).
+      assert decode_body(inserted) == decode_body(root)
+      assert get_resp_header(inserted, "cache-control") == get_resp_header(root, "cache-control")
+      assert decode_body(inserted)["resource"] == "https://api.example.com/mcp"
+    end
+
+    test "fails closed when the resource identifier's path disagrees (RFC 9728 §3.3)" do
+      # Configured identifier path is /api/mcp; the route was mounted for /mcp.
+      protocol = protocol_config("https://api.example.com/api/mcp")
+
+      error =
+        assert_raise RuntimeError, fn ->
+          call_show_inserted(host_config(), protocol, "/mcp")
+        end
+
+      # The message names both values so the wiring error is diagnosable.
+      assert error.message =~ ~s("/mcp")
+      assert error.message =~ "https://api.example.com/api/mcp"
+      assert error.message =~ "RFC 9728 §3.3"
+    end
+
+    test "fails closed when the resource identifier carries no path at all" do
+      assert_raise RuntimeError, ~r/RFC 9728 §3\.3/, fn ->
+        call_show_inserted(host_config(), protocol_config("https://api.example.com"), "/mcp")
+      end
+    end
+  end
+
+  # End-to-end §3.1 derivation through a real router: derive the well-known
+  # URL from the served document's own `resource` member, fetch it, and the
+  # `resource` must round-trip identically - the exact client behavior that
+  # motivated mounting the path-inserted form.
+  describe "path-inserted discovery through the router" do
+    @mcp_resource "https://api.example.com/mcp"
+
+    defmodule InstallConfigs do
+      @moduledoc false
+      import Plug.Conn
+
+      def init(opts), do: opts
+
+      # `Router.call/2` under `Plug.Test` runs in the test process, so the
+      # configs staged in its process dictionary are directly readable here.
+      def call(conn, _opts) do
+        %{host: host, protocol: protocol} = Process.get(:attesto_prm_configs)
+
+        conn
+        |> put_private(:attesto_phoenix_config, host)
+        |> put_private(:attesto_protocol_config, protocol)
+      end
+    end
+
+    defmodule DerivationRouter do
+      use Phoenix.Router
+      use AttestoPhoenix.Router
+
+      pipeline :oauth do
+        plug InstallConfigs
+      end
+
+      scope "/" do
+        attesto_routes(pipeline: :oauth, protected_resource_paths: ["/mcp"])
+      end
+    end
+
+    test "the document's own resource member derives a URL that serves it back" do
+      Process.put(:attesto_prm_configs, %{
+        host: host_config(),
+        protocol: protocol_config(@mcp_resource)
+      })
+
+      fetch = fn url ->
+        uri = URI.parse(url)
+
+        conn(:get, uri.path)
+        |> DerivationRouter.call(DerivationRouter.init([]))
+      end
+
+      # Client-side §3.1 derivation: insert the well-known segment between the
+      # origin and the resource path.
+      resource_uri = URI.parse(@mcp_resource)
+
+      derived =
+        "#{resource_uri.scheme}://#{resource_uri.host}/.well-known/oauth-protected-resource#{resource_uri.path}"
+
+      conn = fetch.(derived)
+
+      assert conn.status == 200
+      body = JSON.decode!(conn.resp_body)
+      # §3.3: the retrieved document's resource is identical to the identifier
+      # the URI was derived from.
+      assert body["resource"] == @mcp_resource
+    end
+
+    test "the route stages the inserted path: a mismatched identifier raises through the router" do
+      # Proves attesto_routes/1 actually delivers :attesto_prm_inserted_path
+      # into conn.private (the negative controller tests stage it by hand).
+      Process.put(:attesto_prm_configs, %{
+        host: host_config(),
+        protocol: protocol_config("https://api.example.com/api/mcp")
+      })
+
+      assert_raise WrapperError, ~r/RFC 9728 §3\.3/, fn ->
+        conn(:get, "/.well-known/oauth-protected-resource/mcp")
+        |> DerivationRouter.call(DerivationRouter.init([]))
       end
     end
   end

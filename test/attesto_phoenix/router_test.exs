@@ -10,6 +10,7 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.CheckSessionController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
+  alias AttestoPhoenix.Controller.ProtectedResourceController
   alias AttestoPhoenix.Controller.UserinfoController
 
   defmodule DefaultRouter do
@@ -58,6 +59,25 @@ defmodule AttestoPhoenix.RouterTest do
 
     scope "/" do
       attesto_routes(logout: true, session_management: true)
+    end
+  end
+
+  defmodule ProtectedResourcePathRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      # A bare "mcp" normalizes to "/mcp" (leading slash inserted).
+      attesto_routes(protected_resource_paths: ["mcp"])
+    end
+  end
+
+  defmodule ProtectedResourceRootlessRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(protected_resource_root: false, protected_resource_paths: ["/mcp"])
     end
   end
 
@@ -164,6 +184,70 @@ defmodule AttestoPhoenix.RouterTest do
       route = find_route(LogoutRouter, :get, "/oauth/check_session")
       assert route
       assert route.plug == CheckSessionController
+    end
+  end
+
+  describe "attesto_routes/1 protected-resource metadata (RFC 9728)" do
+    test "mounts only the root document by default (RFC 9728 §3, backward compat)" do
+      assert find_route(DefaultRouter, :get, "/.well-known/oauth-protected-resource")
+      refute find_route(DefaultRouter, :get, "/.well-known/oauth-protected-resource/mcp")
+    end
+
+    test "protected_resource_paths mounts the §3.1 path-inserted URI (bare path normalized)" do
+      route =
+        find_route(ProtectedResourcePathRouter, :get, "/.well-known/oauth-protected-resource/mcp")
+
+      assert route
+      assert route.plug == ProtectedResourceController
+      # The root document is still mounted alongside it.
+      assert find_route(ProtectedResourcePathRouter, :get, "/.well-known/oauth-protected-resource")
+    end
+
+    # That the route stages the inserted path for the §3.3 controller guard is
+    # proven end-to-end (through a router call, mismatch raising) in
+    # ProtectedResourceControllerTest - Phoenix.Router.routes/1 does not expose
+    # route privates for direct table introspection.
+
+    test "protected_resource_root: false omits the root document" do
+      refute find_route(
+               ProtectedResourceRootlessRouter,
+               :get,
+               "/.well-known/oauth-protected-resource"
+             )
+
+      assert find_route(
+               ProtectedResourceRootlessRouter,
+               :get,
+               "/.well-known/oauth-protected-resource/mcp"
+             )
+    end
+
+    test "more than one path is a compile-time error pointing at attesto_mcp's macro" do
+      assert_raise ArgumentError, ~r/attesto_mcp_protected_resource_metadata/, fn ->
+        defmodule TwoPathRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(protected_resource_paths: ["/mcp", "/files"])
+          end
+        end
+      end
+    end
+
+    test "path normalization accepts bare and slashed forms, rejects degenerate paths" do
+      normalize = &AttestoPhoenix.Router.normalize_protected_resource_paths!/1
+
+      assert normalize.(["mcp"]) == ["/mcp"]
+      assert normalize.(["/mcp"]) == ["/mcp"]
+      assert normalize.([]) == []
+
+      assert_raise ArgumentError, ~r/names no resource path/, fn -> normalize.([""]) end
+      assert_raise ArgumentError, ~r/names no resource path/, fn -> normalize.(["/"]) end
+      assert_raise ArgumentError, ~r/not a plain resource path/, fn -> normalize.(["a/../b"]) end
+      assert_raise ArgumentError, ~r/not a plain resource path/, fn -> normalize.(["/mcp?x=1"]) end
+      assert_raise ArgumentError, ~r/expected a resource path string/, fn -> normalize.([:mcp]) end
+      assert_raise ArgumentError, ~r/expected a list/, fn -> normalize.("/mcp") end
     end
   end
 end

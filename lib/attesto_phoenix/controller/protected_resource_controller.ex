@@ -47,6 +47,19 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
   are required; a missing value raises rather than serving a partial document,
   because a document that omits `authorization_servers` or `resource` would
   misdirect a client.
+
+  ## The path-inserted form (RFC 9728 §3.1)
+
+  The same action also serves the path-inserted well-known URI
+  (`/.well-known/oauth-protected-resource/mcp`) that
+  `AttestoPhoenix.Router.attesto_routes/1` mounts for
+  `:protected_resource_paths`. That route stages the inserted resource path
+  under `conn.private[:attesto_prm_inserted_path]`, and this controller then
+  enforces RFC 9728 §3.3: the served `resource` member must equal the
+  identifier the URI is derived from, so a configured resource identifier
+  whose path disagrees with the mounted path raises (fail closed at first
+  request) instead of serving a document a conformant client is required to
+  reject.
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -82,10 +95,47 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
     protocol_config = fetch_protocol_config!(conn)
 
     metadata = ProtectedResourceMetadata.metadata(protocol_config, metadata_opts(config))
+    ensure_inserted_path_consistency!(conn, metadata)
 
     conn
     |> put_cache_control()
     |> json(metadata)
+  end
+
+  # RFC 9728 §3.3: a client MUST verify that the `resource` member of the
+  # retrieved document is identical to the resource identifier it derived the
+  # well-known URI from. A path-inserted document (RFC 9728 §3.1, mounted via
+  # `attesto_routes(protected_resource_paths: [...])`, which stages the
+  # inserted path here) served at `/.well-known/oauth-protected-resource<p>`
+  # is derived from `<origin><p>`, so the served `resource` must carry exactly
+  # that path. A mismatch means the host mounted a path that disagrees with the
+  # configured resource identifier - serving the document anyway would hand a
+  # conformant client a response it is REQUIRED to reject, so this fails closed
+  # at first request instead, naming both values.
+  @inserted_path_key :attesto_prm_inserted_path
+
+  @spec ensure_inserted_path_consistency!(Plug.Conn.t(), map()) :: :ok
+  defp ensure_inserted_path_consistency!(conn, metadata) do
+    case conn.private do
+      %{@inserted_path_key => inserted_path} ->
+        resource = Map.fetch!(metadata, "resource")
+
+        if URI.parse(resource).path == inserted_path do
+          :ok
+        else
+          raise "#{inspect(__MODULE__)}: the path-inserted protected-resource metadata URI " <>
+                  "was mounted for the resource path #{inspect(inserted_path)} " <>
+                  "(protected_resource_paths), but the configured resource identifier is " <>
+                  "#{inspect(resource)} (path #{inspect(URI.parse(resource).path)}). " <>
+                  "RFC 9728 §3.3 requires the served `resource` to equal the identifier the " <>
+                  "well-known URI is derived from, so this document would be rejected by a " <>
+                  "conformant client. Align the mounted path with the resource identifier " <>
+                  "(the access-token audience) or drop the option."
+        end
+
+      _ ->
+        :ok
+    end
   end
 
   # Source the RFC 9728 §2 host-specific members from the configuration the

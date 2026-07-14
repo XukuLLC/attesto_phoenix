@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-07-13
+
+### Added
+
+- **RFC 9728 conformance: the path-inserted protected-resource metadata URI.**
+  `attesto_routes/1` grows `protected_resource_paths: ["/mcp"]`, mounting the
+  RFC 9728 §3.1 path-inserted well-known form
+  (`/.well-known/oauth-protected-resource/mcp`) alongside the root document.
+  Clients that derive that form from the resource URL (current MCP clients
+  probe it first, before the `WWW-Authenticate` `resource_metadata` fallback)
+  previously missed a host serving only the root URI. The controller enforces
+  RFC 9728 §3.3 fail-closed: the served `resource` member must equal the
+  identifier the URI is derived from, so a mounted path that disagrees with
+  the configured resource identifier raises at first request instead of
+  serving a document a conformant client is required to reject. More than one
+  path is a compile-time error pointing at `attesto_mcp`'s per-resource
+  `attesto_mcp_protected_resource_metadata/2`.
+- `attesto_routes/1` grows `protected_resource_root: false` to hand root PRM
+  document ownership to `attesto_mcp`'s macro in combined AS+RS apps, so each
+  PRM route has exactly one owner.
+
 ## [1.2.0] - 2026-07-08
 
 ### Added

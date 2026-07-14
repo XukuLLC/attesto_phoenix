@@ -14,7 +14,11 @@ defmodule AttestoPhoenix.Router do
       keys (RFC 7517 §5; the discovery document's `jwks_uri` per RFC 8414 §2).
     * `GET /.well-known/oauth-protected-resource` - protected-resource metadata
       (RFC 9728 §3), the discovery target of the §5.1 `WWW-Authenticate`
-      challenge the resource-server plugs emit.
+      challenge the resource-server plugs emit. For a resource identifier that
+      carries a path, the §3.1 **path-inserted** form
+      (`/.well-known/oauth-protected-resource/mcp`) is mounted via
+      `:protected_resource_paths` - see the option below; the root document
+      alone does not satisfy clients that derive that form.
     * `GET /oauth/authorize` - the authorization endpoint (RFC 6749 §3.1;
       OpenID Connect Core 1.0 §3.1.2).
     * `POST /oauth/token` - the token endpoint (RFC 6749 §3.2).
@@ -91,11 +95,54 @@ defmodule AttestoPhoenix.Router do
       (OpenID Connect Session Management 1.0 §3.3). Defaults to `false`. The
       page answers 404 unless the host also enables
       `session_management: [enabled: true]` in `AttestoPhoenix.Config`.
+    * `:protected_resource_paths` - additionally mounts the RFC 9728 §3.1
+      **path-inserted** protected-resource metadata URI for the given resource
+      path. RFC 9728 §3.1 derives the well-known URI by inserting the
+      well-known segment between the origin and the resource path: for the
+      resource identifier `https://host.example/mcp` the metadata lives at
+      `/.well-known/oauth-protected-resource/mcp`. The root document alone is
+      NOT RFC 9728-complete for such a resource: clients that derive the
+      path-inserted URI from the resource URL (current MCP clients probe it
+      first, before the `WWW-Authenticate` `resource_metadata` fallback) miss
+      a host that serves only the root form. Accepts a single-element list
+      (`["/mcp"]`; a bare `"mcp"` is normalized to `"/mcp"`). The served
+      document must satisfy RFC 9728 §3.3 - its `resource` member must equal
+      the identifier the URI was derived from - so the controller fails closed
+      at request time when the configured resource identifier's path does not
+      match. More than one entry is a compile-time error: one controller
+      document cannot equal two identifiers; multi-resource hosts should use
+      `attesto_mcp`'s `AttestoMCP.Router.attesto_mcp_protected_resource_metadata/2`,
+      which serves per-resource documents. Defaults to `[]` (root only,
+      today's behavior).
+    * `:protected_resource_root` - when `false`, does not mount the root
+      `/.well-known/oauth-protected-resource` document. Use this when PRM
+      ownership lives elsewhere: a host that mounts `attesto_mcp`'s
+      `attesto_mcp_protected_resource_metadata/2` with its root compatibility
+      document enabled should pass `protected_resource_root: false` here so
+      exactly one package owns each PRM route. Defaults to `true` (today's
+      behavior).
 
   The library never inspects `:registration` to make a policy decision: it is
   a route-existence toggle. Authorization-server metadata advertised at the
   discovery endpoint is derived from `AttestoPhoenix.Config` by the discovery
   controller, not from these macro options.
+
+  ## How protected-resource discovery actually happens
+
+  A client calls the resource URL and gets a 401 whose `WWW-Authenticate`
+  challenge carries a `resource_metadata` pointer (RFC 9728 §5.1). Modern
+  clients ALSO - often first - derive the §3.1 path-inserted well-known URI
+  from the resource URL itself (`https://host.example/mcp` →
+  `/.well-known/oauth-protected-resource/mcp`) and probe it before falling
+  back to the challenge pointer. Both URIs must serve the same document, and
+  its `resource` member must equal the identifier the URI was derived from
+  (§3.3) or the client is required to reject it. A single-resource AS+RS host
+  covers all of this with `attesto_routes(protected_resource_paths: ["/mcp"])`;
+  a host with multiple protected resources needs per-resource documents and
+  should mount them with `attesto_mcp`'s
+  `AttestoMCP.Router.attesto_mcp_protected_resource_metadata/2` instead
+  (passing `protected_resource_root: false` here if that macro also owns the
+  root document, so each PRM route has exactly one owner).
   """
 
   # Well-known paths are fixed by their registries and are NOT subject to the
@@ -195,9 +242,14 @@ defmodule AttestoPhoenix.Router do
     ciba? = Keyword.get(opts, :ciba, false)
     logout? = Keyword.get(opts, :logout, false)
     session_management? = Keyword.get(opts, :session_management, false)
+    protected_resource_root? = Keyword.get(opts, :protected_resource_root, true)
+
+    inserted_resource_paths =
+      opts
+      |> Keyword.get(:protected_resource_paths, [])
+      |> normalize_protected_resource_paths!()
 
     discovery_path = @discovery_path
-    protected_resource_path = @protected_resource_path
     openid_configuration_path = @openid_configuration_path
     jwks_path = @jwks_path
     authorize_path = @authorize_path
@@ -208,7 +260,6 @@ defmodule AttestoPhoenix.Router do
     register_path = @register_path
     userinfo_path = @userinfo_path
     discovery_controller = @discovery_controller
-    protected_resource_controller = @protected_resource_controller
     openid_configuration_controller = @openid_configuration_controller
     jwks_controller = @jwks_controller
     authorize_controller = @authorize_controller
@@ -328,6 +379,41 @@ defmodule AttestoPhoenix.Router do
         end
       end
 
+    # RFC 9728 §3: the root protected-resource metadata document. Emitted by
+    # default; a host that hands PRM ownership to attesto_mcp's macro (which
+    # can mount the root compatibility document itself) opts out with
+    # `protected_resource_root: false` so exactly one package owns the route.
+    protected_resource_root_route =
+      if protected_resource_root? do
+        quote do
+          get(
+            unquote(@protected_resource_path),
+            unquote(@protected_resource_controller),
+            :show
+          )
+        end
+      end
+
+    # RFC 9728 §3.1: the path-inserted well-known URI for a resource whose
+    # identifier carries a path (`https://host.example/mcp` ->
+    # `/.well-known/oauth-protected-resource/mcp`). Clients derive this form
+    # from the resource URL, so a path-bearing resource served only at the
+    # root URI fails their discovery probe. The route carries the inserted
+    # path in `conn.private` so the controller can enforce RFC 9728 §3.3
+    # (the served `resource` member must equal the identifier the URI was
+    # derived from) fail-closed at request time.
+    protected_resource_path_routes =
+      for inserted_path <- inserted_resource_paths do
+        quote do
+          get(
+            unquote(@protected_resource_path <> inserted_path),
+            unquote(@protected_resource_controller),
+            :show,
+            private: %{attesto_prm_inserted_path: unquote(inserted_path)}
+          )
+        end
+      end
+
     # OpenID Connect Session Management 1.0 §3.3: the check_session_iframe is
     # emitted only when the host opts in (`session_management: true`), so a
     # deployment without session management exposes no iframe endpoint at all.
@@ -359,7 +445,10 @@ defmodule AttestoPhoenix.Router do
         # public metadata served at its registered well-known URI at the host
         # root (RFC 8615), so a client following the RFC 9728 §5.1
         # `WWW-Authenticate` challenge can discover the authorization server.
-        get(unquote(protected_resource_path), unquote(protected_resource_controller), :show)
+        # The §3.1 path-inserted form is mounted alongside it for a resource
+        # identifier that carries a path (see `:protected_resource_paths`).
+        unquote(protected_resource_root_route)
+        unquote_splicing(protected_resource_path_routes)
 
         # RFC 6749 §3.1 / OpenID Connect Core 1.0 §3.1.2: the authorization
         # endpoint accepts both GET and POST under the host-chosen prefix. It
@@ -397,5 +486,74 @@ defmodule AttestoPhoenix.Router do
         post(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
       end
     end
+  end
+
+  # Validate and normalize the `:protected_resource_paths` option at macro
+  # expansion time. These are author errors in the router source, not runtime
+  # input, so each rejection raises `ArgumentError` at compile time.
+  #
+  # RFC 9728 §3.3 requires the served document's `resource` member to equal the
+  # identifier the well-known URI was derived from, and the controller serves a
+  # single document, so a list with more than one entry can never be conformant
+  # here - it is rejected toward attesto_mcp's per-resource macro instead.
+  @doc false
+  @spec normalize_protected_resource_paths!(term()) :: [String.t()]
+  def normalize_protected_resource_paths!(paths) when is_list(paths) do
+    normalized = Enum.map(paths, &normalize_protected_resource_path!/1)
+
+    case normalized do
+      [] ->
+        []
+
+      [_single] ->
+        normalized
+
+      _many ->
+        raise ArgumentError,
+              "attesto_routes/1 protected_resource_paths: got #{inspect(paths)}, but the " <>
+                "protected-resource metadata controller serves a single document whose " <>
+                "`resource` member must equal the identifier each well-known URI is derived " <>
+                "from (RFC 9728 §3.3), so only one path can be mounted here. For a host with " <>
+                "multiple protected resources use attesto_mcp's " <>
+                "AttestoMCP.Router.attesto_mcp_protected_resource_metadata/2, which serves " <>
+                "per-resource documents."
+    end
+  end
+
+  def normalize_protected_resource_paths!(other) do
+    raise ArgumentError,
+          "attesto_routes/1 protected_resource_paths: expected a list of resource path " <>
+            "strings (e.g. [\"/mcp\"]), got: #{inspect(other)}"
+  end
+
+  defp normalize_protected_resource_path!(path) when is_binary(path) do
+    normalized =
+      case path do
+        "/" <> _rest -> path
+        _bare -> "/" <> path
+      end
+
+    cond do
+      path == "" or normalized == "/" ->
+        raise ArgumentError,
+              "attesto_routes/1 protected_resource_paths: #{inspect(path)} names no resource " <>
+                "path - the root document is already mounted at " <>
+                "/.well-known/oauth-protected-resource (RFC 9728 §3.1 inserts the well-known " <>
+                "segment between the origin and a non-empty resource path)"
+
+      String.contains?(normalized, "..") or String.contains?(normalized, "?") ->
+        raise ArgumentError,
+              "attesto_routes/1 protected_resource_paths: #{inspect(path)} is not a plain " <>
+                "resource path (no \"..\" segments or query strings)"
+
+      true ->
+        normalized
+    end
+  end
+
+  defp normalize_protected_resource_path!(other) do
+    raise ArgumentError,
+          "attesto_routes/1 protected_resource_paths: expected a resource path string " <>
+            "(e.g. \"/mcp\"), got: #{inspect(other)}"
   end
 end
