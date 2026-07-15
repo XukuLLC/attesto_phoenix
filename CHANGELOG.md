@@ -15,6 +15,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   metadata and externally submitted OAuth protocol requests. Calls without the
   new option retain the existing route table and pipeline data.
 
+### Fixed
+
+- `route_pipelines:` now rejects `nil` values and module-attribute pipeline
+  expressions with actionable compile-time errors instead of silently treating
+  `nil` as an empty pipeline list or exposing Phoenix's internal attribute AST.
+
 ## [1.3.0] - 2026-07-13
 
 ### Added

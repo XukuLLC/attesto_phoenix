@@ -480,6 +480,30 @@ defmodule AttestoPhoenix.RouterTest do
         end
       end
 
+      assert_raise ArgumentError, ~r/ordered list of pipeline atoms.*nil/s, fn ->
+        defmodule NilRoutePipelineValueRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(route_pipelines: [metadata: nil])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/must use literal pipeline atoms/, fn ->
+        defmodule AttributeRoutePipelineValueRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          @metadata_pipeline :metadata
+
+          scope "/" do
+            attesto_routes(route_pipelines: [metadata: @metadata_pipeline])
+          end
+        end
+      end
+
       assert_raise ArgumentError, ~r/ordered list of pipeline atoms/, fn ->
         defmodule ImproperRoutePipelineListRouter do
           use Phoenix.Router

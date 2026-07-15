@@ -113,7 +113,10 @@ defmodule AttestoPhoenix.Router do
 
       Unknown or duplicate class keys and malformed values raise
       `ArgumentError` during router compilation. When this option is absent,
-      the legacy single-`:pipeline` route expansion is used unchanged.
+      the legacy single-`:pipeline` route expansion is used unchanged. Write
+      pipeline names as literal atoms/lists inside a Phoenix `scope`; module
+      attributes are not available when Phoenix expands the nested route
+      macro and are rejected with an actionable error.
     * `:registration` - when `true`, mounts `POST /oauth/register`
       (RFC 7591) and `DELETE /oauth/register/:client_id` (RFC 7592). Defaults
       to `false`. The endpoints still fail closed at request time unless the
@@ -728,17 +731,36 @@ defmodule AttestoPhoenix.Router do
     end
   end
 
+  defp normalize_route_pipeline_value!(nil, label) do
+    raise ArgumentError,
+          "attesto_routes/1 route_pipelines: #{label} must be a pipeline atom or an " <>
+            "ordered list of pipeline atoms, got: nil"
+  end
+
   defp normalize_route_pipeline_value!(value, label) do
     pipelines = List.wrap(value)
 
-    if pipeline_atom_list?(pipelines) do
-      pipelines
-    else
-      raise ArgumentError,
-            "attesto_routes/1 route_pipelines: #{label} must be a pipeline atom or an " <>
-              "ordered list of pipeline atoms, got: #{inspect(value)}"
+    cond do
+      Enum.any?(pipelines, &module_attribute_read?/1) ->
+        raise ArgumentError,
+              "attesto_routes/1 route_pipelines: #{label} must use literal pipeline atoms; " <>
+                "module attributes are not available when Phoenix expands a scope"
+
+      pipeline_atom_list?(pipelines) ->
+        pipelines
+
+      true ->
+        raise ArgumentError,
+              "attesto_routes/1 route_pipelines: #{label} must be a pipeline atom or an " <>
+                "ordered list of pipeline atoms, got: #{inspect(value)}"
     end
   end
+
+  defp module_attribute_read?({:@, _meta, [_attribute]}), do: true
+
+  defp module_attribute_read?({{:., _dot_meta, [_module, :__get_attribute__]}, _call_meta, _arguments}), do: true
+
+  defp module_attribute_read?(_other), do: false
 
   defp pipeline_atom_list?([]), do: true
   defp pipeline_atom_list?([pipeline | rest]) when is_atom(pipeline), do: pipeline_atom_list?(rest)

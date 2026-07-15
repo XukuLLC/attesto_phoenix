@@ -303,7 +303,9 @@ override is the complete ordered list for that class, while omitted classes use
 `pipeline:`. The host owns the actual session, resource-owner authentication,
 CSRF, and content-negotiation policy. In particular, do not place externally
 submitted OAuth POST endpoints behind generic browser CSRF or browser-only
-`Accept` handling.
+`Accept` handling. Write pipeline names as literal atoms/lists inside the
+Phoenix `scope`; module attributes are not available when Phoenix expands the
+nested route macro.
 
 `attesto_routes/1` mounts:
 
