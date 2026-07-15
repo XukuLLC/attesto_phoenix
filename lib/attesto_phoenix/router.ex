@@ -54,10 +54,10 @@ defmodule AttestoPhoenix.Router do
   (RFC 6749 §2.3, RFC 7009 §2, RFC 7591 §3), and the UserInfo endpoint is
   bearer-authenticated from the `Authorization` header (RFC 6750 §2.1) by its
   controller, rather than from a caller session, so they too take no
-  session-bearing pipeline. Supply a `:pipeline` only to attach
-  transport-level concerns the host wants in front of every endpoint (for
-  example a parser that accepts `application/x-www-form-urlencoded` at the
-  token endpoint per RFC 6749 §4.4.2, or an HTTPS-enforcing plug).
+  session-bearing pipeline. Supply a `:pipeline` to attach transport-level
+  concerns the host wants in front of every endpoint (for example an
+  HTTPS-enforcing plug), and use `:route_pipelines` when the interactive,
+  metadata, and non-browser protocol surfaces need different host pipelines.
 
       scope "/" do
         attesto_routes()
@@ -68,6 +68,26 @@ defmodule AttestoPhoenix.Router do
         attesto_routes(pipeline: :oauth_server, prefix: "/auth")
       end
 
+      # or classify browser-facing routes separately while retaining shared
+      # transport policy on every class:
+      scope "/" do
+        attesto_routes(
+          pipeline: :oauth_common,
+          route_pipelines: [
+            interactive: [:oauth_interactive, :oauth_common]
+          ]
+        )
+      end
+
+  A route-class override is the complete ordered pipeline list for that class;
+  Attesto does not append or prepend the `:pipeline` default. The host remains
+  responsible for the policy inside those pipelines. In particular, externally
+  submitted OAuth POST requests must not accidentally inherit a generic browser
+  pipeline that rejects them through CSRF protection or browser-only `Accept`
+  negotiation. The `:interactive` name means that those endpoints participate
+  in resource-owner/browser interactions; it does not mean Attesto silently
+  applies the host's ordinary browser pipeline.
+
   ## Options
 
     * `:prefix` - path segment prepended to the `/oauth/*` endpoints (the
@@ -77,6 +97,23 @@ defmodule AttestoPhoenix.Router do
       `pipe_through` for the mounted routes. Defaults to `[]` (no extra
       pipeline; the surrounding `scope`'s `pipe_through`, if any, still
       applies).
+    * `:route_pipelines` - optional route-class overrides. Accepts a keyword
+      list whose keys are `:metadata`, `:interactive`, or `:protocol`, and
+      whose values are a pipeline atom or an ordered list of pipeline atoms.
+      An override replaces `:pipeline` for its class; classes not present keep
+      the `:pipeline` default. The classes are:
+
+        * `:metadata` - authorization-server discovery, OpenID configuration,
+          JWKS, and protected-resource metadata routes owned by this macro.
+        * `:interactive` - authorization, device verification, end-session,
+          and check-session routes.
+        * `:protocol` - token, PAR, revocation, introspection, registration
+          management, UserInfo, device authorization, and CIBA backchannel
+          authentication routes.
+
+      Unknown or duplicate class keys and malformed values raise
+      `ArgumentError` during router compilation. When this option is absent,
+      the legacy single-`:pipeline` route expansion is used unchanged.
     * `:registration` - when `true`, mounts `POST /oauth/register`
       (RFC 7591) and `DELETE /oauth/register/:client_id` (RFC 7592). Defaults
       to `false`. The endpoints still fail closed at request time unless the
@@ -203,6 +240,8 @@ defmodule AttestoPhoenix.Router do
   @end_session_path @oauth_prefix <> AttestoPhoenix.Config.end_session_tail()
   @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
 
+  @route_pipeline_classes [:metadata, :interactive, :protocol]
+
   # Controllers that back each endpoint. Named here once so the macro
   # expansion does not scatter controller module references through the
   # callers' router source.
@@ -237,6 +276,8 @@ defmodule AttestoPhoenix.Router do
   defmacro attesto_routes(opts \\ []) do
     prefix = Keyword.get(opts, :prefix, "")
     pipelines = opts |> Keyword.get(:pipeline, []) |> List.wrap()
+    route_pipelines = normalize_route_pipeline_option!(opts, pipelines)
+
     registration? = Keyword.get(opts, :registration, false)
     device? = Keyword.get(opts, :device, false)
     ciba? = Keyword.get(opts, :ciba, false)
@@ -286,12 +327,8 @@ defmodule AttestoPhoenix.Router do
     # at macro-expansion time (an empty list yields no calls, piping through
     # nothing extra) so a host that wires a parser / HTTPS pipeline attaches it
     # to this server scope only, never leaking onto unrelated routes.
-    pipe_through_calls =
-      for attesto_pipeline <- pipelines do
-        quote do
-          pipe_through(unquote(attesto_pipeline))
-        end
-      end
+    pipe_through_calls = pipe_through_calls(pipelines)
+    class_pipe_through_calls = pipeline_calls_by_class(route_pipelines)
 
     # The registration routes are emitted only when the host opts in (RFC 7591
     # §3.1 / RFC 7592 §2), decided here at expansion time so a deployment that
@@ -342,6 +379,20 @@ defmodule AttestoPhoenix.Router do
           )
         end
       end
+
+    # Route-class expansion needs to split the device grant's non-browser
+    # authorization request from its resource-owner verification page while
+    # retaining their legacy order. The legacy branch below continues to use
+    # `device_route` exactly as before.
+    {device_authorization_route, device_verification_route} =
+      classed_device_routes(
+        device?,
+        prefix,
+        device_authorization_path,
+        device_authorization_controller,
+        device_verification_path,
+        device_verification_controller
+      )
 
     # OpenID Connect CIBA Core 1.0 §7.1: the backchannel authentication endpoint
     # is emitted only when the host opts in (`ciba: true`), so a deployment that
@@ -428,65 +479,270 @@ defmodule AttestoPhoenix.Router do
         end
       end
 
-    quote do
-      scope "/" do
-        unquote_splicing(pipe_through_calls)
+    if route_pipelines do
+      # `pipe_through/1` accumulates for the remainder of its scope and Phoenix
+      # has no inverse operation. Isolate every contiguous route-class block in
+      # a nested scope so each receives exactly its selected list. Keeping the
+      # blocks in catalog order also preserves route ordering when an override
+      # is enabled (notably device authorization before verification, followed
+      # by CIBA, logout, session management, and finally UserInfo).
+      quote do
+        scope "/" do
+          scope "/" do
+            unquote_splicing(Map.fetch!(class_pipe_through_calls, :metadata))
 
-        # RFC 8615: the well-known documents are anchored at the host root and
-        # are not relocated by the host's `:prefix`. RFC 8414 §3 (OAuth
-        # authorization-server metadata) and OpenID Connect Discovery 1.0 §4
-        # (OpenID Provider configuration) are both unauthenticated public
-        # metadata served at their registered URIs.
-        get(unquote(discovery_path), unquote(discovery_controller), :show)
-        get(unquote(openid_configuration_path), unquote(openid_configuration_controller), :show)
-        get(unquote(jwks_path), unquote(jwks_controller), :show)
+            get(unquote(discovery_path), unquote(discovery_controller), :show)
+            get(unquote(openid_configuration_path), unquote(openid_configuration_controller), :show)
+            get(unquote(jwks_path), unquote(jwks_controller), :show)
+            unquote(protected_resource_root_route)
+            unquote_splicing(protected_resource_path_routes)
+          end
 
-        # RFC 9728 §3: the protected-resource metadata document is unauthenticated
-        # public metadata served at its registered well-known URI at the host
-        # root (RFC 8615), so a client following the RFC 9728 §5.1
-        # `WWW-Authenticate` challenge can discover the authorization server.
-        # The §3.1 path-inserted form is mounted alongside it for a resource
-        # identifier that carries a path (see `:protected_resource_paths`).
-        unquote(protected_resource_root_route)
-        unquote_splicing(protected_resource_path_routes)
+          scope "/" do
+            unquote_splicing(Map.fetch!(class_pipe_through_calls, :interactive))
 
-        # RFC 6749 §3.1 / OpenID Connect Core 1.0 §3.1.2: the authorization
-        # endpoint accepts both GET and POST under the host-chosen prefix. It
-        # carries no client-authentication pipeline (RFC 6749 §3.1: the client
-        # is not authenticated here; the resource owner authenticates through
-        # the host's login/consent callbacks).
-        get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
-        post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+            get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+            post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+          end
 
-        # RFC 6749 §3.2 / RFC 7009 §2: token issuance and revocation are POST
-        # endpoints under the host-chosen prefix. They authenticate the client
-        # from the request itself (RFC 6749 §2.3, RFC 7009 §2).
-        post(unquote(prefix <> token_path), unquote(token_controller), :create)
-        post(unquote(prefix <> par_path), unquote(par_controller), :create)
-        post(unquote(prefix <> revoke_path), unquote(revocation_controller), :create)
+          scope "/" do
+            unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
 
-        # RFC 7662 §2: token introspection is a POST endpoint that authenticates
-        # the client from the request (RFC 7662 §2.1); RFC 9701 adds the signed
-        # JWT response negotiated by the Accept header.
-        post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
+            post(unquote(prefix <> token_path), unquote(token_controller), :create)
+            post(unquote(prefix <> par_path), unquote(par_controller), :create)
+            post(unquote(prefix <> revoke_path), unquote(revocation_controller), :create)
+            post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
+            unquote(registration_route)
+            unquote(device_authorization_route)
+          end
 
-        unquote(registration_route)
-        unquote(device_route)
-        unquote(ciba_route)
-        unquote(logout_route)
-        unquote(session_management_route)
+          scope "/" do
+            unquote_splicing(Map.fetch!(class_pipe_through_calls, :interactive))
+            unquote(device_verification_route)
+          end
 
-        # OpenID Connect Core 1.0 §5.3.1: the UserInfo endpoint accepts both
-        # GET and POST, and is a bearer-authenticated protected resource
-        # (RFC 6750 §2.1). The controller verifies the presented access token
-        # from the `Authorization` header before returning any claim, so the
-        # endpoint authenticates from the request itself rather than from a
-        # caller session.
-        get(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
-        post(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
+          scope "/" do
+            unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
+            unquote(ciba_route)
+          end
+
+          scope "/" do
+            unquote_splicing(Map.fetch!(class_pipe_through_calls, :interactive))
+            unquote(logout_route)
+            unquote(session_management_route)
+          end
+
+          scope "/" do
+            unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
+
+            get(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
+            post(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
+          end
+        end
+      end
+    else
+      # Compatibility branch: when `:route_pipelines` is absent, retain the
+      # original one-scope expansion and its exact route catalog/pipeline data.
+      quote do
+        scope "/" do
+          unquote_splicing(pipe_through_calls)
+
+          # RFC 8615: the well-known documents are anchored at the host root and
+          # are not relocated by the host's `:prefix`. RFC 8414 §3 (OAuth
+          # authorization-server metadata) and OpenID Connect Discovery 1.0 §4
+          # (OpenID Provider configuration) are both unauthenticated public
+          # metadata served at their registered URIs.
+          get(unquote(discovery_path), unquote(discovery_controller), :show)
+          get(unquote(openid_configuration_path), unquote(openid_configuration_controller), :show)
+          get(unquote(jwks_path), unquote(jwks_controller), :show)
+
+          # RFC 9728 §3: the protected-resource metadata document is unauthenticated
+          # public metadata served at its registered well-known URI at the host
+          # root (RFC 8615), so a client following the RFC 9728 §5.1
+          # `WWW-Authenticate` challenge can discover the authorization server.
+          # The §3.1 path-inserted form is mounted alongside it for a resource
+          # identifier that carries a path (see `:protected_resource_paths`).
+          unquote(protected_resource_root_route)
+          unquote_splicing(protected_resource_path_routes)
+
+          # RFC 6749 §3.1 / OpenID Connect Core 1.0 §3.1.2: the authorization
+          # endpoint accepts both GET and POST under the host-chosen prefix. It
+          # carries no client-authentication pipeline (RFC 6749 §3.1: the client
+          # is not authenticated here; the resource owner authenticates through
+          # the host's login/consent callbacks).
+          get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+          post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+
+          # RFC 6749 §3.2 / RFC 7009 §2: token issuance and revocation are POST
+          # endpoints under the host-chosen prefix. They authenticate the client
+          # from the request itself (RFC 6749 §2.3, RFC 7009 §2).
+          post(unquote(prefix <> token_path), unquote(token_controller), :create)
+          post(unquote(prefix <> par_path), unquote(par_controller), :create)
+          post(unquote(prefix <> revoke_path), unquote(revocation_controller), :create)
+
+          # RFC 7662 §2: token introspection is a POST endpoint that authenticates
+          # the client from the request (RFC 7662 §2.1); RFC 9701 adds the signed
+          # JWT response negotiated by the Accept header.
+          post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
+
+          unquote(registration_route)
+          unquote(device_route)
+          unquote(ciba_route)
+          unquote(logout_route)
+          unquote(session_management_route)
+
+          # OpenID Connect Core 1.0 §5.3.1: the UserInfo endpoint accepts both
+          # GET and POST, and is a bearer-authenticated protected resource
+          # (RFC 6750 §2.1). The controller verifies the presented access token
+          # from the `Authorization` header before returning any claim, so the
+          # endpoint authenticates from the request itself rather than from a
+          # caller session.
+          get(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
+          post(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
+        end
       end
     end
   end
+
+  defp normalize_route_pipeline_option!(opts, default_pipelines) do
+    case Keyword.get_values(opts, :route_pipelines) do
+      [] ->
+        nil
+
+      [overrides] ->
+        normalize_route_pipelines!(overrides, default_pipelines)
+
+      conflicting ->
+        raise ArgumentError,
+              "attesto_routes/1 route_pipelines: conflicting option values " <>
+                "#{inspect(conflicting)}; specify :route_pipelines only once"
+    end
+  end
+
+  defp pipe_through_calls(pipelines) do
+    Enum.map(pipelines, fn attesto_pipeline ->
+      quote do
+        pipe_through(unquote(attesto_pipeline))
+      end
+    end)
+  end
+
+  defp pipeline_calls_by_class(nil), do: nil
+
+  defp pipeline_calls_by_class(route_pipelines) do
+    Map.new(route_pipelines, fn {route_class, pipelines} ->
+      {route_class, pipe_through_calls(pipelines)}
+    end)
+  end
+
+  defp classed_device_routes(
+         true,
+         prefix,
+         authorization_path,
+         authorization_controller,
+         verification_path,
+         verification_controller
+       ) do
+    authorization_route =
+      quote do
+        post(
+          unquote(prefix <> authorization_path),
+          unquote(authorization_controller),
+          :create
+        )
+      end
+
+    verification_route =
+      quote do
+        get(
+          unquote(prefix <> verification_path),
+          unquote(verification_controller),
+          :verify
+        )
+
+        post(
+          unquote(prefix <> verification_path),
+          unquote(verification_controller),
+          :verify
+        )
+      end
+
+    {authorization_route, verification_route}
+  end
+
+  defp classed_device_routes(false, _prefix, _auth_path, _auth_controller, _verify_path, _verify_controller) do
+    {nil, nil}
+  end
+
+  # Validate the opt-in class map before Phoenix expands any route. A class
+  # override is deliberately a replacement, while omitted classes inherit the
+  # already-normalized legacy `:pipeline` list.
+  @doc false
+  @spec normalize_route_pipelines!(term(), term()) :: keyword([atom()])
+  def normalize_route_pipelines!(overrides, default_pipelines) when is_list(overrides) do
+    if !Keyword.keyword?(overrides) do
+      raise ArgumentError,
+            "attesto_routes/1 route_pipelines: expected a keyword list with keys " <>
+              "#{inspect(@route_pipeline_classes)}, got: #{inspect(overrides)}"
+    end
+
+    keys = Keyword.keys(overrides)
+    unknown = keys |> Enum.reject(&(&1 in @route_pipeline_classes)) |> Enum.uniq()
+
+    duplicates =
+      keys
+      |> Enum.frequencies()
+      |> Enum.filter(fn {_key, count} -> count > 1 end)
+      |> Enum.map(&elem(&1, 0))
+
+    cond do
+      unknown != [] ->
+        raise ArgumentError,
+              "attesto_routes/1 route_pipelines: unknown route class key(s) " <>
+                "#{inspect(unknown)}; expected only #{inspect(@route_pipeline_classes)}"
+
+      duplicates != [] ->
+        raise ArgumentError,
+              "attesto_routes/1 route_pipelines: conflicting duplicate override(s) for " <>
+                "#{inspect(duplicates)}; each route class may be specified once"
+
+      true ->
+        default = normalize_route_pipeline_value!(default_pipelines, ":pipeline default")
+
+        Enum.map(@route_pipeline_classes, fn route_class ->
+          {route_class, route_pipeline_for_class(overrides, route_class, default)}
+        end)
+    end
+  end
+
+  def normalize_route_pipelines!(other, _default_pipelines) do
+    raise ArgumentError,
+          "attesto_routes/1 route_pipelines: expected a keyword list with keys " <>
+            "#{inspect(@route_pipeline_classes)}, got: #{inspect(other)}"
+  end
+
+  defp route_pipeline_for_class(overrides, route_class, default) do
+    case Keyword.fetch(overrides, route_class) do
+      {:ok, value} -> normalize_route_pipeline_value!(value, inspect(route_class))
+      :error -> default
+    end
+  end
+
+  defp normalize_route_pipeline_value!(value, label) do
+    pipelines = List.wrap(value)
+
+    if pipeline_atom_list?(pipelines) do
+      pipelines
+    else
+      raise ArgumentError,
+            "attesto_routes/1 route_pipelines: #{label} must be a pipeline atom or an " <>
+              "ordered list of pipeline atoms, got: #{inspect(value)}"
+    end
+  end
+
+  defp pipeline_atom_list?([]), do: true
+  defp pipeline_atom_list?([pipeline | rest]) when is_atom(pipeline), do: pipeline_atom_list?(rest)
+  defp pipeline_atom_list?(_other), do: false
 
   # Validate and normalize the `:protected_resource_paths` option at macro
   # expansion time. These are author errors in the router source, not runtime
