@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## [1.4.0] - 2026-07-15
+
 ### Added
 
 - `attesto_routes/1` accepts `route_pipelines:` overrides for the documented
