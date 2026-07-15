@@ -49,9 +49,12 @@ primitives, and the token-lifecycle building blocks.
   records, and Pushed Authorization Request (PAR) references — so a clustered or
   load-balanced deployment keeps no OAuth state per node.
 
-It deliberately does **not** own your client registry, principal store, secret
-hashing, scope catalog, or audit log. Those are application policy and are
-supplied through a small set of neutral configuration callbacks.
+Attesto owns the standards route catalog and protocol controllers; the host
+chooses endpoint capabilities and route pipeline classes declaratively. It
+deliberately does **not** own your client registry, principal store, secret
+hashing, scope catalog, resource-owner authentication, consent, or audit log.
+Those are application policy and are supplied through neutral configuration
+callbacks.
 
 ## What you can build with it
 
@@ -307,10 +310,27 @@ submitted OAuth POST endpoints behind generic browser CSRF or browser-only
 Phoenix `scope`; module attributes are not available when Phoenix expands the
 nested route macro.
 
+The OIDC-only surfaces default on for compatibility and can be disabled
+independently. An OAuth authorization server that does not act as an OpenID
+Provider can retain authorization, token, PAR, revocation, introspection, JWKS,
+and RFC 8414 metadata while omitting both declarations:
+
+```elixir
+attesto_routes(
+  userinfo: false,
+  openid_configuration: false
+)
+```
+
+`userinfo: false` removes both UserInfo verbs. If OpenID configuration remains
+enabled, also leave the Config `:userinfo_endpoint` metadata value unset so the
+document does not advertise an unsupported endpoint.
+
 `attesto_routes/1` mounts:
 
 - `GET  /.well-known/oauth-authorization-server` (RFC 8414 metadata)
-- `GET  /.well-known/openid-configuration` (OIDC Discovery metadata)
+- `GET  /.well-known/openid-configuration` (OIDC Discovery metadata; omitted
+  with `openid_configuration: false`)
 - `GET  /.well-known/jwks.json` (RFC 7517 JWK Set)
 - `GET  /.well-known/oauth-protected-resource` (RFC 9728 metadata)
 - `GET  /oauth/authorize` and `POST /oauth/authorize`
@@ -320,8 +340,8 @@ nested route macro.
 - `POST /oauth/introspect` (RFC 7662)
 - `POST /oauth/register` (RFC 7591, only with `registration: true`)
 - `DELETE /oauth/register/:client_id` (RFC 7592, with registration)
-- `GET  /oauth/userinfo`
-- `POST /oauth/userinfo`
+- `GET  /oauth/userinfo` (omitted with `userinfo: false`)
+- `POST /oauth/userinfo` (omitted with `userinfo: false`)
 - `POST /oauth/bc-authorize` (CIBA, only with `attesto_routes(ciba: true)`)
 - `POST /oauth/device_authorization` (RFC 8628, only with `device: true`)
 - `GET  /oauth/device_verification` and `POST /oauth/device_verification` (device user-code entry, with `device: true`)
@@ -346,6 +366,14 @@ The authorization endpoint also emits JARM responses when the validated request
 uses `response_mode=jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`.
 Discovery advertises the supported response modes and the server signing
 algorithms used for authorization response JWTs.
+
+The route plumbing is profile-neutral. A permissive standards-compliant
+OAuth deployment can admit PKCE-bound public clients and select its supported
+grants, while a strict FAPI 2.0 deployment uses the same controllers and route
+classes with policy that requires PAR, signed request objects where applicable,
+confidential client authentication, sender-constrained tokens, and the FAPI
+algorithm catalog. Switching profiles is configuration, not a fork of the
+token, authorization, PAR, discovery, DPoP, or mTLS implementations.
 
 ### Backchannel authentication (CIBA)
 
@@ -425,10 +453,36 @@ intentionally accept RFC 6750 form-body `access_token` credentials.
 using `Attesto.Scope` grant-form algebra. It accepts either a single scope
 string or a list of required scopes.
 
-When `:resource_metadata` is set on the config, a 401 challenge carries the
-RFC 9728 `resource_metadata` pointer to the `/.well-known/oauth-protected-resource`
-document (mounted by `attesto_routes/1`), so a client refused without a valid
-token can discover which authorization server issues tokens for the resource.
+When `:resource_metadata` is set on the config, a 401 challenge carries that
+static RFC 9728 `resource_metadata` pointer, preserving the single-resource
+default. A host serving several protected resources can instead select the
+correct pointer per request, or return `nil` when that surface has no applicable
+metadata declaration:
+
+```elixir
+resource_metadata: "https://api.example/.well-known/oauth-protected-resource",
+resource_metadata_resolver: {MyAppWeb.ResourceMetadata, :for_request}
+```
+
+```elixir
+def for_request(%Plug.Conn{request_path: "/alpha"}) do
+  "https://api.example/.well-known/oauth-protected-resource/alpha"
+end
+
+def for_request(%Plug.Conn{request_path: "/beta"}) do
+  "https://api.example/.well-known/oauth-protected-resource/beta"
+end
+
+def for_request(_conn), do: nil
+```
+
+The resolver is authoritative when present; it does not fall back to the static
+URL when it returns `nil`. The protected-resource integration still owns the
+actual RFC 9728 declarations. Publish one document per exact resource
+identifier, with the path-inserted well-known URI and matching `resource`
+member; do not collapse multiple identifiers into a root document. When no
+resource owns the origin root, use `protected_resource_root: false` and let the
+per-resource integration mount only the documents it owns.
 
 For first-party web flows, keep cookie semantics in your app and pass a generic
 credential extractor to the plug:

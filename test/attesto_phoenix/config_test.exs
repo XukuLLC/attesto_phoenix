@@ -412,6 +412,44 @@ defmodule AttestoPhoenix.ConfigTest do
       assert cfg.resource_metadata == "https://api.example/.well-known/x"
     end
 
+    test ":resource_metadata_resolver selects per-request metadata and may deliberately omit it" do
+      base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+      static = "https://api.example/.well-known/oauth-protected-resource"
+
+      resolver = fn conn ->
+        case conn.request_path do
+          "/alpha" -> "https://api.example/.well-known/oauth-protected-resource/alpha"
+          "/invalid" -> "not-an-absolute-url"
+          _ -> nil
+        end
+      end
+
+      cfg =
+        base
+        |> Keyword.put(:resource_metadata, static)
+        |> Keyword.put(:resource_metadata_resolver, resolver)
+        |> Config.new()
+
+      assert Config.resource_metadata_url(cfg, Plug.Test.conn(:get, "/alpha")) ==
+               "https://api.example/.well-known/oauth-protected-resource/alpha"
+
+      assert Config.resource_metadata_url(cfg, Plug.Test.conn(:get, "/unowned")) == nil
+      assert Config.resource_metadata_url(cfg, Plug.Test.conn(:get, "/invalid")) == nil
+
+      static_cfg = Config.new(Keyword.put(base, :resource_metadata, static))
+      assert Config.resource_metadata_url(static_cfg, Plug.Test.conn(:get, "/alpha")) == static
+    end
+
+    test ":resource_metadata_resolver validates its callback shape" do
+      base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+
+      for bad <- [123, :resolver, fn -> nil end, {"not-a-module", :resolve}] do
+        assert_raise ArgumentError, ~r/:resource_metadata_resolver must be a one-argument callback/, fn ->
+          Config.new(Keyword.put(base, :resource_metadata_resolver, bad))
+        end
+      end
+    end
+
     test ":bearer_methods_supported defaults to header-only and is configurable" do
       base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
 

@@ -212,6 +212,44 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert challenge =~ ~s(resource_metadata="#{url}")
   end
 
+  test "selects or omits resource_metadata per protected-resource request", %{config: config} do
+    static = @issuer <> "/.well-known/oauth-protected-resource"
+
+    resolver = fn conn ->
+      case conn.request_path do
+        "/alpha" -> @issuer <> "/.well-known/oauth-protected-resource/alpha"
+        "/beta" -> @issuer <> "/.well-known/oauth-protected-resource/beta"
+        _ -> nil
+      end
+    end
+
+    config = %{config | resource_metadata: static, resource_metadata_resolver: resolver}
+
+    for {path, suffix} <- [{"/alpha", "alpha"}, {"/beta", "beta"}] do
+      conn =
+        :get
+        |> conn(path)
+        |> Authenticate.call(Authenticate.init(config: config))
+
+      assert conn.status == 401
+      [challenge] = get_resp_header(conn, "www-authenticate")
+
+      assert challenge =~
+               ~s(resource_metadata="#{@issuer}/.well-known/oauth-protected-resource/#{suffix}")
+
+      refute challenge =~ ~s(resource_metadata="#{static}")
+    end
+
+    unowned =
+      :get
+      |> conn("/unowned")
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert unowned.status == 401
+    [challenge] = get_resp_header(unowned, "www-authenticate")
+    refute challenge =~ "resource_metadata"
+  end
+
   test "omits the resource_metadata pointer when the Config does not set it", %{config: config} do
     conn =
       :get

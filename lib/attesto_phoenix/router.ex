@@ -9,7 +9,8 @@ defmodule AttestoPhoenix.Router do
     * `GET /.well-known/oauth-authorization-server` - authorization-server
       metadata (RFC 8414 §3).
     * `GET /.well-known/openid-configuration` - OpenID Provider configuration
-      (OpenID Connect Discovery 1.0 §4).
+      (OpenID Connect Discovery 1.0 §4), omitted with
+      `openid_configuration: false`.
     * `GET /.well-known/jwks.json` - the JSON Web Key Set of the verification
       keys (RFC 7517 §5; the discovery document's `jwks_uri` per RFC 8414 §2).
     * `GET /.well-known/oauth-protected-resource` - protected-resource metadata
@@ -31,7 +32,8 @@ defmodule AttestoPhoenix.Router do
     * `DELETE /oauth/register/:client_id` - dynamic client registration
       management cleanup (RFC 7592 §2), mounted with registration.
     * `GET` and `POST /oauth/userinfo` - the UserInfo endpoint (OpenID Connect
-      Core 1.0 §5.3); a bearer-authenticated protected resource (RFC 6750 §2.1).
+      Core 1.0 §5.3); a bearer-authenticated protected resource (RFC 6750
+      §2.1), omitted with `userinfo: false`.
     * `GET` and `POST /oauth/end_session` - the end-session endpoint (OpenID
       Connect RP-Initiated Logout 1.0 §2), mounted only with `logout: true`.
     * `GET /oauth/check_session` - the `check_session_iframe` (OpenID Connect
@@ -45,8 +47,9 @@ defmodule AttestoPhoenix.Router do
 
   ## Placement and pipelines
 
-  The discovery, OpenID configuration, and JWKS documents are unauthenticated
-  public metadata (RFC 8414 §5; OpenID Connect Discovery 1.0 §4; RFC 8615).
+  The discovery, optional OpenID configuration, and JWKS documents are
+  unauthenticated public metadata (RFC 8414 §5; OpenID Connect Discovery 1.0
+  §4; RFC 8615).
   The authorization endpoint does not authenticate the client (RFC 6749 §3.1):
   the resource owner authenticates through the host's login/consent callbacks,
   so it carries no client-authentication pipeline. The token, revocation, and
@@ -123,6 +126,15 @@ defmodule AttestoPhoenix.Router do
       host has wired the registration callbacks in `AttestoPhoenix.Config`;
       this option only controls whether the routes exist, so a deployment that
       never offers registration presents no registration surface at all.
+    * `:userinfo` - when `false`, omits `GET`/`POST /oauth/userinfo` while
+      retaining the generic OAuth authorization-server routes. Defaults to
+      `true` for compatibility. When OpenID configuration remains enabled,
+      leave `AttestoPhoenix.Config`'s `:userinfo_endpoint` unset so the
+      document does not advertise an endpoint the host disabled.
+    * `:openid_configuration` - when `false`, omits the OpenID Provider
+      configuration document while retaining RFC 8414 authorization-server
+      metadata. Defaults to `true` for compatibility. An OAuth-only host that
+      is not an OpenID Provider normally disables this and `:userinfo`.
     * `:device` - when `true`, mounts the RFC 8628 device-authorization
       endpoint and verification page. Defaults to `false`.
     * `:ciba` - when `true`, mounts `POST /oauth/bc-authorize`, the OpenID
@@ -286,6 +298,8 @@ defmodule AttestoPhoenix.Router do
     ciba? = Keyword.get(opts, :ciba, false)
     logout? = Keyword.get(opts, :logout, false)
     session_management? = Keyword.get(opts, :session_management, false)
+    userinfo? = normalize_endpoint_capability!(opts, :userinfo, true)
+    openid_configuration? = normalize_endpoint_capability!(opts, :openid_configuration, true)
     protected_resource_root? = Keyword.get(opts, :protected_resource_root, true)
 
     inserted_resource_paths =
@@ -352,6 +366,22 @@ defmodule AttestoPhoenix.Router do
           )
         end
       end
+
+    # OpenID Connect Discovery §4 describes metadata about an OpenID Provider,
+    # not a generic OAuth authorization server. Keep it mounted by default for
+    # compatibility, but let an OAuth-only deployment omit that declaration
+    # while retaining RFC 8414 authorization-server metadata.
+    openid_configuration_route =
+      openid_configuration_route(
+        openid_configuration?,
+        openid_configuration_path,
+        openid_configuration_controller
+      )
+
+    # OpenID Connect Core §5.3 defines UserInfo as an optional protected
+    # surface of this route catalog. It remains enabled by default so existing
+    # calls expand to the exact same route table.
+    userinfo_route = userinfo_route(userinfo?, prefix, userinfo_path, userinfo_controller)
 
     # RFC 8628 §3.1: the device authorization endpoint is emitted only when the
     # host opts in (`device: true`), so a deployment that does not offer the
@@ -495,7 +525,7 @@ defmodule AttestoPhoenix.Router do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :metadata))
 
             get(unquote(discovery_path), unquote(discovery_controller), :show)
-            get(unquote(openid_configuration_path), unquote(openid_configuration_controller), :show)
+            unquote(openid_configuration_route)
             get(unquote(jwks_path), unquote(jwks_controller), :show)
             unquote(protected_resource_root_route)
             unquote_splicing(protected_resource_path_routes)
@@ -538,8 +568,7 @@ defmodule AttestoPhoenix.Router do
           scope "/" do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
 
-            get(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
-            post(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
+            unquote(userinfo_route)
           end
         end
       end
@@ -556,7 +585,7 @@ defmodule AttestoPhoenix.Router do
           # (OpenID Provider configuration) are both unauthenticated public
           # metadata served at their registered URIs.
           get(unquote(discovery_path), unquote(discovery_controller), :show)
-          get(unquote(openid_configuration_path), unquote(openid_configuration_controller), :show)
+          unquote(openid_configuration_route)
           get(unquote(jwks_path), unquote(jwks_controller), :show)
 
           # RFC 9728 §3: the protected-resource metadata document is unauthenticated
@@ -600,10 +629,33 @@ defmodule AttestoPhoenix.Router do
           # from the `Authorization` header before returning any claim, so the
           # endpoint authenticates from the request itself rather than from a
           # caller session.
-          get(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
-          post(unquote(prefix <> userinfo_path), unquote(userinfo_controller), :userinfo)
+          unquote(userinfo_route)
         end
       end
+    end
+  end
+
+  # The two opt-out capabilities are compile-time route declarations. Require
+  # literal booleans so a typo cannot silently expose a route, and reject
+  # duplicate declarations rather than choosing one by keyword-list position.
+  # Existing capability options retain their exact legacy expansion semantics.
+  defp normalize_endpoint_capability!(opts, capability, default) do
+    case Keyword.get_values(opts, capability) do
+      [] ->
+        default
+
+      [configured] when is_boolean(configured) ->
+        configured
+
+      [configured] ->
+        raise ArgumentError,
+              "attesto_routes/1 endpoint capability #{inspect(capability)} must be a " <>
+                "literal boolean, got: #{inspect(configured)}"
+
+      conflicting ->
+        raise ArgumentError,
+              "attesto_routes/1 endpoint capability #{inspect(capability)} has conflicting " <>
+                "option values #{inspect(conflicting)}; specify it only once"
     end
   end
 
@@ -676,6 +728,23 @@ defmodule AttestoPhoenix.Router do
   defp classed_device_routes(false, _prefix, _auth_path, _auth_controller, _verify_path, _verify_controller) do
     {nil, nil}
   end
+
+  defp openid_configuration_route(true, path, controller) do
+    quote do
+      get(unquote(path), unquote(controller), :show)
+    end
+  end
+
+  defp openid_configuration_route(false, _path, _controller), do: nil
+
+  defp userinfo_route(true, prefix, path, controller) do
+    quote do
+      get(unquote(prefix <> path), unquote(controller), :userinfo)
+      post(unquote(prefix <> path), unquote(controller), :userinfo)
+    end
+  end
+
+  defp userinfo_route(false, _prefix, _path, _controller), do: nil
 
   # Validate the opt-in class map before Phoenix expands any route. A class
   # override is deliberately a replacement, while omitted classes inherit the

@@ -20,6 +20,11 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   `:cnf`, and `:principal`. It is deliberately protocol-shaped; application
   policy such as accounts, roles, audit actors, and error envelopes belongs in
   the host application.
+
+  RFC 9728 challenge discovery is selected through
+  `AttestoPhoenix.Config.resource_metadata_url/2`: the existing static
+  `:resource_metadata` URL remains the default, while an optional
+  `:resource_metadata_resolver` can choose a URL or omit it for each request.
   """
 
   @behaviour Plug
@@ -43,18 +48,19 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   def call(conn, opts) do
     config = resolve_config(opts)
     claims_key = Keyword.get(opts, :claims_key, @claims_key)
+    resource_metadata = Config.resource_metadata_url(config, conn)
 
     case RequestContext.check_https(conn, config) do
       :ok ->
         conn =
           conn
-          |> CoreAuthenticate.call(CoreAuthenticate.init(core_opts(config, claims_key, opts)))
+          |> CoreAuthenticate.call(CoreAuthenticate.init(core_opts(config, claims_key, opts, resource_metadata)))
 
         if conn.halted do
           emit_denied(config, conn, :invalid_token)
           conn
         else
-          reject_revoked_or_assign_principal(conn, config, claims_key, opts)
+          reject_revoked_or_assign_principal(conn, config, claims_key, opts, resource_metadata)
         end
 
       {:error, :insecure_transport} ->
@@ -64,19 +70,25 @@ defmodule AttestoPhoenix.Plug.Authenticate do
           conn,
           :bearer,
           "invalid_token",
-          error_opts(config, description: "TLS required")
+          error_opts(config, resource_metadata, description: "TLS required")
         )
     end
   end
 
-  defp reject_revoked_or_assign_principal(conn, config, claims_key, opts) do
+  defp reject_revoked_or_assign_principal(conn, config, claims_key, opts, resource_metadata) do
     claims = conn.assigns[claims_key]
 
     if access_token_revoked?(config, claims) do
       emit_denied(config, conn, :invalid_token)
-      OAuthError.unauthorized(conn, scheme_of(claims), "invalid_token", error_opts(config, []))
+
+      OAuthError.unauthorized(
+        conn,
+        scheme_of(claims),
+        "invalid_token",
+        error_opts(config, resource_metadata, [])
+      )
     else
-      assign_principal(conn, config, claims_key, opts)
+      assign_principal(conn, config, claims_key, opts, resource_metadata)
     end
   end
 
@@ -86,7 +98,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   defp access_token_revoked?(_config, _claims), do: false
 
-  defp assign_principal(conn, config, claims_key, opts) do
+  defp assign_principal(conn, config, claims_key, opts, resource_metadata) do
     claims = conn.assigns[claims_key]
     subject = claims["sub"]
 
@@ -102,7 +114,13 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
       {:error, _reason} ->
         emit_denied(config, conn, :invalid_token)
-        OAuthError.unauthorized(conn, scheme_of(claims), "invalid_token", error_opts(config, []))
+
+        OAuthError.unauthorized(
+          conn,
+          scheme_of(claims),
+          "invalid_token",
+          error_opts(config, resource_metadata, [])
+        )
     end
   end
 
@@ -124,24 +142,24 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   defp scheme_of(%{"cnf" => %{"jkt" => jkt}}) when is_binary(jkt), do: :dpop
   defp scheme_of(_claims), do: :bearer
 
-  defp core_opts(config, claims_key, opts) do
+  defp core_opts(config, claims_key, opts, resource_metadata) do
     overrides =
       opts
       |> Keyword.drop([:config, :otp_app, :claims_key, :principal_key, :context_key])
       |> Keyword.put(:claims_key, claims_key)
 
     config
-    |> configured_core_opts(claims_key)
+    |> configured_core_opts(claims_key, resource_metadata)
     |> Keyword.merge(overrides)
   end
 
-  defp configured_core_opts(config, claims_key) do
+  defp configured_core_opts(config, claims_key, resource_metadata) do
     [config: attesto_config(config), claims_key: claims_key]
     |> Keyword.put(:bearer_methods, config.bearer_methods_supported)
     |> put_optional(:send_error, config.send_error)
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)
-    |> put_optional(:resource_metadata, config.resource_metadata)
+    |> put_optional(:resource_metadata, resource_metadata)
     |> put_optional(:replay_check, replay_check(config))
     |> put_optional(:nonce_check, nonce_check(config))
     |> put_optional(:nonce_issue, nonce_issue(config))
@@ -237,12 +255,12 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   defp put_optional(opts, _key, nil), do: opts
   defp put_optional(opts, key, value), do: Keyword.put(opts, key, value)
 
-  defp error_opts(config, extra) do
+  defp error_opts(config, resource_metadata, extra) do
     [
       send_error: config.send_error,
       www_authenticate: config.www_authenticate,
       no_store: config.no_store,
-      resource_metadata: config.resource_metadata
+      resource_metadata: resource_metadata
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Keyword.merge(extra)

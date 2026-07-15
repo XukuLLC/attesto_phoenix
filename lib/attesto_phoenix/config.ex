@@ -55,6 +55,14 @@ defmodule AttestoPhoenix.Config do
       `WWW-Authenticate` challenge it renders (RFC 9728 §5.1), so a client that
       is refused with 401 can discover which authorization server issues tokens
       for this resource. Omitted from the challenge when unset.
+    * `:resource_metadata_resolver` - `(conn -> absolute_url | nil)`. Optional
+      request-aware override for `:resource_metadata`. When configured, its
+      result selects the RFC 9728 metadata URI for that protected-resource
+      request; returning `nil` deliberately omits the auth-param. This lets one
+      origin serve multiple resource identifiers without pointing every
+      challenge at one global document. An invalid callback result is omitted
+      rather than advertised. When unset, the static `:resource_metadata` value
+      retains its existing behavior.
     * `:basic_realm` - realm string for token-endpoint Basic auth challenges.
       Default `"OAuth"`.
     * `:htu` - `(conn -> canonical_url_string)`. Overrides how the DPoP `htu`
@@ -221,15 +229,16 @@ defmodule AttestoPhoenix.Config do
       SHOULD NOT be used). Defaults to `["header"]`; add `"body"` only for a
       resource server that intentionally accepts RFC 6750 §2.2 form-body
       `access_token` credentials and wants to advertise that method.
-    * `:authorization_endpoint` - absolute URL of the host-owned authorization
-      endpoint (RFC 6749 §3.1 / OpenID Connect Discovery §3). The authorization
-      endpoint runs the host's login/consent UI, so the library does not mount
-      it; the host supplies the URL where it serves it. Advertised in the
-      OpenID Provider Metadata; omitted when unset.
-    * `:userinfo_endpoint` - absolute URL of the host-owned UserInfo endpoint
-      (OpenID Connect Core §5.3). The host owns the claim source, so the
-      library does not mount it; the host supplies the URL. Advertised in the
-      OpenID Provider Metadata; omitted when unset.
+    * `:authorization_endpoint` - absolute authorization endpoint URL to
+      advertise in OpenID Provider Metadata (RFC 6749 §3.1 / OpenID Connect
+      Discovery §3). `attesto_routes/1` mounts the generic controller; the host
+      supplies resource-owner authentication and consent through callbacks.
+      Omitted from OpenID Provider Metadata when unset.
+    * `:userinfo_endpoint` - absolute UserInfo URL to advertise in OpenID
+      Provider Metadata (OpenID Connect Core §5.3). `attesto_routes/1` mounts
+      the generic controller by default and the host supplies claim values
+      through `:build_userinfo_claims`; leave this unset when the UserInfo route
+      is disabled. Omitted from OpenID Provider Metadata when unset.
     * `:claims_supported` - list of claim names the host's UserInfo endpoint
       and ID Tokens can return (OpenID Connect Discovery §3). Advertised in the
       OpenID Provider Metadata; omitted when unset.
@@ -449,6 +458,7 @@ defmodule AttestoPhoenix.Config do
     :no_store,
     :www_authenticate,
     :resource_metadata,
+    :resource_metadata_resolver,
     :htu,
     :cert_der,
     :register_client,
@@ -574,6 +584,7 @@ defmodule AttestoPhoenix.Config do
           no_store: callback() | nil,
           www_authenticate: callback() | nil,
           resource_metadata: String.t() | nil,
+          resource_metadata_resolver: callback() | nil,
           basic_realm: String.t(),
           htu: callback() | nil,
           cert_der: callback() | nil,
@@ -1697,6 +1708,26 @@ defmodule AttestoPhoenix.Config do
   end
 
   @doc """
+  Selects the RFC 9728 protected-resource metadata URL for `conn`.
+
+  A configured `:resource_metadata_resolver` is authoritative and may return
+  an absolute HTTPS URL or `nil` to omit the `resource_metadata` auth-param for
+  this request. Without a resolver, the static `:resource_metadata` value is
+  returned unchanged. Invalid resolver results are omitted so a challenge
+  never advertises an unusable or unsafe metadata URI.
+  """
+  @spec resource_metadata_url(t(), Plug.Conn.t()) :: String.t() | nil
+  def resource_metadata_url(%__MODULE__{} = config, %Plug.Conn{} = conn) do
+    candidate =
+      case config.resource_metadata_resolver do
+        nil -> config.resource_metadata
+        callback -> Callback.invoke(callback, [conn])
+      end
+
+    if absolute_resource_url?(candidate), do: candidate
+  end
+
+  @doc """
   Absolute URL of the JWK Set document (RFC 7517 §5; the `jwks_uri` per
   RFC 8414 §2). The JWKS document is anchored at the host root under RFC 8615,
   so it is NOT relocated by `:oauth_path_prefix`.
@@ -2012,6 +2043,7 @@ defmodule AttestoPhoenix.Config do
     end
 
     validate_resource_metadata!(config)
+    validate_resource_metadata_resolver!(config)
     validate_bearer_methods_supported!(config)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
@@ -2076,6 +2108,26 @@ defmodule AttestoPhoenix.Config do
               "in the WWW-Authenticate challenge); got #{inspect(rm)}."
     end
   end
+
+  defp validate_resource_metadata_resolver!(%{resource_metadata_resolver: nil}), do: :ok
+
+  defp validate_resource_metadata_resolver!(%{resource_metadata_resolver: resolver}) do
+    if callback_with_call_arity?(resolver, 1) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :resource_metadata_resolver must be a one-argument " <>
+              "callback in a supported form or nil; got #{inspect(resolver)}."
+    end
+  end
+
+  defp callback_with_call_arity?(callback, arity) when is_function(callback), do: is_function(callback, arity)
+
+  defp callback_with_call_arity?({module, fun}, _arity), do: is_atom(module) and is_atom(fun)
+
+  defp callback_with_call_arity?({module, fun, extra}, _arity), do: is_atom(module) and is_atom(fun) and is_list(extra)
+
+  defp callback_with_call_arity?(_callback, _arity), do: false
 
   # RFC 6750 §2.1/§2.2: the access-token presentation methods
   # `AttestoPhoenix.Plug.Authenticate` actually accepts. The §2.3 URI query

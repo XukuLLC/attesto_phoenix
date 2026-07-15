@@ -6,6 +6,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- `attesto_routes/1` accepts `userinfo: false` and
+  `openid_configuration: false` as independent, compile-time endpoint
+  capability controls. Both default to `true`, so existing calls retain the
+  exact route table and pipeline data; OAuth-only hosts can omit the OIDC-only
+  surfaces without restating the authorization-server routes.
+- `AttestoPhoenix.Config` accepts a `:resource_metadata_resolver` callback that
+  selects an RFC 9728 protected-resource metadata URI for each request or
+  returns `nil` to omit it. `AttestoPhoenix.Plug.Authenticate` and UserInfo use
+  the selected URI consistently across core verification, revoked-token,
+  insufficient-scope, and transport failures. The existing static
+  `:resource_metadata` URL remains the backward-compatible fallback when no
+  resolver is configured.
+
+### Documentation
+
+- Documented the maintained route-catalog/host-policy boundary, declarative
+  route pipeline and endpoint capability model, shared plumbing for permissive
+  OAuth and strict FAPI profiles, and per-resource RFC 9728 ownership for
+  multi-resource origins.
+
 ## [1.4.0] - 2026-07-15
 
 ### Added

@@ -37,9 +37,10 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   authorization endpoint does not consume the `claims` parameter unless the
   host wires it.
 
-  The host-specific members - the `authorization_endpoint` (RFC 6749 §3.1)
-  and `userinfo_endpoint` (OpenID Connect Core §5.3), both host-owned and
-  hence not mounted by `AttestoPhoenix.Router`; the supported scopes
+  The host-declared members - the `authorization_endpoint` (RFC 6749 §3.1)
+  and `userinfo_endpoint` (OpenID Connect Core §5.3), whose generic
+  controllers can be mounted by `AttestoPhoenix.Router` while authentication,
+  consent, and claim values remain host callbacks; the supported scopes
   (`scopes_supported`, to which the core builder adds the reserved `openid`
   scope per OpenID Connect Core §3.1.2.1); the supported claims
   (`claims_supported`); the supported ACR values (`acr_values_supported`,

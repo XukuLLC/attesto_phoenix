@@ -64,6 +64,9 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
       this endpoint).
     * `:issuer`, `:audience`, `:keystore`, `:access_token_ttl` - claim-level
       policy supplied to the engine verify path as an `Attesto.Config`.
+    * `:resource_metadata` / `:resource_metadata_resolver` - the static or
+      request-selected RFC 9728 metadata URI included in challenges, or `nil`
+      to omit it for this surface.
     * `:dpop_enabled`, `:dpop_nonce_required`, `:nonce_store`, `:replay_check`,
       `:cert_der`, `:mtls_enabled`, `:htu` - sender-constraint policy and
       stores, threaded into `Attesto.Plug.Authenticate`.
@@ -116,24 +119,25 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   @spec userinfo(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def userinfo(conn, _params) do
     config = resolve_config()
+    resource_metadata = Config.resource_metadata_url(config, conn)
 
     # Reuse the engine verify path. On failure it halts the conn with the
     # RFC 6750 / RFC 9449 challenge already written; return it unchanged.
-    conn = Authenticate.call(conn, authenticate_opts(config))
+    conn = Authenticate.call(conn, authenticate_opts(config, resource_metadata))
 
     cond do
       conn.halted ->
         conn
 
       access_token_revoked?(config, conn.assigns[@claims_key]) ->
-        invalid_token(conn, scheme_of(conn.assigns[@claims_key]), config)
+        invalid_token(conn, scheme_of(conn.assigns[@claims_key]), resource_metadata)
 
       true ->
-        respond(conn, config)
+        respond(conn, config, resource_metadata)
     end
   end
 
-  defp respond(conn, config) do
+  defp respond(conn, config, resource_metadata) do
     claims = conn.assigns[@claims_key]
     granted_scopes = granted_scopes(claims)
 
@@ -154,7 +158,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
       |> put_no_store_headers()
       |> json(userinfo)
     else
-      insufficient_scope(conn, scheme_of(claims), config)
+      insufficient_scope(conn, scheme_of(claims), resource_metadata)
     end
   end
 
@@ -212,11 +216,11 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   defp access_token_revoked?(_config, _claims), do: false
 
-  defp invalid_token(conn, scheme, config) do
+  defp invalid_token(conn, scheme, resource_metadata) do
     challenge =
       challenge(
         scheme,
-        [{"error", "invalid_token"}] ++ resource_metadata_param(config)
+        [{"error", "invalid_token"}] ++ resource_metadata_param(resource_metadata)
       )
 
     conn
@@ -228,7 +232,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   # RFC 6750 §3.1: a valid token that lacks the required scope is answered 403
   # `insufficient_scope` with the `scope` auth-param naming what is needed.
-  defp insufficient_scope(conn, scheme, config) do
+  defp insufficient_scope(conn, scheme, resource_metadata) do
     challenge =
       challenge(
         scheme,
@@ -236,7 +240,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
           {"error", "insufficient_scope"},
           {"error_description", "The UserInfo endpoint requires the openid scope."},
           {"scope", @openid_scope}
-        ] ++ resource_metadata_param(config)
+        ] ++ resource_metadata_param(resource_metadata)
       )
 
     conn
@@ -270,9 +274,9 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # RFC 9728 §5.1: when the resource advertises protected-resource metadata,
   # every `WWW-Authenticate` challenge carries a `resource_metadata` pointer so a
   # refused client can discover the authorization server. Omitted when unset.
-  defp resource_metadata_param(%Config{resource_metadata: url}) when is_binary(url), do: [{"resource_metadata", url}]
+  defp resource_metadata_param(url) when is_binary(url), do: [{"resource_metadata", url}]
 
-  defp resource_metadata_param(_config), do: []
+  defp resource_metadata_param(_url), do: []
 
   defp put_no_store_headers(conn) do
     conn
@@ -286,7 +290,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # `Attesto.Plug.Authenticate` consumes. The DPoP replay/nonce/cert wiring
   # mirrors the token endpoint so the userinfo endpoint enforces exactly the
   # same sender-constraint policy on the presented token.
-  defp authenticate_opts(config) do
+  defp authenticate_opts(config, resource_metadata) do
     [config: attesto_config(config), claims_key: @claims_key]
     |> put_optional(:replay_check, replay_check(config))
     |> put_optional(:nonce_check, nonce_check(config))
@@ -294,7 +298,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     |> put_optional(:cert_der, cert_der(config))
     # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it
     # must also carry the protected-resource metadata pointer when configured.
-    |> put_optional(:resource_metadata, config.resource_metadata)
+    |> put_optional(:resource_metadata, resource_metadata)
     # RFC 9449 §4.3: derive the DPoP `htu` the same way every other endpoint
     # does — via RequestContext.canonical_url, which honours a configured
     # `:htu` but otherwise gates `X-Forwarded-*`/Host on the trusted-proxy

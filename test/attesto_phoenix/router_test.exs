@@ -159,6 +159,58 @@ defmodule AttestoPhoenix.RouterTest do
     end
   end
 
+  defmodule UserInfoDisabledRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(userinfo: false)
+    end
+  end
+
+  defmodule OpenIDConfigurationDisabledRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(openid_configuration: false)
+    end
+  end
+
+  defmodule CapabilityInteractionRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :oauth_metadata do
+      plug :accepts, ["json"]
+    end
+
+    pipeline :oauth_interactive do
+      plug :accepts, ["html"]
+    end
+
+    pipeline :oauth_protocol do
+      plug :accepts, ["json"]
+    end
+
+    scope "/" do
+      attesto_routes(
+        route_pipelines: [
+          metadata: :oauth_metadata,
+          interactive: :oauth_interactive,
+          protocol: :oauth_protocol
+        ],
+        registration: true,
+        device: true,
+        ciba: true,
+        logout: true,
+        session_management: true,
+        userinfo: false,
+        openid_configuration: false
+      )
+    end
+  end
+
   defmodule LogoutRouter do
     use Phoenix.Router
     use AttestoPhoenix.Router
@@ -260,6 +312,62 @@ defmodule AttestoPhoenix.RouterTest do
       assert post_route
       assert get_route.plug == UserinfoController
       assert post_route.plug == UserinfoController
+    end
+
+    test "UserInfo and OpenID configuration are independently controllable" do
+      refute find_route(UserInfoDisabledRouter, :get, "/oauth/userinfo")
+      refute find_route(UserInfoDisabledRouter, :post, "/oauth/userinfo")
+
+      assert find_route(
+               UserInfoDisabledRouter,
+               :get,
+               "/.well-known/openid-configuration"
+             )
+
+      refute find_route(
+               OpenIDConfigurationDisabledRouter,
+               :get,
+               "/.well-known/openid-configuration"
+             )
+
+      assert find_route(OpenIDConfigurationDisabledRouter, :get, "/oauth/userinfo")
+      assert find_route(OpenIDConfigurationDisabledRouter, :post, "/oauth/userinfo")
+    end
+
+    test "OIDC surface opt-outs compose with existing optional routes and route classes" do
+      refute find_route(CapabilityInteractionRouter, :get, "/.well-known/openid-configuration")
+      refute find_route(CapabilityInteractionRouter, :get, "/oauth/userinfo")
+      refute find_route(CapabilityInteractionRouter, :post, "/oauth/userinfo")
+
+      assert route_pipeline(
+               CapabilityInteractionRouter,
+               :get,
+               "/.well-known/oauth-authorization-server"
+             ) == [:oauth_metadata]
+
+      assert route_pipeline(CapabilityInteractionRouter, :get, "/oauth/authorize") == [
+               :oauth_interactive
+             ]
+
+      for {method, path} <- [
+            {:post, "/oauth/token"},
+            {:post, "/oauth/par"},
+            {:post, "/oauth/revoke"},
+            {:post, "/oauth/introspect"},
+            {:post, "/oauth/register"},
+            {:post, "/oauth/device_authorization"},
+            {:post, "/oauth/bc-authorize"}
+          ] do
+        assert route_pipeline(CapabilityInteractionRouter, method, path) == [:oauth_protocol]
+      end
+
+      for {method, path} <- [
+            {:get, "/oauth/device_verification"},
+            {:get, "/oauth/end_session"},
+            {:get, "/oauth/check_session"}
+          ] do
+        assert route_pipeline(CapabilityInteractionRouter, method, path) == [:oauth_interactive]
+      end
     end
 
     test "mounts the revocation endpoint" do
@@ -536,6 +644,30 @@ defmodule AttestoPhoenix.RouterTest do
               route_pipelines: [metadata: :one],
               route_pipelines: [metadata: :two]
             )
+          end
+        end
+      end
+    end
+
+    test "endpoint opt-outs validate at macro expansion" do
+      assert_raise ArgumentError, ~r/endpoint capability :userinfo must be a literal boolean/, fn ->
+        defmodule MalformedUserInfoCapabilityRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(userinfo: :disabled)
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/endpoint capability :openid_configuration has conflicting option values/, fn ->
+        defmodule DuplicateOpenIDConfigurationCapabilityRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(openid_configuration: false, openid_configuration: true)
           end
         end
       end
