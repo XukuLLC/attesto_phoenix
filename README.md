@@ -111,7 +111,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 1.2"}
+    {:attesto_phoenix, "~> 1.4"}
   ]
 end
 ```
@@ -122,7 +122,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 1.2"},
+    {:attesto_phoenix, "~> 1.4"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
@@ -282,17 +282,43 @@ defmodule MyAppWeb.Router do
 end
 ```
 
+When interactive routes need host session/resource-owner support that protocol
+clients must not inherit, classify the generated routes without hand-writing
+the route catalog:
+
+```elixir
+attesto_routes(
+  pipeline: :oauth_common,
+  route_pipelines: [
+    interactive: [:oauth_interactive, :oauth_common]
+  ],
+  registration: true
+)
+```
+
+`:metadata` covers discovery, OpenID configuration, JWKS, and protected-resource
+metadata; `:interactive` covers authorization, device verification, end-session,
+and check-session; `:protocol` covers the remaining OAuth/OIDC endpoints. Each
+override is the complete ordered list for that class, while omitted classes use
+`pipeline:`. The host owns the actual session, resource-owner authentication,
+CSRF, and content-negotiation policy. In particular, do not place externally
+submitted OAuth POST endpoints behind generic browser CSRF or browser-only
+`Accept` handling. Write pipeline names as literal atoms/lists inside the
+Phoenix `scope`; module attributes are not available when Phoenix expands the
+nested route macro.
+
 `attesto_routes/1` mounts:
 
 - `GET  /.well-known/oauth-authorization-server` (RFC 8414 metadata)
 - `GET  /.well-known/openid-configuration` (OIDC Discovery metadata)
 - `GET  /.well-known/jwks.json` (RFC 7517 JWK Set)
 - `GET  /.well-known/oauth-protected-resource` (RFC 9728 metadata)
-- `GET  /oauth/authorize`
+- `GET  /oauth/authorize` and `POST /oauth/authorize`
 - `POST /oauth/token`
 - `POST /oauth/par` (RFC 9126)
 - `POST /oauth/revoke` (RFC 7009)
-- `POST /oauth/register` (RFC 7591, only when `registration_enabled: true`)
+- `POST /oauth/introspect` (RFC 7662)
+- `POST /oauth/register` (RFC 7591, only with `registration: true`)
 - `DELETE /oauth/register/:client_id` (RFC 7592, with registration)
 - `GET  /oauth/userinfo`
 - `POST /oauth/userinfo`

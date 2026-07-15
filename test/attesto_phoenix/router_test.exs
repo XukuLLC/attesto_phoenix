@@ -7,10 +7,20 @@ defmodule AttestoPhoenix.RouterTest do
   use ExUnit.Case, async: true
 
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Controller.BackchannelAuthenticationController
   alias AttestoPhoenix.Controller.CheckSessionController
+  alias AttestoPhoenix.Controller.DeviceAuthorizationController
+  alias AttestoPhoenix.Controller.DeviceVerificationController
+  alias AttestoPhoenix.Controller.DiscoveryController
+  alias AttestoPhoenix.Controller.EndSessionController
+  alias AttestoPhoenix.Controller.IntrospectionController
+  alias AttestoPhoenix.Controller.JWKSController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
   alias AttestoPhoenix.Controller.ProtectedResourceController
+  alias AttestoPhoenix.Controller.RegistrationController
+  alias AttestoPhoenix.Controller.RevocationController
+  alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
 
   defmodule DefaultRouter do
@@ -53,6 +63,102 @@ defmodule AttestoPhoenix.RouterTest do
     end
   end
 
+  defmodule LegacyAllFeaturesRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :oauth_server do
+      plug :accepts, ["json"]
+    end
+
+    scope "/" do
+      attesto_routes(
+        pipeline: :oauth_server,
+        registration: true,
+        device: true,
+        ciba: true,
+        logout: true,
+        session_management: true
+      )
+    end
+  end
+
+  defmodule ClassPipelineRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :oauth_common do
+      plug :accepts, ["json"]
+    end
+
+    pipeline :oauth_metadata do
+      plug :accepts, ["json"]
+    end
+
+    pipeline :oauth_interactive do
+      plug :accepts, ["html"]
+    end
+
+    pipeline :oauth_protocol do
+      plug :accepts, ["json"]
+    end
+
+    scope "/" do
+      attesto_routes(
+        pipeline: :oauth_common,
+        route_pipelines: [
+          metadata: :oauth_metadata,
+          interactive: [:oauth_interactive, :oauth_common],
+          protocol: [:oauth_protocol, :oauth_common]
+        ],
+        registration: true,
+        device: true,
+        ciba: true,
+        logout: true,
+        session_management: true
+      )
+    end
+  end
+
+  defmodule PrefixedOverrideRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :oauth_common do
+      plug :accepts, ["json"]
+    end
+
+    pipeline :oauth_interactive do
+      plug :accepts, ["html"]
+    end
+
+    scope "/" do
+      attesto_routes(
+        prefix: "/mcp",
+        pipeline: :oauth_common,
+        route_pipelines: [interactive: [:oauth_interactive, :oauth_common]],
+        protected_resource_paths: ["/mcp/alpha"],
+        protected_resource_root: false
+      )
+    end
+  end
+
+  defmodule EmptyMetadataPipelineRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :oauth_common do
+      plug :accepts, ["json"]
+    end
+
+    scope "/" do
+      attesto_routes(
+        pipeline: :oauth_common,
+        route_pipelines: [metadata: []]
+      )
+    end
+  end
+
   defmodule LogoutRouter do
     use Phoenix.Router
     use AttestoPhoenix.Router
@@ -87,6 +193,28 @@ defmodule AttestoPhoenix.RouterTest do
     router
     |> Phoenix.Router.routes()
     |> Enum.find(fn r -> r.verb == method and r.path == path end)
+  end
+
+  defp route_pipeline(router, method, path) do
+    router
+    |> Phoenix.Router.route_info(method |> Atom.to_string() |> String.upcase(), path, "localhost")
+    |> Map.fetch!(:pipe_through)
+  end
+
+  defp route_signature(router) do
+    router
+    |> Phoenix.Router.routes()
+    |> Enum.map(fn route ->
+      {
+        route.verb,
+        route.path,
+        route.plug,
+        route.plug_opts,
+        route.helper,
+        route.metadata,
+        route_pipeline(router, route.verb, route.path)
+      }
+    end)
   end
 
   describe "attesto_routes/1" do
@@ -168,6 +296,249 @@ defmodule AttestoPhoenix.RouterTest do
     test "with a pipeline pipes the mounted routes through the named pipeline" do
       info = Phoenix.Router.route_info(PipelineRouter, "POST", "/oauth/token", "localhost")
       assert info.pipe_through == [:oauth_server]
+    end
+
+    test "legacy pipeline applies identically to every generated route" do
+      assert Enum.all?(Phoenix.Router.routes(LegacyAllFeaturesRouter), fn route ->
+               route_pipeline(LegacyAllFeaturesRouter, route.verb, route.path) == [:oauth_server]
+             end)
+    end
+
+    test "complete legacy all-feature route table remains unchanged" do
+      metadata = %{log: :debug}
+
+      assert route_signature(LegacyAllFeaturesRouter) == [
+               {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery", metadata,
+                [:oauth_server]},
+               {:get, "/.well-known/openid-configuration", OpenIDConfigurationController, :show,
+                "open_id_configuration", metadata, [:oauth_server]},
+               {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", metadata, [:oauth_server]},
+               {:get, "/.well-known/oauth-protected-resource", ProtectedResourceController, :show, "protected_resource",
+                metadata, [:oauth_server]},
+               {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, [:oauth_server]},
+               {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, [:oauth_server]},
+               {:post, "/oauth/token", TokenController, :create, "token", metadata, [:oauth_server]},
+               {:post, "/oauth/par", PARController, :create, "par", metadata, [:oauth_server]},
+               {:post, "/oauth/revoke", RevocationController, :create, "revocation", metadata, [:oauth_server]},
+               {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", metadata,
+                [:oauth_server]},
+               {:post, "/oauth/register", RegistrationController, :create, "registration", metadata, [:oauth_server]},
+               {:delete, "/oauth/register/:client_id", RegistrationController, :delete, "registration", metadata,
+                [:oauth_server]},
+               {:post, "/oauth/device_authorization", DeviceAuthorizationController, :create, "device_authorization",
+                metadata, [:oauth_server]},
+               {:get, "/oauth/device_verification", DeviceVerificationController, :verify, "device_verification",
+                metadata, [:oauth_server]},
+               {:post, "/oauth/device_verification", DeviceVerificationController, :verify, "device_verification",
+                metadata, [:oauth_server]},
+               {:post, "/oauth/bc-authorize", BackchannelAuthenticationController, :create,
+                "backchannel_authentication", metadata, [:oauth_server]},
+               {:get, "/oauth/end_session", EndSessionController, :end_session, "end_session", metadata,
+                [:oauth_server]},
+               {:post, "/oauth/end_session", EndSessionController, :end_session, "end_session", metadata,
+                [:oauth_server]},
+               {:get, "/oauth/check_session", CheckSessionController, :show, "check_session", metadata,
+                [:oauth_server]},
+               {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, [:oauth_server]},
+               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, [:oauth_server]}
+             ]
+    end
+
+    test "route-class overrides replace only their class and preserve pipeline order" do
+      metadata_routes = [
+        {:get, "/.well-known/oauth-authorization-server"},
+        {:get, "/.well-known/openid-configuration"},
+        {:get, "/.well-known/jwks.json"},
+        {:get, "/.well-known/oauth-protected-resource"}
+      ]
+
+      interactive_routes = [
+        {:get, "/oauth/authorize"},
+        {:post, "/oauth/authorize"},
+        {:get, "/oauth/device_verification"},
+        {:post, "/oauth/device_verification"},
+        {:get, "/oauth/end_session"},
+        {:post, "/oauth/end_session"},
+        {:get, "/oauth/check_session"}
+      ]
+
+      protocol_routes = [
+        {:post, "/oauth/token"},
+        {:post, "/oauth/par"},
+        {:post, "/oauth/revoke"},
+        {:post, "/oauth/introspect"},
+        {:post, "/oauth/register"},
+        {:delete, "/oauth/register/:client_id"},
+        {:post, "/oauth/device_authorization"},
+        {:post, "/oauth/bc-authorize"},
+        {:get, "/oauth/userinfo"},
+        {:post, "/oauth/userinfo"}
+      ]
+
+      for {method, path} <- metadata_routes do
+        assert route_pipeline(ClassPipelineRouter, method, path) == [:oauth_metadata]
+      end
+
+      for {method, path} <- interactive_routes do
+        assert route_pipeline(ClassPipelineRouter, method, path) == [
+                 :oauth_interactive,
+                 :oauth_common
+               ]
+      end
+
+      for {method, path} <- protocol_routes do
+        assert route_pipeline(ClassPipelineRouter, method, path) == [
+                 :oauth_protocol,
+                 :oauth_common
+               ]
+      end
+
+      assert route_pipeline(
+               EmptyMetadataPipelineRouter,
+               :get,
+               "/.well-known/oauth-authorization-server"
+             ) == []
+
+      assert route_pipeline(EmptyMetadataPipelineRouter, :post, "/oauth/token") == [
+               :oauth_common
+             ]
+    end
+
+    test "class expansion retains the complete legacy route order and catalog" do
+      legacy = Enum.map(route_signature(LegacyAllFeaturesRouter), &Tuple.delete_at(&1, 6))
+      classed = Enum.map(route_signature(ClassPipelineRouter), &Tuple.delete_at(&1, 6))
+
+      assert classed == legacy
+    end
+
+    test "prefix and protected-resource root options keep working with overrides" do
+      refute find_route(
+               PrefixedOverrideRouter,
+               :get,
+               "/.well-known/oauth-protected-resource"
+             )
+
+      assert find_route(
+               PrefixedOverrideRouter,
+               :get,
+               "/.well-known/oauth-protected-resource/mcp/alpha"
+             )
+
+      assert find_route(PrefixedOverrideRouter, :get, "/.well-known/oauth-authorization-server")
+      assert find_route(PrefixedOverrideRouter, :get, "/.well-known/openid-configuration")
+      assert find_route(PrefixedOverrideRouter, :get, "/.well-known/jwks.json")
+      assert find_route(PrefixedOverrideRouter, :get, "/mcp/oauth/authorize")
+      assert find_route(PrefixedOverrideRouter, :post, "/mcp/oauth/token")
+
+      assert route_pipeline(
+               PrefixedOverrideRouter,
+               :get,
+               "/.well-known/oauth-protected-resource/mcp/alpha"
+             ) == [:oauth_common]
+
+      assert route_pipeline(PrefixedOverrideRouter, :get, "/mcp/oauth/authorize") == [
+               :oauth_interactive,
+               :oauth_common
+             ]
+
+      assert route_pipeline(PrefixedOverrideRouter, :post, "/mcp/oauth/token") == [
+               :oauth_common
+             ]
+    end
+
+    test "unknown and malformed class overrides fail during router compilation" do
+      assert_raise ArgumentError, ~r/unknown route class.*browser/s, fn ->
+        defmodule UnknownRoutePipelineClassRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(route_pipelines: [browser: :browser])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/expected a keyword list/, fn ->
+        defmodule NonKeywordRoutePipelinesRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(route_pipelines: [:metadata])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/ordered list of pipeline atoms/, fn ->
+        defmodule MalformedRoutePipelineValueRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(route_pipelines: [metadata: [:metadata, "not_an_atom"]])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/ordered list of pipeline atoms.*nil/s, fn ->
+        defmodule NilRoutePipelineValueRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(route_pipelines: [metadata: nil])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/must use literal pipeline atoms/, fn ->
+        defmodule AttributeRoutePipelineValueRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          @metadata_pipeline :metadata
+
+          scope "/" do
+            attesto_routes(route_pipelines: [metadata: @metadata_pipeline])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/ordered list of pipeline atoms/, fn ->
+        defmodule ImproperRoutePipelineListRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(route_pipelines: [interactive: [:interactive | :improper_tail]])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/conflicting duplicate override/, fn ->
+        defmodule DuplicateRoutePipelineClassRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(route_pipelines: [metadata: :one, metadata: :two])
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/conflicting option values/, fn ->
+        defmodule DuplicateRoutePipelinesOptionRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(
+              route_pipelines: [metadata: :one],
+              route_pipelines: [metadata: :two]
+            )
+          end
+        end
+      end
     end
 
     test "does not mount the end-session or check-session endpoints by default" do

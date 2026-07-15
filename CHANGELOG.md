@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+## [1.4.0] - 2026-07-15
+
+### Added
+
+- `attesto_routes/1` accepts `route_pipelines:` overrides for the documented
+  `:metadata`, `:interactive`, and `:protocol` route classes. Each atom or
+  ordered atom list replaces the legacy `pipeline:` default for that class,
+  allowing browser/resource-owner support to remain separate from public
+  metadata and externally submitted OAuth protocol requests. Calls without the
+  new option retain the existing route table and pipeline data.
+
+### Fixed
+
+- `route_pipelines:` now rejects `nil` values and module-attribute pipeline
+  expressions with actionable compile-time errors instead of silently treating
+  `nil` as an empty pipeline list or exposing Phoenix's internal attribute AST.
+
 ## [1.3.0] - 2026-07-13
 
 ### Added
