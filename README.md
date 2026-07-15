@@ -50,7 +50,7 @@ primitives, and the token-lifecycle building blocks.
   load-balanced deployment keeps no OAuth state per node.
 
 Attesto owns the standards route catalog and protocol controllers; the host
-chooses endpoint capabilities and route pipeline classes declaratively. It
+chooses route mounts and route pipeline classes declaratively. It
 deliberately does **not** own your client registry, principal store, secret
 hashing, scope catalog, resource-owner authentication, consent, or audit log.
 Those are application policy and are supplied through neutral configuration
@@ -310,10 +310,10 @@ submitted OAuth POST endpoints behind generic browser CSRF or browser-only
 Phoenix `scope`; module attributes are not available when Phoenix expands the
 nested route macro.
 
-The OIDC-only surfaces default on for compatibility and can be disabled
-independently. An OAuth authorization server that does not act as an OpenID
-Provider can retain authorization, token, PAR, revocation, introspection, JWKS,
-and RFC 8414 metadata while omitting both declarations:
+The OIDC-only local route mounts default on for compatibility. An OAuth
+authorization server that does not act as an OpenID Provider can retain
+authorization, token, PAR, revocation, introspection, JWKS, and RFC 8414
+metadata while omitting both declarations:
 
 ```elixir
 attesto_routes(
@@ -322,9 +322,26 @@ attesto_routes(
 )
 ```
 
-`userinfo: false` removes both UserInfo verbs. If OpenID configuration remains
-enabled, also leave the Config `:userinfo_endpoint` metadata value unset so the
-document does not advertise an unsupported endpoint.
+These flags are compile-time route-mount controls; metadata is built later from
+runtime `AttestoPhoenix.Config`. `userinfo: false` removes both local UserInfo
+verbs. The retained Provider Metadata route suppresses a configured
+`:userinfo_endpoint` on the issuer origin at the removed local path (including
+equivalent host-case, default-port, or query variants); an endpoint on a
+different origin or path remains advertised. OIDC conformance for features
+such as CIBA, logout, and session management relies on Provider Metadata, so
+those deployments must keep OpenID configuration enabled unless the host
+serves equivalent metadata separately. A dynamically discovered and
+dynamically registered OpenID Provider that issues access tokens must still
+satisfy OIDC's Discovery and UserInfo requirements; these independent macro
+controls do not make every route combination an OIDC-conformant deployment.
+
+The bundled well-known routes are the standards-derived forms for an
+origin-only issuer such as `https://issuer.example`. If the issuer contains a
+path, OIDC Discovery and RFC 8414 derive two different path-bearing well-known
+locations; mount those routes explicitly instead of using the macro's fixed
+root discovery routes. Because the macro always owns its RFC 8414 route, a
+path-bearing issuer requires a manually declared route catalog rather than
+adding duplicate discovery routes alongside `attesto_routes/1`.
 
 `attesto_routes/1` mounts:
 
@@ -477,9 +494,23 @@ def for_request(_conn), do: nil
 ```
 
 The resolver is authoritative when present; it does not fall back to the static
-URL when it returns `nil`. The protected-resource integration still owns the
-actual RFC 9728 declarations. Publish one document per exact resource
-identifier, with the path-inserted well-known URI and matching `resource`
+URL when it returns `nil`. An invalid runtime return is safely omitted rather
+than turned into a challenge or a request-time exception; invalid static
+configuration still fails at boot. Function callbacks must accept one argument,
+and MFA tuples must export the effective arity (the request plus any extra
+arguments). An explicit per-plug `resource_metadata:` option, including `nil`,
+wins on core verification, TLS, revocation, and principal failures and skips
+the resolver.
+
+The resolver is trusted configuration. Return pinned or allowlisted HTTPS URLs;
+do not construct a metadata authority from untrusted Host, forwarded, query, or
+arbitrary header values. The returned URL is never fetched or used as a
+redirect, and it is validated with the same HTTPS/host/no-fragment rules as the
+static value before it can enter a quoted challenge.
+
+The protected-resource integration still owns the actual RFC 9728 declarations.
+Publish one document per exact resource identifier, with the path-inserted
+well-known URI and matching `resource`
 member; do not collapse multiple identifiers into a root document. When no
 resource owns the origin root, use `protected_resource_root: false` and let the
 per-resource integration mount only the documents it owns.

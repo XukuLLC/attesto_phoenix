@@ -22,7 +22,9 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   the host application.
 
   RFC 9728 challenge discovery is selected through
-  `AttestoPhoenix.Config.resource_metadata_url/2`: the existing static
+  `AttestoPhoenix.Config.resource_metadata_url/3`: an explicit per-plug
+  `:resource_metadata` value (including `nil`) takes precedence on every error
+  path and skips the resolver. Otherwise, the existing static
   `:resource_metadata` URL remains the default, while an optional
   `:resource_metadata_resolver` can choose a URL or omit it for each request.
   """
@@ -40,6 +42,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   @claims_key :attesto_claims
   @principal_key :attesto_principal
   @context_key :attesto_context
+  @error_option_keys [:send_error, :www_authenticate, :no_store]
 
   @impl Plug
   def init(opts) when is_list(opts), do: opts
@@ -48,7 +51,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   def call(conn, opts) do
     config = resolve_config(opts)
     claims_key = Keyword.get(opts, :claims_key, @claims_key)
-    resource_metadata = Config.resource_metadata_url(config, conn)
+    resource_metadata = Config.resource_metadata_url(config, conn, opts)
 
     case RequestContext.check_https(conn, config) do
       :ok ->
@@ -70,7 +73,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
           conn,
           :bearer,
           "invalid_token",
-          error_opts(config, resource_metadata, description: "TLS required")
+          error_opts(config, opts, resource_metadata, description: "TLS required")
         )
     end
   end
@@ -85,7 +88,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
         conn,
         scheme_of(claims),
         "invalid_token",
-        error_opts(config, resource_metadata, [])
+        error_opts(config, opts, resource_metadata, [])
       )
     else
       assign_principal(conn, config, claims_key, opts, resource_metadata)
@@ -119,7 +122,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
           conn,
           scheme_of(claims),
           "invalid_token",
-          error_opts(config, resource_metadata, [])
+          error_opts(config, opts, resource_metadata, [])
         )
     end
   end
@@ -151,6 +154,10 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     config
     |> configured_core_opts(claims_key, resource_metadata)
     |> Keyword.merge(overrides)
+    # Normalize an explicit override (including nil/invalid) after the raw plug
+    # options are merged, so the delegated core path sees the same selected URL
+    # as the wrapper-owned TLS, revocation, and principal failures.
+    |> Keyword.put(:resource_metadata, resource_metadata)
   end
 
   defp configured_core_opts(config, claims_key, resource_metadata) do
@@ -255,14 +262,14 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   defp put_optional(opts, _key, nil), do: opts
   defp put_optional(opts, key, value), do: Keyword.put(opts, key, value)
 
-  defp error_opts(config, resource_metadata, extra) do
+  defp error_opts(config, plug_opts, resource_metadata, extra) do
     [
       send_error: config.send_error,
       www_authenticate: config.www_authenticate,
       no_store: config.no_store,
       resource_metadata: resource_metadata
     ]
-    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Keyword.merge(Keyword.take(plug_opts, @error_option_keys))
     |> Keyword.merge(extra)
   end
 

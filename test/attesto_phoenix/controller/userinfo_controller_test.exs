@@ -113,6 +113,24 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert body(conn)["error"] == "invalid_token"
     end
 
+    test "refuses a valid token over HTTP when HTTPS is required" do
+      metadata_url = "https://api.example/.well-known/oauth-protected-resource/userinfo"
+
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.put(:require_https, true)
+      |> Keyword.put(:resource_metadata_resolver, fn _conn -> metadata_url end)
+      |> put_config()
+
+      conn = get_userinfo(mint(scope: "openid profile"))
+
+      assert conn.status == 401
+      assert body(conn)["error"] == "invalid_token"
+      assert [challenge = "Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ ~s(error_description="TLS required")
+      assert challenge =~ ~s(resource_metadata="#{metadata_url}")
+    end
+
     test "the 401 challenge carries the RFC 9728 resource_metadata pointer when configured" do
       metadata_url = "https://api.example/.well-known/oauth-protected-resource"
 
@@ -179,6 +197,49 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert [challenge = "Bearer " <> _] = get_resp_header(conn, "www-authenticate")
       assert challenge =~ ~s(resource_metadata="#{metadata_url}")
     end
+
+    test "configured error transport hooks cover verification, TLS, revocation, and scope failures" do
+      base = Application.fetch_env!(:attesto_phoenix, AttestoPhoenix.Config)
+      openid_token = mint(scope: "openid")
+      insufficient_token = mint(scope: "profile")
+      Process.put(:attesto_phoenix_revoked_jti, peek_claims(openid_token)["jti"])
+      on_exit(fn -> Process.delete(:attesto_phoenix_revoked_jti) end)
+
+      send_error = fn conn, status, error_body ->
+        conn
+        |> put_resp_header("x-host-send-error", "true")
+        |> send_resp(status, JSON.encode!(%{"host_error" => error_body}))
+        |> halt()
+      end
+
+      www_authenticate = fn conn, challenge ->
+        conn
+        |> put_resp_header("www-authenticate", challenge)
+        |> put_resp_header("x-host-www-authenticate", "true")
+      end
+
+      no_store = fn conn -> put_resp_header(conn, "x-host-no-store", "true") end
+
+      hooks = [send_error: send_error, www_authenticate: www_authenticate, no_store: no_store]
+
+      cases = [
+        {:verification, hooks, nil},
+        {:tls, Keyword.put(hooks, :require_https, true), openid_token},
+        {:revocation, Keyword.put(hooks, :code_store, __MODULE__.RevokedTokenStore), openid_token},
+        {:scope, hooks, insufficient_token}
+      ]
+
+      for {failure, overrides, token} <- cases do
+        put_config(Keyword.merge(base, overrides))
+        response = get_userinfo(token)
+
+        assert response.status in [401, 403], "unexpected status for #{failure} failure"
+        assert get_resp_header(response, "x-host-send-error") == ["true"]
+        assert get_resp_header(response, "x-host-www-authenticate") == ["true"]
+        assert get_resp_header(response, "x-host-no-store") == ["true"]
+        assert body(response)["host_error"]["error"] in ["invalid_token", "insufficient_scope"]
+      end
+    end
   end
 
   describe "scope requirement (OpenID Connect Core §5.3.1 / RFC 6750 §3.1)" do
@@ -196,8 +257,15 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert conn.status == 403
       assert body(conn)["error"] == "insufficient_scope"
 
+      assert body(conn)["error_description"] ==
+               "The UserInfo endpoint requires the openid scope."
+
       assert [challenge] = get_resp_header(conn, "www-authenticate")
       assert challenge =~ "Bearer"
+
+      assert challenge =~
+               ~s(error_description="The UserInfo endpoint requires the openid scope.")
+
       assert challenge =~ ~s(scope="openid")
       assert challenge =~ ~s(resource_metadata="#{metadata_url}")
     end
@@ -324,6 +392,20 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert conn.status == 200
       assert body(conn)["sub"] == @subject
       assert body(conn)["name"] == "Ada Lovelace"
+    end
+
+    test "accepts an RFC 6750 form-body token only when advertised by config" do
+      base = Application.fetch_env!(:attesto_phoenix, AttestoPhoenix.Config)
+      put_config(Keyword.put(base, :bearer_methods_supported, ["header", "body"]))
+
+      conn =
+        :post
+        |> conn(@endpoint_path, %{"access_token" => mint(scope: "openid")})
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> UserinfoController.userinfo(%{})
+
+      assert conn.status == 200
+      assert body(conn)["sub"] == @subject
     end
   end
 

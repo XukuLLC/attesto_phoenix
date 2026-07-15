@@ -168,6 +168,33 @@ defmodule AttestoPhoenix.RouterTest do
     end
   end
 
+  defmodule PrefixedUserInfoDisabledRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(prefix: "/auth", userinfo: false)
+    end
+  end
+
+  defmodule ScopedUserInfoDisabledRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/tenant" do
+      attesto_routes(userinfo: false)
+    end
+  end
+
+  defmodule DynamicScopedUserInfoDisabledRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/:tenant" do
+      attesto_routes(userinfo: false)
+    end
+  end
+
   defmodule OpenIDConfigurationDisabledRouter do
     use Phoenix.Router
     use AttestoPhoenix.Router
@@ -269,6 +296,15 @@ defmodule AttestoPhoenix.RouterTest do
     end)
   end
 
+  defp prepared_route_conn(router, method, path) do
+    segments = String.split(path, "/", trim: true)
+
+    {metadata, prepare, _pipeline, _dispatch} =
+      router.__match_route__(segments, method |> Atom.to_string() |> String.upcase(), "localhost")
+
+    prepare.(Plug.Test.conn(method, path), metadata)
+  end
+
   describe "attesto_routes/1" do
     test "mounts the discovery document at the well-known path" do
       assert find_route(DefaultRouter, :get, "/.well-known/oauth-authorization-server")
@@ -334,7 +370,54 @@ defmodule AttestoPhoenix.RouterTest do
       assert find_route(OpenIDConfigurationDisabledRouter, :post, "/oauth/userinfo")
     end
 
-    test "OIDC surface opt-outs compose with existing optional routes and route classes" do
+    test "userinfo opt-out marks the retained Provider Metadata route without changing the default route" do
+      disabled =
+        prepared_route_conn(
+          UserInfoDisabledRouter,
+          :get,
+          "/.well-known/openid-configuration"
+        )
+
+      default =
+        prepared_route_conn(
+          DefaultRouter,
+          :get,
+          "/.well-known/openid-configuration"
+        )
+
+      prefixed =
+        prepared_route_conn(
+          PrefixedUserInfoDisabledRouter,
+          :get,
+          "/.well-known/openid-configuration"
+        )
+
+      scoped =
+        prepared_route_conn(
+          ScopedUserInfoDisabledRouter,
+          :get,
+          "/tenant/.well-known/openid-configuration"
+        )
+
+      dynamic =
+        prepared_route_conn(
+          DynamicScopedUserInfoDisabledRouter,
+          :get,
+          "/acme/.well-known/openid-configuration"
+        )
+
+      assert disabled.private.attesto_phoenix_local_userinfo_path == "/oauth/userinfo"
+      assert prefixed.private.attesto_phoenix_local_userinfo_path == "/auth/oauth/userinfo"
+      assert scoped.private.attesto_phoenix_local_userinfo_path == "/tenant/oauth/userinfo"
+      assert dynamic.private.attesto_phoenix_local_userinfo_path == "/:tenant/oauth/userinfo"
+      assert dynamic.path_params == %{"tenant" => "acme"}
+      refute Map.has_key?(default.private, :attesto_phoenix_local_userinfo_path)
+    end
+
+    test "route-mount opt-outs compose mechanically with existing optional routes and route classes" do
+      # This is macro-expansion coverage, not a claim that every combination of
+      # OIDC feature routes and omitted Provider Metadata is a conformant
+      # deployment; the public route docs spell out that runtime obligation.
       refute find_route(CapabilityInteractionRouter, :get, "/.well-known/openid-configuration")
       refute find_route(CapabilityInteractionRouter, :get, "/oauth/userinfo")
       refute find_route(CapabilityInteractionRouter, :post, "/oauth/userinfo")
@@ -410,6 +493,27 @@ defmodule AttestoPhoenix.RouterTest do
       assert Enum.all?(Phoenix.Router.routes(LegacyAllFeaturesRouter), fn route ->
                route_pipeline(LegacyAllFeaturesRouter, route.verb, route.path) == [:oauth_server]
              end)
+    end
+
+    test "complete default route table and pipeline data remain unchanged" do
+      metadata = %{log: :debug}
+
+      assert route_signature(DefaultRouter) == [
+               {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery", metadata, []},
+               {:get, "/.well-known/openid-configuration", OpenIDConfigurationController, :show,
+                "open_id_configuration", metadata, []},
+               {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", metadata, []},
+               {:get, "/.well-known/oauth-protected-resource", ProtectedResourceController, :show, "protected_resource",
+                metadata, []},
+               {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, []},
+               {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, []},
+               {:post, "/oauth/token", TokenController, :create, "token", metadata, []},
+               {:post, "/oauth/par", PARController, :create, "par", metadata, []},
+               {:post, "/oauth/revoke", RevocationController, :create, "revocation", metadata, []},
+               {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", metadata, []},
+               {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, []},
+               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, []}
+             ]
     end
 
     test "complete legacy all-feature route table remains unchanged" do
@@ -650,7 +754,7 @@ defmodule AttestoPhoenix.RouterTest do
     end
 
     test "endpoint opt-outs validate at macro expansion" do
-      assert_raise ArgumentError, ~r/endpoint capability :userinfo must be a literal boolean/, fn ->
+      assert_raise ArgumentError, ~r/route-mount control :userinfo must be a literal boolean/, fn ->
         defmodule MalformedUserInfoCapabilityRouter do
           use Phoenix.Router
           use AttestoPhoenix.Router
@@ -661,7 +765,7 @@ defmodule AttestoPhoenix.RouterTest do
         end
       end
 
-      assert_raise ArgumentError, ~r/endpoint capability :openid_configuration has conflicting option values/, fn ->
+      assert_raise ArgumentError, ~r/route-mount control :openid_configuration has conflicting option values/, fn ->
         defmodule DuplicateOpenIDConfigurationCapabilityRouter do
           use Phoenix.Router
           use AttestoPhoenix.Router

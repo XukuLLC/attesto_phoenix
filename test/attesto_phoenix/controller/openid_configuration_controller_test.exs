@@ -64,8 +64,12 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
 
   # Invoke the controller action directly with both configs placed where the
   # action expects them, mirroring what a router pipeline installs.
-  defp call_show(host, protocol) do
-    conn(:get, "/.well-known/openid-configuration")
+  defp call_show(host, protocol, route_private \\ %{}, path_params \\ %{}) do
+    route_private
+    |> Enum.reduce(conn(:get, "/.well-known/openid-configuration"), fn {key, value}, conn ->
+      put_private(conn, key, value)
+    end)
+    |> Map.put(:path_params, path_params)
     |> put_private(:attesto_phoenix_config, host)
     |> put_private(:attesto_protocol_config, protocol)
     |> OpenIDConfigurationController.show(%{})
@@ -363,17 +367,104 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       assert body["scopes_supported"] == ["openid"]
     end
 
-    test "omits authorization_endpoint when the host does not supply one" do
+    test "derives the required authorization_endpoint when the host does not override it" do
       body =
         call_show(host_config(authorization_endpoint: nil), protocol_config()) |> decode_body()
 
-      refute Map.has_key?(body, "authorization_endpoint")
+      assert body["authorization_endpoint"] == "#{@issuer}/oauth/authorize"
     end
 
     test "omits userinfo_endpoint when the host does not supply one" do
       body = call_show(host_config(userinfo_endpoint: nil), protocol_config()) |> decode_body()
 
       refute Map.has_key?(body, "userinfo_endpoint")
+    end
+
+    test "suppresses equivalent local userinfo endpoint URLs when the macro route is disabled" do
+      base = host_config(userinfo_endpoint: nil)
+
+      for endpoint <- [
+            Config.userinfo_endpoint_url(base),
+            "https://ISSUER.EXAMPLE:443/oauth/userinfo?aud=api",
+            "https://%69SSUER.EXAMPLE/oauth/userinfo",
+            "https://issuer.example/oauth/%75serinfo",
+            "https://issuer.example/oauth/unused/../userinfo"
+          ] do
+        body =
+          call_show(
+            host_config(userinfo_endpoint: endpoint),
+            protocol_config(),
+            %{attesto_phoenix_local_userinfo_path: "/oauth/userinfo"}
+          )
+          |> decode_body()
+
+        refute Map.has_key?(body, "userinfo_endpoint")
+      end
+    end
+
+    test "uses the actual prefixed local userinfo path recorded by the router" do
+      body =
+        call_show(
+          host_config(userinfo_endpoint: "https://issuer.example/auth/oauth/userinfo?aud=api"),
+          protocol_config(),
+          %{attesto_phoenix_local_userinfo_path: "/auth/oauth/userinfo"}
+        )
+        |> decode_body()
+
+      refute Map.has_key?(body, "userinfo_endpoint")
+    end
+
+    test "expands a dynamic surrounding scope before comparing the removed route" do
+      for {tenant, endpoint} <- [
+            {"acme", "https://issuer.example/acme/oauth/userinfo"},
+            {"acme@example", "https://issuer.example/acme@example/oauth/userinfo"},
+            {"acme@example", "https://issuer.example/acme%40example/oauth/userinfo"},
+            {"acme/foo", "https://issuer.example/acme%2Ffoo/oauth/userinfo"}
+          ] do
+        body =
+          call_show(
+            host_config(userinfo_endpoint: endpoint),
+            protocol_config(),
+            %{attesto_phoenix_local_userinfo_path: "/:tenant/oauth/userinfo"},
+            %{"tenant" => tenant}
+          )
+          |> decode_body()
+
+        refute Map.has_key?(body, "userinfo_endpoint")
+      end
+    end
+
+    test "does not collapse an encoded dynamic-scope slash into a path separator" do
+      external = "https://issuer.example/acme/foo/oauth/userinfo"
+
+      body =
+        call_show(
+          host_config(userinfo_endpoint: external),
+          protocol_config(),
+          %{attesto_phoenix_local_userinfo_path: "/:tenant/oauth/userinfo"},
+          %{"tenant" => "acme/foo"}
+        )
+        |> decode_body()
+
+      assert body["userinfo_endpoint"] == external
+    end
+
+    test "preserves an explicit externally mounted userinfo_endpoint when the local route is disabled" do
+      for external <- [
+            "https://claims.example/userinfo",
+            "https://issuer.example/external/userinfo",
+            "https://issuer.example//external/oauth/userinfo"
+          ] do
+        body =
+          call_show(
+            host_config(userinfo_endpoint: external),
+            protocol_config(),
+            %{attesto_phoenix_local_userinfo_path: "/oauth/userinfo"}
+          )
+          |> decode_body()
+
+        assert body["userinfo_endpoint"] == external
+      end
     end
 
     test "omits claims_supported when none are configured" do

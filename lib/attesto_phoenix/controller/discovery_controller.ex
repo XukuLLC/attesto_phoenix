@@ -158,9 +158,10 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
       # derives only issuer/token_endpoint, so it MUST be supplied here or the
       # RFC 8414 document silently omits it (and an OAuth client - e.g. the
       # ChatGPT MCP connector - that reads this document rather than OpenID
-      # Discovery cannot run the code flow). Derived from the same path
-      # resolution as token_endpoint so the two can never diverge.
-      authorization_endpoint: Config.authorize_endpoint_url(config),
+      # Discovery cannot run the code flow). An explicit validated HTTPS URL
+      # supports a separately mounted host login surface; otherwise derive it
+      # from the same trusted issuer/path configuration as token_endpoint.
+      authorization_endpoint: config.authorization_endpoint || Config.authorize_endpoint_url(config),
       response_types_supported: @response_types_supported,
       response_modes_supported: @response_modes_supported,
       grant_types_supported: Config.grant_types_supported(config),

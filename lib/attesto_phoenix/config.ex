@@ -15,8 +15,11 @@ defmodule AttestoPhoenix.Config do
 
   ### Required
 
-    * `:issuer` - issuer URL (string) used as the JWT `iss`, the discovery
-      issuer, and the base for endpoint URLs.
+    * `:issuer` - absolute HTTPS issuer URL (string, with no query or fragment)
+      used as the JWT `iss`, the discovery issuer, and the base for endpoint
+      URLs. The bundled router's root well-known routes require an origin-only
+      issuer; a path-bearing issuer requires standards-derived well-known
+      routes mounted by the host.
     * `:keystore` - module implementing `Attesto.Keystore` providing the
       signing key and the verification keys published via JWKS. Use a static
       keystore or a host KMS/HSM/Vault-backed implementation; per-key `alg`
@@ -49,9 +52,10 @@ defmodule AttestoPhoenix.Config do
     * `:www_authenticate` - `(conn, challenge_string -> conn)`. Optional
       transport hook used by `AttestoPhoenix.OAuthError` to write the
       `WWW-Authenticate` challenge header.
-    * `:resource_metadata` - absolute URL of this resource's protected-resource
-      metadata document (RFC 9728). When set, `AttestoPhoenix.Plug.Authenticate`
-      advertises it as a `resource_metadata` auth-param on every
+    * `:resource_metadata` - absolute HTTPS URL (with no fragment) of this
+      resource's protected-resource metadata document (RFC 9728). When set,
+      `AttestoPhoenix.Plug.Authenticate` advertises it as a `resource_metadata`
+      auth-param on every
       `WWW-Authenticate` challenge it renders (RFC 9728 §5.1), so a client that
       is refused with 401 can discover which authorization server issues tokens
       for this resource. Omitted from the challenge when unset.
@@ -62,7 +66,9 @@ defmodule AttestoPhoenix.Config do
       origin serve multiple resource identifiers without pointing every
       challenge at one global document. An invalid callback result is omitted
       rather than advertised. When unset, the static `:resource_metadata` value
-      retains its existing behavior.
+      retains its existing behavior. The callback is trusted configuration:
+      return pinned or allowlisted metadata URLs and do not derive their
+      authority from request Host, forwarded, query, or header values.
     * `:basic_realm` - realm string for token-endpoint Basic auth challenges.
       Default `"OAuth"`.
     * `:htu` - `(conn -> canonical_url_string)`. Overrides how the DPoP `htu`
@@ -229,16 +235,19 @@ defmodule AttestoPhoenix.Config do
       SHOULD NOT be used). Defaults to `["header"]`; add `"body"` only for a
       resource server that intentionally accepts RFC 6750 §2.2 form-body
       `access_token` credentials and wants to advertise that method.
-    * `:authorization_endpoint` - absolute authorization endpoint URL to
+    * `:authorization_endpoint` - absolute HTTPS authorization endpoint URL to
       advertise in OpenID Provider Metadata (RFC 6749 §3.1 / OpenID Connect
       Discovery §3). `attesto_routes/1` mounts the generic controller; the host
-      supplies resource-owner authentication and consent through callbacks.
-      Omitted from OpenID Provider Metadata when unset.
-    * `:userinfo_endpoint` - absolute UserInfo URL to advertise in OpenID
+      supplies resource-owner authentication and consent through callbacks. It
+      defaults to the URL derived from `:issuer` and `:authorize_path`.
+    * `:userinfo_endpoint` - absolute HTTPS UserInfo URL to advertise in OpenID
       Provider Metadata (OpenID Connect Core §5.3). `attesto_routes/1` mounts
       the generic controller by default and the host supplies claim values
-      through `:build_userinfo_claims`; leave this unset when the UserInfo route
-      is disabled. Omitted from OpenID Provider Metadata when unset.
+      through `:build_userinfo_claims`. When the macro's local UserInfo route is
+      disabled, an endpoint on the issuer origin at the removed local path is
+      suppressed from its retained Provider Metadata route; an endpoint on a
+      different origin or path is retained. Omitted from OpenID Provider
+      Metadata when unset.
     * `:claims_supported` - list of claim names the host's UserInfo endpoint
       and ID Tokens can return (OpenID Connect Discovery §3). Advertised in the
       OpenID Provider Metadata; omitted when unset.
@@ -361,9 +370,10 @@ defmodule AttestoPhoenix.Config do
       `/oauth/par`, etc. A host mounting under `/mcp/oauth` sets
       `oauth_path_prefix: "/mcp/oauth"` to advertise `/mcp/oauth/token` and so
       on. This is the FULL client-visible mount prefix, since the controllers
-      cannot see the surrounding Phoenix `scope`. The well-known documents
-      (RFC 8615) and the JWKS document stay anchored at the host root and are
-      NOT relocated by this prefix.
+      cannot see the surrounding Phoenix `scope`. It does not relocate the
+      router macro's discovery or JWKS routes. Those discovery routes are the
+      fixed origin-issuer forms; see `AttestoPhoenix.Router` for the
+      path-bearing issuer boundary.
     * `:authorize_path`, `:token_path`, `:par_path`, `:revocation_path`,
       `:introspection_path`, `:registration_path`, `:userinfo_path` - explicit per-endpoint path
       overrides. When set, the override wins over `:oauth_path_prefix` for that
@@ -1715,13 +1725,27 @@ defmodule AttestoPhoenix.Config do
   this request. Without a resolver, the static `:resource_metadata` value is
   returned unchanged. Invalid resolver results are omitted so a challenge
   never advertises an unusable or unsafe metadata URI.
+
+  The optional third argument is a plug option list. When it contains
+  `:resource_metadata`, that explicit value (including `nil`) is authoritative,
+  is validated by the same rules, and the configured resolver is not invoked.
+  This keeps a per-plug override consistent across every error path.
   """
   @spec resource_metadata_url(t(), Plug.Conn.t()) :: String.t() | nil
-  def resource_metadata_url(%__MODULE__{} = config, %Plug.Conn{} = conn) do
+  @spec resource_metadata_url(t(), Plug.Conn.t(), keyword()) :: String.t() | nil
+  def resource_metadata_url(config, conn, plug_opts \\ [])
+
+  def resource_metadata_url(%__MODULE__{} = config, %Plug.Conn{} = conn, plug_opts) when is_list(plug_opts) do
     candidate =
-      case config.resource_metadata_resolver do
-        nil -> config.resource_metadata
-        callback -> Callback.invoke(callback, [conn])
+      case Keyword.fetch(plug_opts, :resource_metadata) do
+        {:ok, explicit} ->
+          explicit
+
+        :error ->
+          case config.resource_metadata_resolver do
+            nil -> config.resource_metadata
+            callback -> Callback.invoke(callback, [conn])
+          end
       end
 
     if absolute_resource_url?(candidate), do: candidate
@@ -1729,8 +1753,8 @@ defmodule AttestoPhoenix.Config do
 
   @doc """
   Absolute URL of the JWK Set document (RFC 7517 §5; the `jwks_uri` per
-  RFC 8414 §2). The JWKS document is anchored at the host root under RFC 8615,
-  so it is NOT relocated by `:oauth_path_prefix`.
+  RFC 8414 §2). This library keeps the JWKS document at its stable root path,
+  so it is not relocated by `:oauth_path_prefix`.
   """
   @spec jwks_uri(t()) :: String.t()
   def jwks_uri(%__MODULE__{} = config), do: endpoint_url(config, "/.well-known/jwks.json")
@@ -2042,8 +2066,11 @@ defmodule AttestoPhoenix.Config do
               "Got: #{inspect(config.audience)}."
     end
 
+    validate_issuer!(config)
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
+    validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
+    validate_optional_https_endpoint!(:userinfo_endpoint, config.userinfo_endpoint)
     validate_bearer_methods_supported!(config)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
@@ -2123,9 +2150,14 @@ defmodule AttestoPhoenix.Config do
 
   defp callback_with_call_arity?(callback, arity) when is_function(callback), do: is_function(callback, arity)
 
-  defp callback_with_call_arity?({module, fun}, _arity), do: is_atom(module) and is_atom(fun)
+  defp callback_with_call_arity?({module, fun}, arity) when is_atom(module) and is_atom(fun) do
+    Code.ensure_loaded?(module) and function_exported?(module, fun, arity)
+  end
 
-  defp callback_with_call_arity?({module, fun, extra}, _arity), do: is_atom(module) and is_atom(fun) and is_list(extra)
+  defp callback_with_call_arity?({module, fun, extra}, arity)
+       when is_atom(module) and is_atom(fun) and is_list(extra) do
+    Code.ensure_loaded?(module) and function_exported?(module, fun, arity + length(extra))
+  end
 
   defp callback_with_call_arity?(_callback, _arity), do: false
 
@@ -2173,6 +2205,44 @@ defmodule AttestoPhoenix.Config do
 
   defp absolute_resource_url?(_), do: false
 
+  # RFC 8414 §2 and OpenID Connect Discovery §3 require an HTTPS issuer and
+  # prohibit query and fragment components. A path is valid at the protocol
+  # layer; the bundled router's origin-only limitation is documented at its
+  # route-mount API because Config can also support host-mounted routes.
+  defp validate_issuer!(%__MODULE__{issuer: issuer}) do
+    valid? =
+      if is_binary(issuer) do
+        case URI.new(issuer) do
+          {:ok, %URI{scheme: "https", host: host, query: nil, fragment: nil}}
+          when is_binary(host) and host != "" ->
+            not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, issuer)
+
+          _ ->
+            false
+        end
+      else
+        false
+      end
+
+    if not valid? do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :issuer must be an absolute URL using the https scheme, with a host " <>
+              "and no query or fragment; got #{inspect(issuer)}."
+    end
+  end
+
+  defp validate_optional_https_endpoint!(_key, nil), do: :ok
+
+  defp validate_optional_https_endpoint!(key, value) do
+    if absolute_resource_url?(value) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: #{inspect(key)}, when set, must be an absolute https URL " <>
+              "with a host and no fragment; got #{inspect(value)}."
+    end
+  end
+
   # ── Boot-time discovery-document safety guard ────────────────────────────
   #
   # A discovery document that omits a required endpoint - or advertises an
@@ -2196,7 +2266,7 @@ defmodule AttestoPhoenix.Config do
   # `{member_name, resolver}` where the resolver derives the advertised value
   # from this config; the library owns every one of them (they are derived from
   # `:issuer` and the resolved endpoint paths), so every one MUST resolve to a
-  # non-nil absolute https/http URL or the document would silently omit or
+  # non-nil absolute HTTPS URL or the document would silently omit or
   # mis-advertise a required member.
   @required_discovery_endpoints [
     {"issuer", &__MODULE__.issuer/1},
@@ -2221,7 +2291,7 @@ defmodule AttestoPhoenix.Config do
     Enum.each(@required_discovery_endpoints, fn {member, resolver} ->
       url = resolver.(config)
 
-      if not absolute_url?(url) do
+      if not absolute_resource_url?(url) do
         raise ArgumentError,
               "AttestoPhoenix.Config: the discovery document would advertise a missing " <>
                 "or non-absolute #{member} (#{inspect(url)}). RFC 8414 §2 / OpenID Connect " <>
@@ -2232,23 +2302,11 @@ defmodule AttestoPhoenix.Config do
     end)
   end
 
-  # An absolute URL for discovery purposes has both a scheme and a host. A
-  # path-only string (what `URI.merge/2` yields from a scheme-less issuer) has a
-  # nil host and is rejected.
-  defp absolute_url?(value) when is_binary(value) and value != "" do
-    case URI.parse(value) do
-      %URI{scheme: scheme, host: host} when is_binary(scheme) and is_binary(host) and host != "" -> true
-      _ -> false
-    end
-  end
-
-  defp absolute_url?(_), do: false
-
   # The OAuth endpoint members whose advertised path the router mounts, paired
   # with the resolver that yields the advertised path and the canonical tail the
-  # router appends under its own `/oauth` mount prefix. The well-known documents
-  # and `jwks_uri` are anchored at the host root (RFC 8615) and are NOT relocated
-  # by `:oauth_path_prefix`, so they are not in this set. The authorization
+  # router appends under its own `/oauth` mount prefix. The macro's discovery
+  # routes and this library's `jwks_uri` are not relocated by
+  # `:oauth_path_prefix`, so they are not in this set. The authorization
   # endpoint is excluded because the host MAY serve it off-server via the
   # `:authorization_endpoint` absolute-URL override (it runs the host login UI),
   # which the router does not mount.

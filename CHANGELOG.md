@@ -9,8 +9,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `attesto_routes/1` accepts `userinfo: false` and
-  `openid_configuration: false` as independent, compile-time endpoint
-  capability controls. Both default to `true`, so existing calls retain the
+  `openid_configuration: false` as independent, compile-time route-mount
+  controls. Both default to `true`, so existing calls retain the
   exact route table and pipeline data; OAuth-only hosts can omit the OIDC-only
   surfaces without restating the authorization-server routes.
 - `AttestoPhoenix.Config` accepts a `:resource_metadata_resolver` callback that
@@ -21,10 +21,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `:resource_metadata` URL remains the backward-compatible fallback when no
   resolver is configured.
 
+### Fixed
+
+- UserInfo now enforces `:require_https` before verifying or returning claims,
+  and honors the configured error transport hooks on verification, TLS,
+  revoked-token, and insufficient-scope failures. Its accepted RFC 6750 Bearer
+  presentation methods now remain aligned with `bearer_methods_supported`.
+- An explicit per-plug `:resource_metadata` value (including `nil`) and error
+  transport hooks now take precedence consistently across core verification,
+  TLS, revocation, and principal-resolution failures. Invalid dynamic values
+  are omitted; the configured resolver is skipped for an explicit override.
+- OpenID Provider Metadata now derives the required `authorization_endpoint`
+  when no override is configured, and both OAuth and OpenID metadata honor the
+  same validated external override. Issuer and advertised endpoint URLs are
+  validated as HTTPS, and resource-metadata MFA callbacks fail at boot when the
+  configured function is missing or has the wrong effective arity.
+- `userinfo: false` now suppresses a configured `:userinfo_endpoint` on the
+  issuer origin at the removed local path (including equivalent URL spelling),
+  while preserving an endpoint on a different origin or path in Provider
+  Metadata.
+
 ### Documentation
 
 - Documented the maintained route-catalog/host-policy boundary, declarative
-  route pipeline and endpoint capability model, shared plumbing for permissive
+  route pipeline and route-mount model, shared plumbing for permissive
   OAuth and strict FAPI profiles, and per-resource RFC 9728 ownership for
   multi-resource origins.
 

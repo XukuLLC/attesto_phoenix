@@ -84,8 +84,8 @@ defmodule AttestoPhoenix do
 
   `AttestoPhoenix.Router` provides the `attesto_routes/1` macro, which
   mounts the authorization-server endpoints under a scope the host chooses.
-  Hosts declaratively select optional endpoint capabilities and route pipeline
-  classes; application authentication and consent remain callbacks. The same
+  Hosts declaratively select optional route mounts and route pipeline classes;
+  application authentication and consent remain callbacks. The same
   routing and controller plumbing supports public-client OAuth and strict FAPI
   profiles through different policy configuration rather than controller
   forks. Discovery and the JWK Set are public; the token and revocation

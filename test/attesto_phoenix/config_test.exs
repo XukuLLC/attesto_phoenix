@@ -93,6 +93,14 @@ defmodule AttestoPhoenix.ConfigTest do
     def load_client(_client_id), do: {:error, :not_found}
   end
 
+  defmodule ResourceMetadataResolver do
+    @moduledoc false
+
+    def resolve(conn), do: "https://api.example/.well-known/oauth-protected-resource" <> conn.request_path
+    def resolve_with_base(conn, base), do: base <> conn.request_path
+    def wrong_arity, do: nil
+  end
+
   # The minimal required-key set. Required callbacks stay flat (this phase keeps
   # the flat keys as the required surface); overrides layer behaviour-module
   # keys or competing flat callbacks on top.
@@ -440,10 +448,46 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.resource_metadata_url(static_cfg, Plug.Test.conn(:get, "/alpha")) == static
     end
 
-    test ":resource_metadata_resolver validates its callback shape" do
+    test "an explicit plug resource_metadata override is validated, wins including nil, and skips the resolver" do
       base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
 
-      for bad <- [123, :resolver, fn -> nil end, {"not-a-module", :resolve}] do
+      cfg =
+        base
+        |> Keyword.put(:resource_metadata_resolver, fn _conn ->
+          raise "the configured resolver must not run for an explicit plug override"
+        end)
+        |> Config.new()
+
+      conn = Plug.Test.conn(:get, "/alpha")
+      explicit = "https://plug.example/.well-known/oauth-protected-resource/alpha"
+
+      assert Config.resource_metadata_url(cfg, conn, resource_metadata: explicit) == explicit
+      assert Config.resource_metadata_url(cfg, conn, resource_metadata: nil) == nil
+      assert Config.resource_metadata_url(cfg, conn, resource_metadata: "http://unsafe.example") == nil
+    end
+
+    test ":resource_metadata_resolver validates function and MFA call arity" do
+      base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+
+      pair = {ResourceMetadataResolver, :resolve}
+      triple = {ResourceMetadataResolver, :resolve_with_base, ["https://api.example"]}
+
+      assert %Config{resource_metadata_resolver: ^pair} =
+               Config.new(Keyword.put(base, :resource_metadata_resolver, pair))
+
+      assert %Config{resource_metadata_resolver: ^triple} =
+               Config.new(Keyword.put(base, :resource_metadata_resolver, triple))
+
+      for bad <- [
+            123,
+            :resolver,
+            fn -> nil end,
+            {"not-a-module", :resolve},
+            {ResourceMetadataResolver, :missing},
+            {ResourceMetadataResolver, :wrong_arity},
+            {ResourceMetadataResolver, :resolve_with_base, []},
+            {ResourceMetadataResolver, :resolve, [:unexpected]}
+          ] do
         assert_raise ArgumentError, ~r/:resource_metadata_resolver must be a one-argument callback/, fn ->
           Config.new(Keyword.put(base, :resource_metadata_resolver, bad))
         end
@@ -604,6 +648,46 @@ defmodule AttestoPhoenix.ConfigTest do
       assert_raise ArgumentError, ~r/absolute URL/, fn ->
         config(issuer: "/oauth")
       end
+    end
+
+    test ":issuer must use HTTPS and cannot contain a query, fragment, or malformed escape" do
+      for bad <- [
+            "http://issuer.example",
+            "https://issuer.example?tenant=one",
+            "https://issuer.example#tenant-one",
+            "https://issuer.example/%ZZ",
+            123
+          ] do
+        assert_raise ArgumentError, ~r/:issuer must be an absolute URL using the https scheme/, fn ->
+          config(issuer: bad)
+        end
+      end
+    end
+
+    test "path-bearing issuers remain valid for host-mounted standards-derived well-known routes" do
+      assert Config.issuer(config(issuer: "https://issuer.example/tenant")) ==
+               "https://issuer.example/tenant"
+    end
+
+    test "OpenID endpoint overrides must be absolute HTTPS URLs without fragments" do
+      for key <- [:authorization_endpoint, :userinfo_endpoint],
+          bad <- [
+            "/relative",
+            "http://issuer.example/endpoint",
+            "https://issuer.example/endpoint#fragment",
+            "https://issuer.example/%ZZ",
+            123
+          ] do
+        assert_raise ArgumentError, ~r/#{key}.*absolute https URL/, fn ->
+          config([{key, bad}])
+        end
+      end
+
+      assert config(authorization_endpoint: "https://login.example/authorize?audience=api").authorization_endpoint ==
+               "https://login.example/authorize?audience=api"
+
+      assert config(userinfo_endpoint: "https://claims.example/userinfo").userinfo_endpoint ==
+               "https://claims.example/userinfo"
     end
 
     test "the raised message names the offending member and the issuer" do

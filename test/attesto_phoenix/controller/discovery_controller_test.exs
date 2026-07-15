@@ -89,6 +89,13 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
                ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
     end
 
+    test "advertises a validated external authorization endpoint override" do
+      external = "https://login.example/authorize"
+      body = call_show(host_config(authorization_endpoint: external), protocol_config()) |> decode_body()
+
+      assert body["authorization_endpoint"] == external
+    end
+
     test "advertises device_authorization_endpoint + device_code grant only when enabled (RFC 8628)" do
       # Off by default.
       off = call_show(host_config(), protocol_config()) |> decode_body()
