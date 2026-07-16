@@ -9,6 +9,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
+  alias Plug.Router.Utils
 
   @issuer "https://issuer.example"
   @authorization_endpoint "https://issuer.example/authorize"
@@ -64,11 +65,26 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
 
   # Invoke the controller action directly with both configs placed where the
   # action expects them, mirroring what a router pipeline installs.
-  defp call_show(host, protocol) do
-    conn(:get, "/.well-known/openid-configuration")
+  defp call_show(
+         host,
+         protocol,
+         route_private \\ %{},
+         path_params \\ %{},
+         request_path \\ "/.well-known/openid-configuration"
+       ) do
+    route_private
+    |> Enum.reduce(conn(:get, request_path), fn {key, value}, conn ->
+      put_private(conn, key, value)
+    end)
+    |> Map.put(:path_params, path_params)
     |> put_private(:attesto_phoenix_config, host)
     |> put_private(:attesto_protocol_config, protocol)
     |> OpenIDConfigurationController.show(%{})
+  end
+
+  defp local_userinfo_route(path) do
+    {[], segments} = Utils.build_path_match(path)
+    %{attesto_phoenix_local_userinfo_route: {segments, 2}}
   end
 
   defp decode_body(conn), do: JSON.decode!(conn.resp_body)
@@ -363,15 +379,217 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       assert body["scopes_supported"] == ["openid"]
     end
 
-    test "omits authorization_endpoint when the host does not supply one" do
+    test "derives the required authorization_endpoint when the host does not override it" do
       body =
         call_show(host_config(authorization_endpoint: nil), protocol_config()) |> decode_body()
 
-      refute Map.has_key?(body, "authorization_endpoint")
+      assert body["authorization_endpoint"] == "#{@issuer}/oauth/authorize"
     end
 
     test "omits userinfo_endpoint when the host does not supply one" do
       body = call_show(host_config(userinfo_endpoint: nil), protocol_config()) |> decode_body()
+
+      refute Map.has_key?(body, "userinfo_endpoint")
+    end
+
+    test "advertises a derived userinfo endpoint while the local route is enabled" do
+      config = host_config(userinfo_endpoint: :derived)
+      body = call_show(config, protocol_config()) |> decode_body()
+
+      assert body["userinfo_endpoint"] == Config.userinfo_endpoint_url(config)
+    end
+
+    test "suppresses a derived endpoint using Phoenix path-segment equivalence" do
+      for local_path <- [
+            "/oauth/userinfo",
+            "/oauth/userinfo/",
+            "/oauth//userinfo",
+            "//oauth/userinfo"
+          ] do
+        body =
+          call_show(
+            host_config(userinfo_endpoint: :derived),
+            protocol_config(),
+            local_userinfo_route(local_path)
+          )
+          |> decode_body()
+
+        refute Map.has_key?(body, "userinfo_endpoint")
+      end
+
+      for userinfo_path <- [
+            "/oauth/userinfo/",
+            "/oauth//userinfo",
+            "/oauth/%75serinfo",
+            "/oauth/userinfo?aud=api"
+          ] do
+        body =
+          call_show(
+            host_config(userinfo_endpoint: :derived, userinfo_path: userinfo_path),
+            protocol_config(),
+            local_userinfo_route("/oauth/userinfo")
+          )
+          |> decode_body()
+
+        refute Map.has_key?(body, "userinfo_endpoint")
+      end
+    end
+
+    test "keeps static route bytes and dot segments significant just as Phoenix dispatch does" do
+      config = host_config(userinfo_endpoint: :derived)
+
+      for local_path <- [
+            "/oauth/%75serinfo",
+            "/oauth/unused/../userinfo",
+            "/./oauth/userinfo"
+          ] do
+        body =
+          call_show(
+            config,
+            protocol_config(),
+            local_userinfo_route(local_path)
+          )
+          |> decode_body()
+
+        assert body["userinfo_endpoint"] == Config.userinfo_endpoint_url(config)
+      end
+
+      encoded_static =
+        host_config(
+          userinfo_endpoint: :derived,
+          userinfo_path: "/oauth/%2575serinfo"
+        )
+
+      body =
+        call_show(
+          encoded_static,
+          protocol_config(),
+          local_userinfo_route("/oauth/%75serinfo")
+        )
+        |> decode_body()
+
+      refute Map.has_key?(body, "userinfo_endpoint")
+
+      dot_path =
+        host_config(
+          userinfo_endpoint: :derived,
+          userinfo_path: "/oauth/unused/%2E%2E/userinfo"
+        )
+
+      body =
+        call_show(dot_path, protocol_config(), local_userinfo_route("/oauth/userinfo"))
+        |> decode_body()
+
+      assert body["userinfo_endpoint"] == Config.userinfo_endpoint_url(dot_path)
+    end
+
+    test "uses the actual prefixed local userinfo path recorded by the router" do
+      config =
+        host_config(
+          userinfo_endpoint: :derived,
+          oauth_path_prefix: "/auth/oauth"
+        )
+
+      body =
+        call_show(
+          config,
+          protocol_config(),
+          local_userinfo_route("/auth/oauth/userinfo")
+        )
+        |> decode_body()
+
+      refute Map.has_key?(body, "userinfo_endpoint")
+    end
+
+    test "uses realized dynamic surrounding-scope segments" do
+      for {scope_path, userinfo_path} <- [
+            {"acme", "/acme/oauth/userinfo"},
+            {"acme@example", "/acme@example/oauth/userinfo"},
+            {"acme%40example", "/acme%40example/oauth/userinfo"},
+            {"acme%2Ffoo", "/acme%2Ffoo/oauth/userinfo"}
+          ] do
+        body =
+          call_show(
+            host_config(userinfo_endpoint: :derived, userinfo_path: userinfo_path),
+            protocol_config(),
+            local_userinfo_route("/oauth/userinfo"),
+            %{},
+            "/#{scope_path}/.well-known/openid-configuration"
+          )
+          |> decode_body()
+
+        refute Map.has_key?(body, "userinfo_endpoint")
+      end
+    end
+
+    test "does not collapse an encoded dynamic-scope slash into a path separator" do
+      config =
+        host_config(
+          userinfo_endpoint: :derived,
+          userinfo_path: "/acme/foo/oauth/userinfo"
+        )
+
+      body =
+        call_show(
+          config,
+          protocol_config(),
+          local_userinfo_route("/oauth/userinfo"),
+          %{},
+          "/acme%2Ffoo/.well-known/openid-configuration"
+        )
+        |> decode_body()
+
+      assert body["userinfo_endpoint"] == Config.userinfo_endpoint_url(config)
+    end
+
+    test "does not suppress a derived endpoint for a different realized dynamic scope" do
+      config =
+        host_config(
+          userinfo_endpoint: :derived,
+          userinfo_path: "/beta/oauth/userinfo"
+        )
+
+      body =
+        call_show(
+          config,
+          protocol_config(),
+          local_userinfo_route("/oauth/userinfo"),
+          %{},
+          "/acme/.well-known/openid-configuration"
+        )
+        |> decode_body()
+
+      assert body["userinfo_endpoint"] == Config.userinfo_endpoint_url(config)
+    end
+
+    test "preserves every explicit host UserInfo declaration when the bundled route is disabled" do
+      for external <- [
+            "https://issuer.example/oauth/userinfo",
+            "https://ISSUER.EXAMPLE:443/oauth/userinfo?aud=api",
+            "https://claims.example/userinfo",
+            "https://issuer.example/external/userinfo",
+            "https://issuer.example//external/oauth/userinfo"
+          ] do
+        body =
+          call_show(
+            host_config(userinfo_endpoint: external),
+            protocol_config(),
+            local_userinfo_route("/oauth/userinfo")
+          )
+          |> decode_body()
+
+        assert body["userinfo_endpoint"] == external
+      end
+    end
+
+    test "suppresses a derived endpoint on an issuer with a non-default port" do
+      body =
+        call_show(
+          host_config(issuer: "https://issuer.example:8443", userinfo_endpoint: :derived),
+          protocol_config(),
+          local_userinfo_route("/oauth/userinfo")
+        )
+        |> decode_body()
 
       refute Map.has_key?(body, "userinfo_endpoint")
     end

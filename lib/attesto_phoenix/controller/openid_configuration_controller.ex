@@ -37,9 +37,11 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   authorization endpoint does not consume the `claims` parameter unless the
   host wires it.
 
-  The host-specific members - the `authorization_endpoint` (RFC 6749 §3.1)
-  and `userinfo_endpoint` (OpenID Connect Core §5.3), both host-owned and
-  hence not mounted by `AttestoPhoenix.Router`; the supported scopes
+  The configurable members - the `authorization_endpoint` (RFC 6749 §3.1),
+  derived from the mounted authorization path unless explicitly overridden,
+  and `userinfo_endpoint` (OpenID Connect Core §5.3), whose generic
+  controllers can be mounted by `AttestoPhoenix.Router` while authentication,
+  consent, and claim values remain host callbacks; the supported scopes
   (`scopes_supported`, to which the core builder adds the reserved `openid`
   scope per OpenID Connect Core §3.1.2.1); the supported claims
   (`claims_supported`); the supported ACR values (`acr_values_supported`,
@@ -49,6 +51,13 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   registration endpoint (`registration_endpoint`, RFC 7591, advertised only
   when registration is enabled) - are read from `AttestoPhoenix.Config` and
   passed through, never hardcoded here.
+
+  When `attesto_routes(userinfo: false)` retains this metadata route, the
+  router records the removed local path in `conn.private`. A
+  `userinfo_endpoint: :derived` value on the issuer origin at a
+  route-equivalent path is then omitted. A configured URL is an authoritative
+  host declaration and remains advertised, including when the host replaces
+  the bundled controller at that same path.
 
   The response carries no secrets and is identical for every caller, so it is
   served unauthenticated. OpenID Connect Discovery §4 permits caching of the
@@ -73,6 +82,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   alias Attesto.OpenIDDiscovery
   alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.URLComparison
 
   # The router pipeline installs the AttestoPhoenix.Config here. This is the
   # same private key the token and discovery endpoints read.
@@ -81,6 +91,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   # The router pipeline installs the derived Attesto.Config (the protocol
   # configuration the core metadata builder reads) here.
   @protocol_config_key :attesto_protocol_config
+  @local_userinfo_route_key :attesto_phoenix_local_userinfo_route
 
   # OpenID Connect Discovery §4: the configuration document is static for a
   # given provider configuration, so it may be cached by Relying Parties and
@@ -131,7 +142,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
     metadata =
       protocol_config
-      |> OpenIDDiscovery.metadata(discovery_opts(config))
+      |> OpenIDDiscovery.metadata(discovery_opts(config, conn))
       |> put_fapi_metadata(config)
 
     conn
@@ -180,8 +191,8 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   # reserved `openid` scope (OpenID Connect Core §3.1.2.1), so the core builder
   # adds it to the host's catalog, yielding `["openid"]` even when the host
   # configures no other scopes.
-  @spec discovery_opts(Config.t()) :: keyword()
-  defp discovery_opts(%Config{} = config) do
+  @spec discovery_opts(Config.t(), Plug.Conn.t()) :: keyword()
+  defp discovery_opts(%Config{} = config, %Plug.Conn{} = conn) do
     jar_alg_values = RequestObjectMetadata.signing_alg_values(config)
 
     [
@@ -195,8 +206,10 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       # mTLS `cnf` binding is enabled; nil-dropped otherwise so a non-mTLS OP
       # stays silent (FAPI / FAPI-CIBA read this from the provider metadata).
       tls_client_certificate_bound_access_tokens: tls_client_certificate_bound_access_tokens(config),
-      authorization_endpoint: config.authorization_endpoint,
-      userinfo_endpoint: config.userinfo_endpoint,
+      # OpenID Connect Discovery §3 requires this member. Config owns the
+      # explicit HTTPS override and the issuer/path-derived fallback.
+      authorization_endpoint: config.authorization_endpoint || Config.authorize_endpoint_url(config),
+      userinfo_endpoint: userinfo_endpoint(config, conn),
       revocation_endpoint: revocation_endpoint(config),
       introspection_endpoint: Config.introspection_endpoint_url(config),
       introspection_endpoint_auth_methods_supported: introspection_auth_methods(config),
@@ -318,6 +331,89 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   defp require_pushed_authorization_requests(%Config{}), do: nil
 
+  # Bridge the macro's compile-time local route decision into request-time
+  # metadata without overriding a deliberate host declaration. The released
+  # nil/string contract remains authoritative; only the explicit `:derived`
+  # derivation marker is eligible for stale-local-route suppression.
+  defp userinfo_endpoint(%Config{userinfo_endpoint: :derived} = config, %Plug.Conn{} = conn) do
+    endpoint = Config.userinfo_endpoint_url(config)
+
+    local_route = Map.get(conn.private, @local_userinfo_route_key)
+
+    if !local_userinfo_endpoint?(
+         endpoint,
+         config.issuer,
+         local_route,
+         conn.path_info,
+         conn.script_name
+       ),
+       do: endpoint
+  end
+
+  defp userinfo_endpoint(%Config{userinfo_endpoint: endpoint}, %Plug.Conn{}), do: endpoint
+
+  defp local_userinfo_endpoint?(endpoint, issuer, {local_segments, metadata_segment_count}, path_info, script_name)
+       when is_list(local_segments) and is_integer(metadata_segment_count) and metadata_segment_count >= 0 do
+    with true <- is_binary(endpoint) and is_binary(issuer),
+         {:ok, endpoint_uri} <- URI.new(endpoint),
+         {:ok, issuer_uri} <- URI.new(issuer) do
+      URLComparison.same_https_origin?(endpoint_uri, issuer_uri) and
+        route_path_matches?(
+          endpoint_uri.path,
+          local_segments,
+          metadata_segment_count,
+          path_info,
+          script_name
+        )
+    else
+      _error -> false
+    end
+  end
+
+  defp local_userinfo_endpoint?(_endpoint, _issuer, _local_route, _path_info, _script_name), do: false
+
+  # Reconstruct the concrete client-visible local route from Plug/Phoenix data
+  # instead of interpreting Phoenix route syntax. `path_info` contains the
+  # realized surrounding scope plus the metadata route; dropping that fixed
+  # tail yields concrete static/dynamic scope segments. `script_name` contributes
+  # any outer forwarded-router prefix. Both are request segments and decode
+  # once; the macro-relative route segments came from Plug's route compiler and
+  # remain literal. Dot segments are ordinary data throughout.
+  defp route_path_matches?(endpoint_path, local_segments, metadata_segment_count, path_info, script_name) do
+    with {:ok, endpoint_segments} <- request_path_segments(endpoint_path),
+         {:ok, request_segments} <- decode_request_segments(path_info),
+         {:ok, forwarded_segments} <- decode_request_segments(script_name),
+         true <- length(request_segments) >= metadata_segment_count do
+      surrounding_scope_segments =
+        Enum.take(request_segments, length(request_segments) - metadata_segment_count)
+
+      endpoint_segments == forwarded_segments ++ surrounding_scope_segments ++ local_segments
+    else
+      _error -> false
+    end
+  end
+
+  defp request_path_segments(path) when is_binary(path) do
+    segments =
+      for segment <- String.split(path, "/", trim: false), segment != "" do
+        URI.decode(segment)
+      end
+
+    {:ok, segments}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp request_path_segments(_path), do: :error
+
+  defp decode_request_segments(segments) when is_list(segments) do
+    {:ok, Enum.map(segments, &URI.decode/1)}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp decode_request_segments(_segments), do: :error
+
   defp authorization_response_iss_parameter_supported(%Config{authorization_response_iss: true}), do: true
 
   defp authorization_response_iss_parameter_supported(%Config{}), do: nil
@@ -390,7 +486,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   # An empty list means "not advertised": collapse it to nil so the core
   # builder omits the member instead of publishing an empty array. Used for the
   # optional `claims_supported` catalog, not for `scopes_supported` (which is
-  # always advertised; see discovery_opts/1).
+  # always advertised; see discovery_opts/2).
   @spec presence([term()]) :: [term()] | nil
   defp presence([]), do: nil
   defp presence(list) when is_list(list), do: list

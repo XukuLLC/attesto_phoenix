@@ -29,14 +29,16 @@ defmodule AttestoPhoenix do
       is reused verbatim; this package adds no crypto and forwards every
       protocol decision to it.
 
-    * **Transport (here).** Controllers behind a router macro that mount
-      authorization, token, pushed-authorization-request (RFC 9126),
-      revocation (RFC 7009), discovery (RFC 8414), JWK Set (RFC 7517),
-      UserInfo, and optional dynamic-registration (RFC 7591) endpoints, plus
-      protected-resource plugs that verify a Bearer/DPoP access token and
-      enforce its sender-constraint binding. The controllers and plugs use
-      the core OAuth-error / `WWW-Authenticate` helpers so every failure is
-      an RFC 6749 §5.2 / RFC 6750 §3 response, never a silent reject.
+    * **Transport (here).** Standards controllers behind a router macro that
+      owns the maintained route catalog for authorization, token,
+      pushed-authorization-request (RFC 9126), revocation (RFC 7009),
+      discovery (RFC 8414), JWK Set (RFC 7517), UserInfo, and optional
+      dynamic-registration (RFC 7591) endpoints. Hosts select endpoint
+      capabilities and metadata/interactive/protocol pipeline classes instead
+      of restating those routes. Protected-resource plugs verify Bearer/DPoP
+      access tokens and enforce sender-constraint binding. The controllers and
+      plugs use the core OAuth-error / `WWW-Authenticate` helpers so every
+      failure is an RFC 6749 §5.2 / RFC 6750 §3 response, never a silent reject.
 
     * **Persistence (here).** Ecto schemas that implement the core store
       behaviours for authorization codes and refresh tokens, and - for
@@ -82,9 +84,13 @@ defmodule AttestoPhoenix do
 
   `AttestoPhoenix.Router` provides the `attesto_routes/1` macro, which
   mounts the authorization-server endpoints under a scope the host chooses.
-  Discovery and the JWK Set are public; the token and revocation endpoints
-  authenticate the client via the `:load_client` / `:verify_client_secret`
-  callbacks.
+  Hosts declaratively select optional route mounts and route pipeline classes;
+  application authentication and consent remain callbacks. The same
+  routing and controller plumbing supports public-client OAuth and strict FAPI
+  profiles through different policy configuration rather than controller
+  forks. Discovery and the JWK Set are public; the token and revocation
+  endpoints authenticate the client via the `:load_client` /
+  `:verify_client_secret` callbacks.
 
   ## Entry points
 

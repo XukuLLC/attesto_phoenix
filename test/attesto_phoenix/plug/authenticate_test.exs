@@ -36,6 +36,18 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     def cert_der(_conn), do: Process.get(:attesto_phoenix_test_cert_der)
   end
 
+  defmodule ResourceMetadataResolver do
+    @moduledoc false
+
+    def resolve(conn) do
+      "https://pair.example/.well-known/oauth-protected-resource" <> conn.request_path
+    end
+
+    def resolve_with_extra(conn, base, resource) do
+      base <> conn.request_path <> "/" <> resource
+    end
+  end
+
   defmodule RevokedTokenStore do
     @moduledoc false
 
@@ -210,6 +222,233 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert conn.status == 401
     [challenge] = get_resp_header(conn, "www-authenticate")
     assert challenge =~ ~s(resource_metadata="#{url}")
+  end
+
+  test "selects or omits resource_metadata per protected-resource request", %{config: config} do
+    static = @issuer <> "/.well-known/oauth-protected-resource"
+
+    resolver = fn conn ->
+      case conn.request_path do
+        "/alpha" -> @issuer <> "/.well-known/oauth-protected-resource/alpha"
+        "/beta" -> @issuer <> "/.well-known/oauth-protected-resource/beta"
+        "/invalid" -> "http://unsafe.example/.well-known/oauth-protected-resource"
+        "/invalid-utf8" -> <<"https://api.example/", 0xFF>>
+        _ -> nil
+      end
+    end
+
+    config = %{config | resource_metadata: static, resource_metadata_resolver: resolver}
+
+    for {path, suffix} <- [{"/alpha", "alpha"}, {"/beta", "beta"}] do
+      conn =
+        :get
+        |> conn(path)
+        |> Authenticate.call(Authenticate.init(config: config))
+
+      assert conn.status == 401
+      [challenge] = get_resp_header(conn, "www-authenticate")
+
+      assert challenge =~
+               ~s(resource_metadata="#{@issuer}/.well-known/oauth-protected-resource/#{suffix}")
+
+      refute challenge =~ ~s(resource_metadata="#{static}")
+    end
+
+    for path <- ["/unowned", "/invalid", "/invalid-utf8"] do
+      unowned =
+        :get
+        |> conn(path)
+        |> Authenticate.call(Authenticate.init(config: config))
+
+      assert unowned.status == 401
+      [challenge] = get_resp_header(unowned, "www-authenticate")
+      refute challenge =~ "resource_metadata"
+    end
+  end
+
+  test "invokes MFA metadata resolvers through the challenge path with extra arguments appended", %{config: config} do
+    cases = [
+      {{__MODULE__.ResourceMetadataResolver, :resolve},
+       "https://pair.example/.well-known/oauth-protected-resource/reports"},
+      {{__MODULE__.ResourceMetadataResolver, :resolve_with_extra,
+        ["https://extra.example/.well-known/oauth-protected-resource", "invoices"]},
+       "https://extra.example/.well-known/oauth-protected-resource/reports/invoices"}
+    ]
+
+    for {resolver, selected} <- cases do
+      response =
+        :get
+        |> conn("/reports")
+        |> Authenticate.call(Authenticate.init(config: %{config | resource_metadata_resolver: resolver}))
+
+      assert response.status == 401
+      assert [challenge] = get_resp_header(response, "www-authenticate")
+      assert challenge =~ ~s(resource_metadata="#{selected}")
+    end
+  end
+
+  test "a resolver exception aborts the request instead of rendering an authentication response", %{config: config} do
+    config = %{
+      config
+      | resource_metadata_resolver: fn _conn ->
+          raise "resource metadata resolver failed"
+        end
+    }
+
+    assert_raise RuntimeError, "resource metadata resolver failed", fn ->
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config))
+    end
+  end
+
+  test "explicit plug challenge options win on core, TLS, revocation, and principal failures", %{config: config} do
+    resolver_url = "https://resolver.example/.well-known/oauth-protected-resource"
+    explicit_url = "https://plug.example/.well-known/oauth-protected-resource"
+    token = mint(config, scope: "openid")
+    Process.put(:attesto_phoenix_revoked_jti, peek_claims(config, token)["jti"])
+    on_exit(fn -> Process.delete(:attesto_phoenix_revoked_jti) end)
+
+    configured_hook = fn _conn, _status, _body ->
+      raise "the configured transport hook must lose to the explicit plug option"
+    end
+
+    explicit_send_error = fn conn, status, body ->
+      conn
+      |> put_resp_header("x-explicit-send-error", "true")
+      |> send_resp(status, JSON.encode!(body))
+      |> halt()
+    end
+
+    explicit_www_authenticate = fn conn, challenge ->
+      conn
+      |> put_resp_header("www-authenticate", challenge)
+      |> put_resp_header("x-explicit-www-authenticate", "true")
+    end
+
+    explicit_no_store = fn conn -> put_resp_header(conn, "x-explicit-no-store", "true") end
+
+    config = %{
+      config
+      | resource_metadata_resolver: fn _conn -> resolver_url end,
+        send_error: configured_hook,
+        www_authenticate: fn _conn, _challenge -> raise "configured WWW hook must not run" end,
+        no_store: fn _conn -> raise "configured no-store hook must not run" end
+    }
+
+    authenticated =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+
+    cases = [
+      {:core, conn(:get, "/reports"), config},
+      {:tls, authenticated, %{config | require_https: true}},
+      {:revocation, authenticated, %{config | code_store: __MODULE__.RevokedTokenStore}},
+      {:principal, authenticated, %{config | load_principal: fn _ -> {:error, :not_found} end}}
+    ]
+
+    for {failure, request, case_config} <- cases do
+      response =
+        Authenticate.call(
+          request,
+          Authenticate.init(
+            config: case_config,
+            resource_metadata: explicit_url,
+            send_error: explicit_send_error,
+            www_authenticate: explicit_www_authenticate,
+            no_store: explicit_no_store
+          )
+        )
+
+      assert response.status == 401, "unexpected status for #{failure} failure"
+      assert get_resp_header(response, "x-explicit-send-error") == ["true"]
+      assert get_resp_header(response, "x-explicit-www-authenticate") == ["true"]
+      assert get_resp_header(response, "x-explicit-no-store") == ["true"]
+      assert [challenge] = get_resp_header(response, "www-authenticate")
+      assert challenge =~ ~s(resource_metadata="#{explicit_url}")
+      refute challenge =~ resolver_url
+    end
+  end
+
+  test "an explicit nil plug metadata value is authoritative and safely omitted", %{config: config} do
+    config = %{
+      config
+      | resource_metadata_resolver: fn _conn ->
+          raise "resolver must not run when the plug explicitly selects nil"
+        end
+    }
+
+    response =
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config, resource_metadata: nil))
+
+    assert [challenge] = get_resp_header(response, "www-authenticate")
+    refute challenge =~ "resource_metadata"
+  end
+
+  test "init rejects an invalid static per-plug resource_metadata value" do
+    for invalid <- [
+          "",
+          "/relative",
+          "not-a-url",
+          "http://unsafe.example/metadata",
+          "https://api.example/metadata#fragment",
+          "https://api.example/%ZZ",
+          <<"https://api.example/", 0xFF>>,
+          123
+        ] do
+      assert_raise ArgumentError,
+                   ~r/AttestoPhoenix.Plug.Authenticate: :resource_metadata, when set, must be an absolute https URL/,
+                   fn ->
+                     Authenticate.init(resource_metadata: invalid)
+                   end
+    end
+
+    assert Authenticate.init(resource_metadata: nil) == [resource_metadata: nil]
+
+    assert Authenticate.init(resource_metadata: "https://api.example/.well-known/oauth-protected-resource") ==
+             [resource_metadata: "https://api.example/.well-known/oauth-protected-resource"]
+  end
+
+  test "Bearer, DPoP, and mTLS binding failures carry the selected metadata pointer", %{config: config} do
+    selected = "https://api.example/.well-known/oauth-protected-resource/reports"
+    config = %{config | resource_metadata_resolver: fn _conn -> selected end}
+
+    bearer =
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert [bearer_challenge = "Bearer " <> _] = get_resp_header(bearer, "www-authenticate")
+    assert bearer_challenge =~ ~s(resource_metadata="#{selected}")
+
+    dpop_key = DPoPKey.generate(:es256)
+    dpop_token = mint(config, scope: "openid", dpop_jkt: DPoPKey.thumbprint(dpop_key))
+
+    dpop =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> dpop_token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert [dpop_challenge = "DPoP " <> _] = get_resp_header(dpop, "www-authenticate")
+    assert dpop_challenge =~ ~s(resource_metadata="#{selected}")
+
+    der = self_signed_cert_der()
+    {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
+    mtls_token = mint(config, scope: "openid", mtls_cert_thumbprint: thumbprint)
+    mtls_config = %{config | mtls_enabled: true, cert_der: fn _conn -> nil end}
+
+    mtls =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> mtls_token)
+      |> Authenticate.call(Authenticate.init(config: mtls_config))
+
+    assert [mtls_challenge = "Bearer " <> _] = get_resp_header(mtls, "www-authenticate")
+    assert mtls_challenge =~ ~s(resource_metadata="#{selected}")
   end
 
   test "omits the resource_metadata pointer when the Config does not set it", %{config: config} do

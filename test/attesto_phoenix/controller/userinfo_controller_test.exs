@@ -51,6 +51,27 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     def access_token_revoked?(jti), do: jti == Process.get(:attesto_phoenix_revoked_jti)
   end
 
+  defmodule TransportCallbacks do
+    @moduledoc false
+
+    import Plug.Conn
+
+    def no_store(conn), do: put_resp_header(conn, "x-mfa-no-store", "pair")
+
+    def www_authenticate(conn, challenge, marker) do
+      conn
+      |> put_resp_header("www-authenticate", challenge)
+      |> put_resp_header("x-mfa-www-authenticate", marker)
+    end
+
+    def send_error(conn, 403, %{"error" => "insufficient_scope"} = body, marker) do
+      conn
+      |> put_resp_header("x-mfa-send-error", marker)
+      |> send_resp(403, JSON.encode!(Map.put(body, "transport", marker)))
+      |> halt()
+    end
+  end
+
   # One principal kind so `Attesto.Token.mint/3` has a kind to issue under.
   @user_kind Attesto.PrincipalKind.new("user", "ou_", required_claims: [{"client_id", :non_empty_string}])
 
@@ -113,6 +134,24 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert body(conn)["error"] == "invalid_token"
     end
 
+    test "refuses a valid token over HTTP when HTTPS is required" do
+      metadata_url = "https://api.example/.well-known/oauth-protected-resource/userinfo"
+
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.put(:require_https, true)
+      |> Keyword.put(:resource_metadata_resolver, fn _conn -> metadata_url end)
+      |> put_config()
+
+      conn = get_userinfo(mint(scope: "openid profile"))
+
+      assert conn.status == 401
+      assert body(conn)["error"] == "invalid_token"
+      assert [challenge = "Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ ~s(error_description="TLS required")
+      assert challenge =~ ~s(resource_metadata="#{metadata_url}")
+    end
+
     test "the 401 challenge carries the RFC 9728 resource_metadata pointer when configured" do
       metadata_url = "https://api.example/.well-known/oauth-protected-resource"
 
@@ -128,10 +167,45 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert challenge =~ ~s(resource_metadata="#{metadata_url}")
     end
 
+    test "the request-aware metadata resolver overrides or deliberately omits the static pointer" do
+      static = "https://api.example/.well-known/oauth-protected-resource"
+      selected = "https://api.example/.well-known/oauth-protected-resource/userinfo"
+
+      config =
+        :attesto_phoenix
+        |> Application.fetch_env!(AttestoPhoenix.Config)
+        |> Keyword.put(:resource_metadata, static)
+        |> Keyword.put(:resource_metadata_resolver, fn conn ->
+          if conn.request_path == @endpoint_path, do: selected
+        end)
+
+      put_config(config)
+
+      conn = get_userinfo("not-a-jwt")
+
+      assert conn.status == 401
+      assert [challenge] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ ~s(resource_metadata="#{selected}")
+      refute challenge =~ ~s(resource_metadata="#{static}")
+
+      config
+      |> Keyword.put(:resource_metadata_resolver, fn _conn -> nil end)
+      |> put_config()
+
+      conn = get_userinfo("not-a-jwt")
+
+      assert conn.status == 401
+      assert [challenge] = get_resp_header(conn, "www-authenticate")
+      refute challenge =~ "resource_metadata"
+    end
+
     test "returns 401 when a previously issued access token has been revoked" do
+      metadata_url = "https://api.example/.well-known/oauth-protected-resource/userinfo"
+
       :attesto_phoenix
       |> Application.fetch_env!(AttestoPhoenix.Config)
       |> Keyword.put(:code_store, __MODULE__.RevokedTokenStore)
+      |> Keyword.put(:resource_metadata_resolver, fn _conn -> metadata_url end)
       |> put_config()
 
       token = mint(scope: "openid")
@@ -141,20 +215,103 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
 
       assert conn.status == 401
       assert body(conn)["error"] == "invalid_token"
-      assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+      assert [challenge = "Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ ~s(resource_metadata="#{metadata_url}")
+    end
+
+    test "configured error transport hooks cover verification, TLS, revocation, and scope failures" do
+      base = Application.fetch_env!(:attesto_phoenix, AttestoPhoenix.Config)
+      openid_token = mint(scope: "openid")
+      insufficient_token = mint(scope: "profile")
+      Process.put(:attesto_phoenix_revoked_jti, peek_claims(openid_token)["jti"])
+      on_exit(fn -> Process.delete(:attesto_phoenix_revoked_jti) end)
+
+      send_error = fn conn, status, error_body ->
+        conn
+        |> put_resp_header("x-host-send-error", "true")
+        |> send_resp(status, JSON.encode!(%{"host_error" => error_body}))
+        |> halt()
+      end
+
+      www_authenticate = fn conn, challenge ->
+        conn
+        |> put_resp_header("www-authenticate", challenge)
+        |> put_resp_header("x-host-www-authenticate", "true")
+      end
+
+      no_store = fn conn -> put_resp_header(conn, "x-host-no-store", "true") end
+
+      hooks = [send_error: send_error, www_authenticate: www_authenticate, no_store: no_store]
+
+      cases = [
+        {:verification, hooks, nil},
+        {:tls, Keyword.put(hooks, :require_https, true), openid_token},
+        {:revocation, Keyword.put(hooks, :code_store, __MODULE__.RevokedTokenStore), openid_token},
+        {:scope, hooks, insufficient_token}
+      ]
+
+      for {failure, overrides, token} <- cases do
+        put_config(Keyword.merge(base, overrides))
+        response = get_userinfo(token)
+
+        assert response.status in [401, 403], "unexpected status for #{failure} failure"
+        assert get_resp_header(response, "x-host-send-error") == ["true"]
+        assert get_resp_header(response, "x-host-www-authenticate") == ["true"]
+        assert get_resp_header(response, "x-host-no-store") == ["true"]
+        assert body(response)["host_error"]["error"] in ["invalid_token", "insufficient_scope"]
+      end
     end
   end
 
   describe "scope requirement (OpenID Connect Core §5.3.1 / RFC 6750 §3.1)" do
     test "returns 403 insufficient_scope when the token lacks openid" do
+      metadata_url = "https://api.example/.well-known/oauth-protected-resource/userinfo"
+
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.put(:resource_metadata_resolver, fn _conn -> metadata_url end)
+      |> put_config()
+
       token = mint(scope: "profile email")
       conn = get_userinfo(token)
 
       assert conn.status == 403
       assert body(conn)["error"] == "insufficient_scope"
 
+      assert body(conn)["error_description"] ==
+               "The UserInfo endpoint requires the openid scope."
+
       assert [challenge] = get_resp_header(conn, "www-authenticate")
       assert challenge =~ "Bearer"
+
+      assert challenge =~
+               ~s(error_description="The UserInfo endpoint requires the openid scope.")
+
+      assert challenge =~ ~s(scope="openid")
+      assert challenge =~ ~s(resource_metadata="#{metadata_url}")
+    end
+
+    test "invokes pair and MFA-with-extra transport hooks on insufficient_scope" do
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.merge(
+        no_store: {__MODULE__.TransportCallbacks, :no_store},
+        www_authenticate: {__MODULE__.TransportCallbacks, :www_authenticate, ["extra-last"]},
+        send_error: {__MODULE__.TransportCallbacks, :send_error, ["extra-last"]}
+      )
+      |> put_config()
+
+      conn = get_userinfo(mint(scope: "profile"))
+
+      assert conn.status == 403
+      assert get_resp_header(conn, "x-mfa-no-store") == ["pair"]
+      assert get_resp_header(conn, "x-mfa-www-authenticate") == ["extra-last"]
+      assert get_resp_header(conn, "x-mfa-send-error") == ["extra-last"]
+      assert body(conn)["error"] == "insufficient_scope"
+      assert body(conn)["transport"] == "extra-last"
+
+      assert [challenge] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ ~s(error="insufficient_scope")
       assert challenge =~ ~s(scope="openid")
     end
   end
@@ -280,6 +437,20 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert conn.status == 200
       assert body(conn)["sub"] == @subject
       assert body(conn)["name"] == "Ada Lovelace"
+    end
+
+    test "accepts an RFC 6750 form-body token only when advertised by config" do
+      base = Application.fetch_env!(:attesto_phoenix, AttestoPhoenix.Config)
+      put_config(Keyword.put(base, :bearer_methods_supported, ["header", "body"]))
+
+      conn =
+        :post
+        |> conn(@endpoint_path, %{"access_token" => mint(scope: "openid")})
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> UserinfoController.userinfo(%{})
+
+      assert conn.status == 200
+      assert body(conn)["sub"] == @subject
     end
   end
 

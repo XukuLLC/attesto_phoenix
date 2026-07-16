@@ -49,9 +49,12 @@ primitives, and the token-lifecycle building blocks.
   records, and Pushed Authorization Request (PAR) references — so a clustered or
   load-balanced deployment keeps no OAuth state per node.
 
-It deliberately does **not** own your client registry, principal store, secret
-hashing, scope catalog, or audit log. Those are application policy and are
-supplied through a small set of neutral configuration callbacks.
+Attesto owns the standards route catalog and protocol controllers; the host
+chooses route mounts and route pipeline classes declaratively. It
+deliberately does **not** own your client registry, principal store, secret
+hashing, scope catalog, resource-owner authentication, consent, or audit log.
+Those are application policy and are supplied through neutral configuration
+callbacks.
 
 ## What you can build with it
 
@@ -111,7 +114,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 1.4"}
+    {:attesto_phoenix, "~> 2.0"}
   ]
 end
 ```
@@ -122,7 +125,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 1.4"},
+    {:attesto_phoenix, "~> 2.0"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
@@ -307,10 +310,92 @@ submitted OAuth POST endpoints behind generic browser CSRF or browser-only
 Phoenix `scope`; module attributes are not available when Phoenix expands the
 nested route macro.
 
+The OIDC-only local route mounts default on for compatibility. An OAuth
+authorization server that does not act as an OpenID Provider can retain
+authorization, token, PAR, revocation, introspection, JWKS, and RFC 8414
+metadata while omitting both declarations:
+
+```elixir
+attesto_routes(
+  userinfo: false,
+  openid_configuration: false
+)
+```
+
+These flags are compile-time route-mount controls; metadata is built later from
+runtime `AttestoPhoenix.Config`. `userinfo: false` removes both local UserInfo
+verbs. `openid_configuration: false` removes only the OIDC Provider Metadata
+route; the RFC 8414 authorization-server document remains mounted and its
+contents are unchanged.
+
+UserInfo metadata keeps explicit host intent separate from a mechanically
+derived local endpoint:
+
+- `userinfo_endpoint: nil` preserves the released behavior and omits the member.
+- `userinfo_endpoint: :derived` advertises the URL derived from `:issuer` and
+  `:userinfo_path`. When `userinfo: false`, the retained Provider Metadata route
+  suppresses this value only if it is route-equivalent to the removed bundled
+  route.
+- An explicit HTTPS URL is authoritative and always remains advertised,
+  including at the same origin and path. This is the supported form when a host
+  replaces the bundled UserInfo controller or serves UserInfo elsewhere.
+
+For example, a host can remount its own implementation at the canonical path
+without losing discovery:
+
+```elixir
+scope "/" do
+  attesto_routes(userinfo: false)
+  get "/oauth/userinfo", MyAppWeb.UserInfoController, :show
+end
+```
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  userinfo_endpoint: "https://issuer.example/oauth/userinfo"
+```
+
+The derived-path comparison models Phoenix/Plug dispatch rather than generic
+URI cleanup: adapters discard empty path segments, Phoenix decodes each request
+segment once, and `.`/`..` segments remain significant. It therefore handles
+leading, repeated, and trailing slashes, percent-encoded request segments,
+static or dynamic surrounding scopes, non-default ports, and forwarded router
+mounts without conflating a distinct route with the removed one.
+
+A dynamic macro `:prefix` is not available to the root Provider Metadata
+request. Consequently, `userinfo: false` with retained OpenID configuration
+rejects a dynamic `:prefix` at compile time instead of silently advertising a
+dead derived endpoint. Put the dynamic portion in a surrounding Phoenix scope,
+where the metadata request realizes the same scope, or also set
+`openid_configuration: false`. Static prefixes remain supported.
+
+OIDC conformance for features such as CIBA, logout, and session management
+relies on Provider Metadata, so those deployments must keep OpenID
+configuration enabled unless the host serves equivalent metadata separately. A
+dynamically discovered and dynamically registered OpenID Provider that issues
+access tokens must still satisfy OIDC's Discovery and UserInfo requirements;
+these independent macro controls do not make every route combination an
+OIDC-conformant deployment. If OpenID configuration is disabled, any configured
+UserInfo endpoint is advertised nowhere unless the host publishes an equivalent
+Provider Metadata document.
+
+The bundled well-known routes are the standards-derived forms for an
+origin-only issuer such as `https://issuer.example`. If the issuer contains a
+path, OIDC Discovery and RFC 8414 derive two different path-bearing well-known
+locations; mount those routes explicitly instead of using the macro's fixed
+root discovery routes. Because the macro always owns its RFC 8414 route, a
+path-bearing issuer requires a manually declared route catalog rather than
+adding duplicate discovery routes alongside `attesto_routes/1`. Derived
+endpoint URLs are likewise resolved against the issuer *origin*: the issuer's
+path is not prepended, so a path-bearing issuer must also set
+`:oauth_path_prefix` (or the per-endpoint path overrides) so the advertised
+endpoints sit under its path.
+
 `attesto_routes/1` mounts:
 
 - `GET  /.well-known/oauth-authorization-server` (RFC 8414 metadata)
-- `GET  /.well-known/openid-configuration` (OIDC Discovery metadata)
+- `GET  /.well-known/openid-configuration` (OIDC Discovery metadata; omitted
+  with `openid_configuration: false`)
 - `GET  /.well-known/jwks.json` (RFC 7517 JWK Set)
 - `GET  /.well-known/oauth-protected-resource` (RFC 9728 metadata)
 - `GET  /oauth/authorize` and `POST /oauth/authorize`
@@ -320,8 +405,8 @@ nested route macro.
 - `POST /oauth/introspect` (RFC 7662)
 - `POST /oauth/register` (RFC 7591, only with `registration: true`)
 - `DELETE /oauth/register/:client_id` (RFC 7592, with registration)
-- `GET  /oauth/userinfo`
-- `POST /oauth/userinfo`
+- `GET  /oauth/userinfo` (omitted with `userinfo: false`)
+- `POST /oauth/userinfo` (omitted with `userinfo: false`)
 - `POST /oauth/bc-authorize` (CIBA, only with `attesto_routes(ciba: true)`)
 - `POST /oauth/device_authorization` (RFC 8628, only with `device: true`)
 - `GET  /oauth/device_verification` and `POST /oauth/device_verification` (device user-code entry, with `device: true`)
@@ -346,6 +431,17 @@ The authorization endpoint also emits JARM responses when the validated request
 uses `response_mode=jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`.
 Discovery advertises the supported response modes and the server signing
 algorithms used for authorization response JWTs.
+
+The route plumbing is profile-neutral. A permissive standards-compliant OAuth
+deployment can admit PKCE-bound public clients and select its supported grants.
+A FAPI 2.0 Security Profile deployment coordinates policy settings and
+callbacks that require PAR, PKCE, asymmetric confidential-client
+authentication, sender-constrained access tokens, and the applicable algorithm
+constraints. The optional Message Signing profile adds signed request-object
+enforcement and JARM; `Attesto.RequestObject.Policy.fapi_message_signing/0`
+provides the request-object policy for that profile. These are coordinated
+settings rather than a single profile switch, and they use the same token,
+authorization, PAR, discovery, DPoP, and mTLS implementations.
 
 ### Backchannel authentication (CIBA)
 
@@ -425,10 +521,58 @@ intentionally accept RFC 6750 form-body `access_token` credentials.
 using `Attesto.Scope` grant-form algebra. It accepts either a single scope
 string or a list of required scopes.
 
-When `:resource_metadata` is set on the config, a 401 challenge carries the
-RFC 9728 `resource_metadata` pointer to the `/.well-known/oauth-protected-resource`
-document (mounted by `attesto_routes/1`), so a client refused without a valid
-token can discover which authorization server issues tokens for the resource.
+When `:resource_metadata` is set on the config, a 401 challenge carries that
+static RFC 9728 `resource_metadata` pointer, preserving the single-resource
+default. A host serving several protected resources can instead select the
+correct pointer per request, or return `nil` when that surface has no applicable
+metadata declaration:
+
+```elixir
+resource_metadata: "https://api.example/.well-known/oauth-protected-resource",
+resource_metadata_resolver: {MyAppWeb.ResourceMetadata, :for_request}
+```
+
+```elixir
+def for_request(%Plug.Conn{request_path: "/alpha"}) do
+  "https://api.example/.well-known/oauth-protected-resource/alpha"
+end
+
+def for_request(%Plug.Conn{request_path: "/beta"}) do
+  "https://api.example/.well-known/oauth-protected-resource/beta"
+end
+
+def for_request(_conn), do: nil
+```
+
+The resolver is authoritative when present; it does not fall back to the static
+URL when it returns `nil`. An invalid runtime return is safely omitted rather
+than turned into a challenge or a request-time exception. A static Config value
+is validated by `AttestoPhoenix.Config.new/1`; a non-`nil` per-plug value is
+validated when `AttestoPhoenix.Plug.Authenticate` is initialized (at compile
+time under Phoenix's default Plug initialization mode). Explicit per-plug `nil`
+remains a valid, authoritative omission. Function callbacks must accept one
+argument, and MFA tuples must export the effective arity (the request plus any
+extra arguments, which are appended after it). The explicit per-plug option
+wins on core verification, TLS, revocation, and principal failures and skips
+the resolver.
+
+The resolver is trusted configuration. Return pinned or allowlisted HTTPS URLs;
+do not construct a metadata authority from untrusted Host, forwarded, query, or
+arbitrary header values. The returned URL is never fetched or used as a
+redirect, and it is validated with the same HTTPS/host/no-fragment rules as the
+static value before it can enter a quoted challenge. The resolver runs once per
+protected-resource request — including requests that authenticate successfully,
+since the pointer must be selected before verification renders any challenge —
+so keep it fast and total. Resolver exceptions are not
+rescued: a callback that raises propagates the exception and fails the request
+(successful ones included) instead of rendering an authentication challenge.
+
+The protected-resource integration still owns the actual RFC 9728 declarations.
+Publish one document per exact resource identifier, with the path-inserted
+well-known URI and matching `resource`
+member; do not collapse multiple identifiers into a root document. When no
+resource owns the origin root, use `protected_resource_root: false` and let the
+per-resource integration mount only the documents it owns.
 
 For first-party web flows, keep cookie semantics in your app and pass a generic
 credential extractor to the plug:

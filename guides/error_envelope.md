@@ -9,7 +9,8 @@ those RFC guarantees, using three optional transport hooks in
 
 These hooks change only the transport rendering. The error code, the HTTP
 status, the challenge header, and the no-store semantics are still owned by the
-library.
+library. UserInfo applies the same hooks to token-verification, TLS,
+revoked-token, and insufficient-scope failures.
 
 ## `:send_error` - reshape the body
 
