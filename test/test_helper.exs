@@ -61,4 +61,5 @@ if ecto_included? do
   Ecto.Adapters.SQL.Sandbox.mode(TestRepo, :manual)
 end
 
+{:ok, _started} = Application.ensure_all_started(:bandit)
 ExUnit.start()

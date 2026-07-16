@@ -100,14 +100,14 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecisionTest do
 
   describe "default Req deliverer conformance-locked semantics" do
     setup do
-      bypass = Bypass.open()
-      {:ok, bypass: bypass, url: "http://localhost:#{bypass.port}/ciba/ping"}
+      server = AttestoPhoenix.TestHTTPServer.open()
+      {:ok, server: server, url: "http://localhost:#{server.port}/ciba/ping"}
     end
 
-    test "POSTs the bearer token + JSON body and treats 2xx as success", %{bypass: bypass, url: url} do
+    test "POSTs the bearer token + JSON body and treats 2xx as success", %{server: server, url: url} do
       pid = self()
 
-      Bypass.expect_once(bypass, "POST", "/ciba/ping", fn conn ->
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "POST", "/ciba/ping", fn conn ->
         [auth] = Conn.get_req_header(conn, "authorization")
         {:ok, raw, conn} = Conn.read_body(conn)
         send(pid, {:got, auth, JSON.decode!(raw)})
@@ -118,10 +118,10 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecisionTest do
       assert_receive {:got, "Bearer the-token", %{"auth_req_id" => "arid-123"}}
     end
 
-    test "does not retry on 401 (returns the status; flow is unaffected)", %{bypass: bypass, url: url} do
+    test "does not retry on 401 (returns the status; flow is unaffected)", %{server: server, url: url} do
       pid = self()
 
-      Bypass.expect(bypass, "POST", "/ciba/ping", fn conn ->
+      AttestoPhoenix.TestHTTPServer.expect(server, "POST", "/ciba/ping", fn conn ->
         send(pid, :hit)
         Conn.resp(conn, 401, "")
       end)
@@ -133,8 +133,8 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecisionTest do
       refute_receive :hit, 200
     end
 
-    test "does not follow a 3xx redirect from the notification endpoint (SSRF posture)", %{bypass: bypass, url: url} do
-      Bypass.expect_once(bypass, "POST", "/ciba/ping", fn conn ->
+    test "does not follow a 3xx redirect from the notification endpoint (SSRF posture)", %{server: server, url: url} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "POST", "/ciba/ping", fn conn ->
         conn
         |> Conn.put_resp_header("location", "https://attacker.example/")
         |> Conn.resp(302, "")

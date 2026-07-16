@@ -348,9 +348,16 @@ defmodule AttestoPhoenix.RouterTest do
 
   defp prepared_route_conn(router, method, path) do
     segments = String.split(path, "/", trim: true)
+    verb = method |> Atom.to_string() |> String.upcase()
+
+    match =
+      case router.__match_route__(verb, segments, "localhost") do
+        :error -> router.__match_route__(segments, verb, "localhost")
+        match -> match
+      end
 
     {metadata, prepare, _pipeline, _dispatch} =
-      router.__match_route__(segments, method |> Atom.to_string() |> String.upcase(), "localhost")
+      match
 
     prepare.(Plug.Test.conn(method, path), metadata)
   end

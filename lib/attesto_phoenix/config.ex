@@ -291,7 +291,9 @@ defmodule AttestoPhoenix.Config do
       response parameter on success and error redirects. Default `true`
       (authorization-server mix-up defense, mandated by FAPI 2.0); set `false`
       only for a deployment that must omit it.
-    * `:require_https` - enforce HTTPS on the endpoints. Default `true`.
+    * `:require_https` - enforce HTTPS on incoming endpoint requests. Default
+      `true`. This transport gate never relaxes the standards-required HTTPS
+      issuer or advertised endpoint validation.
     * `:trusted_proxies` - list of trusted proxy CIDRs/IPs controlling whether
       `X-Forwarded-*` headers are honored. Default `[]` (no forwarded trust).
     * `:access_token_ttl` - access-token lifetime, seconds. Default `900`.
