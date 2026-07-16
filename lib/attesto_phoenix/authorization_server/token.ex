@@ -48,7 +48,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
-  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Event, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Event, OAuthError, ResourceAudiencePolicy}
 
   require Logger
 
@@ -116,10 +116,23 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   `AttestoPhoenix.AuthorizationServer.Token.Request` the controller built from
   the request and the conn facts. See the module docs for the return shape.
   This module emits no event itself: the caller emits the returned `events`.
+
+  Direct callers sit at the same trusted post-authentication boundary as the
+  controller. They MUST set `request_client_id` only to the identifier proven
+  by client authentication; this function deliberately does not reauthenticate
+  an already-constructed request. Legacy direct requests that omit the field
+  resolve the configured client identifier once for compatibility.
   """
   @spec issue(Config.t(), Request.t()) ::
           {:ok, response(), [Event.t()]} | {:error, OAuthError.t(), [Event.t()]}
   def issue(%Config{} = _config, %Request{} = request) do
+    # The controller supplies the exact identifier authenticated at the edge.
+    # Preserve compatibility for direct callers that predate that field's
+    # authoritative semantics by resolving the host callback once, up front.
+    # Every downstream grant, token, ID Token, refresh binding, and event then
+    # reads this immutable snapshot instead of re-invoking mutable host policy.
+    request = snapshot_client_id(request)
+
     case run(request) do
       {:ok, response, events} ->
         {:ok, response, events}
@@ -199,8 +212,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
          {:ok, grant} <-
            redeem_code(
-             config,
-             client,
+             request,
              code,
              verifier,
              redirect_uri,
@@ -210,8 +222,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
            mint(
-             config,
-             client,
+             request,
              grant.subject,
              scope,
              token_type,
@@ -227,7 +238,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          # OIDC Core §3.1.3.3: when the request was an OpenID Connect
          # Authentication Request (granted scope contains `openid`), the token
          # response additionally carries an ID Token.
-         {:ok, response} <- maybe_mint_id_token(config, client, grant, scope, code, response) do
+         {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
       :ok = record_code_access_token(config, grant, response)
       issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
 
@@ -264,8 +275,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
          {:ok, rotated} <-
            rotate_refresh(
-             config,
-             client,
+             request,
              presented,
              requested,
              resource,
@@ -274,8 +284,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
          {:ok, response} <-
            mint(
-             config,
-             client,
+             request,
              rotated.context.subject,
              scope,
              token_type,
@@ -297,11 +306,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     %{config: config, client: client, params: params} = request
 
     with {:ok, binding, token_type} <- resolve_sender_constraint(request),
-         subject = client_id(config, client),
+         subject = token_client_id(request),
          {:ok, scope} <- authorize_scope(config, client, parse_requested_scope(params)),
          {:ok, audience} <- request_resource_audience(config, client, params),
          {:ok, response} <-
-           mint(config, client, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
+           mint(request, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
       {:ok, response, [token_issued_event(request, scope, "client_credentials", token_type, binding)]}
     end
   end
@@ -317,13 +326,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, device_code} <- require_param(params, "device_code"),
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
-         {:ok, grant} <- redeem_device_code(config, client, device_code, SenderConstraint.binding_jkt(binding)),
+         {:ok, grant} <- redeem_device_code(request, device_code, SenderConstraint.binding_jkt(binding)),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
            mint(
-             config,
-             client,
+             request,
              grant.subject,
              scope,
              token_type,
@@ -352,13 +360,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, auth_req_id} <- require_param(params, "auth_req_id"),
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
-         {:ok, grant} <- redeem_ciba(config, client, auth_req_id, SenderConstraint.binding_jkt(binding)),
+         {:ok, grant} <- redeem_ciba(request, auth_req_id, SenderConstraint.binding_jkt(binding)),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
            mint(
-             config,
-             client,
+             request,
              grant.subject,
              scope,
              token_type,
@@ -370,7 +377,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
            ),
          # CIBA Core §10.1: the token response carries an ID Token (no nonce -
          # CIBA has none - and no c_hash - there is no authorization code).
-         {:ok, response} <- maybe_mint_ciba_id_token(config, client, grant, scope, response) do
+         {:ok, response} <- maybe_mint_ciba_id_token(request, grant, scope, response) do
       issued = token_issued_event(request, scope, "ciba", token_type, binding)
       # RFC 9470: fold the Grant's struct-level acr/auth_time into its `claims`
       # so the shared refresh-issuance path (which reads them from `claims`)
@@ -405,9 +412,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          requested = requested_exchange_scope(params, claims),
          :ok <- require_scope_within_subject_token(requested, claims),
          {:ok, scope} <- authorize_scope(config, client, requested),
-         {:ok, audience} <- request_resource_audience(config, client, params),
-         :ok <- require_resource_within_subject_token(audience, claims),
-         {:ok, response} <- mint_exchanged_token(config, claims, scope, token_type, binding, audience) do
+         {:ok, audience} <- exchange_resource_audience(config, client, params, claims),
+         {:ok, response} <- mint_exchanged_token(request, claims, scope, token_type, binding, audience) do
       response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
       {:ok, response, [token_issued_event(request, scope, "token_exchange", token_type, binding)]}
     else
@@ -430,14 +436,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     %{config: config, client: client, params: params} = request
 
     with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
-           jwt_bearer_authorize(config, client, params),
+           jwt_bearer_authorize(config, token_client_id(request), params),
          {:ok, binding, token_type} <- resolve_sender_constraint(request),
          {:ok, audience} <- request_resource_audience(config, client, params),
          requested = jwt_bearer_requested_scope(params, ceiling),
          :ok <- require_scope_within_ceiling(requested, ceiling),
          {:ok, scope} <- authorize_scope(config, client, requested),
          {:ok, response} <-
-           mint(config, client, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
+           mint(request, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
       # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: this
       # grant issues NO refresh token. Access is re-derived from a fresh
       # assertion on each request; a refresh token would outlive the enterprise
@@ -459,8 +465,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # (draft §6.1) so the wire never learns which issuers are trusted or why a
   # subject was denied. The authenticated client's identifier is passed so the
   # handler can enforce the `client_id`-claim binding.
-  defp jwt_bearer_authorize(config, client, params) do
-    case JwtBearer.authorize(config, client_id(config, client), params) do
+  defp jwt_bearer_authorize(config, authenticated_client_id, params) do
+    case JwtBearer.authorize(config, authenticated_client_id, params) do
       {:ok, result} ->
         {:ok, result}
 
@@ -601,11 +607,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     {:ok, optional_param(params, "code_verifier")}
   end
 
-  defp redeem_code(config, client, code, verifier, redirect_uri, jkt) do
+  defp redeem_code(%Request{config: config} = request, code, verifier, redirect_uri, jkt) do
     params =
       %{
         redirect_uri: redirect_uri,
-        client_id: client_id(config, client)
+        client_id: token_client_id(request)
       }
       |> put_optional(:code_verifier, verifier)
       |> put_optional(:dpop_jkt, jkt)
@@ -634,12 +640,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `device_code`, carrying the DPoP holder-of-key the token request demonstrated
   # (matched against any pre-bound key). The §3.5 polling signals map to their
   # own wire error codes; only a genuinely bad/unknown code is `invalid_grant`.
-  defp redeem_device_code(config, client, device_code, jkt) do
+  defp redeem_device_code(%Request{config: config} = request, device_code, jkt) do
     store = Config.device_code_store(config)
     interval = config |> Config.device_authorization() |> Keyword.get(:poll_interval_seconds, 5)
 
     params =
-      %{client_id: client_id(config, client)}
+      %{client_id: token_client_id(request)}
       |> put_optional(:dpop_jkt, jkt)
 
     case DeviceCode.redeem(store, device_code, params, interval: interval) do
@@ -665,11 +671,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # against any key pre-bound at issue). The §11 polling signals map to their
   # own wire error codes; only a bad/unknown/wrong-client request is
   # `invalid_grant`.
-  defp redeem_ciba(config, client, auth_req_id, jkt) do
+  defp redeem_ciba(%Request{config: config} = request, auth_req_id, jkt) do
     store = Config.ciba_store(config)
 
     params =
-      %{client_id: client_id(config, client)}
+      %{client_id: token_client_id(request)}
       |> put_optional(:dpop_jkt, jkt)
 
     case Attesto.CIBA.redeem(store, auth_req_id, params, []) do
@@ -722,16 +728,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # Token (the request scope always contains `openid`, CIBA §7.1). It carries
   # `sub`/`acr`/`auth_time` and `at_hash`, but no `nonce` (CIBA has none) and no
   # `c_hash` (there is no authorization code). Gated on `openid` defensively.
-  defp maybe_mint_ciba_id_token(config, client, grant, scope, response) do
+  defp maybe_mint_ciba_id_token(%Request{} = request, grant, scope, response) do
     if @openid_scope in scope do
-      mint_ciba_id_token(config, client, grant, scope, response)
+      mint_ciba_id_token(request, grant, scope, response)
     else
       {:ok, response}
     end
   end
 
-  defp mint_ciba_id_token(config, client, grant, scope, response) do
-    case client_id(config, client) do
+  defp mint_ciba_id_token(%Request{config: config, client: client} = request, grant, scope, response) do
+    case token_client_id(request) do
       client_id when is_binary(client_id) and client_id != "" ->
         opts =
           [access_token: response.access_token]
@@ -837,9 +843,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp rotate_refresh(config, client, presented, requested, resource, jkt) do
+  defp rotate_refresh(%Request{config: config} = request, presented, requested, resource, jkt) do
     opts =
-      [client_id: client_id(config, client)]
+      [client_id: token_client_id(request)]
       |> put_optional_kw(:scope, requested)
       # RFC 8707: a present `resource` narrows the bound set (subset-only); absent
       # (`nil`) keeps the full granted set so the refreshed token stays audienced
@@ -918,7 +924,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # refresh family so refreshes preserve the real authentication event.
     context =
       %{subject: grant.subject, scope: scope, resource: grant.resource}
-      |> put_optional(:client_id, client_id(config, client))
+      |> put_optional(:client_id, token_client_id(request))
       |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
       |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
       |> put_optional(:dpop_jkt, SenderConstraint.refresh_binding_jkt(config, client, binding))
@@ -973,19 +979,20 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # token. The trigger is the granted scope containing the `openid` scope
   # value (OIDC Core §3.1.2.1); a non-openid authorization-code grant is a
   # plain OAuth 2.0 response (access token only) and is left untouched.
-  defp maybe_mint_id_token(config, client, grant, scope, code, response) do
+  defp maybe_mint_id_token(%Request{} = request, grant, scope, code, response) do
     if @openid_scope in scope do
-      mint_id_token(config, client, grant, scope, code, response)
+      mint_id_token(request, grant, scope, code, response)
     else
       {:ok, response}
     end
   end
 
-  # The ID Token's `aud` is the OAuth `client_id` (OIDC Core §2), so a host
-  # that does not expose `:client_id` cannot mint a well-addressed identity
-  # assertion: fail closed rather than emit one without an audience.
-  defp mint_id_token(config, client, grant, scope, code, response) do
-    case client_id(config, client) do
+  # The ID Token's `aud` is the exact OAuth `client_id` authenticated for this
+  # token request (OIDC Core §2). Use the same immutable snapshot as the access
+  # token and state redemption so a mutable host callback cannot split one
+  # response across two client identities.
+  defp mint_id_token(%Request{config: config, client: client} = request, grant, scope, code, response) do
+    case token_client_id(request) do
       client_id when is_binary(client_id) and client_id != "" ->
         opts = id_token_opts(config, client, grant, scope, code, response)
 
@@ -1135,18 +1142,19 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp verify_subject_token(config, token, binding) when binding in [nil, :none] do
-    Attesto.Token.verify(attesto_config(config), token, expected_typ: "access")
+    Attesto.Token.verify(attesto_config(config), token, subject_token_verify_opts(config))
   end
 
   defp verify_subject_token(config, token, {:dpop, jkt}) do
-    Attesto.Token.verify(attesto_config(config), token, expected_typ: "access", dpop_jkt: jkt)
+    Attesto.Token.verify(attesto_config(config), token, subject_token_verify_opts(config, dpop_jkt: jkt))
   end
 
   defp verify_subject_token(config, token, {:mtls, thumb}) do
-    Attesto.Token.verify(attesto_config(config), token,
-      expected_typ: "access",
-      mtls_cert_thumbprint: thumb
-    )
+    Attesto.Token.verify(attesto_config(config), token, subject_token_verify_opts(config, mtls_cert_thumbprint: thumb))
+  end
+
+  defp subject_token_verify_opts(config, binding_opts \\ []) do
+    [expected_typ: "access", trusted_audiences: ResourceAudiencePolicy.resolver(config)] ++ binding_opts
   end
 
   defp requested_exchange_scope(params, claims) do
@@ -1168,14 +1176,21 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # RFC 8693 §2.1 + RFC 8707: token exchange MUST NOT carry authority the subject
-  # token lacks. Just as scope is ceilinged to the subject token's scope, a
-  # requested `resource` is ceilinged to the subject token's own `aud` - a token
-  # confined to resource A cannot be exchanged for a token audienced to sibling
-  # resource B, even if B is otherwise an allow-listed server resource. An absent
-  # `resource` (`[]`) requests no resource-specific audience and is unconstrained
-  # here (the exchanged token keeps `config.audience`).
-  defp require_resource_within_subject_token([], _claims), do: :ok
+  # RFC 8693 §2.1 + RFC 8707: token exchange MUST NOT carry authority the
+  # subject token lacks. An explicit `resource` is validated and authorized for
+  # the exchanger, then ceilinged to the subject token's `aud`. When the request
+  # omits `resource`, inherit the full subject audience and re-authorize every
+  # member for the exchanger. This mirrors omitted `scope` and refresh behavior
+  # and, critically, never lets an absent parameter turn a resource-confined
+  # subject token into one for `config.audience`.
+  defp exchange_resource_audience(config, client, params, claims) do
+    with {:ok, requested} <- validate_resource_param(params),
+         effective = if(requested == [], do: List.wrap(Map.get(claims, "aud")), else: requested),
+         {:ok, authorized} <- authorize_resources(config, client, effective),
+         :ok <- require_resource_within_subject_token(authorized, claims) do
+      {:ok, authorized}
+    end
+  end
 
   defp require_resource_within_subject_token(requested, claims) do
     subject_aud = List.wrap(Map.get(claims, "aud"))
@@ -1205,9 +1220,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `mint_extra_opts` is appended to the sender-constraint mint opts; today it
   # carries only the RFC 8707 `:audience` override (jwt-bearer grant), so the
   # `aud` of any other grant's token is unaffected.
-  defp mint(config, client, subject, scope, token_type, binding, extra_claims, mint_extra_opts) do
+  defp mint(
+         %Request{config: config, client: client} = request,
+         subject,
+         scope,
+         token_type,
+         binding,
+         extra_claims,
+         mint_extra_opts
+       ) do
     with {:ok, principal} <- build_principal(config, client, subject, scope),
          principal = merge_principal_claims(principal, extra_claims),
+         {:ok, principal} <- put_access_token_client_id(principal, token_client_id(request)),
          {:ok, minted} <-
            Attesto.Token.mint(
              attesto_config(config),
@@ -1257,18 +1281,21 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp mint_exchanged_token(config, claims, scope, token_type, binding, audience) do
+  defp mint_exchanged_token(%Request{config: config} = request, claims, scope, token_type, binding, audience) do
     attesto_config = attesto_config(config)
     kind_claim = attesto_config.principal_kind_claim
 
-    principal = %{
-      kind: Map.get(claims, kind_claim),
-      sub: Map.get(claims, "sub"),
-      scopes: scope,
-      claims: exchange_extra_claims(claims, kind_claim)
-    }
-
-    with {:ok, minted} <-
+    with {:ok, authenticated_client_id} <- require_token_client_id(request),
+         principal = %{
+           kind: Map.get(claims, kind_claim),
+           sub: Map.get(claims, "sub"),
+           scopes: scope,
+           claims:
+             claims
+             |> exchange_extra_claims(kind_claim)
+             |> Map.put("client_id", authenticated_client_id)
+         },
+         {:ok, minted} <-
            Attesto.Token.mint(
              attesto_config,
              principal,
@@ -1281,6 +1308,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          expires_in: minted.expires_in,
          scope: minted.scope
        }}
+    else
+      {:error, reason} ->
+        Logger.error("token exchange mint failed: #{inspect(reason)}")
+        {:error, error(@error_invalid_request, "unable to issue token")}
     end
   end
 
@@ -1288,7 +1319,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # `acr` / `auth_time` are reserved: an exchanged (machine-authorized) token
     # must not inherit the subject token's authentication context, which would
     # let token exchange forge a step-up-satisfying token (RFC 9470).
-    reserved = MapSet.new(~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time) ++ [principal_kind_claim])
+    reserved =
+      MapSet.new(~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++ [principal_kind_claim])
 
     claims
     |> Enum.reject(fn {key, _value} -> MapSet.member?(reserved, key) end)
@@ -1300,6 +1332,52 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       %{} = principal -> {:ok, principal}
       _ -> {:error, :no_principal_builder}
     end
+  end
+
+  # RFC 9068 §2.2: `client_id` identifies the authenticated client to which the
+  # access token was issued. It is protocol-owned, not an optional host claim.
+  # A matching host value remains compatible; a conflict fails closed rather
+  # than signing a token whose resource policy and client identity disagree.
+  defp put_access_token_client_id(principal, authenticated_client_id) do
+    case Map.get(principal, :claims, %{}) do
+      claims when is_map(claims) ->
+        reconcile_access_token_client_id(
+          principal,
+          claims,
+          Map.get(claims, "client_id"),
+          authenticated_client_id
+        )
+
+      _invalid_claims ->
+        {:error, :invalid_principal_claims}
+    end
+  end
+
+  defp reconcile_access_token_client_id(principal, claims, nil, auth_id) when is_binary(auth_id) and auth_id != "" do
+    {:ok, Map.put(principal, :claims, Map.put(claims, "client_id", auth_id))}
+  end
+
+  defp reconcile_access_token_client_id(principal, _claims, existing, auth_id)
+       when is_binary(auth_id) and auth_id != "" and existing == auth_id do
+    {:ok, principal}
+  end
+
+  defp reconcile_access_token_client_id(_principal, _claims, _existing, auth_id)
+       when is_binary(auth_id) and auth_id != "" do
+    {:error, :conflicting_client_id}
+  end
+
+  # Compatibility for trusted direct `Token.issue/2` callers that did not
+  # populate `request_client_id` before 2.0.2. The shipped controller always
+  # supplies the authenticated snapshot, so only the legacy direct-call
+  # boundary may retain a valid builder claim.
+  defp reconcile_access_token_client_id(principal, _claims, existing, _authenticated_client_id)
+       when is_binary(existing) and existing != "" do
+    {:ok, principal}
+  end
+
+  defp reconcile_access_token_client_id(_principal, _claims, _existing, _authenticated_client_id) do
+    {:error, :missing_client_id}
   end
 
   # OIDC Core §5.5: the access token carries the claims request object so the
@@ -1366,17 +1444,36 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # ── Configured-callback access ───────────────────────────────────────────
 
-  # The client's identifier (RFC 6749 §2.2). A CIMD client
-  # (`draft-ietf-oauth-client-id-metadata-document-01`) is identified by the URL
-  # its document is bound to, read from the document rather than the host's
-  # `:client_id` callback. For a registered client, read the host callback
-  # defensively so this module works today and lights up when a host supplies
-  # `:client_id`; when absent the identifier is unknown (`nil`), which is correct
-  # for audit and is never used as a credential.
+  # Legacy direct `Token.issue/2` callers may not have populated the request
+  # snapshot. Resolve their opaque client once for compatibility. Controller
+  # requests always arrive with the exact credential-carried identifier, so no
+  # callback is invoked after authentication and no later callback change can
+  # relabel state, tokens, ID Tokens, or audit events.
   defp client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
 
   defp client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)
+  end
+
+  defp snapshot_client_id(%Request{request_client_id: client_id} = request)
+       when is_binary(client_id) and client_id != "", do: request
+
+  defp snapshot_client_id(%Request{config: config, client: client} = request) do
+    %{request | request_client_id: client_id(config, client)}
+  end
+
+  defp token_client_id(%Request{} = request) do
+    case request.request_client_id do
+      client_id when is_binary(client_id) and client_id != "" -> client_id
+      _missing -> nil
+    end
+  end
+
+  defp require_token_client_id(%Request{} = request) do
+    case token_client_id(request) do
+      client_id when is_binary(client_id) and client_id != "" -> {:ok, client_id}
+      _missing -> {:error, :missing_client_id}
+    end
   end
 
   # Host *policy* callbacks (`:authorize_scope`, `:build_principal`,
@@ -1421,7 +1518,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp issued_like_event(request, name, scope, grant_type, token_type, binding) do
     Event.new(name, %{
-      client_id: client_id(request.config, request.client),
+      client_id: token_client_id(request),
       scope: Enum.join(List.wrap(scope), " "),
       grant_type: grant_type,
       metadata:
@@ -1457,8 +1554,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §5.2: the audit event for a denied grant. The error code is the
   # atom `err.error`; it rides as its wire string. The `:scope` and
   # `:grant_type` are the requested values off the request (not a resolved
-  # grant), and the `client_id` prefers the host's `:client_id` callback over
-  # the request-supplied fallback.
+  # grant), and the `client_id` is the immutable authenticated identifier
+  # snapshot used throughout the grant.
   defp denied_event(request, %OAuthError{} = err) do
     code = Atom.to_string(err.error)
     client_id = denial_client_id(request)
@@ -1483,9 +1580,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     })
   end
 
-  defp denial_client_id(request) do
-    client_id(request.config, request.client) || request.request_client_id
-  end
+  defp denial_client_id(request), do: token_client_id(request)
 
   # ── Request helpers ──────────────────────────────────────────────────────
 

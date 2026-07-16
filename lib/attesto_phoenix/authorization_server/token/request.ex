@@ -22,9 +22,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
       presented DPoP proof (RFC 9449), the presented client certificate DER
       (RFC 8705), and the canonical request URL/method the proof is bound to.
     * `:client_ip` - the request client IP for audit-event metadata, or `nil`.
-    * `:request_client_id` - the `client_id` derived from the request body or
-      the Basic credentials, used as the denial-event `client_id` fallback when
-      the host exposes no `:client_id` callback.
+    * `:request_client_id` - the authenticated OAuth `client_id` from
+      `AttestoPhoenix.ClientAuthentication.Result`. It is authoritative for
+      access-token `client_id` claims and is also the audit fallback when the
+      host exposes no `:client_id` callback. The field name is retained for
+      compatibility with direct callers that already build this struct. Direct
+      callers are a trusted boundary and MUST populate it only from completed
+      client authentication, never from an unverified request-body parameter.
+      When omitted for backward compatibility, `Token.issue/2` resolves the
+      host `:client_id` callback once before processing and never re-resolves it
+      during the grant.
   """
 
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint

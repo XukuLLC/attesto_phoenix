@@ -209,6 +209,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert response.token_type == "Bearer"
       assert is_integer(response.expires_in)
       assert response.scope == "read write"
+      assert claim!(response.access_token, "client_id") == "client-1"
       # RFC 6749 §4.4.3: no refresh token for client_credentials.
       refute Map.has_key?(response, :refresh_token)
 
@@ -332,6 +333,46 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "authorization_code grant (RFC 6749 §4.1)" do
+    test "one authenticated client_id snapshot binds code, ID Token, refresh family, and rotation" do
+      code_store = start_code_store("oc_user-1", ["openid", "offline_access"])
+      refresh_store = start_refresh_store()
+
+      config =
+        config(
+          code_store: code_store,
+          refresh_store: refresh_store,
+          client_id: nil
+        )
+
+      code_request =
+        request(config,
+          request_client_id: "client-1",
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, code_request)
+      assert claim!(response.access_token, "client_id") == "client-1"
+      assert claim!(response.id_token, "aud") == "client-1"
+      assert is_binary(response.refresh_token)
+
+      refresh_request =
+        request(config,
+          request_client_id: "client-1",
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => response.refresh_token}
+        )
+
+      assert {:ok, refreshed, [%Event{name: :refresh_rotated, client_id: "client-1"}]} =
+               Token.issue(config, refresh_request)
+
+      assert claim!(refreshed.access_token, "client_id") == "client-1"
+    end
+
     test "a token_issued event carries bearer sender metadata" do
       code_store = start_code_store("oc_user-1", ["openid"])
       config = config(code_store: code_store)
@@ -559,6 +600,17 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.access_token, "sub") == "oc_user-1"
     end
 
+    test "an authenticated snapshot redeems without a host client_id callback" do
+      config = device_config(client_id: nil)
+      %{device_code: dc, user_code: uc} = issue_device_code(["read"])
+      :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
+
+      request = %{device_request(config, dc) | request_client_id: "client-1"}
+
+      assert {:ok, response, [%Event{client_id: "client-1"}]} = Token.issue(config, request)
+      assert claim!(response.access_token, "client_id") == "client-1"
+    end
+
     test "a consumed device_code cannot be redeemed twice" do
       config = device_config()
       %{device_code: dc, user_code: uc} = issue_device_code()
@@ -663,6 +715,18 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.access_token, "acr") == "urn:mace:incommon:iap:silver"
     end
 
+    test "an authenticated snapshot binds CIBA access and ID Tokens without a host callback" do
+      config = ciba_config(client_id: nil)
+      %{auth_req_id: arid} = issue_ciba(["openid"])
+      {:ok, _} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, arid, %{subject: "user-1", scope: ["openid"]})
+
+      request = %{ciba_request(config, arid) | request_client_id: "client-1"}
+
+      assert {:ok, response, [%Event{client_id: "client-1"}]} = Token.issue(config, request)
+      assert claim!(response.access_token, "client_id") == "client-1"
+      assert claim!(response.id_token, "aud") == "client-1"
+    end
+
     test "a consumed auth_req_id cannot be redeemed twice (single use)" do
       config = ciba_config()
       %{auth_req_id: arid} = issue_ciba()
@@ -711,6 +775,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert response.token_type == "Bearer"
       assert response.issued_token_type == @subject_token_type_access_token
       assert response.scope == "read"
+      assert aud!(response.access_token) == config.audience
       assert event.grant_type == "token_exchange"
 
       assert event.metadata == %{
@@ -726,10 +791,10 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       b = "https://api.example/b"
       config = config(resource_indicators: [allowed_resources: [a, b]])
 
-      # Subject token audienced to the AS audience + resource A (so it verifies
-      # AND carries A); it was never granted resource B.
-      subject_request =
-        request(config, params: %{"scope" => "read", "resource" => ["https://issuer.example", a]})
+      # A normal RFC 8707 subject token carries only resource A. Subject-token
+      # verification must recognize that trusted audience before enforcing that
+      # an exchange cannot widen it to resource B.
+      subject_request = request(config, params: %{"scope" => "read", "resource" => a})
 
       assert {:ok, subject_response, _} = Token.issue(config, subject_request)
 
@@ -749,13 +814,165 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert {:ok, ok_response, _} = Token.issue(config, exchange.(a))
       assert aud!(ok_response.access_token) == a
 
+      # Omitting resource preserves the subject token's audience instead of
+      # silently falling back to the server default.
+      inherited =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, inherited_response, _} = Token.issue(config, inherited)
+      assert aud!(inherited_response.access_token) == a
+
       # B is an allow-listed server resource but NOT in the subject token's aud,
       # so exchanging for it would widen authority — refused.
       assert {:error, %OAuthError{error: :invalid_target}, _} = Token.issue(config, exchange.(b))
     end
+
+    test "an inherited subject audience is re-authorized for the exchanger" do
+      resource = "https://api.example/client-1-only"
+      subject_client = %{id: "client-1", public?: false}
+      exchanger = %{id: "client-2", public?: false}
+
+      config =
+        config(
+          load_client: fn
+            "client-1" -> {:ok, subject_client}
+            "client-2" -> {:ok, exchanger}
+            _other -> {:error, :not_found}
+          end,
+          resource_indicators: [
+            allowed_resources_for: fn
+              %{id: "client-1"} -> [resource]
+              _other -> []
+            end
+          ]
+        )
+
+      subject_request =
+        request(config,
+          client: subject_client,
+          request_client_id: "client-1",
+          params: %{"scope" => "read", "resource" => resource}
+        )
+
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+
+      exchange_request =
+        request(config,
+          client: exchanger,
+          request_client_id: "client-2",
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_target}, _events} = Token.issue(config, exchange_request)
+    end
+
+    test "omitting resource preserves a subject token's complete audience array" do
+      a = "https://api.example/a"
+      b = "https://api.example/b"
+      config = config(resource_indicators: [allowed_resources: [a, b]])
+
+      subject_request = request(config, params: %{"scope" => "read", "resource" => [a, b]})
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, exchange_request)
+      assert aud!(response.access_token) == [a, b]
+    end
+
+    test "an exchanged token identifies the authenticated exchanger, not the subject-token client" do
+      resource = "https://api.example/exchange"
+      subject_client = %{id: "client-1", public?: false}
+      exchanger = %{id: "client-2", public?: false}
+
+      config =
+        config(
+          load_client: fn
+            "client-1" -> {:ok, subject_client}
+            "client-2" -> {:ok, exchanger}
+            _other -> {:error, :not_found}
+          end,
+          resource_indicators: [allowed_resources_for: fn _client -> [resource] end]
+        )
+
+      subject_request =
+        request(config,
+          client: subject_client,
+          request_client_id: "client-1",
+          params: %{"scope" => "read", "resource" => resource}
+        )
+
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+      assert claim!(subject_response.access_token, "client_id") == "client-1"
+
+      exchange_request =
+        request(config,
+          client: exchanger,
+          request_client_id: "client-2",
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read",
+            "resource" => resource
+          }
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, exchange_request)
+      assert claim!(response.access_token, "client_id") == "client-2"
+
+      assert {:ok, %{"client_id" => "client-2", "aud" => ^resource}} =
+               Attesto.Token.verify(Config.to_attesto_config(config), response.access_token,
+                 trusted_audiences: AttestoPhoenix.ResourceAudiencePolicy.resolver(config)
+               )
+    end
   end
 
   describe "denials (RFC 6749 §5.2)" do
+    test "a populated authenticated snapshot is never recomputed for denial audit" do
+      test_pid = self()
+
+      config =
+        config(
+          client_id: fn _client ->
+            send(test_pid, :client_id_callback_invoked)
+            "relabeled-client"
+          end
+        )
+
+      request =
+        request(config,
+          request_client_id: "client-1",
+          grant_type: "password",
+          params: %{"scope" => "read"}
+        )
+
+      assert {:error, %OAuthError{}, [%Event{client_id: "client-1", metadata: %{client_id: "client-1"}}]} =
+               Token.issue(config, request)
+
+      refute_received :client_id_callback_invoked
+    end
+
     test "an unsupported grant type returns an OAuthError and a :token_denied event" do
       config = config()
       request = request(config, grant_type: "password", params: %{"scope" => "read"})
@@ -776,6 +993,45 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert event.metadata.token_type == "Bearer"
       assert event.metadata.sender_constraint == :none
       assert event.metadata.cnf == nil
+    end
+
+    test "the protocol injects the authenticated client_id when the principal builder omits it" do
+      authenticated_client_id = "authenticated-client"
+
+      config =
+        config(
+          client_id: nil,
+          build_principal: fn _client, subject, scope ->
+            %{kind: "client", sub: ensure_sub(subject), scopes: scope, claims: %{}}
+          end
+        )
+
+      request =
+        request(config,
+          params: %{"scope" => "read"},
+          request_client_id: authenticated_client_id
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, request)
+      assert claim!(response.access_token, "client_id") == authenticated_client_id
+    end
+
+    test "a principal builder cannot replace the authenticated client_id" do
+      config =
+        config(
+          build_principal: fn _client, subject, scope ->
+            %{
+              kind: "client",
+              sub: ensure_sub(subject),
+              scopes: scope,
+              claims: %{"client_id" => "different-client"}
+            }
+          end
+        )
+
+      request = request(config, params: %{"scope" => "read"}, request_client_id: "authenticated-client")
+
+      assert {:error, %OAuthError{error: :invalid_request}, _events} = Token.issue(config, request)
     end
 
     test "an invalid scope decision (RFC 6749 §5.2) surfaces invalid_scope" do

@@ -9,12 +9,13 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   and renders the response - negotiating, by the `Accept` header, between the
   plain JSON response (RFC 7662 §2.2) and a signed JWT
   (`Attesto.SignedIntrospection`, `application/token-introspection+jwt`,
-  RFC 9701). No introspection policy is decided here: activeness, claim
-  selection, and the no-existence-oracle discipline are all the core's
-  (`Attesto.Token` signature/temporal/audience verification for access tokens,
-  the `Attesto.RefreshStore` for refresh tokens). The endpoint only captures the
-  authenticated caller and hands the host's optional `:introspection_authorize`
-  policy (RFC 7662 §4 / RFC 9701 §5) to the core, which enforces it fail-closed.
+  RFC 9701). Activeness, claim selection, and the no-existence-oracle discipline
+  remain the core's (`Attesto.Token` verification for access tokens and the
+  `Attesto.RefreshStore` for refresh tokens). For RFC 8707 tokens, the endpoint
+  supplies the trusted static resources and, only when needed, resolves the
+  signed token's original OAuth client for its per-client resource policy. The
+  authenticated introspection caller is kept separate and is passed only to the
+  host's optional `:introspection_authorize` policy (RFC 7662 §4 / RFC 9701 §5).
 
   ## Client authentication (RFC 7662 §2.1)
 
@@ -34,7 +35,8 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   Reads `AttestoPhoenix.Config` from the application environment (the same
   source the token endpoint uses): `:load_client` / `:verify_client_secret`
   (client authentication), `:keystore` / `:issuer` (signing the RFC 9701
-  response), and `:refresh_store` (consulted for opaque refresh tokens).
+  response), `:resource_indicators` (trusted RFC 8707 audiences), and
+  `:refresh_store` (consulted for opaque refresh tokens).
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -43,7 +45,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
 
   alias Attesto.Introspection
   alias Attesto.SignedIntrospection
-  alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext, ResourceAudiencePolicy}
   alias AttestoPhoenix.ClientAuthentication.Policy
   # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
   # introspection response as a signed JWT, and the type of that response.
@@ -94,6 +96,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
       Introspection.introspect(protocol_config, token,
         refresh_store: refresh_store(config),
         token_type_hint: token_type_hint(params),
+        trusted_audiences: ResourceAudiencePolicy.resolver(config),
         authorize: caller_authorize(config, client_id)
       )
 

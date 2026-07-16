@@ -11,6 +11,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
   alias AttestoPhoenix.Controller.IntrospectionController
 
   @client_id "rs-1"
+  @token_client_id "oauth-client-1"
   @client_secret "s3cr3t"
   @signed_media_type "application/token-introspection+jwt"
 
@@ -61,6 +62,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       repo: Repo,
       load_client: fn
         @client_id -> {:ok, %{id: @client_id}}
+        @token_client_id -> {:ok, %{id: @token_client_id}}
         _other -> {:error, :not_found}
       end,
       verify_client_secret: fn
@@ -82,14 +84,21 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     {:ok, config: Config.new(config_opts())}
   end
 
-  defp access_token(config) do
+  defp access_token(config, opts \\ []) do
+    token_client_id = Keyword.get(opts, :client_id, @token_client_id)
+    mint_opts = Keyword.delete(opts, :client_id)
+
     {:ok, %{access_token: jwt}} =
-      Token.mint(Config.to_attesto_config(config), %{
-        kind: "client",
-        sub: "oc_abc123",
-        scopes: ["documents.read"],
-        claims: %{"client_id" => "oc_abc123"}
-      })
+      Token.mint(
+        Config.to_attesto_config(config),
+        %{
+          kind: "client",
+          sub: "oc_abc123",
+          scopes: ["documents.read"],
+          claims: %{"client_id" => token_client_id}
+        },
+        mint_opts
+      )
 
     jwt
   end
@@ -119,6 +128,115 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
 
     test "an invalid token returns active:false", %{config: _config} do
       conn = call(%{"token" => "not-a-real-token"})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
+
+    test "a static RFC 8707 audience needs no token-client lookup or dynamic policy", %{config: config} do
+      resource = "https://resource.example/mcp"
+      test_pid = self()
+
+      opts =
+        config_opts()
+        |> Keyword.put(:load_client, fn
+          @client_id ->
+            {:ok, %{id: @client_id}}
+
+          @token_client_id ->
+            send(test_pid, :token_client_loaded)
+            {:ok, %{id: @token_client_id}}
+
+          _other ->
+            {:error, :not_found}
+        end)
+        |> Keyword.put(:resource_indicators,
+          allowed_resources: [resource],
+          allowed_resources_for: fn _client -> raise "static audience must bypass dynamic policy" end
+        )
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn = call(%{"token" => access_token(config, audience: resource)})
+
+      assert conn.status == 200
+      body = JSON.decode!(conn.resp_body)
+      assert body["active"] == true
+      assert body["aud"] == resource
+      refute_received :token_client_loaded
+    end
+
+    test "an access token for a resource outside the trusted allowlist is inactive", %{
+      config: config
+    } do
+      configured = "https://resource.example/allowed"
+      untrusted = "https://resource.example/not-allowed"
+
+      opts =
+        Keyword.put(config_opts(), :resource_indicators, allowed_resources: [configured])
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn = call(%{"token" => access_token(config, audience: untrusted)})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
+
+    test "per-client audience trust is derived from the signed token client, not the caller", %{
+      config: config
+    } do
+      resource = "https://resource.example/per-client"
+
+      opts =
+        Keyword.put(config_opts(), :resource_indicators,
+          allowed_resources_for: fn
+            %{id: @token_client_id} -> [resource]
+            %{id: @client_id} -> []
+          end
+        )
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn = call(%{"token" => access_token(config, audience: resource)})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body)["active"] == true
+    end
+
+    test "the introspection caller's own resource policy cannot activate the token", %{
+      config: config
+    } do
+      resource = "https://resource.example/caller-only"
+
+      opts =
+        Keyword.put(config_opts(), :resource_indicators,
+          allowed_resources_for: fn
+            %{id: @client_id} -> [resource]
+            %{id: @token_client_id} -> []
+          end
+        )
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn = call(%{"token" => access_token(config, audience: resource)})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
+
+    test "an unknown original client receives static trust only", %{config: config} do
+      resource = "https://resource.example/dynamic-only"
+
+      opts =
+        Keyword.put(config_opts(), :resource_indicators, allowed_resources_for: fn _known_client -> [resource] end)
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      conn =
+        call(%{
+          "token" => access_token(config, audience: resource, client_id: "deleted-client")
+        })
 
       assert conn.status == 200
       assert JSON.decode!(conn.resp_body) == %{"active" => false}

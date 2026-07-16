@@ -113,10 +113,12 @@ defmodule AttestoPhoenix.ClientAuthentication do
     The authenticated client and how it authenticated.
 
     `:client` is the opaque host client value returned by `:load_client`,
-    `:client_id` is the OAuth identifier (RFC 6749 §2.2) - the host's
-    `:client_id` callback when configured, otherwise the identifier the
-    credentials carried (the Basic/body `client_id` or the assertion `sub`), so
-    it is never `nil` for a successful authentication - and `:method` is the
+    `:client_id` is the OAuth identifier (RFC 6749 §2.2) carried by the
+    credentials (the Basic/body `client_id` or the assertion `sub`). When the
+    host's optional `:client_id` callback supplies an identifier, it must agree
+    exactly with the credential-carried value. Library-produced successful
+    results therefore always contain a non-empty `client_id`; the field remains
+    optional on the public struct for source compatibility. `:method` is the
     RFC 6749 §2.3 / OIDC Core §9 authentication method
     (`:client_secret_basic`, `:client_secret_post`, `:private_key_jwt`, or
     `:none` for the public-client path).
@@ -400,7 +402,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
     case invoke(Config.load_client_fun(config), [client_id]) do
       {:ok, client} ->
         if invoke(verify_client_secret, [client, secret]) == true do
-          {:ok, result(config, client, client_id, method)}
+          result(config, client, client_id, method)
         else
           {:error, error(@error_invalid_client, @client_auth_failed)}
         end
@@ -418,15 +420,16 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp verify_private_key_jwt_client(config, policy, assertion) do
     with {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
-         {:ok, client} <- load_existing_client(config, client_id),
+         {:ok, client} <- resolve_client(config, client_id),
          {:ok, jwks} <- client_jwks(config, client),
          {:ok, claims} <-
            ClientAssertion.verify(assertion, client_id, policy.assertion_audiences, jwks,
              max_lifetime: policy.assertion_max_lifetime,
              accepted_algs: policy.assertion_signing_algs
            ),
+         {:ok, result} <- result(config, client, client_id, :private_key_jwt),
          :ok <- consume_client_assertion_jti(config, policy, client_id, claims) do
-      {:ok, result(config, client, client_id, :private_key_jwt)}
+      {:ok, result}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
@@ -488,23 +491,26 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # is redeemed. A revoked or unknown client - and a confidential client
   # presenting no secret - fails closed with the single generic message.
   defp load_public_client(config, client_id) do
-    with {:ok, client} <- load_existing_client(config, client_id),
-         true <- client_public?(config, client) do
-      {:ok, result(config, client, client_id, :none)}
+    with {:ok, client} <- resolve_client(config, client_id),
+         true <- client_public?(config, client),
+         {:ok, result} <- result(config, client, client_id, :none) do
+      {:ok, result}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
 
-  # Resolve the client for the secretless (`none`) and `private_key_jwt` paths.
-  # A CIMD `client_id` (an HTTPS URL, with the feature enabled) is dereferenced
-  # to its metadata document and wrapped as `{:cimd, metadata}` so the
-  # public-client and jwks discriminators read the document directly; any opaque
-  # `client_id` (or any `client_id` while CIMD is off) goes to the host's
-  # `:load_client` registry unchanged. A CIMD resolution failure is reported as
-  # `:not_found`, identical to an unknown registry client, so the generic
-  # `invalid_client` message never reveals which path was taken.
-  defp load_existing_client(config, client_id) do
+  # Resolve a client through the same registry/CIMD path used by authentication.
+  # Besides the secretless (`none`) and `private_key_jwt` paths, signed-token
+  # policy lookup reuses this function so a token's original `client_id` has
+  # identical resolution semantics. A CIMD `client_id` (an HTTPS URL, with the
+  # feature enabled) is dereferenced and wrapped as `{:cimd, metadata}`; any
+  # opaque identifier goes to the host's `:load_client` registry. Every failure
+  # becomes `:not_found`, revealing neither which path ran nor whether a client
+  # was revoked.
+  @doc false
+  @spec resolve_client(Config.t(), String.t()) :: {:ok, term()} | {:error, :not_found}
+  def resolve_client(%Config{} = config, client_id) when is_binary(client_id) and client_id != "" do
     if ClientIdMetadata.cimd_client_id?(client_id, config) do
       case ClientIdMetadata.resolve(client_id, config) do
         {:ok, metadata} -> {:ok, {:cimd, metadata}}
@@ -517,6 +523,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
       end
     end
   end
+
+  def resolve_client(%Config{}, _client_id), do: {:error, :not_found}
 
   # The public/confidential discriminator (RFC 6749 §2.1). Read defensively
   # from the configuration; fail closed (treat as confidential, i.e. not
@@ -533,19 +541,29 @@ defmodule AttestoPhoenix.ClientAuthentication do
     Callback.invoke(Config.client_public_fun(config), [client], false) == true
   end
 
-  # The authenticated OAuth `client_id` (RFC 6749 §2.2) the credentials carried
-  # - the Basic/body `client_id` or the assertion `sub` - is always known for a
-  # successful authentication, so it is the reliable identifier. The host's
-  # `:client_id` callback, when configured, maps the opaque client to its
-  # identifier and takes precedence; absent it, the presented identifier stands
-  # (never `nil` for a successful auth), so downstream uses such as the RFC 9701
-  # signed-introspection audience always have an identifier.
-  defp result(config, client, presented_client_id, method) do
-    %Result{
-      client: client,
-      client_id: resolved_client_id(config, client) || presented_client_id,
-      method: method
-    }
+  # The authenticated OAuth `client_id` (RFC 6749 §2.2) carried by the
+  # credentials is authoritative. A host callback may independently map its
+  # opaque client value to an identifier, but accepting a different identifier
+  # would authenticate one client while attributing the result to another. An
+  # absent mapping leaves the credential-carried identifier in place; a present
+  # mapping must agree exactly. CIMD resolution follows the same agreement rule,
+  # but obtains the identifier from the validated document and never consults
+  # the host callback.
+  defp result(config, client, presented_client_id, method)
+       when is_binary(presented_client_id) and presented_client_id != "" do
+    case resolved_client_id(config, client) do
+      nil -> {:ok, authenticated_result(client, presented_client_id, method)}
+      ^presented_client_id -> {:ok, authenticated_result(client, presented_client_id, method)}
+      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp result(_config, _client, _presented_client_id, _method) do
+    {:error, error(@error_invalid_client, @client_auth_failed)}
+  end
+
+  defp authenticated_result(client, presented_client_id, method) do
+    %Result{client: client, client_id: presented_client_id, method: method}
   end
 
   # A CIMD client's identifier is the URL its document is bound to; a registered

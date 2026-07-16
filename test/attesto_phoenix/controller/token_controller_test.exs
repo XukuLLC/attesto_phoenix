@@ -715,6 +715,21 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["token_type"] == "Bearer"
       assert body(conn)["scope"] == "read"
     end
+
+    test "the authenticated request id becomes client_id without a host callback or builder claim" do
+      put_config(
+        principal_kinds: [@client_kind],
+        build_principal: fn _client, subject, scope ->
+          %{kind: "client", sub: ensure_sub(subject), scopes: scope, claims: %{}}
+        end,
+        client_id: nil
+      )
+
+      conn = post_token(client_credentials_params())
+
+      assert conn.status == 200
+      assert peek_claims(body(conn)["access_token"])["client_id"] == "confidential-1"
+    end
   end
 
   describe "content-type enforcement" do
@@ -913,6 +928,33 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
                         grant_type: nil,
                         scope: "read",
                         result: "invalid_request"
+                      }}
+    end
+
+    test "missing-grant audit retains a private_key_jwt authenticated client_id" do
+      capture_events()
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+      put_config(client_jwks: fn %{id: "confidential-1"} -> client_jwks end)
+
+      conn =
+        post_token(%{
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => client_assertion(client_key, "confidential-1"),
+          "scope" => "read"
+        })
+
+      assert conn.status == 400
+
+      assert_receive {:event,
+                      %AttestoPhoenix.Event{
+                        name: :token_denied,
+                        client_id: "confidential-1",
+                        grant_type: nil,
+                        scope: "read",
+                        result: "invalid_request",
+                        metadata: %{client_id: "confidential-1"}
                       }}
     end
 
@@ -2124,12 +2166,12 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   defp enable_minting do
     put_config(
       principal_kinds: [@client_kind],
-      build_principal: fn client, subject, scope ->
+      build_principal: fn _client, subject, scope ->
         %{
           kind: "client",
           sub: ensure_sub(subject),
           scopes: scope,
-          claims: %{"client_id" => Map.get(client, :id, "unknown")}
+          claims: %{}
         }
       end,
       client_id: fn client -> Map.get(client, :id) end

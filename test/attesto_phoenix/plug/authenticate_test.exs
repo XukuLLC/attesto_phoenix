@@ -104,6 +104,34 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
   end
 
+  test "requires explicit trust for a resource-audienced access token", %{config: config} do
+    resource = "https://resource.example/reports"
+    token = mint(config, scope: "read:reports", audience: resource)
+
+    rejected =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    assert rejected.halted
+    assert rejected.status == 401
+    assert JSON.decode!(rejected.resp_body)["error"] == "invalid_token"
+    assert_receive {:event, %AttestoPhoenix.Event{name: :auth_denied, result: :invalid_token}}
+
+    accepted =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config, trusted_audiences: [resource]))
+
+    refute accepted.halted
+    assert accepted.assigns.attesto_claims["aud"] == resource
+    assert accepted.assigns.attesto_principal == %{subject: @subject, kind: :user}
+    assert accepted.assigns.attesto_context.claims == accepted.assigns.attesto_claims
+    assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
+  end
+
   test "rejects a form-body access_token by default", %{config: config} do
     token = mint(config, scope: "openid read:reports")
 
@@ -549,6 +577,7 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
     mint_opts =
       []
+      |> maybe_mint_opt(:audience, Keyword.get(opts, :audience))
       |> maybe_mint_opt(:mtls_cert_thumbprint, Keyword.get(opts, :mtls_cert_thumbprint))
       |> maybe_mint_opt(:dpop_jkt, Keyword.get(opts, :dpop_jkt))
 

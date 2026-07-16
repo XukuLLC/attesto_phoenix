@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.0.1"
+  @version "2.0.2"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -69,15 +69,14 @@ defmodule AttestoPhoenix.MixProject do
   # and a path dep cannot be packaged ("only Hex packages can be dependencies"),
   # so a Mix.env-based switch would break publishing from a dev checkout. The
   # default - including every publish - resolves the published version
-  # constraint; local development sets ATTESTO_PATH=1 to use the sibling. This
-  # branch requires attesto 0.13 for OpenID Connect logout (RP-Initiated +
-  # Back-Channel): Attesto.LogoutToken / EndSession / LogoutSessionStore and the
-  # IDToken `sid` claim.
+  # constraint; local development sets ATTESTO_PATH=1 to use the sibling. The
+  # 1.2.2 floor supplies trusted RFC 8707 audience policy to introspection,
+  # token exchange, and protected-resource plugs.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, "~> 1.2"}
+      {:attesto, ">= 1.2.2 and < 2.0.0"}
     end
   end
 
@@ -96,7 +95,7 @@ defmodule AttestoPhoenix.MixProject do
       {:open_api_spex, "~> 3.0", optional: true},
       # Plug behaviours for the protected-resource plugs (also a Phoenix
       # transitive dependency).
-      {:plug, "~> 1.15"},
+      {:plug, ">= 1.19.5 and < 2.0.0"},
       # `mix attesto_phoenix.install` (Mix.Tasks.AttestoPhoenix.Install) is an
       # upgrade-aware Igniter installer: it inspects the host's config and router
       # and applies idempotent patches. Declared `optional: true` so the runtime
@@ -211,6 +210,7 @@ defmodule AttestoPhoenix.MixProject do
           AttestoPhoenix.OAuthError,
           AttestoPhoenix.Event,
           AttestoPhoenix.PARStore,
+          AttestoPhoenix.ResourceAudiencePolicy,
           AttestoPhoenix.RequestContext
         ]
       ]
