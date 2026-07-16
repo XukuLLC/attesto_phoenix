@@ -6,6 +6,11 @@ defmodule AttestoPhoenix.RouterTest do
 
   use ExUnit.Case, async: true
 
+  import Plug.Conn
+  import Plug.Test
+
+  alias Attesto.PrincipalKind
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController
   alias AttestoPhoenix.Controller.CheckSessionController
@@ -22,6 +27,22 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.RevocationController
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
+  alias Phoenix.Router.NoRouteError
+
+  defmodule StubKeystore do
+    @moduledoc false
+  end
+
+  defmodule HostUserInfoPlug do
+    @moduledoc false
+    @behaviour Plug
+
+    @impl true
+    def init(opts), do: opts
+
+    @impl true
+    def call(conn, _opts), do: Plug.Conn.send_resp(conn, 204, "")
+  end
 
   defmodule DefaultRouter do
     use Phoenix.Router
@@ -195,6 +216,35 @@ defmodule AttestoPhoenix.RouterTest do
     end
   end
 
+  defmodule EscapedColonPrefixUserInfoDisabledRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(prefix: "/org\\:tenant", userinfo: false)
+    end
+  end
+
+  defmodule ForwardedUserInfoDisabledRouter do
+    use Phoenix.Router
+
+    alias AttestoPhoenix.RouterTest.UserInfoDisabledRouter
+
+    forward "/gateway", UserInfoDisabledRouter
+  end
+
+  defmodule SamePathHostRemountRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    alias AttestoPhoenix.RouterTest.HostUserInfoPlug
+
+    scope "/" do
+      attesto_routes(userinfo: false)
+      get "/oauth/userinfo", HostUserInfoPlug, []
+    end
+  end
+
   defmodule OpenIDConfigurationDisabledRouter do
     use Phoenix.Router
     use AttestoPhoenix.Router
@@ -305,6 +355,42 @@ defmodule AttestoPhoenix.RouterTest do
     prepare.(Plug.Test.conn(method, path), metadata)
   end
 
+  defp metadata_config(overrides) do
+    Config.new(
+      Keyword.merge(
+        [
+          issuer: "https://issuer.example",
+          audience: "https://api.example",
+          keystore: StubKeystore,
+          repo: __MODULE__.StubRepo,
+          load_client: fn _client_id -> {:error, :not_found} end,
+          verify_client_secret: fn _client, _secret -> false end,
+          load_principal: fn _subject -> {:error, :not_found} end
+        ],
+        overrides
+      )
+    )
+  end
+
+  defp configured_conn(method, path, config) do
+    protocol_config =
+      Config.to_attesto_config(config,
+        principal_kinds: [
+          PrincipalKind.new("client", "oc_", required_claims: [{"client_id", :non_empty_string}])
+        ]
+      )
+
+    method
+    |> conn(path)
+    |> put_private(:attesto_phoenix_config, config)
+    |> put_private(:attesto_protocol_config, protocol_config)
+  end
+
+  defp dispatch_metadata(router, path, config) do
+    response = router.call(configured_conn(:get, path, config), [])
+    {response, JSON.decode!(response.resp_body)}
+  end
+
   describe "attesto_routes/1" do
     test "mounts the discovery document at the well-known path" do
       assert find_route(DefaultRouter, :get, "/.well-known/oauth-authorization-server")
@@ -406,12 +492,84 @@ defmodule AttestoPhoenix.RouterTest do
           "/acme/.well-known/openid-configuration"
         )
 
-      assert disabled.private.attesto_phoenix_local_userinfo_path == "/oauth/userinfo"
-      assert prefixed.private.attesto_phoenix_local_userinfo_path == "/auth/oauth/userinfo"
-      assert scoped.private.attesto_phoenix_local_userinfo_path == "/tenant/oauth/userinfo"
-      assert dynamic.private.attesto_phoenix_local_userinfo_path == "/:tenant/oauth/userinfo"
+      assert disabled.private.attesto_phoenix_local_userinfo_route ==
+               {["oauth", "userinfo"], 2}
+
+      assert prefixed.private.attesto_phoenix_local_userinfo_route ==
+               {["auth", "oauth", "userinfo"], 2}
+
+      assert scoped.private.attesto_phoenix_local_userinfo_route ==
+               {["oauth", "userinfo"], 2}
+
+      assert dynamic.private.attesto_phoenix_local_userinfo_route ==
+               {["oauth", "userinfo"], 2}
+
       assert dynamic.path_params == %{"tenant" => "acme"}
-      refute Map.has_key?(default.private, :attesto_phoenix_local_userinfo_path)
+      refute Map.has_key?(default.private, :attesto_phoenix_local_userinfo_route)
+    end
+
+    test "full router dispatch carries the UserInfo marker into Provider Metadata" do
+      cases = [
+        {UserInfoDisabledRouter, "/.well-known/openid-configuration", []},
+        {PrefixedUserInfoDisabledRouter, "/.well-known/openid-configuration", [oauth_path_prefix: "/auth/oauth"]},
+        {ScopedUserInfoDisabledRouter, "/tenant/.well-known/openid-configuration",
+         [userinfo_path: "/tenant/oauth/userinfo"]},
+        {DynamicScopedUserInfoDisabledRouter, "/acme/.well-known/openid-configuration",
+         [userinfo_path: "/acme/oauth/userinfo"]},
+        {EscapedColonPrefixUserInfoDisabledRouter, "/.well-known/openid-configuration",
+         [oauth_path_prefix: "/org:tenant/oauth"]},
+        {ForwardedUserInfoDisabledRouter, "/gateway/.well-known/openid-configuration",
+         [userinfo_path: "/gateway/oauth/userinfo"]}
+      ]
+
+      for {router, path, overrides} <- cases do
+        config = metadata_config([userinfo_endpoint: :derived] ++ overrides)
+        {response, body} = dispatch_metadata(router, path, config)
+
+        assert response.status == 200, "unexpected metadata status for #{inspect(router)}"
+
+        refute Map.has_key?(body, "userinfo_endpoint"),
+               "derived endpoint was retained for #{inspect(router)}"
+      end
+    end
+
+    test "a host remount at the canonical UserInfo path remains live and advertised" do
+      endpoint = "https://issuer.example/oauth/userinfo"
+      config = metadata_config(userinfo_endpoint: endpoint)
+
+      {metadata_response, body} =
+        dispatch_metadata(
+          SamePathHostRemountRouter,
+          "/.well-known/openid-configuration",
+          config
+        )
+
+      assert metadata_response.status == 200
+      assert body["userinfo_endpoint"] == endpoint
+
+      userinfo_response = SamePathHostRemountRouter.call(conn(:get, "/oauth/userinfo"), [])
+      assert userinfo_response.status == 204
+    end
+
+    test "disabling Provider Metadata leaves RFC 8414 dispatch unchanged" do
+      config = metadata_config(userinfo_endpoint: :derived)
+      rfc8414_path = "/.well-known/oauth-authorization-server"
+
+      {default_response, default_body} = dispatch_metadata(DefaultRouter, rfc8414_path, config)
+
+      {disabled_response, disabled_body} =
+        dispatch_metadata(OpenIDConfigurationDisabledRouter, rfc8414_path, config)
+
+      assert default_response.status == 200
+      assert disabled_response.status == 200
+      assert disabled_body == default_body
+
+      assert_raise NoRouteError, fn ->
+        OpenIDConfigurationDisabledRouter.call(
+          configured_conn(:get, "/.well-known/openid-configuration", config),
+          []
+        )
+      end
     end
 
     test "route-mount opt-outs compose mechanically with existing optional routes and route classes" do
@@ -765,6 +923,30 @@ defmodule AttestoPhoenix.RouterTest do
         end
       end
 
+      assert_raise ArgumentError,
+                   ~r/route-mount control :openid_configuration must be a literal boolean/,
+                   fn ->
+                     defmodule MalformedOpenIDConfigurationCapabilityRouter do
+                       use Phoenix.Router
+                       use AttestoPhoenix.Router
+
+                       scope "/" do
+                         attesto_routes(openid_configuration: :disabled)
+                       end
+                     end
+                   end
+
+      assert_raise ArgumentError, ~r/route-mount control :userinfo has conflicting option values/, fn ->
+        defmodule DuplicateUserInfoCapabilityRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(userinfo: false, userinfo: true)
+          end
+        end
+      end
+
       assert_raise ArgumentError, ~r/route-mount control :openid_configuration has conflicting option values/, fn ->
         defmodule DuplicateOpenIDConfigurationCapabilityRouter do
           use Phoenix.Router
@@ -775,6 +957,52 @@ defmodule AttestoPhoenix.RouterTest do
           end
         end
       end
+    end
+
+    test "rejects dynamic macro prefixes only when UserInfo suppression needs Provider Metadata" do
+      assert_raise ArgumentError, ~r/cannot combine a dynamic :prefix/, fn ->
+        defmodule DynamicUserInfoPrefixRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(prefix: "/:tenant", userinfo: false)
+          end
+        end
+      end
+
+      assert_raise ArgumentError, ~r/cannot combine a dynamic :prefix/, fn ->
+        defmodule PartialDynamicUserInfoPrefixRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(prefix: "/org-:tenant", userinfo: false)
+          end
+        end
+      end
+
+      defmodule DynamicPrefixWithoutProviderMetadataRouter do
+        use Phoenix.Router
+        use AttestoPhoenix.Router
+
+        scope "/" do
+          attesto_routes(
+            prefix: "/:tenant",
+            userinfo: false,
+            openid_configuration: false
+          )
+        end
+      end
+
+      assert find_route(DynamicPrefixWithoutProviderMetadataRouter, :post, "/:tenant/oauth/token")
+      refute find_route(DynamicPrefixWithoutProviderMetadataRouter, :get, "/:tenant/oauth/userinfo")
+
+      assert find_route(
+               EscapedColonPrefixUserInfoDisabledRouter,
+               :post,
+               "/org\\:tenant/oauth/token"
+             )
     end
 
     test "does not mount the end-session or check-session endpoints by default" do

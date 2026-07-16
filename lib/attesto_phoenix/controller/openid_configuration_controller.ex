@@ -53,9 +53,11 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   passed through, never hardcoded here.
 
   When `attesto_routes(userinfo: false)` retains this metadata route, the
-  router records the removed local path in `conn.private`. A configured
-  `userinfo_endpoint` on the issuer origin at that path is then omitted, while
-  an endpoint on a different origin or path remains advertised.
+  router records the removed local path in `conn.private`. A
+  `userinfo_endpoint: :derived` value on the issuer origin at a
+  route-equivalent path is then omitted. A configured URL is an authoritative
+  host declaration and remains advertised, including when the host replaces
+  the bundled controller at that same path.
 
   The response carries no secrets and is identical for every caller, so it is
   served unauthenticated. OpenID Connect Discovery §4 permits caching of the
@@ -88,7 +90,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   # The router pipeline installs the derived Attesto.Config (the protocol
   # configuration the core metadata builder reads) here.
   @protocol_config_key :attesto_protocol_config
-  @local_userinfo_path_key :attesto_phoenix_local_userinfo_path
+  @local_userinfo_route_key :attesto_phoenix_local_userinfo_route
 
   # OpenID Connect Discovery §4: the configuration document is static for a
   # given provider configuration, so it may be cached by Relying Parties and
@@ -329,51 +331,45 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   defp require_pushed_authorization_requests(%Config{}), do: nil
 
   # Bridge the macro's compile-time local route decision into request-time
-  # metadata without suppressing a genuinely external UserInfo endpoint. The
-  # marker exists only on the new `userinfo: false` route expansion, so legacy
-  # default/all-feature routes retain their exact Phoenix route data. Compare
-  # URL identity rather than serialization: host case, an explicit default
-  # port, and a query do not turn the removed local route into a distinct
-  # endpoint.
-  defp userinfo_endpoint(%Config{} = config, %Plug.Conn{} = conn) do
-    local_path =
-      conn.private
-      |> Map.get(@local_userinfo_path_key)
-      |> expand_route_path(conn.path_params)
+  # metadata without overriding a deliberate host declaration. The released
+  # nil/string contract remains authoritative; only the explicit `:derived`
+  # derivation marker is eligible for stale-local-route suppression.
+  defp userinfo_endpoint(%Config{userinfo_endpoint: :derived} = config, %Plug.Conn{} = conn) do
+    endpoint = Config.userinfo_endpoint_url(config)
 
-    if !local_userinfo_endpoint?(config.userinfo_endpoint, config.issuer, local_path),
-      do: config.userinfo_endpoint
+    local_route = Map.get(conn.private, @local_userinfo_route_key)
+
+    if !local_userinfo_endpoint?(
+         endpoint,
+         config.issuer,
+         local_route,
+         conn.path_info,
+         conn.script_name
+       ),
+       do: endpoint
   end
 
-  defp expand_route_path(path, path_params) when is_binary(path) and is_map(path_params) do
-    path
-    |> String.split("/", trim: false)
-    |> Enum.map_join("/", &expand_route_segment(&1, path_params))
-  end
+  defp userinfo_endpoint(%Config{userinfo_endpoint: endpoint}, %Plug.Conn{}), do: endpoint
 
-  defp expand_route_path(path, _path_params), do: path
-
-  defp expand_route_segment(":" <> name = segment, path_params) do
-    case Map.get(path_params, name) do
-      value when is_binary(value) -> URI.encode(value, &path_segment_char?/1)
-      _other -> segment
-    end
-  end
-
-  defp expand_route_segment(segment, _path_params), do: segment
-
-  defp local_userinfo_endpoint?(endpoint, issuer, local_path)
-       when is_binary(endpoint) and is_binary(issuer) and is_binary(local_path) do
-    with {:ok, endpoint_uri} <- URI.new(endpoint),
+  defp local_userinfo_endpoint?(endpoint, issuer, {local_segments, metadata_segment_count}, path_info, script_name)
+       when is_list(local_segments) and is_integer(metadata_segment_count) and metadata_segment_count >= 0 do
+    with true <- is_binary(endpoint) and is_binary(issuer),
+         {:ok, endpoint_uri} <- URI.new(endpoint),
          {:ok, issuer_uri} <- URI.new(issuer) do
       same_https_origin?(endpoint_uri, issuer_uri) and
-        normalize_route_path(endpoint_uri.path) == normalize_route_path(local_path)
+        route_path_matches?(
+          endpoint_uri.path,
+          local_segments,
+          metadata_segment_count,
+          path_info,
+          script_name
+        )
     else
       _error -> false
     end
   end
 
-  defp local_userinfo_endpoint?(_endpoint, _issuer, _local_path), do: false
+  defp local_userinfo_endpoint?(_endpoint, _issuer, _local_route, _path_info, _script_name), do: false
 
   defp same_https_origin?(
          %URI{scheme: "https", host: left_host} = left,
@@ -389,13 +385,47 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   defp effective_https_port(%URI{port: nil}), do: 443
   defp effective_https_port(%URI{port: port}), do: port
 
-  defp normalize_route_path(path) when is_binary(path) do
-    path
-    |> normalize_percent_encoding(&path_segment_char?/1)
-    |> then(&URI.merge("https://attesto.invalid/", %URI{path: &1}).path)
+  # Reconstruct the concrete client-visible local route from Plug/Phoenix data
+  # instead of interpreting Phoenix route syntax. `path_info` contains the
+  # realized surrounding scope plus the metadata route; dropping that fixed
+  # tail yields concrete static/dynamic scope segments. `script_name` contributes
+  # any outer forwarded-router prefix. Both are request segments and decode
+  # once; the macro-relative route segments came from Plug's route compiler and
+  # remain literal. Dot segments are ordinary data throughout.
+  defp route_path_matches?(endpoint_path, local_segments, metadata_segment_count, path_info, script_name) do
+    with {:ok, endpoint_segments} <- request_path_segments(endpoint_path),
+         {:ok, request_segments} <- decode_request_segments(path_info),
+         {:ok, forwarded_segments} <- decode_request_segments(script_name),
+         true <- length(request_segments) >= metadata_segment_count do
+      surrounding_scope_segments =
+        Enum.take(request_segments, length(request_segments) - metadata_segment_count)
+
+      endpoint_segments == forwarded_segments ++ surrounding_scope_segments ++ local_segments
+    else
+      _error -> false
+    end
   end
 
-  defp normalize_route_path(_path), do: nil
+  defp request_path_segments(path) when is_binary(path) do
+    segments =
+      for segment <- String.split(path, "/", trim: false), segment != "" do
+        URI.decode(segment)
+      end
+
+    {:ok, segments}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp request_path_segments(_path), do: :error
+
+  defp decode_request_segments(segments) when is_list(segments) do
+    {:ok, Enum.map(segments, &URI.decode/1)}
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp decode_request_segments(_segments), do: :error
 
   defp normalize_host(host) do
     host
@@ -409,14 +439,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
       if decoded_char?.(byte), do: <<byte>>, else: "%" <> String.upcase(hex)
     end)
-  end
-
-  # RFC 3986 §3.3 `pchar`: these bytes carry data inside one path segment and
-  # are equivalent to their percent-encoded spellings for Phoenix route
-  # matching. Delimiters such as `/`, `?`, and `#` remain encoded so a dynamic
-  # segment cannot become a different path shape during comparison.
-  defp path_segment_char?(byte) do
-    URI.char_unreserved?(byte) or byte in ~c"!$&'()*+,;=:@"
   end
 
   defp authorization_response_iss_parameter_supported(%Config{authorization_response_iss: true}), do: true
@@ -491,7 +513,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   # An empty list means "not advertised": collapse it to nil so the core
   # builder omits the member instead of publishing an empty array. Used for the
   # optional `claims_supported` catalog, not for `scopes_supported` (which is
-  # always advertised; see discovery_opts/1).
+  # always advertised; see discovery_opts/2).
   @spec presence([term()]) :: [term()] | nil
   defp presence([]), do: nil
   defp presence(list) when is_list(list), do: list

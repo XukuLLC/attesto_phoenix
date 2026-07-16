@@ -51,6 +51,27 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     def access_token_revoked?(jti), do: jti == Process.get(:attesto_phoenix_revoked_jti)
   end
 
+  defmodule TransportCallbacks do
+    @moduledoc false
+
+    import Plug.Conn
+
+    def no_store(conn), do: put_resp_header(conn, "x-mfa-no-store", "pair")
+
+    def www_authenticate(conn, challenge, marker) do
+      conn
+      |> put_resp_header("www-authenticate", challenge)
+      |> put_resp_header("x-mfa-www-authenticate", marker)
+    end
+
+    def send_error(conn, 403, %{"error" => "insufficient_scope"} = body, marker) do
+      conn
+      |> put_resp_header("x-mfa-send-error", marker)
+      |> send_resp(403, JSON.encode!(Map.put(body, "transport", marker)))
+      |> halt()
+    end
+  end
+
   # One principal kind so `Attesto.Token.mint/3` has a kind to issue under.
   @user_kind Attesto.PrincipalKind.new("user", "ou_", required_claims: [{"client_id", :non_empty_string}])
 
@@ -268,6 +289,30 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
 
       assert challenge =~ ~s(scope="openid")
       assert challenge =~ ~s(resource_metadata="#{metadata_url}")
+    end
+
+    test "invokes pair and MFA-with-extra transport hooks on insufficient_scope" do
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.merge(
+        no_store: {__MODULE__.TransportCallbacks, :no_store},
+        www_authenticate: {__MODULE__.TransportCallbacks, :www_authenticate, ["extra-last"]},
+        send_error: {__MODULE__.TransportCallbacks, :send_error, ["extra-last"]}
+      )
+      |> put_config()
+
+      conn = get_userinfo(mint(scope: "profile"))
+
+      assert conn.status == 403
+      assert get_resp_header(conn, "x-mfa-no-store") == ["pair"]
+      assert get_resp_header(conn, "x-mfa-www-authenticate") == ["extra-last"]
+      assert get_resp_header(conn, "x-mfa-send-error") == ["extra-last"]
+      assert body(conn)["error"] == "insufficient_scope"
+      assert body(conn)["transport"] == "extra-last"
+
+      assert [challenge] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ ~s(error="insufficient_scope")
+      assert challenge =~ ~s(scope="openid")
     end
   end
 

@@ -36,6 +36,18 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     def cert_der(_conn), do: Process.get(:attesto_phoenix_test_cert_der)
   end
 
+  defmodule ResourceMetadataResolver do
+    @moduledoc false
+
+    def resolve(conn) do
+      "https://pair.example/.well-known/oauth-protected-resource" <> conn.request_path
+    end
+
+    def resolve_with_extra(conn, base, resource) do
+      base <> conn.request_path <> "/" <> resource
+    end
+  end
+
   defmodule RevokedTokenStore do
     @moduledoc false
 
@@ -219,6 +231,8 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
       case conn.request_path do
         "/alpha" -> @issuer <> "/.well-known/oauth-protected-resource/alpha"
         "/beta" -> @issuer <> "/.well-known/oauth-protected-resource/beta"
+        "/invalid" -> "http://unsafe.example/.well-known/oauth-protected-resource"
+        "/invalid-utf8" -> <<"https://api.example/", 0xFF>>
         _ -> nil
       end
     end
@@ -240,14 +254,52 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
       refute challenge =~ ~s(resource_metadata="#{static}")
     end
 
-    unowned =
-      :get
-      |> conn("/unowned")
-      |> Authenticate.call(Authenticate.init(config: config))
+    for path <- ["/unowned", "/invalid", "/invalid-utf8"] do
+      unowned =
+        :get
+        |> conn(path)
+        |> Authenticate.call(Authenticate.init(config: config))
 
-    assert unowned.status == 401
-    [challenge] = get_resp_header(unowned, "www-authenticate")
-    refute challenge =~ "resource_metadata"
+      assert unowned.status == 401
+      [challenge] = get_resp_header(unowned, "www-authenticate")
+      refute challenge =~ "resource_metadata"
+    end
+  end
+
+  test "invokes MFA metadata resolvers through the challenge path with extra arguments appended", %{config: config} do
+    cases = [
+      {{__MODULE__.ResourceMetadataResolver, :resolve},
+       "https://pair.example/.well-known/oauth-protected-resource/reports"},
+      {{__MODULE__.ResourceMetadataResolver, :resolve_with_extra,
+        ["https://extra.example/.well-known/oauth-protected-resource", "invoices"]},
+       "https://extra.example/.well-known/oauth-protected-resource/reports/invoices"}
+    ]
+
+    for {resolver, selected} <- cases do
+      response =
+        :get
+        |> conn("/reports")
+        |> Authenticate.call(Authenticate.init(config: %{config | resource_metadata_resolver: resolver}))
+
+      assert response.status == 401
+      assert [challenge] = get_resp_header(response, "www-authenticate")
+      assert challenge =~ ~s(resource_metadata="#{selected}")
+    end
+  end
+
+  test "a resolver exception aborts the request instead of rendering an authentication response", %{config: config} do
+    config = %{
+      config
+      | resource_metadata_resolver: fn _conn ->
+          raise "resource metadata resolver failed"
+        end
+    }
+
+    assert_raise RuntimeError, "resource metadata resolver failed", fn ->
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config))
+    end
   end
 
   test "explicit plug challenge options win on core, TLS, revocation, and principal failures", %{config: config} do
@@ -319,23 +371,45 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     end
   end
 
-  test "invalid or nil explicit plug metadata is authoritative and safely omitted", %{config: config} do
+  test "an explicit nil plug metadata value is authoritative and safely omitted", %{config: config} do
     config = %{
       config
       | resource_metadata_resolver: fn _conn ->
-          raise "resolver must not run when the plug explicitly selects nil or an invalid value"
+          raise "resolver must not run when the plug explicitly selects nil"
         end
     }
 
-    for explicit <- [nil, "http://unsafe.example/metadata"] do
-      response =
-        :get
-        |> conn("/reports")
-        |> Authenticate.call(Authenticate.init(config: config, resource_metadata: explicit))
+    response =
+      :get
+      |> conn("/reports")
+      |> Authenticate.call(Authenticate.init(config: config, resource_metadata: nil))
 
-      assert [challenge] = get_resp_header(response, "www-authenticate")
-      refute challenge =~ "resource_metadata"
+    assert [challenge] = get_resp_header(response, "www-authenticate")
+    refute challenge =~ "resource_metadata"
+  end
+
+  test "init rejects an invalid static per-plug resource_metadata value" do
+    for invalid <- [
+          "",
+          "/relative",
+          "not-a-url",
+          "http://unsafe.example/metadata",
+          "https://api.example/metadata#fragment",
+          "https://api.example/%ZZ",
+          <<"https://api.example/", 0xFF>>,
+          123
+        ] do
+      assert_raise ArgumentError,
+                   ~r/AttestoPhoenix.Plug.Authenticate: :resource_metadata, when set, must be an absolute https URL/,
+                   fn ->
+                     Authenticate.init(resource_metadata: invalid)
+                   end
     end
+
+    assert Authenticate.init(resource_metadata: nil) == [resource_metadata: nil]
+
+    assert Authenticate.init(resource_metadata: "https://api.example/.well-known/oauth-protected-resource") ==
+             [resource_metadata: "https://api.example/.well-known/oauth-protected-resource"]
   end
 
   test "Bearer, DPoP, and mTLS binding failures carry the selected metadata pointer", %{config: config} do

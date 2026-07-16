@@ -135,9 +135,13 @@ defmodule AttestoPhoenix.Router do
     * `:userinfo` - a compile-time route-mount control. When `false`, omits
       `GET`/`POST /oauth/userinfo` while retaining the generic OAuth
       authorization-server routes. Defaults to `true` for compatibility.
-      The retained local Provider Metadata route suppresses a
-      `:userinfo_endpoint` on the issuer origin at the removed local path; an
-      endpoint on a different origin or path remains advertised.
+      The retained local Provider Metadata route suppresses only
+      `userinfo_endpoint: :derived` at the removed route-equivalent path. A
+      configured URL remains authoritative, so a host can replace the bundled
+      controller at the same path. Dynamic surrounding Phoenix scopes are
+      supported. A dynamic macro `:prefix` is rejected for this option
+      combination because that prefix does not apply to the root metadata
+      request; move it to a surrounding scope instead.
     * `:openid_configuration` - when `false`, omits the OpenID Provider
       configuration document while retaining RFC 8414 authorization-server
       metadata. This is also a compile-time route-mount control and defaults to
@@ -189,12 +193,13 @@ defmodule AttestoPhoenix.Router do
   a route-existence toggle. Metadata is otherwise derived from
   `AttestoPhoenix.Config` at request time rather than from macro options. The
   bounded exception is `userinfo: false`: the retained local Provider Metadata
-  route records the removed path so it cannot advertise that same local route.
-  An endpoint at a different origin or path remains a runtime configuration
-  concern. For a dynamically discovered and dynamically registered OpenID
-  Provider that issues access tokens, the OIDC requirements for Discovery and
-  UserInfo still apply; the opt-outs are not a claim that every combination is
-  an OIDC-conformant deployment.
+  route records the removed route so only `userinfo_endpoint: :derived` can be
+  suppressed when it resolves there. A configured HTTPS URL is authoritative,
+  including at the same path, which lets the host replace the bundled
+  controller without losing discovery. For a dynamically discovered and
+  dynamically registered OpenID Provider that issues access tokens, the OIDC
+  requirements for Discovery and UserInfo still apply; the opt-outs are not a
+  claim that every combination is an OIDC-conformant deployment.
 
   ## How protected-resource discovery actually happens
 
@@ -236,6 +241,7 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.RevocationController
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
+  alias Plug.Router.Utils
 
   @discovery_path "/.well-known/oauth-authorization-server"
   @jwks_path "/.well-known/jwks.json"
@@ -318,6 +324,7 @@ defmodule AttestoPhoenix.Router do
     session_management? = Keyword.get(opts, :session_management, false)
     userinfo? = normalize_route_mount_control!(opts, :userinfo, true)
     openid_configuration? = normalize_route_mount_control!(opts, :openid_configuration, true)
+    validate_userinfo_suppression_prefix!(prefix, userinfo?, openid_configuration?)
     protected_resource_root? = Keyword.get(opts, :protected_resource_root, true)
 
     inserted_resource_paths =
@@ -680,6 +687,27 @@ defmodule AttestoPhoenix.Router do
     end
   end
 
+  # `:prefix` applies to OAuth routes but not this macro's root metadata route.
+  # A dynamic prefix therefore has no concrete value on the metadata request.
+  # Ask Plug's own route compiler whether the prefix binds params so partial
+  # dynamics and escaped literals follow Phoenix semantics without a parallel
+  # hand-written parser. A surrounding dynamic scope remains supported because
+  # both metadata and UserInfo share its realized request segments.
+  defp validate_userinfo_suppression_prefix!(prefix, false, true) when is_binary(prefix) do
+    case Utils.build_path_match(prefix) do
+      {[], _segments} ->
+        :ok
+
+      {_params, _segments} ->
+        raise ArgumentError,
+              "attesto_routes/1 cannot combine a dynamic :prefix with userinfo: false and " <>
+                "openid_configuration: true; move dynamic segments to a surrounding Phoenix " <>
+                "scope, or also set openid_configuration: false"
+    end
+  end
+
+  defp validate_userinfo_suppression_prefix!(_prefix, _userinfo?, _openid_configuration?), do: :ok
+
   defp normalize_route_pipeline_option!(opts, default_pipelines) do
     case Keyword.get_values(opts, :route_pipelines) do
       [] ->
@@ -757,13 +785,16 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp openid_configuration_route(true, false, local_userinfo_path, path, controller) do
+    {[], local_userinfo_segments} = Utils.build_path_match(local_userinfo_path)
+    metadata_path_segment_count = path |> Utils.split() |> length()
+
     quote do
       get(
         unquote(path),
         unquote(controller),
         :show,
         private: %{
-          attesto_phoenix_local_userinfo_path: Phoenix.Router.scoped_path(__MODULE__, unquote(local_userinfo_path))
+          attesto_phoenix_local_userinfo_route: {unquote(local_userinfo_segments), unquote(metadata_path_segment_count)}
         }
       )
     end

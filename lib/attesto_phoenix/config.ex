@@ -65,7 +65,8 @@ defmodule AttestoPhoenix.Config do
       request; returning `nil` deliberately omits the auth-param. This lets one
       origin serve multiple resource identifiers without pointing every
       challenge at one global document. An invalid callback result is omitted
-      rather than advertised. When unset, the static `:resource_metadata` value
+      rather than advertised. Exceptions raised by the resolver are not rescued
+      and abort the request. When unset, the static `:resource_metadata` value
       retains its existing behavior. The callback is trusted configuration:
       return pinned or allowlisted metadata URLs and do not derive their
       authority from request Host, forwarded, query, or header values.
@@ -241,13 +242,14 @@ defmodule AttestoPhoenix.Config do
       supplies resource-owner authentication and consent through callbacks. It
       defaults to the URL derived from `:issuer` and `:authorize_path`.
     * `:userinfo_endpoint` - absolute HTTPS UserInfo URL to advertise in OpenID
-      Provider Metadata (OpenID Connect Core §5.3). `attesto_routes/1` mounts
-      the generic controller by default and the host supplies claim values
-      through `:build_userinfo_claims`. When the macro's local UserInfo route is
-      disabled, an endpoint on the issuer origin at the removed local path is
-      suppressed from its retained Provider Metadata route; an endpoint on a
-      different origin or path is retained. Omitted from OpenID Provider
-      Metadata when unset.
+      Provider Metadata (OpenID Connect Core §5.3), `:derived`, or `nil`.
+      `attesto_routes/1` mounts the generic controller by default and the host
+      supplies claim values through `:build_userinfo_claims`. A URL is an
+      authoritative host declaration and remains advertised even when the host
+      replaces the bundled route at the same path. `:derived` resolves through
+      `userinfo_endpoint_url/1`; when the macro's local UserInfo route is
+      disabled, only that derived value is eligible for suppression at the
+      removed route-equivalent path. `nil` omits the member.
     * `:claims_supported` - list of claim names the host's UserInfo endpoint
       and ID Tokens can return (OpenID Connect Discovery §3). Advertised in the
       OpenID Provider Metadata; omitted when unset.
@@ -626,7 +628,7 @@ defmodule AttestoPhoenix.Config do
           require_pushed_authorization_requests: boolean(),
           authorization_response_iss: boolean(),
           authorization_endpoint: String.t() | nil,
-          userinfo_endpoint: String.t() | nil,
+          userinfo_endpoint: String.t() | :derived | nil,
           replay_check: callback() | module() | nil,
           nonce_store: module() | nil,
           sweep_interval_ms: pos_integer() | nil,
@@ -1699,8 +1701,9 @@ defmodule AttestoPhoenix.Config do
 
   @doc """
   Absolute URL of the UserInfo endpoint: the issuer merged with
-  `userinfo_path/1`. Used when the host does not supply a separate
-  `:userinfo_endpoint`.
+  `userinfo_path/1`. This is the URL selected by
+  `userinfo_endpoint: :derived`; an explicit URL or `nil` remains
+  authoritative in Provider Metadata.
   """
   @spec userinfo_endpoint_url(t()) :: String.t()
   def userinfo_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, userinfo_path(config))
@@ -1724,7 +1727,9 @@ defmodule AttestoPhoenix.Config do
   an absolute HTTPS URL or `nil` to omit the `resource_metadata` auth-param for
   this request. Without a resolver, the static `:resource_metadata` value is
   returned unchanged. Invalid resolver results are omitted so a challenge
-  never advertises an unusable or unsafe metadata URI.
+  never advertises an unusable or unsafe metadata URI. Resolver exceptions are
+  deliberately not rescued: trusted configuration that raises aborts the
+  request instead of disguising a host failure as an authentication response.
 
   The optional third argument is a plug option list. When it contains
   `:resource_metadata`, that explicit value (including `nil`) is authoritative,
@@ -1750,6 +1755,10 @@ defmodule AttestoPhoenix.Config do
 
     if absolute_resource_url?(candidate), do: candidate
   end
+
+  @doc false
+  @spec valid_resource_metadata_url?(term()) :: boolean()
+  def valid_resource_metadata_url?(candidate), do: absolute_resource_url?(candidate)
 
   @doc """
   Absolute URL of the JWK Set document (RFC 7517 §5; the `jwks_uri` per
@@ -2070,7 +2079,7 @@ defmodule AttestoPhoenix.Config do
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
-    validate_optional_https_endpoint!(:userinfo_endpoint, config.userinfo_endpoint)
+    validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
@@ -2194,12 +2203,16 @@ defmodule AttestoPhoenix.Config do
   # request `resource` permits any scheme per §2.1 and is validated separately in
   # `AttestoPhoenix.AuthorizationServer.Token`.)
   defp absolute_resource_url?(url) when is_binary(url) do
-    case URI.new(url) do
-      {:ok, %URI{scheme: "https", host: host, fragment: nil}} when is_binary(host) and host != "" ->
-        not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, url)
+    if String.valid?(url) do
+      case URI.new(url) do
+        {:ok, %URI{scheme: "https", host: host, fragment: nil}} when is_binary(host) and host != "" ->
+          not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, url)
 
-      _ ->
-        false
+        _ ->
+          false
+      end
+    else
+      false
     end
   end
 
@@ -2211,7 +2224,7 @@ defmodule AttestoPhoenix.Config do
   # route-mount API because Config can also support host-mounted routes.
   defp validate_issuer!(%__MODULE__{issuer: issuer}) do
     valid? =
-      if is_binary(issuer) do
+      if is_binary(issuer) and String.valid?(issuer) do
         case URI.new(issuer) do
           {:ok, %URI{scheme: "https", host: host, query: nil, fragment: nil}}
           when is_binary(host) and host != "" ->
@@ -2241,6 +2254,59 @@ defmodule AttestoPhoenix.Config do
             "AttestoPhoenix.Config: #{inspect(key)}, when set, must be an absolute https URL " <>
               "with a host and no fragment; got #{inspect(value)}."
     end
+  end
+
+  defp validate_userinfo_endpoint!(%__MODULE__{userinfo_endpoint: :derived} = config) do
+    derived = userinfo_endpoint_url(config)
+
+    cond do
+      not absolute_resource_url?(derived) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :userinfo_endpoint resolves to an invalid derived URL; " <>
+                "expected an absolute https URL with a host and no fragment, got: #{inspect(derived)}"
+
+      not same_https_origin?(derived, config.issuer) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: userinfo_endpoint: :derived must remain on the :issuer " <>
+                "origin; use an explicit HTTPS URL for an external or host-owned UserInfo " <>
+                "endpoint, got: #{inspect(derived)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_userinfo_endpoint!(%__MODULE__{userinfo_endpoint: value}) do
+    validate_optional_https_endpoint!(:userinfo_endpoint, value)
+  end
+
+  defp same_https_origin?(left, right) do
+    with {:ok, %URI{scheme: "https", host: left_host} = left_uri} when is_binary(left_host) <- URI.new(left),
+         {:ok, %URI{scheme: "https", host: right_host} = right_uri} when is_binary(right_host) <- URI.new(right) do
+      normalize_host(left_host) == normalize_host(right_host) and
+        effective_https_port(left_uri) == effective_https_port(right_uri)
+    else
+      _error -> false
+    end
+  end
+
+  defp effective_https_port(%URI{port: nil}), do: 443
+  defp effective_https_port(%URI{port: port}), do: port
+
+  # RFC 3986 §6.2.2.1/§6.2.2.2: scheme and host are case-insensitive, and
+  # percent-encoded unreserved host bytes are equivalent to their decoded form.
+  defp normalize_host(host) do
+    host
+    |> normalize_percent_encoding(&URI.char_unreserved?/1)
+    |> String.downcase()
+  end
+
+  defp normalize_percent_encoding(value, decoded_char?) do
+    Regex.replace(~r/%[0-9A-Fa-f]{2}/, value, fn "%" <> hex ->
+      byte = String.to_integer(hex, 16)
+
+      if decoded_char?.(byte), do: <<byte>>, else: "%" <> String.upcase(hex)
+    end)
   end
 
   # ── Boot-time discovery-document safety guard ────────────────────────────
@@ -2339,8 +2405,8 @@ defmodule AttestoPhoenix.Config do
   # "explicit endpoint overrides plus sane defaults"); flagging every override
   # would break that contract and contradict "do not invent constraints". But
   # once a host sets a custom prefix, an override that does not sit under it is
-  # the precise silent mismatch a downstream consumer hit: discovery advertises
-  # that endpoint under a different prefix than its siblings (and than the prefix
+  # a precise silent mismatch: discovery advertises that endpoint under a
+  # different prefix than its siblings (and than the prefix
   # the host declared), while the router mounts them all together, so a client is
   # misdirected to a route that is not served. That divergence is provable from
   # the config alone, so we raise.

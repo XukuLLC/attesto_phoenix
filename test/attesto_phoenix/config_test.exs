@@ -428,6 +428,7 @@ defmodule AttestoPhoenix.ConfigTest do
         case conn.request_path do
           "/alpha" -> "https://api.example/.well-known/oauth-protected-resource/alpha"
           "/invalid" -> "not-an-absolute-url"
+          "/invalid-utf8" -> <<"https://api.example/", 0xFF>>
           _ -> nil
         end
       end
@@ -443,6 +444,7 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.resource_metadata_url(cfg, Plug.Test.conn(:get, "/unowned")) == nil
       assert Config.resource_metadata_url(cfg, Plug.Test.conn(:get, "/invalid")) == nil
+      assert Config.resource_metadata_url(cfg, Plug.Test.conn(:get, "/invalid-utf8")) == nil
 
       static_cfg = Config.new(Keyword.put(base, :resource_metadata, static))
       assert Config.resource_metadata_url(static_cfg, Plug.Test.conn(:get, "/alpha")) == static
@@ -468,15 +470,25 @@ defmodule AttestoPhoenix.ConfigTest do
 
     test ":resource_metadata_resolver validates function and MFA call arity" do
       base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+      conn = Plug.Test.conn(:get, "/reports")
 
       pair = {ResourceMetadataResolver, :resolve}
       triple = {ResourceMetadataResolver, :resolve_with_base, ["https://api.example"]}
 
       assert %Config{resource_metadata_resolver: ^pair} =
+               pair_config =
                Config.new(Keyword.put(base, :resource_metadata_resolver, pair))
 
+      assert Config.resource_metadata_url(pair_config, conn) ==
+               "https://api.example/.well-known/oauth-protected-resource/reports"
+
       assert %Config{resource_metadata_resolver: ^triple} =
+               triple_config =
                Config.new(Keyword.put(base, :resource_metadata_resolver, triple))
+
+      # The request is the per-call argument and the configured base is
+      # appended after it. Reversing that order would fail inside the callback.
+      assert Config.resource_metadata_url(triple_config, conn) == "https://api.example/reports"
 
       for bad <- [
             123,
@@ -656,6 +668,7 @@ defmodule AttestoPhoenix.ConfigTest do
             "https://issuer.example?tenant=one",
             "https://issuer.example#tenant-one",
             "https://issuer.example/%ZZ",
+            <<255>>,
             123
           ] do
         assert_raise ArgumentError, ~r/:issuer must be an absolute URL using the https scheme/, fn ->
@@ -676,6 +689,7 @@ defmodule AttestoPhoenix.ConfigTest do
             "http://issuer.example/endpoint",
             "https://issuer.example/endpoint#fragment",
             "https://issuer.example/%ZZ",
+            :automatic,
             123
           ] do
         assert_raise ArgumentError, ~r/#{key}.*absolute https URL/, fn ->
@@ -688,6 +702,36 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert config(userinfo_endpoint: "https://claims.example/userinfo").userinfo_endpoint ==
                "https://claims.example/userinfo"
+
+      assert config(userinfo_endpoint: :derived).userinfo_endpoint == :derived
+    end
+
+    test "a derived UserInfo endpoint must resolve to a valid HTTPS URL at boot" do
+      for userinfo_path <- [
+            "/oauth/%ZZ",
+            "/oauth/user info",
+            "/oauth/userinfo#claims"
+          ] do
+        assert_raise ArgumentError, ~r/:userinfo_endpoint resolves to an invalid derived URL/, fn ->
+          config(userinfo_endpoint: :derived, userinfo_path: userinfo_path)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:derived must remain on the :issuer origin/, fn ->
+        config(
+          userinfo_endpoint: :derived,
+          userinfo_path: "//claims.example/userinfo"
+        )
+      end
+
+      same_origin =
+        config(
+          userinfo_endpoint: :derived,
+          userinfo_path: "//%69SSUER.EXAMPLE:443/oauth/userinfo"
+        )
+
+      assert Config.userinfo_endpoint_url(same_origin) ==
+               "https://%69SSUER.EXAMPLE/oauth/userinfo"
     end
 
     test "the raised message names the offending member and the issuer" do

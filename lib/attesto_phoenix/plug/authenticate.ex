@@ -24,9 +24,14 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   RFC 9728 challenge discovery is selected through
   `AttestoPhoenix.Config.resource_metadata_url/3`: an explicit per-plug
   `:resource_metadata` value (including `nil`) takes precedence on every error
-  path and skips the resolver. Otherwise, the existing static
+  path and skips the resolver. A non-nil per-plug value is static Plug
+  configuration and is validated by `init/1`, which Phoenix runs at compile
+  time by default. Otherwise, the existing static
   `:resource_metadata` URL remains the default, while an optional
   `:resource_metadata_resolver` can choose a URL or omit it for each request.
+  Invalid runtime resolver results are omitted. A resolver exception is not
+  rescued and aborts the request, because resolvers are trusted host
+  configuration rather than untrusted request input.
   """
 
   @behaviour Plug
@@ -45,7 +50,24 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   @error_option_keys [:send_error, :www_authenticate, :no_store]
 
   @impl Plug
-  def init(opts) when is_list(opts), do: opts
+  def init(opts) when is_list(opts) do
+    case Keyword.fetch(opts, :resource_metadata) do
+      :error ->
+        opts
+
+      {:ok, nil} ->
+        opts
+
+      {:ok, candidate} ->
+        if Config.valid_resource_metadata_url?(candidate) do
+          opts
+        else
+          raise ArgumentError,
+                "AttestoPhoenix.Plug.Authenticate: :resource_metadata, when set, must be an " <>
+                  "absolute https URL with a host and no fragment; got #{inspect(candidate)}."
+        end
+    end
+  end
 
   @impl Plug
   def call(conn, opts) do
