@@ -7,7 +7,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
   (§11) calls out: no generic conformance suite exercises them. They run against
   an injected `:resolver` so the guard's CIDR table and IP-pinning are exercised
   without real DNS, while the protocol rejections (non-200, redirect, oversize,
-  non-JSON) and the happy path run against a real `Bypass` HTTP origin.
+  non-JSON) and the happy path run against a real local Bandit HTTP origin.
   """
 
   use ExUnit.Case, async: true
@@ -174,9 +174,9 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
 
     test "allow_loopback: true permits loopback only" do
       # loopback now allowed...
-      bypass = Bypass.open()
+      server = AttestoPhoenix.TestHTTPServer.open()
 
-      Bypass.expect_once(bypass, "GET", "/cb", fn conn ->
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
@@ -186,7 +186,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
                Fetcher.fetch(@url,
                  resolver: resolver([{127, 0, 0, 1}]),
                  allow_loopback: true,
-                 req_options: bypass_url(bypass)
+                 req_options: server_url(server)
                )
 
       assert body =~ "client_id"
@@ -197,63 +197,63 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
     end
   end
 
-  describe "fetch/2 protocol rejections (real Bypass transport)" do
+  describe "fetch/2 protocol rejections (real Bandit transport)" do
     setup do
-      bypass = Bypass.open()
-      {:ok, bypass: bypass}
+      server = AttestoPhoenix.TestHTTPServer.open()
+      {:ok, server: server}
     end
 
-    test "rejects a non-200 status", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/cb", fn conn ->
+    test "rejects a non-200 status", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         Plug.Conn.resp(conn, 404, "nope")
       end)
 
-      assert {:error, {:status, 404}} = fetch_via(bypass)
+      assert {:error, {:status, 404}} = fetch_via(server)
     end
 
-    test "rejects any redirect (redirects disabled, surfaced as 3xx)", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/cb", fn conn ->
+    test "rejects any redirect (redirects disabled, surfaced as 3xx)", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         conn
         |> Plug.Conn.put_resp_header("location", "https://elsewhere.example/cb")
         |> Plug.Conn.resp(302, "")
       end)
 
-      assert {:error, {:status, 302}} = fetch_via(bypass)
+      assert {:error, {:status, 302}} = fetch_via(server)
     end
 
-    test "rejects a non-JSON content type", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/cb", fn conn ->
+    test "rejects a non-JSON content type", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("text/html")
         |> Plug.Conn.resp(200, "<html></html>")
       end)
 
-      assert {:error, :bad_content_type} = fetch_via(bypass)
+      assert {:error, :bad_content_type} = fetch_via(server)
     end
 
-    test "accepts the application/<x>+json structured suffix", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/cb", fn conn ->
+    test "accepts the application/<x>+json structured suffix", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("application/cimd+json")
         |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
       end)
 
-      assert {:ok, %{body: body}} = fetch_via(bypass)
+      assert {:ok, %{body: body}} = fetch_via(server)
       assert body =~ "client_id"
     end
 
-    test "rejects a body over the cap", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/cb", fn conn ->
+    test "rejects a body over the cap", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.resp(200, String.duplicate("x", 6_000))
       end)
 
-      assert {:error, :too_large} = fetch_via(bypass, max_document_bytes: 5_120)
+      assert {:error, :too_large} = fetch_via(server, max_document_bytes: 5_120)
     end
 
-    test "happy path: returns the document body and parsed cache-control", %{bypass: bypass} do
-      Bypass.expect_once(bypass, "GET", "/cb", fn conn ->
+    test "happy path: returns the document body and parsed cache-control", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         # the fetcher sends Accept: application/json and Host: app.example
         assert {"accept", "application/json"} in conn.req_headers
         assert {"host", "app.example"} in conn.req_headers
@@ -264,7 +264,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
         |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}","redirect_uris":["#{@url}"]}))
       end)
 
-      assert {:ok, %{body: body, cache_control: cache_control}} = fetch_via(bypass)
+      assert {:ok, %{body: body, cache_control: cache_control}} = fetch_via(server)
       assert Jason.decode!(body)["client_id"] == @url
       assert cache_control[:max_age] == 600
       assert cache_control[:no_cache] == true
@@ -329,21 +329,21 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
     end
   end
 
-  # Point the fetcher's request at the Bypass HTTP origin: the SSRF guard and IP
+  # Point the fetcher's request at the local Bandit HTTP origin: the SSRF guard and IP
   # screening still run on the injected resolver, but the actual transport hits
-  # Bypass over plain HTTP (Bypass does not serve TLS).
-  defp fetch_via(bypass, extra_opts \\ []) do
+  # Bandit over plain HTTP (the test server does not serve TLS).
+  defp fetch_via(server, extra_opts \\ []) do
     opts =
       [
         resolver: resolver([{127, 0, 0, 1}]),
         allow_loopback: true,
-        req_options: bypass_url(bypass)
+        req_options: server_url(server)
       ] ++ extra_opts
 
     Fetcher.fetch(@url, opts)
   end
 
-  defp bypass_url(bypass) do
-    [url: "http://127.0.0.1:#{bypass.port}/cb", connect_options: [hostname: "app.example"]]
+  defp server_url(server) do
+    [url: "http://127.0.0.1:#{server.port}/cb", connect_options: [hostname: "app.example"]]
   end
 end

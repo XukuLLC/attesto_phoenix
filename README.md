@@ -184,6 +184,8 @@ config :my_app, AttestoPhoenix.Config,
   request_object_policy: Attesto.RequestObject.Policy.generic(),
 
   # --- optional deployment + features ---
+  # Incoming request transport gate only; issuer and advertised endpoint URLs
+  # remain HTTPS-only regardless of this value.
   require_https: true,
   trusted_proxies: ["10.0.0.0/8"],     # honor X-Forwarded-* only from these
   access_token_ttl: 900,
