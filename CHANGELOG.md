@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-07-16
+
+### Security
+
+- Raise the optional Req dependency floor to 0.6.1, the first release patched
+  for EEF-CVE-2026-49755 decompression-bomb denial of service. The built-in
+  Client ID Metadata, CIBA ping, and back-channel logout HTTP implementations
+  can receive responses from remote endpoints and now cannot resolve with an
+  affected Req release.
+- Replace the test-only Bypass/Cowboy origin servers with a local Bandit-backed
+  helper, removing the advisory-affected Cowlib dependency from the development
+  lock and CI audit surface.
+
+### Documentation
+
+- Clarify that `:require_https` controls incoming request transport checks; it
+  never relaxes the standards-required HTTPS issuer and advertised endpoint
+  validation.
+
 ## [2.0.0] - 2026-07-15
 
 > **Why this is a major release.** The released 1.4 public contract accepted
@@ -94,20 +113,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   releases Bearer-token claims over an insecure transport when HTTPS is
   required. These security fixes are also the breaking changes called out
   above.
-- Raise the optional Req dependency floor to 0.6.1, the first release patched
-  for EEF-CVE-2026-49755 decompression-bomb denial of service. The built-in
-  Client ID Metadata, CIBA ping, and back-channel logout HTTP implementations
-  can receive responses from remote endpoints and now cannot resolve with an
-  affected Req release.
-- Replace the test-only Bypass/Cowboy origin servers with a local Bandit-backed
-  helper, removing the advisory-affected Cowlib dependency from the development
-  lock and CI audit surface.
-
-### Documentation
-
-- Clarify that `:require_https` controls incoming request transport checks; it
-  never relaxes the standards-required HTTPS issuer and advertised endpoint
-  validation.
 
 ## [1.4.0] - 2026-07-15
 
