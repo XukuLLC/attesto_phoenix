@@ -188,8 +188,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   defp create_checked(config, conn, params) do
     case authenticate_client(config, conn, params) do
-      {:ok, client, method} ->
-        create_authenticated(config, conn, params, client, method)
+      {:ok, %ClientAuthentication.Result{} = result} ->
+        create_authenticated(config, conn, params, result)
 
       {:error, %OAuthError{} = err} ->
         # A holder-of-key (DPoP) failure on a sender-constrained code takes
@@ -219,21 +219,21 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   defp holder_of_key_error(_config, _conn, _params), do: nil
 
-  defp create_authenticated(config, conn, params, client, method) do
+  defp create_authenticated(config, conn, params, %ClientAuthentication.Result{} = result) do
     case fetch_grant_type(params) do
       {:ok, grant_type} ->
-        issue(config, conn, params, client, method, grant_type)
+        issue(config, conn, params, result, grant_type)
 
       {:error, %OAuthError{} = err} ->
         # A valid client without a grant_type: the core never runs, so the
         # framing layer emits the denial event (the resolved client's id is
         # known, but no grant_type was parsed).
-        deny(config, conn, params, client, err)
+        deny(config, conn, params, result.client_id, err)
     end
   end
 
-  defp issue(config, conn, params, client, method, grant_type) do
-    request = build_request(config, conn, params, client, method, grant_type)
+  defp issue(config, conn, params, %ClientAuthentication.Result{} = result, grant_type) do
+    request = build_request(config, conn, params, result, grant_type)
 
     case Token.issue(config, request) do
       {:ok, response, events} ->
@@ -254,17 +254,17 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # Lift the request and the conn facts the core needs into a plain
   # `Token.Request`. The sender-constraint input (RFC 9449 / RFC 8705) is parsed
   # off the conn here; the core reads only this data. `client_ip` and the
-  # request-derived `client_id` are carried for the audit events the core builds.
-  defp build_request(config, conn, params, client, method, grant_type) do
+  # authenticated `client_id` are carried for token claims and audit events.
+  defp build_request(config, conn, params, %ClientAuthentication.Result{} = result, grant_type) do
     %Request{
       config: config,
-      client: client,
-      client_auth_method: method,
+      client: result.client,
+      client_auth_method: result.method,
       grant_type: grant_type,
       params: params,
       sender_constraint_input: sender_constraint_input(config, conn),
       client_ip: RequestContext.client_ip(conn, config),
-      request_client_id: request_client_id(conn, params)
+      request_client_id: result.client_id
     }
   end
 
@@ -319,8 +319,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
            config,
            policy
          ) do
-      {:ok, %ClientAuthentication.Result{client: client, method: method}} ->
-        {:ok, client, method}
+      {:ok, %ClientAuthentication.Result{} = result} ->
+        {:ok, result}
 
       {:error, %OAuthError{} = err, %ErrorContext{} = context} ->
         {:error, token_endpoint_client_auth_error(config, err, context)}
@@ -382,9 +382,9 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # then render the error. Mirrors the core's denial event for the fields a
   # pre-core failure can know: there is no resolved grant_type for a missing-
   # grant or client-auth failure, and the client may be unauthenticated.
-  defp deny(config, conn, params, client, %OAuthError{} = err) do
+  defp deny(config, conn, params, authenticated_client_id, %OAuthError{} = err) do
     code = Atom.to_string(err.error)
-    client_id = denial_client_id(config, conn, params, client)
+    client_id = denial_client_id(conn, params, authenticated_client_id)
 
     Event.emit(config, :token_denied, %{
       client_id: client_id,
@@ -408,17 +408,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
     render_error(conn, err)
   end
 
-  defp denial_client_id(config, conn, params, client) when not is_nil(client) do
-    client_id(config, client) || request_client_id(conn, params)
-  end
-
-  defp denial_client_id(_config, conn, params, _client) do
-    request_client_id(conn, params)
-  end
-
-  defp client_id(config, client) do
-    Callback.invoke(Config.client_id_fun(config), [client], nil)
-  end
+  defp denial_client_id(_conn, _params, client_id) when is_binary(client_id) and client_id != "", do: client_id
+  defp denial_client_id(conn, params, _unknown), do: request_client_id(conn, params)
 
   defp request_client_id(conn, params), do: optional_param(params, "client_id") || basic_client_id(conn)
 

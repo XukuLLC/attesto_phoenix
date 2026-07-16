@@ -248,6 +248,75 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
               }} =
                authenticate([], params, config, allow_public: true)
     end
+
+    test "Basic credentials reject a conflicting host client_id", %{config: config} do
+      config = %{config | client_id: fn _client -> "different-client" end}
+
+      assert_generic_invalid_client(authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: true))
+    end
+
+    test "body credentials reject a conflicting host client_id", %{config: config} do
+      config = %{config | client_id: fn _client -> "different-client" end}
+      params = %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"}
+
+      assert_generic_invalid_client(authenticate([], params, config, allow_public: true))
+    end
+
+    test "Basic credentials never produce a successful result with an empty client_id", %{
+      config: config
+    } do
+      config = %{
+        config
+        | load_client: fn "" -> {:ok, @confidential} end,
+          client_id: nil
+      }
+
+      assert_generic_invalid_client(authenticate(basic("", "s3cr3t"), %{}, config, allow_public: true))
+    end
+
+    test "public credentials reject a conflicting host client_id", %{config: config} do
+      config = %{config | client_id: fn _client -> "different-client" end}
+
+      assert_generic_invalid_client(authenticate([], %{"client_id" => "public-1"}, config, allow_public: true))
+    end
+
+    test "an absent host client_id callback preserves the credential-carried identifier", %{
+      config: config
+    } do
+      config = %{config | client_id: nil}
+
+      assert {:ok,
+              %Result{
+                client: @confidential,
+                client_id: "confidential-1",
+                method: :client_secret_basic
+              }} = authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: true)
+    end
+  end
+
+  describe "private_key_jwt identity agreement" do
+    test "rejects a conflicting host client_id after verification without consuming jti", %{
+      config: config
+    } do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+      test_process = self()
+
+      config = %{
+        config
+        | client_id: fn _client -> "different-client" end,
+          client_jwks: fn @confidential -> client_jwks end,
+          replay_check: fn _key, _ttl -> send(test_process, :jti_consumed) end
+      }
+
+      params = %{
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, "confidential-1")
+      }
+
+      assert_generic_invalid_client(authenticate([], params, config, allow_public: true))
+      refute_received :jti_consumed
+    end
   end
 
   defp authenticate(headers, params, config, opts) do
@@ -263,6 +332,36 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
   defp basic(client_id, secret) do
     ["Basic " <> Base.encode64("#{client_id}:#{secret}")]
+  end
+
+  defp assert_generic_invalid_client(result) do
+    assert {:error,
+            %OAuthError{
+              error: :invalid_client,
+              error_description: "client authentication failed"
+            }} = result
+  end
+
+  defp client_assertion(jwk, client_id) do
+    now = System.system_time(:second)
+
+    claims = %{
+      "iss" => client_id,
+      "sub" => client_id,
+      "aud" => "https://issuer.example",
+      "iat" => now,
+      "exp" => now + 60,
+      "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    }
+
+    header = %{"alg" => "ES256", "kid" => JOSE.JWK.thumbprint(jwk)}
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    compact
+  end
+
+  defp public_jwk(jwk) do
+    {_kty, map} = JOSE.JWK.to_public_map(jwk)
+    Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"})
   end
 
   defp normalize_lookup({:ok, client}), do: {:ok, client}

@@ -499,7 +499,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # by redirect (the redirect_uri is already trusted). Under prompt=none
         # the equivalent disposition is consent_required (OIDC Core §3.1.2.6):
         # consent could not be obtained without interaction.
-        emit_denied(conn, config, client)
+        emit_denied(conn, config, request.client_id)
 
         error_code = if prompt_none?, do: @error_consent_required, else: @error_access_denied
         emit_error(conn, config, request, error_code)
@@ -522,7 +522,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp issue_and_redirect(conn, config, client, request, subject, dpop_jkt) do
     case authorize_request_resource(config, client, request) do
       :ok ->
-        issue_and_redirect_authorized(conn, config, client, request, subject, dpop_jkt)
+        issue_and_redirect_authorized(conn, config, request, subject, dpop_jkt)
 
       {:error, :invalid_target} ->
         # RFC 8707 §2.2: the client requested a resource this server does not
@@ -545,7 +545,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
   end
 
-  defp issue_and_redirect_authorized(conn, config, client, request, subject, dpop_jkt) do
+  defp issue_and_redirect_authorized(conn, config, request, subject, dpop_jkt) do
     # RFC 9126 §2.2: claim the PAR `request_uri` as the atomic single-use gate
     # BEFORE issuing the code, so two concurrent completions (on any node) cannot
     # each mint a code from one pushed request - exactly one wins the claim.
@@ -553,7 +553,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       :ok ->
         attrs =
           %{
-            client_id: client_id(config, client),
+            client_id: request.client_id,
             redirect_uri: request.redirect_uri,
             code_challenge: request.code_challenge,
             code_challenge_method: request.code_challenge_method,
@@ -570,7 +570,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
         case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
           {:ok, code} ->
-            emit_code_issued(conn, config, client, request.scope)
+            emit_code_issued(conn, config, request.client_id, request.scope)
             emit_success(conn, config, request, subject, code)
 
           {:error, reason} ->
@@ -715,14 +715,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # (`:invalid_subject`), which is reported as server_error.
   defp subject_id(subject) when is_map(subject), do: Map.get(subject, :subject)
   defp subject_id(_subject), do: nil
-
-  # The CIMD client's `client_id` is the URL the document is bound to; a
-  # registered client's is the host's `:client_id` callback.
-  defp client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
-
-  defp client_id(config, client) do
-    Callback.invoke(Config.client_id_fun(config), [client], nil)
-  end
 
   defp code_store(config), do: Callback.config_callback(config, :code_store)
 
@@ -1087,18 +1079,18 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   # ── Audit / telemetry ────────────────────────────────────────────────────
 
-  defp emit_code_issued(conn, config, client, scope) do
+  defp emit_code_issued(conn, config, client_id, scope) do
     Event.emit(config, :code_issued, %{
-      client_id: client_id(config, client),
+      client_id: client_id,
       scope: Enum.join(List.wrap(scope), " "),
       grant_type: "authorization_code",
       metadata: %{client_ip: RequestContext.client_ip(conn, config)}
     })
   end
 
-  defp emit_denied(conn, config, client) do
+  defp emit_denied(conn, config, client_id) do
     Event.emit(config, :authorization_denied, %{
-      client_id: client_id(config, client),
+      client_id: client_id,
       metadata: %{client_ip: RequestContext.client_ip(conn, config)}
     })
   end

@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-07-16
+
+### Changed
+
+- **Upgrade note:** a configured `:client_id` callback must now return exactly
+  the identifier carried by the successfully verified client credentials. A
+  callback that maps the authenticated client to a different canonical or
+  internal identifier now fails authentication with generic `invalid_client`.
+  Keep internal identifiers on the opaque client value returned by
+  `:load_client`; use `:client_id` only to confirm its OAuth identifier.
+
+### Fixed
+
+- The introspection endpoint now recognizes access tokens minted for trusted
+  RFC 8707 resource indicators. It derives the accepted audience set from the
+  configured default audience plus static and signed original-token-client
+  resource allowlists, while unknown resources and partially untrusted audience
+  arrays remain inactive. The introspection caller remains a separate
+  authorization decision.
+- Token exchange now accepts trusted resource-audienced subject tokens and
+  stamps the authenticated exchanger's `client_id` instead of inheriting the
+  subject token's client. An omitted `resource` preserves and re-authorizes the
+  complete subject audience rather than falling back to the server default.
+- Every token-endpoint grant now uses one immutable, credential-carried
+  `client_id` for state redemption, access and ID Tokens, refresh families, and
+  audit. Host callbacks may confirm that identifier but cannot relabel an
+  authenticated client, and trusted direct callers retain their legacy builder
+  claim fallback.
+- Invalid static resource indicators and callback configuration now fail at
+  boot; malformed dynamic callback entries are ignored safely.
+
+### Security
+
+- Raise the direct Plug dependency floor to 1.19.5, matching Attesto core and
+  excluding releases affected by multipart temp-file exhaustion,
+  nested-parameter quadratic-time denial of service, and cookie
+  attribute-injection advisories.
+
 ## [2.0.1] - 2026-07-16
 
 ### Security

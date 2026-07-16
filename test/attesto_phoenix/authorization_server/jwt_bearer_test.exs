@@ -276,13 +276,13 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert access_token_aud(config, response) == resource
     end
 
-    test "a resource with invalid percent-encoding is invalid_target (not a malformed aud)" do
-      # RFC 3986 §2.1: even with a matching allow-list entry, a bad `%HH` triplet
-      # must be rejected rather than minted into the access token aud.
-      config = config(resource_indicators: [allowed_resources: ["https://api.example/%ZZ"]])
-      params = %{"assertion" => assertion(), "resource" => "https://api.example/%ZZ"}
-
-      assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, params)
+    test "a configured resource with invalid percent-encoding fails at boot" do
+      # RFC 3986 §2.1: a bad `%HH` triplet must never reach access-token
+      # issuance. Static policy is trusted configuration, so reject it while
+      # building Config instead of waiting for the first request.
+      assert_raise ArgumentError, ~r/every :resource_indicators :allowed_resources entry/, fn ->
+        config(resource_indicators: [allowed_resources: ["https://api.example/%ZZ"]])
+      end
     end
 
     test "a present-but-empty resource is invalid_target, not silently absent" do

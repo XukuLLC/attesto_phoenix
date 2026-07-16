@@ -367,6 +367,55 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe "RFC 8707 resource-indicator policy" do
+    test "static resources compose with the default audience and de-duplicate" do
+      resource = "https://resource.example/mcp"
+
+      built =
+        config(
+          resource_indicators: [
+            allowed_resources: [resource, resource],
+            allowed_resources_for: fn _client -> ["https://resource.example/per-client"] end
+          ]
+        )
+
+      assert Config.static_allowed_resources(built) == ["https://api.example.com", resource]
+
+      assert Config.allowed_resources(built, :client) == [
+               "https://api.example.com",
+               resource,
+               "https://resource.example/per-client"
+             ]
+    end
+
+    test "invalid static resources fail at boot" do
+      for invalid <- ["", "/relative", "https://resource.example/#fragment", "https://resource.example/%ZZ", 123] do
+        assert_raise ArgumentError, ~r/every :resource_indicators :allowed_resources entry/, fn ->
+          config(resource_indicators: [allowed_resources: [invalid]])
+        end
+      end
+    end
+
+    test "an invalid per-client callback fails at boot" do
+      assert_raise ArgumentError, ~r/:allowed_resources_for must be a one-argument callback/, fn ->
+        config(resource_indicators: [allowed_resources_for: fn -> [] end])
+      end
+    end
+
+    test "invalid dynamic callback entries are ignored without poisoning valid trust" do
+      resource = "https://resource.example/per-client"
+
+      built =
+        config(
+          resource_indicators: [
+            allowed_resources_for: fn _client -> [resource, "", 123, "https://bad.example/#fragment"] end
+          ]
+        )
+
+      assert Config.allowed_resources(built, :client) == ["https://api.example.com", resource]
+    end
+  end
+
   describe ":audience boot gate (RFC 9068 §3 aud)" do
     # The required-key/capability checks all pass here; only :audience is
     # missing, so this isolates the audience gate from the other boot checks.

@@ -106,6 +106,12 @@ defmodule AttestoPhoenix.Config do
       audience/scope against the calling protected resource. Optional - when
       unset, every authenticated caller may introspect any token (the
       single-trust-domain default).
+    * `:resource_indicators` - RFC 8707 resource policy as
+      `[allowed_resources: [...], allowed_resources_for: callback]`. Static
+      entries are absolute resource URIs. The optional one-argument callback
+      receives the original OAuth client and returns additional identifiers
+      that client may target. The same policy governs issuance, introspection,
+      and token-exchange subject-token verification.
     * `:principal_kinds` - non-empty list of `Attesto.PrincipalKind` values
       or a zero-arity callback returning that list, passed into the core token
       configuration.
@@ -120,6 +126,9 @@ defmodule AttestoPhoenix.Config do
       imposes no namespace). `:build_principal` is the sole seam that applies
       the prefix; the prefix is mint-time defense-in-depth (an issued token's
       `sub` is unambiguous across principal kinds), not a substitute for it.
+      The protocol layer injects the authenticated OAuth `client_id` claim
+      required by RFC 9068; the callback may omit it or return the same value,
+      but a conflicting value fails issuance.
     * `:build_userinfo_claims` - `(subject, granted_scopes, requested_claims ->
       claims_map)`. Produces the claim values the UserInfo endpoint
       (OpenID Connect Core §5.3) returns for the authenticated subject. The
@@ -442,6 +451,7 @@ defmodule AttestoPhoenix.Config do
   """
 
   alias Attesto.RequestObject.Policy
+  alias Attesto.ResourceIndicator
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.URLComparison
@@ -952,12 +962,27 @@ defmodule AttestoPhoenix.Config do
   """
   @spec allowed_resources(t(), term()) :: [String.t()]
   def allowed_resources(%__MODULE__{} = config, client) do
-    opts = resource_indicators(config)
-    static = opts |> Keyword.get(:allowed_resources, []) |> List.wrap()
-    per_client = per_client_allowed_resources(opts, client)
+    static = static_allowed_resources(config)
+    per_client = config |> resource_indicators() |> per_client_allowed_resources(client)
 
-    (List.wrap(config.audience) ++ static ++ per_client)
-    |> Enum.filter(&is_binary/1)
+    (static ++ per_client)
+    |> Enum.filter(&ResourceIndicator.valid_indicator?/1)
+    |> Enum.uniq()
+  end
+
+  @doc """
+  The configured default audience plus static RFC 8707 resource identifiers.
+
+  Unlike `allowed_resources/2`, this does not invoke the per-client issuance
+  callback. It is the safe fallback when no verified original OAuth client is
+  available, including malformed or legacy tokens during introspection.
+  """
+  @spec static_allowed_resources(t()) :: [String.t()]
+  def static_allowed_resources(%__MODULE__{} = config) do
+    static = config |> resource_indicators() |> Keyword.get(:allowed_resources, []) |> List.wrap()
+
+    (List.wrap(config.audience) ++ static)
+    |> Enum.filter(&ResourceIndicator.valid_indicator?/1)
     |> Enum.uniq()
   end
 
@@ -2090,6 +2115,7 @@ defmodule AttestoPhoenix.Config do
     end
 
     validate_issuer!(config)
+    validate_resource_indicators!(config)
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
@@ -2139,6 +2165,35 @@ defmodule AttestoPhoenix.Config do
     validate_advertised_paths_consistent!(config)
 
     config
+  end
+
+  defp validate_resource_indicators!(%__MODULE__{} = config) do
+    opts = resource_indicators(config)
+    static = opts |> Keyword.get(:allowed_resources, []) |> List.wrap()
+
+    case Enum.find(static, &(not ResourceIndicator.valid_indicator?(&1))) do
+      nil ->
+        :ok
+
+      invalid ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: every :resource_indicators :allowed_resources entry " <>
+                "must be a non-empty absolute URI with no fragment; got #{inspect(invalid)}."
+    end
+
+    case Keyword.get(opts, :allowed_resources_for) do
+      nil ->
+        :ok
+
+      callback ->
+        if callback_with_call_arity?(callback, 1) do
+          :ok
+        else
+          raise ArgumentError,
+                "AttestoPhoenix.Config: :resource_indicators :allowed_resources_for must " <>
+                  "be a one-argument callback in a supported form or nil; got #{inspect(callback)}."
+        end
+    end
   end
 
   # RFC 9728 §5.1: when set, :resource_metadata is rendered as a quoted
