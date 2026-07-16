@@ -114,7 +114,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 1.4"}
+    {:attesto_phoenix, "~> 2.0"}
   ]
 end
 ```
@@ -125,7 +125,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 1.4"},
+    {:attesto_phoenix, "~> 2.0"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
@@ -385,7 +385,11 @@ path, OIDC Discovery and RFC 8414 derive two different path-bearing well-known
 locations; mount those routes explicitly instead of using the macro's fixed
 root discovery routes. Because the macro always owns its RFC 8414 route, a
 path-bearing issuer requires a manually declared route catalog rather than
-adding duplicate discovery routes alongside `attesto_routes/1`.
+adding duplicate discovery routes alongside `attesto_routes/1`. Derived
+endpoint URLs are likewise resolved against the issuer *origin*: the issuer's
+path is not prepended, so a path-bearing issuer must also set
+`:oauth_path_prefix` (or the per-endpoint path overrides) so the advertised
+endpoints sit under its path.
 
 `attesto_routes/1` mounts:
 
@@ -556,9 +560,12 @@ The resolver is trusted configuration. Return pinned or allowlisted HTTPS URLs;
 do not construct a metadata authority from untrusted Host, forwarded, query, or
 arbitrary header values. The returned URL is never fetched or used as a
 redirect, and it is validated with the same HTTPS/host/no-fragment rules as the
-static value before it can enter a quoted challenge. Resolver exceptions are not
+static value before it can enter a quoted challenge. The resolver runs once per
+protected-resource request — including requests that authenticate successfully,
+since the pointer must be selected before verification renders any challenge —
+so keep it fast and total. Resolver exceptions are not
 rescued: a callback that raises propagates the exception and fails the request
-instead of rendering an authentication challenge.
+(successful ones included) instead of rendering an authentication challenge.
 
 The protected-resource integration still owns the actual RFC 9728 declarations.
 Publish one document per exact resource identifier, with the path-inserted

@@ -4,9 +4,9 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [2.0.0] - 2026-07-15
 
-> **Release recommendation: 2.0.0.** The released 1.4 public contract accepted
+> **Why this is a major release.** The released 1.4 public contract accepted
 > absolute non-HTTPS endpoint overrides, and UserInfo did not apply the existing
 > `:require_https` policy. The security and conformance corrections below can
 > therefore fail a previously accepted configuration at startup or change an
@@ -76,9 +76,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - UserInfo now honors the configured error transport hooks on verification,
-  TLS, revoked-token, and insufficient-scope failures. Its accepted RFC 6750
-  Bearer presentation methods remain aligned with
-  `bearer_methods_supported`.
+  TLS, revoked-token, and insufficient-scope failures. UserInfo also now honors
+  `bearer_methods_supported` (previously it accepted header credentials only,
+  regardless of configuration): a host advertising `"body"` will see UserInfo
+  begin accepting RFC 6750 §2.2 form-body tokens as advertised.
 - An explicit per-plug `:resource_metadata` value (including `nil`) and error
   transport hooks now take precedence consistently across core verification,
   TLS, revocation, and principal-resolution failures.

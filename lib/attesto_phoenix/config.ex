@@ -19,7 +19,11 @@ defmodule AttestoPhoenix.Config do
       used as the JWT `iss`, the discovery issuer, and the base for endpoint
       URLs. The bundled router's root well-known routes require an origin-only
       issuer; a path-bearing issuer requires standards-derived well-known
-      routes mounted by the host.
+      routes mounted by the host. Derived endpoint URLs are resolved against
+      the issuer *origin*: an issuer path is not prepended to the resolved
+      endpoint paths, so a path-bearing issuer must also set
+      `:oauth_path_prefix` (or the per-endpoint path overrides) to advertise
+      its endpoints under that path.
     * `:keystore` - module implementing `Attesto.Keystore` providing the
       signing key and the verification keys published via JWKS. Use a static
       keystore or a host KMS/HSM/Vault-backed implementation; per-key `alg`
@@ -65,9 +69,13 @@ defmodule AttestoPhoenix.Config do
       request; returning `nil` deliberately omits the auth-param. This lets one
       origin serve multiple resource identifiers without pointing every
       challenge at one global document. An invalid callback result is omitted
-      rather than advertised. Exceptions raised by the resolver are not rescued
-      and abort the request. When unset, the static `:resource_metadata` value
-      retains its existing behavior. The callback is trusted configuration:
+      rather than advertised. The resolver is consulted once per
+      protected-resource request - including requests that authenticate
+      successfully, because the selected URI must be in place before
+      verification renders any challenge - so it should be fast and total.
+      Exceptions raised by the resolver are not rescued and abort the request,
+      successful ones included. When unset, the static `:resource_metadata`
+      value retains its existing behavior. The callback is trusted configuration:
       return pinned or allowlisted metadata URLs and do not derive their
       authority from request Host, forwarded, query, or header values.
     * `:basic_realm` - realm string for token-endpoint Basic auth challenges.
@@ -433,6 +441,8 @@ defmodule AttestoPhoenix.Config do
 
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Callback
+  alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
+  alias AttestoPhoenix.URLComparison
 
   # Only the plain required *values* are enforced by `struct!/2`. The required
   # *capabilities* (`:load_client`, `:verify_client_secret`, `:load_principal`)
@@ -440,8 +450,6 @@ defmodule AttestoPhoenix.Config do
   # behaviour module (`:client_store` / `:principal_store`) instead of a flat
   # callback. They are validated by resolution in `validate!/1` so the
   # behaviour-module install path actually works.
-  alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
-
   @enforce_keys [
     :issuer,
     :keystore,
@@ -1727,9 +1735,13 @@ defmodule AttestoPhoenix.Config do
   an absolute HTTPS URL or `nil` to omit the `resource_metadata` auth-param for
   this request. Without a resolver, the static `:resource_metadata` value is
   returned unchanged. Invalid resolver results are omitted so a challenge
-  never advertises an unusable or unsafe metadata URI. Resolver exceptions are
-  deliberately not rescued: trusted configuration that raises aborts the
-  request instead of disguising a host failure as an authentication response.
+  never advertises an unusable or unsafe metadata URI. The resolver runs once
+  per protected-resource request, including requests that authenticate
+  successfully, because the selected URI must be in place before verification
+  renders any challenge. Resolver exceptions are deliberately not rescued:
+  trusted configuration that raises aborts the request - successful ones
+  included - instead of disguising a host failure as an authentication
+  response.
 
   The optional third argument is a plug option list. When it contains
   `:resource_metadata`, that explicit value (including `nil`) is authoritative,
@@ -2265,7 +2277,7 @@ defmodule AttestoPhoenix.Config do
               "AttestoPhoenix.Config: :userinfo_endpoint resolves to an invalid derived URL; " <>
                 "expected an absolute https URL with a host and no fragment, got: #{inspect(derived)}"
 
-      not same_https_origin?(derived, config.issuer) ->
+      not URLComparison.same_https_origin?(derived, config.issuer) ->
         raise ArgumentError,
               "AttestoPhoenix.Config: userinfo_endpoint: :derived must remain on the :issuer " <>
                 "origin; use an explicit HTTPS URL for an external or host-owned UserInfo " <>
@@ -2278,35 +2290,6 @@ defmodule AttestoPhoenix.Config do
 
   defp validate_userinfo_endpoint!(%__MODULE__{userinfo_endpoint: value}) do
     validate_optional_https_endpoint!(:userinfo_endpoint, value)
-  end
-
-  defp same_https_origin?(left, right) do
-    with {:ok, %URI{scheme: "https", host: left_host} = left_uri} when is_binary(left_host) <- URI.new(left),
-         {:ok, %URI{scheme: "https", host: right_host} = right_uri} when is_binary(right_host) <- URI.new(right) do
-      normalize_host(left_host) == normalize_host(right_host) and
-        effective_https_port(left_uri) == effective_https_port(right_uri)
-    else
-      _error -> false
-    end
-  end
-
-  defp effective_https_port(%URI{port: nil}), do: 443
-  defp effective_https_port(%URI{port: port}), do: port
-
-  # RFC 3986 §6.2.2.1/§6.2.2.2: scheme and host are case-insensitive, and
-  # percent-encoded unreserved host bytes are equivalent to their decoded form.
-  defp normalize_host(host) do
-    host
-    |> normalize_percent_encoding(&URI.char_unreserved?/1)
-    |> String.downcase()
-  end
-
-  defp normalize_percent_encoding(value, decoded_char?) do
-    Regex.replace(~r/%[0-9A-Fa-f]{2}/, value, fn "%" <> hex ->
-      byte = String.to_integer(hex, 16)
-
-      if decoded_char?.(byte), do: <<byte>>, else: "%" <> String.upcase(hex)
-    end)
   end
 
   # ── Boot-time discovery-document safety guard ────────────────────────────

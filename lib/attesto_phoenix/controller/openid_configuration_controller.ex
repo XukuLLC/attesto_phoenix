@@ -82,6 +82,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   alias Attesto.OpenIDDiscovery
   alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.URLComparison
 
   # The router pipeline installs the AttestoPhoenix.Config here. This is the
   # same private key the token and discovery endpoints read.
@@ -356,7 +357,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
     with true <- is_binary(endpoint) and is_binary(issuer),
          {:ok, endpoint_uri} <- URI.new(endpoint),
          {:ok, issuer_uri} <- URI.new(issuer) do
-      same_https_origin?(endpoint_uri, issuer_uri) and
+      URLComparison.same_https_origin?(endpoint_uri, issuer_uri) and
         route_path_matches?(
           endpoint_uri.path,
           local_segments,
@@ -370,20 +371,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   end
 
   defp local_userinfo_endpoint?(_endpoint, _issuer, _local_route, _path_info, _script_name), do: false
-
-  defp same_https_origin?(
-         %URI{scheme: "https", host: left_host} = left,
-         %URI{scheme: "https", host: right_host} = right
-       )
-       when is_binary(left_host) and is_binary(right_host) do
-    normalize_host(left_host) == normalize_host(right_host) and
-      effective_https_port(left) == effective_https_port(right)
-  end
-
-  defp same_https_origin?(_left, _right), do: false
-
-  defp effective_https_port(%URI{port: nil}), do: 443
-  defp effective_https_port(%URI{port: port}), do: port
 
   # Reconstruct the concrete client-visible local route from Plug/Phoenix data
   # instead of interpreting Phoenix route syntax. `path_info` contains the
@@ -426,20 +413,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   end
 
   defp decode_request_segments(_segments), do: :error
-
-  defp normalize_host(host) do
-    host
-    |> normalize_percent_encoding(&URI.char_unreserved?/1)
-    |> String.downcase()
-  end
-
-  defp normalize_percent_encoding(value, decoded_char?) do
-    Regex.replace(~r/%[0-9A-Fa-f]{2}/, value, fn "%" <> hex ->
-      byte = String.to_integer(hex, 16)
-
-      if decoded_char?.(byte), do: <<byte>>, else: "%" <> String.upcase(hex)
-    end)
-  end
 
   defp authorization_response_iss_parameter_supported(%Config{authorization_response_iss: true}), do: true
 
