@@ -6,47 +6,93 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+> **Release recommendation: 2.0.0.** The released 1.4 public contract accepted
+> absolute non-HTTPS endpoint overrides, and UserInfo did not apply the existing
+> `:require_https` policy. The security and conformance corrections below can
+> therefore fail a previously accepted configuration at startup or change an
+> HTTP UserInfo response from success to rejection. They are incompatible
+> behavior changes under this project's declared Semantic Versioning policy,
+> even though the old behavior was not standards-conformant.
+
 ### Added
 
 - `attesto_routes/1` accepts `userinfo: false` and
   `openid_configuration: false` as independent, compile-time route-mount
   controls. Both default to `true`, so existing calls retain the
   exact route table and pipeline data; OAuth-only hosts can omit the OIDC-only
-  surfaces without restating the authorization-server routes.
+  surfaces without restating the authorization-server routes. Disabling OpenID
+  configuration does not remove or alter RFC 8414 authorization-server
+  metadata.
+- `:userinfo_endpoint` accepts `:derived` as an explicit derivation marker for
+  the issuer/path-derived bundled UserInfo URL. With `userinfo: false`, only
+  this derived value can be suppressed when it is route-equivalent to the
+  removed local endpoint. An explicit HTTPS URL is always authoritative,
+  including at the same path, so a host can replace the bundled controller
+  without losing Provider Metadata; `nil` retains its released omission
+  behavior. Suppression follows Phoenix/Plug dispatch semantics for prefixes,
+  static and dynamic scopes, empty path segments, trailing/repeated slashes,
+  percent-decoded request segments, dot segments, non-default ports, and
+  forwarded router mounts. A dynamic macro `:prefix` is rejected when
+  `userinfo: false` is combined with `openid_configuration: true`, because the
+  retained Provider Metadata route cannot resolve that prefix; a surrounding
+  dynamic Phoenix scope remains supported.
 - `AttestoPhoenix.Config` accepts a `:resource_metadata_resolver` callback that
   selects an RFC 9728 protected-resource metadata URI for each request or
   returns `nil` to omit it. `AttestoPhoenix.Plug.Authenticate` and UserInfo use
   the selected URI consistently across core verification, revoked-token,
   insufficient-scope, and transport failures. The existing static
   `:resource_metadata` URL remains the backward-compatible fallback when no
-  resolver is configured.
+  resolver is configured. Function, `{module, function}`, and
+  `{module, function, extra_args}` forms are supported; extra arguments follow
+  the request argument. Configuration validates MFA callbacks and their
+  effective arity. Invalid runtime resolver values are safely omitted; an
+  explicit per-Plug override, including `nil`, skips the resolver; and a
+  resolver exception deliberately propagates and fails the request.
+
+### Changed
+
+- **Breaking — advertised URL validation.** `AttestoPhoenix.Config.new/1` now
+  requires an HTTPS issuer with a host and no query or fragment, and requires
+  explicit `:authorization_endpoint` and `:userinfo_endpoint` URLs to use HTTPS
+  with a host and no fragment. Previously accepted insecure or malformed values
+  now raise `ArgumentError` during configuration. Migrate production and local
+  issuers/endpoints to HTTPS, remove query/fragment components from the issuer,
+  and use the locally trusted certificate workflow in `guides/local_https.md`
+  for development. Endpoint query components remain supported.
+- **Breaking — UserInfo transport enforcement.** UserInfo now applies
+  `:require_https` before token verification or claim release. A deployment that
+  terminates TLS at a proxy must configure the immediate proxy in
+  `:trusted_proxies` so its forwarded HTTPS scheme is trusted; do not disable
+  HTTPS in production.
+- **Potentially breaking — static Plug option validation.** A non-`nil`
+  `resource_metadata:` option passed directly to
+  `AttestoPhoenix.Plug.Authenticate` is now validated by `init/1` and raises for
+  an invalid URL. Phoenix runs Plug initialization at compile time by default;
+  hosts using runtime Plug initialization see the same error when the Plug is
+  initialized. Fix the URL or use explicit `nil`. Invalid runtime resolver
+  returns are still safely omitted, while a resolver exception deliberately
+  propagates and fails the request.
 
 ### Fixed
 
-- UserInfo now enforces `:require_https` before verifying or returning claims,
-  and honors the configured error transport hooks on verification, TLS,
-  revoked-token, and insufficient-scope failures. Its accepted RFC 6750 Bearer
-  presentation methods now remain aligned with `bearer_methods_supported`.
+- UserInfo now honors the configured error transport hooks on verification,
+  TLS, revoked-token, and insufficient-scope failures. Its accepted RFC 6750
+  Bearer presentation methods remain aligned with
+  `bearer_methods_supported`.
 - An explicit per-plug `:resource_metadata` value (including `nil`) and error
   transport hooks now take precedence consistently across core verification,
-  TLS, revocation, and principal-resolution failures. Invalid dynamic values
-  are omitted; the configured resolver is skipped for an explicit override.
+  TLS, revocation, and principal-resolution failures.
 - OpenID Provider Metadata now derives the required `authorization_endpoint`
   when no override is configured, and both OAuth and OpenID metadata honor the
-  same validated external override. Issuer and advertised endpoint URLs are
-  validated as HTTPS, and resource-metadata MFA callbacks fail at boot when the
-  configured function is missing or has the wrong effective arity.
-- `userinfo: false` now suppresses a configured `:userinfo_endpoint` on the
-  issuer origin at the removed local path (including equivalent URL spelling),
-  while preserving an endpoint on a different origin or path in Provider
-  Metadata.
+  same validated external override.
 
-### Documentation
+### Security
 
-- Documented the maintained route-catalog/host-policy boundary, declarative
-  route pipeline and route-mount model, shared plumbing for permissive
-  OAuth and strict FAPI profiles, and per-resource RFC 9728 ownership for
-  multi-resource origins.
+- Issuer and advertised endpoint validation now enforces the HTTPS requirements
+  of RFC 8414 and OpenID Provider Metadata, and UserInfo no longer accepts or
+  releases Bearer-token claims over an insecure transport when HTTPS is
+  required. These security fixes are also the breaking changes called out
+  above.
 
 ## [1.4.0] - 2026-07-15
 

@@ -324,16 +324,60 @@ attesto_routes(
 
 These flags are compile-time route-mount controls; metadata is built later from
 runtime `AttestoPhoenix.Config`. `userinfo: false` removes both local UserInfo
-verbs. The retained Provider Metadata route suppresses a configured
-`:userinfo_endpoint` on the issuer origin at the removed local path (including
-equivalent host-case, default-port, or query variants); an endpoint on a
-different origin or path remains advertised. OIDC conformance for features
-such as CIBA, logout, and session management relies on Provider Metadata, so
-those deployments must keep OpenID configuration enabled unless the host
-serves equivalent metadata separately. A dynamically discovered and
-dynamically registered OpenID Provider that issues access tokens must still
-satisfy OIDC's Discovery and UserInfo requirements; these independent macro
-controls do not make every route combination an OIDC-conformant deployment.
+verbs. `openid_configuration: false` removes only the OIDC Provider Metadata
+route; the RFC 8414 authorization-server document remains mounted and its
+contents are unchanged.
+
+UserInfo metadata keeps explicit host intent separate from a mechanically
+derived local endpoint:
+
+- `userinfo_endpoint: nil` preserves the released behavior and omits the member.
+- `userinfo_endpoint: :derived` advertises the URL derived from `:issuer` and
+  `:userinfo_path`. When `userinfo: false`, the retained Provider Metadata route
+  suppresses this value only if it is route-equivalent to the removed bundled
+  route.
+- An explicit HTTPS URL is authoritative and always remains advertised,
+  including at the same origin and path. This is the supported form when a host
+  replaces the bundled UserInfo controller or serves UserInfo elsewhere.
+
+For example, a host can remount its own implementation at the canonical path
+without losing discovery:
+
+```elixir
+scope "/" do
+  attesto_routes(userinfo: false)
+  get "/oauth/userinfo", MyAppWeb.UserInfoController, :show
+end
+```
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  userinfo_endpoint: "https://issuer.example/oauth/userinfo"
+```
+
+The derived-path comparison models Phoenix/Plug dispatch rather than generic
+URI cleanup: adapters discard empty path segments, Phoenix decodes each request
+segment once, and `.`/`..` segments remain significant. It therefore handles
+leading, repeated, and trailing slashes, percent-encoded request segments,
+static or dynamic surrounding scopes, non-default ports, and forwarded router
+mounts without conflating a distinct route with the removed one.
+
+A dynamic macro `:prefix` is not available to the root Provider Metadata
+request. Consequently, `userinfo: false` with retained OpenID configuration
+rejects a dynamic `:prefix` at compile time instead of silently advertising a
+dead derived endpoint. Put the dynamic portion in a surrounding Phoenix scope,
+where the metadata request realizes the same scope, or also set
+`openid_configuration: false`. Static prefixes remain supported.
+
+OIDC conformance for features such as CIBA, logout, and session management
+relies on Provider Metadata, so those deployments must keep OpenID
+configuration enabled unless the host serves equivalent metadata separately. A
+dynamically discovered and dynamically registered OpenID Provider that issues
+access tokens must still satisfy OIDC's Discovery and UserInfo requirements;
+these independent macro controls do not make every route combination an
+OIDC-conformant deployment. If OpenID configuration is disabled, any configured
+UserInfo endpoint is advertised nowhere unless the host publishes an equivalent
+Provider Metadata document.
 
 The bundled well-known routes are the standards-derived forms for an
 origin-only issuer such as `https://issuer.example`. If the issuer contains a
@@ -384,13 +428,16 @@ uses `response_mode=jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`.
 Discovery advertises the supported response modes and the server signing
 algorithms used for authorization response JWTs.
 
-The route plumbing is profile-neutral. A permissive standards-compliant
-OAuth deployment can admit PKCE-bound public clients and select its supported
-grants, while a strict FAPI 2.0 deployment uses the same controllers and route
-classes with policy that requires PAR, signed request objects where applicable,
-confidential client authentication, sender-constrained tokens, and the FAPI
-algorithm catalog. Switching profiles is configuration, not a fork of the
-token, authorization, PAR, discovery, DPoP, or mTLS implementations.
+The route plumbing is profile-neutral. A permissive standards-compliant OAuth
+deployment can admit PKCE-bound public clients and select its supported grants.
+A FAPI 2.0 Security Profile deployment coordinates policy settings and
+callbacks that require PAR, PKCE, asymmetric confidential-client
+authentication, sender-constrained access tokens, and the applicable algorithm
+constraints. The optional Message Signing profile adds signed request-object
+enforcement and JARM; `Attesto.RequestObject.Policy.fapi_message_signing/0`
+provides the request-object policy for that profile. These are coordinated
+settings rather than a single profile switch, and they use the same token,
+authorization, PAR, discovery, DPoP, and mTLS implementations.
 
 ### Backchannel authentication (CIBA)
 
@@ -495,10 +542,13 @@ def for_request(_conn), do: nil
 
 The resolver is authoritative when present; it does not fall back to the static
 URL when it returns `nil`. An invalid runtime return is safely omitted rather
-than turned into a challenge or a request-time exception; invalid static
-configuration still fails at boot. Function callbacks must accept one argument,
-and MFA tuples must export the effective arity (the request plus any extra
-arguments). An explicit per-plug `resource_metadata:` option, including `nil`,
+than turned into a challenge or a request-time exception. A static Config value
+is validated by `AttestoPhoenix.Config.new/1`; a non-`nil` per-plug value is
+validated when `AttestoPhoenix.Plug.Authenticate` is initialized (at compile
+time under Phoenix's default Plug initialization mode). Explicit per-plug `nil`
+remains a valid, authoritative omission. Function callbacks must accept one
+argument, and MFA tuples must export the effective arity (the request plus any
+extra arguments, which are appended after it). The explicit per-plug option
 wins on core verification, TLS, revocation, and principal failures and skips
 the resolver.
 
@@ -506,7 +556,9 @@ The resolver is trusted configuration. Return pinned or allowlisted HTTPS URLs;
 do not construct a metadata authority from untrusted Host, forwarded, query, or
 arbitrary header values. The returned URL is never fetched or used as a
 redirect, and it is validated with the same HTTPS/host/no-fragment rules as the
-static value before it can enter a quoted challenge.
+static value before it can enter a quoted challenge. Resolver exceptions are not
+rescued: a callback that raises propagates the exception and fails the request
+instead of rendering an authentication challenge.
 
 The protected-resource integration still owns the actual RFC 9728 declarations.
 Publish one document per exact resource identifier, with the path-inserted
