@@ -16,7 +16,7 @@ defmodule AttestoPhoenix.CIBAPing do
   endpoint whether or not the notification lands, so a client that misses the
   ping simply falls back to polling (§10.2 treats a ping client that polls as a
   poll client). The default implementation is `AttestoPhoenix.CIBAPing.Req`; a
-  host overrides it with `ciba: [ping_http_client: MyDeliverer]`.
+  host overrides it with `ciba_ping_http_client: MyDeliverer`.
 
   ## Conformance-locked semantics (fapi-ciba-id1 ping modules)
 

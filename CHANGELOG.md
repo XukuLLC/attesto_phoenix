@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] - 2026-07-17
+
+### Added
+
+- Add a minimum-version consumer smoke test without Req so optional dependency
+  regressions fail CI. It covers disabled, active-default, and custom-adapter
+  configurations and fails CI on any compiler warning from AttestoPhoenix
+  against the minimum dependency set.
+
+### Fixed
+
+- Compile the bundled Back-Channel Logout and CIBA ping Req implementations
+  only when the optional Req dependency is available, matching the Client ID
+  Metadata fetcher. Consumers that supply their own HTTP implementations can
+  now compile without adding Req. Enabled features validate the selected
+  adapter module and callback at configuration time; a missing bundled Req
+  adapter gets actionable dependency guidance instead of crashing on the first
+  outbound request.
+- Correct the CIBA ping documentation to use the top-level
+  `:ciba_ping_http_client` configuration key.
+- Reject CIBA `:push` delivery at configuration time because AttestoPhoenix has
+  no push deliverer. Advertising an undeliverable mode could leave an approved
+  request with no notification and no polling fallback.
+
+### Security
+
+- Restrict Phoenix and Plug requirements to advisory-patched releases across
+  every supported minor line. This preserves the widest compatible dependency
+  range without allowing a resolver to select a known-vulnerable version.
+- Raise the Attesto runtime floor to 1.2.5 so its transitive JOSE requirement
+  excludes OTP 28-incompatible EC handling and incorrect builtin-JSON `nil`
+  encoding while its Plug metadata preserves advisory-safe dependency ranges.
+  Raise the development/test Postgrex floor to 0.22.3.
+
 ## [2.0.2] - 2026-07-16
 
 ### Changed

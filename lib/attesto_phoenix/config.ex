@@ -827,12 +827,13 @@ defmodule AttestoPhoenix.Config do
   # metadata — the host MUST ALSO pass `ciba: true` to `attesto_routes/1` to
   # mount the endpoint, and supply a `:ciba_store` + `:authenticate_ciba_user`
   # callback. `:delivery_modes` are the advertised + enforced
-  # `backchannel_token_delivery_modes_supported` (FAPI-CIBA §5.2.1 forbids
-  # `:push`). `:require_signed_request` (FAPI-CIBA §5.2.2: signed authentication
-  # requests are mandatory) and `:request_signing_algs` bound the accepted
-  # `request` JWTs. `:expires_in_seconds` / `:max_expires_in_seconds` /
-  # `:interval_seconds` are the §7.3 `expires_in` / clamp / `interval`. Off by
-  # default.
+  # `backchannel_token_delivery_modes_supported`. Poll and ping are implemented;
+  # push is rejected at boot because this package has no push deliverer (and the
+  # FAPI-CIBA profile forbids push in any case, §5.2.1). `:require_signed_request`
+  # (FAPI-CIBA §5.2.2: signed authentication requests are mandatory) and
+  # `:request_signing_algs` bound the accepted `request` JWTs.
+  # `:expires_in_seconds` / `:max_expires_in_seconds` / `:interval_seconds` are
+  # the §7.3 `expires_in` / clamp / `interval`. Off by default.
   @ciba_defaults [
     enabled: false,
     delivery_modes: [:poll, :ping],
@@ -1061,8 +1062,8 @@ defmodule AttestoPhoenix.Config do
   @spec ciba_store(t()) :: module() | nil
   def ciba_store(%__MODULE__{ciba_store: store}), do: store
 
-  @doc "The advertised + enforced CIBA `backchannel_token_delivery_modes_supported` (atoms)."
-  @spec ciba_delivery_modes(t()) :: [:poll | :ping | :push]
+  @doc "The advertised + enforced CIBA modes (`:poll`/`:ping`; `:push` is rejected at boot)."
+  @spec ciba_delivery_modes(t()) :: [:poll | :ping]
   def ciba_delivery_modes(%__MODULE__{} = config) do
     config |> ciba() |> Keyword.get(:delivery_modes, [:poll, :ping])
   end
@@ -1983,6 +1984,12 @@ defmodule AttestoPhoenix.Config do
   # that can only ever error.
   defp validate_ciba!(%__MODULE__{} = config) do
     if ciba_enabled?(config) do
+      if :push in List.wrap(ciba_delivery_modes(config)) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: CIBA :push delivery is not implemented and cannot be " <>
+                "advertised. Configure `ciba: [delivery_modes: [:poll, :ping]]` or disable CIBA."
+      end
+
       if is_nil(ciba_store(config)) do
         raise ArgumentError,
               "AttestoPhoenix.Config: :ciba_store is required when CIBA is enabled " <>
@@ -2075,6 +2082,120 @@ defmodule AttestoPhoenix.Config do
     :ok
   end
 
+  # Req is optional, so its bundled adapters are compiled only when a consumer
+  # actually resolves the dependency. Keep disabled configurations Req-free,
+  # but validate the selected module and callback whenever an outbound path is
+  # active. A missing bundled adapter gets dependency-specific guidance;
+  # invalid custom adapters get the same boot-time failure instead of waiting
+  # for the first outbound request.
+  defp validate_req_adapters!(%__MODULE__{} = config) do
+    if client_id_metadata_enabled?(config) do
+      fetcher = config |> client_id_metadata() |> Keyword.fetch!(:fetcher)
+
+      validate_outbound_adapter!(
+        fetcher,
+        Req,
+        :fetch,
+        2,
+        "client_id_metadata: [fetcher: ...]"
+      )
+    end
+
+    if backchannel_logout_supported?(config) do
+      validate_outbound_adapter!(
+        backchannel_logout_http(config),
+        AttestoPhoenix.BackChannelLogout.Req,
+        :post,
+        2,
+        "logout: [http_client: ...]"
+      )
+    end
+
+    if ciba_enabled?(config) and :ping in ciba_delivery_modes(config) do
+      validate_outbound_adapter!(
+        ciba_ping_http_client(config),
+        AttestoPhoenix.CIBAPing.Req,
+        :post,
+        3,
+        "ciba_ping_http_client: ..."
+      )
+    end
+
+    jwt_opts = jwt_bearer(config)
+
+    if jwt_bearer_enabled?(config) and jwt_bearer_uses_remote_jwks?(jwt_opts) do
+      validate_outbound_adapter!(
+        Keyword.fetch!(jwt_opts, :jwks_fetcher),
+        Req,
+        :fetch,
+        2,
+        "jwt_bearer: [jwks_fetcher: ...]"
+      )
+    end
+
+    :ok
+  end
+
+  defp validate_outbound_adapter!(selected, bundled, fun, arity, config_path) do
+    cond do
+      selected == bundled and not callback_exported?(bundled, fun, arity) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{config_path} selects the bundled " <>
+                "#{inspect(bundled)}, but that adapter was not compiled because the optional " <>
+                "Req dependency is unavailable. Add `{:req, \">= 0.6.1 and < 1.0.0\"}` to " <>
+                "your dependencies and recompile, or configure a custom module implementing " <>
+                "#{fun}/#{arity}."
+
+      not is_atom(selected) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{config_path} must select a module implementing " <>
+                "#{fun}/#{arity}; got #{inspect(selected)}."
+
+      not Code.ensure_loaded?(selected) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{config_path} selects #{inspect(selected)}, which cannot " <>
+                "be loaded. Configure a module implementing #{fun}/#{arity}."
+
+      not function_exported?(selected, fun, arity) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{config_path} module #{inspect(selected)} does not export " <>
+                "#{fun}/#{arity}."
+
+      true ->
+        :ok
+    end
+  end
+
+  # Match AuthorizationServer.JwtBearer's resolution precedence exactly:
+  # custom resolver, then per-issuer static JWKS, then remote JWKS URI. Elixir
+  # treats every value except nil/false as configured, including empty
+  # collections, so preserve that truthiness here rather than imposing a new
+  # validation policy.
+  defp jwt_bearer_uses_remote_jwks?(opts) do
+    if configured?(Keyword.get(opts, :jwks_resolver)) do
+      false
+    else
+      opts |> Keyword.get(:issuers, %{}) |> any_remote_jwks_issuer?()
+    end
+  end
+
+  defp any_remote_jwks_issuer?(issuers) when is_map(issuers) do
+    Enum.any?(issuers, fn {_issuer, issuer_opts} ->
+      issuer_opts = normalize_jwt_issuer_opts(issuer_opts)
+
+      not configured?(Map.get(issuer_opts, :jwks)) and
+        configured?(Map.get(issuer_opts, :jwks_uri))
+    end)
+  end
+
+  defp any_remote_jwks_issuer?(_issuers), do: false
+
+  defp normalize_jwt_issuer_opts(opts) when is_list(opts), do: Map.new(opts)
+  defp normalize_jwt_issuer_opts(%{} = opts), do: opts
+  defp normalize_jwt_issuer_opts(_opts), do: %{}
+
+  defp configured?(value), do: value not in [nil, false]
+
   defp validate!(%__MODULE__{} = config) do
     Enum.each(@required, fn key ->
       if is_nil(Map.fetch!(config, key)) do
@@ -2145,6 +2266,7 @@ defmodule AttestoPhoenix.Config do
     validate_session_management!(config)
     validate_registration_default_scope!(config)
     validate_jwt_bearer!(config)
+    validate_req_adapters!(config)
     validate_behaviour_modules!(config)
     validate_request_object_policy!(config)
 
