@@ -680,6 +680,77 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe "outbound adapter boot validation" do
+    test "rejects an active adapter configured with a non-module value" do
+      assert_raise ArgumentError, ~r/client_id_metadata.*must select a module/s, fn ->
+        config(client_id_metadata: [enabled: true, fetcher: {:not, :a_module}])
+      end
+    end
+
+    test "rejects an active adapter module that cannot be loaded" do
+      assert_raise ArgumentError, ~r/client_id_metadata.*cannot be loaded/s, fn ->
+        config(
+          client_id_metadata: [
+            enabled: true,
+            fetcher: __MODULE__.MissingOutboundAdapter
+          ]
+        )
+      end
+    end
+
+    test "rejects an active CIMD adapter without fetch/2" do
+      assert_raise ArgumentError, ~r/client_id_metadata.*does not export fetch\/2/s, fn ->
+        config(client_id_metadata: [enabled: true, fetcher: EmptyModule])
+      end
+    end
+
+    test "rejects an active Back-Channel Logout adapter without post/2" do
+      assert_raise ArgumentError, ~r/logout.*does not export post\/2/s, fn ->
+        config(
+          logout: [enabled: true, http_client: EmptyModule],
+          logout_session_store: EmptyModule,
+          terminate_session: fn _conn, _params -> :ok end
+        )
+      end
+    end
+
+    test "rejects an active CIBA ping adapter without post/3" do
+      assert_raise ArgumentError, ~r/ciba_ping_http_client.*does not export post\/3/s, fn ->
+        config(
+          ciba: [enabled: true, delivery_modes: [:ping]],
+          ciba_store: EmptyModule,
+          ciba_ping_http_client: EmptyModule,
+          authenticate_ciba_user: fn _request -> {:error, :not_found} end
+        )
+      end
+    end
+
+    test "rejects an active JWT remote-JWKS adapter without fetch/2" do
+      assert_raise ArgumentError, ~r/jwt_bearer.*does not export fetch\/2/s, fn ->
+        config(
+          jwt_bearer: [
+            enabled: true,
+            jwks_fetcher: EmptyModule,
+            issuers: %{"https://assertions.example" => [jwks_uri: "https://assertions.example/jwks"]}
+          ],
+          resolve_jwt_bearer_subject: fn _claims -> {:error, :not_found} end
+        )
+      end
+    end
+  end
+
+  describe "CIBA delivery-mode boot validation" do
+    test "rejects :push because no push deliverer is implemented" do
+      assert_raise ArgumentError, ~r/CIBA :push delivery is not implemented/, fn ->
+        config(
+          ciba: [enabled: true, delivery_modes: [:push]],
+          ciba_store: EmptyModule,
+          authenticate_ciba_user: fn _request -> {:error, :not_found} end
+        )
+      end
+    end
+  end
+
   # Boot-time discovery-document safety guard (the "silent discovery mismatch"
   # class of failure): `new/1` must fail fast rather than build a config that
   # would serve a discovery document missing a required endpoint (RFC 8414 §2 /

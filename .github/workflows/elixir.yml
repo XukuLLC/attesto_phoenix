@@ -102,3 +102,20 @@ jobs:
         env:
           MIX_ENV: dev
         run: mix docs
+
+      - name: Compile minimum consumer without optional Req
+        if: ${{ matrix.lint }}
+        working-directory: integration/consumer_without_req
+        env:
+          MIX_ENV: prod
+        run: |
+          set -o pipefail
+          mix deps.get
+          mix deps.compile
+          compile_log="${RUNNER_TEMP}/attesto_phoenix_minimum_compile.log"
+          mix deps.compile attesto_phoenix --force 2>&1 | tee "$compile_log"
+          if grep -F "warning:" "$compile_log"; then
+            echo "AttestoPhoenix emitted a compiler warning against the minimum dependency set" >&2
+            exit 1
+          fi
+          mix run --no-start verify.exs
