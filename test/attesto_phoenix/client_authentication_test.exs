@@ -14,7 +14,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   row is covered under both `allow_public: true` (token-endpoint policy) and
   `allow_public: false` (PAR-endpoint policy).
   """
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError}
   alias AttestoPhoenix.ClientAuthentication.{Policy, Result}
@@ -319,12 +319,78 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
   end
 
+  describe "private_key_jwt key-bound algorithm policy" do
+    test "the default FAPI policy rejects weak PS256 while an explicit non-FAPI policy can opt in", %{
+      config: config
+    } do
+      key = JOSE.JWK.generate_key({:rsa, 1024})
+      trusted = public_jwk(key, %{"alg" => "PS256"})
+      config = %{config | client_jwks: fn @confidential -> %{"keys" => [trusted]} end}
+      params = assertion_params(key, "PS256")
+
+      assert_generic_invalid_client(
+        authenticate([], params, config,
+          allow_public: false,
+          assertion_signing_algs: ["PS256"],
+          assertion_enforce_fapi_alg_policy: true
+        )
+      )
+
+      assert {:ok, %Result{method: :private_key_jwt}} =
+               authenticate([], params, config,
+                 allow_public: false,
+                 assertion_signing_algs: ["PS256"]
+               )
+    end
+
+    test "the default policy accepts legacy and exact Ed25519 identifiers", %{config: config} do
+      key = JOSE.JWK.generate_key({:okp, :Ed25519})
+
+      for alg <- ["EdDSA", "Ed25519"] do
+        trusted = public_jwk(key, %{"alg" => alg})
+        configured = %{config | client_jwks: fn @confidential -> %{"keys" => [trusted]} end}
+
+        assert {:ok, %Result{method: :private_key_jwt}} =
+                 authenticate([], assertion_params(key, alg), configured,
+                   allow_public: false,
+                   assertion_signing_algs: Attesto.SigningAlg.fapi_algs(),
+                   assertion_enforce_fapi_alg_policy: true
+                 )
+      end
+    end
+
+    test "legacy EdDSA over Ed448 requires an explicit non-FAPI policy", %{config: config} do
+      enable_ed448_support()
+      key = JOSE.JWK.generate_key({:okp, :Ed448})
+      trusted = public_jwk(key, %{"alg" => "EdDSA"})
+      config = %{config | client_jwks: fn @confidential -> %{"keys" => [trusted]} end}
+      params = assertion_params(key, "EdDSA")
+
+      assert_generic_invalid_client(
+        authenticate([], params, config,
+          allow_public: false,
+          assertion_signing_algs: ["EdDSA"],
+          assertion_enforce_fapi_alg_policy: true
+        )
+      )
+
+      assert {:ok, %Result{method: :private_key_jwt}} =
+               authenticate([], params, config,
+                 allow_public: false,
+                 assertion_signing_algs: ["EdDSA"]
+               )
+    end
+  end
+
   defp authenticate(headers, params, config, opts) do
     policy = %Policy{
       allow_public: Keyword.fetch!(opts, :allow_public),
       assertion_audiences: [config.issuer],
       assertion_max_lifetime: 300,
-      assertion_signing_algs: config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs()
+      assertion_signing_algs:
+        Keyword.get(opts, :assertion_signing_algs, config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs()),
+      assertion_enforce_fapi_alg_policy:
+        Keyword.get(opts, :assertion_enforce_fapi_alg_policy, config.client_auth_enforce_fapi_alg_policy)
     }
 
     ClientAuthentication.authenticate(headers, params, config, policy)
@@ -342,7 +408,14 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
             }} = result
   end
 
-  defp client_assertion(jwk, client_id) do
+  defp assertion_params(jwk, alg) do
+    %{
+      "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+      "client_assertion" => client_assertion(jwk, "confidential-1", alg)
+    }
+  end
+
+  defp client_assertion(jwk, client_id, alg \\ "ES256") do
     now = System.system_time(:second)
 
     claims = %{
@@ -354,14 +427,24 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
     }
 
-    header = %{"alg" => "ES256", "kid" => JOSE.JWK.thumbprint(jwk)}
+    header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
     {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
     compact
   end
 
-  defp public_jwk(jwk) do
+  defp public_jwk(jwk, overrides \\ %{}) do
     {_kty, map} = JOSE.JWK.to_public_map(jwk)
-    Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"})
+
+    Map.merge(
+      map,
+      Map.merge(%{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"}, overrides)
+    )
+  end
+
+  defp enable_ed448_support do
+    previous = JOSE.crypto_fallback()
+    JOSE.crypto_fallback(true)
+    on_exit(fn -> JOSE.crypto_fallback(previous) end)
   end
 
   defp normalize_lookup({:ok, client}), do: {:ok, client}

@@ -228,15 +228,27 @@ defmodule AttestoPhoenix.Config do
     * `:client_auth_signing_algs` - the JOSE algorithms accepted for
       `private_key_jwt` client-assertion signatures, and the set advertised as
       `token_endpoint_auth_signing_alg_values_supported` in discovery. Defaults
-      to `Attesto.SigningAlg.fapi_algs/0` (PS256, ES256, EdDSA). A non-FAPI
-      deployment can widen it; verification and the advertised metadata stay in
-      lockstep because both read this one value.
+      to `Attesto.SigningAlg.fapi_algs/0` (PS256, ES256, legacy EdDSA over
+      Ed25519, and explicit Ed25519). A non-FAPI deployment can widen it;
+      verification and the advertised metadata stay in lockstep because both
+      read this one value.
+    * `:client_auth_enforce_fapi_alg_policy` - additionally enforce FAPI's RSA
+      modulus and Edwards-curve restrictions for `private_key_jwt`. When unset,
+      this defaults to `true` if `:client_auth_signing_algs` is omitted and to
+      `false` if the host supplies an explicit algorithm list. Set it to `true`
+      when narrowing the FAPI allowlist; an enforced list must remain a subset
+      of `Attesto.SigningAlg.fapi_algs/0`. Set it to `false` only for an
+      explicit non-FAPI policy.
     * `:request_object_policy` - an `Attesto.RequestObject.Policy` controlling
       verification of signed authorization request objects (JAR, RFC 9101).
       Defaults to `%Attesto.RequestObject.Policy{}` (generic OpenID Connect §6.1:
       `nbf`/`exp`/`typ` not required). For FAPI 2.0 Message Signing §5.3.1 set
       `Attesto.RequestObject.Policy.fapi_message_signing()`; the policy is then
-      enforced both at the PAR endpoint and at `/authorize`.
+      enforced both at the PAR endpoint and at `/authorize`. Supplying an
+      explicit `accepted_algs` list selects non-FAPI key compatibility unless
+      the policy's `enforce_fapi_alg_policy` field is `true`; the named FAPI
+      policy sets that field explicitly, so narrowing its list keeps the key
+      gate enabled.
     * `:scopes_supported` - list of supported scope strings (concrete and
       wildcard) advertised in discovery and used as the default scope catalog.
       For an OpenID Provider the reserved `openid` scope (OpenID Connect Core
@@ -482,6 +494,7 @@ defmodule AttestoPhoenix.Config do
     :registration,
     :claims_provider,
     :client_auth_signing_algs,
+    :client_auth_enforce_fapi_alg_policy,
     :request_object_policy,
     :audience,
     :authorize_scope,
@@ -608,6 +621,7 @@ defmodule AttestoPhoenix.Config do
           registration: module() | nil,
           claims_provider: module() | nil,
           client_auth_signing_algs: [String.t()] | nil,
+          client_auth_enforce_fapi_alg_policy: boolean() | nil,
           request_object_policy: Policy.t() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
@@ -723,10 +737,29 @@ defmodule AttestoPhoenix.Config do
   # Defaults that cannot be static struct values (they call a function) or that
   # merge a host-supplied keyword list over the library's defaults.
   defp apply_defaults(%__MODULE__{} = config) do
+    client_auth_enforce_fapi_alg_policy =
+      case config.client_auth_enforce_fapi_alg_policy do
+        nil -> is_nil(config.client_auth_signing_algs)
+        value -> value
+      end
+
+    client_auth_signing_algs =
+      case config.client_auth_signing_algs do
+        nil -> Attesto.SigningAlg.fapi_algs()
+        value -> value
+      end
+
+    request_object_policy =
+      case config.request_object_policy do
+        nil -> %Policy{}
+        value -> value
+      end
+
     %{
       config
-      | client_auth_signing_algs: config.client_auth_signing_algs || Attesto.SigningAlg.fapi_algs(),
-        request_object_policy: config.request_object_policy || %Policy{},
+      | client_auth_signing_algs: client_auth_signing_algs,
+        client_auth_enforce_fapi_alg_policy: client_auth_enforce_fapi_alg_policy,
+        request_object_policy: request_object_policy,
         client_id_metadata: normalize_client_id_metadata(config.client_id_metadata),
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
         resource_indicators: normalize_resource_indicators(config.resource_indicators),
@@ -831,9 +864,13 @@ defmodule AttestoPhoenix.Config do
   # push is rejected at boot because this package has no push deliverer (and the
   # FAPI-CIBA profile forbids push in any case, §5.2.1). `:require_signed_request`
   # (FAPI-CIBA §5.2.2: signed authentication requests are mandatory) and
-  # `:request_signing_algs` bound the accepted `request` JWTs.
+  # `:request_signing_algs` bound the accepted `request` JWTs. As with client
+  # assertions, `:enforce_fapi_alg_policy` defaults to true when that list is
+  # omitted and false when the host supplies an explicit non-FAPI list.
   # `:expires_in_seconds` / `:max_expires_in_seconds` / `:interval_seconds` are
   # the §7.3 `expires_in` / clamp / `interval`. Off by default.
+  @fapi_ciba_signing_algs ["PS256", "ES256"]
+
   @ciba_defaults [
     enabled: false,
     delivery_modes: [:poll, :ping],
@@ -841,14 +878,22 @@ defmodule AttestoPhoenix.Config do
     max_expires_in_seconds: 600,
     interval_seconds: 5,
     require_signed_request: true,
-    request_signing_algs: ["PS256", "ES256"],
+    request_signing_algs: @fapi_ciba_signing_algs,
     binding_message_max_length: 128,
     require_binding_message: false,
     user_code_parameter_supported: false
   ]
 
-  defp normalize_ciba(nil), do: @ciba_defaults
-  defp normalize_ciba(opts) when is_list(opts), do: Keyword.merge(@ciba_defaults, opts)
+  defp normalize_ciba(nil), do: Keyword.put(@ciba_defaults, :enforce_fapi_alg_policy, true)
+
+  defp normalize_ciba(opts) when is_list(opts) do
+    enforce_fapi_alg_policy =
+      Keyword.get(opts, :enforce_fapi_alg_policy, not Keyword.has_key?(opts, :request_signing_algs))
+
+    @ciba_defaults
+    |> Keyword.merge(opts)
+    |> Keyword.put(:enforce_fapi_alg_policy, enforce_fapi_alg_policy)
+  end
 
   # OpenID Connect RP-Initiated Logout 1.0 + Back-Channel Logout 1.0 +
   # Front-Channel Logout 1.0. `enabled: true` mounts the end-session endpoint
@@ -2268,6 +2313,7 @@ defmodule AttestoPhoenix.Config do
     validate_jwt_bearer!(config)
     validate_req_adapters!(config)
     validate_behaviour_modules!(config)
+    validate_algorithm_policy!(config)
     validate_request_object_policy!(config)
 
     validate_path!(:oauth_path_prefix, config.oauth_path_prefix)
@@ -2620,6 +2666,94 @@ defmodule AttestoPhoenix.Config do
     claims_provider: []
   }
 
+  defp validate_algorithm_policy!(%__MODULE__{} = config) do
+    if !is_boolean(config.client_auth_enforce_fapi_alg_policy) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :client_auth_enforce_fapi_alg_policy must be a boolean; " <>
+              "got #{inspect(config.client_auth_enforce_fapi_alg_policy)}."
+    end
+
+    validate_signing_algorithm_list!(
+      ":client_auth_signing_algs",
+      config.client_auth_signing_algs
+    )
+
+    if config.client_auth_enforce_fapi_alg_policy do
+      validate_fapi_algorithm_list!(
+        ":client_auth_signing_algs",
+        config.client_auth_signing_algs
+      )
+    end
+
+    ciba_opts = ciba(config)
+    ciba_enforcement = Keyword.get(ciba_opts, :enforce_fapi_alg_policy)
+
+    if !is_boolean(ciba_enforcement) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: ciba: [:enforce_fapi_alg_policy] must be a boolean; " <>
+              "got #{inspect(ciba_enforcement)}."
+    end
+
+    ciba_algs = Keyword.get(ciba_opts, :request_signing_algs)
+    validate_signing_algorithm_list!("ciba: [:request_signing_algs]", ciba_algs)
+
+    if ciba_enforcement do
+      validate_fapi_algorithm_list!(
+        "ciba: [:request_signing_algs]",
+        ciba_algs,
+        @fapi_ciba_signing_algs,
+        "FAPI-CIBA"
+      )
+    end
+
+    :ok
+  end
+
+  defp validate_signing_algorithm_list!(label, algs) when is_list(algs) and algs != [] do
+    supported = Attesto.SigningAlg.allowed()
+    unsupported = Enum.uniq(Enum.reject(algs, &(&1 in supported)))
+
+    cond do
+      unsupported != [] ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{label} contains unsupported signing algorithms " <>
+                "#{inspect(unsupported)}; supported values are #{inspect(supported)}."
+
+      length(algs) != MapSet.size(MapSet.new(algs)) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{label} must contain distinct signing algorithms; " <>
+                "got #{inspect(algs)}."
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_signing_algorithm_list!(label, value) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: #{label} must be a non-empty list of supported signing " <>
+            "algorithm names; got #{inspect(value)}."
+  end
+
+  defp validate_fapi_algorithm_list!(label, algs) do
+    fapi_algs = Attesto.SigningAlg.fapi_algs()
+    validate_fapi_algorithm_list!(label, algs, fapi_algs, "FAPI")
+  end
+
+  defp validate_fapi_algorithm_list!(label, algs, fapi_algs, profile) do
+    outside_fapi = Enum.uniq(Enum.reject(algs, &(&1 in fapi_algs)))
+
+    if outside_fapi != [] do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: #{label} contains #{inspect(outside_fapi)}, which is outside " <>
+              "the enforced #{profile} signing algorithm set #{inspect(fapi_algs)}. Narrow the list to " <>
+              "that set, or set the corresponding :enforce_fapi_alg_policy option to false for " <>
+              "an explicit non-FAPI policy."
+    end
+
+    :ok
+  end
+
   # Boot-time conformance: every installed behaviour module must be loadable and
   # must export the required callbacks of the behaviour it is installed as.
   # `:request_object_policy` is a security knob; reject a wrong value at boot
@@ -2627,6 +2761,28 @@ defmodule AttestoPhoenix.Config do
   # PAR or /authorize request is verified. `apply_defaults/1` has already
   # replaced a `nil` with `%Attesto.RequestObject.Policy{}`.
   defp validate_request_object_policy!(%__MODULE__{request_object_policy: %Policy{} = policy} = config) do
+    enforcement = policy.enforce_fapi_alg_policy
+
+    if enforcement not in [nil, true, false] do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :request_object_policy.enforce_fapi_alg_policy must be nil " <>
+              "or a boolean; got #{inspect(enforcement)}."
+    end
+
+    if !is_nil(policy.accepted_algs) do
+      validate_signing_algorithm_list!(
+        ":request_object_policy.accepted_algs",
+        policy.accepted_algs
+      )
+
+      if enforcement == true do
+        validate_fapi_algorithm_list!(
+          ":request_object_policy.accepted_algs",
+          policy.accepted_algs
+        )
+      end
+    end
+
     # A policy that REQUIRES a signed request object (FAPI 2.0 Message Signing
     # §5.3.1) is unsatisfiable without a way to resolve the client's trusted
     # JWKS: every authorization request would be rejected (one carrying no

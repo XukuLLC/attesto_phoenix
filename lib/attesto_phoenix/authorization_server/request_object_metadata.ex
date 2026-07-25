@@ -33,7 +33,8 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestObjectMetadata do
 
   Mirrors the configured `request_object_policy` accepted algorithms, falling
   back to the verifier default (`Attesto.SigningAlg.fapi_algs/0`: PS256, ES256,
-  EdDSA) when the policy leaves it unset.
+  legacy EdDSA over Ed25519, and explicit Ed25519) when the policy leaves it
+  unset.
   """
   @spec signing_alg_values(Config.t()) :: [String.t()] | nil
   def signing_alg_values(%Config{} = config) do

@@ -146,6 +146,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
       issuer: config.issuer,
       require_signed_request: Keyword.get(opts, :require_signed_request, true),
       accepted_algs: Keyword.get(opts, :request_signing_algs, ["PS256", "ES256"]),
+      enforce_fapi_alg_policy: Keyword.get(opts, :enforce_fapi_alg_policy, true),
       binding_message_max_length: Keyword.get(opts, :binding_message_max_length, 128),
       require_binding_message: Keyword.get(opts, :require_binding_message, false),
       user_code_supported: Keyword.get(opts, :user_code_parameter_supported, false)

@@ -74,7 +74,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
         else: Application.delete_env(:attesto_phoenix, :otp_app)
     end)
 
-    :ok
+    {:ok, config_opts: base}
   end
 
   test "poll happy path returns the §7.3 acknowledgement" do
@@ -105,6 +105,30 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
   test "a request with no client credentials is rejected (invalid_client, confidential-only)" do
     conn = call(%{"scope" => "openid", "login_hint" => "alice@example.test"}, [])
     assert conn.status in [400, 401]
+    assert body(conn)["error"] == "invalid_client"
+  end
+
+  test "private_key_jwt rejects a weak PS256 key under the default FAPI policy", %{config_opts: config_opts} do
+    client_key = JOSE.JWK.generate_key({:rsa, 1024})
+
+    client = %{
+      id: "cli-1",
+      jwks: %{"keys" => [public_jwk(client_key, "PS256")]},
+      ciba: %{token_delivery_mode: :poll}
+    }
+
+    opts = Keyword.put(config_opts, :load_client, fn "cli-1" -> {:ok, client} end)
+    Application.put_env(:attesto_phoenix, @config_key, opts)
+
+    params = %{
+      "scope" => "openid",
+      "login_hint" => "alice@example.test",
+      "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+      "client_assertion" => client_assertion(client_key, "PS256")
+    }
+
+    conn = call(params, [])
+    assert conn.status == 400
     assert body(conn)["error"] == "invalid_client"
   end
 
@@ -141,6 +165,28 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
   defp basic(id, secret), do: {"authorization", "Basic " <> Base.encode64(id <> ":" <> secret)}
 
   defp body(conn), do: JSON.decode!(conn.resp_body)
+
+  defp client_assertion(jwk, alg) do
+    now = System.system_time(:second)
+
+    claims = %{
+      "iss" => "cli-1",
+      "sub" => "cli-1",
+      "aud" => "https://issuer.example",
+      "iat" => now,
+      "exp" => now + 60,
+      "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    }
+
+    header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    compact
+  end
+
+  defp public_jwk(jwk, alg) do
+    {_kty, map} = JOSE.JWK.to_public_map(jwk)
+    Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => alg, "use" => "sig"})
+  end
 
   defp es256_key do
     jwk = JOSE.JWK.generate_key({:ec, "P-256"})

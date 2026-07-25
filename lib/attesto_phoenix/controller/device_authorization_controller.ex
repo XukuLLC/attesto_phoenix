@@ -86,7 +86,8 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
       allow_public: true,
       assertion_audiences: [config.issuer],
       assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs
+      assertion_signing_algs: config.client_auth_signing_algs,
+      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
     }
 
     case ClientAuthentication.authenticate_with_context(get_req_header(conn, "authorization"), params, config, policy) do

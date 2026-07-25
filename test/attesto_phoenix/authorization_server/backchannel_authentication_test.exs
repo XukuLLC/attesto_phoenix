@@ -198,6 +198,75 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
                  request(client, %{"scope" => "openid", "login_hint" => "alice@example.test"})
                )
     end
+
+    test "rejects weak PS256 by default and preserves an explicit non-FAPI opt-in" do
+      jwk = JOSE.JWK.generate_key({:rsa, 1024})
+      client = signing_client(jwk, "PS256")
+      jwt = signed_request(jwk, signed_claims(), "PS256")
+      request = request(client, %{"request" => jwt})
+
+      assert {:error, %OAuthError{error: :invalid_request}} =
+               BackchannelAuthentication.request(
+                 config(ciba: [enabled: true, require_signed_request: true]),
+                 request
+               )
+
+      assert {:error, %OAuthError{error: :invalid_request}} =
+               BackchannelAuthentication.request(
+                 config(
+                   ciba: [
+                     enabled: true,
+                     require_signed_request: true,
+                     request_signing_algs: ["PS256"],
+                     enforce_fapi_alg_policy: true
+                   ]
+                 ),
+                 request
+               )
+
+      assert {:ok, _ack} =
+               BackchannelAuthentication.request(
+                 config(
+                   ciba: [
+                     enabled: true,
+                     require_signed_request: true,
+                     request_signing_algs: ["PS256"]
+                   ]
+                 ),
+                 request
+               )
+    end
+
+    test "legacy EdDSA over Ed448 requires an explicit non-FAPI policy" do
+      enable_ed448_support()
+      jwk = JOSE.JWK.generate_key({:okp, :Ed448})
+      client = signing_client(jwk, "EdDSA")
+      jwt = signed_request(jwk, signed_claims(), "EdDSA")
+      request = request(client, %{"request" => jwt})
+
+      assert_raise ArgumentError, ~r/outside the enforced FAPI-CIBA signing algorithm set/, fn ->
+        config(
+          ciba: [
+            enabled: true,
+            require_signed_request: true,
+            request_signing_algs: ["EdDSA"],
+            enforce_fapi_alg_policy: true
+          ]
+        )
+      end
+
+      assert {:ok, _ack} =
+               BackchannelAuthentication.request(
+                 config(
+                   ciba: [
+                     enabled: true,
+                     require_signed_request: true,
+                     request_signing_algs: ["EdDSA"]
+                   ]
+                 ),
+                 request
+               )
+    end
   end
 
   defp es256_key do
@@ -206,7 +275,26 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
     {jwk, pub_map}
   end
 
-  defp signed_request(jwk, claims) do
+  defp signing_client(jwk, alg) do
+    {_, public} = JOSE.JWK.to_public_map(jwk)
+
+    %{
+      id: "cli-1",
+      jwks: %{"keys" => [Map.merge(public, %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)})]},
+      ciba: %{token_delivery_mode: :poll, request_signing_alg: alg}
+    }
+  end
+
+  defp signed_claims do
+    %{
+      "iss" => "cli-1",
+      "aud" => @issuer,
+      "scope" => "openid",
+      "login_hint" => "alice@example.test"
+    }
+  end
+
+  defp signed_request(jwk, claims, alg \\ "ES256") do
     now = System.system_time(:second)
 
     payload =
@@ -220,7 +308,13 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
         claims
       )
 
-    {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, %{"alg" => "ES256"}, payload))
+    {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, %{"alg" => alg}, payload))
     compact
+  end
+
+  defp enable_ed448_support do
+    previous = JOSE.crypto_fallback()
+    JOSE.crypto_fallback(true)
+    on_exit(fn -> JOSE.crypto_fallback(previous) end)
   end
 end

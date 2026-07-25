@@ -4,10 +4,18 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.3] - 2026-07-17
+## [2.1.0] - 2026-07-25
 
 ### Added
 
+- Add `:client_auth_enforce_fapi_alg_policy` and the corresponding CIBA
+  `:enforce_fapi_alg_policy` option. Omitted algorithm lists retain FAPI key
+  enforcement, while an explicit list remains an intentional non-FAPI policy
+  unless the host opts back into enforcement.
+- Advertise RFC 9864 `Ed25519` alongside legacy `EdDSA` in the default client
+  assertion and request-object algorithm metadata.
+- Advertise `introspection_endpoint_auth_signing_alg_values_supported` from the
+  same client-assertion policy enforced by the introspection endpoint.
 - Add a minimum-version consumer smoke test without Req so optional dependency
   regressions fail CI. It covers disabled, active-default, and custom-adapter
   configurations and fails CI on any compiler warning from AttestoPhoenix
@@ -27,16 +35,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Reject CIBA `:push` delivery at configuration time because AttestoPhoenix has
   no push deliverer. Advertising an undeliverable mode could leave an approved
   request with no notification and no polling fallback.
+- Reject malformed signing-algorithm lists and enforced lists that contain
+  algorithms outside Attesto's FAPI set, preventing discovery metadata from
+  advertising an algorithm the corresponding verifier must reject.
 
 ### Security
 
+- Enforce the FAPI RSA modulus and Edwards-curve policy through every
+  `private_key_jwt` endpoint and CIBA signed-request validation. The default
+  rejects PS256 keys below 2048 bits and legacy `EdDSA` over Ed448; named and
+  narrowed FAPI request-object policies retain the same checks.
 - Restrict Phoenix and Plug requirements to advisory-patched releases across
   every supported minor line. This preserves the widest compatible dependency
   range without allowing a resolver to select a known-vulnerable version.
-- Raise the Attesto runtime floor to 1.2.5 so its transitive JOSE requirement
-  excludes OTP 28-incompatible EC handling and incorrect builtin-JSON `nil`
-  encoding while its Plug metadata preserves advisory-safe dependency ranges.
-  Raise the development/test Postgrex floor to 0.22.3.
+- Raise the Attesto runtime floor to 1.3.0 for key-bound FAPI enforcement and
+  RFC 9864 Edwards identifiers. The floor also retains the transitive JOSE and
+  Plug compatibility and security boundaries from Attesto 1.2.5. Raise the
+  development/test Postgrex floor to 0.22.3.
 
 ## [2.0.2] - 2026-07-16
 

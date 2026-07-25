@@ -428,6 +428,62 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
     end
 
+    test "default private_key_jwt policy rejects a weak PS256 key" do
+      client_key = JOSE.JWK.generate_key({:rsa, 1024})
+      client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
+      put_config(client_jwks: fn %{id: "confidential-1"} -> client_jwks end)
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => client_assertion(client_key, "confidential-1", %{}, "PS256")
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+    end
+
+    test "a narrowed FAPI client-auth policy retains the weak-RSA gate" do
+      client_key = JOSE.JWK.generate_key({:rsa, 1024})
+      client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+        client_auth_signing_algs: ["PS256"],
+        client_auth_enforce_fapi_alg_policy: true
+      )
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => client_assertion(client_key, "confidential-1", %{}, "PS256")
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+    end
+
+    test "an explicit non-FAPI client-auth policy can accept a weak PS256 key" do
+      client_key = JOSE.JWK.generate_key({:rsa, 1024})
+      client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+        client_auth_signing_algs: ["PS256"]
+      )
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => client_assertion(client_key, "confidential-1", %{}, "PS256")
+        })
+
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
     test "accepts private_key_jwt assertion audience set to issuer" do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -2557,7 +2613,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   defp www_authenticate(conn), do: get_resp_header(conn, "www-authenticate")
 
-  defp client_assertion(jwk, client_id, overrides \\ %{}) do
+  defp client_assertion(jwk, client_id, overrides \\ %{}, alg \\ "ES256") do
     now = System.system_time(:second)
 
     claims =
@@ -2573,14 +2629,18 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         overrides
       )
 
-    header = %{"alg" => "ES256", "kid" => JOSE.JWK.thumbprint(jwk)}
+    header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
     {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
     compact
   end
 
-  defp public_jwk(jwk) do
+  defp public_jwk(jwk, overrides \\ %{}) do
     {_kty, map} = JOSE.JWK.to_public_map(jwk)
-    Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"})
+
+    Map.merge(
+      map,
+      Map.merge(%{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"}, overrides)
+    )
   end
 
   defp replay_once do

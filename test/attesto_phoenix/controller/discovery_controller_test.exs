@@ -141,6 +141,10 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       methods = body["introspection_endpoint_auth_methods_supported"]
       assert is_list(methods)
       refute "none" in methods
+
+      assert body["introspection_endpoint_auth_signing_alg_values_supported"] ==
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
+
       assert body["introspection_signing_alg_values_supported"] == ["RS256"]
     end
 
@@ -202,7 +206,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_signing_alg_values_supported"] ==
-               Attesto.SigningAlg.fapi_algs()
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
     end
 
     test "advertised signing algorithms reflect a configured :client_auth_signing_algs" do
@@ -214,6 +218,15 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         call_show(host_config(client_auth_signing_algs: algs), protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_signing_alg_values_supported"] == algs
+      assert body["introspection_endpoint_auth_signing_alg_values_supported"] == algs
+    end
+
+    test "omits introspection auth signing algorithms without private_key_jwt" do
+      host = host_config(token_endpoint_auth_methods_supported: ["client_secret_basic"])
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      refute Map.has_key?(body, "introspection_endpoint_auth_signing_alg_values_supported")
     end
 
     test "advertises RFC 9207 authorization response iss support when enabled" do
@@ -349,7 +362,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       host = host_config(client_jwks: fn _client -> %{"keys" => []} end)
       body = call_show(host, protocol_config()) |> decode_body()
 
-      assert body["request_object_signing_alg_values_supported"] == ["PS256", "ES256", "EdDSA"]
+      assert body["request_object_signing_alg_values_supported"] ==
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
     end
 
     test "omits the JAR metadata without request-object capability" do
@@ -369,7 +383,9 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       body = call_show(host, protocol_config()) |> decode_body()
 
       assert body["require_signed_request_object"] == true
-      assert body["request_object_signing_alg_values_supported"] == ["PS256", "ES256", "EdDSA"]
+
+      assert body["request_object_signing_alg_values_supported"] ==
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
     end
   end
 

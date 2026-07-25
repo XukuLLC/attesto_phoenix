@@ -43,10 +43,31 @@
 #     violates the declared field type raises a clear ArgumentError at
 #     `new/1`/`validate!/1` rather than failing late. The validations are
 #     covered by config_test.exs.
+#
+#   * authorization_server/ciba_decision.ex - `notification_endpoint/2` keeps a
+#     catch-all for malformed decision data. Dialyzer follows the normal core
+#     return type and sees only binary client identifiers, but the boundary is
+#     intentionally fail-closed if a custom store returns invalid persisted
+#     data. Attesto 1.3's tighter CIBA result types make this existing guard
+#     newly visible to Dialyzer.
+#
+#   * openid_configuration_controller.ex - two defensive clauses are narrower
+#     than Plug/Config's success types: the disabled-registration clause and a
+#     catch-all for non-list request path segments. Runtime configuration and
+#     synthetic conns can still reach those boundaries, where omission or a
+#     non-match is safer than raising while serving discovery metadata. The
+#     Attesto 1.3 PLT refresh newly proves the normal-path types; the exact
+#     warning text is filtered below so unrelated warnings in this module still
+#     fail CI.
 [
   {"lib/attesto_phoenix/controller/registration_controller.ex", :pattern_match_cov},
   {"lib/attesto_phoenix/request_context.ex", :pattern_match},
   {"lib/attesto_phoenix/controller/authorize_controller.ex", :pattern_match_cov},
   {"lib/attesto_phoenix/authorization_server/token.ex", :pattern_match_cov},
-  {"lib/attesto_phoenix/config.ex", :pattern_match}
+  {"lib/attesto_phoenix/config.ex", :pattern_match},
+  {"lib/attesto_phoenix/authorization_server/ciba_decision.ex",
+   "The pattern pattern <__config@1, __client_id@1> can never match the type, because it is covered by previous clauses."},
+  {"lib/attesto_phoenix/controller/openid_configuration_controller.ex", "The pattern can never match the type true."},
+  {"lib/attesto_phoenix/controller/openid_configuration_controller.ex",
+   "The pattern variable __segments@1 can never match the type, because it is covered by previous clauses."}
 ]
