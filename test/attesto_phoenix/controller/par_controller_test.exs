@@ -245,6 +245,26 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     refute Map.has_key?(stored, "client_assertion_type")
   end
 
+  test "rejects a weak PS256 private_key_jwt under the default FAPI policy" do
+    client_key = JOSE.JWK.generate_key({:rsa, 1024})
+    client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
+    put_config(client_jwks: fn %{id: "confidential-1"} -> client_jwks end)
+
+    params =
+      Map.merge(auth_params(), %{
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, "confidential-1", %{}, "PS256")
+      })
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert conn.status == 400
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+  end
+
   # CIMD (draft-ietf-oauth-client-id-metadata-document-01): a CIMD client may
   # push an authorization request, but only via private_key_jwt - the PAR
   # endpoint refuses the public-client (`none`) path (`allow_public: false`), and
@@ -785,7 +805,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     {compact, JOSE.JWK.thumbprint(jwk)}
   end
 
-  defp client_assertion(jwk, client_id, overrides \\ %{}) do
+  defp client_assertion(jwk, client_id, overrides \\ %{}, alg \\ "ES256") do
     now = System.system_time(:second)
 
     claims =
@@ -801,14 +821,18 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
         overrides
       )
 
-    header = %{"alg" => "ES256", "kid" => JOSE.JWK.thumbprint(jwk)}
+    header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
     {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
     compact
   end
 
-  defp public_jwk(jwk) do
+  defp public_jwk(jwk, overrides \\ %{}) do
     {_kty, map} = JOSE.JWK.to_public_map(jwk)
-    Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"})
+
+    Map.merge(
+      map,
+      Map.merge(%{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => "ES256", "use" => "sig"}, overrides)
+    )
   end
 
   defp replay_once do

@@ -250,6 +250,9 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       assert is_list(methods)
       refute "none" in methods
 
+      assert body["introspection_endpoint_auth_signing_alg_values_supported"] ==
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
+
       assert body["introspection_signing_alg_values_supported"] ==
                body["id_token_signing_alg_values_supported"]
     end
@@ -260,6 +263,16 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       body = call_show(host, protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+    end
+
+    test "advertises legacy and exact Ed25519 client-assertion identifiers by default" do
+      body = call_show(host_config(), protocol_config()) |> decode_body()
+
+      assert body["token_endpoint_auth_signing_alg_values_supported"] ==
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
+
+      assert body["introspection_endpoint_auth_signing_alg_values_supported"] ==
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
     end
 
     test "advertises when pushed authorization requests are required" do
@@ -295,12 +308,13 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
 
     test "advertises request_object_signing_alg_values_supported when JAR is supported (RFC 9101 §10.5)" do
       # Default policy leaves accepted_algs unset, so the verifier default
-      # (PS256, ES256, EdDSA) is advertised - but only when request objects are
-      # actually supported.
+      # (PS256, ES256, EdDSA over Ed25519, and exact Ed25519) is advertised -
+      # but only when request objects are actually supported.
       host = host_config(client_jwks: fn _client -> %{"keys" => []} end)
       body = call_show(host, protocol_config()) |> decode_body()
 
-      assert body["request_object_signing_alg_values_supported"] == ["PS256", "ES256", "EdDSA"]
+      assert body["request_object_signing_alg_values_supported"] ==
+               ["PS256", "ES256", "EdDSA", "Ed25519"]
     end
 
     test "omits request_object_signing_alg_values_supported without request-object capability" do

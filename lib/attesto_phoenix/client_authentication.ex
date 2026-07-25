@@ -50,6 +50,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
       identifier, commonly the issuer or token endpoint URL).
     * `:assertion_max_lifetime` - the maximum assertion lifetime, in seconds,
       and the replay-record TTL (RFC 7523 §3).
+    * `:assertion_signing_algs` - the trusted JOSE algorithm allowlist for the
+      assertion.
+    * `:assertion_enforce_fapi_alg_policy` - whether trusted assertion keys must
+      also satisfy FAPI's RSA modulus and Edwards-curve restrictions. `nil`
+      preserves the explicit-algorithm behavior of older policy structs.
 
   ## Return value
 
@@ -91,7 +96,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
             allow_public: boolean(),
             assertion_audiences: [String.t()],
             assertion_max_lifetime: pos_integer(),
-            assertion_signing_algs: [String.t()]
+            assertion_signing_algs: [String.t()],
+            assertion_enforce_fapi_alg_policy: boolean() | nil
           }
 
     @enforce_keys [
@@ -104,7 +110,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
       :allow_public,
       :assertion_audiences,
       :assertion_max_lifetime,
-      :assertion_signing_algs
+      :assertion_signing_algs,
+      :assertion_enforce_fapi_alg_policy
     ]
   end
 
@@ -423,15 +430,30 @@ defmodule AttestoPhoenix.ClientAuthentication do
          {:ok, client} <- resolve_client(config, client_id),
          {:ok, jwks} <- client_jwks(config, client),
          {:ok, claims} <-
-           ClientAssertion.verify(assertion, client_id, policy.assertion_audiences, jwks,
-             max_lifetime: policy.assertion_max_lifetime,
-             accepted_algs: policy.assertion_signing_algs
+           ClientAssertion.verify(
+             assertion,
+             client_id,
+             policy.assertion_audiences,
+             jwks,
+             assertion_verify_opts(policy)
            ),
          {:ok, result} <- result(config, client, client_id, :private_key_jwt),
          :ok <- consume_client_assertion_jti(config, policy, client_id, claims) do
       {:ok, result}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp assertion_verify_opts(%Policy{} = policy) do
+    opts = [
+      max_lifetime: policy.assertion_max_lifetime,
+      accepted_algs: policy.assertion_signing_algs
+    ]
+
+    case policy.assertion_enforce_fapi_alg_policy do
+      value when is_boolean(value) -> Keyword.put(opts, :enforce_fapi_alg_policy, value)
+      nil -> opts
     end
   end
 

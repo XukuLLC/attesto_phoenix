@@ -95,7 +95,8 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
         Config.backchannel_authentication_endpoint_url(config)
       ],
       assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs
+      assertion_signing_algs: config.client_auth_signing_algs,
+      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
     }
 
     case ClientAuthentication.authenticate_with_context(get_req_header(conn, "authorization"), params, config, policy) do

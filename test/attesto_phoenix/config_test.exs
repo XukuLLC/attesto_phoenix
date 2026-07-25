@@ -595,12 +595,88 @@ defmodule AttestoPhoenix.ConfigTest do
 
   describe ":client_auth_signing_algs" do
     test "defaults to the FAPI 2 set when unset" do
-      assert config().client_auth_signing_algs == Attesto.SigningAlg.fapi_algs()
+      built = config()
+
+      assert built.client_auth_signing_algs == Attesto.SigningAlg.fapi_algs()
+      assert "Ed25519" in built.client_auth_signing_algs
+      assert built.client_auth_enforce_fapi_alg_policy == true
     end
 
-    test "is overridable by the host" do
+    test "an explicit algorithm list is a non-FAPI policy unless enforcement is requested" do
       algs = ["PS256", "ES256", "RS256"]
-      assert config(client_auth_signing_algs: algs).client_auth_signing_algs == algs
+      explicit = config(client_auth_signing_algs: algs)
+
+      enforced =
+        config(
+          client_auth_signing_algs: ["PS256", "ES256"],
+          client_auth_enforce_fapi_alg_policy: true
+        )
+
+      assert explicit.client_auth_signing_algs == algs
+      assert explicit.client_auth_enforce_fapi_alg_policy == false
+      assert enforced.client_auth_enforce_fapi_alg_policy == true
+    end
+
+    test "an explicit false can opt the default allowlist out of the FAPI key gate" do
+      assert config(client_auth_enforce_fapi_alg_policy: false).client_auth_enforce_fapi_alg_policy == false
+    end
+
+    test "rejects a non-boolean enforcement value at boot" do
+      assert_raise ArgumentError, ~r/:client_auth_enforce_fapi_alg_policy must be a boolean/, fn ->
+        config(client_auth_enforce_fapi_alg_policy: :yes)
+      end
+    end
+
+    test "rejects malformed and unsupported algorithm lists at boot" do
+      assert_raise ArgumentError, ~r/:client_auth_signing_algs must be a non-empty list/, fn ->
+        config(client_auth_signing_algs: false)
+      end
+
+      assert_raise ArgumentError, ~r/unsupported signing algorithms \["unknown"\]/, fn ->
+        config(client_auth_signing_algs: ["PS256", "unknown"])
+      end
+    end
+
+    test "an enforced list cannot advertise algorithms outside the FAPI set" do
+      assert_raise ArgumentError, ~r/:client_auth_signing_algs contains \["RS256"\].*outside.*FAPI/s, fn ->
+        config(
+          client_auth_signing_algs: ["PS256", "RS256"],
+          client_auth_enforce_fapi_alg_policy: true
+        )
+      end
+    end
+  end
+
+  describe "CIBA algorithm policy" do
+    test "the default FAPI-CIBA allowlist retains the FAPI key gate" do
+      opts = Config.ciba(config())
+
+      assert opts[:request_signing_algs] == ["PS256", "ES256"]
+      assert opts[:enforce_fapi_alg_policy] == true
+    end
+
+    test "an explicit request allowlist is non-FAPI unless enforcement is requested" do
+      explicit = Config.ciba(config(ciba: [request_signing_algs: ["EdDSA"]]))
+
+      enforced =
+        Config.ciba(config(ciba: [request_signing_algs: ["PS256"], enforce_fapi_alg_policy: true]))
+
+      assert explicit[:enforce_fapi_alg_policy] == false
+      assert enforced[:enforce_fapi_alg_policy] == true
+    end
+
+    test "rejects a non-boolean CIBA enforcement value at boot" do
+      assert_raise ArgumentError, ~r/ciba: \[:enforce_fapi_alg_policy\] must be a boolean/, fn ->
+        config(ciba: [enforce_fapi_alg_policy: :yes])
+      end
+    end
+
+    test "an enforced CIBA list is limited to the FAPI-CIBA PS256/ES256 set" do
+      for alg <- ["EdDSA", "Ed448"] do
+        assert_raise ArgumentError, ~r/ciba: \[:request_signing_algs\].*outside.*FAPI-CIBA/s, fn ->
+          config(ciba: [request_signing_algs: [alg], enforce_fapi_alg_policy: true])
+        end
+      end
     end
   end
 
@@ -621,9 +697,33 @@ defmodule AttestoPhoenix.ConfigTest do
     end
 
     test "rejects a non-Policy value at boot" do
-      assert_raise ArgumentError, ~r/:request_object_policy must be an/, fn ->
-        config(request_object_policy: :fapi)
+      for value <- [:fapi, false] do
+        assert_raise ArgumentError, ~r/:request_object_policy must be an/, fn ->
+          config(request_object_policy: value)
+        end
       end
+    end
+
+    test "rejects a non-boolean request-object enforcement value at boot" do
+      policy = %Policy{enforce_fapi_alg_policy: :yes}
+
+      assert_raise ArgumentError, ~r/request_object_policy.enforce_fapi_alg_policy must be nil or a boolean/, fn ->
+        config(request_object_policy: policy)
+      end
+    end
+
+    test "an enforced request-object list cannot advertise algorithms outside the FAPI set" do
+      policy = %Policy{accepted_algs: ["RS256"], enforce_fapi_alg_policy: true}
+
+      assert_raise ArgumentError, ~r/request_object_policy.accepted_algs.*\["RS256"\].*outside.*FAPI/s, fn ->
+        config(request_object_policy: policy)
+      end
+    end
+
+    test "an explicit non-FAPI request-object policy retains supported compatibility algorithms" do
+      policy = %Policy{accepted_algs: ["RS256", "Ed448"], enforce_fapi_alg_policy: false}
+
+      assert config(request_object_policy: policy).request_object_policy == policy
     end
 
     test "rejects a required-request-object policy without :client_jwks at boot" do

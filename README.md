@@ -181,6 +181,7 @@ config :my_app, AttestoPhoenix.Config,
   send_error: &MyApp.OAuthErrors.render/3,
   #   (conn, status, body_map -> conn), optional custom OAuth error envelope
   client_auth_signing_algs: Attesto.SigningAlg.fapi_algs(),
+  client_auth_enforce_fapi_alg_policy: true,
   request_object_policy: Attesto.RequestObject.Policy.generic(),
 
   # --- optional deployment + features ---
@@ -423,11 +424,26 @@ token-exchange, and JWT-assertion (`jwt-bearer`) grants. The PAR endpoint accept
 secret methods plus `private_key_jwt`, then stores the authorization request
 behind a one-time `request_uri`.
 
+When `:client_auth_signing_algs` is omitted, client assertions use Attesto's
+FAPI allowlist and enforce its key policy: RSA signatures require a modulus of
+at least 2048 bits, and legacy `EdDSA` is FAPI-compatible only over Ed25519.
+The default discovery metadata includes both legacy `EdDSA` and RFC 9864's
+exact `Ed25519` identifier. Supplying an explicit algorithm list selects a
+non-FAPI policy for compatibility; pair a narrowed FAPI list with
+`client_auth_enforce_fapi_alg_policy: true` as in the example above. An
+enforced list must be a subset of `Attesto.SigningAlg.fapi_algs/0`; invalid or
+incoherent lists fail when the server configuration is built rather than being
+advertised and rejected only at request time.
+
 When `:request_object_policy` is configured, signed request objects are verified
 at PAR submission and re-verified at `/authorize`; verified request-object
 parameters are authoritative over unsigned request body/query values. Set
 `Attesto.RequestObject.Policy.fapi_message_signing/0` to enforce the FAPI 2.0
-Message Signing JAR profile.
+Message Signing JAR profile. Request-object policies follow the same presence
+rule: an explicit `accepted_algs` list is non-FAPI unless
+`enforce_fapi_alg_policy` is `true`. The named FAPI policy sets it to `true`, so
+copying that policy and narrowing `accepted_algs` retains the RSA-strength and
+Edwards-curve gate.
 
 The authorization endpoint also emits JARM responses when the validated request
 uses `response_mode=jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`.
@@ -456,6 +472,12 @@ flow the user approves out of band on their own phone, then collects the tokens
 at the token endpoint: in `poll` mode the client polls until the user approves,
 and in `ping` mode the AS calls the client's notification endpoint when the
 tokens are ready. Signed authentication requests follow the FAPI-CIBA profile.
+The default CIBA request algorithm list (`PS256` and `ES256`) retains the same
+FAPI key-strength checks. An explicit `ciba: [request_signing_algs: ...]` list
+is treated as non-FAPI unless paired with `enforce_fapi_alg_policy: true`; this
+lets a generic deployment opt into additional algorithms without weakening a
+narrowed FAPI policy accidentally. An enforced FAPI-CIBA list is limited to
+`PS256` and `ES256`, as required by the profile.
 
 ### Device Authorization Grant (RFC 8628)
 

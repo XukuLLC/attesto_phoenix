@@ -293,9 +293,26 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       "token_endpoint_auth_signing_alg_values_supported",
       config.client_auth_signing_algs
     )
+    |> put_introspection_auth_signing_alg_values_supported(config)
     |> put_authorization_signing_alg_values_supported()
     |> put_introspection_signing_alg_values_supported()
     |> put_authorization_response_iss_supported(config)
+  end
+
+  # RFC 8414 §2: private_key_jwt callers of introspection use the same client
+  # assertion verifier and configured algorithm policy as the token endpoint.
+  # This client-authentication field is separate from the RFC 9701 response JWT
+  # signing field added below.
+  defp put_introspection_auth_signing_alg_values_supported(metadata, %Config{} = config) do
+    if "private_key_jwt" in introspection_auth_methods(config) do
+      Map.put(
+        metadata,
+        "introspection_endpoint_auth_signing_alg_values_supported",
+        config.client_auth_signing_algs
+      )
+    else
+      metadata
+    end
   end
 
   # RFC 9701 §10 `introspection_signing_alg_values_supported`: the algorithms the

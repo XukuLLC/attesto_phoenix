@@ -76,7 +76,28 @@ end
 
 # Every feature remains Req-free while disabled or while its outbound path is
 # unused. These are real Config.new/1 calls in a dependency graph without Req.
-Consumer.config()
+default_config = Consumer.config()
+
+if default_config.client_auth_enforce_fapi_alg_policy != true or
+     "Ed25519" not in default_config.client_auth_signing_algs do
+  raise "default client-authentication FAPI policy or exact Ed25519 metadata is missing"
+end
+
+explicit_client_policy = Consumer.config(client_auth_signing_algs: ["PS256"])
+
+if explicit_client_policy.client_auth_enforce_fapi_alg_policy != false do
+  raise "an explicit client-authentication algorithm list did not preserve non-FAPI policy intent"
+end
+
+if AttestoPhoenix.Config.ciba(default_config)[:enforce_fapi_alg_policy] != true do
+  raise "default CIBA configuration did not retain FAPI key enforcement"
+end
+
+explicit_ciba_policy = Consumer.config(ciba: [request_signing_algs: ["EdDSA"]])
+
+if AttestoPhoenix.Config.ciba(explicit_ciba_policy)[:enforce_fapi_alg_policy] != false do
+  raise "an explicit CIBA algorithm list did not preserve non-FAPI policy intent"
+end
 
 Consumer.config(
   logout: [enabled: true],

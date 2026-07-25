@@ -113,6 +113,28 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
 
   defp basic_auth, do: "Basic " <> Base.encode64("#{@client_id}:#{@client_secret}")
 
+  defp client_assertion(jwk, alg) do
+    now = System.system_time(:second)
+
+    claims = %{
+      "iss" => @client_id,
+      "sub" => @client_id,
+      "aud" => "https://issuer.test",
+      "iat" => now,
+      "exp" => now + 60,
+      "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    }
+
+    header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    compact
+  end
+
+  defp public_jwk(jwk, alg) do
+    {_kty, map} = JOSE.JWK.to_public_map(jwk)
+    Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(jwk), "alg" => alg, "use" => "sig"})
+  end
+
   describe "create/2 (RFC 7662)" do
     test "an active access token returns the JSON introspection response", %{config: config} do
       conn = call(%{"token" => access_token(config)})
@@ -257,6 +279,28 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       conn =
         conn(:post, "/oauth/introspect", params)
         |> put_req_header("authorization", "Basic " <> Base.encode64("#{@client_id}:wrong"))
+        |> IntrospectionController.create(params)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+    end
+
+    test "private_key_jwt rejects a weak PS256 key under the default FAPI policy", %{config: config} do
+      client_key = JOSE.JWK.generate_key({:rsa, 1024})
+      client_jwks = %{"keys" => [public_jwk(client_key, "PS256")]}
+
+      opts = Keyword.put(config_opts(), :client_jwks, fn %{id: @client_id} -> client_jwks end)
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      params = %{
+        "token" => access_token(config),
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, "PS256")
+      }
+
+      conn =
+        :post
+        |> conn("/oauth/introspect", params)
         |> IntrospectionController.create(params)
 
       assert conn.status == 400

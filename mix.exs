@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.0.3"
+  @version "2.1.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -70,15 +70,15 @@ defmodule AttestoPhoenix.MixProject do
   # so a Mix.env-based switch would break publishing from a dev checkout. The
   # default - including every publish - resolves the published version
   # constraint; local development sets ATTESTO_PATH=1 to use the sibling. The
-  # 1.2.5 floor carries Attesto core's JOSE 1.11.12 compatibility boundary
-  # and maximum-compatible Plug requirement. An older core requirement would
-  # intersect with this package's constraints and could re-admit affected or
-  # runtime-incompatible releases.
+  # 1.3.0 floor carries key-bound FAPI algorithm enforcement and RFC 9864
+  # Edwards identifiers. An older core requirement would intersect with this
+  # package's constraints and silently omit the policy that this release wires
+  # through client authentication, request objects, and CIBA.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.2.5 and < 2.0.0"}
+      {:attesto, ">= 1.3.0 and < 2.0.0"}
     end
   end
 
