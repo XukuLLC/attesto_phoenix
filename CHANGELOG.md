@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- RFC 8252 (BCP 212) native-app profile support, keyed on a new
+  `:client_native?` client-store callback (`(client -> boolean())`, defaulting
+  to `false`) and a new `:native_apps` option group. Every part of it is off
+  until the host classifies its clients, so an existing deployment's behavior is
+  unchanged.
+
+  With a client marked native, two restrictions apply and need no flag:
+  PKCE is required for it regardless of the global `:require_pkce` setting
+  (§8.1; `S256`-only and no `plain` were already unconditional), and a client
+  marked both native and public may only authenticate at the token endpoint
+  with `none` — `client_secret_basic`, `client_secret_post`, and
+  `private_key_jwt` are refused with the usual generic `invalid_client` (§8.4),
+  because a credential shipped inside an installed binary is not confidential.
+
+  Two rules are additionally opt-in through `:native_apps`:
+
+  - `loopback_redirect: true` enables RFC 8252 §7.3 loopback interface
+    redirection for native clients: an `http://127.0.0.1/...` or
+    `http://[::1]/...` redirect URI matches the registered one on any port, so
+    an ephemeral port bound at runtime needs no registration, while scheme,
+    host, path, and query still compare exactly. Nothing else is relaxed —
+    `https`, private-use schemes, remote hosts, non-native clients, and the
+    hostname `localhost` (forbidden by §8.3) stay byte-exact, and an unmatched
+    redirect URI is still a direct, non-redirectable error. **This widens a
+    check the OpenID Connect and FAPI profiles assume is exact, so enabling it
+    is incompatible with certifying against them**; it requires both the
+    server-wide flag and the per-client mark.
+  - `reject_embedded_user_agents: true` enables the RFC 8252 §8.12 refusal of
+    authorization requests that appear to come from an in-app webview, via the
+    new `AttestoPhoenix.RequestContext.embedded_user_agent?/1` and
+    `check_embedded_user_agent/2`. Detection is a `User-Agent` heuristic and is
+    documented as defense in depth rather than a boundary, which is why it is
+    opt-in; it applies to all clients, since the embedding app need not be the
+    OAuth client.
+
+  Also adds `AttestoPhoenix.AuthorizationServer.RequestPolicy.redirect_uri_matching/2`
+  and `client_native?/2`, and `AttestoPhoenix.Config.native_apps/1`,
+  `native_app_loopback_redirect?/1`, and `reject_embedded_user_agents?/1`.
+  Requires `attesto` with `Attesto.RedirectURI`.
+
 ## [2.1.0] - 2026-07-25
 
 ### Added

@@ -6,15 +6,17 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   Both endpoints validate the same authorization request the same way (RFC 9126
   §2.1: "validate the pushed request as it would an authorization request sent
   to the authorization endpoint"), so the policy inputs `Attesto.AuthorizationRequest.validate/2`
-  needs - the client's registered redirect URIs (RFC 6749 §3.1.2.3), whether
-  PKCE is required (RFC 9700 §2.1.1), and whether `nonce` is required (OIDC Core
-  §3.1.2.1) - are resolved here once, from `%AttestoPhoenix.Config{}` and the
-  opaque host client, rather than duplicated per endpoint. This module reads
-  only data: it touches no `conn` and carries no policy of its own beyond the
-  fail-closed defaults documented on each function.
+  needs - the client's registered redirect URIs (RFC 6749 §3.1.2.3), how they
+  are matched (RFC 8252 §7.3), whether PKCE is required (RFC 9700 §2.1.1), and
+  whether `nonce` is required (OIDC Core §3.1.2.1) - are resolved here once,
+  from `%AttestoPhoenix.Config{}` and the opaque host client, rather than
+  duplicated per endpoint. This module reads only data: it touches no `conn` and
+  carries no policy of its own beyond the fail-closed defaults documented on
+  each function.
   """
 
   alias Attesto.AuthorizationRequest
+  alias Attesto.RedirectURI
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config}
 
@@ -37,6 +39,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
     opts =
       [
         registered_redirect_uris: registered_redirect_uris(config, client),
+        redirect_uri_matching: redirect_uri_matching(config, client),
         require_pkce: require_pkce?(config, client),
         require_nonce: require_nonce?(config)
       ] ++ extra_opts
@@ -67,15 +70,53 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   end
 
   @doc """
-  Whether PKCE is required for this client (RFC 7636 §4.3 / RFC 9700 §2.1.1).
+  How the request `redirect_uri` is matched against the registered set
+  (RFC 6749 §3.1.2.3, RFC 8252 §7.3).
+
+  `:exact` - the RFC 6749 §3.1.2.3 simple string comparison - unless BOTH gates
+  are open: the host enabled `native_apps: [loopback_redirect: true]` AND marked
+  this client native via `:client_native?`. Only then does the client get
+  `:exact_allow_loopback_port`, under which its `http://127.0.0.1/...` /
+  `http://[::1]/...` redirect URI matches on any port (see
+  `Attesto.RedirectURI` for exactly how narrow that exception is).
+
+  Two gates rather than one: this is the only rule in the RFC 8252 profile that
+  *relaxes* a check, so it takes both a server-wide decision and a per-client
+  classification, and it can never widen matching for a client the host did not
+  deliberately mark. A CIMD client is never native - its `client_id` is an
+  `https` URL and its `redirect_uris` come from the document, which the
+  authorization endpoint additionally holds to the same origin.
+  """
+  @spec redirect_uri_matching(Config.t(), term()) :: RedirectURI.matching()
+  def redirect_uri_matching(_config, {:cimd, _metadata}), do: :exact
+
+  def redirect_uri_matching(config, client) do
+    if Config.native_app_loopback_redirect?(config) and client_native?(config, client) do
+      :exact_allow_loopback_port
+    else
+      :exact
+    end
+  end
+
+  @doc """
+  Whether PKCE is required for this client (RFC 7636 §4.3 / RFC 9700 §2.1.1,
+  RFC 8252 §8.1).
 
   A public client MUST use PKCE, so `client_public?/2` forces it regardless of
   config. A sender-constrained client (DPoP or mTLS) is a FAPI 2.0 client, and
   FAPI 2.0 Security Profile §5.3.1.2 / RFC 9700 §2.1.1 require PKCE for it even
   though it authenticates confidentially - so `client_requires_dpop?/2` and
-  `client_requires_mtls?/2` force it too. For any other confidential client the
-  global `:require_pkce` flag applies (default `true`). Fail closed: absent the
-  host's deliberate opt-out, PKCE is required.
+  `client_requires_mtls?/2` force it too. RFC 8252 §8.1 requires it for a native
+  app, so `client_native?/2` forces it as well; the requirement is stated for
+  public native clients, and applying it to any native client is strictly
+  safer - a native app that claims to be confidential cannot actually hold a
+  secret (§8.4). For any other confidential client the global `:require_pkce`
+  flag applies (default `true`). Fail closed: absent the host's deliberate
+  opt-out, PKCE is required.
+
+  RFC 8252 §8.1 also requires `S256` rather than `plain`. That needs no policy
+  here: `Attesto.AuthorizationRequest` rejects `code_challenge_method=plain`
+  and any non-`S256` method unconditionally, for every client.
   """
   @spec require_pkce?(Config.t(), term()) :: boolean()
   # A CIMD client is public (`none` + PKCE) or `private_key_jwt`; PKCE is
@@ -85,9 +126,28 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
 
   def require_pkce?(config, client) do
     client_public?(config, client) or
+      client_native?(config, client) or
       SenderConstraint.client_requires_dpop?(config, client) or
       SenderConstraint.client_requires_mtls?(config, client) or
       Callback.config_flag(config, :require_pkce)
+  end
+
+  @doc """
+  Classify the client as an installed native application (RFC 8252 / BCP 212)
+  via the host's `:client_native?` callback.
+
+  Absent the callback, the client is NOT native. Unlike `client_public?/2` this
+  cannot fail closed by defaulting to `true`: "native" gates one relaxation
+  (§7.3 loopback ports) alongside its restrictions, and a host that has not
+  classified its clients must get the unmodified RFC 6749 behavior.
+  """
+  @spec client_native?(Config.t(), term()) :: boolean()
+  # A CIMD client is identified by an `https` URL that resolves to a document
+  # served over the network; it is not an installed native app.
+  def client_native?(_config, {:cimd, _metadata}), do: false
+
+  def client_native?(config, client) do
+    Callback.invoke(Config.client_native_fun(config), [client], false) == true
   end
 
   @doc """

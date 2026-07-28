@@ -20,6 +20,7 @@ defmodule AttestoPhoenix.ClientStore do
     * `client_jwks/1` (`:client_jwks`)
     * `client_redirect_uris/1` (`:client_redirect_uris`)
     * `client_public?/1` (`:client_public?`)
+    * `client_native?/1` (`:client_native?`)
     * `client_requires_mtls?/1` (`:client_requires_mtls?`)
     * `client_requires_dpop?/1` (`:client_requires_dpop?`)
     * `client_grant_types/1` (`:client_grant_types`)
@@ -76,6 +77,24 @@ defmodule AttestoPhoenix.ClientStore do
   (RFC 6749 §2.1 / RFC 7636).
   """
   @callback client_public?(client()) :: boolean()
+
+  @doc """
+  Whether the client is an installed native application (RFC 8252 / BCP 212).
+
+  A native app runs on the end user's own device — an iOS/Android app or a
+  desktop binary — rather than on a server the operator controls. That single
+  fact drives the RFC 8252 authorization-server obligations: PKCE is required
+  for it (§8.1), it must authenticate at the token endpoint with `none` because
+  it cannot hold a secret confidentially (§8.4), and — only when the host also
+  enables `native_apps: [loopback_redirect: true]` — its loopback redirect URI
+  may vary in port (§7.3).
+
+  Returns `false` when the callback is not exposed, so a host that has not
+  classified its clients gets no RFC 8252 behavior at all. Marking a client
+  native is purely additive hardening except for the loopback redirect
+  exception, which additionally requires the host to enable it.
+  """
+  @callback client_native?(client()) :: boolean()
 
   @doc """
   Whether the client requires mTLS-bound token issuance (RFC 8705).
@@ -152,6 +171,7 @@ defmodule AttestoPhoenix.ClientStore do
                       client_jwks: 1,
                       client_redirect_uris: 1,
                       client_public?: 1,
+                      client_native?: 1,
                       client_requires_mtls?: 1,
                       client_requires_dpop?: 1,
                       client_grant_types: 1,

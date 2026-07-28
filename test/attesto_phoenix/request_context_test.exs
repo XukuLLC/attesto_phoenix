@@ -360,4 +360,124 @@ defmodule AttestoPhoenix.RequestContextTest do
       assert RequestContext.cert_der(build_conn(:get, "/"), cfg) == nil
     end
   end
+
+  describe "embedded_user_agent?/1 (RFC 8252 §8.12)" do
+    defp with_user_agent(user_agent) do
+      build_conn(:get, "/oauth/authorize", headers: [{"user-agent", user_agent}])
+    end
+
+    test "detects the Android System WebView platform token" do
+      assert RequestContext.embedded_user_agent?(
+               with_user_agent(
+                 "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A; wv) AppleWebKit/537.36 " <>
+                   "(KHTML, like Gecko) Version/4.0 Chrome/119.0.0.0 Mobile Safari/537.36"
+               )
+             )
+    end
+
+    test "detects an iOS WKWebView by the absent Safari product token" do
+      assert RequestContext.embedded_user_agent?(
+               with_user_agent(
+                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 " <>
+                   "(KHTML, like Gecko) Mobile/21A329"
+               )
+             )
+    end
+
+    test "detects well-known in-app browser product tokens" do
+      for marker <- [
+            "FBAN/FBIOS;FBAV/440.0",
+            "Instagram 302.0.0.23.113",
+            "Line/13.5.0",
+            "MicroMessenger/8.0.42",
+            "Electron/27.0.0"
+          ] do
+        assert RequestContext.embedded_user_agent?(with_user_agent("Mozilla/5.0 " <> marker)),
+               "expected #{marker} to be detected as an embedded user agent"
+      end
+    end
+
+    test "matches case-insensitively" do
+      assert RequestContext.embedded_user_agent?(with_user_agent("Mozilla/5.0 fban/FBIOS"))
+      assert RequestContext.embedded_user_agent?(with_user_agent("Mozilla/5.0 MICROMESSENGER/8.0"))
+    end
+
+    test "does not flag the system browsers a native app is supposed to use" do
+      for user_agent <- [
+            # Mobile Safari on iOS.
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 " <>
+              "(KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            # Chrome on iOS - a WebKit shell, but a browser: it keeps Safari/.
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 " <>
+              "(KHTML, like Gecko) CriOS/119.0.6045.109 Mobile/15E148 Safari/604.1",
+            # Firefox on iOS.
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 " <>
+              "(KHTML, like Gecko) FxiOS/119.0 Mobile/15E148 Safari/605.1.15",
+            # Chrome on Android, including a Custom Tab (same UA, no `wv`).
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " <>
+              "Chrome/119.0.0.0 Mobile Safari/537.36",
+            # Desktop browsers.
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) " <>
+              "Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:119.0) Gecko/20100101 Firefox/119.0"
+          ] do
+        refute RequestContext.embedded_user_agent?(with_user_agent(user_agent)),
+               "expected #{user_agent} to pass as an external user agent"
+      end
+    end
+
+    test "an absent or empty User-Agent is not treated as embedded" do
+      refute RequestContext.embedded_user_agent?(build_conn(:get, "/oauth/authorize"))
+      refute RequestContext.embedded_user_agent?(with_user_agent(""))
+    end
+
+    # X-Requested-With is set by Android webviews AND by some Custom Tabs
+    # implementations, so keying on it would refuse the arrangement RFC 8252
+    # recommends. It is deliberately ignored.
+    test "X-Requested-With alone is not evidence" do
+      conn =
+        build_conn(:get, "/oauth/authorize",
+          headers: [
+            {"user-agent",
+             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " <>
+               "Chrome/119.0.0.0 Mobile Safari/537.36"},
+            {"x-requested-with", "com.example.app"}
+          ]
+        )
+
+      refute RequestContext.embedded_user_agent?(conn)
+    end
+  end
+
+  describe "check_embedded_user_agent/2 (RFC 8252 §8.12)" do
+    @webview "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A; wv) AppleWebKit/537.36 " <>
+               "(KHTML, like Gecko) Version/4.0 Chrome/119.0.0.0 Mobile Safari/537.36"
+
+    test "is off by default, so a webview request passes" do
+      assert RequestContext.check_embedded_user_agent(with_user_agent(@webview), config()) == :ok
+    end
+
+    test "refuses a webview request once the host opts in" do
+      cfg = config(native_apps: [reject_embedded_user_agents: true])
+
+      assert RequestContext.check_embedded_user_agent(with_user_agent(@webview), cfg) ==
+               {:error, :embedded_user_agent}
+    end
+
+    test "an external user agent passes with the check enabled" do
+      cfg = config(native_apps: [reject_embedded_user_agents: true])
+
+      user_agent =
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " <>
+          "Chrome/119.0.0.0 Mobile Safari/537.36"
+
+      assert RequestContext.check_embedded_user_agent(with_user_agent(user_agent), cfg) == :ok
+    end
+
+    test "enabling the loopback redirect exception does not enable this check" do
+      cfg = config(native_apps: [loopback_redirect: true])
+
+      assert RequestContext.check_embedded_user_agent(with_user_agent(@webview), cfg) == :ok
+    end
+  end
 end

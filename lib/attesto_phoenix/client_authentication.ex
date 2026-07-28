@@ -17,6 +17,15 @@ defmodule AttestoPhoenix.ClientAuthentication do
   OIDC Core §9). Presenting more than one client-authentication method is
   rejected (RFC 6749 §2.3).
 
+  ## Native apps (RFC 8252 §8.4)
+
+  A client the host marks both native (`:client_native?`) and public
+  (`:client_public?`) may only authenticate with `none`. A native app cannot
+  keep a credential confidential - its binary is on the end user's device - so
+  presenting a client secret or an assertion is refused with the same generic
+  `invalid_client` message as any other failure. Neither classification defaults
+  to `true`, so this never affects a host that has not classified its clients.
+
   ## Client ID Metadata Documents (CIMD)
 
   When CIMD (`draft-ietf-oauth-client-id-metadata-document-01`) is enabled and
@@ -573,10 +582,14 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # the host callback.
   defp result(config, client, presented_client_id, method)
        when is_binary(presented_client_id) and presented_client_id != "" do
-    case resolved_client_id(config, client) do
-      nil -> {:ok, authenticated_result(client, presented_client_id, method)}
-      ^presented_client_id -> {:ok, authenticated_result(client, presented_client_id, method)}
-      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    if native_client_auth_permitted?(config, client, method) do
+      case resolved_client_id(config, client) do
+        nil -> {:ok, authenticated_result(client, presented_client_id, method)}
+        ^presented_client_id -> {:ok, authenticated_result(client, presented_client_id, method)}
+        _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+      end
+    else
+      {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
 
@@ -586,6 +599,44 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp authenticated_result(client, presented_client_id, method) do
     %Result{client: client, client_id: presented_client_id, method: method}
+  end
+
+  # RFC 8252 §8.4: an installed native app cannot keep a credential
+  # confidential. Its binary is distributed to every user's device, so anything
+  # shipped inside it - a `client_secret`, an assertion signing key - is
+  # readable by anyone who has the app, and an authorization server that accepts
+  # it is authenticating "possession of the app", not "possession of a secret".
+  # A client the host marks native (RFC 8252 / `:client_native?`) and public
+  # (RFC 6749 §2.1 / `:client_public?`) therefore authenticates with `none`; its
+  # security rests on PKCE instead (§8.1, enforced by
+  # `AttestoPhoenix.AuthorizationServer.RequestPolicy.require_pkce?/2`).
+  #
+  # Presenting `client_secret_basic`, `client_secret_post`, or `private_key_jwt`
+  # is refused even when the host registry happens to hold a matching credential
+  # - silently accepting it would let a secret extracted from one installed copy
+  # authenticate as the client forever. The refusal is the single generic
+  # `invalid_client` message every other authentication failure returns, so it
+  # reveals nothing about the client's registration.
+  #
+  # Scoped to native AND public: a confidential client the operator runs on its
+  # own server is untouched, and neither classification defaults to true, so a
+  # host that has not classified its clients sees no change.
+  defp native_client_auth_permitted?(_config, _client, :none), do: true
+
+  defp native_client_auth_permitted?(config, client, _method) do
+    not (client_native?(config, client) and client_public?(config, client))
+  end
+
+  # The native-app discriminator (RFC 8252 / BCP 212). A CIMD client is
+  # identified by an `https` URL resolving to a document served over the
+  # network, not an installed app. A registered client defers to the host's
+  # `:client_native?` callback, which defaults to `false`: an unclassified
+  # client is not native, so this check cannot refuse an authentication the
+  # host never opted into.
+  defp client_native?(_config, {:cimd, _metadata}), do: false
+
+  defp client_native?(config, client) do
+    Callback.invoke(Config.client_native_fun(config), [client], false) == true
   end
 
   # A CIMD client's identifier is the URL its document is bound to; a registered
