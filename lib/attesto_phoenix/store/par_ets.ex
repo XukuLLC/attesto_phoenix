@@ -78,10 +78,32 @@ defmodule AttestoPhoenix.Store.PAR.ETS do
     Owner.ensure_table(@table)
   end
 
-  defp ensure_owner do
-    case GenServer.start_link(Owner, %{}, name: Owner) do
-      {:ok, _pid} -> :ok
-      {:error, {:already_started, _pid}} -> :ok
+  # `GenServer.start/3`, NOT `start_link/3`. The owner holds the ETS table, and
+  # whichever process happens to touch this store first is an ordinary request
+  # process. Linking the owner to it means that when that request terminates
+  # ABNORMALLY - any unhandled exception, a timeout, a shutdown - the exit
+  # signal propagates and kills the owner, destroying the table with it. This
+  # store then silently starts over empty for the whole node.
+  #
+  # Starting unlinked gives the owner no parent to be killed by. It is a
+  # singleton table holder with no supervision tree available (this library
+  # installs no application callback module), so a deliberate orphan is the
+  # correct shape: nothing should be able to take it down but itself.
+  #
+  # The `:already_started` pid is checked for liveness because a registered name
+  # can briefly outlive its process. Treating that window as success is what
+  # produces `GenServer.call` crashing with "no process" a moment later.
+  defp ensure_owner(attempts \\ 5) do
+    case GenServer.start(Owner, %{}, name: Owner) do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, {:already_started, pid}} ->
+        cond do
+          Process.alive?(pid) -> :ok
+          attempts > 1 -> Process.sleep(10) && ensure_owner(attempts - 1)
+          true -> raise "#{inspect(Owner)} is registered but not alive"
+        end
     end
   end
 end

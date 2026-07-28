@@ -169,6 +169,12 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @signing_pem)
     on_exit(fn -> Application.delete_env(:attesto_phoenix, __MODULE__.Keystore) end)
 
+    # The CIMD cache outlives the process that created it, so a document cached
+    # by an earlier case would otherwise be served here — and the CIMD cases
+    # script a FRESH signing key per run, so a stale document fails
+    # authentication rather than obviously misbehaving. Start each case cold.
+    AttestoPhoenix.ClientIdMetadata.Cache.ETS.delete_all()
+
     clients =
       Map.new([@public_client, @confidential_client], &{&1.id, &1})
 
