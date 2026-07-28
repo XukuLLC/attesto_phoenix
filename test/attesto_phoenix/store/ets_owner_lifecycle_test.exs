@@ -63,6 +63,30 @@ defmodule AttestoPhoenix.Store.ETSOwnerLifecycleTest do
     end
   end
 
+  describe "CIMD cache eviction" do
+    test "delete/1 evicts exactly the named document" do
+      expires = DateTime.add(DateTime.utc_now(), 300, :second)
+      a = "https://a.example/m.json"
+      b = "https://b.example/m.json"
+
+      :ok = CIMDCache.put(a, %{"client_id" => a}, expires)
+      :ok = CIMDCache.put(b, %{"client_id" => b}, expires)
+
+      assert :ok = CIMDCache.delete(a)
+
+      assert CIMDCache.get(a) == :miss
+      assert {:ok, %{"client_id" => ^b}} = CIMDCache.get(b)
+    end
+
+    test "delete_all/0 evicts every document" do
+      expires = DateTime.add(DateTime.utc_now(), 300, :second)
+      :ok = CIMDCache.put("https://c.example/m.json", %{"client_id" => "c"}, expires)
+
+      assert :ok = CIMDCache.delete_all()
+      assert CIMDCache.get("https://c.example/m.json") == :miss
+    end
+  end
+
   describe "owner process" do
     test "is not linked to the caller that starts it" do
       # Directly pin the property the fix rests on: after a caller that touched

@@ -7,8 +7,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL
   and validates the returned document. Caching the validated document keeps
-  every authorization request from reaching out to the network. The default
-  per-node `AttestoPhoenix.ClientIdMetadata.Cache.ETS` would re-fetch on each
+  every authorization request from reaching out to the network. The per-node
+  `AttestoPhoenix.ClientIdMetadata.Cache.ETS` opt-out would re-fetch on each
   node and offers no coherence; this store persists each entry so a document
   fetched on one node is served from every node and the outbound fetch fan-out
   is bounded under load. It is the cache default for exactly the same reason the
@@ -97,6 +97,32 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
       conflict_target: :url
     )
 
+    :ok
+  end
+
+  @doc """
+  Evicts the cached document for `url`, if any.
+
+  Cluster-wide by construction: the row is the shared cache, so deleting it
+  evicts on every node at once. That is the point of having this on the DEFAULT
+  backend rather than only on the per-node ETS one — a rotated or compromised
+  CIMD document is otherwise honored until `expires_at`, up to 24 hours under
+  the default `:cache_ttl_bounds`, on every node independently.
+  """
+  @impl Cache
+  @spec delete(String.t()) :: :ok
+  def delete(url) when is_binary(url) do
+    repo().delete_all(from(c in ClientIdMetadata, where: c.url == ^url))
+    :ok
+  end
+
+  @doc """
+  Evicts every cached document, cluster-wide. See `delete/1`.
+  """
+  @impl Cache
+  @spec delete_all() :: :ok
+  def delete_all do
+    repo().delete_all(ClientIdMetadata)
     :ok
   end
 

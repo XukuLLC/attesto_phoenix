@@ -22,6 +22,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   calls this out as the reason authorization servers reject desktop and CLI
   clients' redirect URIs.
 
+### Security
+
+- Stop a crashing request from destroying the ETS-backed stores. Both
+  `AttestoPhoenix.Store.PAR.ETS` — the **default** `:par_store` — and
+  `AttestoPhoenix.ClientIdMetadata.Cache.ETS` started their table-owner process
+  with `GenServer.start_link/3` from whichever caller touched the store first.
+  In a running server that is an ordinary request process, and a link carries
+  abnormal exits, so any unhandled exception, timeout, or shutdown in that
+  request killed the owner and destroyed its ETS table. For the PAR store that
+  discarded every stored `request_uri` on the node, breaking in-flight
+  authorization for every client at once, triggered by one unrelated request
+  crashing. The owner is now started unlinked, and an `:already_started` pid is
+  checked for liveness (a registered name can briefly outlive its process).
+
+### Added
+
+- `AttestoPhoenix.ClientIdMetadata.Cache` gains optional `c:delete/1` and
+  `c:delete_all/0` callbacks, implemented by **both** shipped caches — the
+  Postgres-backed `Cache.Ecto` (the default, where eviction is cluster-wide)
+  and the per-node `Cache.ETS` — plus `Cache.evict/2` and `Cache.evict_all/1`
+  which dispatch through the configured module and report
+  `{:error, :not_supported}` for a custom cache that cannot evict.
+
+  A cached CIMD document is otherwise honored until its `expires_at`, up to 24
+  hours under the default `:cache_ttl_bounds`, which is the wrong behavior once
+  a document is known to have rotated or be compromised: the stale copy keeps
+  authorizing the client with superseded `jwks`, `redirect_uris`, and auth
+  metadata. The callbacks are optional, so an existing custom `Cache`
+  implementation continues to compile unchanged.
+
 ### Fixed
 
 - Accept the canonical RFC 8252 §7.1 private-use scheme redirect URI at the
@@ -32,11 +62,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   correctly at the authorization endpoint. RFC 6749 §3.1.2's "absolute URI" does
   not require an authority (RFC 3986 §4.3).
 
-  The allowance is gated on the scheme containing a dot, which RFC 8252 §7.1
-  requires of a conforming private-use scheme (a reverse-ordered domain name
-  under the app author's control, per RFC 7595 §3.8). That keeps out the
-  authority-less schemes which must never be a redirect target — `javascript:`
-  and `data:` among them.
+  The authority-less form is admitted only for a client that declared
+  `application_type: "native"`, and only when its scheme contains a dot and it
+  carries a non-empty path. Those are necessary for the §7.1 convention (a
+  reverse-ordered domain name under the app author's control, per RFC 7595
+  §3.8) but not sufficient to prove that control — nothing syntactic is. What
+  they do buy is keeping the authority-less door shut for web clients entirely
+  and keeping out the schemes that must never be a redirect target,
+  `javascript:` and `data:` among them.
+
+- Reject a redirect URI carrying a fragment at the registration endpoint, for
+  every client type. RFC 6749 §3.1.2: "The redirection endpoint URI MUST NOT
+  include a fragment component."
+
+- Reject an explicit JSON `null` `application_type` rather than reading it as
+  the `"web"` default; an absent member still defaults.
 
 ## [2.3.0] - 2026-07-28
 

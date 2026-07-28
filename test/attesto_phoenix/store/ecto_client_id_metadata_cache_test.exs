@@ -11,6 +11,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
 
   use AttestoPhoenix.DataCase, async: true
 
+  alias AttestoPhoenix.ClientIdMetadata.Cache, as: CacheAPI
   alias AttestoPhoenix.ClientIdMetadata.Cache.Ecto, as: Cache
   alias AttestoPhoenix.Schema.ClientIdMetadata
   alias AttestoPhoenix.TestRepo
@@ -84,5 +85,68 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
     assert :ok = Cache.put(@url, @metadata, soon())
     assert {:ok, fetched} = Cache.get(@url)
     assert fetched == @metadata
+  end
+
+  # Eviction is the operator's answer to a rotated or compromised document,
+  # which is otherwise honoured until `expires_at` - up to 24h under the default
+  # `:cache_ttl_bounds`. It lives on THIS backend because this is the default;
+  # having it only on the per-node ETS opt-out would leave the lever missing
+  # where it is actually needed.
+  describe "delete/1 and delete_all/0" do
+    test "delete/1 evicts exactly the named document" do
+      other = "https://other.example/metadata.json"
+      expires = DateTime.add(DateTime.utc_now(), 300, :second)
+
+      :ok = Cache.put(@url, %{"client_id" => @url}, expires)
+      :ok = Cache.put(other, %{"client_id" => other}, expires)
+
+      assert :ok = Cache.delete(@url)
+
+      assert Cache.get(@url) == :miss
+      assert {:ok, %{"client_id" => ^other}} = Cache.get(other)
+    end
+
+    test "delete/1 on an absent url is a no-op" do
+      assert :ok = Cache.delete("https://never.cached.example/metadata.json")
+    end
+
+    test "delete_all/0 evicts every document" do
+      expires = DateTime.add(DateTime.utc_now(), 300, :second)
+      :ok = Cache.put(@url, %{"client_id" => @url}, expires)
+      :ok = Cache.put("https://other.example/m.json", %{"client_id" => "x"}, expires)
+
+      assert :ok = Cache.delete_all()
+
+      assert Cache.get(@url) == :miss
+      assert Cache.get("https://other.example/m.json") == :miss
+    end
+
+    # The resolver reaches the cache through the configured module, so eviction
+    # has to be reachable that way rather than only as a direct call.
+    test "is reachable through the behaviour dispatch helper" do
+      expires = DateTime.add(DateTime.utc_now(), 300, :second)
+      :ok = Cache.put(@url, %{"client_id" => @url}, expires)
+
+      assert :ok = CacheAPI.evict(Cache, @url)
+      assert Cache.get(@url) == :miss
+
+      assert :ok = CacheAPI.evict_all(Cache)
+    end
+
+    test "the dispatch helper reports a cache that cannot evict" do
+      defmodule NoEvictCache do
+        @moduledoc false
+        @behaviour CacheAPI
+
+        @impl true
+        def get(_url), do: :miss
+
+        @impl true
+        def put(_url, _metadata, _expires_at), do: :ok
+      end
+
+      assert CacheAPI.evict(NoEvictCache, @url) == {:error, :not_supported}
+      assert CacheAPI.evict_all(NoEvictCache) == {:error, :not_supported}
+    end
   end
 end

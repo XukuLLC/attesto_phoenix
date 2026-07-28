@@ -70,4 +70,55 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache do
   any existing entry for the same `url` rather than failing on conflict.
   """
   @callback put(url :: String.t(), metadata :: metadata(), expires_at :: DateTime.t()) :: :ok
+
+  @doc """
+  Evicts the cached document for a CIMD `client_id` URL, if one is present.
+
+  A cached document is otherwise honored until the `expires_at` it was stored
+  with — up to 24 hours under the default `:cache_ttl_bounds`. That is the wrong
+  behavior once the document is known to have rotated or to be compromised,
+  because the stale copy keeps authorizing the client with superseded `jwks`,
+  `redirect_uris`, and auth metadata. This is the operator's lever for that.
+
+  Optional: a cache that cannot evict simply does not implement it, and callers
+  must handle its absence (see `AttestoPhoenix.ClientIdMetadata.Cache.evict/2`).
+  """
+  @callback delete(url :: String.t()) :: :ok
+
+  @doc """
+  Evicts every cached document. Optional; see `c:delete/1`.
+  """
+  @callback delete_all() :: :ok
+
+  @optional_callbacks delete: 1, delete_all: 0
+
+  @doc """
+  Evicts `url` from `cache`, or returns `{:error, :not_supported}` when that
+  implementation cannot evict.
+
+  Dispatching through here rather than calling a backend directly is what keeps
+  eviction available on whichever cache a deployment configured — the shipped
+  ETS and Ecto caches both support it, and the default is Ecto.
+  """
+  @spec evict(module(), String.t()) :: :ok | {:error, :not_supported}
+  def evict(cache, url) when is_atom(cache) and is_binary(url) do
+    if Code.ensure_loaded?(cache) and function_exported?(cache, :delete, 1) do
+      cache.delete(url)
+    else
+      {:error, :not_supported}
+    end
+  end
+
+  @doc """
+  Evicts every document from `cache`, or returns `{:error, :not_supported}`.
+  See `evict/2`.
+  """
+  @spec evict_all(module()) :: :ok | {:error, :not_supported}
+  def evict_all(cache) when is_atom(cache) do
+    if Code.ensure_loaded?(cache) and function_exported?(cache, :delete_all, 0) do
+      cache.delete_all()
+    else
+      {:error, :not_supported}
+    end
+  end
 end

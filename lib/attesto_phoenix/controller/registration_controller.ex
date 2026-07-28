@@ -245,7 +245,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     with {:ok, auth_method} <- validate_auth_method(metadata, config),
          {:ok, application_type} <- validate_application_type(metadata),
          {:ok, grant_types} <- validate_grant_types(metadata, config),
-         {:ok, redirect_uris} <- validate_redirect_uris(metadata, grant_types),
+         {:ok, redirect_uris} <- validate_redirect_uris(metadata, grant_types, application_type),
          {:ok, scope} <- validate_scope(metadata, config),
          {:ok, passthrough} <- validate_passthrough_metadata(metadata) do
       core = %{
@@ -343,14 +343,17 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   @default_application_type "web"
 
   defp validate_application_type(metadata) do
-    case Map.get(metadata, "application_type") do
-      nil ->
+    # `Map.fetch/2`, not `Map.get/2`: an ABSENT member defaults to `"web"`, but
+    # a present JSON `null` is a malformed value and must be rejected, not
+    # silently read as the default.
+    case Map.fetch(metadata, "application_type") do
+      :error ->
         {:ok, @default_application_type}
 
-      type when type in @application_types ->
+      {:ok, type} when type in @application_types ->
         {:ok, type}
 
-      other ->
+      {:ok, other} ->
         {:error,
          error(
            @error_invalid_client_metadata,
@@ -413,7 +416,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # RFC 7591 §2 / RFC 6749 §3.1.2: a grant type that redirects the resource
   # owner back to the client requires at least one absolute redirect URI; a
   # malformed or relative URI is rejected as invalid_redirect_uri.
-  defp validate_redirect_uris(metadata, grant_types) do
+  defp validate_redirect_uris(metadata, grant_types, application_type) do
     redirect_uris = Map.get(metadata, "redirect_uris")
     needs_redirect? = Enum.any?(grant_types, &(&1 in @redirect_requiring_grant_types))
 
@@ -429,14 +432,14 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
         {:ok, []}
 
       is_list(redirect_uris) ->
-        validate_redirect_uri_list(redirect_uris, needs_redirect?)
+        validate_redirect_uri_list(redirect_uris, needs_redirect?, application_type)
 
       true ->
         {:error, error(@error_invalid_redirect_uri, "redirect_uris must be an array")}
     end
   end
 
-  defp validate_redirect_uri_list([], true) do
+  defp validate_redirect_uri_list([], true, _application_type) do
     {:error,
      error(
        @error_invalid_redirect_uri,
@@ -444,8 +447,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
      )}
   end
 
-  defp validate_redirect_uri_list(redirect_uris, _needs_redirect?) do
-    case Enum.find(redirect_uris, &(not absolute_uri?(&1))) do
+  defp validate_redirect_uri_list(redirect_uris, _needs_redirect?, application_type) do
+    case Enum.find(redirect_uris, &(not valid_redirect_uri?(&1, application_type))) do
       nil ->
         {:ok, redirect_uris}
 
@@ -454,41 +457,54 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     end
   end
 
-  # RFC 6749 §3.1.2: a redirect URI must be an absolute URI. That does NOT
-  # require an authority - RFC 3986 §4.3 is `scheme ":" hier-part`, and
-  # `hier-part` may be a bare absolute path - which matters because the
-  # canonical RFC 8252 §7.1 private-use scheme redirect has exactly that shape:
+  # RFC 6749 §3.1.2: a redirect URI must be an absolute URI, and MUST NOT
+  # include a fragment. "Absolute URI" does NOT require an authority - RFC 3986
+  # §4.3 is `scheme ":" hier-part`, where `hier-part` may be a bare absolute
+  # path - which matters because the canonical RFC 8252 §7.1 private-use scheme
+  # redirect has exactly that shape:
   #
   #     com.example.app:/oauth2redirect/example-provider
   #
-  # It is the FIRST redirect type RFC 8252 prescribes for a native app, ahead
-  # of loopback (§7.3). Requiring a host rejected it outright, so a native app
+  # It is the FIRST redirect type RFC 8252 prescribes for a native app, ahead of
+  # loopback (§7.3). Requiring a host rejected it outright, so a native app
   # could be registered with one by hand but never through this endpoint, even
   # though `Attesto.RedirectURI` matches it correctly at the authorization
   # endpoint.
   #
-  # An authority-less URI is accepted only when its scheme contains a dot.
-  # RFC 8252 §7.1 requires the scheme to be a domain name under the app
-  # author's control expressed in reverse order (per RFC 7595 §3.8), so the dot
-  # is inherent to a conforming private-use scheme - and requiring it keeps out
-  # the authority-less schemes that must never be a redirect target, `javascript:`
-  # and `data:` among them.
-  defp absolute_uri?(value) when is_binary(value) do
+  # The authority-less form is admitted only for a client that declared
+  # `application_type: "native"`, and only when its scheme contains a dot and it
+  # carries a non-empty absolute path. Those conditions are necessary for the
+  # §7.1 convention - the scheme must be a domain name under the app author's
+  # control expressed in reverse order (RFC 7595 §3.8) - but they are NOT
+  # sufficient to prove that control, and nothing here can be: `com.apple.x:`
+  # is as dotted as `com.example.app:`. What they do buy is keeping the
+  # authority-less door shut for web clients entirely, and keeping the schemes
+  # that must never be a redirect target (`javascript:`, `data:`, `mailto:`)
+  # out of it. Ownership, if a deployment needs it enforced, is host policy in
+  # front of this endpoint.
+  defp valid_redirect_uri?(value, application_type) when is_binary(value) do
     case URI.new(value) do
-      {:ok, %URI{scheme: scheme, host: host}} when is_binary(scheme) and scheme != "" ->
-        cond do
-          is_binary(host) and host != "" -> true
-          # RFC 8252 §7.1 private-use scheme, reverse-DNS, no authority.
-          String.contains?(scheme, ".") -> true
-          true -> false
-        end
-
-      _ ->
-        false
+      {:ok, uri} -> acceptable_redirect_uri?(uri, application_type)
+      _ -> false
     end
   end
 
-  defp absolute_uri?(_value), do: false
+  defp valid_redirect_uri?(_value, _application_type), do: false
+
+  # RFC 6749 §3.1.2: "The redirection endpoint URI MUST NOT include a fragment
+  # component." True of every client type, checked before anything else.
+  defp acceptable_redirect_uri?(%URI{fragment: fragment}, _application_type) when not is_nil(fragment), do: false
+
+  # The ordinary form: scheme + authority.
+  defp acceptable_redirect_uri?(%URI{scheme: scheme, host: host}, _application_type)
+       when is_binary(scheme) and scheme != "" and is_binary(host) and host != "", do: true
+
+  # RFC 8252 §7.1 private-use scheme: no authority, reverse-DNS scheme, and a
+  # real path to call back to.
+  defp acceptable_redirect_uri?(%URI{scheme: scheme, path: path}, "native")
+       when is_binary(scheme) and scheme != "" and is_binary(path) and path != "", do: String.contains?(scheme, ".")
+
+  defp acceptable_redirect_uri?(%URI{}, _application_type), do: false
 
   # RFC 7591 §2 / RFC 6749 §3.3: the requested scope is a space-delimited
   # string; every requested scope must be in the server's catalog

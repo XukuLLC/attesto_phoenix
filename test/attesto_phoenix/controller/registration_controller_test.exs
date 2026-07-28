@@ -87,16 +87,48 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert body(conn)["application_type"] == "web"
     end
 
+    # Asserted against what reaches `:register_client`, not just the echoed
+    # response body. The response is rendered from the issued attrs, so a body
+    # assertion alone would still pass if the member were dropped on the way to
+    # the host — and the host is the only place it can be persisted for
+    # `client_native?/1` to read later.
     test "carries a declared native application_type through to the host" do
+      test_pid = self()
+
       conn =
-        post_register(config([]), %{
-          "grant_types" => ["authorization_code"],
-          "application_type" => "native",
-          "redirect_uris" => ["http://127.0.0.1:0/cb"]
-        })
+        post_register(
+          config(
+            register_client: fn attrs ->
+              send(test_pid, {:persisted, attrs})
+              {:ok, attrs}
+            end
+          ),
+          %{
+            "grant_types" => ["authorization_code"],
+            "application_type" => "native",
+            "redirect_uris" => ["http://127.0.0.1:0/cb"]
+          }
+        )
 
       assert conn.status == 201
       assert body(conn)["application_type"] == "native"
+
+      assert_receive {:persisted, attrs}
+      assert attrs["application_type"] == "native"
+    end
+
+    # An ABSENT member defaults to "web"; a present JSON null is a malformed
+    # value and must not be read as the default.
+    test "rejects an explicit null application_type" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "application_type" => nil,
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
     end
 
     test "rejects an application_type outside the defined set" do
@@ -141,19 +173,64 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert conn.status == 201
     end
 
+    defp register_native(uri) do
+      post_register(config([]), %{
+        "grant_types" => ["authorization_code"],
+        "application_type" => "native",
+        "redirect_uris" => [uri]
+      })
+    end
+
     # The authority-less allowance is gated on a reverse-DNS scheme (RFC 8252
     # §7.1 / RFC 7595 §3.8). Without that gate it would admit exactly the
     # schemes that must never be a redirect target.
     test "still rejects authority-less schemes that are not reverse-DNS" do
       for uri <- ["javascript:alert(1)", "data:text/html,x", "mailto:a@b.c", "urn:ietf:params:oauth:x"] do
-        conn =
-          post_register(config([]), %{
-            "grant_types" => ["authorization_code"],
-            "application_type" => "native",
-            "redirect_uris" => [uri]
-          })
+        conn = register_native(uri)
 
         assert conn.status == 400, "expected #{uri} to be refused"
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+    end
+
+    # A dot is NECESSARY for the §7.1 convention but not SUFFICIENT to be a
+    # usable callback, so the shape is checked too. (It cannot be sufficient to
+    # prove app-author control of the domain either — nothing syntactic can —
+    # which is why the allowance is additionally confined to native clients.)
+    test "rejects a dotted private-use scheme with no path" do
+      assert register_native("com.example.app:").status == 400
+    end
+
+    # RFC 6749 §3.1.2: the redirection endpoint URI MUST NOT include a
+    # fragment. True of every client type, not just native.
+    test "rejects a fragment on any redirect URI" do
+      assert register_native("com.example.app:/cb#frag").status == 400
+
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/cb#frag"]
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_redirect_uri"
+    end
+
+    # The authority-less door is shut entirely for web clients, so a private-use
+    # scheme cannot be smuggled in by a client that never declared itself
+    # native.
+    test "refuses a private-use scheme from a client that did not declare native" do
+      for metadata <- [
+            %{"grant_types" => ["authorization_code"], "redirect_uris" => ["com.example.app:/cb"]},
+            %{
+              "grant_types" => ["authorization_code"],
+              "application_type" => "web",
+              "redirect_uris" => ["com.example.app:/cb"]
+            }
+          ] do
+        conn = post_register(config([]), metadata)
+
+        assert conn.status == 400, "expected a non-native client to be refused a private-use scheme"
         assert body(conn)["error"] == "invalid_redirect_uri"
       end
     end

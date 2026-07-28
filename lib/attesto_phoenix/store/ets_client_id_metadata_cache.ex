@@ -97,6 +97,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
   compromised, since the stale copy keeps authorizing the client — this is the
   operator's lever for that, and the reason the cache is not write-only.
   """
+  @impl Cache
   @spec delete(String.t()) :: :ok
   def delete(url) when is_binary(url) do
     ensure_table()
@@ -112,6 +113,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
   design — see `ensure_owner/1`), so it no longer resets by accident when a
   caller terminates.
   """
+  @impl Cache
   @spec delete_all() :: :ok
   def delete_all do
     ensure_table()
