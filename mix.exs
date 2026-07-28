@@ -125,7 +125,7 @@ defmodule AttestoPhoenix.MixProject do
       {:req_dpop, "~> 0.5", only: :test, runtime: false},
       # test-only HTTP origin server for outbound delivery/fetch tests. Bandit
       # avoids pulling the advisory-affected Cowboy/Cowlib stack into the lock.
-      {:bandit, "~> 1.12", only: :test},
+      {:bandit, "~> 1.12.1", only: :test},
 
       # dev / quality
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},

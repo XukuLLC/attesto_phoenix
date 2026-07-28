@@ -103,6 +103,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Raise the test-only Bandit floor to 1.12.1, excluding the releases affected
+  by the quadratic-time WebSocket fragment-reassembly denial of service
+  (EEF-CVE-2026-65623, introduced in 1.11.0). Test-only, so no published
+  consumer was ever exposed.
 - Require `attesto ~> 1.4`, which carries `Attesto.RedirectURI` and the
   `:redirect_uri_matching` validation option this release depends on. Against
   an older `attesto` the loopback option would be silently ignored rather than
