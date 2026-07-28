@@ -23,9 +23,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   because a credential shipped inside an installed binary is not confidential.
   Only a native client the host *explicitly* classifies as confidential keeps
   the secret path, that being the per-instance-credential case §8.4 carves out
-  for dynamic registration; an absent `:client_public?` callback resolves to
-  public here, so wiring `:client_native?` alone still gets §8.4 enforcement
-  rather than silently accepting a shipped secret.
+  for dynamic registration. Where no `:client_public?` callback is configured
+  at all, a client marked native counts as public — so wiring `:client_native?`
+  alone gets §8.4 enforcement rather than silently accepting a shipped secret,
+  and the same client is still admitted on `none` + PKCE. An unclassified
+  *non-native* client remains confidential, unchanged.
 
   Two rules are additionally opt-in through `:native_apps`:
 
@@ -73,6 +75,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   check runs on the effective parameters, so one carried only inside a signed
   request object is covered. A client that pushes its own `client_id` — every
   conforming client — is unaffected.
+
+- Verify a pushed signed request object (RFC 9101) against the bound client
+  identifier rather than the host `:client_id` callback alone. A deployment
+  exposing no such callback previously verified every pushed request object
+  against a `nil` issuer, which `Attesto.RequestObject` treats as unverifiable,
+  so PAR + JAR was rejected outright as `invalid_request_object` for those
+  hosts.
 
 - Apply the RFC 8252 §8.4 client-authentication restriction at the revocation
   endpoint too. It parses credentials itself rather than going through
