@@ -657,7 +657,21 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp native_client_auth_permitted?(_config, _client, :none), do: true
 
   defp native_client_auth_permitted?(config, client, _method) do
-    not (client_native?(config, client) and client_public?(config, client))
+    not native_secret_refused?(config, client)
+  end
+
+  # Whether RFC 8252 §8.4 refuses a credential from `client`: true when the host
+  # marks it native and it resolves as public.
+  #
+  # Exposed because the revocation endpoint parses client credentials itself
+  # rather than going through `authenticate/4`, and a hand-copied second
+  # implementation of this predicate would be free to drift from the one the
+  # token, PAR, introspection, device, and CIBA endpoints enforce. There is one
+  # rule and one place it lives.
+  @doc false
+  @spec native_secret_refused?(Config.t(), term()) :: boolean()
+  def native_secret_refused?(%Config{} = config, client) do
+    client_native?(config, client) and client_public?(config, client)
   end
 
   # The native-app discriminator (RFC 8252 / BCP 212). A CIMD client is

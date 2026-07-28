@@ -96,6 +96,19 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   @spec store(Config.t(), Request.t()) ::
           {:ok, %{request_uri: String.t(), expires_in: pos_integer()}}
           | {:error, OAuthError.t()}
+  # `@enforce_keys` requires `:client_id` to be PRESENT but still admits an
+  # explicit `nil`, which would fall through to the request body's own
+  # `client_id` and reproduce exactly the cross-client binding hole this
+  # function exists to close. There is no caller for which a nil authenticated
+  # identifier is meaningful - `ClientAuthentication` only ever emits a
+  # non-empty binary - so refuse it loudly rather than storing an unbound
+  # request.
+  def store(%Config{}, %Request{client_id: client_id}) when not is_binary(client_id) or client_id == "" do
+    raise ArgumentError,
+          "AttestoPhoenix.AuthorizationServer.PAR.store/2: :client_id must be the authenticated client identifier, " <>
+            "got #{inspect(client_id)}"
+  end
+
   def store(%Config{} = config, %Request{} = request) do
     %{client: client, client_id: authenticated_client_id, params: params, dpop_input: dpop_input} = request
     ttl = config_field(config, :par_ttl, @default_par_ttl)

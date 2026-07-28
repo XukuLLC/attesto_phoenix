@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.2.0] - 2026-07-27
 
+### Upgrade note
+
+- `client_native?/1` is a new **optional** `AttestoPhoenix.ClientStore`
+  callback, resolved automatically from an installed `:client_store` module the
+  same way every other client callback is. If your client-store module already
+  exports a function of that name meaning something else — "native to our
+  platform", "first-party", and so on — it will now be read as the RFC 8252
+  native-app classification, which forces PKCE for those clients and refuses
+  their client secrets at every endpoint. Rename it, or set the flat
+  `:client_native?` config key to a function returning `false`, before
+  upgrading. Hosts with no such function are unaffected.
+
 ### Added
 
 - RFC 8252 (BCP 212) native-app profile support, keyed on a new

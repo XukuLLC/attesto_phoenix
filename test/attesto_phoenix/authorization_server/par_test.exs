@@ -225,6 +225,62 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
       assert stored["client_id"] == "confidential-1"
     end
 
+    # A `client_id` smuggled inside a signed request object cannot reach the
+    # store either. Two independent rules close it, so this pins both rather
+    # than assuming `require_matching_client_id/2` is the one doing the work:
+    # RFC 9101 requires the object's `client_id` to equal its `iss`, and the
+    # object's `iss` is verified against the bound client identifier.
+    test "cannot push another client's request via a signed request object" do
+      jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_, public_map} = JOSE.JWK.to_public_map(jwk)
+      config = config(client_jwks: fn _client -> %{"keys" => [Map.put(public_map, "kid", "par-key-1")]} end)
+
+      signed = fn claims ->
+        {_, request} =
+          jwk
+          |> JOSE.JWT.sign(%{"alg" => "ES256", "kid" => "par-key-1"}, claims)
+          |> JOSE.JWS.compact()
+
+        request
+      end
+
+      # (a) client_id names the victim while iss stays honest: RFC 9101's
+      #     iss == client_id rule rejects it.
+      mismatched =
+        signed.(
+          Map.merge(base_params(), %{
+            "iss" => "confidential-1",
+            "aud" => "https://issuer.example",
+            "client_id" => "victim-client"
+          })
+        )
+
+      assert {:error, %OAuthError{error: :invalid_request_object}} =
+               PAR.store(config, request(params: %{"request" => mismatched}))
+
+      # (b) both iss and client_id name the victim, satisfying RFC 9101: the
+      #     issuer no longer matches the bound client, so verification fails.
+      impersonating =
+        signed.(
+          Map.merge(base_params(), %{
+            "iss" => "victim-client",
+            "aud" => "https://issuer.example",
+            "client_id" => "victim-client"
+          })
+        )
+
+      assert {:error, %OAuthError{error: :invalid_request_object}} =
+               PAR.store(config, request(params: %{"request" => impersonating}))
+    end
+
+    test "refuses to store a request carrying no authenticated client_id" do
+      # `@enforce_keys` admits an explicit nil; storing it would fall back to
+      # the body's own client_id and reopen the binding hole.
+      assert_raise ArgumentError, ~r/:client_id must be the authenticated client identifier/, fn ->
+        PAR.store(config(), request(client_id: nil, params: base_params()))
+      end
+    end
+
     test "binds to the authenticated client_id when the host exposes no :client_id callback" do
       # With no `:client_id` callback the opaque client term yields no
       # identifier. The binding must then come from what the client

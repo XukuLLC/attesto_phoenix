@@ -63,6 +63,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   alias Attesto.Revocation
   alias AttestoPhoenix.Callback
+  alias AttestoPhoenix.ClientAuthentication
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
   alias AttestoPhoenix.RequestContext
@@ -284,16 +285,16 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   # too - otherwise revocation would be a second client-authentication surface
   # accepting a credential the token endpoint refuses.
   #
-  # Matches `ClientAuthentication`'s scoping exactly: only a native client the
-  # host EXPLICITLY classifies as confidential (per-instance credentials from
-  # dynamic registration, the §8.4 carve-out) keeps the secret path. An absent
-  # `:client_public?` callback resolves to public and the secret is refused, and
-  # `:client_native?` defaults to false, so an unclassified deployment is
-  # unaffected. The refusal is the same generic `invalid_client` as every other
-  # failure here, so it is not an oracle.
+  # The predicate itself is NOT reimplemented here: it is the one
+  # `ClientAuthentication` enforces at every other endpoint. A hand-copied copy
+  # would be free to drift from it, and the two defaults it composes
+  # (`:client_native?` absent -> false, `:client_public?` absent -> native) are
+  # exactly the kind of detail that drifts silently. The refusal is the same
+  # generic `invalid_client` as every other failure here, so it is not an
+  # oracle, and it runs only on the branch where the secret already verified,
+  # leaving the unknown-client dummy-verify timing equalization untouched.
   defp native_secret_refused?(config, client) do
-    Callback.invoke(Config.client_native_fun(config), [client], false) == true and
-      Callback.invoke(Config.client_public_fun(config), [client], true) == true
+    ClientAuthentication.native_secret_refused?(config, client)
   end
 
   defp fetch_token(params) do

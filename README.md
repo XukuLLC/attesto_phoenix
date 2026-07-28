@@ -266,12 +266,22 @@ gets the two restrictions:
 - **PKCE is required (§8.1).** It is forced for a native client regardless of
   the global `:require_pkce` flag. `S256` is required and `plain` is rejected
   for every client already.
-- **No client secret (§8.4).** A client marked both native and public may only
-  authenticate at the token endpoint with `none`. Presenting
-  `client_secret_basic`, `client_secret_post`, or `private_key_jwt` is rejected
-  — a credential shipped inside an installed binary is readable by anyone who
-  has the app, so accepting it authenticates possession of the app rather than
-  possession of a secret.
+- **No client secret (§8.4).** A native client may only authenticate at the
+  token endpoint with `none`. Presenting `client_secret_basic`,
+  `client_secret_post`, or `private_key_jwt` is rejected — a credential shipped
+  inside an installed binary is readable by anyone who has the app, so accepting
+  it authenticates possession of the app rather than possession of a secret. The
+  one exception is a native client you *explicitly* mark confidential
+  (`client_public?` returning `false`), which is §8.4's carve-out for
+  per-instance credentials issued by dynamic registration.
+
+> **Two things to know before marking a client native.** Where no
+> `:client_public?` callback is configured at all, a native client counts as
+> public — so marking it native both refuses its secret and admits it on
+> `none` + PKCE. And a native *public* client cannot use PAR: that endpoint
+> refuses secretless clients and §8.4 refuses this one a secret, so a
+> deployment running `require_pushed_authorization_requests: true` cannot also
+> serve native public clients.
 
 The other two rules are opt-in:
 

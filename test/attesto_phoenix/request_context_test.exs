@@ -390,11 +390,44 @@ defmodule AttestoPhoenix.RequestContextTest do
             "Instagram 302.0.0.23.113",
             "Line/13.5.0",
             "MicroMessenger/8.0.42",
-            "Electron/27.0.0"
+            "Electron/27.0.0",
+            "WhatsApp/2.24.1",
+            "Telegram-Android/10.2.0",
+            "LinkedInApp/9.28.0",
+            "Reddit/Version 2024.1.0",
+            "Pinterest/11.5"
           ] do
         assert RequestContext.embedded_user_agent?(with_user_agent("Mozilla/5.0 " <> marker)),
                "expected #{marker} to be detected as an embedded user agent"
       end
+    end
+
+    # Short product tokens are matched only at a token boundary, so they cannot
+    # collide with an unrelated vendor string that happens to contain them.
+    test "short markers do not match inside an unrelated product token" do
+      for user_agent <- [
+            "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Streamline/4.2 Safari/537.36",
+            "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Outline/1.9 Safari/537.36",
+            "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Timeline/3.0 Safari/537.36"
+          ] do
+        refute RequestContext.embedded_user_agent?(with_user_agent(user_agent)),
+               "expected #{user_agent} not to collide with the `line/` marker"
+      end
+
+      # The real token still matches, at the start of the string too.
+      assert RequestContext.embedded_user_agent?(with_user_agent("Line/13.5.0 (iPhone)"))
+    end
+
+    # The Google App hands external links to an in-app browser TAB, which is the
+    # arrangement RFC 8252 §8.1 recommends. Matching its product token would
+    # refuse correct behavior, so it is deliberately not a marker.
+    test "does not flag the Google App, which uses an in-app browser tab" do
+      refute RequestContext.embedded_user_agent?(
+               with_user_agent(
+                 "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) " <>
+                   "Chrome/119.0.0.0 Mobile Safari/537.36 GSA/14.0.0.0"
+               )
+             )
     end
 
     test "matches case-insensitively" do

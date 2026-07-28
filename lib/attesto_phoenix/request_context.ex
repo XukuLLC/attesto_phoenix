@@ -73,6 +73,7 @@ defmodule AttestoPhoenix.RequestContext do
   # application may ship a webview with an unmodified UA) and it can be wrong
   # (a UA string is client-supplied and freely spoofable in both directions),
   # which is why the check it backs is opt-in.
+  # Markers distinctive enough to match anywhere in the string.
   @embedded_user_agent_markers [
     # Android System WebView adds the `wv` platform token (Chrome 42+).
     "; wv)",
@@ -85,16 +86,32 @@ defmodule AttestoPhoenix.RequestContext do
     "fban/",
     "fbav/",
     "fb_iab",
-    "instagram",
-    "line/",
     "micromessenger",
     "twitterandroid",
     "twitter for i",
-    "snapchat",
-    "musical_ly",
     "bytedancewebview",
-    "gsa/"
+    "musical_ly",
+    "whatsapp/",
+    "telegram",
+    "linkedinapp"
   ]
+
+  # Markers short or generic enough that a bare substring test would collide
+  # with unrelated product tokens - `line/` inside `Streamline/`, `snapchat` or
+  # `instagram` inside an arbitrary vendor string. Matched only at a token
+  # boundary: the start of the User-Agent, or immediately after a space.
+  @embedded_user_agent_tokens [
+    "line/",
+    "instagram",
+    "snapchat",
+    "reddit/",
+    "pinterest"
+  ]
+
+  # `GSA/` (the Google App on iOS/Android) is deliberately NOT a marker. The
+  # Google App hands external links to an in-app browser tab rather than a
+  # webview it can inspect, which is the very arrangement RFC 8252 §8.1
+  # recommends - so matching it would refuse the correct behavior.
 
   # An iOS in-app webview (WKWebView) renders with WebKit and reports a
   # `Mobile/<build>` token, but - unlike Safari and every third-party iOS
@@ -185,6 +202,17 @@ defmodule AttestoPhoenix.RequestContext do
   never a security boundary, and the enforcement it backs is off by default (see
   `check_embedded_user_agent/2`).
 
+  Both error directions are real and known:
+
+    * **False negatives.** Any Android webview whose host app calls
+      `setUserAgentString/1` and drops the `wv` token is missed, as is any
+      in-app browser whose product token is not on the list. The list names the
+      largest ones; it cannot be complete.
+    * **False positives.** An iOS web app launched from the home screen
+      (standalone display mode) is indistinguishable from a WKWebView by
+      `User-Agent` and is flagged. Deployments serving such an app should leave
+      this off.
+
   Only the `User-Agent` is consulted. `X-Requested-With` is deliberately
   ignored: Android webviews set it to the host application's package name, but
   so have some Custom Tabs implementations, and Custom Tabs is precisely the
@@ -201,6 +229,7 @@ defmodule AttestoPhoenix.RequestContext do
         user_agent = String.downcase(value)
 
         Enum.any?(@embedded_user_agent_markers, &String.contains?(user_agent, &1)) or
+          Enum.any?(@embedded_user_agent_tokens, &token_present?(user_agent, &1)) or
           ios_webview?(user_agent)
 
       _ ->
@@ -232,10 +261,21 @@ defmodule AttestoPhoenix.RequestContext do
     end
   end
 
+  # A marker at a token boundary: at the very start, or immediately after a
+  # space. Keeps `line/` from matching inside `Streamline/`.
+  defp token_present?(user_agent, marker) do
+    String.starts_with?(user_agent, marker) or String.contains?(user_agent, " " <> marker)
+  end
+
   # WebKit + a `Mobile/` build token but no `Safari/` product token: an iOS
   # WKWebView. Safari and every third-party iOS browser (which are all WebKit
   # shells) keep `Safari/`, so its absence distinguishes an app-hosted webview
   # from a browser.
+  #
+  # KNOWN FALSE POSITIVE: an iOS web app launched from the home screen
+  # (standalone/PWA display mode) reports the same shape - WebKit and `Mobile/`
+  # with no `Safari/` - and is flagged. The two are genuinely indistinguishable
+  # by User-Agent, which is part of why this whole check is opt-in.
   defp ios_webview?(user_agent) do
     String.contains?(user_agent, @ios_webkit_marker) and
       String.contains?(user_agent, @ios_mobile_marker) and
