@@ -34,8 +34,8 @@ defmodule AttestoPhoenix.Controller.PARController do
     conn = put_no_store(conn)
 
     with :ok <- RequestContext.check_https(conn, config),
-         {:ok, client} <- authenticate_client(config, conn, params),
-         {:ok, stored} <- PAR.store(config, par_request(config, conn, client, params)) do
+         {:ok, auth} <- authenticate_client(config, conn, params),
+         {:ok, stored} <- PAR.store(config, par_request(config, conn, auth, params)) do
       conn
       |> put_status(:created)
       |> json(stored)
@@ -79,7 +79,10 @@ defmodule AttestoPhoenix.Controller.PARController do
            config,
            policy
          ) do
-      {:ok, %ClientAuthentication.Result{client: client}} -> {:ok, client}
+      # The whole Result is carried onward, not just the client: the identifier
+      # the caller AUTHENTICATED as is what binds the stored request to its
+      # pusher, and the opaque client term alone cannot supply it.
+      {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}
       {:error, %OAuthError{}} = err -> err
     end
   end
@@ -89,9 +92,10 @@ defmodule AttestoPhoenix.Controller.PARController do
   # facts (RFC 9449 §4.1 / §4.2 / §4.3 - the `DPoP` request-header values and
   # the canonical request URL/method the proof is bound to). The core reads
   # only this data; it never touches the conn.
-  defp par_request(config, conn, client, params) do
+  defp par_request(config, conn, %ClientAuthentication.Result{} = auth, params) do
     %PAR.Request{
-      client: client,
+      client: auth.client,
+      client_id: auth.client_id,
       params: params,
       dpop_input: %{
         proofs: get_req_header(conn, @dpop_request_header),

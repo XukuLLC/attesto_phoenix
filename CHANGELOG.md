@@ -4,6 +4,114 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-07-28
+
+### Upgrade note
+
+- `client_native?/1` is a new **optional** `AttestoPhoenix.ClientStore`
+  callback, resolved automatically from an installed `:client_store` module the
+  same way every other client callback is. If your client-store module already
+  exports a function of that name meaning something else — "native to our
+  platform", "first-party", and so on — it will now be read as the RFC 8252
+  native-app classification, which forces PKCE for those clients and refuses
+  their client secrets at every endpoint. Rename it, or set the flat
+  `:client_native?` config key to a function returning `false`, before
+  upgrading. Hosts with no such function are unaffected.
+
+### Added
+
+- RFC 8252 (BCP 212) native-app profile support, keyed on a new
+  `:client_native?` client-store callback (`(client -> boolean())`, defaulting
+  to `false`) and a new `:native_apps` option group. Every part of it is off
+  until the host classifies its clients, so an existing deployment's behavior is
+  unchanged.
+
+  With a client marked native, two restrictions apply and need no flag:
+  PKCE is required for it regardless of the global `:require_pkce` setting
+  (§8.1; `S256`-only and no `plain` were already unconditional), and a client
+  marked both native and public may only authenticate at the token endpoint
+  with `none` — `client_secret_basic`, `client_secret_post`, and
+  `private_key_jwt` are refused with the usual generic `invalid_client` (§8.4),
+  because a credential shipped inside an installed binary is not confidential.
+  Only a native client the host *explicitly* classifies as confidential keeps
+  the secret path, that being the per-instance-credential case §8.4 carves out
+  for dynamic registration. Where no `:client_public?` callback is configured
+  at all, a client marked native counts as public — so wiring `:client_native?`
+  alone gets §8.4 enforcement rather than silently accepting a shipped secret,
+  and the same client is still admitted on `none` + PKCE. An unclassified
+  *non-native* client remains confidential, unchanged.
+
+  Two rules are additionally opt-in through `:native_apps`:
+
+  - `loopback_redirect: true` enables RFC 8252 §7.3 loopback interface
+    redirection for native clients: an `http://127.0.0.1/...` or
+    `http://[::1]/...` redirect URI matches the registered one on any port, so
+    an ephemeral port bound at runtime needs no registration, while scheme,
+    host, path, and query still compare exactly. Nothing else is relaxed —
+    `https`, private-use schemes, remote hosts, non-native clients, and the
+    hostname `localhost` (forbidden by §8.3) stay byte-exact, and an unmatched
+    redirect URI is still a direct, non-redirectable error. **This widens a
+    check the OpenID Connect and FAPI profiles assume is exact, so enabling it
+    is incompatible with certifying against them**; it requires both the
+    server-wide flag and the per-client mark.
+  - `reject_embedded_user_agents: true` enables the RFC 8252 §8.12 refusal of
+    authorization requests that appear to come from an in-app webview, via the
+    new `AttestoPhoenix.RequestContext.embedded_user_agent?/1` and
+    `check_embedded_user_agent/2`. Detection is a `User-Agent` heuristic and is
+    documented as defense in depth rather than a boundary, which is why it is
+    opt-in; it applies to all clients, since the embedding app need not be the
+    OAuth client.
+
+  Also adds `AttestoPhoenix.AuthorizationServer.RequestPolicy.redirect_uri_matching/2`
+  and `client_native?/2`, and `AttestoPhoenix.Config.native_apps/1`,
+  `native_app_loopback_redirect?/1`, and `reject_embedded_user_agents?/1`.
+
+### Security
+
+- Bind a pushed authorization request to the client that actually authenticated
+  (RFC 9126 §2.1). `AttestoPhoenix.AuthorizationServer.PAR.Request` now carries
+  the identifier from `AttestoPhoenix.ClientAuthentication.Result`, and the
+  stored record is bound to it whenever the optional `:client_id` callback does
+  not resolve one. Previously the request body's own `client_id` was left in
+  place in that case, contrary to the documented contract that it is "never
+  trusted from the request body". Because the stored record is later resolved at
+  the authorization endpoint *against the client named in it*, an authenticated
+  client could push a request naming a different client and have the
+  authorization endpoint issue a code for that client while the `redirect_uri`
+  had only been validated against the pusher's registered set — a confused
+  deputy reachable by any deployment that exposes no `:client_id` callback.
+
+  Relatedly, a pushed `client_id` that disagrees with the authenticated client
+  is now rejected with `invalid_request` rather than silently rewritten,
+  matching how the token endpoint already treats a conflicting `client_id`. The
+  check runs on the effective parameters, so one carried only inside a signed
+  request object is covered. A client that pushes its own `client_id` — every
+  conforming client — is unaffected.
+
+- Verify a pushed signed request object (RFC 9101) against the bound client
+  identifier rather than the host `:client_id` callback alone. A deployment
+  exposing no such callback previously verified every pushed request object
+  against a `nil` issuer, which `Attesto.RequestObject` treats as unverifiable,
+  so PAR + JAR was rejected outright as `invalid_request_object` for those
+  hosts.
+
+- Apply the RFC 8252 §8.4 client-authentication restriction at the revocation
+  endpoint too. It parses credentials itself rather than going through
+  `AttestoPhoenix.ClientAuthentication`, so without this it would be a second
+  authentication surface accepting a secret the token endpoint refuses. No
+  effect on a deployment that exposes no `:client_native?` callback.
+
+### Changed
+
+- Raise the test-only Bandit floor to 1.12.1, excluding the releases affected
+  by the quadratic-time WebSocket fragment-reassembly denial of service
+  (EEF-CVE-2026-65623, introduced in 1.11.0). Test-only, so no published
+  consumer was ever exposed.
+- Require `attesto ~> 1.4`, which carries `Attesto.RedirectURI` and the
+  `:redirect_uri_matching` validation option this release depends on. Against
+  an older `attesto` the loopback option would be silently ignored rather than
+  refused, so the floor is raised rather than left at 1.3.
+
 ## [2.1.0] - 2026-07-25
 
 ### Added

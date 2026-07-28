@@ -242,6 +242,77 @@ advertises its identifier via protected-resource metadata, the client echoes it
 as `resource`, the AS mints that `aud`, and the resource server validates it
 (see `attesto_mcp` for the resource-server half).
 
+### Native apps (RFC 8252)
+
+[RFC 8252](https://datatracker.ietf.org/doc/html/rfc8252) (BCP 212) profiles
+OAuth for applications installed on the end user's own device. Most of it binds
+the *client*; the authorization server's obligations are narrow, and they are
+all keyed on one host-supplied fact — a `:client_native?` callback saying this
+client is an installed app:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  client_native?: {MyApp.OAuth, :client_native?},   # (client -> boolean), default false
+
+  native_apps: [
+    loopback_redirect: false,            # RFC 8252 §7.3 — see the warning below
+    reject_embedded_user_agents: false   # RFC 8252 §8.12 — heuristic, opt-in
+  ]
+```
+
+With `:client_native?` in place and nothing else configured, a native client
+gets the two restrictions:
+
+- **PKCE is required (§8.1).** It is forced for a native client regardless of
+  the global `:require_pkce` flag. `S256` is required and `plain` is rejected
+  for every client already.
+- **No client secret (§8.4).** A native client may only authenticate at the
+  token endpoint with `none`. Presenting `client_secret_basic`,
+  `client_secret_post`, or `private_key_jwt` is rejected — a credential shipped
+  inside an installed binary is readable by anyone who has the app, so accepting
+  it authenticates possession of the app rather than possession of a secret. The
+  one exception is a native client you *explicitly* mark confidential
+  (`client_public?` returning `false`), which is §8.4's carve-out for
+  per-instance credentials issued by dynamic registration.
+
+> **Two things to know before marking a client native.** Where no
+> `:client_public?` callback is configured at all, a native client counts as
+> public — so marking it native both refuses its secret and admits it on
+> `none` + PKCE. And a native *public* client cannot use PAR: that endpoint
+> refuses secretless clients and §8.4 refuses this one a secret, so a
+> deployment running `require_pushed_authorization_requests: true` cannot also
+> serve native public clients.
+
+The other two rules are opt-in:
+
+- **`loopback_redirect: true` (§7.3)** lets a native client that cannot use a
+  private-use URI scheme bind an ephemeral loopback port at runtime: its
+  `http://127.0.0.1/...` or `http://[::1]/...` redirect URI then matches the
+  registered one on **any port**, while scheme, host, path, and query still
+  compare exactly. Nothing else relaxes — `https`, private-use schemes, remote
+  hosts, non-native clients, and the hostname `localhost` (§8.3 forbids it) all
+  stay byte-exact, and an unmatched redirect URI is still refused directly
+  rather than redirected to.
+
+  > **Certification note.** This is the only rule here that *widens* a check.
+  > Exact redirect-URI matching is assumed by the OpenID Connect and FAPI
+  > profiles, so enabling this is incompatible with certifying against them.
+  > It takes both the server-wide flag and the per-client `:client_native?`
+  > mark, and it is off by default.
+
+- **`reject_embedded_user_agents: true` (§8.12)** refuses an authorization
+  request that appears to come from an in-app webview, whose host application
+  can read the page and capture the user's credentials. Detection is a
+  `User-Agent` heuristic
+  (`AttestoPhoenix.RequestContext.embedded_user_agent?/1`), so it produces false
+  positives and is trivially spoofable — defense in depth, not a boundary, which
+  is why it is opt-in. It applies to every client, since the embedding
+  application need not be the OAuth client.
+
+Serving the platform association files (`apple-app-site-association`,
+`assetlinks.json`) that claim HTTPS app links is app distribution, not OAuth,
+and is left to the host.
+
 ### Host policy modules
 
 The preferred install surface groups host-owned callbacks by concern:

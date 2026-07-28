@@ -44,6 +44,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   @redirect_uri "https://client.example.com/callback"
   @client_id "test-client"
 
+  # RFC 8252: an installed native app registering loopback redirect URIs. The
+  # registered port is irrelevant under §7.3 - the app binds an ephemeral one at
+  # runtime - so it is registered as 0 by convention. Both loopback families are
+  # registered, because which one the app can bind depends on the device's
+  # networking stack.
+  @native_client_id "native-client"
+  @native_loopback_uri "http://127.0.0.1:0/cb"
+  @native_loopback_uri_v6 "http://[::1]:0/cb"
+
   # OP-only HMAC key for the login-bound, OP-owned browser-state value
   # (Session Management 1.0 §3.2). Required whenever session management is on.
   @browser_state_secret :crypto.strong_rand_bytes(32)
@@ -112,6 +121,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         load_principal: &__MODULE__.load_principal/1,
         client_id: &__MODULE__.client_id/1,
         client_redirect_uris: &__MODULE__.client_redirect_uris/1,
+        client_native?: &__MODULE__.client_native?/1,
         authenticate_resource_owner: &__MODULE__.authenticate/3,
         consent: &__MODULE__.consent/3,
         code_store: TestStore,
@@ -145,10 +155,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     )
   end
 
-  defp call(params) do
-    build_conn()
-    |> Map.put(:scheme, :https)
-    |> AuthorizeController.authorize(params)
+  defp call(params, opts \\ []) do
+    conn = Map.put(build_conn(), :scheme, :https)
+
+    conn =
+      case Keyword.get(opts, :user_agent) do
+        nil -> conn
+        user_agent -> put_req_header(conn, "user-agent", user_agent)
+      end
+
+    AuthorizeController.authorize(conn, params)
   end
 
   defp location(conn) do
@@ -1325,6 +1341,169 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
   end
 
+  # ── RFC 8252 native apps (BCP 212) ─────────────────────────────────────────
+
+  describe "loopback interface redirection (RFC 8252 §7.3)" do
+    defp native_params(redirect_uri, extra \\ %{}) do
+      valid_params(Map.merge(%{"client_id" => @native_client_id, "redirect_uri" => redirect_uri}, extra))
+    end
+
+    test "a native client's loopback redirect matches on any port once the host opts in" do
+      put_config(native_apps: [loopback_redirect: true])
+
+      conn = call(native_params("http://127.0.0.1:51823/cb"))
+
+      assert conn.status == 302
+      # The redirect goes to the ephemeral port the app actually bound, not the
+      # registered one.
+      assert location(conn) =~ "http://127.0.0.1:51823/cb"
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    test "the same request is a direct error with the exception off (the default)" do
+      conn = call(native_params("http://127.0.0.1:51823/cb"))
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "redirect_uri is not registered"
+      # Non-redirectable: no Location header, so nothing is redirected to an
+      # unvalidated URI.
+      assert location(conn) == nil
+    end
+
+    test "the IPv6 loopback behaves identically" do
+      put_config(native_apps: [loopback_redirect: true])
+
+      conn = call(native_params("http://[::1]:51823/cb"))
+
+      assert conn.status == 302
+      assert location(conn) =~ "http://[::1]:51823/cb"
+    end
+
+    # RFC 8252 §8.3: the literal IP is required.
+    test "localhost is refused even with the exception on" do
+      put_config(native_apps: [loopback_redirect: true])
+
+      conn = call(native_params("http://localhost:51823/cb"))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    test "a differing path is refused even with the exception on" do
+      put_config(native_apps: [loopback_redirect: true])
+
+      conn = call(native_params("http://127.0.0.1:51823/other"))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    test "a non-native client with the same registration gets no port flexibility" do
+      put_config(
+        native_apps: [loopback_redirect: true],
+        client_redirect_uris: fn _client -> [@native_loopback_uri] end,
+        client_native?: fn _client -> false end
+      )
+
+      conn = call(native_params("http://127.0.0.1:51823/cb"))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    test "an ordinary https client is unaffected by the exception" do
+      put_config(native_apps: [loopback_redirect: true])
+
+      assert call(valid_params()).status == 302
+
+      conn = call(valid_params(%{"redirect_uri" => "https://client.example.com/other"}))
+      assert conn.status == 400
+    end
+  end
+
+  describe "PKCE for native apps (RFC 8252 §8.1)" do
+    # The global flag is relaxed and the clients are classified confidential, so
+    # the only thing that can still force PKCE here is being native.
+    defp no_pkce_config(overrides \\ []) do
+      put_config([require_pkce: false, client_public?: fn _client -> false end] ++ overrides)
+    end
+
+    test "a native client without code_challenge is rejected" do
+      no_pkce_config()
+
+      conn = call(Map.drop(native_params(@native_loopback_uri), ["code_challenge", "code_challenge_method"]))
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert query["error"] == "invalid_request"
+      assert query["error_description"] =~ "code_challenge"
+    end
+
+    test "a native client using code_challenge_method=plain is rejected" do
+      no_pkce_config()
+
+      conn = call(native_params(@native_loopback_uri, %{"code_challenge_method" => "plain"}))
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert query["error"] == "invalid_request"
+      assert query["error_description"] =~ "plain"
+    end
+
+    test "a non-native client is unaffected by the native PKCE requirement" do
+      no_pkce_config()
+
+      conn = call(Map.drop(valid_params(), ["code_challenge", "code_challenge_method"]))
+
+      assert conn.status == 302
+      assert is_binary(location_query(conn)["code"])
+    end
+  end
+
+  describe "embedded user agents (RFC 8252 §8.12)" do
+    @webview_user_agent "Mozilla/5.0 (Linux; Android 13; Pixel 7 Build/TQ3A; wv) AppleWebKit/537.36 " <>
+                          "(KHTML, like Gecko) Version/4.0 Chrome/119.0.0.0 Mobile Safari/537.36"
+
+    @browser_user_agent "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 " <>
+                          "(KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36"
+
+    test "a webview request is served normally while the check is off (the default)" do
+      conn = call(valid_params(), user_agent: @webview_user_agent)
+
+      assert conn.status == 302
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    test "a webview request is refused directly once the host opts in" do
+      put_config(native_apps: [reject_embedded_user_agents: true])
+
+      conn = call(valid_params(), user_agent: @webview_user_agent)
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "embedded user agent"
+      # Refused, not redirected: the flow must not continue inside the webview.
+      assert location(conn) == nil
+    end
+
+    test "the system browser is served normally with the check on" do
+      put_config(native_apps: [reject_embedded_user_agents: true])
+
+      conn = call(valid_params(), user_agent: @browser_user_agent)
+
+      assert conn.status == 302
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    test "the refusal happens before the client is resolved" do
+      put_config(native_apps: [reject_embedded_user_agents: true])
+
+      conn = call(valid_params(%{"client_id" => "no-such-client"}), user_agent: @webview_user_agent)
+
+      assert conn.status == 400
+      assert conn.resp_body =~ "embedded user agent"
+    end
+  end
+
   # ── Stub host callbacks ────────────────────────────────────────────────────
 
   # The authorization endpoint never mints a token, so the signing key is never
@@ -1349,6 +1528,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   def load_client(@client_id), do: {:ok, %{id: @client_id}}
+  def load_client(@native_client_id), do: {:ok, %{id: @native_client_id, native?: true, public?: true}}
   def load_client(_), do: {:error, :not_found}
 
   def verify_secret(_, _), do: false
@@ -1358,7 +1538,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   def client_id(%{id: id}), do: id
 
   def client_redirect_uris(%{id: @client_id}), do: [@redirect_uri]
+  def client_redirect_uris(%{id: @native_client_id}), do: [@native_loopback_uri, @native_loopback_uri_v6]
   def client_redirect_uris(_), do: []
+
+  def client_native?(client), do: Map.get(client, :native?, false)
 
   # The default stub establishes a fixed subject. It echoes the `auth_opts`
   # the controller threaded in (prompt/force_reauth/interactive/max_age) into

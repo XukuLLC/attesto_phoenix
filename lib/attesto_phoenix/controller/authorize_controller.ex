@@ -158,6 +158,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     par_request_uri = params["request_uri"]
 
     with :ok <- RequestContext.check_https(conn, config),
+         :ok <- RequestContext.check_embedded_user_agent(conn, config),
          {:ok, params, par_resolved?} <- resolve_request_uri(config, params),
          {:ok, client} <- load_client(config, params),
          {:ok, request} <- validate_request(config, client, params, par_resolved?) do
@@ -169,6 +170,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # RFC 6749 §3.1 / §10.1: the authorization endpoint requires TLS. The
         # request is untrusted, so this is a direct error, never a redirect.
         render_direct_error(conn, config, :insecure_transport)
+
+      {:error, :embedded_user_agent} ->
+        # RFC 8252 §8.12 (opt-in, `native_apps: [reject_embedded_user_agents:
+        # true]`): the request appears to come from an in-app webview, whose
+        # host application can observe the credentials the user is about to
+        # enter. Refused before the client is resolved - the decision depends on
+        # nothing but the request - and reported directly: redirecting the flow
+        # onward would leave it inside the webview being refused.
+        emit_failure(conn, config, :embedded_user_agent)
+        render_direct_error(conn, config, :embedded_user_agent)
 
       {:error, {:direct, reason}} ->
         # OIDC Core §3.1.2.6: bad client_id / redirect_uri is non-redirectable.
@@ -234,11 +245,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # ── Request validation (Attesto.AuthorizationRequest) ────────────────────
 
   # The registered redirect-URI set is a fact the host supplies via
-  # `:client_redirect_uris`; the exact-match check is protocol and is performed
-  # by `Attesto.AuthorizationRequest` (RFC 6749 §3.1.2.3). A host that does not
+  # `:client_redirect_uris`; the match check is protocol and is performed by
+  # `Attesto.AuthorizationRequest` (RFC 6749 §3.1.2.3). A host that does not
   # supply the callback exposes no registered URIs, so every request is rejected
   # with `{:direct, :redirect_uri_not_registered}` (fail closed) rather than
-  # silently trusting the supplied URI.
+  # silently trusting the supplied URI. Matching is exact unless the host has
+  # both enabled `native_apps: [loopback_redirect: true]` and marked this client
+  # native, in which case RFC 8252 §7.3 lets its loopback redirect URI vary in
+  # port; `RequestPolicy.redirect_uri_matching/2` owns that decision. An
+  # unmatched URI stays non-redirectable under every policy.
   #
   # OIDC Core §3.1.2.1: the `nonce` is OPTIONAL for the code flow by default, but
   # an OpenID Provider MAY require it. When the host sets `:require_nonce`, a
@@ -251,6 +266,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     with {:ok, request} <-
            AuthorizationRequest.validate(params,
              registered_redirect_uris: RequestPolicy.registered_redirect_uris(config, client),
+             redirect_uri_matching: RequestPolicy.redirect_uri_matching(config, client),
              require_nonce: RequestPolicy.require_nonce?(config),
              require_pkce: RequestPolicy.require_pkce?(config, client),
              request_object_jwks: client_jwks(config, client),
@@ -1057,6 +1073,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp direct_error_description(:insecure_transport), do: "TLS required"
+
+  # RFC 8252 §8.12: the message names the remedy, because the human seeing it is
+  # inside an app that must reopen the flow in the system browser.
+  defp direct_error_description(:embedded_user_agent),
+    do: "authorization requests from an embedded user agent are not permitted; use the system browser"
+
   defp direct_error_description(:invalid_client_id), do: "client_id is invalid"
   defp direct_error_description(:missing_redirect_uri), do: "redirect_uri is required"
   defp direct_error_description(:invalid_redirect_uri), do: "redirect_uri is invalid"

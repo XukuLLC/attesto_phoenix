@@ -112,6 +112,35 @@ defmodule AttestoPhoenix.Config do
       receives the original OAuth client and returns additional identifiers
       that client may target. The same policy governs issuance, introspection,
       and token-exchange subject-token verification.
+    * `:native_apps` - RFC 8252 (BCP 212) native-app profile options as
+      `[loopback_redirect: false, reject_embedded_user_agents: false]`. Both
+      members are off by default, so the server's behavior is unchanged unless
+      the host opts in.
+
+      `:loopback_redirect` enables RFC 8252 §7.3 loopback interface
+      redirection: for a client the host marks native (`:client_native?`), a
+      request `redirect_uri` of `http://127.0.0.1/...` or `http://[::1]/...`
+      matches the registered URI on any port, while scheme, host, path, and
+      query still compare exactly. Nothing else is relaxed — `https`,
+      private-use schemes, remote hosts, and the hostname `localhost` (§8.3
+      forbids it) all stay exact-match, as does every non-native client. **This
+      is incompatible with profiles that mandate exact redirect-URI matching**,
+      including the OpenID Connect and FAPI profiles, so enable it only for a
+      deployment that is not certifying against them.
+
+      `:reject_embedded_user_agents` enables the RFC 8252 §8.12 recommendation
+      that the authorization endpoint refuse requests made from an in-app
+      webview, which the host application can use to observe the user's
+      credentials. Detection is a `User-Agent` heuristic
+      (`AttestoPhoenix.RequestContext.embedded_user_agent?/1`) and therefore
+      produces false positives, which is why it is opt-in and applies to every
+      client rather than only native ones — the embedding app is not
+      necessarily the OAuth client.
+
+      The remaining RFC 8252 obligations (§8.1 PKCE, §8.4 client
+      authentication) follow from `:client_native?` alone and need no flag:
+      they are strictly additional restrictions on a client the host has
+      deliberately classified as native.
     * `:principal_kinds` - non-empty list of `Attesto.PrincipalKind` values
       or a zero-arity callback returning that list, passed into the core token
       configuration.
@@ -183,6 +212,12 @@ defmodule AttestoPhoenix.Config do
       authenticated subject.
     * `:client_public?` - `(client -> boolean())`. Returns whether a client
       may authenticate without a secret and rely on PKCE.
+    * `:client_native?` - `(client -> boolean())`. Returns whether a client is
+      an installed native application (RFC 8252 / BCP 212). Defaults to `false`
+      when unset, so a host that does not classify its clients gets no RFC 8252
+      behavior. A native client always requires PKCE (§8.1) and, when it is
+      also public, may not authenticate at the token endpoint with a secret
+      (§8.4). See also `:native_apps`.
     * `:client_requires_mtls?` - `(client -> boolean())`. Returns whether a
       client requires mTLS-bound token issuance.
     * `:client_requires_dpop?` - `(client -> boolean())`. Returns whether a
@@ -527,6 +562,7 @@ defmodule AttestoPhoenix.Config do
     :ciba_store,
     :backchannel_authentication_path,
     :client_public?,
+    :client_native?,
     :client_requires_mtls?,
     :client_requires_dpop?,
     :client_grant_types,
@@ -589,6 +625,7 @@ defmodule AttestoPhoenix.Config do
     registration_enabled: false,
     client_id_metadata: [],
     jwt_bearer: [],
+    native_apps: [],
     resource_indicators: [],
     device_authorization: [],
     ciba: [],
@@ -648,6 +685,7 @@ defmodule AttestoPhoenix.Config do
           authenticate_resource_owner: callback() | nil,
           consent: callback() | nil,
           client_public?: callback() | nil,
+          client_native?: callback() | nil,
           client_requires_mtls?: callback() | nil,
           client_requires_dpop?: callback() | nil,
           client_grant_types: callback() | nil,
@@ -697,6 +735,7 @@ defmodule AttestoPhoenix.Config do
           registration_enabled: boolean(),
           client_id_metadata: keyword(),
           jwt_bearer: keyword(),
+          native_apps: keyword(),
           resource_indicators: keyword(),
           device_code_store: module() | nil,
           authenticate_ciba_user: callback() | nil,
@@ -762,6 +801,7 @@ defmodule AttestoPhoenix.Config do
         request_object_policy: request_object_policy,
         client_id_metadata: normalize_client_id_metadata(config.client_id_metadata),
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
+        native_apps: normalize_native_apps(config.native_apps),
         resource_indicators: normalize_resource_indicators(config.resource_indicators),
         device_authorization: normalize_device_authorization(config.device_authorization),
         ciba: normalize_ciba(config.ciba),
@@ -817,6 +857,30 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_jwt_bearer(opts) when is_list(opts) do
     Keyword.merge(@jwt_bearer_defaults, opts)
+  end
+
+  # RFC 8252 (BCP 212) native-app profile. Both members are off by default, so
+  # an existing deployment sees byte-identical behavior until it opts in.
+  #
+  # `:loopback_redirect` widens redirect-URI matching to the §7.3 loopback
+  # exception, but only for a client the host marks native — it is the one
+  # RELAXATION in the profile, so it takes both a server-wide flag and a
+  # per-client classification, and it is incompatible with profiles that mandate
+  # exact redirect-URI matching.
+  #
+  # `:reject_embedded_user_agents` turns on the §8.12 in-app-webview refusal at
+  # the authorization endpoint. It is a `User-Agent` heuristic, so it is opt-in;
+  # it deliberately is NOT scoped to native clients, because the embedding
+  # application need not be the OAuth client.
+  #
+  # The §8.1 PKCE and §8.4 client-authentication rules take no flag: they are
+  # additional restrictions that follow from `:client_native?` alone.
+  @native_apps_defaults [loopback_redirect: false, reject_embedded_user_agents: false]
+
+  defp normalize_native_apps(nil), do: @native_apps_defaults
+
+  defp normalize_native_apps(opts) when is_list(opts) do
+    Keyword.merge(@native_apps_defaults, opts)
   end
 
   # RFC 8707 Resource Indicators. `:allowed_resources` is the grant-agnostic
@@ -989,6 +1053,41 @@ defmodule AttestoPhoenix.Config do
   """
   @spec jwt_bearer(t()) :: keyword()
   def jwt_bearer(%__MODULE__{jwt_bearer: opts}), do: opts
+
+  @doc """
+  Returns the merged, defaulted RFC 8252 native-app profile options, so every
+  recognized member (`:loopback_redirect`, `:reject_embedded_user_agents`) is
+  always present.
+  """
+  @spec native_apps(t()) :: keyword()
+  def native_apps(%__MODULE__{native_apps: opts}), do: opts
+
+  @doc """
+  Returns `true` iff RFC 8252 §7.3 loopback interface redirection is enabled.
+
+  Off unless the host sets `native_apps: [loopback_redirect: true]`. Even then
+  the exception applies only to a client the host marks native
+  (`:client_native?`) and only to `http://127.0.0.1/...` / `http://[::1]/...`
+  redirect URIs; see `AttestoPhoenix.AuthorizationServer.RequestPolicy.redirect_uri_matching/2`
+  and `Attesto.RedirectURI`.
+  """
+  @spec native_app_loopback_redirect?(t()) :: boolean()
+  def native_app_loopback_redirect?(%__MODULE__{} = config) do
+    config |> native_apps() |> Keyword.get(:loopback_redirect, false) == true
+  end
+
+  @doc """
+  Returns `true` iff the authorization endpoint should refuse requests that
+  appear to come from an embedded user agent (RFC 8252 §8.12).
+
+  Off unless the host sets `native_apps: [reject_embedded_user_agents: true]`.
+  The detection is a heuristic; see
+  `AttestoPhoenix.RequestContext.embedded_user_agent?/1`.
+  """
+  @spec reject_embedded_user_agents?(t()) :: boolean()
+  def reject_embedded_user_agents?(%__MODULE__{} = config) do
+    config |> native_apps() |> Keyword.get(:reject_embedded_user_agents, false) == true
+  end
 
   @doc """
   Returns the merged, defaulted RFC 8707 Resource Indicators options
@@ -1886,6 +1985,7 @@ defmodule AttestoPhoenix.Config do
     client_frontchannel_logout_uri: {:client_store, :client_frontchannel_logout_uri, 1},
     client_frontchannel_logout_session_required: {:client_store, :client_frontchannel_logout_session_required, 1},
     client_public?: {:client_store, :client_public?, 1},
+    client_native?: {:client_store, :client_native?, 1},
     client_requires_mtls?: {:client_store, :client_requires_mtls?, 1},
     client_requires_dpop?: {:client_store, :client_requires_dpop?, 1},
     client_grant_types: {:client_store, :client_grant_types, 1},

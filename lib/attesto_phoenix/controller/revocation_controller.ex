@@ -63,6 +63,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   alias Attesto.Revocation
   alias AttestoPhoenix.Callback
+  alias AttestoPhoenix.ClientAuthentication
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
   alias AttestoPhoenix.RequestContext
@@ -264,7 +265,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
     case Callback.invoke(Config.load_client_fun(config), [client_id]) do
       {:ok, client} ->
-        if Callback.invoke(verify_client_secret, [client, client_secret]) == true do
+        if Callback.invoke(verify_client_secret, [client, client_secret]) == true and
+             not native_secret_refused?(config, client) do
           {:ok, client}
         else
           {:error, :invalid_client}
@@ -274,6 +276,25 @@ defmodule AttestoPhoenix.Controller.RevocationController do
         _ = Callback.invoke(verify_client_secret, [:unknown_client, client_secret])
         {:error, :invalid_client}
     end
+  end
+
+  # RFC 8252 §8.4: an installed native app cannot keep a client secret
+  # confidential, so a secret it presents is not proof of its identity. This
+  # endpoint parses credentials itself rather than going through
+  # `AttestoPhoenix.ClientAuthentication`, so the rule has to be applied here
+  # too - otherwise revocation would be a second client-authentication surface
+  # accepting a credential the token endpoint refuses.
+  #
+  # The predicate itself is NOT reimplemented here: it is the one
+  # `ClientAuthentication` enforces at every other endpoint. A hand-copied copy
+  # would be free to drift from it, and the two defaults it composes
+  # (`:client_native?` absent -> false, `:client_public?` absent -> native) are
+  # exactly the kind of detail that drifts silently. The refusal is the same
+  # generic `invalid_client` as every other failure here, so it is not an
+  # oracle, and it runs only on the branch where the secret already verified,
+  # leaving the unknown-client dummy-verify timing equalization untouched.
+  defp native_secret_refused?(config, client) do
+    ClientAuthentication.native_secret_refused?(config, client)
   end
 
   defp fetch_token(params) do

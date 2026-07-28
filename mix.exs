@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.1.0"
+  @version "2.2.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -78,7 +78,7 @@ defmodule AttestoPhoenix.MixProject do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.3.0 and < 2.0.0"}
+      {:attesto, ">= 1.4.0 and < 2.0.0"}
     end
   end
 
@@ -125,7 +125,7 @@ defmodule AttestoPhoenix.MixProject do
       {:req_dpop, "~> 0.5", only: :test, runtime: false},
       # test-only HTTP origin server for outbound delivery/fetch tests. Bandit
       # avoids pulling the advisory-affected Cowboy/Cowlib stack into the lock.
-      {:bandit, "~> 1.12", only: :test},
+      {:bandit, "~> 1.12.1", only: :test},
 
       # dev / quality
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},

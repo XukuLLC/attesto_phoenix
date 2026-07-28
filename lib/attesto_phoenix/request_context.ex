@@ -12,7 +12,10 @@ defmodule AttestoPhoenix.RequestContext do
     * the canonical request **URL** (`htu`) and **method** (`htm`) a DPoP proof is
       bound to, per RFC 9449 §4.2 / §4.3;
     * the peer **certificate DER** presented at the TLS layer, used for the
-      RFC 8705 §3 mutual-TLS `cnf` binding.
+      RFC 8705 §3 mutual-TLS `cnf` binding;
+    * whether the request appears to come from an **embedded user agent**
+      (an in-app webview), which RFC 8252 §8.12 recommends refusing at the
+      authorization endpoint.
 
   Every forwarded-header-derived fact is gated on a trusted-proxy allowlist. A
   request that arrives from a peer outside that allowlist with forged
@@ -57,6 +60,67 @@ defmodule AttestoPhoenix.RequestContext do
   # `htu` matches what a client built from a bare `https://host/path` URL.
   @https_default_port 443
   @http_default_port 80
+
+  @user_agent_header "user-agent"
+
+  # RFC 8252 §8.12: substrings that identify a request as coming from an
+  # embedded user agent (an in-app webview) rather than the system browser.
+  # Matched case-insensitively against the `User-Agent`. Two kinds of marker:
+  # the platform webview tokens, and the product tokens well-known applications
+  # add to their in-app browser.
+  #
+  # This list is a heuristic, not a specification. It cannot be complete (any
+  # application may ship a webview with an unmodified UA) and it can be wrong
+  # (a UA string is client-supplied and freely spoofable in both directions),
+  # which is why the check it backs is opt-in.
+  # Markers distinctive enough to match anywhere in the string.
+  @embedded_user_agent_markers [
+    # Android System WebView adds the `wv` platform token (Chrome 42+).
+    "; wv)",
+    "; wv;",
+    # Desktop application shells that embed Chromium directly.
+    "electron/",
+    # Product tokens for widely deployed in-app browsers. Each of these renders
+    # the authorization page inside the host application's process, which is
+    # exactly the arrangement §8.12 warns about.
+    "fban/",
+    "fbav/",
+    "fb_iab",
+    "micromessenger",
+    "twitterandroid",
+    "twitter for i",
+    "bytedancewebview",
+    "musical_ly",
+    "whatsapp/",
+    "telegram",
+    "linkedinapp"
+  ]
+
+  # Markers short or generic enough that a bare substring test would collide
+  # with unrelated product tokens - `line/` inside `Streamline/`, `snapchat` or
+  # `instagram` inside an arbitrary vendor string. Matched only at a token
+  # boundary: the start of the User-Agent, or immediately after a space.
+  @embedded_user_agent_tokens [
+    "line/",
+    "instagram",
+    "snapchat",
+    "reddit/",
+    "pinterest"
+  ]
+
+  # `GSA/` (the Google App on iOS/Android) is deliberately NOT a marker. The
+  # Google App hands external links to an in-app browser tab rather than a
+  # webview it can inspect, which is the very arrangement RFC 8252 §8.1
+  # recommends - so matching it would refuse the correct behavior.
+
+  # An iOS in-app webview (WKWebView) renders with WebKit and reports a
+  # `Mobile/<build>` token, but - unlike Safari and every third-party iOS
+  # browser, which are WebKit shells and keep the token - omits `Safari/`.
+  # Absence of `Safari/` alongside those two is the standard signal, and it is
+  # the only structural (rather than product-name) rule here.
+  @ios_webkit_marker "applewebkit"
+  @ios_mobile_marker "mobile/"
+  @ios_browser_marker "safari/"
 
   @loopback_v4_cidr {{127, 0, 0, 0}, 8}
   @loopback_v6 {0, 0, 0, 0, 0, 0, 0, 1}
@@ -115,6 +179,107 @@ defmodule AttestoPhoenix.RequestContext do
     else
       :ok
     end
+  end
+
+  @doc """
+  Returns `true` when the request's `User-Agent` looks like an embedded user
+  agent - an in-app webview - rather than the system browser (RFC 8252 §8.12).
+
+  §8.12 recommends that an authorization server not permit an embedded user
+  agent for the authorization request: the application hosting the webview can
+  read the page's DOM, inject scripts, and capture keystrokes, so the user's
+  credentials are exposed to the very party the authorization is meant to
+  constrain. The native-app remedy is an external user agent - the system
+  browser, an in-app browser tab (`SFSafariViewController` /
+  Android Custom Tabs) - which the host application cannot inspect.
+
+  ## This is a heuristic
+
+  The `User-Agent` is client-supplied and unauthenticated. A webview can send
+  any string, so this check is trivially evaded by an attacker who wants to; and
+  because it matches on product tokens and platform quirks it will
+  misclassify some honest browsers. It is therefore a defense-in-depth hint,
+  never a security boundary, and the enforcement it backs is off by default (see
+  `check_embedded_user_agent/2`).
+
+  Both error directions are real and known:
+
+    * **False negatives.** Any Android webview whose host app calls
+      `setUserAgentString/1` and drops the `wv` token is missed, as is any
+      in-app browser whose product token is not on the list. The list names the
+      largest ones; it cannot be complete.
+    * **False positives.** An iOS web app launched from the home screen
+      (standalone display mode) is indistinguishable from a WKWebView by
+      `User-Agent` and is flagged. Deployments serving such an app should leave
+      this off.
+
+  Only the `User-Agent` is consulted. `X-Requested-With` is deliberately
+  ignored: Android webviews set it to the host application's package name, but
+  so have some Custom Tabs implementations, and Custom Tabs is precisely the
+  RFC 8252 §8.1-recommended arrangement - keying on that header would refuse the
+  behavior the RFC asks for.
+
+  A request with no `User-Agent` is not treated as embedded: absence is not
+  evidence, and refusing it would break non-browser callers.
+  """
+  @spec embedded_user_agent?(Plug.Conn.t()) :: boolean()
+  def embedded_user_agent?(%Plug.Conn{} = conn) do
+    case first_header(conn, @user_agent_header) do
+      value when is_binary(value) and value != "" ->
+        user_agent = String.downcase(value)
+
+        Enum.any?(@embedded_user_agent_markers, &String.contains?(user_agent, &1)) or
+          Enum.any?(@embedded_user_agent_tokens, &token_present?(user_agent, &1)) or
+          ios_webview?(user_agent)
+
+      _ ->
+        false
+    end
+  end
+
+  @doc """
+  Returns `:ok` when the request satisfies the configured embedded-user-agent
+  policy, or `{:error, :embedded_user_agent}` when the host has enabled
+  `native_apps: [reject_embedded_user_agents: true]` and the request looks like
+  it came from an in-app webview (RFC 8252 §8.12).
+
+  Returns `:ok` unconditionally when the flag is off, which is the default. The
+  caller reports the failure directly to the user agent - there is no trusted
+  `redirect_uri` at this point, and redirecting the flow onward inside the
+  webview would defeat the purpose of refusing it.
+
+  This applies to the front-channel authorization request only. The PAR and
+  token endpoints are back-channel calls from the client itself, where no user
+  agent is involved and the `User-Agent` carries no such meaning.
+  """
+  @spec check_embedded_user_agent(Plug.Conn.t(), Config.t()) :: :ok | {:error, :embedded_user_agent}
+  def check_embedded_user_agent(%Plug.Conn{} = conn, %Config{} = config) do
+    if Config.reject_embedded_user_agents?(config) and embedded_user_agent?(conn) do
+      {:error, :embedded_user_agent}
+    else
+      :ok
+    end
+  end
+
+  # A marker at a token boundary: at the very start, or immediately after a
+  # space. Keeps `line/` from matching inside `Streamline/`.
+  defp token_present?(user_agent, marker) do
+    String.starts_with?(user_agent, marker) or String.contains?(user_agent, " " <> marker)
+  end
+
+  # WebKit + a `Mobile/` build token but no `Safari/` product token: an iOS
+  # WKWebView. Safari and every third-party iOS browser (which are all WebKit
+  # shells) keep `Safari/`, so its absence distinguishes an app-hosted webview
+  # from a browser.
+  #
+  # KNOWN FALSE POSITIVE: an iOS web app launched from the home screen
+  # (standalone/PWA display mode) reports the same shape - WebKit and `Mobile/`
+  # with no `Safari/` - and is flagged. The two are genuinely indistinguishable
+  # by User-Agent, which is part of why this whole check is opt-in.
+  defp ios_webview?(user_agent) do
+    String.contains?(user_agent, @ios_webkit_marker) and
+      String.contains?(user_agent, @ios_mobile_marker) and
+      not String.contains?(user_agent, @ios_browser_marker)
   end
 
   @doc """

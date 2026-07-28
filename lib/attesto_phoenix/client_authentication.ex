@@ -17,6 +17,24 @@ defmodule AttestoPhoenix.ClientAuthentication do
   OIDC Core §9). Presenting more than one client-authentication method is
   rejected (RFC 6749 §2.3).
 
+  ## Native apps (RFC 8252 §8.4)
+
+  A client the host marks native (`:client_native?`) may only authenticate with
+  `none`. A native app cannot keep a credential confidential - its binary is on
+  the end user's device - so presenting a client secret or an assertion is
+  refused with the same generic `invalid_client` message as any other failure.
+
+  The one exception is the one §8.4 makes: a native client the host
+  *explicitly* classifies as confidential (`:client_public?` returning `false`)
+  is taken to hold per-instance credentials from dynamic registration, and keeps
+  the secret path. An absent `:client_public?` callback is not that
+  classification and resolves to public, so a host that wires `:client_native?`
+  alone still gets §8.4 enforcement rather than silently accepting a shipped
+  secret.
+
+  `:client_native?` itself defaults to `false`, so none of this affects a host
+  that has not classified its clients.
+
   ## Client ID Metadata Documents (CIMD)
 
   When CIMD (`draft-ietf-oauth-client-id-metadata-document-01`) is enabled and
@@ -559,8 +577,29 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # defers to the host's `:client_public?` discriminator.
   defp client_public?(_config, {:cimd, _metadata}), do: true
 
+  # Absent the host's `:client_public?` callback the answer normally fails
+  # closed to `false`: an unclassified client must not be admitted on the
+  # secretless path, because doing so would let anyone who knows a confidential
+  # client's `client_id` authenticate as it.
+  #
+  # For a client the host marked NATIVE that default flips to `true`, because
+  # for a native app the fail-closed direction is the other way. RFC 8252 §8.4
+  # says an installed app's statically included secret MUST NOT be accepted as
+  # proof of identity, so treating an unclassified native client as
+  # confidential would accept exactly the credential §8.4 forbids. Marking a
+  # client native is itself the deliberate classification that makes it public;
+  # `none` + PKCE is the posture §8.1 prescribes for it.
+  #
+  # One rule, used by BOTH the secretless gate and the §8.4 secret refusal, so
+  # the two cannot disagree. An earlier split - fail-closed-to-false here,
+  # fail-closed-to-true for §8.4 - left a native client with no
+  # `:client_public?` callback refused on both paths and therefore unable to
+  # authenticate at all.
   defp client_public?(config, client) do
-    Callback.invoke(Config.client_public_fun(config), [client], false) == true
+    case Config.client_public_fun(config) do
+      nil -> client_native?(config, client)
+      callback -> Callback.invoke(callback, [client]) == true
+    end
   end
 
   # The authenticated OAuth `client_id` (RFC 6749 §2.2) carried by the
@@ -573,10 +612,14 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # the host callback.
   defp result(config, client, presented_client_id, method)
        when is_binary(presented_client_id) and presented_client_id != "" do
-    case resolved_client_id(config, client) do
-      nil -> {:ok, authenticated_result(client, presented_client_id, method)}
-      ^presented_client_id -> {:ok, authenticated_result(client, presented_client_id, method)}
-      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    if native_client_auth_permitted?(config, client, method) do
+      case resolved_client_id(config, client) do
+        nil -> {:ok, authenticated_result(client, presented_client_id, method)}
+        ^presented_client_id -> {:ok, authenticated_result(client, presented_client_id, method)}
+        _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+      end
+    else
+      {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
 
@@ -586,6 +629,61 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp authenticated_result(client, presented_client_id, method) do
     %Result{client: client, client_id: presented_client_id, method: method}
+  end
+
+  # RFC 8252 §8.4: an installed native app cannot keep a credential
+  # confidential. Its binary is distributed to every user's device, so anything
+  # shipped inside it - a `client_secret`, an assertion signing key - is
+  # readable by anyone who has the app, and an authorization server that accepts
+  # it is authenticating "possession of the app", not "possession of a secret".
+  # A client the host marks native (RFC 8252 / `:client_native?`) and public
+  # (RFC 6749 §2.1 / `:client_public?`) therefore authenticates with `none`; its
+  # security rests on PKCE instead (§8.1, enforced by
+  # `AttestoPhoenix.AuthorizationServer.RequestPolicy.require_pkce?/2`).
+  #
+  # Presenting `client_secret_basic`, `client_secret_post`, or `private_key_jwt`
+  # is refused even when the host registry happens to hold a matching credential
+  # - silently accepting it would let a secret extracted from one installed copy
+  # authenticate as the client forever. The refusal is the single generic
+  # `invalid_client` message every other authentication failure returns, so it
+  # reveals nothing about the client's registration.
+  #
+  # RFC 8252 §8.4 carves out exactly one case where a native client may still
+  # authenticate: per-instance credentials provisioned by dynamic registration,
+  # which are genuinely confidential because no two installs share them. That is
+  # the only reason this is scoped to native AND public rather than to native
+  # alone, and it is why the host must say so explicitly - see
+  # `native_client_public?/2`.
+  defp native_client_auth_permitted?(_config, _client, :none), do: true
+
+  defp native_client_auth_permitted?(config, client, _method) do
+    not native_secret_refused?(config, client)
+  end
+
+  # Whether RFC 8252 §8.4 refuses a credential from `client`: true when the host
+  # marks it native and it resolves as public.
+  #
+  # Exposed because the revocation endpoint parses client credentials itself
+  # rather than going through `authenticate/4`, and a hand-copied second
+  # implementation of this predicate would be free to drift from the one the
+  # token, PAR, introspection, device, and CIBA endpoints enforce. There is one
+  # rule and one place it lives.
+  @doc false
+  @spec native_secret_refused?(Config.t(), term()) :: boolean()
+  def native_secret_refused?(%Config{} = config, client) do
+    client_native?(config, client) and client_public?(config, client)
+  end
+
+  # The native-app discriminator (RFC 8252 / BCP 212). A CIMD client is
+  # identified by an `https` URL resolving to a document served over the
+  # network, not an installed app. A registered client defers to the host's
+  # `:client_native?` callback, which defaults to `false`: an unclassified
+  # client is not native, so this check cannot refuse an authentication the
+  # host never opted into.
+  defp client_native?(_config, {:cimd, _metadata}), do: false
+
+  defp client_native?(config, client) do
+    Callback.invoke(Config.client_native_fun(config), [client], false) == true
   end
 
   # A CIMD client's identifier is the URL its document is bound to; a registered

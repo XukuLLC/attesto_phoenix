@@ -79,6 +79,56 @@ AttestoPhoenix.Config.new(
 )
 ```
 
+## Installed native app (RFC 8252)
+
+A native app is a public PKCE client that additionally runs on the end user's
+own device, which RFC 8252 (BCP 212) treats as its own case. Mark it with
+`:client_native?` and the server requires PKCE for it (§8.1) and refuses any
+token-endpoint credential from it (§8.4) — both without further configuration.
+
+Add `native_apps: [loopback_redirect: true]` only if the app cannot use a
+private-use URI scheme (`com.example.app:/cb`) and must instead bind an
+ephemeral port on the loopback interface (§7.3). That option widens
+redirect-URI matching, which the OpenID Connect and FAPI profiles assume is
+exact — see the README's certification note before turning it on.
+
+```elixir
+AttestoPhoenix.Config.new(
+  issuer: "https://auth.example",
+  keystore: MyApp.Keystore,
+  repo: MyApp.Repo,
+
+  load_client: &MyApp.AuthZ.load_client/1,
+  verify_client_secret: fn _client, _secret -> false end,
+  client_id: &MyApp.AuthZ.client_id/1,
+  # Registered as `http://127.0.0.1:0/cb` (and/or `http://[::1]:0/cb`) - the
+  # port is ignored under §7.3, so any placeholder will do. `localhost` is NOT
+  # acceptable (§8.3); register the literal IP.
+  client_redirect_uris: &MyApp.AuthZ.client_redirect_uris/1,
+  client_public?: fn _client -> true end,
+  client_native?: &MyApp.AuthZ.client_native?/1,
+
+  native_apps: [
+    loopback_redirect: true,
+    # Optional §8.12 in-app-webview refusal; a User-Agent heuristic, so it can
+    # misjudge honest browsers.
+    reject_embedded_user_agents: false
+  ],
+
+  load_principal: &MyApp.AuthZ.load_principal/1,
+  build_principal: &MyApp.AuthZ.build_principal/3,
+  authenticate_resource_owner: &MyApp.AuthZ.authenticate_resource_owner/3,
+
+  scopes_supported: ["openid", "profile"],
+
+  code_store: AttestoPhoenix.Store.EctoCodeStore,
+  refresh_store: AttestoPhoenix.Store.EctoRefreshStore,
+  replay_check: &AttestoPhoenix.Store.EctoReplayCheck.check_and_record/2,
+  nonce_store: AttestoPhoenix.Store.EctoNonceStore,
+  sweep_interval_ms: 60_000
+)
+```
+
 ## Mounting somewhere other than `/oauth`
 
 Both configs above advertise the historic `/oauth/*` endpoints. To advertise a

@@ -102,6 +102,9 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
     fields =
       [
         client: @client,
+        # The identifier the client authenticated as, exactly as the controller
+        # carries it over from `ClientAuthentication.Result`.
+        client_id: @client.id,
         params: %{},
         dpop_input: %{proofs: [], http_uri: @htu, http_method: @htm}
       ]
@@ -167,13 +170,130 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
       assert {:ok, %{expires_in: 90}} = PAR.store(config, request(params: base_params()))
     end
 
-    test "stores the authenticated client_id, never a body-supplied value" do
+    test "stores the authenticated client_id" do
       # RFC 6749 §2.3.1: the stored record carries the client_id resolved from
-      # the authenticated client, even when the body carries a different one.
+      # the authenticated client, never a caller-controlled value.
       config = config()
-      params = Map.put(base_params(), "client_id", "body-supplied-other")
 
-      assert {:ok, %{request_uri: request_uri}} = PAR.store(config, request(params: params))
+      assert {:ok, %{request_uri: request_uri}} = PAR.store(config, request(params: base_params()))
+      assert {:ok, stored, 45} = Store.lookup(request_uri)
+      assert stored["client_id"] == "confidential-1"
+    end
+
+    test "rejects a body client_id that disagrees with the authenticated client" do
+      # Pushing a request in another client's name is refused outright rather
+      # than silently rewritten: the stored record is later resolved at
+      # /authorize AGAINST THE CLIENT NAMED IN IT, so an accepted mismatch would
+      # have the authorization endpoint issue a code for the named client while
+      # the redirect_uri was validated against the pusher's registered set.
+      config = config()
+      params = Map.put(base_params(), "client_id", "some-other-client")
+
+      assert {:error, %OAuthError{error: :invalid_request, error_description: detail}} =
+               PAR.store(config, request(params: params))
+
+      assert detail =~ "does not match the authenticated client"
+    end
+
+    # RFC 9101: the request object's `iss` is verified against the client's
+    # identifier. With no `:client_id` callback that identifier can only come
+    # from what the client AUTHENTICATED as - reading it from the callback alone
+    # leaves the expected issuer nil, which `Attesto.RequestObject` treats as
+    # unverifiable, rejecting every signed request object such a deployment
+    # pushes.
+    test "verifies a signed request object when the host exposes no :client_id callback" do
+      jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_, public_map} = JOSE.JWK.to_public_map(jwk)
+
+      claims =
+        base_params()
+        |> Map.merge(%{"iss" => "confidential-1", "aud" => "https://issuer.example"})
+
+      {_, request} =
+        jwk
+        |> JOSE.JWT.sign(%{"alg" => "ES256", "kid" => "par-key-1"}, claims)
+        |> JOSE.JWS.compact()
+
+      config =
+        config(
+          client_id: nil,
+          client_jwks: fn _client -> %{"keys" => [Map.put(public_map, "kid", "par-key-1")]} end
+        )
+
+      assert {:ok, %{request_uri: request_uri}} = PAR.store(config, request(params: %{"request" => request}))
+      assert {:ok, stored, 45} = Store.lookup(request_uri)
+      assert stored["client_id"] == "confidential-1"
+    end
+
+    # A `client_id` smuggled inside a signed request object cannot reach the
+    # store either. Two independent rules close it, so this pins both rather
+    # than assuming `require_matching_client_id/2` is the one doing the work:
+    # RFC 9101 requires the object's `client_id` to equal its `iss`, and the
+    # object's `iss` is verified against the bound client identifier.
+    test "cannot push another client's request via a signed request object" do
+      jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_, public_map} = JOSE.JWK.to_public_map(jwk)
+      config = config(client_jwks: fn _client -> %{"keys" => [Map.put(public_map, "kid", "par-key-1")]} end)
+
+      signed = fn claims ->
+        {_, request} =
+          jwk
+          |> JOSE.JWT.sign(%{"alg" => "ES256", "kid" => "par-key-1"}, claims)
+          |> JOSE.JWS.compact()
+
+        request
+      end
+
+      # (a) client_id names the victim while iss stays honest: RFC 9101's
+      #     iss == client_id rule rejects it.
+      mismatched =
+        signed.(
+          Map.merge(base_params(), %{
+            "iss" => "confidential-1",
+            "aud" => "https://issuer.example",
+            "client_id" => "victim-client"
+          })
+        )
+
+      assert {:error, %OAuthError{error: :invalid_request_object}} =
+               PAR.store(config, request(params: %{"request" => mismatched}))
+
+      # (b) both iss and client_id name the victim, satisfying RFC 9101: the
+      #     issuer no longer matches the bound client, so verification fails.
+      impersonating =
+        signed.(
+          Map.merge(base_params(), %{
+            "iss" => "victim-client",
+            "aud" => "https://issuer.example",
+            "client_id" => "victim-client"
+          })
+        )
+
+      assert {:error, %OAuthError{error: :invalid_request_object}} =
+               PAR.store(config, request(params: %{"request" => impersonating}))
+    end
+
+    test "refuses to store a request carrying no authenticated client_id" do
+      # `@enforce_keys` admits an explicit nil; storing it would fall back to
+      # the body's own client_id and reopen the binding hole.
+      assert_raise ArgumentError, ~r/:client_id must be the authenticated client identifier/, fn ->
+        PAR.store(config(), request(client_id: nil, params: base_params()))
+      end
+    end
+
+    test "binds to the authenticated client_id when the host exposes no :client_id callback" do
+      # With no `:client_id` callback the opaque client term yields no
+      # identifier. The binding must then come from what the client
+      # AUTHENTICATED as - falling back to the request body would let an
+      # authenticated client push a request in another client's name.
+      config = config(client_id: nil)
+      params = Map.put(base_params(), "client_id", "victim-client")
+
+      assert {:error, %OAuthError{error: :invalid_request}} = PAR.store(config, request(params: params))
+
+      assert {:ok, %{request_uri: request_uri}} =
+               PAR.store(config, request(params: Map.put(base_params(), "client_id", "confidential-1")))
+
       assert {:ok, stored, 45} = Store.lookup(request_uri)
       assert stored["client_id"] == "confidential-1"
     end
