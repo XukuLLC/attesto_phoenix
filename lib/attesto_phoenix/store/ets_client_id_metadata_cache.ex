@@ -147,9 +147,14 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
       {:error, {:already_started, pid}} ->
         cond do
           Process.alive?(pid) -> :ok
-          attempts > 1 -> Process.sleep(10) && ensure_owner(attempts - 1)
+          attempts > 1 -> retry_owner(attempts)
           true -> raise "#{inspect(Owner)} is registered but not alive"
         end
     end
+  end
+
+  defp retry_owner(attempts) do
+    Process.sleep(10)
+    ensure_owner(attempts - 1)
   end
 end
