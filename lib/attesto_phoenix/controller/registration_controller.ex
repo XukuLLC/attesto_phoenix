@@ -243,12 +243,14 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # was rejected.
   defp validate_metadata(metadata, config) do
     with {:ok, auth_method} <- validate_auth_method(metadata, config),
+         {:ok, application_type} <- validate_application_type(metadata),
          {:ok, grant_types} <- validate_grant_types(metadata, config),
          {:ok, redirect_uris} <- validate_redirect_uris(metadata, grant_types),
          {:ok, scope} <- validate_scope(metadata, config),
          {:ok, passthrough} <- validate_passthrough_metadata(metadata) do
       core = %{
         "token_endpoint_auth_method" => auth_method,
+        "application_type" => application_type,
         "grant_types" => grant_types,
         "redirect_uris" => redirect_uris,
         "scope" => scope
@@ -325,6 +327,38 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   # RFC 7591 §2 / RFC 6749 §2.3.1: the token-endpoint auth method must be one
   # the server supports. Absent, it defaults to client_secret_basic.
+  # OpenID Connect Dynamic Client Registration §2 `application_type`: `"web"`
+  # (the default) or `"native"`. It is the standard wire signal a client uses to
+  # declare itself an installed app, and it is what lets an authorization server
+  # accept the redirect URIs RFC 8252 prescribes - a private-use scheme (§7.1)
+  # or a loopback address with a runtime port (§7.3) - instead of rejecting
+  # them as it would for a web client.
+  #
+  # The validated value is carried through to the host's `:register_client`
+  # callback in the client metadata, so a host can persist it and answer
+  # `AttestoPhoenix.ClientStore.client_native?/1` from it. This endpoint does
+  # not itself classify the client: the registered value is a claim by the
+  # client, and whether to honour it is the host's decision.
+  @application_types ~w(web native)
+  @default_application_type "web"
+
+  defp validate_application_type(metadata) do
+    case Map.get(metadata, "application_type") do
+      nil ->
+        {:ok, @default_application_type}
+
+      type when type in @application_types ->
+        {:ok, type}
+
+      other ->
+        {:error,
+         error(
+           @error_invalid_client_metadata,
+           "application_type #{inspect(other)} is invalid; expected one of #{inspect(@application_types)}"
+         )}
+    end
+  end
+
   defp validate_auth_method(metadata, config) do
     supported = token_endpoint_auth_methods_supported(config)
 
@@ -420,11 +454,34 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     end
   end
 
-  # RFC 6749 §3.1.2: a redirect URI must be an absolute URI (scheme + host).
+  # RFC 6749 §3.1.2: a redirect URI must be an absolute URI. That does NOT
+  # require an authority - RFC 3986 §4.3 is `scheme ":" hier-part`, and
+  # `hier-part` may be a bare absolute path - which matters because the
+  # canonical RFC 8252 §7.1 private-use scheme redirect has exactly that shape:
+  #
+  #     com.example.app:/oauth2redirect/example-provider
+  #
+  # It is the FIRST redirect type RFC 8252 prescribes for a native app, ahead
+  # of loopback (§7.3). Requiring a host rejected it outright, so a native app
+  # could be registered with one by hand but never through this endpoint, even
+  # though `Attesto.RedirectURI` matches it correctly at the authorization
+  # endpoint.
+  #
+  # An authority-less URI is accepted only when its scheme contains a dot.
+  # RFC 8252 §7.1 requires the scheme to be a domain name under the app
+  # author's control expressed in reverse order (per RFC 7595 §3.8), so the dot
+  # is inherent to a conforming private-use scheme - and requiring it keeps out
+  # the authority-less schemes that must never be a redirect target, `javascript:`
+  # and `data:` among them.
   defp absolute_uri?(value) when is_binary(value) do
     case URI.new(value) do
-      {:ok, %URI{scheme: scheme, host: host}} ->
-        is_binary(scheme) and scheme != "" and is_binary(host) and host != ""
+      {:ok, %URI{scheme: scheme, host: host}} when is_binary(scheme) and scheme != "" ->
+        cond do
+          is_binary(host) and host != "" -> true
+          # RFC 8252 §7.1 private-use scheme, reverse-DNS, no authority.
+          String.contains?(scheme, ".") -> true
+          true -> false
+        end
 
       _ ->
         false

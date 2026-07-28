@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Recognize the OpenID Connect Registration §2 `application_type` member
+  (`"web"` | `"native"`, defaulting to `"web"`) at the dynamic registration
+  endpoint, and carry the validated value through to `:register_client` in the
+  client metadata. This is the standard wire signal a client uses to declare
+  itself an installed app, so a host can now answer
+  `AttestoPhoenix.ClientStore.client_native?/1` from a registration rather than
+  classifying every native client by hand — connecting dynamic registration to
+  the RFC 8252 profile added in 2.2.0. An `application_type` outside the defined
+  set is rejected with `invalid_client_metadata`.
+
+  Required by the MCP 2026-07-28 authorization specification (SEP-837), which
+  calls this out as the reason authorization servers reject desktop and CLI
+  clients' redirect URIs.
+
+### Fixed
+
+- Accept the canonical RFC 8252 §7.1 private-use scheme redirect URI at the
+  dynamic registration endpoint. `com.example.app:/oauth2redirect` carries no
+  authority, and registration required a non-empty host, so the FIRST redirect
+  type RFC 8252 prescribes for a native app could be registered by hand but
+  never through `POST /register` — even though `Attesto.RedirectURI` matches it
+  correctly at the authorization endpoint. RFC 6749 §3.1.2's "absolute URI" does
+  not require an authority (RFC 3986 §4.3).
+
+  The allowance is gated on the scheme containing a dot, which RFC 8252 §7.1
+  requires of a conforming private-use scheme (a reverse-ordered domain name
+  under the app author's control, per RFC 7595 §3.8). That keeps out the
+  authority-less schemes which must never be a redirect target — `javascript:`
+  and `data:` among them.
+
 ## [2.3.0] - 2026-07-28
 
 ### Changed

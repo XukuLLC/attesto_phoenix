@@ -91,6 +91,15 @@ defmodule AttestoPhoenix.ClientStore do
   Returns `false` when the callback is not exposed, so a host that has not
   classified its clients gets no RFC 8252 behavior at all.
 
+  A host that accepts dynamic registrations can answer this from the client's
+  own declaration rather than classifying by hand: the registration endpoint
+  validates the OpenID Connect Registration §2 `application_type` member
+  (`"web"` | `"native"`, defaulting to `"web"`) and passes it to
+  `:register_client` in the client metadata, so persisting it makes
+  `client_native?/1` a lookup:
+
+      def client_native?(client), do: client.application_type == "native"
+
   > #### Exporting this name means opting in {: .warning}
   >
   > This callback is resolved automatically from an installed `:client_store`

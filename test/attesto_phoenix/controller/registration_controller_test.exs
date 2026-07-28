@@ -71,6 +71,94 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
   defp body(conn), do: JSON.decode!(conn.resp_body)
 
+  # OpenID Connect Registration §2 `application_type`, the standard wire signal
+  # a client uses to declare itself an installed app. Recognising it is what
+  # lets a host answer `client_native?/1` from a dynamic registration instead of
+  # classifying every native client by hand.
+  describe "application_type (OpenID Connect Registration §2 / RFC 8252)" do
+    test "defaults to web when the client does not declare one" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 201
+      assert body(conn)["application_type"] == "web"
+    end
+
+    test "carries a declared native application_type through to the host" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "application_type" => "native",
+          "redirect_uris" => ["http://127.0.0.1:0/cb"]
+        })
+
+      assert conn.status == 201
+      assert body(conn)["application_type"] == "native"
+    end
+
+    test "rejects an application_type outside the defined set" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "application_type" => "mobile",
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+      assert body(conn)["error_description"] =~ "application_type"
+    end
+  end
+
+  # RFC 8252 §7.1: the FIRST redirect type prescribed for a native app is a
+  # private-use URI scheme, whose canonical form carries no authority at all.
+  describe "native app redirect URIs (RFC 8252 §7.1 / §7.3)" do
+    test "accepts the canonical private-use scheme form, which has no authority" do
+      for uri <- ["com.example.app:/oauth2redirect/example-provider", "com.example.app:/"] do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["authorization_code"],
+            "application_type" => "native",
+            "redirect_uris" => [uri]
+          })
+
+        assert conn.status == 201, "expected #{uri} to be registrable, got: #{conn.resp_body}"
+        assert body(conn)["redirect_uris"] == [uri]
+      end
+    end
+
+    test "accepts loopback redirect URIs in both address families" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "application_type" => "native",
+          "redirect_uris" => ["http://127.0.0.1:0/cb", "http://[::1]:0/cb"]
+        })
+
+      assert conn.status == 201
+    end
+
+    # The authority-less allowance is gated on a reverse-DNS scheme (RFC 8252
+    # §7.1 / RFC 7595 §3.8). Without that gate it would admit exactly the
+    # schemes that must never be a redirect target.
+    test "still rejects authority-less schemes that are not reverse-DNS" do
+      for uri <- ["javascript:alert(1)", "data:text/html,x", "mailto:a@b.c", "urn:ietf:params:oauth:x"] do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["authorization_code"],
+            "application_type" => "native",
+            "redirect_uris" => [uri]
+          })
+
+        assert conn.status == 400, "expected #{uri} to be refused"
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+    end
+  end
+
   describe "successful registration (RFC 7591 §3.2.1)" do
     test "registers a confidential client and returns 201 with credentials" do
       conn =
