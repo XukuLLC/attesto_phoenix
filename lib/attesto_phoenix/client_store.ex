@@ -83,14 +83,21 @@ defmodule AttestoPhoenix.ClientStore do
 
   A native app runs on the end user's own device — an iOS/Android app or a
   desktop binary — rather than on a server the operator controls. That single
-  fact drives the RFC 8252 authorization-server obligations: PKCE is required
-  for it (§8.1), it must authenticate at the token endpoint with `none` because
-  it cannot hold a secret confidentially (§8.4), and — only when the host also
-  enables `native_apps: [loopback_redirect: true]` — its loopback redirect URI
-  may vary in port (§7.3).
+  fact drives the RFC 8252 authorization-server obligations: its loopback
+  redirect URI may vary in port (§7.3), PKCE is required for it (§8.1), and it
+  must authenticate at the token endpoint with `none` because it cannot hold a
+  secret confidentially (§8.4).
 
   Returns `false` when the callback is not exposed, so a host that has not
   classified its clients gets no RFC 8252 behavior at all.
+
+  > #### Exporting this name means opting in {: .warning}
+  >
+  > This callback is resolved automatically from an installed `:client_store`
+  > module. If yours already exports `client_native?/1` meaning something else —
+  > "native to our platform", "first-party" — those clients get the RFC 8252
+  > profile, **including the §7.3 redirect-URI relaxation**. Rename it, or set
+  > the flat `:client_native?` config key to a function returning `false`.
 
   Marking a client native is the whole decision — the RFC 8252 profile then
   applies to that client — with two consequences worth stating outright:

@@ -249,11 +249,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `Attesto.AuthorizationRequest` (RFC 6749 §3.1.2.3). A host that does not
   # supply the callback exposes no registered URIs, so every request is rejected
   # with `{:direct, :redirect_uri_not_registered}` (fail closed) rather than
-  # silently trusting the supplied URI. Matching is exact unless the host has
-  # both enabled `native_apps: [loopback_redirect: true]` and marked this client
-  # native, in which case RFC 8252 §7.3 lets its loopback redirect URI vary in
-  # port; `RequestPolicy.redirect_uri_matching/2` owns that decision. An
-  # unmatched URI stays non-redirectable under every policy.
+  # silently trusting the supplied URI. Matching is exact unless the host marked
+  # this client native, in which case RFC 8252 §7.3 lets its loopback redirect
+  # URI vary in port; `RequestPolicy.redirect_uri_matching/2` owns that
+  # decision. An unmatched URI stays non-redirectable under every policy.
   #
   # OIDC Core §3.1.2.1: the `nonce` is OPTIONAL for the code flow by default, but
   # an OpenID Provider MAY require it. When the host sets `:require_nonce`, a

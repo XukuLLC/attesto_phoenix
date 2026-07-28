@@ -1086,7 +1086,12 @@ defmodule AttestoPhoenix.Config do
   """
   @spec native_app_loopback_redirect?(t()) :: boolean()
   def native_app_loopback_redirect?(%__MODULE__{} = config) do
-    config |> native_apps() |> Keyword.get(:loopback_redirect, true) != false
+    # Strict `== true`, matching every other flag reader in this module. The
+    # default is what differs (absent means enabled, because §7.3 is a MUST) -
+    # NOT the parsing. A value that is neither `true` nor `false` never reaches
+    # here through `new/1`, which refuses it at boot; should one arrive on a
+    # struct built by hand, it disables the relaxation rather than granting it.
+    config |> native_apps() |> Keyword.get(:loopback_redirect, true) == true
   end
 
   @doc """
@@ -2444,8 +2449,47 @@ defmodule AttestoPhoenix.Config do
 
     validate_discovery_endpoints!(config)
     validate_advertised_paths_consistent!(config)
+    validate_native_apps!(config)
 
     config
+  end
+
+  # `:native_apps` carries exactly two members, both booleans, and one of them
+  # (`:loopback_redirect`) is an opt-OUT: it is the switch an operator reaches
+  # for to FORBID the RFC 8252 §7.3 relaxation. A silently-ignored value there
+  # fails open - the operator believes the relaxation is off while the server
+  # still grants it - so both a non-boolean value and an unrecognized member
+  # (a typo'd `:loopbak_redirect`, say) are refused at boot rather than at the
+  # first authorization request.
+  #
+  # This matters more here than for the library's opt-IN flags, where an
+  # unreadable value merely leaves a feature off. `native_apps: [loopback_redirect:
+  # System.get_env("...", "false")]` is an ordinary `runtime.exs` shape and
+  # yields the string `"false"`, which is exactly the case that must not be
+  # mistaken for "enabled".
+  @native_apps_members Keyword.keys(@native_apps_defaults)
+
+  defp validate_native_apps!(%__MODULE__{} = config) do
+    opts = native_apps(config)
+
+    Enum.each(opts, fn {key, value} ->
+      cond do
+        key not in @native_apps_members ->
+          raise ArgumentError,
+                "AttestoPhoenix.Config: unknown :native_apps option #{inspect(key)}; " <>
+                  "expected one of #{inspect(@native_apps_members)}"
+
+        not is_boolean(value) ->
+          raise ArgumentError,
+                "AttestoPhoenix.Config: :native_apps #{inspect(key)} must be true or false, " <>
+                  "got #{inspect(value)}"
+
+        true ->
+          :ok
+      end
+    end)
+
+    :ok
   end
 
   defp validate_resource_indicators!(%__MODULE__{} = config) do

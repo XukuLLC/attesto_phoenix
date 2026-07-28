@@ -29,15 +29,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as an operator kill switch or for a deployment certifying against a profile
   that mandates exact redirect-URI matching.
 
-  **Upgrading from 2.2.0:** `loopback_redirect: true` becomes a no-op (it is
-  now the default) and `false` keeps its meaning, so neither setting changes
-  behavior. The one behavioral change is for a host that marked clients native
-  but left the option unset — those clients now get the §7.3 exception, which
-  is what RFC 8252 requires.
-
   `reject_embedded_user_agents` is unaffected and remains a genuine opt-in
   flag: §8.12 is a heuristic SHOULD and a server-wide posture rather than a
   per-client property.
+
+- `:native_apps` options are now validated at config build. A non-boolean
+  member value, or an unrecognized member (a typo'd `:loopbak_redirect`),
+  raises `ArgumentError` instead of being silently ignored. This matters
+  because `:loopback_redirect` is the switch an operator reaches for to
+  *forbid* a relaxation: `native_apps: [loopback_redirect: System.get_env("X",
+  "false")]` yields the string `"false"`, which must not be mistaken for
+  "enabled". The predicate itself now reads strictly (`== true`), matching every
+  other flag in `AttestoPhoenix.Config`; only the default differs.
+
+### Upgrading from 2.2.0
+
+Behavior changes only where a client is marked native — `:client_native?`
+still defaults to `false`, so a deployment that classifies no clients is
+entirely unaffected.
+
+Where native clients do exist, these configuration shapes gain the §7.3
+exception that 2.2.0 withheld: `:native_apps` omitted entirely; `native_apps:
+[]`; `native_apps: nil`; and `native_apps: [reject_embedded_user_agents:
+true]` (a host that configured the group for §8.12 only). `loopback_redirect:
+true` becomes a no-op and `false` keeps its meaning, so an explicit setting
+is unchanged either way.
+
+> #### Check whether your `:client_store` exports `client_native?/1` {: .warning}
+>
+> 2.2.0 noted that a `:client_store` module already exporting a function of
+> that name — meaning "native to our platform", "first-party" — would be read
+> as the RFC 8252 classification. In 2.2.0 the consequences were *restrictions*
+> (forced PKCE, refused client secrets), which a public + PKCE client would not
+> have noticed. **In 2.3.0 the same accidental mark also widens redirect-URI
+> matching**: any such client with a loopback redirect URI registered — a
+> routine `http://127.0.0.1:3000/callback` dev entry alongside the production
+> one — will accept the authorization code on *any* port on 127.0.0.1.
+>
+> If your client store exports `client_native?/1` for an unrelated purpose,
+> rename it, or set the flat `:client_native?` config key to a function
+> returning `false`, before upgrading.
 
 ## [2.2.0] - 2026-07-28
 

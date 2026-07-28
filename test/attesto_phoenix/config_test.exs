@@ -814,6 +814,31 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.reject_embedded_user_agents?(config(native_apps: [reject_embedded_user_agents: true]))
     end
 
+    # `:loopback_redirect` is the switch an operator reaches for to FORBID a
+    # relaxation, so a value it cannot read must not be mistaken for "enabled".
+    # Refused at boot rather than silently ignored.
+    test "rejects a non-boolean :loopback_redirect rather than failing open" do
+      for value <- ["false", "true", nil, 0, :no, 1] do
+        assert_raise ArgumentError, ~r/:native_apps :loopback_redirect must be true or false/, fn ->
+          config(native_apps: [loopback_redirect: value])
+        end
+      end
+    end
+
+    test "rejects a non-boolean :reject_embedded_user_agents too" do
+      assert_raise ArgumentError, ~r/must be true or false/, fn ->
+        config(native_apps: [reject_embedded_user_agents: "yes"])
+      end
+    end
+
+    # A typo'd member would otherwise sit in the keyword list doing nothing
+    # while the operator believed it had disabled the exception.
+    test "rejects an unrecognized :native_apps member" do
+      assert_raise ArgumentError, ~r/unknown :native_apps option :loopbak_redirect/, fn ->
+        config(native_apps: [loopbak_redirect: false])
+      end
+    end
+
     test "the two members are independent" do
       config = config(native_apps: [loopback_redirect: false, reject_embedded_user_agents: true])
 

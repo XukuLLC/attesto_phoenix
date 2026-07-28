@@ -114,6 +114,9 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
     test "a client the host has not marked native stays exact" do
       assert RequestPolicy.redirect_uri_matching(config([]), @confidential) == :exact
       assert RequestPolicy.redirect_uri_matching(config([]), @public) == :exact
+
+      # Control on the same config: the exception IS available, just not to them.
+      assert RequestPolicy.redirect_uri_matching(config([]), @native_public) == :exact_allow_loopback_port
     end
 
     test "an unclassified deployment sees exact matching everywhere" do
@@ -124,27 +127,32 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
     end
 
     # The remaining flag is an escape hatch, not a gate: it can only ever
-    # REMOVE the exception.
+    # REMOVE the exception. Paired with the unset case on the same client, so
+    # the assertion cannot be satisfied by an implementation that simply never
+    # grants the exception.
     test "the server-wide opt-out forbids the exception even for a native client" do
-      config = config(native_apps: [loopback_redirect: false])
+      assert RequestPolicy.redirect_uri_matching(config(native_apps: [loopback_redirect: false]), @native_public) ==
+               :exact
 
-      assert RequestPolicy.redirect_uri_matching(config, @native_public) == :exact
+      assert RequestPolicy.redirect_uri_matching(config([]), @native_public) == :exact_allow_loopback_port
     end
 
     test "setting the opt-out to true is a no-op, since that is the default" do
       assert RequestPolicy.redirect_uri_matching(config(native_apps: [loopback_redirect: true]), @native_public) ==
-               RequestPolicy.redirect_uri_matching(config([]), @native_public)
+               :exact_allow_loopback_port
     end
 
     test "a CIMD client is never granted the exception" do
       assert RequestPolicy.redirect_uri_matching(config([]), {:cimd, %{}}) == :exact
+
+      assert RequestPolicy.redirect_uri_matching(config([]), @native_public) == :exact_allow_loopback_port
     end
 
     # Both resolved modes must be ones the core actually implements, and they
     # must be DIFFERENT - an implementation that collapsed to a single mode
     # would satisfy "is a valid mode" while silently disabling the feature.
     test "the two resolved modes are distinct and both accepted by Attesto.RedirectURI" do
-      config = config(native_apps: [loopback_redirect: true])
+      config = config([])
 
       native = RequestPolicy.redirect_uri_matching(config, @native_public)
       other = RequestPolicy.redirect_uri_matching(config, @confidential)

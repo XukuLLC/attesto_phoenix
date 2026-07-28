@@ -1388,19 +1388,22 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert location(conn) =~ "http://[::1]:51823/cb"
     end
 
-    # RFC 8252 §8.3: the literal IP is required.
-    test "localhost is refused even with the exception on" do
-      conn = call(native_params("http://localhost:51823/cb"))
+    # RFC 8252 §8.3: the literal IP is required. Each of these pairs the
+    # rejection with a positive control on the SAME configuration, so the test
+    # distinguishes "refused because of this specific difference" from "refused
+    # because the exception was not active at all".
+    test "localhost is refused while the literal IP on the same port succeeds" do
+      assert call(native_params("http://localhost:51823/cb")).status == 400
+      assert call(native_params("http://localhost:51823/cb")) |> location() == nil
 
-      assert conn.status == 400
-      assert location(conn) == nil
+      assert call(native_params("http://127.0.0.1:51823/cb")).status == 302
     end
 
-    test "a differing path is refused even with the exception on" do
-      conn = call(native_params("http://127.0.0.1:51823/other"))
+    test "a differing path is refused while the registered path on a varying port succeeds" do
+      assert call(native_params("http://127.0.0.1:51823/other")).status == 400
+      assert call(native_params("http://127.0.0.1:51823/other")) |> location() == nil
 
-      assert conn.status == 400
-      assert location(conn) == nil
+      assert call(native_params("http://127.0.0.1:51823/cb")).status == 302
     end
 
     test "a non-native client with the same registration gets no port flexibility" do

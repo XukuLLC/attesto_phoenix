@@ -79,14 +79,18 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   `http://[::1]/...` redirect URI matches on any port (see `Attesto.RedirectURI`
   for exactly how narrow that exception is).
 
-  Marking the client native is the whole decision, and deliberately so.
-  RFC 8252 §7.3 says the authorization server MUST allow any port for a loopback
-  redirect URI; requiring a second server-wide opt-in on top would mean
-  violating that MUST for a client the host had already declared to be an
-  installed app. It would also be inconsistent with the rest of the profile,
-  since §8.1 (PKCE) and §8.4 (client authentication) key on the mark alone - if
-  the mark is trusted to refuse a client its secret, it is trusted to vary a
-  port.
+  Marking the client native is the whole decision. RFC 8252 §7.3 says the
+  authorization server MUST allow any port for a loopback redirect URI, so
+  requiring a second server-wide opt-in on top would mean violating that MUST
+  for a client the host had already declared to be an installed app.
+
+  That is the entire argument, deliberately. A tempting second one - that §8.1
+  and §8.4 already key on the mark alone, so §7.3 may too - does not hold up:
+  those are RESTRICTIONS and this is a RELAXATION, and the two have very
+  different blast radii when the mark is wrong. A mistaken restriction denies a
+  client service loudly; a mistaken relaxation widens a security check
+  silently. Which is why `:client_native?` is documented as an opt-in that a
+  host must not export by accident.
 
   The default-off guarantee comes from `:client_native?` itself defaulting to
   `false`, not from a separate flag: a deployment that classifies no clients has
