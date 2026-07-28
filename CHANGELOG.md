@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-07-28
+
+### Changed
+
+- RFC 8252 §7.3 loopback interface redirection now follows from marking a
+  client native (`:client_native?`) alone. `native_apps: [loopback_redirect:
+  ...]` is no longer a gate that must be opened; it is an opt-**out**,
+  defaulting to `true`.
+
+  2.2.0 required both a server-wide flag and the per-client mark. That was
+  wrong on two counts. §7.3 states the port allowance as a **MUST**, so
+  refusing a native client's ephemeral port made the server non-conformant for
+  a client the host had already declared to be an installed app. And it was
+  internally inconsistent: §8.1 (PKCE) and §8.4 (client authentication) already
+  keyed on the mark alone — if the mark is trusted to refuse a client its
+  secret, it is trusted to vary a port.
+
+  What keeps the profile off for an unconfigured deployment is unchanged and
+  was never the flag: `:client_native?` itself defaults to `false`, so a host
+  that classifies no clients has no native clients.
+
+  Setting `loopback_redirect: false` still forbids the exception server-wide,
+  as an operator kill switch or for a deployment certifying against a profile
+  that mandates exact redirect-URI matching.
+
+  **Upgrading from 2.2.0:** `loopback_redirect: true` becomes a no-op (it is
+  now the default) and `false` keeps its meaning, so neither setting changes
+  behavior. The one behavioral change is for a host that marked clients native
+  but left the option unset — those clients now get the §7.3 exception, which
+  is what RFC 8252 requires.
+
+  `reject_embedded_user_agents` is unaffected and remains a genuine opt-in
+  flag: §8.12 is a heuristic SHOULD and a server-wide posture rather than a
+  per-client property.
+
 ## [2.2.0] - 2026-07-28
 
 ### Upgrade note

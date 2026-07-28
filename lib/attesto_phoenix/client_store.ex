@@ -92,12 +92,14 @@ defmodule AttestoPhoenix.ClientStore do
   Returns `false` when the callback is not exposed, so a host that has not
   classified its clients gets no RFC 8252 behavior at all.
 
-  Marking a client native is mostly additive hardening, with two consequences
-  worth stating outright:
+  Marking a client native is the whole decision — the RFC 8252 profile then
+  applies to that client — with two consequences worth stating outright:
 
-    * It is what the loopback redirect exception (§7.3) keys on, but that
-      relaxation additionally requires the host to enable
-      `native_apps: [loopback_redirect: true]`.
+    * It enables the §7.3 loopback redirect exception for that client, so its
+      `http://127.0.0.1/...` / `http://[::1]/...` redirect URI matches on any
+      port. §7.3 states that as a MUST, which is why it needs no further
+      opt-in; `native_apps: [loopback_redirect: false]` can forbid it
+      server-wide if a deployment must.
     * Where no `client_public?/1` callback is configured at all, a native client
       counts as public — which both refuses its secret (§8.4) and admits it on
       the secretless `none` path. That is the §8.1/§8.4 posture for a native

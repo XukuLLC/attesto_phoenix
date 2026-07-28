@@ -252,16 +252,14 @@ client is an installed app:
 
 ```elixir
 config :my_app, AttestoPhoenix.Config,
-  client_native?: {MyApp.OAuth, :client_native?},   # (client -> boolean), default false
-
-  native_apps: [
-    loopback_redirect: false,            # RFC 8252 §7.3 — see the warning below
-    reject_embedded_user_agents: false   # RFC 8252 §8.12 — heuristic, opt-in
-  ]
+  client_native?: {MyApp.OAuth, :client_native?}   # (client -> boolean), default false
 ```
 
-With `:client_native?` in place and nothing else configured, a native client
-gets the two restrictions:
+That callback is the whole decision. A client it returns `true` for gets the
+RFC 8252 profile; everything else is untouched, and a deployment that never
+wires it has no native clients and so behaves exactly as before.
+
+Marking a client native gives it:
 
 - **PKCE is required (§8.1).** It is forced for a native client regardless of
   the global `:require_pkce` flag. `S256` is required and `plain` is rejected
@@ -283,22 +281,32 @@ gets the two restrictions:
 > deployment running `require_pushed_authorization_requests: true` cannot also
 > serve native public clients.
 
-The other two rules are opt-in:
-
-- **`loopback_redirect: true` (§7.3)** lets a native client that cannot use a
-  private-use URI scheme bind an ephemeral loopback port at runtime: its
-  `http://127.0.0.1/...` or `http://[::1]/...` redirect URI then matches the
+- **Loopback interface redirection (§7.3).** A native client that cannot use a
+  private-use URI scheme binds an ephemeral loopback port at runtime, so its
+  `http://127.0.0.1/...` or `http://[::1]/...` redirect URI matches the
   registered one on **any port**, while scheme, host, path, and query still
   compare exactly. Nothing else relaxes — `https`, private-use schemes, remote
-  hosts, non-native clients, and the hostname `localhost` (§8.3 forbids it) all
-  stay byte-exact, and an unmatched redirect URI is still refused directly
+  hosts, non-native clients, and the hostname `localhost` (§8.3 discourages it)
+  all stay byte-exact, and an unmatched redirect URI is still refused directly
   rather than redirected to.
 
-  > **Certification note.** This is the only rule here that *widens* a check.
-  > Exact redirect-URI matching is assumed by the OpenID Connect and FAPI
-  > profiles, so enabling this is incompatible with certifying against them.
-  > It takes both the server-wide flag and the per-client `:client_native?`
-  > mark, and it is off by default.
+  §7.3 states this as a MUST, which is why it needs no further opt-in: refusing
+  a declared native app's ephemeral port would be non-conformant.
+
+  > **Certification note.** This is the only rule here that *widens* a check,
+  > and exact redirect-URI matching is assumed by the OpenID Connect and FAPI
+  > profiles. A deployment certifying against those normally has no native
+  > clients, so the answer is simply not to mark any — but
+  > `native_apps: [loopback_redirect: false]` forbids the exception
+  > server-wide if you need a hard switch.
+
+One rule is genuinely opt-in, because unlike the rest it is a server-wide
+posture rather than a per-client property:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  native_apps: [reject_embedded_user_agents: true]   # RFC 8252 §8.12
+```
 
 - **`reject_embedded_user_agents: true` (§8.12)** refuses an authorization
   request that appears to come from an in-app webview, whose host application

@@ -781,25 +781,31 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe ":native_apps (RFC 8252)" do
-    test "defaults to the feature-off keyword list when unset" do
+    test "defaults the §7.3 exception on and the §8.12 heuristic off" do
       native_apps = Config.native_apps(config())
 
-      assert native_apps[:loopback_redirect] == false
+      # §7.3 is a MUST for native clients, so it is an opt-OUT. What keeps the
+      # profile off for an unconfigured deployment is `:client_native?`
+      # defaulting to false, not this member.
+      assert native_apps[:loopback_redirect] == true
+      # §8.12 is a heuristic SHOULD, so it stays a genuine opt-in.
       assert native_apps[:reject_embedded_user_agents] == false
     end
 
     test "merges host overrides over the defaults, leaving unset members defaulted" do
-      native_apps = config(native_apps: [loopback_redirect: true]) |> Config.native_apps()
+      native_apps = config(native_apps: [reject_embedded_user_agents: true]) |> Config.native_apps()
 
+      assert native_apps[:reject_embedded_user_agents] == true
       assert native_apps[:loopback_redirect] == true
-      assert native_apps[:reject_embedded_user_agents] == false
     end
 
-    test "native_app_loopback_redirect?/1 reflects the :loopback_redirect member" do
-      refute Config.native_app_loopback_redirect?(config())
-      refute Config.native_app_loopback_redirect?(config(native_apps: []))
-      refute Config.native_app_loopback_redirect?(config(native_apps: [loopback_redirect: false]))
+    test "native_app_loopback_redirect?/1 is an opt-out, not a gate" do
+      assert Config.native_app_loopback_redirect?(config())
+      assert Config.native_app_loopback_redirect?(config(native_apps: []))
       assert Config.native_app_loopback_redirect?(config(native_apps: [loopback_redirect: true]))
+
+      # Only an explicit `false` turns it off.
+      refute Config.native_app_loopback_redirect?(config(native_apps: [loopback_redirect: false]))
     end
 
     test "reject_embedded_user_agents?/1 reflects the :reject_embedded_user_agents member" do
@@ -809,9 +815,9 @@ defmodule AttestoPhoenix.ConfigTest do
     end
 
     test "the two members are independent" do
-      config = config(native_apps: [loopback_redirect: true, reject_embedded_user_agents: true])
+      config = config(native_apps: [loopback_redirect: false, reject_embedded_user_agents: true])
 
-      assert Config.native_app_loopback_redirect?(config)
+      refute Config.native_app_loopback_redirect?(config)
       assert Config.reject_embedded_user_agents?(config)
     end
   end
