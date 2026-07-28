@@ -195,6 +195,36 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
       assert detail =~ "does not match the authenticated client"
     end
 
+    # RFC 9101: the request object's `iss` is verified against the client's
+    # identifier. With no `:client_id` callback that identifier can only come
+    # from what the client AUTHENTICATED as - reading it from the callback alone
+    # leaves the expected issuer nil, which `Attesto.RequestObject` treats as
+    # unverifiable, rejecting every signed request object such a deployment
+    # pushes.
+    test "verifies a signed request object when the host exposes no :client_id callback" do
+      jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_, public_map} = JOSE.JWK.to_public_map(jwk)
+
+      claims =
+        base_params()
+        |> Map.merge(%{"iss" => "confidential-1", "aud" => "https://issuer.example"})
+
+      {_, request} =
+        jwk
+        |> JOSE.JWT.sign(%{"alg" => "ES256", "kid" => "par-key-1"}, claims)
+        |> JOSE.JWS.compact()
+
+      config =
+        config(
+          client_id: nil,
+          client_jwks: fn _client -> %{"keys" => [Map.put(public_map, "kid", "par-key-1")]} end
+        )
+
+      assert {:ok, %{request_uri: request_uri}} = PAR.store(config, request(params: %{"request" => request}))
+      assert {:ok, stored, 45} = Store.lookup(request_uri)
+      assert stored["client_id"] == "confidential-1"
+    end
+
     test "binds to the authenticated client_id when the host exposes no :client_id callback" do
       # With no `:client_id` callback the opaque client term yields no
       # identifier. The binding must then come from what the client

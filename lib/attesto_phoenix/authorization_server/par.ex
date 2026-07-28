@@ -106,7 +106,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     # (RFC 9101 §6.3) before DPoP reconciliation: a signed `dpop_jkt` must be the
     # value the presented proof is checked against, never an unsigned body value.
     with :ok <- reject_request_uri(params),
-         {:ok, params} <- verify_request_object(config, client, params),
+         {:ok, params} <- verify_request_object(config, client, bound_client_id, params),
          :ok <- require_matching_client_id(params, bound_client_id),
          :ok <- validate_pushed_request(config, client, params),
          {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params) do
@@ -307,9 +307,17 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # compact `request` JWT is retained so /authorize re-verifies it too. A PAR
   # carrying no `request` object is stored as-is - requiring its presence is a
   # separate profile concern.
-  defp verify_request_object(config, client, %{"request" => request}) when is_binary(request) and request != "" do
+  #
+  # The expected `iss` is the BOUND client identifier - the host's `:client_id`
+  # callback when it resolves, otherwise the identifier the client
+  # authenticated as. Reading it from the callback alone would leave `iss` nil
+  # for a host that exposes no `:client_id`, and `Attesto.RequestObject` treats
+  # a nil expected issuer as unverifiable, so every signed request object pushed
+  # to PAR by such a deployment would be rejected as `invalid_request_object`.
+  defp verify_request_object(config, client, bound_client_id, %{"request" => request})
+       when is_binary(request) and request != "" do
     opts =
-      [issuer: client_id(config, client), audience: config.issuer] ++
+      [issuer: bound_client_id, audience: config.issuer] ++
         RequestObject.Policy.to_verify_opts(request_object_policy(config))
 
     case RequestObject.verify(request, client_jwks(config, client) || %{"keys" => []}, opts) do
@@ -325,7 +333,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # configured policy requires a signed request object, a PAR carrying none is
   # rejected here (RFC 9126 §2.3 invalid_request) rather than stored as a plain
   # request; otherwise the pushed plain parameters stand (generic OIDC §6.1).
-  defp verify_request_object(config, _client, params) do
+  defp verify_request_object(config, _client, _bound_client_id, params) do
     if RequestObject.Policy.require_request_object?(request_object_policy(config)) do
       {:error,
        error(

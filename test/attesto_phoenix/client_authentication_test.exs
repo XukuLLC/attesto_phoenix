@@ -457,6 +457,22 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: true)
     end
 
+    # The refusal above must not leave the client unable to authenticate AT ALL.
+    # `none` is the method RFC 8252 §8.1/§8.4 prescribe for a native app, so the
+    # same "unclassified native client is public" rule has to admit it here -
+    # otherwise marking a client native without also wiring `:client_public?`
+    # would brick it on every path.
+    test "a native client with no :client_public? callback still authenticates with none", %{config: config} do
+      config = %{config | client_public?: nil}
+
+      assert {:ok, %Result{client_id: "native-public-1", method: :none}} =
+               authenticate([], %{"client_id" => "native-public-1"}, config, allow_public: true)
+
+      # The default flips only for native clients: an unclassified NON-native
+      # client is still confidential, so the secretless path stays closed to it.
+      assert_generic_invalid_client(authenticate([], %{"client_id" => "confidential-1"}, config, allow_public: true))
+    end
+
     test "a native public client presenting private_key_jwt is rejected", %{config: config} do
       # A private key shipped inside an installed app is no more confidential
       # than a shared secret, so the assertion path is closed too: the client

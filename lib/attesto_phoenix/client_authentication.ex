@@ -577,8 +577,29 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # defers to the host's `:client_public?` discriminator.
   defp client_public?(_config, {:cimd, _metadata}), do: true
 
+  # Absent the host's `:client_public?` callback the answer normally fails
+  # closed to `false`: an unclassified client must not be admitted on the
+  # secretless path, because doing so would let anyone who knows a confidential
+  # client's `client_id` authenticate as it.
+  #
+  # For a client the host marked NATIVE that default flips to `true`, because
+  # for a native app the fail-closed direction is the other way. RFC 8252 §8.4
+  # says an installed app's statically included secret MUST NOT be accepted as
+  # proof of identity, so treating an unclassified native client as
+  # confidential would accept exactly the credential §8.4 forbids. Marking a
+  # client native is itself the deliberate classification that makes it public;
+  # `none` + PKCE is the posture §8.1 prescribes for it.
+  #
+  # One rule, used by BOTH the secretless gate and the §8.4 secret refusal, so
+  # the two cannot disagree. An earlier split - fail-closed-to-false here,
+  # fail-closed-to-true for §8.4 - left a native client with no
+  # `:client_public?` callback refused on both paths and therefore unable to
+  # authenticate at all.
   defp client_public?(config, client) do
-    Callback.invoke(Config.client_public_fun(config), [client], false) == true
+    case Config.client_public_fun(config) do
+      nil -> client_native?(config, client)
+      callback -> Callback.invoke(callback, [client]) == true
+    end
   end
 
   # The authenticated OAuth `client_id` (RFC 6749 §2.2) carried by the
@@ -636,32 +657,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp native_client_auth_permitted?(_config, _client, :none), do: true
 
   defp native_client_auth_permitted?(config, client, _method) do
-    not (client_native?(config, client) and native_client_public?(config, client))
-  end
-
-  # The public/confidential question for a NATIVE client, which defaults the
-  # opposite way to `client_public?/2` above - deliberately, because the two
-  # answer different questions.
-  #
-  # `client_public?/2` gates the secretless path, where an unclassified client
-  # must be treated as confidential so a missing callback cannot let anyone
-  # authenticate as it without a secret. Here the fail-closed direction is
-  # reversed: RFC 8252 §8.4 says that where a native client has a statically
-  # included shared secret the server MUST treat it as a public client and MUST
-  # NOT accept the secret as proof of identity. Defaulting an unclassified
-  # native client to "confidential" would therefore accept exactly the shipped
-  # secret §8.4 forbids - and would do it silently, for a host that wired
-  # `:client_native?` but not `:client_public?`.
-  #
-  # So an absent callback resolves to public and the secret is refused. Only an
-  # explicit `:client_public?` returning false - the host affirmatively claiming
-  # this native client holds per-instance credentials - keeps the secret path
-  # open.
-  defp native_client_public?(config, client) do
-    case Config.client_public_fun(config) do
-      nil -> true
-      callback -> Callback.invoke(callback, [client]) == true
-    end
+    not (client_native?(config, client) and client_public?(config, client))
   end
 
   # The native-app discriminator (RFC 8252 / BCP 212). A CIMD client is
