@@ -160,6 +160,73 @@ defmodule AttestoPhoenix.ClientIdMetadata do
 
   def same_origin_redirect_uri?(_client_id, _redirect_uri), do: false
 
+  # An arbitrary usable port for the loopback probe below.
+  @probe_port 49_152
+
+  @doc """
+  Whether the document declares at least one RFC 8252 §7.3 loopback redirect
+  URI (`http://127.0.0.1/...` or `http://[::1]/...`).
+
+  This is how a CIMD client says "I am an installed app". CIMD has no
+  `application_type` member — it inherits the dynamic-registration metadata
+  registry by reference, and whether that carries OpenID Connect's
+  `application_type` is an open question on the draft's own tracker — so the
+  only native signal available is the shape of the URIs the document itself
+  declares. Those are validated document content rather than a claimed
+  attribute, which makes them the sounder thing to key on regardless.
+  """
+  @spec loopback_redirect_uris?(map()) :: boolean()
+  def loopback_redirect_uris?(metadata) when is_map(metadata) do
+    # `Map.get/3` rather than `redirect_uris/1`: document validation guarantees
+    # the key, but this is a predicate feeding a policy decision and must answer
+    # "no" for a document that somehow lacks it rather than raising mid-request.
+    metadata
+    |> Map.get("redirect_uris", [])
+    |> List.wrap()
+    |> Enum.any?(&loopback_redirect_uri?/1)
+  end
+
+  def loopback_redirect_uris?(_metadata), do: false
+
+  @doc """
+  Whether `uri` is an RFC 8252 §7.3 loopback redirect URI.
+
+  Delegates the decision to `Attesto.RedirectURI` so "what counts as loopback"
+  has exactly one definition: a URI is loopback iff the §7.3 matcher would
+  treat it as one. `http://localhost/...` is deliberately not loopback here
+  (§8.3 — the literal IP is required), so a document declaring only `localhost`
+  gets no port flexibility.
+  """
+  @spec loopback_redirect_uri?(term()) :: boolean()
+  def loopback_redirect_uri?(uri) when is_binary(uri) do
+    # Ask the matcher rather than re-deciding: build a probe that differs from
+    # `uri` ONLY in port and see whether §7.3 matching accepts it. If it does,
+    # `uri` is loopback, because the port allowance is the only thing in that
+    # mode that can bridge the difference. Nothing about which hosts count as
+    # loopback is restated here, so the two cannot drift.
+    #
+    # The authority precondition is not part of that rule - it is what makes
+    # the probe meaningful. A URI with no authority (`com.example.app:/cb`)
+    # cannot carry a port, so the probe would come back byte-identical and
+    # match EXACTLY, which says nothing about loopback.
+    case URI.new(uri) do
+      {:ok, %URI{host: host} = parsed} when is_binary(host) and host != "" ->
+        probe = URI.to_string(%{parsed | port: probe_port(parsed)})
+
+        probe != uri and Attesto.RedirectURI.registered?(probe, [uri], :exact_allow_loopback_port)
+
+      _ ->
+        false
+    end
+  end
+
+  def loopback_redirect_uri?(_uri), do: false
+
+  # A port in the range the §7.3 request side accepts (1..65535, so never 0)
+  # and different from whatever this URI already has.
+  defp probe_port(%URI{port: @probe_port}), do: @probe_port - 1
+  defp probe_port(%URI{}), do: @probe_port
+
   # The effective port: the explicit `:port` when present, else the scheme's
   # default (`URI.default_port/1`), so `https://h/p` and `https://h:443/p`
   # compare equal.

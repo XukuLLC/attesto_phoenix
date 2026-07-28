@@ -278,7 +278,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
   end
 
-  # draft-ietf-oauth-client-id-metadata-document-01 §2 (MAY, enforced by
+  # draft-ietf-oauth-client-id-metadata-document-01 §6.1 (MAY, enforced by
   # default): the request `redirect_uri` must be same-origin (scheme + host +
   # port) with the CIMD `client_id` URL, on top of the exact-match against the
   # document's `redirect_uris` the core already performed. A non-same-origin
@@ -286,6 +286,22 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # non-redirectable - a direct error, like an unregistered redirect_uri. Only
   # applies to CIMD clients; a registered client has no `client_id` URL to be
   # same-origin with.
+  #
+  # A LOOPBACK redirect URI is exempt, and has to be. A CIMD `client_id` is an
+  # `https` URL by definition, so `http://127.0.0.1/cb` can never share its
+  # origin - the check is not a policy such a client fails, it is one no
+  # installed app can satisfy by construction. Applying it there would deny CIMD
+  # to native apps entirely, which is the population the drafts point at CIMD
+  # now that dynamic registration is deprecated, and real clients (Claude Code's
+  # published document among them) declare exactly these URIs.
+  #
+  # What is given up is same-origin binding for loopback redirects: any CIMD
+  # document may declare one and receive a code on the user's own machine. The
+  # check's value is against a document impersonating a better-known client to
+  # collect codes at ITS origin, and that value is retained in full for the
+  # `https` redirects where such an attack lives. For loopback the attacker must
+  # already run code on the device to hold the port, and PKCE is mandatory for
+  # every CIMD client regardless.
   defp require_same_origin_redirect_uri(config, {:cimd, metadata}, request) do
     same_origin_required? =
       config
@@ -294,6 +310,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
     cond do
       not same_origin_required? ->
+        :ok
+
+      ClientIdMetadata.loopback_redirect_uri?(request.redirect_uri) ->
         :ok
 
       ClientIdMetadata.same_origin_redirect_uri?(

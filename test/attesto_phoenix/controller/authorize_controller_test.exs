@@ -405,6 +405,62 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       StubFetcher.script(client_id, {:ok, %{body: body, cache_control: []}})
     end
 
+    # A CIMD client that is an installed native app. The document shape is the
+    # one Claude Code publishes at
+    # https://claude.ai/oauth/claude-code-client-metadata: an https client_id,
+    # PORTLESS loopback redirect URIs, and `none` auth. The CLI binds an
+    # ephemeral port at runtime, so the request URI carries a port the document
+    # cannot have declared.
+    #
+    # Both defaults used to refuse this. Same-origin is unsatisfiable for it by
+    # construction (an https client_id can never share an origin with
+    # http://127.0.0.1), and CIMD was hardcoded to exact matching, so the
+    # ephemeral port failed too.
+    test "a native CIMD client completes the flow on an ephemeral loopback port" do
+      client_id = unique_cimd_client_id()
+
+      script_doc(
+        client_id,
+        cimd_doc(%{"redirect_uris" => ["http://localhost/callback", "http://127.0.0.1/callback"]})
+      )
+
+      put_config(client_id_metadata: cimd_config())
+
+      # Everything at its default: same-origin required, loopback allowance on.
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://127.0.0.1:51353/callback"}))
+
+      assert conn.status == 302, "expected the native CIMD client to be served, got: #{conn.resp_body}"
+      assert location(conn) =~ "http://127.0.0.1:51353/callback"
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    # The exemption is scoped to loopback: an https redirect from a CIMD
+    # document is still held to same origin, which is where the check's
+    # anti-impersonation value actually lies.
+    test "an https redirect from a CIMD document is still held to same origin" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => ["https://elsewhere.example/cb"]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"}))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    # §8.3: the literal IP is required. A document declaring only the localhost
+    # NAME gets neither the same-origin exemption nor port flexibility.
+    test "a localhost-only CIMD document is still refused" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => ["http://localhost/callback"]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost:51353/callback"}))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
     test "resolves a CIMD client_id and issues a code" do
       client_id = unique_cimd_client_id()
       script_doc(client_id, cimd_doc())

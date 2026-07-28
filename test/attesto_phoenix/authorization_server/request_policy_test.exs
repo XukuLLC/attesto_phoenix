@@ -142,10 +142,39 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
                :exact_allow_loopback_port
     end
 
-    test "a CIMD client is never granted the exception" do
-      assert RequestPolicy.redirect_uri_matching(config([]), {:cimd, %{}}) == :exact
+    # A CIMD client has no `:client_native?` callback to consult, so the
+    # document's own declared redirect URIs are the native signal. This is the
+    # shape of a real published document (Claude Code's), which declares
+    # portless loopback URIs and binds an ephemeral port at runtime.
+    test "a CIMD client declaring a loopback redirect URI gets the exception" do
+      cimd = {:cimd, %{"redirect_uris" => ["http://localhost/callback", "http://127.0.0.1/callback"]}}
 
-      assert RequestPolicy.redirect_uri_matching(config([]), @native_public) == :exact_allow_loopback_port
+      assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact_allow_loopback_port
+    end
+
+    test "a CIMD client declaring only web redirect URIs does not" do
+      cimd = {:cimd, %{"redirect_uris" => ["https://app.example/cb"]}}
+
+      assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact
+    end
+
+    # §8.3: the literal IP is required, so a document declaring only the
+    # `localhost` NAME gets no port flexibility.
+    test "a CIMD client declaring only localhost does not" do
+      cimd = {:cimd, %{"redirect_uris" => ["http://localhost/callback"]}}
+
+      assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact
+    end
+
+    test "a malformed or empty CIMD document does not" do
+      assert RequestPolicy.redirect_uri_matching(config([]), {:cimd, %{}}) == :exact
+      assert RequestPolicy.redirect_uri_matching(config([]), {:cimd, %{"redirect_uris" => []}}) == :exact
+    end
+
+    test "the server-wide opt-out still forbids the exception for a CIMD client" do
+      cimd = {:cimd, %{"redirect_uris" => ["http://127.0.0.1/callback"]}}
+
+      assert RequestPolicy.redirect_uri_matching(config(native_apps: [loopback_redirect: false]), cimd) == :exact
     end
 
     # Both resolved modes must be ones the core actually implements, and they
