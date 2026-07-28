@@ -201,9 +201,9 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
       authorization_code_ttl: 60,
       # The harness serves plain HTTP on a loopback port.
       require_https: false,
-      scopes_supported: ["openid", "profile"],
-      # RFC 8252 §7.3, the feature under test.
-      native_apps: [loopback_redirect: true]
+      scopes_supported: ["openid", "profile"]
+      # No `native_apps` configuration: RFC 8252 §7.3 follows from the client
+      # being marked native, which is the feature under test.
     ]
   end
 
@@ -261,8 +261,8 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
       assert result["has_access_token"]
     end
 
-    test "the same client is refused once the loopback exception is off", %{base: base} do
-      # Flip only the feature flag; everything else about the request is
+    test "the server-wide opt-out refuses the same client", %{base: base} do
+      # Engage the server-wide opt-out; everything else about the request is
       # unchanged. This is the control that proves the successes above are the
       # exception doing work, not a permissive redirect check.
       Application.put_env(

@@ -152,9 +152,10 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   defp reject_request_uri(_params), do: :ok
 
   # RFC 9126 §2.1 step 3: validate the pushed request as the authorization
-  # endpoint would - the request `redirect_uri` must exactly match one of the
-  # client's registered URIs (RFC 6749 §3.1.2.3), the `response_type`/PKCE/
-  # `response_mode` must be valid - so an invalid request is refused early here
+  # endpoint would - the request `redirect_uri` must match one of the client's
+  # registered URIs (RFC 6749 §3.1.2.3 exactly, or with RFC 8252 §7.3 port
+  # flexibility for a native client), the `response_type`/PKCE/`response_mode`
+  # must be valid - so an invalid request is refused early here
   # rather than only when the `request_uri` is later resolved at /authorize. The
   # `RequestPolicy` resolvers are shared with the authorization endpoint so both
   # validate identically. The signed `request` object, already verified and

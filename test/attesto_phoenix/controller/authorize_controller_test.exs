@@ -1348,9 +1348,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       valid_params(Map.merge(%{"client_id" => @native_client_id, "redirect_uri" => redirect_uri}, extra))
     end
 
-    test "a native client's loopback redirect matches on any port once the host opts in" do
-      put_config(native_apps: [loopback_redirect: true])
-
+    # RFC 8252 §7.3 is a MUST, so marking the client native is the whole
+    # decision - no `native_apps` configuration at all here.
+    test "a native client's loopback redirect matches on any port" do
       conn = call(native_params("http://127.0.0.1:51823/cb"))
 
       assert conn.status == 302
@@ -1360,7 +1360,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert is_binary(location_query(conn)["code"])
     end
 
-    test "the same request is a direct error with the exception off (the default)" do
+    test "the server-wide opt-out turns the same request into a direct error" do
+      put_config(native_apps: [loopback_redirect: false])
+
       conn = call(native_params("http://127.0.0.1:51823/cb"))
 
       assert conn.status == 400
@@ -1370,37 +1372,42 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert location(conn) == nil
     end
 
-    test "the IPv6 loopback behaves identically" do
-      put_config(native_apps: [loopback_redirect: true])
+    test "a deployment that marks no client native sees exact matching" do
+      put_config(client_native?: fn _client -> false end)
 
+      conn = call(native_params("http://127.0.0.1:51823/cb"))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    test "the IPv6 loopback behaves identically" do
       conn = call(native_params("http://[::1]:51823/cb"))
 
       assert conn.status == 302
       assert location(conn) =~ "http://[::1]:51823/cb"
     end
 
-    # RFC 8252 §8.3: the literal IP is required.
-    test "localhost is refused even with the exception on" do
-      put_config(native_apps: [loopback_redirect: true])
+    # RFC 8252 §8.3: the literal IP is required. Each of these pairs the
+    # rejection with a positive control on the SAME configuration, so the test
+    # distinguishes "refused because of this specific difference" from "refused
+    # because the exception was not active at all".
+    test "localhost is refused while the literal IP on the same port succeeds" do
+      assert call(native_params("http://localhost:51823/cb")).status == 400
+      assert call(native_params("http://localhost:51823/cb")) |> location() == nil
 
-      conn = call(native_params("http://localhost:51823/cb"))
-
-      assert conn.status == 400
-      assert location(conn) == nil
+      assert call(native_params("http://127.0.0.1:51823/cb")).status == 302
     end
 
-    test "a differing path is refused even with the exception on" do
-      put_config(native_apps: [loopback_redirect: true])
+    test "a differing path is refused while the registered path on a varying port succeeds" do
+      assert call(native_params("http://127.0.0.1:51823/other")).status == 400
+      assert call(native_params("http://127.0.0.1:51823/other")) |> location() == nil
 
-      conn = call(native_params("http://127.0.0.1:51823/other"))
-
-      assert conn.status == 400
-      assert location(conn) == nil
+      assert call(native_params("http://127.0.0.1:51823/cb")).status == 302
     end
 
     test "a non-native client with the same registration gets no port flexibility" do
       put_config(
-        native_apps: [loopback_redirect: true],
         client_redirect_uris: fn _client -> [@native_loopback_uri] end,
         client_native?: fn _client -> false end
       )
@@ -1412,8 +1419,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
 
     test "an ordinary https client is unaffected by the exception" do
-      put_config(native_apps: [loopback_redirect: true])
-
       assert call(valid_params()).status == 302
 
       conn = call(valid_params(%{"redirect_uri" => "https://client.example.com/other"}))

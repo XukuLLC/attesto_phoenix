@@ -73,25 +73,43 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   How the request `redirect_uri` is matched against the registered set
   (RFC 6749 §3.1.2.3, RFC 8252 §7.3).
 
-  `:exact` - the RFC 6749 §3.1.2.3 simple string comparison - unless BOTH gates
-  are open: the host enabled `native_apps: [loopback_redirect: true]` AND marked
-  this client native via `:client_native?`. Only then does the client get
-  `:exact_allow_loopback_port`, under which its `http://127.0.0.1/...` /
-  `http://[::1]/...` redirect URI matches on any port (see
-  `Attesto.RedirectURI` for exactly how narrow that exception is).
+  `:exact` - the RFC 6749 §3.1.2.3 simple string comparison - unless the host
+  marked this client native via `:client_native?`, in which case it gets
+  `:exact_allow_loopback_port` and its `http://127.0.0.1/...` /
+  `http://[::1]/...` redirect URI matches on any port (see `Attesto.RedirectURI`
+  for exactly how narrow that exception is).
 
-  Two gates rather than one: this is the only rule in the RFC 8252 profile that
-  *relaxes* a check, so it takes both a server-wide decision and a per-client
-  classification, and it can never widen matching for a client the host did not
-  deliberately mark. A CIMD client is never native - its `client_id` is an
-  `https` URL and its `redirect_uris` come from the document, which the
-  authorization endpoint additionally holds to the same origin.
+  Marking the client native is the whole decision. RFC 8252 §7.3 says the
+  authorization server MUST allow any port for a loopback redirect URI, so
+  requiring a second server-wide opt-in on top would mean violating that MUST
+  for a client the host had already declared to be an installed app.
+
+  That is the entire argument, deliberately. A tempting second one - that §8.1
+  and §8.4 already key on the mark alone, so §7.3 may too - does not hold up:
+  those are RESTRICTIONS and this is a RELAXATION, and the two have very
+  different blast radii when the mark is wrong. A mistaken restriction denies a
+  client service loudly; a mistaken relaxation widens a security check
+  silently. Which is why `:client_native?` is documented as an opt-in that a
+  host must not export by accident.
+
+  The default-off guarantee comes from `:client_native?` itself defaulting to
+  `false`, not from a separate flag: a deployment that classifies no clients has
+  no native clients and so sees exact matching everywhere, unchanged.
+
+  `native_apps: [loopback_redirect: false]` remains available as a server-wide
+  opt-out for a deployment that must forbid the exception outright (an operator
+  kill switch, or one certifying against a profile that mandates exact
+  matching). It defaults to `true`; it is an escape hatch, not a gate.
+
+  A CIMD client is never native - its `client_id` is an `https` URL and its
+  `redirect_uris` come from the document, which the authorization endpoint
+  additionally holds to the same origin.
   """
   @spec redirect_uri_matching(Config.t(), term()) :: RedirectURI.matching()
   def redirect_uri_matching(_config, {:cimd, _metadata}), do: :exact
 
   def redirect_uri_matching(config, client) do
-    if Config.native_app_loopback_redirect?(config) and client_native?(config, client) do
+    if client_native?(config, client) and Config.native_app_loopback_redirect?(config) do
       :exact_allow_loopback_port
     else
       :exact

@@ -83,14 +83,14 @@ AttestoPhoenix.Config.new(
 
 A native app is a public PKCE client that additionally runs on the end user's
 own device, which RFC 8252 (BCP 212) treats as its own case. Mark it with
-`:client_native?` and the server requires PKCE for it (§8.1) and refuses any
-token-endpoint credential from it (§8.4) — both without further configuration.
+`:client_native?` and the whole profile applies to it: PKCE is required (§8.1),
+no token-endpoint credential is accepted (§8.4), and its loopback redirect URI
+matches on any port (§7.3, a MUST). No further configuration.
 
-Add `native_apps: [loopback_redirect: true]` only if the app cannot use a
-private-use URI scheme (`com.example.app:/cb`) and must instead bind an
-ephemeral port on the loopback interface (§7.3). That option widens
-redirect-URI matching, which the OpenID Connect and FAPI profiles assume is
-exact — see the README's certification note before turning it on.
+A deployment that must forbid the §7.3 relaxation server-wide — one certifying
+against a profile that mandates exact redirect-URI matching — sets
+`native_apps: [loopback_redirect: false]`. Such a deployment usually has no
+native clients in the first place, in which case nothing is needed at all.
 
 ```elixir
 AttestoPhoenix.Config.new(
@@ -108,12 +108,10 @@ AttestoPhoenix.Config.new(
   client_public?: fn _client -> true end,
   client_native?: &MyApp.AuthZ.client_native?/1,
 
-  native_apps: [
-    loopback_redirect: true,
-    # Optional §8.12 in-app-webview refusal; a User-Agent heuristic, so it can
-    # misjudge honest browsers.
-    reject_embedded_user_agents: false
-  ],
+  # Optional §8.12 in-app-webview refusal; a User-Agent heuristic, so it can
+  # misjudge honest browsers. Unlike the rest of the profile this is a
+  # server-wide posture, so it is a flag rather than a per-client property.
+  native_apps: [reject_embedded_user_agents: false],
 
   load_principal: &MyApp.AuthZ.load_principal/1,
   build_principal: &MyApp.AuthZ.build_principal/3,
