@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.0] - 2026-07-27
 
 ### Added
 
@@ -46,7 +46,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Also adds `AttestoPhoenix.AuthorizationServer.RequestPolicy.redirect_uri_matching/2`
   and `client_native?/2`, and `AttestoPhoenix.Config.native_apps/1`,
   `native_app_loopback_redirect?/1`, and `reject_embedded_user_agents?/1`.
-  Requires `attesto` with `Attesto.RedirectURI`.
+
+### Changed
+
+- Require `attesto ~> 1.4`, which carries `Attesto.RedirectURI` and the
+  `:redirect_uri_matching` validation option this release depends on. Against
+  an older `attesto` the loopback option would be silently ignored rather than
+  refused, so the floor is raised rather than left at 1.3.
 
 ## [2.1.0] - 2026-07-25
 
