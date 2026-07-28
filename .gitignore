@@ -14,3 +14,7 @@ priv/plts/*.plt
 priv/plts/*.plt.hash
 # Test scratch output.
 /tmp/
+
+# The RFC 8252 end-to-end test drives a real third-party OAuth client
+# (openid-client) from test/support/js; its deps are installed, not vendored.
+/test/support/js/node_modules/

@@ -83,6 +83,12 @@ jobs:
       - name: Install Phoenix installer archive
         run: mix archive.install hex phx_new --force
 
+      # The RFC 8252 native-app end-to-end test (@moduletag :e2e) drives the
+      # real `openid-client` against a live Bandit server. Node ships on the
+      # runner; install the JS deps so the test runs rather than self-skipping.
+      - name: Install Node end-to-end dependencies (openid-client)
+        run: npm install --no-audit --no-fund --prefix test/support/js
+
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
 

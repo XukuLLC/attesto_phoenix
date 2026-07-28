@@ -1,0 +1,10 @@
+{
+  "name": "attesto-phoenix-rfc8252-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Third-party OAuth client reference for the RFC 8252 native-app end-to-end test (test-support only).",
+  "dependencies": {
+    "openid-client": "^6.8.4"
+  }
+}
