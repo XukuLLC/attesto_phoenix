@@ -19,12 +19,21 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   ## Native apps (RFC 8252 §8.4)
 
-  A client the host marks both native (`:client_native?`) and public
-  (`:client_public?`) may only authenticate with `none`. A native app cannot
-  keep a credential confidential - its binary is on the end user's device - so
-  presenting a client secret or an assertion is refused with the same generic
-  `invalid_client` message as any other failure. Neither classification defaults
-  to `true`, so this never affects a host that has not classified its clients.
+  A client the host marks native (`:client_native?`) may only authenticate with
+  `none`. A native app cannot keep a credential confidential - its binary is on
+  the end user's device - so presenting a client secret or an assertion is
+  refused with the same generic `invalid_client` message as any other failure.
+
+  The one exception is the one §8.4 makes: a native client the host
+  *explicitly* classifies as confidential (`:client_public?` returning `false`)
+  is taken to hold per-instance credentials from dynamic registration, and keeps
+  the secret path. An absent `:client_public?` callback is not that
+  classification and resolves to public, so a host that wires `:client_native?`
+  alone still gets §8.4 enforcement rather than silently accepting a shipped
+  secret.
+
+  `:client_native?` itself defaults to `false`, so none of this affects a host
+  that has not classified its clients.
 
   ## Client ID Metadata Documents (CIMD)
 
@@ -618,13 +627,41 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `invalid_client` message every other authentication failure returns, so it
   # reveals nothing about the client's registration.
   #
-  # Scoped to native AND public: a confidential client the operator runs on its
-  # own server is untouched, and neither classification defaults to true, so a
-  # host that has not classified its clients sees no change.
+  # RFC 8252 §8.4 carves out exactly one case where a native client may still
+  # authenticate: per-instance credentials provisioned by dynamic registration,
+  # which are genuinely confidential because no two installs share them. That is
+  # the only reason this is scoped to native AND public rather than to native
+  # alone, and it is why the host must say so explicitly - see
+  # `native_client_public?/2`.
   defp native_client_auth_permitted?(_config, _client, :none), do: true
 
   defp native_client_auth_permitted?(config, client, _method) do
-    not (client_native?(config, client) and client_public?(config, client))
+    not (client_native?(config, client) and native_client_public?(config, client))
+  end
+
+  # The public/confidential question for a NATIVE client, which defaults the
+  # opposite way to `client_public?/2` above - deliberately, because the two
+  # answer different questions.
+  #
+  # `client_public?/2` gates the secretless path, where an unclassified client
+  # must be treated as confidential so a missing callback cannot let anyone
+  # authenticate as it without a secret. Here the fail-closed direction is
+  # reversed: RFC 8252 §8.4 says that where a native client has a statically
+  # included shared secret the server MUST treat it as a public client and MUST
+  # NOT accept the secret as proof of identity. Defaulting an unclassified
+  # native client to "confidential" would therefore accept exactly the shipped
+  # secret §8.4 forbids - and would do it silently, for a host that wired
+  # `:client_native?` but not `:client_public?`.
+  #
+  # So an absent callback resolves to public and the secret is refused. Only an
+  # explicit `:client_public?` returning false - the host affirmatively claiming
+  # this native client holds per-instance credentials - keeps the secret path
+  # open.
+  defp native_client_public?(config, client) do
+    case Config.client_public_fun(config) do
+      nil -> true
+      callback -> Callback.invoke(callback, [client]) == true
+    end
   end
 
   # The native-app discriminator (RFC 8252 / BCP 212). A CIMD client is

@@ -264,7 +264,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
     case Callback.invoke(Config.load_client_fun(config), [client_id]) do
       {:ok, client} ->
-        if Callback.invoke(verify_client_secret, [client, client_secret]) == true do
+        if Callback.invoke(verify_client_secret, [client, client_secret]) == true and
+             not native_secret_refused?(config, client) do
           {:ok, client}
         else
           {:error, :invalid_client}
@@ -274,6 +275,25 @@ defmodule AttestoPhoenix.Controller.RevocationController do
         _ = Callback.invoke(verify_client_secret, [:unknown_client, client_secret])
         {:error, :invalid_client}
     end
+  end
+
+  # RFC 8252 §8.4: an installed native app cannot keep a client secret
+  # confidential, so a secret it presents is not proof of its identity. This
+  # endpoint parses credentials itself rather than going through
+  # `AttestoPhoenix.ClientAuthentication`, so the rule has to be applied here
+  # too - otherwise revocation would be a second client-authentication surface
+  # accepting a credential the token endpoint refuses.
+  #
+  # Matches `ClientAuthentication`'s scoping exactly: only a native client the
+  # host EXPLICITLY classifies as confidential (per-instance credentials from
+  # dynamic registration, the §8.4 carve-out) keeps the secret path. An absent
+  # `:client_public?` callback resolves to public and the secret is refused, and
+  # `:client_native?` defaults to false, so an unclassified deployment is
+  # unaffected. The refusal is the same generic `invalid_client` as every other
+  # failure here, so it is not an oracle.
+  defp native_secret_refused?(config, client) do
+    Callback.invoke(Config.client_native_fun(config), [client], false) == true and
+      Callback.invoke(Config.client_public_fun(config), [client], true) == true
   end
 
   defp fetch_token(params) do

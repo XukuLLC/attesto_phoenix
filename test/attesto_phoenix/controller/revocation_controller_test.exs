@@ -370,6 +370,61 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     end
   end
 
+  # RFC 8252 §8.4. This endpoint parses client credentials itself instead of
+  # going through `AttestoPhoenix.ClientAuthentication`, so without an explicit
+  # check here it would be a second authentication surface accepting a secret
+  # the token endpoint refuses.
+  describe "native clients (RFC 8252 §8.4)" do
+    defp revoke_as_native(overrides) do
+      cfg = build_config([client_native?: fn _client -> true end] ++ overrides)
+
+      params = %{
+        "token" => @live_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      RevocationController.create(build_conn(params, config: cfg), params)
+    end
+
+    test "refuses a correct secret from a native public client" do
+      assert revoke_as_native(client_public?: fn _client -> true end).status == 401
+    end
+
+    test "refuses a correct secret from a native client with no :client_public? callback" do
+      # Same default flip as `ClientAuthentication`: an unclassified native
+      # client is public, so its shipped secret is not proof of identity.
+      assert revoke_as_native([]).status == 401
+    end
+
+    test "still accepts a native client the host EXPLICITLY marks confidential" do
+      # RFC 8252 §8.4's per-instance-credential carve-out.
+      assert revoke_as_native(client_public?: fn _client -> false end).status == 200
+    end
+
+    test "a non-native client is unaffected" do
+      cfg = build_config(client_native?: fn _client -> false end, client_public?: fn _client -> true end)
+
+      params = %{
+        "token" => @live_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      assert RevocationController.create(build_conn(params, config: cfg), params).status == 200
+    end
+
+    test "a deployment with no :client_native? callback is unaffected" do
+      params = %{
+        "token" => @live_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      assert RevocationController.create(build_conn(params, []), params).status == 200
+    end
+  end
+
   test "raises when no config is wired into conn.private" do
     params = %{"token" => @live_token}
 

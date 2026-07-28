@@ -412,23 +412,49 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                authenticate([], %{"client_id" => "native-public-1"}, config, allow_public: true)
     end
 
-    test "a native public client is refused under the PAR policy like any other secretless client", %{config: config} do
-      # `allow_public: false` already rejects the secretless path; §8.4 closes
-      # the secret path, so a native public client cannot use PAR at all.
+    test "a native public client cannot use PAR at all", %{config: config} do
+      # Under the PAR policy `allow_public: false` already rejects the
+      # secretless path. The load-bearing half is the SECRET path: without the
+      # §8.4 check that would authenticate, since the secret verifies.
       assert {:error, %OAuthError{error: :invalid_client}} =
                authenticate([], %{"client_id" => "native-public-1"}, config, allow_public: false)
 
       assert_generic_invalid_client(
         authenticate(basic("native-public-1", "shipped-in-the-binary"), %{}, config, allow_public: false)
       )
+
+      # Control: the same PAR policy accepts an ordinary confidential client's
+      # secret, so the rejection above is the native rule and not the policy.
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: false)
     end
 
-    # §8.4 as written binds the native+public combination. A client the host
-    # classifies as confidential is its claim to make; the library does not
-    # override it here.
-    test "a native client the host marks confidential still authenticates by secret", %{config: config} do
+    # RFC 8252 §8.4 carves out per-instance credentials provisioned by dynamic
+    # registration; those are genuinely confidential. The host claims that case
+    # by explicitly classifying the native client as confidential.
+    test "a native client the host EXPLICITLY marks confidential still authenticates by secret", %{config: config} do
       assert {:ok, %Result{client: @native_confidential, method: :client_secret_basic}} =
                authenticate(basic("native-confidential-1", "s3cr3t"), %{}, config, allow_public: true)
+    end
+
+    # The footgun: a host that wires :client_native? but not :client_public?.
+    # `client_public?/2`'s own fail-closed default is `false` (confidential),
+    # which here would mean "accept the shipped secret" - the exact thing §8.4
+    # forbids. For the native check the default must flip to public.
+    test "a native client is refused a secret when :client_public? is not configured", %{config: config} do
+      config = %{config | client_public?: nil}
+
+      assert_generic_invalid_client(
+        authenticate(basic("native-confidential-1", "s3cr3t"), %{}, config, allow_public: true)
+      )
+
+      assert_generic_invalid_client(
+        authenticate(basic("native-public-1", "shipped-in-the-binary"), %{}, config, allow_public: true)
+      )
+
+      # A non-native client is unaffected by that default.
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: true)
     end
 
     test "a native public client presenting private_key_jwt is rejected", %{config: config} do

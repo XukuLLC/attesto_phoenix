@@ -21,6 +21,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with `none` — `client_secret_basic`, `client_secret_post`, and
   `private_key_jwt` are refused with the usual generic `invalid_client` (§8.4),
   because a credential shipped inside an installed binary is not confidential.
+  Only a native client the host *explicitly* classifies as confidential keeps
+  the secret path, that being the per-instance-credential case §8.4 carves out
+  for dynamic registration; an absent `:client_public?` callback resolves to
+  public here, so wiring `:client_native?` alone still gets §8.4 enforcement
+  rather than silently accepting a shipped secret.
 
   Two rules are additionally opt-in through `:native_apps`:
 
@@ -46,6 +51,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Also adds `AttestoPhoenix.AuthorizationServer.RequestPolicy.redirect_uri_matching/2`
   and `client_native?/2`, and `AttestoPhoenix.Config.native_apps/1`,
   `native_app_loopback_redirect?/1`, and `reject_embedded_user_agents?/1`.
+
+### Security
+
+- Bind a pushed authorization request to the client that actually authenticated
+  (RFC 9126 §2.1). `AttestoPhoenix.AuthorizationServer.PAR.Request` now carries
+  the identifier from `AttestoPhoenix.ClientAuthentication.Result`, and the
+  stored record is bound to it whenever the optional `:client_id` callback does
+  not resolve one. Previously the request body's own `client_id` was left in
+  place in that case, contrary to the documented contract that it is "never
+  trusted from the request body". Because the stored record is later resolved at
+  the authorization endpoint *against the client named in it*, an authenticated
+  client could push a request naming a different client and have the
+  authorization endpoint issue a code for that client while the `redirect_uri`
+  had only been validated against the pusher's registered set — a confused
+  deputy reachable by any deployment that exposes no `:client_id` callback.
+
+  Relatedly, a pushed `client_id` that disagrees with the authenticated client
+  is now rejected with `invalid_request` rather than silently rewritten,
+  matching how the token endpoint already treats a conflicting `client_id`. The
+  check runs on the effective parameters, so one carried only inside a signed
+  request object is covered. A client that pushes its own `client_id` — every
+  conforming client — is unaffected.
+
+- Apply the RFC 8252 §8.4 client-authentication restriction at the revocation
+  endpoint too. It parses credentials itself rather than going through
+  `AttestoPhoenix.ClientAuthentication`, so without this it would be a second
+  authentication surface accepting a secret the token endpoint refuses. No
+  effect on a deployment that exposes no `:client_native?` callback.
 
 ### Changed
 

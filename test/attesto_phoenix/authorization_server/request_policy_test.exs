@@ -135,11 +135,18 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
       assert RequestPolicy.redirect_uri_matching(config, {:cimd, %{}}) == :exact
     end
 
-    test "the resolved mode is one Attesto.RedirectURI accepts" do
+    # Both resolved modes must be ones the core actually implements, and they
+    # must be DIFFERENT - an implementation that collapsed to a single mode
+    # would satisfy "is a valid mode" while silently disabling the feature.
+    test "the two resolved modes are distinct and both accepted by Attesto.RedirectURI" do
       config = config(native_apps: [loopback_redirect: true])
 
-      assert RequestPolicy.redirect_uri_matching(config, @native_public) in Attesto.RedirectURI.matching_modes()
-      assert RequestPolicy.redirect_uri_matching(config, @confidential) in Attesto.RedirectURI.matching_modes()
+      native = RequestPolicy.redirect_uri_matching(config, @native_public)
+      other = RequestPolicy.redirect_uri_matching(config, @confidential)
+
+      assert native != other
+      assert native in Attesto.RedirectURI.matching_modes()
+      assert other in Attesto.RedirectURI.matching_modes()
     end
   end
 
@@ -183,5 +190,57 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
       assert {:error, {:direct, :redirect_uri_not_registered}} =
                RequestPolicy.validate(config, @confidential, params("http://127.0.0.1:51823/cb"))
     end
+
+    # RFC 8252 §8.1 must not be evadable by moving the parameters inside a
+    # signed request object (RFC 9101). `Attesto.AuthorizationRequest` merges the
+    # object BEFORE the redirectable checks, so the PKCE requirement applies to
+    # the object's contents; this pins that for a native client specifically.
+    test "the native PKCE requirement applies to a signed request object's contents" do
+      {request, jwk} = unsigned_request_object_for("http://127.0.0.1:51823/cb")
+
+      config =
+        config(
+          native_apps: [loopback_redirect: true],
+          require_pkce: false,
+          client_public?: fn _client -> false end,
+          client_redirect_uris: fn _client -> ["http://127.0.0.1:0/cb"] end
+        )
+
+      outer = %{"client_id" => "native-1", "request" => request}
+
+      # The object carries no code_challenge, so the request is rejected -
+      # redirectably, since the loopback redirect_uri inside it was matched.
+      assert {:error, {:redirect, error}} =
+               RequestPolicy.validate(config, @native_public, outer,
+                 request_object_jwks: %{"keys" => [jwk]},
+                 request_object_audience: "https://issuer.example"
+               )
+
+      assert error.error == "invalid_request"
+      assert error.error_description =~ "code_challenge"
+    end
+  end
+
+  # A signed request object carrying a complete authorization request EXCEPT
+  # PKCE, returned with the public JWK that verifies it.
+  defp unsigned_request_object_for(redirect_uri) do
+    jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+    {_, public_map} = JOSE.JWK.to_public_map(jwk)
+    client_jwk = Map.merge(public_map, %{"kid" => "native-key-1", "alg" => "ES256"})
+
+    claims = %{
+      "iss" => "native-1",
+      "aud" => "https://issuer.example",
+      "response_type" => "code",
+      "client_id" => "native-1",
+      "redirect_uri" => redirect_uri
+    }
+
+    {_, request} =
+      jwk
+      |> JOSE.JWT.sign(%{"alg" => "ES256", "kid" => "native-key-1"}, claims)
+      |> JOSE.JWS.compact()
+
+    {request, client_jwk}
   end
 end

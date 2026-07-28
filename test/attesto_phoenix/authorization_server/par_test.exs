@@ -102,6 +102,9 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
     fields =
       [
         client: @client,
+        # The identifier the client authenticated as, exactly as the controller
+        # carries it over from `ClientAuthentication.Result`.
+        client_id: @client.id,
         params: %{},
         dpop_input: %{proofs: [], http_uri: @htu, http_method: @htm}
       ]
@@ -167,13 +170,44 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
       assert {:ok, %{expires_in: 90}} = PAR.store(config, request(params: base_params()))
     end
 
-    test "stores the authenticated client_id, never a body-supplied value" do
+    test "stores the authenticated client_id" do
       # RFC 6749 §2.3.1: the stored record carries the client_id resolved from
-      # the authenticated client, even when the body carries a different one.
+      # the authenticated client, never a caller-controlled value.
       config = config()
-      params = Map.put(base_params(), "client_id", "body-supplied-other")
 
-      assert {:ok, %{request_uri: request_uri}} = PAR.store(config, request(params: params))
+      assert {:ok, %{request_uri: request_uri}} = PAR.store(config, request(params: base_params()))
+      assert {:ok, stored, 45} = Store.lookup(request_uri)
+      assert stored["client_id"] == "confidential-1"
+    end
+
+    test "rejects a body client_id that disagrees with the authenticated client" do
+      # Pushing a request in another client's name is refused outright rather
+      # than silently rewritten: the stored record is later resolved at
+      # /authorize AGAINST THE CLIENT NAMED IN IT, so an accepted mismatch would
+      # have the authorization endpoint issue a code for the named client while
+      # the redirect_uri was validated against the pusher's registered set.
+      config = config()
+      params = Map.put(base_params(), "client_id", "some-other-client")
+
+      assert {:error, %OAuthError{error: :invalid_request, error_description: detail}} =
+               PAR.store(config, request(params: params))
+
+      assert detail =~ "does not match the authenticated client"
+    end
+
+    test "binds to the authenticated client_id when the host exposes no :client_id callback" do
+      # With no `:client_id` callback the opaque client term yields no
+      # identifier. The binding must then come from what the client
+      # AUTHENTICATED as - falling back to the request body would let an
+      # authenticated client push a request in another client's name.
+      config = config(client_id: nil)
+      params = Map.put(base_params(), "client_id", "victim-client")
+
+      assert {:error, %OAuthError{error: :invalid_request}} = PAR.store(config, request(params: params))
+
+      assert {:ok, %{request_uri: request_uri}} =
+               PAR.store(config, request(params: Map.put(base_params(), "client_id", "confidential-1")))
+
       assert {:ok, stored, 45} = Store.lookup(request_uri)
       assert stored["client_id"] == "confidential-1"
     end

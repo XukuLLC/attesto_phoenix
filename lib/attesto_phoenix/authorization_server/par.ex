@@ -97,22 +97,24 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
           {:ok, %{request_uri: String.t(), expires_in: pos_integer()}}
           | {:error, OAuthError.t()}
   def store(%Config{} = config, %Request{} = request) do
-    %{client: client, params: params, dpop_input: dpop_input} = request
+    %{client: client, client_id: authenticated_client_id, params: params, dpop_input: dpop_input} = request
     ttl = config_field(config, :par_ttl, @default_par_ttl)
     request_uri = @request_uri_prefix <> random()
+    bound_client_id = client_id(config, client) || authenticated_client_id
 
     # Verify the request object FIRST so its signed parameters are authoritative
     # (RFC 9101 §6.3) before DPoP reconciliation: a signed `dpop_jkt` must be the
     # value the presented proof is checked against, never an unsigned body value.
     with :ok <- reject_request_uri(params),
          {:ok, params} <- verify_request_object(config, client, params),
+         :ok <- require_matching_client_id(params, bound_client_id),
          :ok <- validate_pushed_request(config, client, params),
          {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params) do
       stored =
         params
         |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
         |> put_verified_dpop_jkt(dpop_jkt)
-        |> put_resolved_client_id(client_id(config, client))
+        |> put_resolved_client_id(bound_client_id)
 
       case par_store(config).put(request_uri, stored, ttl) do
         :ok ->
@@ -247,11 +249,33 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     Callback.invoke(Config.client_id_fun(config), [client], nil)
   end
 
-  # Store the authenticated `client_id` when it resolves. When it does not (no
-  # `:client_id` callback), leave the request's own presented `client_id`
-  # intact rather than clobbering it with `nil`. The prior
-  # `client[:id]`/`client["id"]` struct-shape fallback is intentionally gone -
-  # the library makes no assumption about the opaque host client shape.
+  # RFC 9126 §2.1: the pushed request carries a `client_id`, and it must be the
+  # client that actually authenticated. A disagreement is not a correctable
+  # detail, it is one client pushing a request in another's name: the stored
+  # record is later resolved at /authorize AGAINST THE CLIENT NAMED IN IT, so an
+  # accepted mismatch would have the authorization endpoint issue a code for the
+  # named client while the redirect URI was validated against the pusher's
+  # registered set. That is a confused deputy, and it is reachable whenever a
+  # host exposes no `:client_id` callback. Refuse it outright.
+  #
+  # Checked on the EFFECTIVE parameters, after any signed request object has
+  # been merged, so a `client_id` carried only inside the object is covered too.
+  # An absent `client_id` is left alone: `put_resolved_client_id/2` supplies the
+  # authenticated one.
+  defp require_matching_client_id(%{"client_id" => presented}, bound_client_id)
+       when is_binary(presented) and presented != "" and presented != bound_client_id do
+    detail = "client_id does not match the authenticated client"
+    {:error, error(@error_invalid_request, detail)}
+  end
+
+  defp require_matching_client_id(_params, _bound_client_id), do: :ok
+
+  # Bind the stored record to the client that authenticated. The identifier is
+  # the host's `:client_id` callback when it resolves, and otherwise the one
+  # `AttestoPhoenix.ClientAuthentication` authenticated - never the request
+  # body's, which the caller controls. The prior `client[:id]`/`client["id"]`
+  # struct-shape fallback is intentionally gone - the library makes no
+  # assumption about the opaque host client shape.
   defp put_resolved_client_id(params, nil), do: params
   defp put_resolved_client_id(params, client_id), do: Map.put(params, "client_id", client_id)
 
