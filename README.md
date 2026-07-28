@@ -259,11 +259,20 @@ That callback is the whole decision. A client it returns `true` for gets the
 RFC 8252 profile; everything else is untouched, and a deployment that never
 wires it has no native clients and so behaves exactly as before.
 
-Marking a client native gives it:
+Marking a client native applies three rules to it:
 
-- **PKCE is required (§8.1).** It is forced for a native client regardless of
-  the global `:require_pkce` flag. `S256` is required and `plain` is rejected
-  for every client already.
+- **Loopback interface redirection (§7.3).** A native app that cannot use a
+  private-use URI scheme binds an ephemeral loopback port at runtime, so its
+  `http://127.0.0.1/...` or `http://[::1]/...` redirect URI matches the
+  registered one on **any port**, while scheme, host, path, and query still
+  compare exactly. Nothing else relaxes — `https`, private-use schemes, remote
+  hosts, non-native clients, and the hostname `localhost` (§8.3 discourages it)
+  all stay byte-exact, and an unmatched redirect URI is still refused directly
+  rather than redirected to. §7.3 states this as a MUST, which is why it takes
+  no further opt-in.
+- **PKCE is required (§8.1).** Forced for a native client regardless of the
+  global `:require_pkce` flag. (`S256` is required and `plain` rejected for
+  every client already.)
 - **No client secret (§8.4).** A native client may only authenticate at the
   token endpoint with `none`. Presenting `client_secret_basic`,
   `client_secret_post`, or `private_key_jwt` is rejected — a credential shipped
@@ -273,35 +282,23 @@ Marking a client native gives it:
   (`client_public?` returning `false`), which is §8.4's carve-out for
   per-instance credentials issued by dynamic registration.
 
-> **Two things to know before marking a client native.** Where no
-> `:client_public?` callback is configured at all, a native client counts as
-> public — so marking it native both refuses its secret and admits it on
-> `none` + PKCE. And a native *public* client cannot use PAR: that endpoint
-> refuses secretless clients and §8.4 refuses this one a secret, so a
-> deployment running `require_pushed_authorization_requests: true` cannot also
-> serve native public clients.
+> **Three things to know before marking a client native.**
+>
+> 1. Where no `:client_public?` callback is configured at all, a native client
+>    counts as public — so marking it native both refuses its secret and admits
+>    it on `none` + PKCE.
+> 2. A native *public* client cannot use PAR: that endpoint refuses secretless
+>    clients and §8.4 refuses this one a secret, so a deployment running
+>    `require_pushed_authorization_requests: true` cannot also serve native
+>    public clients.
+> 3. §7.3 is the only rule here that *widens* a check, and exact redirect-URI
+>    matching is assumed by the OpenID Connect and FAPI profiles. A deployment
+>    certifying against those normally has no native clients, so the answer is
+>    simply not to mark any — but `native_apps: [loopback_redirect: false]`
+>    forbids the exception server-wide if you need a hard switch.
 
-- **Loopback interface redirection (§7.3).** A native client that cannot use a
-  private-use URI scheme binds an ephemeral loopback port at runtime, so its
-  `http://127.0.0.1/...` or `http://[::1]/...` redirect URI matches the
-  registered one on **any port**, while scheme, host, path, and query still
-  compare exactly. Nothing else relaxes — `https`, private-use schemes, remote
-  hosts, non-native clients, and the hostname `localhost` (§8.3 discourages it)
-  all stay byte-exact, and an unmatched redirect URI is still refused directly
-  rather than redirected to.
-
-  §7.3 states this as a MUST, which is why it needs no further opt-in: refusing
-  a declared native app's ephemeral port would be non-conformant.
-
-  > **Certification note.** This is the only rule here that *widens* a check,
-  > and exact redirect-URI matching is assumed by the OpenID Connect and FAPI
-  > profiles. A deployment certifying against those normally has no native
-  > clients, so the answer is simply not to mark any — but
-  > `native_apps: [loopback_redirect: false]` forbids the exception
-  > server-wide if you need a hard switch.
-
-One rule is genuinely opt-in, because unlike the rest it is a server-wide
-posture rather than a per-client property:
+One further rule is genuinely opt-in, because unlike the three above it is a
+server-wide posture rather than a per-client property:
 
 ```elixir
 config :my_app, AttestoPhoenix.Config,
