@@ -13,13 +13,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ...]` is no longer a gate that must be opened; it is an opt-**out**,
   defaulting to `true`.
 
-  2.2.0 required both a server-wide flag and the per-client mark. That was
-  wrong on two counts. §7.3 states the port allowance as a **MUST**, so
-  refusing a native client's ephemeral port made the server non-conformant for
-  a client the host had already declared to be an installed app. And it was
-  internally inconsistent: §8.1 (PKCE) and §8.4 (client authentication) already
-  keyed on the mark alone — if the mark is trusted to refuse a client its
-  secret, it is trusted to vary a port.
+  2.2.0 required both a server-wide flag and the per-client mark. §7.3 states
+  the port allowance as a **MUST**, so refusing a native client's ephemeral
+  port made the server non-conformant for a client the host had already
+  declared to be an installed app.
 
   What keeps the profile off for an unconfigured deployment is unchanged and
   was never the flag: `:client_native?` itself defaults to `false`, so a host
