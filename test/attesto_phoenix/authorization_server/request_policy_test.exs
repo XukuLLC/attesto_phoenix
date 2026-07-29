@@ -2,6 +2,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
   use ExUnit.Case, async: true
 
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Config
 
   # Clients classified through the config callbacks below.
@@ -97,7 +98,63 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
     end
 
     test "a CIMD client is never native" do
-      refute RequestPolicy.client_native?(config([]), {:cimd, %{}})
+      refute RequestPolicy.client_native?(config([]), %CIMDClient{metadata: %{}})
+    end
+  end
+
+  # The host's client value is opaque by contract, so a host may represent a
+  # client as a tuple. Marking a resolved CIMD client with a tagged tuple would
+  # have made `{:cimd, _}` a shape a host could return by coincidence and have
+  # every CIMD relaxation applied to it - including `client_public?/2`, which is
+  # what decides a client authenticates with no secret. Only the struct counts.
+  describe "a host client is never mistaken for a CIMD client" do
+    @host_tuple {:cimd, %{"redirect_uris" => ["http://127.0.0.1/callback"]}}
+
+    # The default fixture callbacks reach into the client with `Map.get/3`, so
+    # they cannot take an opaque tuple. A host that represents clients as tuples
+    # supplies callbacks that can read them; these stand in for those.
+    defp host_config(overrides \\ []) do
+      config(
+        Keyword.merge(
+          [
+            client_public?: fn _client -> false end,
+            client_native?: fn _client -> false end,
+            client_requires_dpop?: fn _client -> false end,
+            client_requires_mtls?: fn _client -> false end
+          ],
+          overrides
+        )
+      )
+    end
+
+    test "a tuple shaped like the old CIMD marker is not public" do
+      refute RequestPolicy.client_public?(host_config(), @host_tuple)
+    end
+
+    test "a tuple shaped like the old CIMD marker does not force PKCE on CIMD grounds" do
+      refute RequestPolicy.require_pkce?(host_config(require_pkce: false), @host_tuple)
+    end
+
+    test "a tuple shaped like the old CIMD marker takes its redirect URIs from the host" do
+      registered = ["https://host-registered.example/cb"]
+
+      assert RequestPolicy.registered_redirect_uris(
+               host_config(client_redirect_uris: fn _client -> registered end),
+               @host_tuple
+             ) == registered
+    end
+
+    test "a tuple shaped like the old CIMD marker gets no loopback port allowance" do
+      assert RequestPolicy.redirect_uri_matching(host_config(), @host_tuple) == :exact
+    end
+
+    test "the struct still receives every CIMD decision" do
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["http://127.0.0.1/callback"]}}
+
+      assert RequestPolicy.client_public?(config([]), cimd)
+      assert RequestPolicy.require_pkce?(config(require_pkce: false), cimd)
+      assert RequestPolicy.registered_redirect_uris(config([]), cimd) == ["http://127.0.0.1/callback"]
+      assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact_allow_loopback_port
     end
   end
 
@@ -147,13 +204,13 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
     # shape of a real published document (Claude Code's), which declares
     # portless loopback URIs and binds an ephemeral port at runtime.
     test "a CIMD client declaring a loopback redirect URI gets the exception" do
-      cimd = {:cimd, %{"redirect_uris" => ["http://localhost/callback", "http://127.0.0.1/callback"]}}
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["http://localhost/callback", "http://127.0.0.1/callback"]}}
 
       assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact_allow_loopback_port
     end
 
     test "a CIMD client declaring only web redirect URIs does not" do
-      cimd = {:cimd, %{"redirect_uris" => ["https://app.example/cb"]}}
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["https://app.example/cb"]}}
 
       assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact
     end
@@ -161,18 +218,18 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
     # §8.3: the literal IP is required, so a document declaring only the
     # `localhost` NAME gets no port flexibility.
     test "a CIMD client declaring only localhost does not" do
-      cimd = {:cimd, %{"redirect_uris" => ["http://localhost/callback"]}}
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["http://localhost/callback"]}}
 
       assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact
     end
 
     test "a malformed or empty CIMD document does not" do
-      assert RequestPolicy.redirect_uri_matching(config([]), {:cimd, %{}}) == :exact
-      assert RequestPolicy.redirect_uri_matching(config([]), {:cimd, %{"redirect_uris" => []}}) == :exact
+      assert RequestPolicy.redirect_uri_matching(config([]), %CIMDClient{metadata: %{}}) == :exact
+      assert RequestPolicy.redirect_uri_matching(config([]), %CIMDClient{metadata: %{"redirect_uris" => []}}) == :exact
     end
 
     test "the server-wide opt-out still forbids the exception for a CIMD client" do
-      cimd = {:cimd, %{"redirect_uris" => ["http://127.0.0.1/callback"]}}
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["http://127.0.0.1/callback"]}}
 
       assert RequestPolicy.redirect_uri_matching(config(native_apps: [loopback_redirect: false]), cimd) == :exact
     end

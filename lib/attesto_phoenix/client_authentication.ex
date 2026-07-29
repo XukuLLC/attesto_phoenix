@@ -100,6 +100,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   alias Attesto.ClientAssertion
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, OAuthError}
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
   defmodule Policy do
     @moduledoc """
@@ -479,7 +480,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `jwks` / `jwks_uri` (RFC 7523 / OIDC Core §9), not the host's `:client_jwks`
   # callback. A document that carried neither has no keys, so `private_key_jwt`
   # is impossible for it and authentication fails closed.
-  defp client_jwks(_config, {:cimd, metadata}) do
+  defp client_jwks(_config, %CIMDClient{metadata: metadata}) do
     case ClientIdMetadata.jwks(metadata) do
       nil -> {:error, :missing_client_jwks}
       jwks -> {:ok, jwks}
@@ -544,7 +545,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # Besides the secretless (`none`) and `private_key_jwt` paths, signed-token
   # policy lookup reuses this function so a token's original `client_id` has
   # identical resolution semantics. A CIMD `client_id` (an HTTPS URL, with the
-  # feature enabled) is dereferenced and wrapped as `{:cimd, metadata}`; any
+  # feature enabled) is dereferenced and wrapped as `%CIMDClient{metadata: metadata}`; any
   # opaque identifier goes to the host's `:load_client` registry. Every failure
   # becomes `:not_found`, revealing neither which path ran nor whether a client
   # was revoked.
@@ -553,7 +554,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   def resolve_client(%Config{} = config, client_id) when is_binary(client_id) and client_id != "" do
     if ClientIdMetadata.cimd_client_id?(client_id, config) do
       case ClientIdMetadata.resolve(client_id, config) do
-        {:ok, metadata} -> {:ok, {:cimd, metadata}}
+        {:ok, metadata} -> {:ok, %CIMDClient{metadata: metadata}}
         {:error, _reason} -> {:error, :not_found}
       end
     else
@@ -575,7 +576,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # strips `client_secret_*` and the symmetric auth methods), so it is a public
   # client by construction - it relies on PKCE downstream. A registered client
   # defers to the host's `:client_public?` discriminator.
-  defp client_public?(_config, {:cimd, _metadata}), do: true
+  defp client_public?(_config, %CIMDClient{metadata: _metadata}), do: true
 
   # Absent the host's `:client_public?` callback the answer normally fails
   # closed to `false`: an unclassified client must not be admitted on the
@@ -680,7 +681,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `:client_native?` callback, which defaults to `false`: an unclassified
   # client is not native, so this check cannot refuse an authentication the
   # host never opted into.
-  defp client_native?(_config, {:cimd, _metadata}), do: false
+  defp client_native?(_config, %CIMDClient{metadata: _metadata}), do: false
 
   defp client_native?(config, client) do
     Callback.invoke(Config.client_native_fun(config), [client], false) == true
@@ -689,7 +690,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # A CIMD client's identifier is the URL its document is bound to; a registered
   # client's is the host's `:client_id` callback (falling back to the presented
   # identifier in `result/4` when absent).
-  defp resolved_client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
+  defp resolved_client_id(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.client_id(metadata)
 
   defp resolved_client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)
