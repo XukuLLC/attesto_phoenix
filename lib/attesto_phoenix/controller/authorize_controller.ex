@@ -114,6 +114,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.{BrowserState, Callback, Config, Event, RequestContext}
   alias AttestoPhoenix.ClientIdMetadata
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Store.PAR.ETS
 
   require Logger
@@ -211,7 +212,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # unresolvable or invalid CIMD `client_id` is the same non-redirectable class
   # as an unknown registry client (the document - and so its trusted
   # redirect_uris - never materialized), so it is reported as a direct error.
-  # The resolved CIMD client is wrapped as `{:cimd, metadata}` so the request
+  # The resolved CIMD client is wrapped as `%CIMDClient{metadata: metadata}` so the request
   # validation, jwks, and `client_id` helpers read the document directly instead
   # of the host's per-client callbacks.
   defp load_client(config, params) do
@@ -237,7 +238,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   defp load_cimd_client(config, client_id) do
     case ClientIdMetadata.resolve(client_id, config) do
-      {:ok, metadata} -> {:ok, {:cimd, metadata}}
+      {:ok, metadata} -> {:ok, %CIMDClient{metadata: metadata}}
       {:error, _reason} -> {:error, {:direct, :invalid_client_id}}
     end
   end
@@ -335,7 +336,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `https` redirects where such an attack lives. For loopback the attacker must
   # already run code on the device to hold the port, and PKCE is mandatory for
   # every CIMD client regardless.
-  defp require_same_origin_redirect_uri(config, {:cimd, metadata}, redirect_uri) do
+  defp require_same_origin_redirect_uri(config, %CIMDClient{metadata: metadata}, redirect_uri) do
     same_origin_required? =
       config
       |> Config.client_id_metadata()
@@ -446,7 +447,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # The request-object (JAR) verification keys for the client. For a CIMD client
   # the keys are the document's `jwks` / `jwks_uri` (RFC 9101 §6.2); for a
   # registered client they are the host's `:client_jwks` callback.
-  defp client_jwks(_config, {:cimd, metadata}), do: ClientIdMetadata.jwks(metadata)
+  defp client_jwks(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.jwks(metadata)
 
   defp client_jwks(config, client) do
     case Config.client_jwks_fun(config) do

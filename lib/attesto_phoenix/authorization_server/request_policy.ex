@@ -19,6 +19,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   alias Attesto.RedirectURI
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config}
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
   @doc """
   Validate `params` as an authorization request for `client`, resolving the
@@ -50,7 +51,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   @doc """
   The client's registered redirect URIs (RFC 6749 §3.1.2.3).
 
-  For a CIMD client (`{:cimd, metadata}`,
+  For a CIMD client (`%CIMDClient{metadata: metadata}`,
   `draft-ietf-oauth-client-id-metadata-document-01`) the document *is* the
   registration, so the registered set is the document's own `redirect_uris`
   (RFC 9700) and the host's per-client callback is never consulted. For a
@@ -60,7 +61,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   URI (fail closed).
   """
   @spec registered_redirect_uris(Config.t(), term()) :: [String.t()]
-  def registered_redirect_uris(_config, {:cimd, metadata}), do: ClientIdMetadata.redirect_uris(metadata)
+  def registered_redirect_uris(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.redirect_uris(metadata)
 
   def registered_redirect_uris(config, client) do
     case Callback.invoke(Config.client_redirect_uris_fun(config), [client], []) do
@@ -114,7 +115,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   validated document content; a claimed type would not be.
   """
   @spec redirect_uri_matching(Config.t(), term()) :: RedirectURI.matching()
-  def redirect_uri_matching(config, {:cimd, metadata}) do
+  def redirect_uri_matching(config, %CIMDClient{metadata: metadata}) do
     if Config.native_app_loopback_redirect?(config) and ClientIdMetadata.loopback_redirect_uris?(metadata) do
       :exact_allow_loopback_port
     else
@@ -154,7 +155,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   # A CIMD client is public (`none` + PKCE) or `private_key_jwt`; PKCE is
   # mandatory for it regardless of the host's `:require_pkce` flag, and the host
   # sender-constraint callbacks do not apply to the document.
-  def require_pkce?(_config, {:cimd, _metadata}), do: true
+  def require_pkce?(_config, %CIMDClient{metadata: _metadata}), do: true
 
   def require_pkce?(config, client) do
     client_public?(config, client) or
@@ -176,7 +177,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   @spec client_native?(Config.t(), term()) :: boolean()
   # A CIMD client is identified by an `https` URL that resolves to a document
   # served over the network; it is not an installed native app.
-  def client_native?(_config, {:cimd, _metadata}), do: false
+  def client_native?(_config, %CIMDClient{metadata: _metadata}), do: false
 
   def client_native?(config, client) do
     Callback.invoke(Config.client_native_fun(config), [client], false) == true
@@ -192,7 +193,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   @spec client_public?(Config.t(), term()) :: boolean()
   # A CIMD client holds no symmetric secret (document validation strips it), so
   # it is public by construction.
-  def client_public?(_config, {:cimd, _metadata}), do: true
+  def client_public?(_config, %CIMDClient{metadata: _metadata}), do: true
 
   def client_public?(config, client) do
     case Config.client_public_fun(config) do

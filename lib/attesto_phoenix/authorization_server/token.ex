@@ -49,6 +49,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Event, OAuthError, ResourceAudiencePolicy}
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
   require Logger
 
@@ -1449,7 +1450,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # requests always arrive with the exact credential-carried identifier, so no
   # callback is invoked after authentication and no later callback change can
   # relabel state, tokens, ID Tokens, or audit events.
-  defp client_id(_config, {:cimd, metadata}), do: ClientIdMetadata.client_id(metadata)
+  defp client_id(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.client_id(metadata)
 
   defp client_id(config, client) do
     Callback.invoke(Config.client_id_fun(config), [client], nil)
@@ -1481,7 +1482,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # written for the host's own client shape. A CIMD client is handed to them as
   # its bare, string-keyed metadata map (shaped like a `:load_client` result,
   # `draft-ietf-oauth-client-id-metadata-document-01` §7), with the internal
-  # `{:cimd, _}` tag stripped, so a CIMD-aware host reads it like any client map.
+  # `%CIMDClient{metadata: _}` tag stripped, so a CIMD-aware host reads it like any client map.
   # A registered client passes through untouched.
   #
   # One guard: a CIMD document need NOT declare a `scope` member, so the bare map
@@ -1491,7 +1492,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # would `KeyError` on the bare map. Expose the document's *declared* scopes (or
   # an empty set) under the atom `:scopes` key so that callback degrades to an
   # empty set instead of raising; the host still owns what an empty set grants.
-  defp host_client({:cimd, metadata}) do
+  defp host_client(%CIMDClient{metadata: metadata}) do
     Map.put(metadata, :scopes, ClientIdMetadata.scopes(metadata))
   end
 

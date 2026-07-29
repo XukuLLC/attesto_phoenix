@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- Mark a resolved CIMD client with the `AttestoPhoenix.ClientIdMetadata.Client`
+  struct instead of a `{:cimd, metadata}` tuple.
+
+  The host's client value is opaque by contract — the library never inspects it,
+  and a host may represent a client however it likes, including as a tuple. A
+  tagged tuple therefore made `{:cimd, _}` a shape a host could return from
+  `:load_client` by coincidence, and every CIMD-specific decision keyed on that
+  shape alone: the client would take its redirect URIs from the tuple's map
+  rather than the host's callback, receive the RFC 8252 §7.3 loopback port
+  allowance, and — because `client_public?/2` answers `true` for a CIMD client —
+  authenticate with no secret at all.
+
+  A struct cannot be produced by coincidence; a host that constructs one has
+  named the module explicitly. This is an internal marker, not a value hosts
+  were meant to build, so no host that used the documented callbacks is
+  affected.
+
 ## [2.4.0] - 2026-07-28
 
 ### Security
