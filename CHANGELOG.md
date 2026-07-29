@@ -6,6 +6,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.4.0] - 2026-07-28
 
+### Security
+
+- Hold the CIMD same-origin check to URIs on which every URL parser agrees.
+  `AttestoPhoenix.ClientIdMetadata.same_origin_redirect_uri?/2` compared origins
+  using Elixir's RFC 3986 parser, while the browser that receives the `Location`
+  uses the WHATWG URL Standard. `https://evil.example\@client.example/cb` reads
+  as host `client.example` under the first and `evil.example` under the second,
+  so the check could approve a redirect URI the authorization response would not
+  actually be delivered to.
+
+  Requires `attesto` >= 1.5.0, which rejects such a URI during CIMD document
+  validation so it never reaches a registered set; this predicate now refuses it
+  independently, so the two are separate barriers rather than one.
+
+- Settle the CIMD same-origin requirement before any response travels to the
+  redirect URI. It previously ran only after the whole authorization request had
+  validated, so a request that failed an ordinary check — a missing
+  `code_challenge`, say — short-circuited ahead of the gate and carried a
+  redirectable error, with the client's `state` and the issuer, to a
+  cross-origin URI the gate would have refused. The payload never included a
+  code or token, and the destination was one the validated document declared.
+
+  A failed origin check now makes the error direct, exactly as an unregistered
+  `redirect_uri` already was. When the check passes, ordinary validation errors
+  stay redirectable as before.
+
 ### Added
 
 - Recognize the OpenID Connect Registration §2 `application_type` member

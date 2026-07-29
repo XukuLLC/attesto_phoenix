@@ -262,19 +262,52 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # is never subject to the requirement (RFC 6749 keeps the code at SHOULD), so
   # the flag is scoped to OIDC requests via `openid_request?/1`.
   defp validate_request(config, client, params, par_resolved?) do
-    with {:ok, request} <-
-           AuthorizationRequest.validate(params,
-             registered_redirect_uris: RequestPolicy.registered_redirect_uris(config, client),
-             redirect_uri_matching: RequestPolicy.redirect_uri_matching(config, client),
-             require_nonce: RequestPolicy.require_nonce?(config),
-             require_pkce: RequestPolicy.require_pkce?(config, client),
-             request_object_jwks: client_jwks(config, client),
-             request_object_audience: config.issuer,
-             request_object_policy: config.request_object_policy
-           ),
-         :ok <- require_same_origin_redirect_uri(config, client, request),
+    with {:ok, request} <- validate_within_origin(config, client, params),
          :ok <- require_par_if_configured(config, request, par_resolved?) do
       {:ok, request}
+    end
+  end
+
+  # The same-origin requirement gates the redirect URI itself, so it has to be
+  # settled before ANY response is allowed to travel to that URI - including an
+  # error. Checking it only on the success path would let an ordinary validation
+  # failure (a missing `code_challenge`, say) short-circuit ahead of the gate and
+  # carry a redirectable error, with the attacker's `state` and the issuer, to a
+  # cross-origin URI the gate would have refused. The payload is not a credential
+  # and the destination is one the validated document declared, but the control
+  # is stated as "responses for this client go to its own origin", and a control
+  # that holds only when the request is otherwise perfect does not hold.
+  #
+  # So the verdict is applied to both outcomes: a failed origin check turns a
+  # redirectable error into a direct one, exactly as an unregistered
+  # `redirect_uri` already is.
+  defp validate_within_origin(config, client, params) do
+    validated =
+      AuthorizationRequest.validate(params,
+        registered_redirect_uris: RequestPolicy.registered_redirect_uris(config, client),
+        redirect_uri_matching: RequestPolicy.redirect_uri_matching(config, client),
+        require_nonce: RequestPolicy.require_nonce?(config),
+        require_pkce: RequestPolicy.require_pkce?(config, client),
+        request_object_jwks: client_jwks(config, client),
+        request_object_audience: config.issuer,
+        request_object_policy: config.request_object_policy
+      )
+
+    case validated do
+      {:ok, request} ->
+        with :ok <- require_same_origin_redirect_uri(config, client, request.redirect_uri) do
+          {:ok, request}
+        end
+
+      {:error, {:redirect, _error}} = redirectable ->
+        # The URI this error would travel to is the request's own, which reached
+        # a redirectable outcome only by exact-matching the document's set.
+        with :ok <- require_same_origin_redirect_uri(config, client, Map.get(params, "redirect_uri")) do
+          redirectable
+        end
+
+      {:error, {:direct, _reason}} = direct ->
+        direct
     end
   end
 
@@ -302,7 +335,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `https` redirects where such an attack lives. For loopback the attacker must
   # already run code on the device to hold the port, and PKCE is mandatory for
   # every CIMD client regardless.
-  defp require_same_origin_redirect_uri(config, {:cimd, metadata}, request) do
+  defp require_same_origin_redirect_uri(config, {:cimd, metadata}, redirect_uri) do
     same_origin_required? =
       config
       |> Config.client_id_metadata()
@@ -312,12 +345,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       not same_origin_required? ->
         :ok
 
-      ClientIdMetadata.loopback_redirect_uri?(request.redirect_uri) ->
+      ClientIdMetadata.loopback_redirect_uri?(redirect_uri) ->
         :ok
 
       ClientIdMetadata.same_origin_redirect_uri?(
         ClientIdMetadata.client_id(metadata),
-        request.redirect_uri
+        redirect_uri
       ) ->
         :ok
 
@@ -326,7 +359,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
   end
 
-  defp require_same_origin_redirect_uri(_config, _client, _request), do: :ok
+  defp require_same_origin_redirect_uri(_config, _client, _redirect_uri), do: :ok
 
   defp resolve_request_uri(config, %{"request_uri" => request_uri} = params)
        when is_binary(request_uri) and request_uri != "" do

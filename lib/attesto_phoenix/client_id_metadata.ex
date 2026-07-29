@@ -149,7 +149,16 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   """
   @spec same_origin_redirect_uri?(String.t(), String.t()) :: boolean()
   def same_origin_redirect_uri?(client_id, redirect_uri) when is_binary(client_id) and is_binary(redirect_uri) do
-    with %URI{scheme: cs, host: ch} = client_uri when is_binary(ch) <- URI.parse(client_id),
+    # This comparison is stated in terms of an ORIGIN, so it is only sound for
+    # URIs on which Elixir's RFC 3986 parser and the browser's WHATWG parser
+    # agree - the browser, not this function, decides where the response
+    # actually lands. `Attesto.ClientIdMetadata.validate_document/2` already
+    # keeps an ambiguous URI out of a resolved document, so this is the second
+    # of two independent barriers rather than the only one; it is here because a
+    # public predicate must not depend on its caller having validated first.
+    with true <- Attesto.RedirectURI.unambiguous?(redirect_uri),
+         true <- Attesto.RedirectURI.unambiguous?(client_id),
+         %URI{scheme: cs, host: ch} = client_uri when is_binary(ch) <- URI.parse(client_id),
          %URI{scheme: rs, host: rh} = redirect <- URI.parse(redirect_uri),
          true <- is_binary(rh) do
       cs == rs and ch == rh and effective_port(client_uri) == effective_port(redirect)
