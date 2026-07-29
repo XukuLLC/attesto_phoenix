@@ -477,10 +477,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       put_config(client_id_metadata: cimd_config())
 
       conn =
-        call(
-          valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"})
-          |> Map.drop(["code_challenge", "code_challenge_method"])
-        )
+        valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"})
+        |> Map.drop(["code_challenge", "code_challenge_method"])
+        |> call()
 
       assert conn.status == 400
       assert location(conn) == nil, "an error must not be redirected to a URI the origin check refuses"
@@ -497,10 +496,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       put_config(client_id_metadata: cimd_config())
 
       conn =
-        call(
-          valid_params(%{"client_id" => client_id, "redirect_uri" => same_origin})
-          |> Map.drop(["code_challenge", "code_challenge_method"])
-        )
+        valid_params(%{"client_id" => client_id, "redirect_uri" => same_origin})
+        |> Map.drop(["code_challenge", "code_challenge_method"])
+        |> call()
 
       assert conn.status == 302
       assert location(conn) =~ same_origin
