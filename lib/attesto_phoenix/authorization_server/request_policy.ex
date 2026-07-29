@@ -101,12 +101,26 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   kill switch, or one certifying against a profile that mandates exact
   matching). It defaults to `true`; it is an escape hatch, not a gate.
 
-  A CIMD client is never native - its `client_id` is an `https` URL and its
-  `redirect_uris` come from the document, which the authorization endpoint
-  additionally holds to the same origin.
+  A CIMD client has no `:client_native?` callback to consult - there is no host
+  registry entry for it - so the decision comes from the document itself: a
+  document that registered a loopback redirect URI is an installed app saying
+  so in the only vocabulary CIMD gives it, and gets the same §7.3 allowance.
+
+  It is deliberately NOT keyed on an `application_type` member. CIMD defines no
+  such member (it inherits the DCR registry by reference, and whether that
+  carries OIDC's `application_type` is an open question on the draft's own
+  tracker), real documents do not carry it, and `Attesto.ClientIdMetadata`'s
+  passthrough allowlist would drop it anyway. The declared `redirect_uris` are
+  validated document content; a claimed type would not be.
   """
   @spec redirect_uri_matching(Config.t(), term()) :: RedirectURI.matching()
-  def redirect_uri_matching(_config, {:cimd, _metadata}), do: :exact
+  def redirect_uri_matching(config, {:cimd, metadata}) do
+    if Config.native_app_loopback_redirect?(config) and ClientIdMetadata.loopback_redirect_uris?(metadata) do
+      :exact_allow_loopback_port
+    else
+      :exact
+    end
+  end
 
   def redirect_uri_matching(config, client) do
     if client_native?(config, client) and Config.native_app_loopback_redirect?(config) do

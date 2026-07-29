@@ -69,16 +69,21 @@ defmodule AttestoPhoenix.MixProject do
   # and a path dep cannot be packaged ("only Hex packages can be dependencies"),
   # so a Mix.env-based switch would break publishing from a dev checkout. The
   # default - including every publish - resolves the published version
-  # constraint; local development sets ATTESTO_PATH=1 to use the sibling. The
-  # 1.3.0 floor carries key-bound FAPI algorithm enforcement and RFC 9864
-  # Edwards identifiers. An older core requirement would intersect with this
-  # package's constraints and silently omit the policy that this release wires
-  # through client authentication, request objects, and CIBA.
+  # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
+  #
+  # The 1.5.0 floor is load-bearing, not housekeeping: it carries
+  # `Attesto.RedirectURI.unambiguous?/1` and the CIMD document validation that
+  # rejects a parser-ambiguous redirect URI. This package's same-origin check is
+  # phrased in terms of an origin, so against an older core it would compile and
+  # then approve a redirect URI a browser resolves to a different host. An older
+  # core requirement would also intersect with this package's constraints and
+  # silently omit the key-bound FAPI algorithm enforcement and RFC 9864 Edwards
+  # identifiers that client authentication, request objects, and CIBA rely on.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.4.0 and < 2.0.0"}
+      {:attesto, ">= 1.5.0 and < 2.0.0"}
     end
   end
 

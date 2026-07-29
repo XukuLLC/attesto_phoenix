@@ -6,6 +6,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.4.0] - 2026-07-28
 
+### Security
+
+- Hold the CIMD same-origin check to URIs on which every URL parser agrees.
+  `AttestoPhoenix.ClientIdMetadata.same_origin_redirect_uri?/2` compared origins
+  using Elixir's RFC 3986 parser, while the browser that receives the `Location`
+  uses the WHATWG URL Standard. `https://evil.example\@client.example/cb` reads
+  as host `client.example` under the first and `evil.example` under the second,
+  so the check could approve a redirect URI the authorization response would not
+  actually be delivered to.
+
+  Requires `attesto` >= 1.5.0, which rejects such a URI during CIMD document
+  validation so it never reaches a registered set; this predicate now refuses it
+  independently, so the two are separate barriers rather than one.
+
+- Settle the CIMD same-origin requirement before any response travels to the
+  redirect URI. It previously ran only after the whole authorization request had
+  validated, so a request that failed an ordinary check — a missing
+  `code_challenge`, say — short-circuited ahead of the gate and carried a
+  redirectable error, with the client's `state` and the issuer, to a
+  cross-origin URI the gate would have refused. The payload never included a
+  code or token, and the destination was one the validated document declared.
+
+  A failed origin check now makes the error direct, exactly as an unregistered
+  `redirect_uri` already was. When the check passes, ordinary validation errors
+  stay redirectable as before.
+
 ### Added
 
 - Recognize the OpenID Connect Registration §2 `application_type` member
@@ -23,6 +49,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clients' redirect URIs.
 
 ### Security
+
+- Serve RFC 8252 native apps that identify via a Client ID Metadata Document.
+  CIMD clients were hardcoded as never-native (`client_native?` and
+  `redirect_uri_matching` both short-circuited on `{:cimd, _}`) on the reasoning
+  that a CIMD client "is identified by an https URL resolving to a document
+  served over the network, not an installed app". That reasoning was wrong: the
+  document is served over the network for *every* CIMD client — it is the
+  mechanism, not a client-type signal — and it is hosted by the vendor's
+  backend while the app is still installed on the user's device.
+
+  Two defaults refused such a client, and both had to change:
+
+    * The same-origin requirement between the `client_id` URL and the
+      `redirect_uri` is now waived for a loopback redirect URI. A CIMD
+      `client_id` is `https` by definition, so `http://127.0.0.1/cb` can never
+      share its origin — the check was not a policy a native client failed but
+      one no installed app could satisfy by construction. It is retained in
+      full for `https` redirect URIs, which is where its anti-impersonation
+      value lies.
+    * Redirect matching for a CIMD client is now `:exact_allow_loopback_port`
+      when the document itself declares a loopback redirect URI, so an
+      ephemeral port bound at runtime matches a portless registration
+      (RFC 8252 §7.3, whose applicability CIMD §4.2 inherits via RFC 9700
+      §4.1.3). A document declaring only `https` URIs, or only the `localhost`
+      name (§8.3 requires the literal IP), is unaffected.
+
+  The signal is the document's own declared `redirect_uris`, deliberately not
+  an `application_type` member: CIMD defines no such member, whether it inherits
+  OpenID Connect's is an open question on the draft's tracker, real documents do
+  not carry it, and the passthrough allowlist would drop it. Declared redirect
+  URIs are validated document content; a claimed type would not be.
+
+  What is given up is same-origin binding for loopback redirects — any CIMD
+  document may declare one and receive a code on the user's own machine. The
+  attacker must already run code on the device to hold the port, and PKCE is
+  mandatory for every CIMD client, so the exposure is bounded; deployments that
+  want the old posture can set
+  `client_id_metadata: [require_same_origin_redirect_uri: true]` alongside
+  `native_apps: [loopback_redirect: false]`, which forbids the port allowance
+  server-wide.
 
 - Stop a crashing request from destroying the ETS-backed stores. Both
   `AttestoPhoenix.Store.PAR.ETS` — the **default** `:par_store` — and

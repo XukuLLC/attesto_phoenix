@@ -405,6 +405,119 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       StubFetcher.script(client_id, {:ok, %{body: body, cache_control: []}})
     end
 
+    # A CIMD client that is an installed native app. The document shape is the
+    # one Claude Code publishes at
+    # https://claude.ai/oauth/claude-code-client-metadata: an https client_id,
+    # PORTLESS loopback redirect URIs, and `none` auth. The CLI binds an
+    # ephemeral port at runtime, so the request URI carries a port the document
+    # cannot have declared.
+    #
+    # Both defaults used to refuse this. Same-origin is unsatisfiable for it by
+    # construction (an https client_id can never share an origin with
+    # http://127.0.0.1), and CIMD was hardcoded to exact matching, so the
+    # ephemeral port failed too.
+    test "a native CIMD client completes the flow on an ephemeral loopback port" do
+      client_id = unique_cimd_client_id()
+
+      script_doc(
+        client_id,
+        cimd_doc(%{"redirect_uris" => ["http://localhost/callback", "http://127.0.0.1/callback"]})
+      )
+
+      put_config(client_id_metadata: cimd_config())
+
+      # Everything at its default: same-origin required, loopback allowance on.
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://127.0.0.1:51353/callback"}))
+
+      assert conn.status == 302, "expected the native CIMD client to be served, got: #{conn.resp_body}"
+      assert location(conn) =~ "http://127.0.0.1:51353/callback"
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    # The exemption is scoped to loopback: an https redirect from a CIMD
+    # document is still held to same origin, which is where the check's
+    # anti-impersonation value actually lies.
+    test "an https redirect from a CIMD document is still held to same origin" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => ["https://elsewhere.example/cb"]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"}))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    # The same-origin check compares ORIGINS, so it is only as good as the
+    # agreement between the parser that decides and the browser that navigates.
+    # `https://evil.example\@app.example/cb` reads as host `app.example` under
+    # RFC 3986 and as `evil.example` under WHATWG, so approving it would send
+    # the code off-origin. The document carrying it is refused outright, which
+    # keeps the URI out of the registered set the check ever runs against.
+    test "a CIMD document declaring a parser-ambiguous redirect URI is refused" do
+      client_id = unique_cimd_client_id()
+      ambiguous = "https://evil.example\\@#{URI.parse(client_id).host}/cb"
+
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [ambiguous]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => ambiguous}))
+
+      assert conn.status == 400
+      assert location(conn) == nil, "an ambiguous redirect URI must never become a redirect target"
+    end
+
+    # The same-origin requirement gates the redirect URI itself, so it has to be
+    # settled before ANY response travels there. A request that fails ordinary
+    # validation (here: mandatory PKCE) must not short-circuit ahead of the gate
+    # and carry a redirectable error cross-origin.
+    test "a validation error does not escape cross-origin ahead of the same-origin check" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => ["https://elsewhere.example/cb"]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"})
+        |> Map.drop(["code_challenge", "code_challenge_method"])
+        |> call()
+
+      assert conn.status == 400
+      assert location(conn) == nil, "an error must not be redirected to a URI the origin check refuses"
+    end
+
+    # The converse: when the origin check passes, an ordinary validation failure
+    # is still redirectable. The fix orders the gate ahead of the error, it does
+    # not turn every error into a direct one.
+    test "a validation error for a same-origin redirect stays redirectable" do
+      client_id = unique_cimd_client_id()
+      same_origin = "https://#{URI.parse(client_id).host}/cb"
+
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [same_origin]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        valid_params(%{"client_id" => client_id, "redirect_uri" => same_origin})
+        |> Map.drop(["code_challenge", "code_challenge_method"])
+        |> call()
+
+      assert conn.status == 302
+      assert location(conn) =~ same_origin
+      assert location_query(conn)["error"] == "invalid_request"
+    end
+
+    # §8.3: the literal IP is required. A document declaring only the localhost
+    # NAME gets neither the same-origin exemption nor port flexibility.
+    test "a localhost-only CIMD document is still refused" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => ["http://localhost/callback"]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost:51353/callback"}))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
     test "resolves a CIMD client_id and issues a code" do
       client_id = unique_cimd_client_id()
       script_doc(client_id, cimd_doc())
