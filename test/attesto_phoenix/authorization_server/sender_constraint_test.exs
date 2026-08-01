@@ -155,7 +155,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {proof, jkt} = dpop_proof_and_jkt()
       config = base_config(dpop_enabled: true)
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
     end
 
@@ -163,7 +163,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {proof, jkt} = dpop_proof_and_jkt()
       config = base_config(dpop_enabled: true, mtls_enabled: true)
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(
                  config,
                  input(dpop_proof: proof, mtls_cert_der: self_signed_cert_der()),
@@ -182,7 +182,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {proof, _jkt} = dpop_proof_and_jkt()
       config = base_config(dpop_enabled: false)
 
-      assert {:ok, :none, "Bearer"} =
+      assert {:ok, :none, "Bearer", _pending} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
     end
   end
@@ -228,7 +228,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       config =
         base_config(dpop_enabled: true, dpop_nonce_required: true, nonce_store: store)
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
     end
   end
@@ -239,14 +239,14 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
       config = base_config(mtls_enabled: true)
 
-      assert {:ok, {:mtls, ^thumbprint}, "Bearer"} =
+      assert {:ok, {:mtls, ^thumbprint}, "Bearer", _pending} =
                SenderConstraint.resolve(config, input(mtls_cert_der: der), @plain)
     end
 
     test "a certificate is ignored when mTLS is disabled, falling back to Bearer" do
       config = base_config(mtls_enabled: false)
 
-      assert {:ok, :none, "Bearer"} =
+      assert {:ok, :none, "Bearer", _pending} =
                SenderConstraint.resolve(
                  config,
                  input(mtls_cert_der: self_signed_cert_der()),
@@ -268,7 +268,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
     test "no constraint presented and none required yields an unbound Bearer" do
       config = base_config(dpop_enabled: true, mtls_enabled: true)
 
-      assert {:ok, :none, "Bearer"} = SenderConstraint.resolve(config, input([]), @plain)
+      assert {:ok, :none, "Bearer", _pending} = SenderConstraint.resolve(config, input([]), @plain)
     end
 
     test "a DPoP-required client calling without a proof is refused (RFC 9449)" do
@@ -288,7 +288,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
     test "binding requirements fail open to not-required when callbacks are absent" do
       config = bare_config()
 
-      assert {:ok, :none, "Bearer"} =
+      assert {:ok, :none, "Bearer", _pending} =
                SenderConstraint.resolve(config, input([]), @dpop_required)
     end
   end
@@ -309,7 +309,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {proof, jkt} = dpop_proof_and_jkt()
       config = base_config(dpop_enabled: true, mtls_enabled: true)
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @dpop_required)
     end
 
@@ -317,7 +317,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {proof, jkt} = dpop_proof_and_jkt()
       config = base_config(dpop_enabled: true, mtls_enabled: true)
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(
                  config,
                  input(dpop_proof: proof, mtls_cert_der: self_signed_cert_der()),
@@ -338,7 +338,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
       config = base_config(dpop_enabled: true, mtls_enabled: true)
 
-      assert {:ok, {:mtls, ^thumbprint}, "Bearer"} =
+      assert {:ok, {:mtls, ^thumbprint}, "Bearer", _pending} =
                SenderConstraint.resolve(config, input(mtls_cert_der: der), @mtls_required)
     end
 
@@ -348,7 +348,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
       config = base_config(dpop_enabled: true, mtls_enabled: true)
 
-      assert {:ok, {:mtls, ^thumbprint}, "Bearer"} =
+      assert {:ok, {:mtls, ^thumbprint}, "Bearer", _pending} =
                SenderConstraint.resolve(
                  config,
                  input(dpop_proof: proof, mtls_cert_der: der),
@@ -367,19 +367,49 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       {proof, jkt} = dpop_proof_and_jkt()
       config = base_config(dpop_enabled: true, replay_check: {MfaReplay, :check_and_record})
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
     end
 
-    test "a replayed proof is rejected through the MFA replay_check" do
+    # `resolve/3` verifies the proof but no longer claims its `jti` - a token
+    # request reaching that point has proved nothing yet, and a public client
+    # presents no credential at all, so claiming there let anyone knowing a
+    # public `client_id` write a replay row per request. The claim is made by
+    # `commit_replay_claim/2` once the grant has validated, so replay rejection
+    # has to be exercised through both steps, as a grant path does.
+    test "a replayed proof is rejected when the claim is committed" do
       {proof, _jkt} = dpop_proof_and_jkt()
       config = base_config(dpop_enabled: true, replay_check: {MfaReplay, :check_and_record})
 
-      assert {:ok, {:dpop, _jkt}, "DPoP"} =
+      assert {:ok, {:dpop, _jkt}, "DPoP", first} =
+               SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
+
+      assert :ok = SenderConstraint.commit_replay_claim(config, first)
+
+      # The same proof again: verification still passes (it is a valid proof),
+      # and the replay is caught at the claim.
+      assert {:ok, {:dpop, _jkt}, "DPoP", second} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
 
       assert {:error, %OAuthError{error: :invalid_dpop_proof}} =
+               SenderConstraint.commit_replay_claim(config, second)
+    end
+
+    # The point of the deferral: verifying a proof must not touch the store.
+    test "resolving a proof does not claim its jti" do
+      {proof, _jkt} = dpop_proof_and_jkt()
+      config = base_config(dpop_enabled: true, replay_check: {MfaReplay, :check_and_record})
+
+      for _ <- 1..5 do
+        assert {:ok, {:dpop, _jkt}, "DPoP", _pending} =
+                 SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
+      end
+
+      # Nothing was recorded, so the first real claim still succeeds.
+      assert {:ok, _binding, _type, pending} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
+
+      assert :ok = SenderConstraint.commit_replay_claim(config, pending)
     end
   end
 
@@ -409,7 +439,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       nonce = ThreadedNonceStore.issue(config, 300)
       {proof, jkt} = dpop_proof_and_jkt(nonce: nonce)
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(config, input(dpop_proof: proof), @plain)
     end
   end

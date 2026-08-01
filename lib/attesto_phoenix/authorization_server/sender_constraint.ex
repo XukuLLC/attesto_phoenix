@@ -90,6 +90,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @typedoc "The resolved sender-constraint binding."
   @type binding :: {:dpop, String.t()} | {:mtls, String.t()} | :none
 
+  @typedoc """
+  A verified DPoP proof's replay claim, not yet made: the proof's `jti` and the
+  acceptance window the verifier derived for it. `nil` when the request carries
+  no DPoP proof and so has nothing to claim.
+  """
+  @type pending_claim :: {String.t(), pos_integer()} | nil
+
   # RFC 6749 §5.2 / RFC 9449 §5 error codes, held as the atoms
   # `OAuthError.new/3` requires (no string round-trip that could raise).
   @error_invalid_request :invalid_request
@@ -107,11 +114,26 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @doc """
   Resolve the sender-constraint binding for a token request.
 
-  Returns `{:ok, binding, token_type}` or `{:error, %OAuthError{}}`. See the
-  module docs for the precedence rules and the input shape.
+  Returns `{:ok, binding, token_type, pending_claim}` or
+  `{:error, %OAuthError{}}`. See the module docs for the precedence rules and
+  the input shape.
+
+  `pending_claim` is the DPoP proof's replay claim, DEFERRED. The proof is
+  verified here, but its `jti` is deliberately NOT yet recorded: `:replay_check`
+  is a check-and-record operation, and running it at this point would let a
+  caller who has proved nothing write to the replay store. A public client
+  (RFC 6749 §2.1) authenticates with a `client_id` and no credential, so at this
+  point in a token request the caller may be anyone who knows a registered
+  public client's identifier - they could pair a self-signed proof with a bogus
+  authorization code and grow the store a row per request.
+
+  The caller MUST therefore pass this value to `commit_replay_claim/2` once the
+  grant itself has been validated, and before a response is issued. RFC 9449
+  §11.1 is unchanged by the deferral: the claim is still an atomic
+  check-and-record, and it still happens before anything is minted.
   """
   @spec resolve(Config.t(), input(), term()) ::
-          {:ok, binding(), String.t()} | {:error, OAuthError.t()}
+          {:ok, binding(), String.t(), pending_claim()} | {:error, OAuthError.t()}
   def resolve(%Config{} = config, input, client) do
     # Resolve the client's REQUIRED constraint first: a per-client policy must
     # be enforced on its own terms, so a client cannot satisfy its required
@@ -169,7 +191,41 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
         bind_mtls(input)
 
       true ->
-        {:ok, :none, @token_type_bearer}
+        {:ok, :none, @token_type_bearer, nil}
+    end
+  end
+
+  @doc """
+  Make the replay claim `resolve/3` deferred, now that the grant has been
+  validated (RFC 9449 §11.1).
+
+  Call this in every grant path that resolved a sender constraint, immediately
+  after the step that establishes the caller actually holds the grant it is
+  presenting - the redeemed code, the rotated refresh token, the verified
+  subject token - and before any response is issued.
+
+  Deferring the claim is what keeps an unauthenticated caller from writing to
+  the replay store (see `resolve/3`); making it here is what keeps a captured
+  token-endpoint proof from being replayed within its acceptance window. Both
+  are required, and the order between them is the whole point.
+
+  `nil` is the no-op case: the request carried no DPoP proof.
+  """
+  @spec commit_replay_claim(Config.t(), pending_claim()) :: :ok | {:error, OAuthError.t()}
+  def commit_replay_claim(%Config{}, nil), do: :ok
+
+  def commit_replay_claim(%Config{} = config, {jti, ttl}) when is_binary(jti) do
+    case replay_check(config).(jti, ttl) do
+      :ok ->
+        :ok
+
+      {:error, :replay} ->
+        Attesto.Telemetry.dpop_replay_detected(jti)
+        {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: :replay")}
+
+      other ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}; got #{inspect(other)}"
     end
   end
 
@@ -276,19 +332,18 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
     verify_opts =
       [
         http_method: http_method(input),
-        http_uri: http_uri(input),
-        # RFC 9449 §11.1: record the proof's `jti` so a captured token-endpoint
-        # proof cannot be replayed within its acceptance window. The token
-        # endpoint is the one place RFC 9449 §11.1 makes the server responsible
-        # for the replay check itself (there is no later resource-server check to
-        # rely on), so it must be wired here, exactly as the PAR endpoint does.
-        replay_check: replay_check(config)
+        http_uri: http_uri(input)
+        # `:replay_check` is deliberately NOT passed here - see `resolve/3`. The
+        # token endpoint is the one place RFC 9449 §11.1 makes the server
+        # responsible for the replay check itself (there is no later
+        # resource-server check to rely on), so the claim still happens, but
+        # `commit_replay_claim/2` makes it once the grant has been validated.
       ]
       |> put_optional_kw(:nonce_check, nonce_check(config))
 
     case invoke_dpop_verify(proof, verify_opts) do
-      {:ok, %{jkt: jkt}} ->
-        {:ok, {:dpop, jkt}, @token_type_dpop}
+      {:ok, %{jkt: jkt, jti: jti, replay_ttl: ttl}} ->
+        {:ok, {:dpop, jkt}, @token_type_dpop, {jti, ttl}}
 
       {:error, :use_dpop_nonce} ->
         # RFC 9449 §8/§9: hand the client a fresh nonce and demand a retry.
@@ -315,7 +370,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
             # `cnf.x5t#S256` (minted via `Attesto.Token`'s
             # `:mtls_cert_thumbprint` opt). mTLS-bound tokens keep the
             # `Bearer` type (RFC 8705 §3.1).
-            {:ok, {:mtls, x5t}, @token_type_bearer}
+            {:ok, {:mtls, x5t}, @token_type_bearer, nil}
 
           {:error, _reason} ->
             # The presented bytes are not a parseable X.509 certificate, so there

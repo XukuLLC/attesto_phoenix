@@ -1231,6 +1231,40 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert second.status == 400
       assert body(second)["error"] == "invalid_dpop_proof"
     end
+
+    # A public client (RFC 6749 §2.1) presents a `client_id` and no credential,
+    # so at the point a token request resolves its sender constraint the caller
+    # may be anyone who knows a registered public client's identifier. Claiming
+    # the proof's `jti` there let such a caller write one replay-store row per
+    # request, for the cost of a signature, using a bogus grant - the same
+    # unbounded-write the resource-server plug was fixed for.
+    #
+    # The claim is now made only after the grant validates, so a request that
+    # never had a grant leaves nothing behind.
+    test "a public client with a bogus grant cannot write to the replay store" do
+      enable_minting()
+      start_supervised!({ReplayCache, []})
+
+      put_config(
+        dpop_enabled: true,
+        replay_check: &ReplayCache.check_and_record/2,
+        code_store: start_code_store("oc_sub-1", ["read"])
+      )
+
+      before = ReplayCache.size()
+
+      # Fresh proofs, each with its own jti, paired with an authorization code
+      # that does not exist. No client credential is presented.
+      for _ <- 1..5 do
+        conn =
+          post_public_code_grant(dpop_proof(nonce: nil), "not-a-real-code")
+
+        assert conn.status in [400, 401]
+      end
+
+      assert ReplayCache.size() == before,
+             "a caller who proved nothing wrote #{ReplayCache.size() - before} row(s) to the replay store"
+    end
   end
 
   describe "DPoP nonce enforcement (RFC 9449 §8)" do
@@ -2526,6 +2560,25 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     %{base | scheme: :https, host: "issuer.example", port: 443}
     |> put_token_content_type()
     |> put_req_header("authorization", "Basic " <> Base.encode64("confidential-1:s3cr3t"))
+    |> put_req_header("dpop", proof)
+    |> TokenController.create(params)
+  end
+
+  # A PUBLIC client's authorization-code request: a `client_id` and no
+  # credential of any kind, which is exactly what RFC 6749 §2.1 allows.
+  defp post_public_code_grant(proof, code) do
+    params = %{
+      "grant_type" => "authorization_code",
+      "client_id" => "public-1",
+      "code" => code,
+      "redirect_uri" => "https://app.example.com/cb",
+      "code_verifier" => "verifier-that-is-long-enough-to-be-valid-0123456789"
+    }
+
+    %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
+
+    %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
     |> put_req_header("dpop", proof)
     |> TokenController.create(params)
   end

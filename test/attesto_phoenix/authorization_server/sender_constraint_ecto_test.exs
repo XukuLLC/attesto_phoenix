@@ -82,11 +82,17 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintEctoTest do
   describe "MFA-tuple replay_check against EctoReplayCheck" do
     test "a DPoP request with an MFA replay_check issues a DPoP-bound token (no ArgumentError)" do
       {proof, jkt} = dpop_proof_and_jkt()
+      config = config()
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
-               SenderConstraint.resolve(config(), input(proof), @plain)
+      assert {:ok, {:dpop, ^jkt}, "DPoP", pending} =
+               SenderConstraint.resolve(config, input(proof), @plain)
 
-      # The MFA store actually ran: the jti was recorded.
+      # Verifying the proof must NOT write: a token request has proved nothing
+      # at that point, and a public client presents no credential at all.
+      assert TestRepo.aggregate(DPoPReplay, :count) == 0
+
+      # The MFA store runs when the grant path commits the claim.
+      assert :ok = SenderConstraint.commit_replay_claim(config, pending)
       assert TestRepo.aggregate(DPoPReplay, :count) == 1
     end
 
@@ -94,10 +100,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintEctoTest do
       {proof, _jkt} = dpop_proof_and_jkt()
       config = config()
 
-      assert {:ok, {:dpop, _jkt}, "DPoP"} = SenderConstraint.resolve(config, input(proof), @plain)
+      assert {:ok, {:dpop, _jkt}, "DPoP", first} = SenderConstraint.resolve(config, input(proof), @plain)
+      assert :ok = SenderConstraint.commit_replay_claim(config, first)
+
+      assert {:ok, {:dpop, _jkt}, "DPoP", second} = SenderConstraint.resolve(config, input(proof), @plain)
 
       assert {:error, %OAuthError{error: :invalid_dpop_proof}} =
-               SenderConstraint.resolve(config, input(proof), @plain)
+               SenderConstraint.commit_replay_claim(config, second)
     end
   end
 
@@ -124,7 +133,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintEctoTest do
 
       {proof_with_nonce, jkt} = dpop_proof_and_jkt(nonce: nonce)
 
-      assert {:ok, {:dpop, ^jkt}, "DPoP"} =
+      assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(config, input(proof_with_nonce), @plain)
     end
   end

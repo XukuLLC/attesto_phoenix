@@ -210,7 +210,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with {:ok, code} <- require_param(params, "code"),
          {:ok, verifier} <- fetch_code_verifier(config, client, params),
          {:ok, redirect_uri} <- require_param(params, "redirect_uri"),
-         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          {:ok, grant} <-
            redeem_code(
              request,
@@ -219,6 +219,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              redirect_uri,
              SenderConstraint.binding_jkt(binding)
            ),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
@@ -273,7 +274,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with {:ok, presented} <- require_param(params, "refresh_token"),
          requested = parse_requested_scope(params),
          {:ok, resource} <- refresh_requested_resource(params),
-         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          {:ok, rotated} <-
            rotate_refresh(
              request,
@@ -282,6 +283,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              resource,
              SenderConstraint.refresh_binding_jkt(config, client, binding)
            ),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
          {:ok, response} <-
            mint(
@@ -306,9 +308,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp dispatch(%Request{grant_type: "client_credentials"} = request) do
     %{config: config, client: client, params: params} = request
 
-    with {:ok, binding, token_type} <- resolve_sender_constraint(request),
+    with {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          subject = token_client_id(request),
          {:ok, scope} <- authorize_scope(config, client, parse_requested_scope(params)),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, audience} <- request_resource_audience(config, client, params),
          {:ok, response} <-
            mint(request, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
@@ -326,8 +329,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     %{config: config, client: client, params: params} = request
 
     with {:ok, device_code} <- require_param(params, "device_code"),
-         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          {:ok, grant} <- redeem_device_code(request, device_code, SenderConstraint.binding_jkt(binding)),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
@@ -360,8 +364,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     %{config: config, client: client, params: params} = request
 
     with {:ok, auth_req_id} <- require_param(params, "auth_req_id"),
-         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          {:ok, grant} <- redeem_ciba(request, auth_req_id, SenderConstraint.binding_jkt(binding)),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
@@ -408,8 +413,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, subject_token} <- require_param(params, "subject_token"),
          :ok <- require_subject_token_type(params),
-         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          {:ok, claims} <- verify_subject_token(config, subject_token, binding),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          requested = requested_exchange_scope(params, claims),
          :ok <- require_scope_within_subject_token(requested, claims),
          {:ok, scope} <- authorize_scope(config, client, requested),
@@ -438,7 +444,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
            jwt_bearer_authorize(config, token_client_id(request), params),
-         {:ok, binding, token_type} <- resolve_sender_constraint(request),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, audience} <- request_resource_audience(config, client, params),
          requested = jwt_bearer_requested_scope(params, ceiling),
          :ok <- require_scope_within_ceiling(requested, ceiling),

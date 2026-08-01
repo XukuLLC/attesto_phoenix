@@ -8,6 +8,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Claim a token-endpoint DPoP proof's `jti` only after the grant has been
+  validated (RFC 9449 §11.1).
+
+  `AttestoPhoenix.AuthorizationServer.SenderConstraint.resolve/3` passed
+  `:replay_check` into proof verification, so the `jti` was recorded before the
+  authorization code, refresh token, device code, or subject token was looked
+  at. `:replay_check` is a check-AND-record operation, and a **public client**
+  (RFC 6749 §2.1) authenticates with a `client_id` and no credential — so at
+  that point the caller may be anyone who knows a registered public client's
+  identifier.
+
+  Such a caller could pair a self-signed DPoP proof with a bogus authorization
+  code and write one replay-store row per request, for the cost of a signature,
+  without holding any grant. Against the bundled ETS cache that is unbounded
+  growth; against a shared store it is unbounded writes.
+
+  `resolve/3` now returns the claim as a deferred `pending_claim`, and every
+  grant path commits it with `commit_replay_claim/2` once the grant itself has
+  validated and before anything is minted. Replay rejection is unchanged: the
+  claim is still an atomic check-and-record made before a response is issued.
+
+### Security
+
 - Mark a resolved CIMD client with the `AttestoPhoenix.ClientIdMetadata.Client`
   struct instead of a `{:cimd, metadata}` tuple.
 
