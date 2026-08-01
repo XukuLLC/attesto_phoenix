@@ -211,6 +211,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, verifier} <- fetch_code_verifier(config, client, params),
          {:ok, redirect_uri} <- require_param(params, "redirect_uri"),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
+         :ok <- commit_claim_for_presented_grant(request, :code, code, pending_claim),
          {:ok, grant} <-
            redeem_code(
              request,
@@ -219,7 +220,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              redirect_uri,
              SenderConstraint.binding_jkt(binding)
            ),
-         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
@@ -275,6 +275,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          requested = parse_requested_scope(params),
          {:ok, resource} <- refresh_requested_resource(params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
+         :ok <- commit_claim_for_presented_grant(request, :refresh, presented, pending_claim),
          {:ok, rotated} <-
            rotate_refresh(
              request,
@@ -283,7 +284,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              resource,
              SenderConstraint.refresh_binding_jkt(config, client, binding)
            ),
-         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
          {:ok, response} <-
            mint(
@@ -330,8 +330,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, device_code} <- require_param(params, "device_code"),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
-         {:ok, grant} <- redeem_device_code(request, device_code, SenderConstraint.binding_jkt(binding)),
-         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
+         redemption = redeem_device_code(request, device_code, SenderConstraint.binding_jkt(binding)),
+         :ok <- commit_claim_for_polling_grant(config, redemption, pending_claim),
+         {:ok, grant} <- redemption,
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
@@ -365,8 +366,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, auth_req_id} <- require_param(params, "auth_req_id"),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
-         {:ok, grant} <- redeem_ciba(request, auth_req_id, SenderConstraint.binding_jkt(binding)),
-         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
+         redemption = redeem_ciba(request, auth_req_id, SenderConstraint.binding_jkt(binding)),
+         :ok <- commit_claim_for_polling_grant(config, redemption, pending_claim),
+         {:ok, grant} <- redemption,
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
@@ -615,6 +617,43 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     {:ok, optional_param(params, "code_verifier")}
   end
 
+  # Commit the deferred DPoP replay claim, but only once the caller has been
+  # shown to hold the grant it is presenting - WITHOUT consuming it.
+  #
+  # Ordering here has two failure modes and they pull in opposite directions.
+  # Committing before any grant check lets an unauthenticated caller write to
+  # the replay store (a public client presents no credential, so at that point
+  # the caller may be anyone). Committing after redemption means a replayed
+  # proof burns a real grant: the code is consumed, or the refresh parent is
+  # rotated and a successor persisted, and only then is the request refused -
+  # so a legitimate holder loses a credential to someone else's replay.
+  #
+  # A non-destructive existence check separates the two. Seeing the grant proves
+  # the caller holds something real, which is all the replay store needs before
+  # accepting a write; the destructive step then happens after the proof has
+  # been accepted, so a refusal consumes nothing.
+  defp commit_claim_for_presented_grant(%Request{}, _kind, _presented, nil), do: :ok
+
+  defp commit_claim_for_presented_grant(%Request{config: config}, kind, presented, pending) do
+    if grant_present?(config, kind, presented) do
+      SenderConstraint.commit_replay_claim(config, pending)
+    else
+      # The grant is absent or unusable. Say so without touching the replay
+      # store: this caller has proved nothing, which is exactly the case the
+      # deferral exists for. The destructive path below will produce the real
+      # error.
+      :ok
+    end
+  end
+
+  defp grant_present?(config, :code, code) do
+    match?({:ok, _}, grant_store(config, :code_store).get(Attesto.Secret.hash(code)))
+  end
+
+  defp grant_present?(config, :refresh, token) do
+    match?({:ok, _}, grant_store(config, :refresh_store).get(Attesto.Secret.hash(token)))
+  end
+
   defp redeem_code(%Request{config: config} = request, code, verifier, redirect_uri, jkt) do
     params =
       %{
@@ -648,6 +687,37 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `device_code`, carrying the DPoP holder-of-key the token request demonstrated
   # (matched against any pre-bound key). The §3.5 polling signals map to their
   # own wire error codes; only a genuinely bad/unknown code is `invalid_grant`.
+  # A polling grant (device, CIBA) whose record was found, matched to this
+  # client and to this DPoP key, but which is not yet approved, returns
+  # `authorization_pending` or `slow_down`. Those are REFUSALS to the caller but
+  # they are proof the caller holds a real grant - the state machine checked
+  # expiry, client identity and key binding before producing them - so the
+  # proof's `jti` must still be claimed. Otherwise one captured proof polls
+  # forever and is never recorded, which is precisely the replay RFC 9449 §11.1
+  # exists to stop.
+  #
+  # An unknown, expired, denied, wrong-client or wrong-key grant proves nothing
+  # and must NOT reach the store.
+  #
+  # Unlike the code and refresh paths, the claim here still lands after the
+  # approved grant is consumed: `poll/2` on these stores is rate-limiting, so
+  # there is no side-effect-free peek to gate on. The exposure is narrower -
+  # burning a device code requires already holding the victim's device code.
+  defp commit_claim_for_polling_grant(config, redemption, pending) do
+    if pending && polling_grant_validated?(redemption) do
+      SenderConstraint.commit_replay_claim(config, pending)
+    else
+      :ok
+    end
+  end
+
+  defp polling_grant_validated?({:ok, _grant}), do: true
+
+  defp polling_grant_validated?({:error, %OAuthError{error: error}})
+       when error in [@error_authorization_pending, @error_slow_down], do: true
+
+  defp polling_grant_validated?(_other), do: false
+
   defp redeem_device_code(%Request{config: config} = request, device_code, jkt) do
     store = Config.device_code_store(config)
     interval = config |> Config.device_authorization() |> Keyword.get(:poll_interval_seconds, 5)

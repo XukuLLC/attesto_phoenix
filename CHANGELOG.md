@@ -25,9 +25,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   growth; against a shared store it is unbounded writes.
 
   `resolve/3` now returns the claim as a deferred `pending_claim`, and every
-  grant path commits it with `commit_replay_claim/2` once the grant itself has
-  validated and before anything is minted. Replay rejection is unchanged: the
-  claim is still an atomic check-and-record made before a response is issued.
+  grant path commits it with `commit_replay_claim/2`. Replay rejection is
+  unchanged: the claim is still an atomic check-and-record made before a
+  response is issued.
+
+  Placement within each grant is deliberate, because both ends are wrong. The
+  code and refresh paths commit after a NON-destructive check that the grant
+  exists and before it is consumed — committing after redemption meant a
+  replayed proof burned a real grant (the code spent, or the parent rotated and
+  a successor persisted) and only then refused the request. The device and CIBA
+  paths commit on a validated grant *including* `authorization_pending` and
+  `slow_down`, which are refusals but prove the caller holds the grant;
+  otherwise one captured proof could poll indefinitely without ever being
+  recorded.
+
+  **Breaking for direct callers of
+  `AttestoPhoenix.AuthorizationServer.SenderConstraint.resolve/3`:** it now
+  returns a four-element tuple. Hosts matching the documented
+  `{:ok, binding, token_type}` must add the `pending_claim` element and commit
+  it. Hosts using the endpoints are unaffected.
 
 ### Security
 

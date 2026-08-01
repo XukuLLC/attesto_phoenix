@@ -271,6 +271,20 @@ defmodule AttestoPhoenix.Config do
       Ed25519, and explicit Ed25519). A non-FAPI deployment can widen it;
       verification and the advertised metadata stay in lockstep because both
       read this one value.
+    * `:client_assertion_audiences` - the `aud` values a `private_key_jwt`
+      client assertion may carry (RFC 7523 §3), as a list or a one-arity
+      function of the config. Defaults to `[issuer, token_endpoint_url]`.
+
+      Both are accepted by default because the profiles disagree: FAPI 2.0
+      Security Profile Final §5.3.2.1 requires the issuer identifier, while
+      FAPI-CIBA ID1 audiences a token-endpoint assertion to the token endpoint
+      URL. A deployment certifying to only one of them can narrow this to
+      `[config.issuer]` and refuse the other.
+
+      Narrowing does not add much: both values identify THIS server, so
+      accepting either does not let an assertion minted for a different
+      authorization server be replayed here — which is what RFC 7523's audience
+      restriction is for. It is a conformance knob, not a security one.
     * `:client_auth_enforce_fapi_alg_policy` - additionally enforce FAPI's RSA
       modulus and Edwards-curve restrictions for `private_key_jwt`. When unset,
       this defaults to `true` if `:client_auth_signing_algs` is omitted and to
@@ -534,6 +548,7 @@ defmodule AttestoPhoenix.Config do
     :claims_provider,
     :client_auth_signing_algs,
     :client_auth_enforce_fapi_alg_policy,
+    :client_assertion_audiences,
     :request_object_policy,
     :audience,
     :authorize_scope,
@@ -663,6 +678,7 @@ defmodule AttestoPhoenix.Config do
           claims_provider: module() | nil,
           client_auth_signing_algs: [String.t()] | nil,
           client_auth_enforce_fapi_alg_policy: boolean() | nil,
+          client_assertion_audiences: [String.t()] | (t() -> [String.t()]) | nil,
           request_object_policy: Policy.t() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
@@ -1808,6 +1824,23 @@ defmodule AttestoPhoenix.Config do
   """
   @spec token_endpoint_url(t()) :: String.t()
   def token_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, token_path(config))
+
+  @doc """
+  The `aud` values a `private_key_jwt` client assertion may carry (RFC 7523 §3).
+
+  Defaults to the issuer identifier and the token endpoint URL, because the
+  profiles disagree about which one is required — see
+  `:client_assertion_audiences` in the moduledoc. A deployment certifying to a
+  single profile can narrow it.
+  """
+  @spec client_assertion_audiences(t()) :: [String.t()]
+  def client_assertion_audiences(%__MODULE__{} = config) do
+    case config.client_assertion_audiences do
+      nil -> [config.issuer, token_endpoint_url(config)]
+      fun when is_function(fun, 1) -> fun.(config)
+      audiences when is_list(audiences) and audiences != [] -> audiences
+    end
+  end
 
   @doc """
   Absolute URL of the pushed-authorization-request endpoint: the issuer merged

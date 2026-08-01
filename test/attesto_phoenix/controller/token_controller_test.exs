@@ -1241,6 +1241,39 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     #
     # The claim is now made only after the grant validates, so a request that
     # never had a grant leaves nothing behind.
+    # The deferral must not overshoot. Grant validation is DESTRUCTIVE - the
+    # code is consumed, the refresh parent rotated - so committing after it
+    # meant a replayed proof burned a real grant: the credential was spent and
+    # the request then refused, costing its legitimate holder the grant. The
+    # claim now lands after a non-destructive check that the grant exists and
+    # before it is consumed.
+    test "a replayed proof does not consume the authorization code it was replayed against" do
+      enable_minting()
+      start_supervised!({ReplayCache, []})
+
+      code_store = start_code_store("oc_sub-1", ["read"])
+
+      put_config(
+        dpop_enabled: true,
+        replay_check: &ReplayCache.check_and_record/2,
+        code_store: code_store
+      )
+
+      code = Process.get(:auth_code)
+      proof = dpop_proof(nonce: nil)
+
+      # Burn the proof's jti on an unrelated request so the next use is a replay.
+      assert :ok = ReplayCache.check_and_record(peek_jti(proof), 60)
+
+      conn = post_public_code_grant(proof, code)
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_dpop_proof"
+
+      # The code must still be there: a refused request may not spend it.
+      assert {:ok, _entry} = code_store.get(Attesto.Secret.hash(code)),
+             "a replayed proof consumed the authorization code it was refused for"
+    end
+
     test "a public client with a bogus grant cannot write to the replay store" do
       enable_minting()
       start_supervised!({ReplayCache, []})
@@ -1256,10 +1289,13 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       # Fresh proofs, each with its own jti, paired with an authorization code
       # that does not exist. No client credential is presented.
       for _ <- 1..5 do
-        conn =
-          post_public_code_grant(dpop_proof(nonce: nil), "not-a-real-code")
+        conn = post_public_code_grant(dpop_proof(nonce: nil), "not-a-real-code")
 
-        assert conn.status in [400, 401]
+        # Pin the reason, not just the rejection: a regression that refused
+        # `public-1` during client resolution - before the proof was ever
+        # verified - would also leave the store empty and pass otherwise.
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_grant"
       end
 
       assert ReplayCache.size() == before,
@@ -2474,6 +2510,17 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   # Build a signed DPoP proof (RFC 9449 §4.2) for POST @endpoint_path. The
   # proof key is freshly generated per call; `nonce` is included when given.
+  # The `jti` inside a compact DPoP proof, so a test can pre-burn it and make
+  # the next presentation a replay.
+  defp peek_jti(proof) do
+    [_header, payload, _sig] = String.split(proof, ".", parts: 3)
+
+    payload
+    |> Base.url_decode64!(padding: false)
+    |> JSON.decode!()
+    |> Map.fetch!("jti")
+  end
+
   defp dpop_proof(opts) do
     {proof, _jkt} = dpop_proof_and_jkt(opts)
     proof
