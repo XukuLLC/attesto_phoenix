@@ -24,8 +24,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
 
   alias Attesto.{DeviceCode, ResourceIndicator, Scope}
   alias Attesto.DPoP
-  alias Attesto.DPoP.ReplayCache
-  alias AttestoPhoenix.{Callback, Config, OAuthError}
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, OAuthError}
 
   @error_invalid_request :invalid_request
   @error_invalid_scope :invalid_scope
@@ -140,11 +139,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
         {:ok, nil}
 
       [proof] ->
-        opts = [
-          http_method: Map.get(dpop_input, :http_method, "POST"),
-          http_uri: Map.get(dpop_input, :http_uri),
-          replay_check: replay_check(config)
-        ]
+        opts = Adapter.verification_opts(config, dpop_input, http_method_default: "POST")
 
         case DPoP.verify_proof(proof, opts) do
           {:ok, %{jkt: jkt}} -> {:ok, jkt}
@@ -196,9 +191,6 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
       interval: Keyword.get(opts, :poll_interval_seconds)
     }
   end
-
-  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
 
   defp put_optional(map, _key, nil), do: map
   defp put_optional(map, key, value), do: Map.put(map, key, value)

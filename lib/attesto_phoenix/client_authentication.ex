@@ -98,8 +98,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   """
 
   alias Attesto.ClientAssertion
-  alias Attesto.DPoP.ReplayCache
-  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
   defmodule Policy do
@@ -559,7 +558,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp consume_client_assertion_jti(config, policy, client_id, %{"jti" => jti}) when is_binary(jti) and jti != "" do
     key = client_assertion_replay_key(client_id, jti)
 
-    case invoke(replay_check(config), [key, policy.assertion_max_lifetime]) do
+    case invoke(Adapter.replay_check(config), [key, policy.assertion_max_lifetime]) do
       :ok -> :ok
       _other -> {:error, :assertion_replay}
     end
@@ -571,9 +570,6 @@ defmodule AttestoPhoenix.ClientAuthentication do
     digest = :crypto.hash(:sha256, "#{client_id}\0#{jti}")
     "client_assertion:" <> Base.url_encode64(digest, padding: false)
   end
-
-  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  defp replay_check(%Config{replay_check: callback}), do: callback
 
   # RFC 6749 §2.1: a client identified without a secret may proceed only if
   # it is a public client. A successful `:load_client` is sufficient

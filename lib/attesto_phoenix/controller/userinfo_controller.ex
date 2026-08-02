@@ -80,14 +80,12 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   import Plug.Conn
 
-  alias Attesto.DPoP.ReplayCache
   alias Attesto.Plug.Authenticate
   alias Attesto.Plug.OAuthError
   alias AttestoPhoenix.Callback
-  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.{Config, DPoP.Adapter}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
   alias AttestoPhoenix.RequestContext
-  alias AttestoPhoenix.Store.NonceStore
 
   # The conn assign `Attesto.Plug.Authenticate` writes the verified claims
   # under (its default `:claims_key`).
@@ -296,67 +294,15 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     |> put_optional(:send_error, config.send_error)
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)
-    |> put_optional(:replay_check, replay_check(config))
-    |> put_optional(:nonce_check, nonce_check(config))
-    |> put_optional(:nonce_issue, nonce_issue(config))
-    |> put_optional(:cert_der, cert_der(config))
+    |> Keyword.merge(Adapter.protected_resource_opts(config))
     # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it
     # must also carry the protected-resource metadata pointer when configured.
     |> put_optional(:resource_metadata, resource_metadata)
-    # RFC 9449 §4.3: derive the DPoP `htu` the same way every other endpoint
-    # does — via RequestContext.canonical_url, which honours a configured
-    # `:htu` but otherwise gates `X-Forwarded-*`/Host on the trusted-proxy
-    # allowlist (fail closed). Passing the raw `config.htu` (default nil) would
-    # let the core plug fall back to the unguarded request Host on this endpoint
-    # alone, an inconsistency with the rest of the server.
-    |> Keyword.put(:htu, fn conn -> RequestContext.canonical_url(conn, config) end)
   end
 
   # The `Attesto.Config` consumed by `Attesto.Token`, derived from the same
   # `%AttestoPhoenix.Config{}` and carrying the host's principal-kind policy.
   defp attesto_config(config), do: Config.to_attesto_config(config)
-
-  # RFC 9449 §11.1: a DPoP-bound token presented here is verified with replay
-  # protection. The host's `:replay_check` is used when set; otherwise the
-  # single-node ETS replay cache, matching the token endpoint default.
-  defp replay_check(%Config{dpop_enabled: false}), do: nil
-  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
-  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
-  # function. Adapt every callback form into a closure before handing it over.
-  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
-
-  # RFC 9449 §8/§9: demand a server-issued nonce only when the host requires it
-  # and has wired a nonce store. The callback receives the proof's `nonce`
-  # (possibly `nil`) and returns `:ok` only for a currently-valid nonce, else
-  # `{:error, :use_dpop_nonce}`; this mirrors the token endpoint exactly.
-  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store} = config)
-       when is_atom(store) and not is_nil(store) do
-    fn nonce ->
-      if NonceStore.valid?(config, store, nonce), do: :ok, else: {:error, :use_dpop_nonce}
-    end
-  end
-
-  defp nonce_check(_config), do: nil
-
-  # RFC 9449 §8: the `use_dpop_nonce` challenge carries a fresh nonce for the
-  # client to echo; `Attesto.Plug.Authenticate` requires `:nonce_issue`
-  # whenever `:nonce_check` is set. Thread the resolved config so a persistent
-  # store never has to re-resolve its repo from a guessed otp_app.
-  defp nonce_issue(%Config{dpop_nonce_required: true, nonce_store: store} = config)
-       when is_atom(store) and not is_nil(store) do
-    fn -> NonceStore.issue(config, store) end
-  end
-
-  defp nonce_issue(_config), do: nil
-
-  # RFC 8705 §3: the client-certificate DER extractor, supplied only when the
-  # host enabled mTLS (its presence is validated by `AttestoPhoenix.Config`).
-  # The host configures `:cert_der` as a `{module, function}` MFA, but
-  # `Attesto.Plug.Authenticate` demands a bare 1-arity function — adapt it, the
-  # same way `replay_check/1` adapts its callback.
-  defp cert_der(%Config{mtls_enabled: true, cert_der: cert_der}), do: Callback.to_fun1(cert_der)
-  defp cert_der(_config), do: nil
 
   # ── Configuration resolution ─────────────────────────────────────────────
 

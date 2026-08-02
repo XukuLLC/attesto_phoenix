@@ -48,11 +48,11 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   """
 
   alias Attesto.DPoP
-  alias Attesto.DPoP.ReplayCache
   alias Attesto.RequestObject
   alias AttestoPhoenix.AuthorizationServer.PAR.Request
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
-  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, OAuthError}
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, OAuthError}
+  alias AttestoPhoenix.ClientIdMetadata
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Store.PAR.ETS
 
@@ -216,11 +216,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   end
 
   defp verify_dpop_proof(config, dpop_input, params, proof) do
-    opts = [
-      http_method: http_method(dpop_input),
-      http_uri: http_uri(dpop_input),
-      replay_check: replay_check(config)
-    ]
+    opts = Adapter.verification_opts(config, dpop_input)
 
     with {:ok, %{jkt: verified_jkt}} <- DPoP.verify_proof(proof, opts),
          :ok <- check_submitted_dpop_jkt(Map.get(params, "dpop_jkt"), verified_jkt) do
@@ -244,12 +240,6 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
 
   defp submitted_dpop_jkt(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
   defp submitted_dpop_jkt(_params), do: nil
-
-  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
-  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
-  # function. Adapt every callback form into a closure before handing it over.
-  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
 
   # The client's identifier (RFC 6749 §2.2), resolved through the host's
   # `:client_id` callback. When no `:client_id` callback is configured the
@@ -297,9 +287,6 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   defp par_store(config), do: config_field(config, :par_store, ETS)
 
   defp dpop_proofs(dpop_input), do: Map.get(dpop_input, :proofs, [])
-  defp http_uri(dpop_input), do: Map.get(dpop_input, :http_uri)
-  defp http_method(dpop_input), do: Map.get(dpop_input, :http_method)
-
   defp random, do: 32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
 
   defp config_field(config, field, default) do

@@ -31,9 +31,8 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   RFC 8693 token-exchange grant (which runs at the IdP).
   """
 
-  alias Attesto.DPoP.ReplayCache
   alias Attesto.IdentityAssertion
-  alias AttestoPhoenix.{Callback, Config}
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter}
 
   require Logger
 
@@ -234,7 +233,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   defp check_replay(config, opts, %{"jti" => jti, "exp" => exp}) when is_binary(jti) and is_integer(exp) do
     ttl = replay_ttl(exp, opts)
 
-    case Callback.invoke(replay_check(config), [@jti_namespace <> jti, ttl]) do
+    case Callback.invoke(Adapter.replay_check(config), [@jti_namespace <> jti, ttl]) do
       :ok -> :ok
       {:error, :replay} -> {:error, :replay}
       _other -> {:error, :replay}
@@ -246,9 +245,6 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     ceiling = Keyword.get(opts, :assertion_max_lifetime_seconds) || 300
     remaining |> min(ceiling) |> max(1)
   end
-
-  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  defp replay_check(%Config{replay_check: callback}), do: callback
 
   # The host maps the validated claims to a local principal subject. Required
   # when the feature is enabled (`Config.validate!/1` enforces this), so an

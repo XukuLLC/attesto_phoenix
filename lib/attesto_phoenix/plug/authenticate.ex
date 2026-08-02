@@ -38,11 +38,9 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   import Plug.Conn
 
-  alias Attesto.DPoP.ReplayCache
   alias Attesto.Plug.Authenticate, as: CoreAuthenticate
   alias Attesto.Plug.OAuthError
-  alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
-  alias AttestoPhoenix.Store.NonceStore
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, Event, RequestContext}
 
   @claims_key :attesto_claims
   @principal_key :attesto_principal
@@ -189,44 +187,10 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)
     |> put_optional(:resource_metadata, resource_metadata)
-    |> put_optional(:replay_check, replay_check(config))
-    |> put_optional(:nonce_check, nonce_check(config))
-    |> put_optional(:nonce_issue, nonce_issue(config))
-    |> put_optional(:cert_der, cert_der(config))
-    |> Keyword.put(:htu, fn conn -> RequestContext.canonical_url(conn, config) end)
+    |> Keyword.merge(Adapter.protected_resource_opts(config))
   end
 
   defp attesto_config(config), do: Config.to_attesto_config(config)
-
-  defp replay_check(%Config{dpop_enabled: false}), do: nil
-  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
-  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
-  # function. Adapt every callback form into a closure before handing it over.
-  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
-
-  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store} = config)
-       when is_atom(store) and not is_nil(store) do
-    fn nonce ->
-      if NonceStore.valid?(config, store, nonce), do: :ok, else: {:error, :use_dpop_nonce}
-    end
-  end
-
-  defp nonce_check(_config), do: nil
-
-  # Thread the resolved config so a persistent store never has to re-resolve its
-  # repo from a guessed otp_app.
-  defp nonce_issue(%Config{dpop_nonce_required: true, nonce_store: store} = config)
-       when is_atom(store) and not is_nil(store) do
-    fn -> NonceStore.issue(config, store) end
-  end
-
-  defp nonce_issue(_config), do: nil
-
-  defp cert_der(%Config{mtls_enabled: true, cert_der: cert_der}) when not is_nil(cert_der),
-    do: normalize_callback(cert_der)
-
-  defp cert_der(_config), do: nil
 
   defp emit_succeeded(config, claims) do
     Event.emit(config, :auth_succeeded, %{
@@ -278,15 +242,5 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     ]
     |> Keyword.merge(Keyword.take(plug_opts, @error_option_keys))
     |> Keyword.merge(extra)
-  end
-
-  defp normalize_callback(callback) when is_function(callback), do: callback
-
-  defp normalize_callback({module, fun}) when is_atom(module) and is_atom(fun) do
-    fn conn -> apply(module, fun, [conn]) end
-  end
-
-  defp normalize_callback({module, fun, extra}) when is_atom(module) and is_atom(fun) do
-    fn conn -> apply(module, fun, [conn | extra]) end
   end
 end

@@ -73,11 +73,9 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   verbatim alongside the error.
   """
 
-  alias Attesto.DPoP.ReplayCache
   alias Attesto.MTLS
-  alias AttestoPhoenix.{Callback, Config, OAuthError}
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
-  alias AttestoPhoenix.Store.NonceStore
 
   @typedoc "The sender-constraint facts the controller derives from the request."
   @type input :: %{
@@ -217,7 +215,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   def commit_replay_claim(%Config{}, nil), do: :ok
 
   def commit_replay_claim(%Config{} = config, {replay_key, jti, ttl}) when is_binary(replay_key) do
-    case replay_check(config).(replay_key, ttl) do
+    case Adapter.replay_check(config).(replay_key, ttl) do
       :ok ->
         :ok
 
@@ -333,17 +331,9 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   defp bind_dpop(config, input) do
     proof = dpop_proof(input)
 
-    verify_opts =
-      [
-        http_method: http_method(input),
-        http_uri: http_uri(input)
-        # `:replay_check` is deliberately NOT passed here - see `resolve/3`. The
-        # token endpoint is the one place RFC 9449 §11.1 makes the server
-        # responsible for the replay check itself (there is no later
-        # resource-server check to rely on), so the claim still happens, but
-        # `commit_replay_claim/2` makes it once the grant has been validated.
-      ]
-      |> put_optional_kw(:nonce_check, nonce_check(config))
+    # `:replay_check` is deliberately deferred; see `resolve/3`. The token
+    # endpoint commits the returned identity only after grant validation.
+    verify_opts = Adapter.verification_opts(config, input, replay_check: :deferred, nonce_check: true)
 
     case invoke_dpop_verify(proof, verify_opts) do
       # Defer the NAMESPACED, opaque replay identity (`replay_key`), not the raw
@@ -395,33 +385,6 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
     end
   end
 
-  # RFC 9449 §8/§9: when the deployment requires server-issued nonces
-  # (`config.dpop_nonce_required`), hand `Attesto.DPoP.verify_proof/2` a
-  # `:nonce_check` callback that validates the proof's `nonce` claim against
-  # the configured `Attesto.DPoP.NonceStore`. The callback receives the
-  # proof's `nonce` (which may be `nil` if the client sent none) and returns
-  # `:ok` only for a currently-valid nonce, else `{:error, :use_dpop_nonce}`
-  # so the controller answers with a fresh `DPoP-Nonce`. When nonces are not
-  # required, no callback is supplied and the engine enforces none.
-  defp nonce_check(%Config{dpop_nonce_required: true, nonce_store: store} = config)
-       when is_atom(store) and not is_nil(store) do
-    fn nonce ->
-      if NonceStore.valid?(config, store, nonce), do: :ok, else: {:error, :use_dpop_nonce}
-    end
-  end
-
-  defp nonce_check(_config), do: nil
-
-  # RFC 9449 §11.1: the host may supply a `:replay_check` (`(jti, exp) -> :ok |
-  # {:error, _}`); otherwise the package's `Attesto.DPoP.ReplayCache` records the
-  # `jti` and rejects a repeat. Mirrors the PAR endpoint's resolution so the two
-  # DPoP entry points share one replay store.
-  defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2
-  # A host configures `:replay_check` as a `{module, function}` MFA (config holds
-  # no literal fn), but `Attesto.DPoP.verify_proof/2` requires a bare 2-arity
-  # function. Adapt every callback form into a closure before handing it over.
-  defp replay_check(%Config{replay_check: callback}), do: Callback.to_fun2(callback)
-
   # RFC 9449 §8: issue a fresh server nonce and return it in the error's
   # `:headers` so the controller can replay the `DPoP-Nonce` header verbatim,
   # telling the client to retry its proof with the `nonce` claim included.
@@ -434,8 +397,11 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
     )
   end
 
-  defp issue_nonce(%Config{nonce_store: store} = config) when is_atom(store) and not is_nil(store) do
-    NonceStore.issue(config, store)
+  defp issue_nonce(%Config{} = config) do
+    case Adapter.nonce_issue(config) do
+      nil -> ""
+      issue -> issue.()
+    end
   end
 
   defp issue_nonce(_config), do: ""
@@ -451,12 +417,6 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
 
   defp dpop_proof(input), do: Map.get(input, :dpop_proof)
   defp mtls_cert_der(input), do: Map.get(input, :mtls_cert_der)
-  defp http_uri(input), do: Map.get(input, :http_uri)
-  defp http_method(input), do: Map.get(input, :http_method)
-
-  defp put_optional_kw(kw, _key, nil), do: kw
-  defp put_optional_kw(kw, key, value), do: Keyword.put(kw, key, value)
-
   # `code` is a compile-time RFC 6749 §5.2 / RFC 9449 §5 error-code atom, passed
   # straight to `OAuthError.new/3` (which requires an atom). No string-to-atom
   # round-trip that could raise before the atom exists.
