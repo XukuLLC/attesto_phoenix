@@ -123,7 +123,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   endpoint, and carry the validated value through to `:register_client` in the
   client metadata. This is the standard wire signal a client uses to declare
   itself an installed app, so a host can now answer
-  `AttestoPhoenix.ClientStore.client_native?/1` from a registration rather than
+  `c:AttestoPhoenix.ClientStore.client_native?/1` from a registration rather than
   classifying every native client by hand — connecting dynamic registration to
   the RFC 8252 profile added in 2.2.0. An `application_type` outside the defined
   set is rejected with `invalid_client_metadata`.
@@ -188,8 +188,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `AttestoPhoenix.ClientIdMetadata.Cache` gains optional `c:delete/1` and
-  `c:delete_all/0` callbacks, implemented by **both** shipped caches — the
+- `AttestoPhoenix.ClientIdMetadata.Cache` gains optional
+  `c:AttestoPhoenix.ClientIdMetadata.Cache.delete/1` and
+  `c:AttestoPhoenix.ClientIdMetadata.Cache.delete_all/0` callbacks, implemented
+  by **both** shipped caches — the
   Postgres-backed `Cache.Ecto` (the default, where eviction is cluster-wide)
   and the per-node `Cache.ETS` — plus `Cache.evict/2` and `Cache.evict_all/1`
   which dispatch through the configured module and report
