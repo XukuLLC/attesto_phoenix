@@ -19,7 +19,7 @@ mix ecto.migrate
 
 ```elixir
 Mix.install([
-  {:attesto_phoenix, "~> 0.6"},
+  {:attesto_phoenix, "~> 2.6"},
   {:req, "~> 0.5"},
   {:req_dpop, "~> 0.5"},
   {:bandit, "~> 1.0"},
@@ -67,8 +67,10 @@ attesto_phoenix_config =
     verify_client_secret: fn _client, _secret -> false end,
     load_principal: fn subject -> {:ok, %{subject: subject, role: :demo}} end,
     principal_kinds: [principal_kind],
-    # Demo-only: production deployments should use a shared replay store.
-    replay_check: fn _jti, _ttl_seconds -> :ok end,
+    # Demo-only: production deployments should use a shared replay store. The
+    # first argument is an opaque replay identity (the DPoP proof's jti
+    # namespaced by its key), not the raw jti — treat it as an opaque key.
+    replay_check: fn _replay_key, _ttl_seconds -> :ok end,
     # Demo-only: pin the canonical DPoP htu to the HTTPS route the notebook
     # calls. Attesto rejects DPoP proofs over plain HTTP.
     htu: fn _conn -> demo_base_url <> "/api/protected" end,

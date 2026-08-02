@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-08-02
+
+### Security
+
+- The token endpoint records the namespaced DPoP replay identity `attesto`
+  1.7.0's `Attesto.DPoP.verify_proof/2` now returns (`replay_key`, a
+  `sha256(jkt:jti)` digest), rather than the raw `jti`, matching
+  `Attesto.Plug.Authenticate`. A shared replay store therefore never holds two
+  key formats, and two token-endpoint proofs that share a `jti` but are signed
+  by different keys no longer collide. The raw `jti` still rides through to
+  `[:attesto, :dpop, :replay_detected]` telemetry for correlation. **Requires
+  attesto >= 1.7.0.**
+
+### Fixed
+
+- Registration scope validation no longer does a cross-product scan of the
+  requested scopes against the catalogue.
+
+### Changed
+
+- The demo Livebook (`notebooks/attesto_phoenix_demo.livemd`) is pinned to
+  `attesto_phoenix ~> 2.6` (was a stale `~> 0.6`) and its `replay_check`
+  argument is named for the opaque replay identity it now receives.
+
 ## [2.5.0] - 2026-08-01
 
 ### Security
