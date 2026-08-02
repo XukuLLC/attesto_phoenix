@@ -104,6 +104,32 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
   end
 
+  test "resolves principal kinds once per request and preserves the resolved value", %{
+    config: config
+  } do
+    token = mint(config, scope: "openid read:reports")
+    parent = self()
+
+    config = %{
+      config
+      | principal_kinds: fn ->
+          send(parent, {:principal_kinds_resolved, @user_kind})
+          [@user_kind]
+        end
+    }
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    refute conn.halted
+    assert conn.assigns.attesto_principal == %{subject: @subject, kind: :user}
+    assert_receive {:principal_kinds_resolved, @user_kind}
+    refute_receive {:principal_kinds_resolved, _}
+  end
+
   test "requires explicit trust for a resource-audienced access token", %{config: config} do
     resource = "https://resource.example/reports"
     token = mint(config, scope: "read:reports", audience: resource)

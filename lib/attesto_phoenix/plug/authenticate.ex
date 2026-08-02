@@ -196,22 +196,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     |> Keyword.put(:htu, fn conn -> RequestContext.canonical_url(conn, config) end)
   end
 
-  defp attesto_config(config) do
-    Config.to_attesto_config(config, principal_kinds_extra(config))
-  end
-
-  defp principal_kinds_extra(%Config{principal_kinds: kinds}) when is_list(kinds) and kinds != [] do
-    [principal_kinds: kinds]
-  end
-
-  defp principal_kinds_extra(%Config{principal_kinds: callback}) when not is_nil(callback) do
-    case Callback.invoke(callback, []) do
-      kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
-      _ -> []
-    end
-  end
-
-  defp principal_kinds_extra(_config), do: []
+  defp attesto_config(config), do: Config.to_attesto_config(config)
 
   defp replay_check(%Config{dpop_enabled: false}), do: nil
   defp replay_check(%Config{replay_check: nil}), do: &ReplayCache.check_and_record/2

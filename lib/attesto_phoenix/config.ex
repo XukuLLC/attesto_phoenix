@@ -1581,9 +1581,10 @@ defmodule AttestoPhoenix.Config do
   this struct by the controllers and plugs, so they are not duplicated into the
   `Attesto.Config`.
 
-  Pass `principal_kinds:` (a non-empty list of `Attesto.PrincipalKind`) and any
-  other `Attesto.Config.new/1` option as `extra` to complete the protocol
-  config; they are merged over the values derived here.
+  The configured `:principal_kinds` list or callback is resolved once for each
+  call. An explicit `extra` value still wins over the derived values. Any other
+  `Attesto.Config.new/1` option may be supplied as `extra`; those options are
+  merged over the values derived here.
   """
   @spec to_attesto_config(t(), keyword()) :: Attesto.Config.t()
   def to_attesto_config(%__MODULE__{} = config, extra \\ []) do
@@ -1606,9 +1607,9 @@ defmodule AttestoPhoenix.Config do
 
   # Resolve the host's `:principal_kinds` (a list or a callback returning one)
   # so to_attesto_config/1 yields a complete Attesto.Config for callers that do
-  # not pass principal_kinds explicitly (e.g. the authorization endpoint signing
-  # JARM responses). An explicit `extra` still wins. Omitted when unresolved so
-  # Attesto.Config.new/1 surfaces the missing required value.
+  # not pass principal_kinds explicitly (e.g. the authorization endpoint
+  # signing JARM responses). An explicit `extra` still wins. Omitted when
+  # unresolved so Attesto.Config.new/1 surfaces the missing required value.
   defp resolved_principal_kinds(%__MODULE__{principal_kinds: principal_kinds}) do
     # Read the field directly: it is declared `[PrincipalKind.t()] | callback() |
     # nil`, so the list branch is reachable. (`config_callback/2` narrows its

@@ -1496,29 +1496,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # ── Configuration / protocol-config derivation ───────────────────────────
 
   # The `Attesto.Config` consumed by `Attesto.Token`. Derived from the same
-  # `%AttestoPhoenix.Config{}`; the principal-kind declarations are host policy
-  # carried alongside the config and passed through as the protocol `extra`.
-  defp attesto_config(config) do
-    Config.to_attesto_config(config, principal_kinds_extra(config))
-  end
-
-  # Read the field directly: it is declared `[PrincipalKind.t()] | callback() |
-  # nil`, so the list branch is reachable. (`config_callback/2` narrows its
-  # return to `callback() | nil`, under which the `is_list` guard cannot hold.)
-  defp principal_kinds_extra(%Config{principal_kinds: principal_kinds}) do
-    case principal_kinds do
-      kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
-      callback -> callback |> invoke([]) |> principal_kinds_kw()
-    end
-  end
-
-  defp principal_kinds_kw(kinds) when is_list(kinds) and kinds != [] do
-    [principal_kinds: kinds]
-  end
-
-  defp principal_kinds_kw(_other) do
-    []
-  end
+  # `%AttestoPhoenix.Config{}`; Config resolves the host's principal-kind
+  # policy as part of deriving the protocol config.
+  defp attesto_config(config), do: Config.to_attesto_config(config)
 
   # ── Configured-callback access ───────────────────────────────────────────
 
