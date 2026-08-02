@@ -271,8 +271,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp dispatch(%Request{grant_type: "refresh_token"} = request) do
     %{config: config, client: client, params: params} = request
 
-    with :ok <- reject_oversized_scope(params),
-         {:ok, presented} <- require_param(params, "refresh_token"),
+    with {:ok, presented} <- require_param(params, "refresh_token"),
          requested = parse_requested_scope(params),
          {:ok, resource} <- refresh_requested_resource(params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
@@ -309,8 +308,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp dispatch(%Request{grant_type: "client_credentials"} = request) do
     %{config: config, client: client, params: params} = request
 
-    with :ok <- reject_oversized_scope(params),
-         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
+    with {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          subject = token_client_id(request),
          {:ok, scope} <- authorize_scope(config, client, parse_requested_scope(params)),
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
@@ -415,8 +413,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp dispatch(%Request{grant_type: @grant_token_exchange} = request) do
     %{config: config, client: client, params: params} = request
 
-    with :ok <- reject_oversized_scope(params),
-         {:ok, subject_token} <- require_param(params, "subject_token"),
+    with {:ok, subject_token} <- require_param(params, "subject_token"),
          :ok <- require_subject_token_type(params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          {:ok, claims} <- verify_subject_token(config, subject_token, binding),
@@ -447,8 +444,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp dispatch(%Request{grant_type: @grant_jwt_bearer} = request) do
     %{config: config, client: client, params: params} = request
 
-    with :ok <- reject_oversized_scope(params),
-         {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
+    with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
            jwt_bearer_authorize(config, token_client_id(request), params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
@@ -1208,22 +1204,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §3.3: the `scope` parameter is a space-delimited, case-sensitive
   # list of scope tokens. Splitting is pure framing; what the resulting list is
   # allowed to grant is decided by the host's `:authorize_scope` callback.
-  # RFC 6749 §3.3 sets no upper bound on the `scope` value, so an arbitrarily
-  # large one is a cheap way to make the server do work proportional to its
-  # size (scope parsing, and any host `:authorize_scope` policy over it). The
-  # core `Attesto.Scope` matching is linear, so this is defence in depth rather
-  # than the sole guard - but rejecting an absurd value in O(1), before it is
-  # split into a list, costs nothing and no legitimate client sends anything
-  # near this. 8 KiB is ~200 typical scopes.
-  @max_scope_param_bytes 8_192
-
-  defp reject_oversized_scope(%{"scope" => value})
-       when is_binary(value) and byte_size(value) > @max_scope_param_bytes do
-    {:error, error(@error_invalid_scope, "scope parameter is too large")}
-  end
-
-  defp reject_oversized_scope(_params), do: :ok
-
   defp parse_requested_scope(params) do
     case params["scope"] do
       value when is_binary(value) and value != "" -> String.split(value, " ", trim: true)

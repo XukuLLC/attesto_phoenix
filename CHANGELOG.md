@@ -4,16 +4,6 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Security
-
-- Reject an oversized `scope` parameter at the token endpoint in O(1)
-  (`invalid_scope`), before it is split into a list. Defence in depth behind
-  the linear `Attesto.Scope` matching in `attesto`: RFC 6749 §3.3 places no
-  bound on the value, so an absurd one is otherwise cheap work proportional to
-  its size. 8 KiB (~200 typical scopes) is far above real use.
-
 ## [2.5.0] - 2026-08-01
 
 ### Security

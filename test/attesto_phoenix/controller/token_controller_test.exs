@@ -1187,42 +1187,6 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   end
 
   # FIX 3 - DPoP NONCE (RFC 9449 §8/§9).
-  describe "oversized scope parameter (DoS hardening)" do
-    # An authenticated client is enough to reach the grant dispatch, where the
-    # size guard is the first step - so this fires before any minting, which is
-    # why no code store / minting setup is needed.
-    test "a scope parameter beyond the size cap is rejected as invalid_scope" do
-      # ~200k tokens; the pre-hardening path parsed and processed all of them.
-      huge = Enum.map_join(1..200_000, " ", fn i -> "s#{rem(i, 100)}" end)
-
-      conn =
-        post_token(%{
-          "grant_type" => "client_credentials",
-          "client_id" => "confidential-1",
-          "client_secret" => "s3cr3t",
-          "scope" => huge
-        })
-
-      assert conn.status == 400
-      assert body(conn)["error"] == "invalid_scope"
-      assert body(conn)["error_description"] =~ "too large"
-    end
-
-    test "an ordinary scope request is not rejected for size" do
-      conn =
-        post_token(%{
-          "grant_type" => "client_credentials",
-          "client_id" => "confidential-1",
-          "client_secret" => "s3cr3t",
-          "scope" => "read write admin"
-        })
-
-      # Whatever the scope policy or minting config decides, it must NOT be the
-      # size guard talking.
-      refute conn.status == 400 and (body(conn)["error_description"] || "") =~ "too large"
-    end
-  end
-
   describe "DPoP proof replay (RFC 9449 §11.1)" do
     test "emits token_issued with DPoP binding metadata" do
       capture_events()
