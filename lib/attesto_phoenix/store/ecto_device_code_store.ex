@@ -25,9 +25,8 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
 
   import Ecto.Query, only: [from: 2]
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DeviceCode
-
-  @app :attesto_phoenix
 
   @impl Attesto.DeviceCodeStore
   @spec put(Attesto.DeviceCodeStore.entry()) :: :ok | {:error, :user_code_taken}
@@ -145,14 +144,5 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
       else: :error
   end
 
-  defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        raise ArgumentError,
-              "AttestoPhoenix: no :repo configured. Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
-  end
+  defp repo, do: Config.ecto_repo!()
 end

@@ -25,7 +25,7 @@ defmodule AttestoPhoenix.Controller.PARController do
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = resolve_config()
+    config = Config.resolve!()
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- RequestContext.check_https(conn, config),
@@ -41,11 +41,6 @@ defmodule AttestoPhoenix.Controller.PARController do
       {:error, %OAuthError{} = err} ->
         render_error(conn, config, err)
     end
-  end
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
   end
 
   # RFC 6749 §2.3: client authentication is delegated to the conn-free core

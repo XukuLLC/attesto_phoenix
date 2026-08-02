@@ -47,7 +47,7 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
 
   @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def verify(conn, params) do
-    config = resolve_config()
+    config = Config.resolve!()
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
@@ -165,9 +165,4 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
 
   defp string_param(value) when is_binary(value) and value != "", do: value
   defp string_param(_value), do: nil
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
-  end
 end

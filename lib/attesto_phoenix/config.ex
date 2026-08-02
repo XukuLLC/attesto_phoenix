@@ -1038,6 +1038,35 @@ defmodule AttestoPhoenix.Config do
   end
 
   @doc """
+  Resolves the validated config from the library's configured `:otp_app`.
+
+  This is the shared resolution path for controllers that read the global
+  application configuration.
+  """
+  @spec resolve!() :: t()
+  def resolve! do
+    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
+    from_otp_app(otp_app, __MODULE__)
+  end
+
+  @doc """
+  Returns the configured Ecto repository, raising when it is unset.
+
+  `missing_message` is available for adapters that have a more specific
+  existing error message; the lookup and default failure stay shared.
+  """
+  @spec ecto_repo!() :: module()
+  def ecto_repo!, do: ecto_repo!("AttestoPhoenix: no :repo configured. Set `config :attesto_phoenix, repo: MyApp.Repo`")
+
+  @spec ecto_repo!(String.t()) :: module()
+  def ecto_repo!(missing_message) when is_binary(missing_message) do
+    case Application.get_env(:attesto_phoenix, :repo) do
+      nil -> raise ArgumentError, missing_message
+      repo -> repo
+    end
+  end
+
+  @doc """
   Returns the merged, defaulted Client ID Metadata Document (CIMD) options.
 
   This is the host's `:client_id_metadata` keyword list merged over the library

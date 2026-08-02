@@ -1,5 +1,5 @@
 defmodule AttestoPhoenix.ConfigTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
@@ -131,6 +131,35 @@ defmodule AttestoPhoenix.ConfigTest do
     ]
 
     Config.new(Keyword.merge(base, overrides))
+  end
+
+  describe "ecto_repo!/0" do
+    setup do
+      previous = Application.get_env(:attesto_phoenix, :repo)
+
+      on_exit(fn ->
+        case previous do
+          nil -> Application.delete_env(:attesto_phoenix, :repo)
+          repo -> Application.put_env(:attesto_phoenix, :repo, repo)
+        end
+      end)
+
+      :ok
+    end
+
+    test "returns the configured repository" do
+      Application.put_env(:attesto_phoenix, :repo, __MODULE__.Repo)
+
+      assert Config.ecto_repo!() == __MODULE__.Repo
+    end
+
+    test "raises when the repository is unset" do
+      Application.delete_env(:attesto_phoenix, :repo)
+
+      assert_raise ArgumentError,
+                   "AttestoPhoenix: no :repo configured. Set `config :attesto_phoenix, repo: MyApp.Repo`",
+                   &Config.ecto_repo!/0
+    end
   end
 
   describe "resolve_callback/2 precedence" do

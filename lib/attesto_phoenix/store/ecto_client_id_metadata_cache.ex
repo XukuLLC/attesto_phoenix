@@ -44,9 +44,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   import Ecto.Query, only: [from: 2]
 
   alias AttestoPhoenix.ClientIdMetadata.Cache
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.ClientIdMetadata
-
-  @app :attesto_phoenix
 
   @doc """
   Resolves a live cached document for a CIMD `client_id` URL.
@@ -126,16 +125,5 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
     :ok
   end
 
-  defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        # Fail closed: a cache with no backing repository cannot share a
-        # validated document across nodes, so refuse rather than silently no-op.
-        raise ArgumentError,
-              "AttestoPhoenix: no :repo configured. Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
-  end
+  defp repo, do: Config.ecto_repo!()
 end

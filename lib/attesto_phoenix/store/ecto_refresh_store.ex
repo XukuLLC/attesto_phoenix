@@ -47,6 +47,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   import Ecto.Query
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.RefreshSuccessorCipher
   alias AttestoPhoenix.Schema.RefreshToken
 
@@ -246,16 +247,9 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   end
 
   defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        # Fail closed: a refresh store with no backing repository cannot make
-        # any rotation decision safely, so refuse rather than silently degrade.
-        raise ArgumentError,
-              "#{inspect(__MODULE__)} requires an Ecto.Repo configured as " <>
-                "config #{inspect(@app)}, repo: MyApp.Repo"
-
-      repo ->
-        repo
-    end
+    Config.ecto_repo!(
+      "#{inspect(__MODULE__)} requires an Ecto.Repo configured as " <>
+        "config #{inspect(@app)}, repo: MyApp.Repo"
+    )
   end
 end

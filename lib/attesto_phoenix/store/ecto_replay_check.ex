@@ -81,6 +81,7 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
 
   import Ecto.Query, only: [from: 2]
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DPoPReplay
 
   @app :attesto_phoenix
@@ -150,16 +151,9 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
   end
 
   defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        # Fail closed: a replay check with no backing repository cannot
-        # enforce RFC 9449 §11.1, so refuse rather than silently accept.
-        raise ArgumentError,
-              "#{inspect(__MODULE__)} requires an Ecto.Repo. " <>
-                "Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
+    Config.ecto_repo!(
+      "#{inspect(__MODULE__)} requires an Ecto.Repo. " <>
+        "Set `config #{inspect(@app)}, repo: MyApp.Repo`"
+    )
   end
 end

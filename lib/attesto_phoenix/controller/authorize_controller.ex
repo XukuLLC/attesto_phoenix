@@ -153,7 +153,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   """
   @spec authorize(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def authorize(conn, params) do
-    config = resolve_config()
+    config = Config.resolve!()
     # Capture the PAR reference before resolution rebinds `params` to the stored
     # set, so it can be consumed once (and only once) a code is issued.
     par_request_uri = params["request_uri"]
@@ -1174,13 +1174,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       result: reason,
       metadata: %{client_ip: RequestContext.client_ip(conn, config)}
     })
-  end
-
-  # ── Configuration resolution ─────────────────────────────────────────────
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
   end
 
   defp config_field(config, key, default) do

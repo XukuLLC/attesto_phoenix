@@ -32,9 +32,8 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
 
   import Ecto.Query, only: [from: 2]
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.PushedAuthorizationRequest, as: PushedRequest
-
-  @app :attesto_phoenix
 
   @doc """
   Persists a pushed authorization request under `request_uri` for
@@ -110,16 +109,5 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
     end
   end
 
-  defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        # Fail closed: a PAR store with no backing repository cannot share a
-        # reference across nodes, so refuse rather than silently no-op.
-        raise ArgumentError,
-              "AttestoPhoenix: no :repo configured. Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
-  end
+  defp repo, do: Config.ecto_repo!()
 end

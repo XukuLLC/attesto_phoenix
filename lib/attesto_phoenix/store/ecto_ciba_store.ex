@@ -28,6 +28,7 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
 
   import Ecto.Query, only: [from: 2]
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.CIBARequest
 
   @app :attesto_phoenix
@@ -171,14 +172,5 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
 
   defp table_prefix, do: Application.get_env(@app, :table_prefix)
 
-  defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        raise ArgumentError,
-              "AttestoPhoenix: no :repo configured. Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
-  end
+  defp repo, do: Config.ecto_repo!()
 end

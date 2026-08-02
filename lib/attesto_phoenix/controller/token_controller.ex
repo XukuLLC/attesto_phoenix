@@ -88,7 +88,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = resolve_config()
+    config = Config.resolve!()
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_token_content_type(conn),
@@ -274,15 +274,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
       [proof | _] -> proof
       _ -> nil
     end
-  end
-
-  # ── Configuration resolution ─────────────────────────────────────────────
-
-  # The validated `%AttestoPhoenix.Config{}` is resolved from the host's
-  # `:otp_app` configuration so the controller holds no policy of its own.
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
   end
 
   # ── Client authentication (RFC 6749 §2.3) ────────────────────────────────

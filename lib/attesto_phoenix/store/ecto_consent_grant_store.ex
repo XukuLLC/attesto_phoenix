@@ -31,10 +31,9 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
 
   import Ecto.Query, only: [from: 2]
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.ConsentGrant
   alias AttestoPhoenix.Schema.ConsentGrant, as: Grant
-
-  @app :attesto_phoenix
 
   # The grant token is the only secret in the consent hop and is short-lived, so
   # 32 bytes of CSPRNG output (256 bits) url-base64 encoded is an unguessable,
@@ -128,16 +127,5 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
     end
   end
 
-  defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        # Fail closed: a consent-grant store with no backing repository cannot
-        # enforce single use, so refuse rather than silently no-op.
-        raise ArgumentError,
-              "AttestoPhoenix: no :repo configured. Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
-  end
+  defp repo, do: Config.ecto_repo!()
 end

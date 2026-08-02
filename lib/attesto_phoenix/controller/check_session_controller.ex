@@ -42,7 +42,7 @@ defmodule AttestoPhoenix.Controller.CheckSessionController do
 
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = resolve_config()
+    config = Config.resolve!()
 
     if Config.session_management_enabled?(config) do
       conn
@@ -134,10 +134,5 @@ defmodule AttestoPhoenix.Controller.CheckSessionController do
       </body>
     </html>
     """
-  end
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
   end
 end

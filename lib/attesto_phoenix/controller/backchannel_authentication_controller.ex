@@ -30,7 +30,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = resolve_config()
+    config = Config.resolve!()
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_enabled(config),
@@ -98,11 +98,6 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
       client_ip: RequestContext.client_ip(conn, config),
       params: params
     }
-  end
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
   end
 
   defp render_error(conn, config, %OAuthError{} = err) do

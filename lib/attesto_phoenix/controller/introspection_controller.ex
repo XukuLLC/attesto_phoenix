@@ -68,7 +68,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) when is_map(params) do
-    config = resolve_config()
+    config = Config.resolve!()
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),
@@ -206,9 +206,4 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   # `code` is a compile-time RFC 6749 §5.2 error-code atom, passed straight to
   # `OAuthError.new/3` (no string-to-atom round-trip that could raise).
   defp error(code, description), do: OAuthError.new(code, description, status: 400)
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
-  end
 end

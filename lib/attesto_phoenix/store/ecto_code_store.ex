@@ -33,9 +33,8 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   import Ecto.Query, only: [from: 2]
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
-
-  @app :attesto_phoenix
 
   @doc """
   Persists an authorization-code record keyed by its `:code_hash`.
@@ -185,16 +184,5 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     end
   end
 
-  defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        # Fail closed: a code store with no backing repository cannot enforce
-        # single use, so refuse rather than silently no-op.
-        raise ArgumentError,
-              "AttestoPhoenix: no :repo configured. Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
-  end
+  defp repo, do: Config.ecto_repo!()
 end

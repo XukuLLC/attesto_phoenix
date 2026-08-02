@@ -23,9 +23,8 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
 
   import Ecto.Query, only: [from: 2]
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.LogoutSession
-
-  @app :attesto_phoenix
 
   @impl Attesto.LogoutSessionStore
   @spec record(Attesto.LogoutSessionStore.entry()) :: :ok
@@ -116,14 +115,5 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
 
   defp now_dt, do: DateTime.utc_now() |> DateTime.truncate(:second)
 
-  defp repo do
-    case Application.get_env(@app, :repo) do
-      nil ->
-        raise ArgumentError,
-              "AttestoPhoenix: no :repo configured. Set `config #{inspect(@app)}, repo: MyApp.Repo`"
-
-      repo ->
-        repo
-    end
-  end
+  defp repo, do: Config.ecto_repo!()
 end

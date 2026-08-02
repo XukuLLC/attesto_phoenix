@@ -118,7 +118,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   """
   @spec userinfo(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def userinfo(conn, _params) do
-    config = resolve_config()
+    config = Config.resolve!()
     resource_metadata = Config.resource_metadata_url(config, conn)
 
     case RequestContext.check_https(conn, config) do
@@ -303,16 +303,6 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # The `Attesto.Config` consumed by `Attesto.Token`, derived from the same
   # `%AttestoPhoenix.Config{}` and carrying the host's principal-kind policy.
   defp attesto_config(config), do: Config.to_attesto_config(config)
-
-  # ── Configuration resolution ─────────────────────────────────────────────
-
-  # Resolve the validated `%AttestoPhoenix.Config{}` from the host's `:otp_app`
-  # configuration, exactly as the other controllers do, so this controller
-  # holds no policy of its own.
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
-  end
 
   defp put_optional(opts, _key, nil), do: opts
   defp put_optional(opts, key, value), do: Keyword.put(opts, key, value)

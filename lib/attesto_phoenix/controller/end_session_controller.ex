@@ -104,7 +104,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   @spec end_session(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def end_session(conn, params) do
-    config = resolve_config()
+    config = Config.resolve!()
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
@@ -500,9 +500,4 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   defp put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp error_body(description), do: %{error: "invalid_request", error_description: description}
-
-  defp resolve_config do
-    otp_app = Application.get_env(:attesto_phoenix, :otp_app)
-    Config.from_otp_app(otp_app, Config)
-  end
 end
