@@ -50,10 +50,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
 
   import Plug.Conn, only: [put_resp_header: 3]
 
-  alias Attesto.AuthorizationRequest
   alias Attesto.Discovery
-  alias Attesto.SigningAlg
-  alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
+  alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.Config
 
   # The router pipeline installs the AttestoPhoenix.Config here. This is the
@@ -68,32 +66,6 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   # configuration, so it may be cached by clients and intermediaries. One
   # hour balances picking up configuration changes against request volume.
   @cache_max_age_seconds 3600
-
-  # RFC 6749 §3.1.1 / §4.1: an authorization-code authorization server
-  # supports the "code" response type. Fixed by protocol, not configured.
-  @response_types_supported ["code"]
-
-  # RFC 8414 §2 / JARM §2.3 `response_modes_supported`: the response modes the
-  # authorization endpoint implements - the RFC 6749 default `query` and the
-  # JARM JWT modes (FAPI 2.0 Message Signing §5.4). Sourced from
-  # Attesto.AuthorizationRequest so the OAuth metadata matches the OpenID
-  # configuration and never drifts from what the request validator accepts.
-  @response_modes_supported AuthorizationRequest.supported_response_modes()
-
-  # RFC 8414 §2 `token_endpoint_auth_methods_supported`: the client
-  # authentication methods the token endpoint actually accepts. The controller
-  # reads a confidential client's secret from an HTTP Basic header
-  # (`client_secret_basic`, RFC 6749 §2.3.1 / RFC 7617), from the request body
-  # (`client_secret_post`, RFC 6749 §2.3.1), or from a signed client assertion
-  # (`private_key_jwt`, RFC 7523 / OIDC Core §9). It also admits a public
-  # client that presents only a `client_id` and relies on PKCE (`none`,
-  # RFC 6749 §2.1 / RFC 7636). Fixed by what the controller wires.
-  @token_endpoint_auth_methods_supported [
-    "client_secret_basic",
-    "client_secret_post",
-    "private_key_jwt",
-    "none"
-  ]
 
   @doc """
   Render the RFC 8414 metadata document as JSON.
@@ -110,7 +82,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
     metadata =
       protocol_config
       |> Discovery.metadata(discovery_opts(config))
-      |> put_fapi_metadata(config)
+      |> Metadata.enrich_common(config)
 
     conn
     |> put_cache_control()
@@ -144,196 +116,12 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
     end
   end
 
-  # Translate the configured host capabilities into the RFC 8414 §2 host
-  # members understood by Attesto.Discovery.metadata/2. The core builder
-  # drops nil-valued members, so the document advertises only what the
-  # server actually implements.
+  # OAuth-only members remain here; the endpoint and capability members shared
+  # with OpenID Provider Metadata are added by Metadata.enrich_common/2.
   @spec discovery_opts(Config.t()) :: keyword()
   defp discovery_opts(%Config{} = config) do
-    jar_alg_values = RequestObjectMetadata.signing_alg_values(config)
-
-    [
-      # RFC 8414 §2: the authorization endpoint is REQUIRED whenever any
-      # supported grant type uses it (authorization_code does). The core builder
-      # derives only issuer/token_endpoint, so it MUST be supplied here or the
-      # RFC 8414 document silently omits it (and an OAuth client - e.g. the
-      # ChatGPT MCP connector - that reads this document rather than OpenID
-      # Discovery cannot run the code flow). An explicit validated HTTPS URL
-      # supports a separately mounted host login surface; otherwise derive it
-      # from the same trusted issuer/path configuration as token_endpoint.
-      authorization_endpoint: config.authorization_endpoint || Config.authorize_endpoint_url(config),
-      response_types_supported: @response_types_supported,
-      response_modes_supported: @response_modes_supported,
-      grant_types_supported: Config.grant_types_supported(config),
-      token_endpoint_auth_methods_supported: token_endpoint_auth_methods_supported(config),
-      token_endpoint_auth_signing_alg_values_supported: config.client_auth_signing_algs,
-      authorization_response_iss_parameter_supported: authorization_response_iss_parameter_supported(config),
-      scopes_supported: presence(config.scopes_supported),
-      require_pushed_authorization_requests: require_pushed_authorization_requests(config),
-      pushed_authorization_request_endpoint: pushed_authorization_request_endpoint(config),
-      # RFC 8628 §4: advertised only when the device authorization grant is
-      # enabled (nil-dropped by the core builder otherwise).
-      device_authorization_endpoint: device_authorization_endpoint(config),
-      # OpenID Connect CIBA Core 1.0 §4: the backchannel authentication endpoint
-      # and its capability metadata, advertised only when CIBA is enabled so a
-      # FAPI-CIBA client reading RFC 8414 (not OpenID Discovery) sees the same
-      # CIBA support (all nil-dropped by the core builder otherwise).
-      backchannel_authentication_endpoint: backchannel_authentication_endpoint(config),
-      backchannel_token_delivery_modes_supported: backchannel_token_delivery_modes_supported(config),
-      backchannel_authentication_request_signing_alg_values_supported:
-        backchannel_authentication_request_signing_alg_values_supported(config),
-      backchannel_user_code_parameter_supported: backchannel_user_code_parameter_supported(config),
-      # OpenID Connect RP-Initiated Logout 1.0 §3 / Back-Channel Logout 1.0
-      # §2.1: advertised only when logout is enabled (nil-dropped otherwise).
-      end_session_endpoint: end_session_endpoint(config),
-      backchannel_logout_supported: backchannel_logout_supported(config),
-      backchannel_logout_session_supported: backchannel_logout_session_supported(config),
-      introspection_endpoint: Config.introspection_endpoint_url(config),
-      introspection_endpoint_auth_methods_supported: introspection_auth_methods(config),
-      registration_endpoint: registration_endpoint(config),
-      # RFC 9101 §10.5: the signed-request-object (JAR) metadata, derived from
-      # the same capability the OpenID Provider Metadata document uses, so a
-      # FAPI client reading RFC 8414 rather than OpenID Discovery sees identical
-      # JAR support. Both members are nil-dropped by the core builder when JAR
-      # is unsupported / not required.
-      request_object_signing_alg_values_supported: jar_alg_values,
-      require_signed_request_object: RequestObjectMetadata.require_signed(config),
-      # draft-ietf-oauth-client-id-metadata-document-01 §6: advertise that the
-      # server dereferences an HTTPS `client_id` URL to a client metadata
-      # document, but only when the feature is enabled. nil otherwise so the
-      # core builder drops the member entirely.
-      client_id_metadata_document_supported: client_id_metadata_document_supported(config)
-    ]
+    [scopes_supported: presence(config.scopes_supported)]
   end
-
-  defp client_id_metadata_document_supported(%Config{} = config) do
-    if Config.client_id_metadata_enabled?(config), do: true
-  end
-
-  defp token_endpoint_auth_methods_supported(%Config{token_endpoint_auth_methods_supported: methods})
-       when is_list(methods) and methods != [], do: methods
-
-  defp token_endpoint_auth_methods_supported(%Config{}), do: @token_endpoint_auth_methods_supported
-
-  # The introspection endpoint authenticates the caller and rejects the public
-  # ("none") path (RFC 7662 §2.1), so it advertises the confidential subset of
-  # the configured client-authentication methods.
-  defp introspection_auth_methods(config) do
-    Enum.reject(token_endpoint_auth_methods_supported(config), &(&1 == "none"))
-  end
-
-  defp put_fapi_metadata(metadata, %Config{} = config) do
-    metadata
-    |> Map.put(
-      "token_endpoint_auth_signing_alg_values_supported",
-      config.client_auth_signing_algs
-    )
-    |> put_introspection_auth_signing_alg_values_supported(config)
-    |> put_authorization_signing_alg_values_supported(config)
-    |> put_introspection_signing_alg_values_supported(config)
-    |> put_authorization_response_iss_supported(config)
-  end
-
-  # RFC 8414 §2: private_key_jwt callers of introspection use the same client
-  # assertion verifier and configured algorithm policy as the token endpoint.
-  # Publish that list when the method is enabled so an introspection client does
-  # not fall back to an incompatible default. This is distinct from
-  # `introspection_signing_alg_values_supported`, which describes JWT responses
-  # signed by the authorization server.
-  defp put_introspection_auth_signing_alg_values_supported(metadata, %Config{} = config) do
-    if "private_key_jwt" in introspection_auth_methods(config) do
-      Map.put(
-        metadata,
-        "introspection_endpoint_auth_signing_alg_values_supported",
-        config.client_auth_signing_algs
-      )
-    else
-      metadata
-    end
-  end
-
-  # RFC 9701 §10 `introspection_signing_alg_values_supported`: the algorithms the
-  # introspection endpoint signs JWT responses with - the server's own signing
-  # keys, the same set used for ID Tokens and JARM. Omitted when none.
-  defp put_introspection_signing_alg_values_supported(metadata, %Config{keystore: keystore}) do
-    case SigningAlg.keystore_algs(keystore) do
-      [] -> metadata
-      algs -> Map.put(metadata, "introspection_signing_alg_values_supported", algs)
-    end
-  end
-
-  # JARM §3 / FAPI 2.0 Message Signing §5.4 `authorization_signing_alg_values_
-  # supported`: the algorithms the authorization endpoint signs JARM responses
-  # with - the server's own signing keys (the same set the OpenID configuration
-  # advertises as id_token_signing_alg_values_supported). Omitted when the
-  # keystore exposes none.
-  defp put_authorization_signing_alg_values_supported(metadata, %Config{keystore: keystore}) do
-    case SigningAlg.keystore_algs(keystore) do
-      [] -> metadata
-      algs -> Map.put(metadata, "authorization_signing_alg_values_supported", algs)
-    end
-  end
-
-  defp put_authorization_response_iss_supported(metadata, %Config{authorization_response_iss: true}) do
-    Map.put(metadata, "authorization_response_iss_parameter_supported", true)
-  end
-
-  defp put_authorization_response_iss_supported(metadata, %Config{}), do: metadata
-
-  defp require_pushed_authorization_requests(%Config{require_pushed_authorization_requests: true}), do: true
-
-  defp require_pushed_authorization_requests(%Config{}), do: nil
-
-  defp authorization_response_iss_parameter_supported(%Config{authorization_response_iss: true}), do: true
-
-  defp authorization_response_iss_parameter_supported(%Config{}), do: nil
-
-  defp pushed_authorization_request_endpoint(%Config{} = config), do: Config.par_endpoint_url(config)
-
-  defp end_session_endpoint(%Config{} = config) do
-    if Config.logout_enabled?(config), do: Config.end_session_endpoint_url(config)
-  end
-
-  defp backchannel_logout_supported(%Config{} = config) do
-    if Config.backchannel_logout_supported?(config), do: true
-  end
-
-  defp backchannel_logout_session_supported(%Config{} = config) do
-    if Config.backchannel_logout_session_supported?(config), do: true
-  end
-
-  defp device_authorization_endpoint(%Config{} = config) do
-    if Config.device_authorization_enabled?(config), do: Config.device_authorization_endpoint_url(config)
-  end
-
-  defp backchannel_authentication_endpoint(%Config{} = config) do
-    if Config.ciba_enabled?(config), do: Config.backchannel_authentication_endpoint_url(config)
-  end
-
-  # CIBA Core §4: the delivery modes advertised as wire strings, the accepted
-  # signed-request algs, and whether a user_code is supported. Nil when CIBA is
-  # disabled so the core builder drops each member.
-  defp backchannel_token_delivery_modes_supported(%Config{} = config) do
-    if Config.ciba_enabled?(config), do: Enum.map(Config.ciba_delivery_modes(config), &Atom.to_string/1)
-  end
-
-  defp backchannel_authentication_request_signing_alg_values_supported(%Config{} = config) do
-    if Config.ciba_enabled?(config), do: Keyword.get(Config.ciba(config), :request_signing_algs)
-  end
-
-  defp backchannel_user_code_parameter_supported(%Config{} = config) do
-    if Config.ciba_enabled?(config), do: Keyword.get(Config.ciba(config), :user_code_parameter_supported, false)
-  end
-
-  # RFC 7591 §3: advertise the dynamic client registration endpoint only
-  # when registration is enabled; otherwise omit the member entirely. The URL
-  # is resolved from the host's configured registration path (RFC 8414 §2
-  # endpoint members are absolute URLs), so it reflects where the host mounted
-  # the endpoint rather than a hardcoded `/oauth/register`.
-  @spec registration_endpoint(Config.t()) :: String.t() | nil
-  defp registration_endpoint(%Config{registration_enabled: true} = config), do: Config.registration_endpoint_url(config)
-
-  defp registration_endpoint(%Config{registration_enabled: false}), do: nil
 
   # An empty list means "not advertised": collapse it to nil so the core
   # builder omits the member instead of publishing an empty array.

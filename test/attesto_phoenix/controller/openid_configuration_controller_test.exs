@@ -114,6 +114,132 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       assert body["userinfo_endpoint"] == @userinfo_endpoint
     end
 
+    test "snapshots the complete current OpenID Provider Metadata map" do
+      host =
+        host_config(
+          require_pushed_authorization_requests: true,
+          device_authorization: [enabled: true],
+          device_code_store: StubStore,
+          ciba: [enabled: true, delivery_modes: [:poll, :ping], request_signing_algs: ["PS256", "ES256"]],
+          ciba_store: StubStore,
+          authenticate_ciba_user: fn _ -> {:ok, "user"} end,
+          logout: [enabled: true],
+          terminate_session: fn conn, _ctx -> {:ok, conn} end,
+          logout_session_store: StubStore,
+          session_management: [enabled: true, browser_state_secret: :crypto.strong_rand_bytes(32)],
+          registration_enabled: true,
+          client_id_metadata: [enabled: true],
+          client_jwks: fn _client -> %{"keys" => []} end,
+          request_object_policy: Policy.fapi_message_signing(),
+          authorization_response_iss: true,
+          mtls_enabled: true,
+          cert_der: fn _conn -> nil end,
+          register_client: fn _metadata -> {:ok, %{}} end,
+          acr_values_supported: ["urn:mace:incommon:iap:silver"],
+          ui_locales_supported: ["en", "fr"],
+          claims_parameter_supported: true
+        )
+
+      conn = call_show(host, protocol_config())
+      body = decode_body(conn)
+
+      snapshot = %{
+        "acr_values_supported" => ["urn:mace:incommon:iap:silver"],
+        "authorization_endpoint" => "https://issuer.example/authorize",
+        "authorization_response_iss_parameter_supported" => true,
+        "authorization_signing_alg_values_supported" => ["RS256"],
+        "backchannel_authentication_endpoint" => "https://issuer.example/oauth/bc-authorize",
+        "backchannel_authentication_request_signing_alg_values_supported" => ["PS256", "ES256"],
+        "backchannel_logout_session_supported" => true,
+        "backchannel_logout_supported" => true,
+        "backchannel_token_delivery_modes_supported" => ["poll", "ping"],
+        "backchannel_user_code_parameter_supported" => false,
+        "check_session_iframe" => "https://issuer.example/oauth/check_session",
+        "claims_parameter_supported" => true,
+        "claims_supported" => ["sub", "name", "email"],
+        "claim_types_supported" => ["normal"],
+        "client_id_metadata_document_supported" => true,
+        "code_challenge_methods_supported" => ["S256"],
+        "device_authorization_endpoint" => "https://issuer.example/oauth/device_authorization",
+        "dpop_signing_alg_values_supported" => [
+          "ES256",
+          "ES384",
+          "ES512",
+          "RS256",
+          "RS384",
+          "RS512",
+          "PS256",
+          "PS384",
+          "PS512",
+          "EdDSA",
+          "Ed25519"
+        ],
+        "end_session_endpoint" => "https://issuer.example/oauth/end_session",
+        "frontchannel_logout_session_supported" => true,
+        "frontchannel_logout_supported" => true,
+        "grant_types_supported" => [
+          "authorization_code",
+          "refresh_token",
+          "client_credentials",
+          "urn:ietf:params:oauth:grant-type:token-exchange",
+          "urn:ietf:params:oauth:grant-type:device_code",
+          "urn:openid:params:grant-type:ciba"
+        ],
+        "id_token_signing_alg_values_supported" => ["RS256"],
+        "introspection_endpoint" => "https://issuer.example/oauth/introspect",
+        "introspection_endpoint_auth_methods_supported" => [
+          "client_secret_basic",
+          "client_secret_post",
+          "private_key_jwt"
+        ],
+        "introspection_endpoint_auth_signing_alg_values_supported" => [
+          "PS256",
+          "ES256",
+          "EdDSA",
+          "Ed25519"
+        ],
+        "introspection_signing_alg_values_supported" => ["RS256"],
+        "issuer" => "https://issuer.example",
+        "jwks_uri" => "https://issuer.example/.well-known/jwks.json",
+        "pushed_authorization_request_endpoint" => "https://issuer.example/oauth/par",
+        "registration_endpoint" => "https://issuer.example/oauth/register",
+        "revocation_endpoint" => "https://issuer.example/oauth/revoke",
+        "request_object_signing_alg_values_supported" => [
+          "PS256",
+          "ES256",
+          "EdDSA",
+          "Ed25519"
+        ],
+        "request_parameter_supported" => true,
+        "request_uri_parameter_supported" => false,
+        "require_pushed_authorization_requests" => true,
+        "require_signed_request_object" => true,
+        "response_modes_supported" => ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"],
+        "response_types_supported" => ["code"],
+        "scopes_supported" => ["openid", "profile", "email"],
+        "subject_types_supported" => ["public"],
+        "tls_client_certificate_bound_access_tokens" => true,
+        "token_endpoint" => "https://issuer.example/oauth/token",
+        "token_endpoint_auth_methods_supported" => [
+          "client_secret_basic",
+          "client_secret_post",
+          "private_key_jwt",
+          "none"
+        ],
+        "token_endpoint_auth_signing_alg_values_supported" => [
+          "PS256",
+          "ES256",
+          "EdDSA",
+          "Ed25519"
+        ],
+        "ui_locales_supported" => ["en", "fr"],
+        "userinfo_endpoint" => "https://issuer.example/userinfo"
+      }
+
+      assert body == snapshot
+      assert conn.resp_body == JSON.encode!(snapshot)
+    end
+
     test "advertises the logout and session-management metadata when enabled" do
       host =
         host_config(
