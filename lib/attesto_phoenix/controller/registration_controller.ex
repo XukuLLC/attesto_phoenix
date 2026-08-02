@@ -550,7 +550,10 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp check_requested_scope(scope, config) do
     catalog = MapSet.new(List.wrap(config.scopes_supported))
 
-    case scope |> String.split(" ", trim: true) |> Enum.reject(&MapSet.member?(catalog, &1)) do
+    scope
+    |> String.split(" ", trim: true)
+    |> Enum.reject(&MapSet.member?(catalog, &1))
+    |> case do
       [] ->
         {:ok, scope}
 
