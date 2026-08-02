@@ -86,6 +86,11 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # RFC 7591 §3.2.2 error codes.
   @error_invalid_redirect_uri "invalid_redirect_uri"
   @error_invalid_client_metadata "invalid_client_metadata"
+
+  # An 8 KiB (~200 scope) cap on the registration `scope` metadata: registration
+  # can be unauthenticated, so an uncapped value is a cheap DoS lever. Far above
+  # any real client.
+  @max_scope_metadata_bytes 8_192
   @error_invalid_token "invalid_token"
 
   # RFC 7591 §2 / RFC 6749 §2.1: a public client (token_endpoint_auth_method
@@ -520,11 +525,19 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
           scopes -> {:ok, Enum.join(scopes, " ")}
         end
 
+      scope when is_binary(scope) and byte_size(scope) > @max_scope_metadata_bytes ->
+        # Registration is unauthenticated when enabled, so an uncapped `scope`
+        # is a cheap lever: it was split into a list and every token checked for
+        # catalog membership. Reject an absurd value in O(1), before the split.
+        {:error, error(@error_invalid_client_metadata, "scope metadata is too large")}
+
       scope when is_binary(scope) ->
         requested = String.split(scope, " ", trim: true)
-        catalog = List.wrap(config.scopes_supported)
+        # MapSet membership is O(1) per token; `&(&1 in catalog)` over a list
+        # was O(requested x catalog).
+        catalog = MapSet.new(List.wrap(config.scopes_supported))
 
-        case Enum.reject(requested, &(&1 in catalog)) do
+        case Enum.reject(requested, &MapSet.member?(catalog, &1)) do
           [] ->
             {:ok, scope}
 
