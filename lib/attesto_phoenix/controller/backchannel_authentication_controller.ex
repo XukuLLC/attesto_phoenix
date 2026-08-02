@@ -26,12 +26,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
   alias AttestoPhoenix.AuthorizationServer.BackchannelAuthentication
   alias AttestoPhoenix.AuthorizationServer.BackchannelAuthentication.Request
   alias AttestoPhoenix.ClientAuthentication
-  alias AttestoPhoenix.ClientAuthentication.Policy
   alias AttestoPhoenix.{Config, OAuthError, RequestContext}
-
-  # RFC 7523 / OIDC Core §9: client assertions are short-lived JWTs whose `jti`
-  # is consumed once by the authorization server.
-  @client_assertion_max_lifetime 300
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
@@ -87,17 +82,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
   # AS — the conformance suite exercises all three), all derived from trusted
   # `Config` (never the request `Host`).
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: false,
-      assertion_audiences: [
-        config.issuer,
-        Config.token_endpoint_url(config),
-        Config.backchannel_authentication_endpoint_url(config)
-      ],
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :backchannel_authentication)
 
     case ClientAuthentication.authenticate_with_context(get_req_header(conn, "authorization"), params, config, policy) do
       {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}

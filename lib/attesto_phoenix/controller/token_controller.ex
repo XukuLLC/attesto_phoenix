@@ -54,7 +54,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, Event, OAuthError, RequestContext}
-  alias AttestoPhoenix.ClientAuthentication.{ErrorContext, Policy}
+  alias AttestoPhoenix.ClientAuthentication.ErrorContext
   alias Plug.Conn.Unfetched
 
   require Logger
@@ -81,10 +81,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # RFC 9449 §4.2: the token endpoint is reached by POST, so the proof's `htm`
   # claim must equal this.
   @http_method_post "POST"
-
-  # RFC 7523 / OIDC Core §9: client assertions are short-lived JWTs whose `jti`
-  # is consumed once by the authorization server.
-  @client_assertion_max_lifetime 300
 
   @doc """
   Token endpoint action (RFC 6749 §3.2).
@@ -309,15 +305,9 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # lets a single-profile deployment narrow it. Both values name THIS server, so
   # accepting either does not admit an assertion minted for a different
   # authorization server — the point of the audience restriction. The assertion
-  # lives at most `@client_assertion_max_lifetime` seconds.
+  # lifetime is limited to 300 seconds by the shared endpoint policy.
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: true,
-      assertion_audiences: Config.client_assertion_audiences(config),
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :token)
 
     case ClientAuthentication.authenticate_with_context(
            get_req_header(conn, "authorization"),

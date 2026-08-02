@@ -46,16 +46,11 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   alias Attesto.Introspection
   alias Attesto.SignedIntrospection
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext, ResourceAudiencePolicy}
-  alias AttestoPhoenix.ClientAuthentication.Policy
   # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
   # introspection response as a signed JWT, and the type of that response.
   alias AttestoPhoenix.Store.EctoRefreshStore
 
   @signed_media_type "application/token-introspection+jwt"
-
-  # RFC 7523 §3: the maximum client-assertion lifetime, matching the token
-  # endpoint.
-  @client_assertion_max_lifetime 300
 
   # The Attesto.RefreshStore consulted for opaque refresh tokens, defaulting to
   # the package's Ecto-backed store when the host configures none.
@@ -195,13 +190,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   # derived from trusted Config (never the request Host) - the concrete endpoint
   # URL is not accepted as `aud`.
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: false,
-      assertion_audiences: [config.issuer],
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :introspection)
 
     # Return the full Result; the caller reads the authenticated client_id (the
     # RFC 9701 audience) from it.

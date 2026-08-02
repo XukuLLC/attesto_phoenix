@@ -20,13 +20,11 @@ defmodule AttestoPhoenix.Controller.PARController do
 
   alias AttestoPhoenix.AuthorizationServer.PAR
   alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError, RequestContext}
-  alias AttestoPhoenix.ClientAuthentication.Policy
 
   @cache_control_no_store "no-store"
   @pragma_no_cache "no-cache"
   @error_invalid_request "invalid_request"
   @dpop_request_header "dpop"
-  @client_assertion_max_lifetime 300
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
@@ -63,15 +61,9 @@ defmodule AttestoPhoenix.Controller.PARController do
   # Profile §5.3.2.1 / RFC 9126), derived from trusted `Config` (never the
   # request `Host`) - the concrete endpoint URL is NOT accepted as `aud`, so a
   # confused-deputy assertion minted for a different endpoint is rejected. The
-  # assertion lives at most `@client_assertion_max_lifetime` seconds (RFC 7523 §3).
+  # shared endpoint policy limits the assertion to 300 seconds (RFC 7523 §3).
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: false,
-      assertion_audiences: [config.issuer],
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :par)
 
     case ClientAuthentication.authenticate(
            get_req_header(conn, "authorization"),

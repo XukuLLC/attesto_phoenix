@@ -98,6 +98,54 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   describe "successful revocation (RFC 7009 §2.1)" do
+    test "pins the revocation endpoint's accepted and rejected auth methods" do
+      for {method, expected_status} <- [
+            {:client_secret_basic, 200},
+            {:client_secret_post, 200},
+            {:client_secret_basic_with_body_credentials, 200},
+            {:none, 401},
+            {:private_key_jwt, 401}
+          ] do
+        base_params = %{"token" => @unknown_token}
+
+        {conn, params} =
+          case method do
+            :client_secret_basic ->
+              {build_conn(base_params, basic: {@client_id, @client_secret}), base_params}
+
+            :client_secret_post ->
+              params = Map.merge(base_params, %{"client_id" => @client_id, "client_secret" => @client_secret})
+              {build_conn(params, []), params}
+
+            :client_secret_basic_with_body_credentials ->
+              params = Map.merge(base_params, %{"client_id" => @client_id, "client_secret" => @client_secret})
+              {build_conn(params, basic: {@client_id, @client_secret}), params}
+
+            :none ->
+              {build_conn(base_params, []), base_params}
+
+            :private_key_jwt ->
+              params = Map.put(base_params, "client_assertion", "not-used-by-revocation")
+              {build_conn(params, []), params}
+          end
+
+        conn = RevocationController.create(conn, params)
+
+        assert conn.status == expected_status
+
+        if expected_status == 200 do
+          assert conn.resp_body == ""
+        else
+          assert JSON.decode!(conn.resp_body) == %{
+                   "error" => "invalid_client",
+                   "error_description" => "client authentication failed"
+                 }
+
+          assert get_resp_header(conn, "www-authenticate") == ["Basic"]
+        end
+      end
+    end
+
     test "revokes the family of a live refresh token and returns 200, no body" do
       put_record(@live_token, %{
         family_id: @live_family,

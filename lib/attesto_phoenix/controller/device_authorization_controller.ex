@@ -23,12 +23,10 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   alias AttestoPhoenix.AuthorizationServer.DeviceAuthorization
   alias AttestoPhoenix.AuthorizationServer.DeviceAuthorization.Request
   alias AttestoPhoenix.ClientAuthentication
-  alias AttestoPhoenix.ClientAuthentication.Policy
   alias AttestoPhoenix.{Config, OAuthError, RequestContext}
 
   @dpop_request_header "dpop"
   @http_method_post "POST"
-  @client_assertion_max_lifetime 300
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
@@ -82,13 +80,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   # may have no secret; the core then REQUIRES such a public client to present a
   # DPoP proof (sender constraint in lieu of a secret).
   defp authenticate_client(config, conn, params) do
-    policy = %Policy{
-      allow_public: true,
-      assertion_audiences: [config.issuer],
-      assertion_max_lifetime: @client_assertion_max_lifetime,
-      assertion_signing_algs: config.client_auth_signing_algs,
-      assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
-    }
+    policy = ClientAuthentication.Policy.for_endpoint(config, :device_authorization)
 
     case ClientAuthentication.authenticate_with_context(get_req_header(conn, "authorization"), params, config, policy) do
       {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}

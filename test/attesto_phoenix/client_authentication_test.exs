@@ -506,6 +506,107 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
   end
 
+  describe "current endpoint client-authentication policy matrix" do
+    @endpoint_matrix [
+      {:token, true},
+      {:par, false},
+      {:introspection, false},
+      {:device_authorization, true},
+      {:backchannel_authentication, false}
+    ]
+
+    @all_methods [:client_secret_basic, :client_secret_post, :private_key_jwt, :none]
+
+    test "pins the accepted and rejected methods for every policy endpoint", %{config: config} do
+      config = %{
+        config
+        | client_auth_signing_algs: Attesto.SigningAlg.fapi_algs(),
+          client_auth_enforce_fapi_alg_policy: true
+      }
+
+      for {endpoint, allow_public} <- @endpoint_matrix do
+        policy = Policy.for_endpoint(config, endpoint)
+        expected_methods = if allow_public, do: @all_methods, else: @all_methods -- [:none]
+
+        assert policy.allow_public == allow_public
+        assert policy.assertion_max_lifetime == 300
+        assert policy.assertion_signing_algs == config.client_auth_signing_algs
+        assert policy.assertion_enforce_fapi_alg_policy == config.client_auth_enforce_fapi_alg_policy
+
+        expected_audiences =
+          case endpoint do
+            :token ->
+              Config.client_assertion_audiences(config)
+
+            :backchannel_authentication ->
+              [
+                config.issuer,
+                Config.token_endpoint_url(config),
+                Config.backchannel_authentication_endpoint_url(config)
+              ]
+
+            _other ->
+              [config.issuer]
+          end
+
+        assert policy.assertion_audiences == expected_audiences
+
+        for method <- @all_methods do
+          result = authenticate_endpoint_method(method, policy, config)
+
+          if method in expected_methods do
+            assert {:ok, %Result{method: ^method}} = result
+          else
+            assert {:error,
+                    %OAuthError{
+                      error: :invalid_client,
+                      error_description: "client authentication required"
+                    }} = result
+          end
+        end
+      end
+    end
+
+    defp authenticate_endpoint_method(:client_secret_basic, policy, config) do
+      config = %{config | token_endpoint_auth_methods_supported: ["client_secret_basic"]}
+      ClientAuthentication.authenticate(basic("confidential-1", "s3cr3t"), %{}, config, policy)
+    end
+
+    defp authenticate_endpoint_method(:client_secret_post, policy, config) do
+      config = %{config | token_endpoint_auth_methods_supported: ["client_secret_post"]}
+
+      ClientAuthentication.authenticate(
+        [],
+        %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"},
+        config,
+        policy
+      )
+    end
+
+    defp authenticate_endpoint_method(:private_key_jwt, policy, config) do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      config = %{
+        config
+        | token_endpoint_auth_methods_supported: ["private_key_jwt"],
+          client_jwks: fn @confidential -> %{"keys" => [public_jwk(client_key)]} end
+      }
+
+      ClientAuthentication.authenticate([], assertion_params(client_key, "ES256"), config, policy)
+    end
+
+    defp authenticate_endpoint_method(:none, policy, config) do
+      config = %{config | token_endpoint_auth_methods_supported: ["none"]}
+
+      ClientAuthentication.authenticate(
+        [],
+        %{"client_id" => "public-1"},
+        config,
+        policy
+      )
+    end
+  end
+
   defp authenticate(headers, params, config, opts) do
     policy = %Policy{
       allow_public: Keyword.fetch!(opts, :allow_public),

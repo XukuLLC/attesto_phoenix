@@ -111,6 +111,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
     core.
     """
 
+    alias AttestoPhoenix.Config
+
     @type t :: %__MODULE__{
             allow_public: boolean(),
             assertion_audiences: [String.t()],
@@ -132,6 +134,59 @@ defmodule AttestoPhoenix.ClientAuthentication do
       :assertion_signing_algs,
       :assertion_enforce_fapi_alg_policy
     ]
+
+    @client_assertion_max_lifetime 300
+
+    @type endpoint ::
+            :token
+            | :par
+            | :introspection
+            | :device_authorization
+            | :backchannel_authentication
+
+    @doc """
+    Build the client-authentication policy for an endpoint.
+
+    This is the authoritative endpoint matrix. The client-authentication
+    methods themselves remain the configured Basic, post-body, and
+    `private_key_jwt` methods; `allow_public` controls whether the `none`
+    method is admitted. Revocation intentionally does not use this policy: its
+    RFC 7009 parser accepts only Basic/post credentials and preserves Basic
+    precedence over body credentials.
+    """
+    @spec for_endpoint(Config.t(), endpoint()) :: t()
+    def for_endpoint(%Config{} = config, endpoint) do
+      {allow_public, assertion_audiences} =
+        case endpoint do
+          :token ->
+            {true, Config.client_assertion_audiences(config)}
+
+          :par ->
+            {false, [config.issuer]}
+
+          :introspection ->
+            {false, [config.issuer]}
+
+          :device_authorization ->
+            {true, [config.issuer]}
+
+          :backchannel_authentication ->
+            {false,
+             [
+               config.issuer,
+               Config.token_endpoint_url(config),
+               Config.backchannel_authentication_endpoint_url(config)
+             ]}
+        end
+
+      %__MODULE__{
+        allow_public: allow_public,
+        assertion_audiences: assertion_audiences,
+        assertion_max_lifetime: @client_assertion_max_lifetime,
+        assertion_signing_algs: config.client_auth_signing_algs,
+        assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
+      }
+    end
   end
 
   defmodule Result do
