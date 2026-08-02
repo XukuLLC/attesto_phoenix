@@ -22,9 +22,10 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   authenticated `client_id` is then threaded into revocation so one client
   cannot revoke another client's tokens (RFC 7009 §2.1).
 
-  Client lookup and secret comparison are delegated to the host through the
-  `:load_client` and `:verify_client_secret` configuration callbacks; this
-  controller owns no client registry.
+  Client authentication is delegated to the shared
+  `AttestoPhoenix.ClientAuthentication` service, which resolves clients and
+  compares secrets through the host's configured callbacks; this controller
+  owns no client registry or authentication parser.
 
   ## No-existence oracle (RFC 7009 §2.2)
 
@@ -89,18 +90,10 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   @error_invalid_request :invalid_request
   @error_invalid_client :invalid_client
 
-  # RFC 6749 §2.3.1: HTTP Basic credentials are the userid:password (here
-  # client_id:client_secret) joined by a single colon.
-  @basic_credentials_separator ":"
-
   # RFC 7009 §2.1: the form parameter carrying the credential to revoke, and
   # the optional hint about its type (RFC 7009 §2.1).
   @token_param "token"
   @token_type_hint_param "token_type_hint"
-
-  # RFC 6749 §2.3.1: client_secret_post form parameters.
-  @client_id_param "client_id"
-  @client_secret_param "client_secret"
 
   # The configured AttestoPhoenix.Config is threaded through the connection's
   # private storage by the host pipeline.
@@ -127,8 +120,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- RequestContext.check_https(conn, config),
-         {:ok, client_id, client_secret} <- client_credentials(conn, params),
-         {:ok, _client} <- authenticate_client(config, client_id, client_secret),
+         {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
+           authenticate_client(config, conn, params),
          {:ok, token} <- fetch_token(params) do
       revoke_token(conn, config, client_id, token, params)
     else
@@ -156,7 +149,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
           "the request is missing the required \"token\" parameter"
         )
 
-      {:error, :invalid_client} ->
+      {:error, %OAuthError{}} ->
         # RFC 6749 §5.2: client authentication failed. This endpoint serves
         # confidential clients authenticating with HTTP Basic, so the 401
         # carries a Basic `WWW-Authenticate` challenge.
@@ -199,103 +192,20 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     |> halt()
   end
 
-  # RFC 6749 §2.3.1: a confidential client authenticates with either HTTP
-  # Basic (client_secret_basic) or request-body parameters
-  # (client_secret_post). Basic takes precedence when present. A request
-  # that carries neither is treated as failed client authentication, since
-  # this endpoint serves confidential clients (fail-closed).
-  defp client_credentials(conn, params) do
-    case basic_credentials(conn) do
-      {:ok, client_id, client_secret} ->
-        {:ok, client_id, client_secret}
+  # RFC 7009 §2.1: revocation accepts only client_secret_basic and
+  # client_secret_post. The shared endpoint policy preserves the established
+  # Basic-first precedence and deliberately does not apply the token endpoint's
+  # configurable method allowlist, which the legacy revocation endpoint never
+  # consulted.
+  defp authenticate_client(config, conn, params) do
+    policy = ClientAuthentication.Policy.for_endpoint(config, :revocation)
 
-      # RFC 6749 §2.3.1: a present-but-malformed Basic credential fails
-      # authentication; it does not fall back to body parameters.
-      {:error, :invalid_client} = error ->
-        error
-
-      :none ->
-        post_credentials(params)
-    end
-  end
-
-  defp basic_credentials(conn) do
-    case get_req_header(conn, "authorization") do
-      ["Basic " <> encoded | _rest] ->
-        decode_basic(encoded)
-
-      _absent ->
-        :none
-    end
-  end
-
-  defp decode_basic(encoded) do
-    with {:ok, decoded} <- Base.decode64(encoded),
-         [client_id, client_secret] <-
-           String.split(decoded, @basic_credentials_separator, parts: 2) do
-      {:ok, URI.decode_www_form(client_id), URI.decode_www_form(client_secret)}
-    else
-      # RFC 6749 §2.3.1: a malformed Basic credential is a failed
-      # authentication, not a free pass.
-      _malformed -> {:error, :invalid_client}
-    end
-  end
-
-  defp post_credentials(params) do
-    case {Map.get(params, @client_id_param), Map.get(params, @client_secret_param)} do
-      {client_id, client_secret}
-      when is_binary(client_id) and is_binary(client_secret) ->
-        {:ok, client_id, client_secret}
-
-      _absent ->
-        # No client_secret_basic and no usable client_secret_post: this
-        # confidential-client endpoint rejects the request.
-        {:error, :invalid_client}
-    end
-  end
-
-  defp authenticate_client(config, client_id, client_secret) when is_binary(client_id) and is_binary(client_secret) do
-    # RFC 6749 §5.2: an unknown or revoked client, and a wrong secret, all
-    # surface to the caller as the same `invalid_client` so the endpoint is not
-    # an existence oracle for client ids. To keep that true in OBSERVABLE TIMING
-    # too (RFC 6749 §2.3 / OWASP), a lookup failure still runs a dummy
-    # `verify_client_secret` against `:unknown_client` so its latency matches the
-    # wrong-secret path - the same equalization the shared
-    # `AttestoPhoenix.ClientAuthentication` core applies.
-    verify_client_secret = Config.verify_client_secret_fun(config)
-
-    case Callback.invoke(Config.load_client_fun(config), [client_id]) do
-      {:ok, client} ->
-        if Callback.invoke(verify_client_secret, [client, client_secret]) == true and
-             not native_secret_refused?(config, client) do
-          {:ok, client}
-        else
-          {:error, :invalid_client}
-        end
-
-      _unknown ->
-        _ = Callback.invoke(verify_client_secret, [:unknown_client, client_secret])
-        {:error, :invalid_client}
-    end
-  end
-
-  # RFC 8252 §8.4: an installed native app cannot keep a client secret
-  # confidential, so a secret it presents is not proof of its identity. This
-  # endpoint parses credentials itself rather than going through
-  # `AttestoPhoenix.ClientAuthentication`, so the rule has to be applied here
-  # too - otherwise revocation would be a second client-authentication surface
-  # accepting a credential the token endpoint refuses.
-  #
-  # The predicate itself is NOT reimplemented here: it is the one
-  # `ClientAuthentication` enforces at every other endpoint. A hand-copied copy
-  # would be free to drift from it, and the two defaults it composes
-  # (`:client_native?` absent -> false, `:client_public?` absent -> native) are
-  # exactly the kind of detail that drifts silently. The refusal is the same
-  # generic `invalid_client` as every other failure here, so it is not an
-  # oracle, and it runs only on the branch where the secret already verified,
-  # leaving the unknown-client dummy-verify timing equalization untouched.
-  defp native_secret_refused?(config, client) do
-    ClientAuthentication.native_secret_refused?(config, client)
+    ClientAuthentication.authenticate(
+      get_req_header(conn, "authorization"),
+      params,
+      config,
+      policy
+    )
   end
 
   defp fetch_token(params) do

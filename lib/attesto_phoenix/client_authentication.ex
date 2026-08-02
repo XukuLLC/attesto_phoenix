@@ -73,6 +73,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
     * `:assertion_enforce_fapi_alg_policy` - whether trusted assertion keys must
       also satisfy FAPI's RSA modulus and Edwards-curve restrictions. `nil`
       preserves the explicit-algorithm behavior of older policy structs.
+    * `:allowed_methods` - the authentication methods admitted by the endpoint.
+    * `:basic_precedence` - whether a Basic header wins over body credentials.
+    * `:honor_configured_methods` - whether the endpoint also applies the
+      configured `token_endpoint_auth_methods_supported` allowlist.
 
   ## Return value
 
@@ -117,8 +121,15 @@ defmodule AttestoPhoenix.ClientAuthentication do
             assertion_audiences: [String.t()],
             assertion_max_lifetime: pos_integer(),
             assertion_signing_algs: [String.t()],
-            assertion_enforce_fapi_alg_policy: boolean() | nil
+            assertion_enforce_fapi_alg_policy: boolean() | nil,
+            allowed_methods: [method()],
+            basic_precedence: boolean(),
+            honor_configured_methods: boolean()
           }
+
+    @type method :: :client_secret_basic | :client_secret_post | :private_key_jwt | :none
+
+    @all_methods [:client_secret_basic, :client_secret_post, :private_key_jwt, :none]
 
     @enforce_keys [
       :allow_public,
@@ -131,7 +142,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
       :assertion_audiences,
       :assertion_max_lifetime,
       :assertion_signing_algs,
-      :assertion_enforce_fapi_alg_policy
+      :assertion_enforce_fapi_alg_policy,
+      allowed_methods: @all_methods,
+      basic_precedence: false,
+      honor_configured_methods: true
     ]
 
     @client_assertion_max_lifetime 300
@@ -142,6 +156,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
             | :introspection
             | :device_authorization
             | :backchannel_authentication
+            | :revocation
 
     @doc """
     Build the client-authentication policy for an endpoint.
@@ -149,9 +164,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
     This is the authoritative endpoint matrix. The client-authentication
     methods themselves remain the configured Basic, post-body, and
     `private_key_jwt` methods; `allow_public` controls whether the `none`
-    method is admitted. Revocation intentionally does not use this policy: its
-    RFC 7009 parser accepts only Basic/post credentials and preserves Basic
-    precedence over body credentials.
+    method is admitted. Revocation uses the same service with its RFC 7009
+    Basic/post-only policy and Basic precedence over body credentials.
     """
     @spec for_endpoint(Config.t(), endpoint()) :: t()
     def for_endpoint(%Config{} = config, endpoint) do
@@ -176,6 +190,18 @@ defmodule AttestoPhoenix.ClientAuthentication do
                Config.token_endpoint_url(config),
                Config.backchannel_authentication_endpoint_url(config)
              ]}
+
+          :revocation ->
+            {false, []}
+        end
+
+      {allowed_methods, basic_precedence, honor_configured_methods} =
+        case endpoint do
+          :revocation ->
+            {[:client_secret_basic, :client_secret_post], true, false}
+
+          _other ->
+            {@all_methods, false, true}
         end
 
       %__MODULE__{
@@ -183,7 +209,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
         assertion_audiences: assertion_audiences,
         assertion_max_lifetime: @client_assertion_max_lifetime,
         assertion_signing_algs: config.client_auth_signing_algs,
-        assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy
+        assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy,
+        allowed_methods: allowed_methods,
+        basic_precedence: basic_precedence,
+        honor_configured_methods: honor_configured_methods
       }
     end
   end
@@ -290,22 +319,22 @@ defmodule AttestoPhoenix.ClientAuthentication do
       {:ok, :none, client_id} ->
         # RFC 6749 §2.1: identified but unauthenticated. Permitted only for
         # public clients, which must compensate with PKCE (RFC 7636).
-        with :ok <- require_client_auth_method(config, "none") do
+        with :ok <- require_client_auth_method(config, policy, :none) do
           load_public_client(config, client_id)
         end
 
       {:ok, :client_secret_basic, client_id, secret} ->
-        with :ok <- require_client_auth_method(config, "client_secret_basic") do
+        with :ok <- require_client_auth_method(config, policy, :client_secret_basic) do
           verify_confidential_client(config, client_id, secret, :client_secret_basic)
         end
 
       {:ok, :client_secret_post, client_id, secret} ->
-        with :ok <- require_client_auth_method(config, "client_secret_post") do
+        with :ok <- require_client_auth_method(config, policy, :client_secret_post) do
           verify_confidential_client(config, client_id, secret, :client_secret_post)
         end
 
       {:ok, :private_key_jwt, assertion} ->
-        with :ok <- require_client_auth_method(config, "private_key_jwt") do
+        with :ok <- require_client_auth_method(config, policy, :private_key_jwt) do
           verify_private_key_jwt_client(config, policy, assertion)
         end
 
@@ -351,6 +380,19 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `client_id`, so a body `client_id` is permitted iff it agrees with it; a
   # conflicting body `client_id` is an internally inconsistent request and is
   # rejected before any credential is verified.
+  defp fetch_client_credentials(header, params, %Policy{basic_precedence: true} = policy) do
+    case header do
+      ["Basic " <> encoded | _rest] ->
+        # RFC 7009's established behavior is intentionally Basic-first: body
+        # credentials are ignored whenever a Basic header is present, even if
+        # the body also carries a client secret or assertion.
+        decode_basic_credentials(encoded)
+
+      _other ->
+        fetch_body_credentials(params, policy)
+    end
+  end
+
   defp fetch_client_credentials(header, params, policy) do
     cond do
       assertion_credentials?(params) ->
@@ -455,10 +497,23 @@ defmodule AttestoPhoenix.ClientAuthentication do
     end
   end
 
-  defp require_client_auth_method(config, method) do
+  defp require_client_auth_method(config, %Policy{} = policy, method) do
+    cond do
+      method not in policy.allowed_methods ->
+        {:error, error(@error_invalid_client, @client_auth_failed)}
+
+      not policy.honor_configured_methods ->
+        :ok
+
+      true ->
+        require_configured_client_auth_method(config, method)
+    end
+  end
+
+  defp require_configured_client_auth_method(config, method) do
     case Map.get(config, :token_endpoint_auth_methods_supported) do
       methods when is_list(methods) and methods != [] ->
-        if method in methods,
+        if Atom.to_string(method) in methods,
           do: :ok,
           else: {:error, error(@error_invalid_client, @client_auth_failed)}
 

@@ -607,6 +607,56 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
   end
 
+  describe "revocation endpoint client-authentication policy" do
+    test "allows only Basic/post and gives Basic precedence over body credentials", %{
+      config: config
+    } do
+      policy = Policy.for_endpoint(config, :revocation)
+
+      assert policy.allow_public == false
+      assert policy.assertion_audiences == []
+      assert policy.allowed_methods == [:client_secret_basic, :client_secret_post]
+      assert policy.basic_precedence == true
+      # Revocation historically accepted Basic/post independently of the
+      # token endpoint's configured method advertisement.
+      assert policy.honor_configured_methods == false
+
+      config = %{config | token_endpoint_auth_methods_supported: ["private_key_jwt"]}
+
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               ClientAuthentication.authenticate(
+                 basic("confidential-1", "s3cr3t"),
+                 %{
+                   "client_id" => "confidential-1",
+                   "client_secret" => "wrong",
+                   "client_assertion" => "ignored"
+                 },
+                 config,
+                 policy
+               )
+
+      assert {:ok, %Result{method: :client_secret_post}} =
+               ClientAuthentication.authenticate(
+                 [],
+                 %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"},
+                 config,
+                 policy
+               )
+
+      assert {:error, %OAuthError{error: :invalid_client}} =
+               ClientAuthentication.authenticate(
+                 [],
+                 %{
+                   "client_id" => "confidential-1",
+                   "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+                   "client_assertion" => "not-used-by-revocation"
+                 },
+                 config,
+                 policy
+               )
+    end
+  end
+
   defp authenticate(headers, params, config, opts) do
     policy = %Policy{
       allow_public: Keyword.fetch!(opts, :allow_public),

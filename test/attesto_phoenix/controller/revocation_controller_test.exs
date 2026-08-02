@@ -418,10 +418,8 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     end
   end
 
-  # RFC 8252 §8.4. This endpoint parses client credentials itself instead of
-  # going through `AttestoPhoenix.ClientAuthentication`, so without an explicit
-  # check here it would be a second authentication surface accepting a secret
-  # the token endpoint refuses.
+  # RFC 8252 §8.4. The shared client-authentication service applies the same
+  # native-client secret refusal used by the other credential endpoints.
   describe "native clients (RFC 8252 §8.4)" do
     defp revoke_as_native(overrides) do
       cfg = build_config([client_native?: fn _client -> true end] ++ overrides)
