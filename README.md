@@ -511,6 +511,17 @@ enforced list must be a subset of `Attesto.SigningAlg.fapi_algs/0`; invalid or
 incoherent lists fail when the server configuration is built rather than being
 advertised and rejected only at request time.
 
+`:client_assertion_audiences` controls which `aud` values a `private_key_jwt`
+assertion may carry at the **token endpoint** (RFC 7523 §3). It defaults to the
+issuer identifier *and* the token endpoint URL, because the profiles disagree:
+FAPI 2.0 Security Profile Final §5.3.2.1 requires the issuer, while FAPI-CIBA
+ID1 audiences a token-endpoint assertion to the token endpoint URL. A
+deployment certifying to only one of them can narrow it to `[config.issuer]`.
+The other endpoints (PAR, introspection, device authorization) are
+issuer-only already. Narrowing is a conformance choice rather than a security
+one: both values name *this* server, so accepting either does not admit an
+assertion minted for a different authorization server.
+
 When `:request_object_policy` is configured, signed request objects are verified
 at PAR submission and re-verified at `/authorize`; verified request-object
 parameters are authoritative over unsigned request body/query values. Set
