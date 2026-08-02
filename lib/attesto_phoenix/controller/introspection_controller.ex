@@ -56,9 +56,6 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   # the package's Ecto-backed store when the host configures none.
   @default_refresh_store EctoRefreshStore
 
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
-
   # RFC 6749 §5.2 error code, held as the atom `OAuthError.new/3` requires.
   @error_invalid_request :invalid_request
 
@@ -72,7 +69,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) when is_map(params) do
     config = resolve_config()
-    conn = put_no_store_headers(conn)
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),
          {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
@@ -80,7 +77,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
          {:ok, token} <- fetch_token(params) do
       respond(conn, config, client_id, token, params)
     else
-      {:error, %OAuthError{} = err} -> render_error(conn, err)
+      {:error, %OAuthError{} = err} -> render_error(conn, config, err)
     end
   end
 
@@ -202,25 +199,13 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     )
   end
 
-  defp render_error(conn, %OAuthError{} = err) do
-    conn
-    |> merge_resp_headers(err.headers)
-    |> put_status(err.status)
-    |> json(error_body(err.error, err.error_description))
+  defp render_error(conn, config, %OAuthError{} = err) do
+    OAuthError.render(conn, err, auth_scheme: :none, config: config)
   end
-
-  defp error_body(code, nil), do: %{error: code}
-  defp error_body(code, description), do: %{error: code, error_description: description}
 
   # `code` is a compile-time RFC 6749 §5.2 error-code atom, passed straight to
   # `OAuthError.new/3` (no string-to-atom round-trip that could raise).
   defp error(code, description), do: OAuthError.new(code, description, status: 400)
-
-  defp put_no_store_headers(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
-  end
 
   defp resolve_config do
     otp_app = Application.get_env(:attesto_phoenix, :otp_app)

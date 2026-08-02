@@ -9,7 +9,7 @@ if Code.ensure_loaded?(Plug.Conn) do
       * **a struct** - the controllers build `%AttestoPhoenix.OAuthError{}`
         with `new/2` / `new/3` and thread it through their `with` chains as
         the `{:error, error}` term, then render it once at the boundary with
-        `render/2`; and
+        `render/3`; and
 
       * **a set of header helpers** - `unauthorized/4`, `use_dpop_nonce/3`,
         `insufficient_scope/3`, `no_store/2`, and `www_authenticate/3` -
@@ -22,11 +22,10 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       * **Token / endpoint errors** (RFC 6749 §5.2) - the JSON body
         `{"error": <code>, "error_description": <text>}` returned by the
-        token, revocation, and registration endpoints. When the request
-        attempted HTTP `Authorization`-based client authentication and the
-        status is 401, RFC 6749 §5.2 requires a matching `WWW-Authenticate`
-        challenge, so `render/2` re-derives it from the request rather than
-        trusting the caller to remember.
+        token, revocation, and registration endpoints. The caller explicitly
+        selects whether rendering adds a Basic, Bearer, or DPoP challenge, or
+        preserves a challenge already attached by an authentication context.
+        Rendering never infers an auth scheme from request headers.
 
       * **Protected-resource challenges** (RFC 6750 §3 / RFC 9449 §7.1) - a
         `WWW-Authenticate` response header naming the `Bearer` or `DPoP`
@@ -63,9 +62,10 @@ if Code.ensure_loaded?(Plug.Conn) do
         challenge header. Default sets the `www-authenticate` response
         header.
 
-    The RFC semantics (which code maps to which status, which auth-params,
-    which header) are owned by this module and are not overridable; only the
-    serialization/transport is.
+    The RFC envelope, cache headers, challenge formatting, and escaping are
+    owned by this module. The caller still owns the endpoint's status, error
+    values, and explicit authentication context; only serialization/transport
+    is overridable.
 
     This module compiles only when `Plug` is available.
     """
@@ -77,6 +77,11 @@ if Code.ensure_loaded?(Plug.Conn) do
 
     @typedoc "The protected-resource authentication scheme a challenge names."
     @type scheme :: :bearer | :dpop
+
+    @typedoc "The explicit challenge selection for endpoint-error rendering."
+    @type auth_scheme :: :none | :basic | :bearer | :dpop | :from_error_context
+
+    @type challenge_scheme :: :basic | :bearer | :dpop | String.t()
 
     @typedoc "An OAuth 2.0 error value rendered to the RFC 6749 §5.2 envelope."
     @type t :: %__MODULE__{
@@ -107,11 +112,9 @@ if Code.ensure_loaded?(Plug.Conn) do
     @basic_scheme "Basic"
     @default_realm "OAuth"
 
-    # RFC 6749 §5.2 default status mapping. `invalid_client` is the only code
-    # the spec singles out: 401 when client authentication was attempted via
-    # the `Authorization` header, 400 otherwise. It defaults to 400 here and
-    # `render/2`'s request inspection raises it to 401 so a code path that
-    # forgets to set the status still produces a valid envelope. RFC 6750 §3.1
+    # RFC 6749 §5.2 default status mapping. `invalid_client` defaults to 400;
+    # callers that know an Authorization-header attempt requires 401 set that
+    # status explicitly before rendering. RFC 6750 §3.1
     # / RFC 9449 §7.1 protected-resource codes (`invalid_token`,
     # `invalid_dpop_proof`, `use_dpop_nonce`) are 401 and `insufficient_scope`
     # is 403; those are emitted through the dedicated challenge helpers below.
@@ -159,16 +162,32 @@ if Code.ensure_loaded?(Plug.Conn) do
     Render an `%AttestoPhoenix.OAuthError{}` to the RFC 6749 §5.2 wire format.
 
     Writes the JSON envelope `{"error": code, "error_description": desc}` with
-    the error's status, applies the RFC 6749 §5.1 no-store headers, and - when
-    the request attempted `Authorization`-based client authentication and the
-    status is 401 - adds the RFC 6749 §5.2 `WWW-Authenticate: Basic`
-    challenge. The Basic realm defaults to `"OAuth"` and may be overridden by
-    the `:basic_realm` config key.
+    the error's status, applies the RFC 6749 §5.1 no-store headers, and applies
+    the caller-selected auth challenge. `:none` adds no challenge,
+    `:from_error_context` preserves a challenge already carried in
+    `error.headers`, and the concrete schemes use `format_challenge/2`.
+
+    Options:
+
+      * `:auth_scheme` - `:none`, `:basic`, `:bearer`, `:dpop`, or
+        `:from_error_context`. The `/2` form uses `:none` for compatibility;
+        rendering never guesses from the request's `Authorization` header.
+      * `:challenge_params` - explicit auth-params for a generated challenge.
+        When omitted, Basic uses the configured realm and Bearer/DPoP use the
+        error code and optional description.
+      * `:config` - an explicit `%AttestoPhoenix.Config{}` when the controller
+        resolved configuration outside `conn.private`.
     """
     @spec render(Plug.Conn.t(), t()) :: Plug.Conn.t()
     def render(conn, %__MODULE__{} = error) do
-      config = fetch_config(conn)
-      status = effective_status(error, conn)
+      render(conn, error, auth_scheme: :none)
+    end
+
+    @spec render(Plug.Conn.t(), t(), keyword()) :: Plug.Conn.t()
+    def render(conn, %__MODULE__{} = error, opts) when is_list(opts) do
+      config = Keyword.get(opts, :config) || fetch_config(conn)
+      auth_scheme = Keyword.get(opts, :auth_scheme, :none)
+      params = challenge_params(error, config, opts, auth_scheme)
 
       body =
         %{"error" => Atom.to_string(error.error)}
@@ -176,8 +195,37 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       conn
       |> no_store(config)
-      |> maybe_basic_challenge(config, status, basic_realm(config))
-      |> do_send_error(config, status, body)
+      |> merge_resp_headers(error.headers)
+      |> maybe_challenge(config, auth_scheme, params)
+      |> do_send_error(config, error.status, body)
+    end
+
+    @doc """
+    Format an escaping-safe `WWW-Authenticate` challenge.
+
+    `params` may be a keyword list or a list of `{name, value}` pairs. The
+    three protocol schemes are named explicitly; a validated binary scheme is
+    also accepted so an authentication context can preserve its scheme token
+    without lowercasing or rewriting it.
+    """
+    @spec format_challenge(challenge_scheme(), keyword() | [{String.t(), String.t()}]) :: String.t()
+    def format_challenge(scheme, params \\ []) when is_list(params) do
+      label = challenge_scheme_label(scheme)
+
+      params =
+        if Keyword.keyword?(params) do
+          Enum.map(params, fn {key, value} -> {to_string(key), value} end)
+        else
+          params
+        end
+
+      case params do
+        [] ->
+          label
+
+        params ->
+          label <> " " <> Enum.map_join(params, ", ", fn {key, value} -> ~s(#{key}="#{escape(value)}") end)
+      end
     end
 
     @doc """
@@ -209,7 +257,7 @@ if Code.ensure_loaded?(Plug.Conn) do
       conn
       |> no_store(config)
       |> maybe_put_dpop_nonce(Keyword.get(opts, :dpop_nonce))
-      |> www_authenticate(config, challenge(scheme, params))
+      |> www_authenticate(config, format_challenge(scheme, params))
       |> do_send_error(config, 401, error_body(error, Keyword.get(opts, :description)))
     end
 
@@ -259,7 +307,7 @@ if Code.ensure_loaded?(Plug.Conn) do
 
       conn
       |> no_store(config)
-      |> www_authenticate(config, challenge(scheme, params))
+      |> www_authenticate(config, format_challenge(scheme, params))
       |> do_send_error(config, 403, error_body(@insufficient_scope, description))
     end
 
@@ -295,38 +343,6 @@ if Code.ensure_loaded?(Plug.Conn) do
     # ----- internal -----
 
     defp default_status(code), do: Map.get(@default_status, code, 400)
-
-    # RFC 6749 §5.2: `invalid_client` is 401 when the request authenticated
-    # via the `Authorization` header. The struct defaults it to 400; raise it
-    # to 401 here when an `Authorization` attempt is present so the dedicated
-    # Basic challenge can attach.
-    defp effective_status(%__MODULE__{error: :invalid_client, status: 400}, conn) do
-      if authorization_attempted?(conn), do: 401, else: 400
-    end
-
-    defp effective_status(%__MODULE__{status: status}, _conn), do: status
-
-    # RFC 6749 §5.2: a 401 returned to a request that attempted
-    # `Authorization`-header client authentication MUST carry a matching
-    # `WWW-Authenticate` challenge. It is re-derived from the request so any
-    # caller that returns 401 is compliant without remembering the header.
-    defp maybe_basic_challenge(conn, config, 401, realm) do
-      if authorization_attempted?(conn) do
-        www_authenticate(conn, config, basic_challenge(realm))
-      else
-        conn
-      end
-    end
-
-    defp maybe_basic_challenge(conn, _config, _status, _realm), do: conn
-
-    defp authorization_attempted?(conn) do
-      get_req_header(conn, "authorization") != []
-    end
-
-    defp basic_challenge(realm) do
-      @basic_scheme <> ~s( realm="#{escape(realm)}")
-    end
 
     defp basic_realm(config) when is_map(config), do: Map.get(config, :basic_realm) || @default_realm
 
@@ -369,16 +385,48 @@ if Code.ensure_loaded?(Plug.Conn) do
       |> put_resp_header("pragma", @pragma_no_cache)
     end
 
-    # RFC 9110 §11.1: `WWW-Authenticate` is `scheme SP #auth-param`. The
-    # auth-param values are quoted-strings.
-    defp challenge(scheme, params) do
-      label = scheme_label(scheme)
-      param_str = Enum.map_join(params, ", ", fn {k, v} -> ~s(#{k}="#{escape(v)}") end)
-      label <> " " <> param_str
+    defp challenge_params(_error, _config, opts, auth_scheme) when auth_scheme in [:none, :from_error_context],
+      do: Keyword.get(opts, :challenge_params, [])
+
+    defp challenge_params(_error, config, opts, :basic) do
+      case Keyword.fetch(opts, :challenge_params) do
+        {:ok, params} -> params
+        :error -> [realm: basic_realm(config)]
+      end
     end
 
-    defp scheme_label(:dpop), do: "DPoP"
-    defp scheme_label(:bearer), do: "Bearer"
+    defp challenge_params(error, _config, opts, auth_scheme) when auth_scheme in [:bearer, :dpop] do
+      case Keyword.fetch(opts, :challenge_params) do
+        {:ok, params} ->
+          params
+
+        :error ->
+          [{"error", Atom.to_string(error.error)}]
+          |> append_param("error_description", error.error_description)
+      end
+    end
+
+    defp challenge_params(_error, _config, opts, _auth_scheme), do: Keyword.get(opts, :challenge_params, [])
+
+    defp maybe_challenge(conn, _config, auth_scheme, _params) when auth_scheme in [:none, :from_error_context], do: conn
+
+    defp maybe_challenge(conn, config, auth_scheme, params) do
+      www_authenticate(conn, config, format_challenge(auth_scheme, params))
+    end
+
+    defp challenge_scheme_label(:basic), do: @basic_scheme
+    defp challenge_scheme_label(:bearer), do: "Bearer"
+    defp challenge_scheme_label(:dpop), do: "DPoP"
+
+    defp challenge_scheme_label(scheme) when is_binary(scheme) do
+      if Regex.match?(~r/\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/, scheme) do
+        if String.downcase(scheme) == "basic", do: @basic_scheme, else: scheme
+      else
+        raise ArgumentError, "invalid WWW-Authenticate scheme"
+      end
+    end
+
+    defp challenge_scheme_label(_scheme), do: raise(ArgumentError, "invalid WWW-Authenticate scheme")
 
     defp error_body(error, nil), do: %{"error" => error}
 

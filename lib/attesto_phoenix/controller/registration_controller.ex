@@ -74,24 +74,21 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   import Plug.Conn
 
   alias Attesto.{Secret, SecureCompare}
-  alias AttestoPhoenix.{Callback, Config, Event, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, Event, OAuthError, RequestContext}
 
   # RFC 7234 §5.2: a credential-bearing response must never be cached.
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
-
   # RFC 7591 §3.1: the registration request body is a JSON object.
   @content_type_json "application/json"
 
   # RFC 7591 §3.2.2 error codes.
-  @error_invalid_redirect_uri "invalid_redirect_uri"
-  @error_invalid_client_metadata "invalid_client_metadata"
+  @error_invalid_redirect_uri :invalid_redirect_uri
+  @error_invalid_client_metadata :invalid_client_metadata
 
   # An 8 KiB (~200 scope) cap on the registration `scope` metadata: registration
   # can be unauthenticated, so an uncapped value is a cheap DoS lever. Far above
   # any real client.
   @max_scope_metadata_bytes 8_192
-  @error_invalid_token "invalid_token"
+  @error_invalid_token :invalid_token
 
   # RFC 7591 §2 / RFC 6749 §2.1: a public client (token_endpoint_auth_method
   # "none") holds no secret; any other method designates a confidential client,
@@ -153,8 +150,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, _params) do
-    conn = put_no_store_headers(conn)
     config = config(conn)
+    conn = OAuthError.no_store(conn, config)
     metadata = registration_metadata(conn)
 
     with :ok <- check_https(conn, config),
@@ -182,8 +179,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   """
   @spec delete(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def delete(conn, %{"client_id" => client_id}) when is_binary(client_id) do
-    conn = put_no_store_headers(conn)
     config = config(conn)
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),
          {:ok, token} <- registration_bearer_token(conn),
@@ -738,32 +735,17 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp check_https(conn, config) do
     case RequestContext.check_https(conn, config) do
       :ok -> :ok
-      {:error, :insecure_transport} -> {:error, error("invalid_request", "the request must be made over TLS")}
+      {:error, :insecure_transport} -> {:error, error(:invalid_request, "the request must be made over TLS")}
     end
   end
 
-  defp render_error(conn, %{error: code} = err) do
-    conn
-    |> put_status(Map.get(err, :status, 400))
-    |> json(error_body(code, Map.get(err, :description)))
+  defp render_error(conn, %OAuthError{} = err) do
+    OAuthError.render(conn, err, auth_scheme: :none, config: config(conn))
   end
 
-  defp error_body(code, nil), do: %{error: code}
-  defp error_body(code, description), do: %{error: code, error_description: description}
-
-  defp error(code, description), do: %{error: code, description: description, status: 400}
+  defp error(code, description), do: OAuthError.new(code, description, status: 400)
 
   defp invalid_registration_token_error do
-    %{
-      error: @error_invalid_token,
-      description: "registration access token is missing or invalid",
-      status: 401
-    }
-  end
-
-  defp put_no_store_headers(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
+    OAuthError.new(@error_invalid_token, "registration access token is missing or invalid", status: 401)
   end
 end

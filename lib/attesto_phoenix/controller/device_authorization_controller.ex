@@ -31,7 +31,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
     config = resolve_config()
-    conn = put_no_store(conn)
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
@@ -40,7 +40,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
          {:ok, response} <- DeviceAuthorization.request(config, build_request(config, conn, result, params)) do
       json(conn, response)
     else
-      {:error, %OAuthError{} = err} -> render_error(conn, err)
+      {:error, %OAuthError{} = err} -> render_error(conn, config, err)
     end
   end
 
@@ -108,19 +108,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
     Config.from_otp_app(otp_app, Config)
   end
 
-  defp render_error(conn, %OAuthError{} = err) do
-    conn
-    |> merge_resp_headers(err.headers)
-    |> put_status(err.status)
-    |> json(error_body(err))
-  end
-
-  defp error_body(%OAuthError{error: code, error_description: nil}), do: %{error: code}
-  defp error_body(%OAuthError{error: code, error_description: desc}), do: %{error: code, error_description: desc}
-
-  defp put_no_store(conn) do
-    conn
-    |> put_resp_header("cache-control", "no-store")
-    |> put_resp_header("pragma", "no-cache")
+  defp render_error(conn, config, %OAuthError{} = err) do
+    OAuthError.render(conn, err, auth_scheme: :none, config: config)
   end
 end

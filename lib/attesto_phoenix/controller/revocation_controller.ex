@@ -66,6 +66,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   alias AttestoPhoenix.ClientAuthentication
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
+  alias AttestoPhoenix.OAuthError
   alias AttestoPhoenix.RequestContext
 
   # Dispatch through the action plug so the module is a complete `Plug`
@@ -85,12 +86,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   @http_unauthorized 401
 
   # RFC 6749 §5.2 error codes.
-  @error_invalid_request "invalid_request"
-  @error_invalid_client "invalid_client"
-
-  # RFC 6749 §5.1: every response from a token-family endpoint must be marked
-  # uncacheable.
-  @no_store_headers [{"cache-control", "no-store"}, {"pragma", "no-cache"}]
+  @error_invalid_request :invalid_request
+  @error_invalid_client :invalid_client
 
   # RFC 6749 §2.3.1: HTTP Basic credentials are the userid:password (here
   # client_id:client_secret) joined by a single colon.
@@ -127,7 +124,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   def create(conn, params) when is_map(params) do
     config = fetch_config!(conn)
     # RFC 6749 §5.1: success and error responses alike carry no-store.
-    conn = put_no_store_headers(conn)
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- RequestContext.check_https(conn, config),
          {:ok, client_id, client_secret} <- client_credentials(conn, params),
@@ -142,6 +139,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
         # credential-bearing endpoint does (see `AttestoPhoenix.RequestContext`).
         send_oauth_error(
           conn,
+          config,
           @http_bad_request,
           @error_invalid_request,
           "the request must be made over TLS"
@@ -152,6 +150,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
         # missing or otherwise malformed.
         send_oauth_error(
           conn,
+          config,
           @http_bad_request,
           @error_invalid_request,
           "the request is missing the required \"token\" parameter"
@@ -161,12 +160,14 @@ defmodule AttestoPhoenix.Controller.RevocationController do
         # RFC 6749 §5.2: client authentication failed. This endpoint serves
         # confidential clients authenticating with HTTP Basic, so the 401
         # carries a Basic `WWW-Authenticate` challenge.
-        conn
-        |> put_resp_header("www-authenticate", "Basic")
-        |> send_oauth_error(
+        send_oauth_error(
+          conn,
+          config,
           @http_unauthorized,
           @error_invalid_client,
-          "client authentication failed"
+          "client authentication failed",
+          auth_scheme: :basic,
+          challenge_params: []
         )
     end
   end
@@ -326,21 +327,15 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     :ok
   end
 
-  defp put_no_store_headers(conn) do
-    Enum.reduce(@no_store_headers, conn, fn {key, value}, acc ->
-      put_resp_header(acc, key, value)
-    end)
-  end
-
-  # RFC 6749 §5.2: an error response is `application/json` carrying the
-  # `error` code and a human-readable `error_description`.
-  defp send_oauth_error(conn, status, error, description) do
-    body = JSON.encode!(%{"error" => error, "error_description" => description})
-
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, body)
-    |> halt()
+  # RFC 6749 §5.2: all revocation errors use the shared JSON envelope. The
+  # invalid-client branch passes `auth_scheme: :basic` explicitly because this
+  # endpoint's established challenge is the bare `Basic` scheme.
+  defp send_oauth_error(conn, config, status, error, description, opts \\ []) do
+    OAuthError.render(
+      conn,
+      OAuthError.new(error, description, status: status),
+      Keyword.merge([config: config, auth_scheme: :none], opts)
+    )
   end
 
   defp refresh_store(conn) do

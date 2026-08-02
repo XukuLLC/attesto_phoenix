@@ -21,15 +21,12 @@ defmodule AttestoPhoenix.Controller.PARController do
   alias AttestoPhoenix.AuthorizationServer.PAR
   alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError, RequestContext}
 
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
-  @error_invalid_request "invalid_request"
   @dpop_request_header "dpop"
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
     config = resolve_config()
-    conn = put_no_store(conn)
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- RequestContext.check_https(conn, config),
          {:ok, auth} <- authenticate_client(config, conn, params),
@@ -39,10 +36,10 @@ defmodule AttestoPhoenix.Controller.PARController do
       |> json(stored)
     else
       {:error, :insecure_transport} ->
-        render_error(conn, @error_invalid_request, "TLS required")
+        render_error(conn, config, OAuthError.new(:invalid_request, "TLS required", status: 400))
 
       {:error, %OAuthError{} = err} ->
-        render_error(conn, Atom.to_string(err.error), err.error_description)
+        render_error(conn, config, err)
     end
   end
 
@@ -97,15 +94,9 @@ defmodule AttestoPhoenix.Controller.PARController do
     }
   end
 
-  defp put_no_store(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
-  end
-
-  defp render_error(conn, code, desc) do
-    conn
-    |> put_status(:bad_request)
-    |> json(%{error: code, error_description: desc})
+  defp render_error(conn, config, %OAuthError{} = err) do
+    # PAR's existing renderer returns 400 for every failure, including any
+    # future core error that carries a different default status.
+    OAuthError.render(conn, %{err | status: 400}, auth_scheme: :none, config: config)
   end
 end

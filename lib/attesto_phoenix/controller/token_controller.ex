@@ -59,10 +59,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   require Logger
 
-  # RFC 7234 §5.2: token responses and errors must never be cached.
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
-
   # RFC 6749 §5.2 / RFC 9449 §5 error codes the framing layer raises before the
   # core runs, held as the atoms `OAuthError.new/3` requires (no string round-trip).
   @error_invalid_request :invalid_request
@@ -93,7 +89,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
     config = resolve_config()
-    conn = put_no_store_headers(conn)
+    conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_token_content_type(conn),
          :ok <- reject_query_credentials(conn),
@@ -241,7 +237,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
       {:error, %OAuthError{} = err, events} ->
         emit_all(config, events)
-        render_error(conn, err)
+        render_error(conn, config, err)
     end
   end
 
@@ -348,17 +344,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   defp client_auth_challenge(%Config{basic_realm: realm}, scheme) do
     # `:basic_realm` is typed `String.t()` and defaults to "OAuth", so it is
     # always a binary - no nil fallback is needed (and dialyzer flags one as dead).
-    challenge_scheme(scheme) <> ~s( realm="#{escape_auth_param(realm)}")
-  end
-
-  defp challenge_scheme(scheme) do
-    if String.downcase(scheme) == "basic", do: "Basic", else: scheme
-  end
-
-  defp escape_auth_param(value) do
-    value
-    |> String.replace("\\", "\\\\")
-    |> String.replace("\"", "\\\"")
+    OAuthError.format_challenge(scheme, realm: realm)
   end
 
   defp fetch_grant_type(%{"grant_type" => gt}) when is_binary(gt) and gt != "", do: {:ok, gt}
@@ -401,7 +387,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
         |> Map.new()
     })
 
-    render_error(conn, err)
+    render_error(conn, config, err)
   end
 
   defp denial_client_id(_conn, _params, client_id) when is_binary(client_id) and client_id != "", do: client_id
@@ -425,7 +411,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
 
   # ── Rendering (RFC 6749 §5.2) ────────────────────────────────────────────
 
-  defp render_error(conn, %OAuthError{} = err) do
+  defp render_error(conn, config, %OAuthError{} = err) do
     # RFC 6749 §5.2 keeps the wire body terse (a code, an optional description),
     # which makes an opaque `invalid_request` / `invalid_scope` 400 hard to
     # diagnose from the response alone. Surface the resolved code + description in
@@ -438,15 +424,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
         if(err.error_description, do: " — #{err.error_description}", else: "")
     end)
 
-    conn
-    |> merge_resp_headers(err.headers)
-    |> put_status(err.status)
-    |> json(error_body(err.error, err.error_description))
+    OAuthError.render(conn, err, auth_scheme: :from_error_context, config: config)
   end
-
-  # RFC 6749 §5.2 error response body.
-  defp error_body(code, nil), do: %{error: code}
-  defp error_body(code, description), do: %{error: code, error_description: description}
 
   # The single error value the controller raises at the framing edge is an
   # `%AttestoPhoenix.OAuthError{}` (the shape the core and the
@@ -459,11 +438,5 @@ defmodule AttestoPhoenix.Controller.TokenController do
       value when is_binary(value) and value != "" -> value
       _ -> nil
     end
-  end
-
-  defp put_no_store_headers(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
   end
 end

@@ -95,13 +95,23 @@ defmodule AttestoPhoenix.OAuthErrorTest do
       assert body(conn) == %{"error" => "invalid_request"}
     end
 
-    test "raises invalid_client to 401 and adds the Basic challenge when Authorization was attempted" do
+    test "does not infer a challenge or status from an Authorization header" do
       conn =
         conn()
         |> Plug.Conn.put_req_header("authorization", "Basic Zm9vOmJhcg==")
         |> OAuthError.render(OAuthError.new(:invalid_client, "bad creds"))
 
-      assert conn.status == 401
+      assert conn.status == 400
+      assert header(conn, "www-authenticate") == []
+    end
+
+    test "adds the explicitly selected Basic challenge" do
+      conn =
+        conn()
+        |> Plug.Conn.put_req_header("authorization", "Bearer opaque")
+        |> OAuthError.render(OAuthError.new(:invalid_client, "bad creds"), auth_scheme: :basic)
+
+      assert conn.status == 400
       assert header(conn, "www-authenticate") == [~s(Basic realm="OAuth")]
     end
 
@@ -116,7 +126,7 @@ defmodule AttestoPhoenix.OAuthErrorTest do
       conn =
         conn(config: config(basic_realm: "tokens"))
         |> Plug.Conn.put_req_header("authorization", "Basic Zm9vOmJhcg==")
-        |> OAuthError.render(OAuthError.new(:invalid_client))
+        |> OAuthError.render(OAuthError.new(:invalid_client), auth_scheme: :basic)
 
       assert header(conn, "www-authenticate") == [~s(Basic realm="tokens")]
     end
@@ -195,6 +205,21 @@ defmodule AttestoPhoenix.OAuthErrorTest do
       assert header(conn, "www-authenticate") == [
                ~s(Bearer error="invalid_token", error_description="quote \\" and back \\\\ slash")
              ]
+    end
+  end
+
+  describe "format_challenge/2" do
+    test "formats an explicit Basic challenge" do
+      assert OAuthError.format_challenge(:basic, realm: "OAuth") == ~s(Basic realm="OAuth")
+    end
+
+    test "formats an explicit Bearer challenge" do
+      assert OAuthError.format_challenge(:bearer, error: "invalid_token") == ~s(Bearer error="invalid_token")
+    end
+
+    test "formats an explicit DPoP challenge" do
+      assert OAuthError.format_challenge(:dpop, error: "invalid_dpop_proof", algs: "ES256") ==
+               ~s(DPoP error="invalid_dpop_proof", algs="ES256")
     end
   end
 

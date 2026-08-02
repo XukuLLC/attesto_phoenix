@@ -85,6 +85,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   alias Attesto.Plug.OAuthError
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
   alias AttestoPhoenix.RequestContext
   alias AttestoPhoenix.Store.NonceStore
 
@@ -96,11 +97,6 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # scope (OpenID Connect Core §3.1.2.1).
   @openid_scope "openid"
   @insufficient_scope_description "The UserInfo endpoint requires the openid scope."
-
-  # RFC 7234 §5.2 / OpenID Connect Core §5.3.2: the response carries the
-  # authenticated subject's claims and must not be cached by an intermediary.
-  @cache_control_no_store "no-store"
-  @pragma_no_cache "no-cache"
 
   # OpenID Connect Core §5.4: the scope -> claim-name mapping. `sub` is handled
   # separately (always returned, OpenID Connect Core §5.3.2) and is not listed.
@@ -177,7 +173,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
         |> Map.put("sub", subject)
 
       conn
-      |> put_no_store_headers()
+      |> PhoenixOAuthError.no_store(config)
       |> json(userinfo)
     else
       insufficient_scope(conn, config, scheme_of(claims), resource_metadata)
@@ -244,7 +240,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # endpoint keeps its established wire contract at the controller boundary.
   defp insufficient_scope(conn, config, scheme, resource_metadata) do
     challenge =
-      challenge(
+      PhoenixOAuthError.format_challenge(
         scheme,
         [
           {"error", "insufficient_scope"},
@@ -264,7 +260,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     |> send_scope_error(config, body)
   end
 
-  defp apply_no_store(conn, %Config{no_store: nil}), do: put_no_store_headers(conn)
+  defp apply_no_store(conn, %Config{no_store: nil} = config), do: PhoenixOAuthError.no_store(conn, config)
   defp apply_no_store(conn, %Config{no_store: callback}), do: Callback.invoke(callback, [conn])
 
   defp apply_www_authenticate(conn, %Config{www_authenticate: nil}, challenge) do
@@ -285,31 +281,8 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     Callback.invoke(callback, [conn, 403, body])
   end
 
-  # RFC 9110 §11.1: `WWW-Authenticate` is `scheme SP #auth-param`; escape the
-  # quoted-string delimiters so no configured value can inject another param.
-  defp challenge(scheme, params) do
-    scheme_label(scheme) <>
-      " " <> Enum.map_join(params, ", ", fn {key, value} -> ~s(#{key}="#{escape(value)}") end)
-  end
-
-  defp scheme_label(:dpop), do: "DPoP"
-  defp scheme_label(:bearer), do: "Bearer"
-
-  defp escape(value) do
-    value
-    |> to_string()
-    |> String.replace("\\", "\\\\")
-    |> String.replace("\"", "\\\"")
-  end
-
   defp resource_metadata_param(url) when is_binary(url), do: [{"resource_metadata", url}]
   defp resource_metadata_param(_url), do: []
-
-  defp put_no_store_headers(conn) do
-    conn
-    |> put_resp_header("cache-control", @cache_control_no_store)
-    |> put_resp_header("pragma", @pragma_no_cache)
-  end
 
   # ── Engine verify wiring ─────────────────────────────────────────────────
 
