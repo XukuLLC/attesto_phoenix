@@ -8,33 +8,11 @@ defmodule AttestoPhoenix.Store.PAR.ETS do
 
   @behaviour AttestoPhoenix.PARStore
 
+  alias AttestoPhoenix.Store.ETSOwner
+
   @table :attesto_phoenix_par_requests
 
-  defmodule Owner do
-    @moduledoc false
-
-    use GenServer
-
-    def ensure_table(table) do
-      GenServer.call(__MODULE__, {:ensure_table, table})
-    end
-
-    @impl true
-    def init(state), do: {:ok, state}
-
-    @impl true
-    def handle_call({:ensure_table, table}, _from, state) do
-      case :ets.whereis(table) do
-        :undefined ->
-          :ets.new(table, [:set, :public, :named_table, read_concurrency: true])
-
-        _tid ->
-          table
-      end
-
-      {:reply, table, state}
-    end
-  end
+  @table_options [:set, :public, :named_table, read_concurrency: true]
 
   @impl true
   def put(request_uri, params, ttl_seconds) when is_binary(request_uri) and is_map(params) do
@@ -74,41 +52,6 @@ defmodule AttestoPhoenix.Store.PAR.ETS do
   end
 
   defp ensure_table do
-    ensure_owner()
-    Owner.ensure_table(@table)
-  end
-
-  # `GenServer.start/3`, NOT `start_link/3`. The owner holds the ETS table, and
-  # whichever process happens to touch this store first is an ordinary request
-  # process. Linking the owner to it means that when that request terminates
-  # ABNORMALLY - any unhandled exception, a timeout, a shutdown - the exit
-  # signal propagates and kills the owner, destroying the table with it. This
-  # store then silently starts over empty for the whole node.
-  #
-  # Starting unlinked gives the owner no parent to be killed by. It is a
-  # singleton table holder with no supervision tree available (this library
-  # installs no application callback module), so a deliberate orphan is the
-  # correct shape: nothing should be able to take it down but itself.
-  #
-  # The `:already_started` pid is checked for liveness because a registered name
-  # can briefly outlive its process. Treating that window as success is what
-  # produces `GenServer.call` crashing with "no process" a moment later.
-  defp ensure_owner(attempts \\ 5) do
-    case GenServer.start(Owner, %{}, name: Owner) do
-      {:ok, _pid} ->
-        :ok
-
-      {:error, {:already_started, pid}} ->
-        cond do
-          Process.alive?(pid) -> :ok
-          attempts > 1 -> retry_owner(attempts)
-          true -> raise "#{inspect(Owner)} is registered but not alive"
-        end
-    end
-  end
-
-  defp retry_owner(attempts) do
-    Process.sleep(10)
-    ensure_owner(attempts - 1)
+    ETSOwner.ensure(@table, @table_options)
   end
 end

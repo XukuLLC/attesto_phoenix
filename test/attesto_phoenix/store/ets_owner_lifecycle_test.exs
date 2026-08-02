@@ -16,8 +16,12 @@ defmodule AttestoPhoenix.Store.ETSOwnerLifecycleTest do
   use ExUnit.Case, async: false
 
   alias AttestoPhoenix.ClientIdMetadata.Cache.ETS, as: CIMDCache
+  alias AttestoPhoenix.Store.ETSOwner
   alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
-  alias AttestoPhoenix.Store.PAR.ETS.Owner
+
+  @par_table :attesto_phoenix_par_requests
+  @cimd_table :attesto_phoenix_client_id_metadata
+  @table_options [:set, :public, :named_table, read_concurrency: true]
 
   # Run `fun` inside a process that then dies abnormally, and wait for it to go.
   defp in_crashing_process(fun) do
@@ -93,10 +97,86 @@ defmodule AttestoPhoenix.Store.ETSOwnerLifecycleTest do
       # the store dies abnormally, the owner is still alive.
       in_crashing_process(fn -> :ok = PARStore.put("urn:test:link-check", %{}, 90) end)
 
-      owner = Process.whereis(Owner)
+      owner = Process.whereis(ETSOwner)
 
       assert is_pid(owner) and Process.alive?(owner),
              "the ETS owner must outlive the request process that first touched the store"
+    end
+
+    test "concurrent ensures create one table and preserve all data" do
+      table = :"attesto_phoenix_ets_owner_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        if :ets.whereis(table) != :undefined do
+          :ets.delete(table)
+        end
+      end)
+
+      results =
+        1..200
+        |> Task.async_stream(
+          fn i ->
+            ^table = ETSOwner.ensure(table, @table_options)
+            true = :ets.insert(table, {i, {:value, i}})
+            table
+          end,
+          max_concurrency: 100,
+          timeout: 5_000
+        )
+        |> Enum.to_list()
+
+      assert Enum.uniq(results) == [{:ok, table}]
+      assert :ets.whereis(table) != :undefined
+      assert :ets.info(table, :name) == table
+      assert :ets.info(table, :type) == :set
+      assert :ets.info(table, :protection) == :public
+      assert :ets.info(table, :read_concurrency)
+      assert Enum.sort(:ets.tab2list(table)) == Enum.map(1..200, &{&1, {:value, &1}})
+    end
+
+    test "PAR first use tolerates concurrent table creation and preserves data" do
+      delete_table(@par_table)
+
+      results =
+        1..200
+        |> Task.async_stream(
+          fn i ->
+            uri = "urn:test:concurrent-par:#{i}"
+            :ok = PARStore.put(uri, %{"i" => i}, 60)
+            PARStore.fetch(uri)
+          end,
+          max_concurrency: 100,
+          timeout: 5_000
+        )
+        |> Enum.to_list()
+
+      assert Enum.sort(results) == Enum.map(1..200, &{:ok, {:ok, %{"i" => &1}}})
+    end
+
+    test "CIMD cache first use tolerates concurrent table creation and preserves data" do
+      delete_table(@cimd_table)
+      expires_at = DateTime.add(DateTime.utc_now(), 60, :second)
+
+      results =
+        1..200
+        |> Task.async_stream(
+          fn i ->
+            url = "https://concurrent-cimd.example/#{i}"
+            :ok = CIMDCache.put(url, %{"i" => i}, expires_at)
+            CIMDCache.get(url)
+          end,
+          max_concurrency: 100,
+          timeout: 5_000
+        )
+        |> Enum.to_list()
+
+      assert Enum.sort(results) == Enum.map(1..200, &{:ok, {:ok, %{"i" => &1}}})
+    end
+  end
+
+  defp delete_table(table) do
+    if :ets.whereis(table) != :undefined do
+      :ets.delete(table)
     end
   end
 end
