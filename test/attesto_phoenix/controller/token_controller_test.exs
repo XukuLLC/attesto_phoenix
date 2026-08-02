@@ -1260,10 +1260,13 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       )
 
       code = Process.get(:auth_code)
-      proof = dpop_proof(nonce: nil)
+      {proof, jkt} = dpop_proof_and_jkt(nonce: nil)
 
-      # Burn the proof's jti on an unrelated request so the next use is a replay.
-      assert :ok = ReplayCache.check_and_record(peek_jti(proof), 60)
+      # Burn the proof's NAMESPACED replay identity (the jkt:jti digest the
+      # verifier records, not the raw jti) on an unrelated request, so the next
+      # use is a replay.
+      replay_key = :sha256 |> :crypto.hash(jkt <> ":" <> peek_jti(proof)) |> Base.url_encode64(padding: false)
+      assert :ok = ReplayCache.check_and_record(replay_key, 60)
 
       conn = post_public_code_grant(proof, code)
       assert conn.status == 400
