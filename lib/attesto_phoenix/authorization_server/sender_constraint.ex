@@ -91,11 +91,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @type binding :: {:dpop, String.t()} | {:mtls, String.t()} | :none
 
   @typedoc """
-  A verified DPoP proof's replay claim, not yet made: the proof's `jti` and the
-  acceptance window the verifier derived for it. `nil` when the request carries
-  no DPoP proof and so has nothing to claim.
+  A verified DPoP proof's replay claim, not yet made: the proof's namespaced,
+  opaque replay identity (`replay_key` from `Attesto.DPoP.verify_proof/2`), the
+  raw `jti` (for replay telemetry only), and the acceptance window the verifier
+  derived. `nil` when the request carries no DPoP proof and so has nothing to
+  claim.
   """
-  @type pending_claim :: {String.t(), pos_integer()} | nil
+  @type pending_claim :: {String.t(), String.t(), pos_integer()} | nil
 
   # RFC 6749 §5.2 / RFC 9449 §5 error codes, held as the atoms
   # `OAuthError.new/3` requires (no string round-trip that could raise).
@@ -214,12 +216,14 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @spec commit_replay_claim(Config.t(), pending_claim()) :: :ok | {:error, OAuthError.t()}
   def commit_replay_claim(%Config{}, nil), do: :ok
 
-  def commit_replay_claim(%Config{} = config, {jti, ttl}) when is_binary(jti) do
-    case replay_check(config).(jti, ttl) do
+  def commit_replay_claim(%Config{} = config, {replay_key, jti, ttl}) when is_binary(replay_key) do
+    case replay_check(config).(replay_key, ttl) do
       :ok ->
         :ok
 
       {:error, :replay} ->
+        # Store keys on the opaque `replay_key`; telemetry emits the raw `jti`
+        # for correlation with the client's proof.
         Attesto.Telemetry.dpop_replay_detected(jti)
         {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: :replay")}
 
@@ -342,8 +346,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
       |> put_optional_kw(:nonce_check, nonce_check(config))
 
     case invoke_dpop_verify(proof, verify_opts) do
-      {:ok, %{jkt: jkt, jti: jti, replay_ttl: ttl}} ->
-        {:ok, {:dpop, jkt}, @token_type_dpop, {jti, ttl}}
+      # Defer the NAMESPACED, opaque replay identity (`replay_key`), not the raw
+      # `jti` - `jti` is unique only per key, so recording it alone would collide
+      # across keys (a cross-client false replay and a targeted DoS). This must
+      # match what `Attesto.Plug.Authenticate` records into the same store. The
+      # raw `jti` rides alongside for replay telemetry only.
+      {:ok, %{jkt: jkt, replay_key: replay_key, jti: jti, replay_ttl: ttl}} ->
+        {:ok, {:dpop, jkt}, @token_type_dpop, {replay_key, jti, ttl}}
 
       {:error, :use_dpop_nonce} ->
         # RFC 9449 §8/§9: hand the client a fresh nonce and demand a retry.

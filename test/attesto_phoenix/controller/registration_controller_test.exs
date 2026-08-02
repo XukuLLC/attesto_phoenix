@@ -236,6 +236,23 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     end
   end
 
+  describe "oversized scope metadata (DoS hardening)" do
+    test "a scope metadata value beyond the size cap is rejected as invalid_client_metadata" do
+      huge = Enum.map_join(1..200_000, " ", fn i -> "s#{rem(i, 100)}" end)
+
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/callback"],
+          "scope" => huge
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+      assert body(conn)["error_description"] =~ "too large"
+    end
+  end
+
   describe "successful registration (RFC 7591 §3.2.1)" do
     test "registers a confidential client and returns 201 with credentials" do
       conn =
