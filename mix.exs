@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.4.0"
+  @version "2.5.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -71,19 +71,23 @@ defmodule AttestoPhoenix.MixProject do
   # default - including every publish - resolves the published version
   # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
   #
-  # The 1.5.0 floor is load-bearing, not housekeeping: it carries
-  # `Attesto.RedirectURI.unambiguous?/1` and the CIMD document validation that
-  # rejects a parser-ambiguous redirect URI. This package's same-origin check is
-  # phrased in terms of an origin, so against an older core it would compile and
-  # then approve a redirect URI a browser resolves to a different host. An older
-  # core requirement would also intersect with this package's constraints and
-  # silently omit the key-bound FAPI algorithm enforcement and RFC 9864 Edwards
-  # identifiers that client authentication, request objects, and CIBA rely on.
+  # The 1.6.0 floor is load-bearing, not housekeeping. It carries
+  # `Attesto.DPoP.verify_proof/2`'s `replay_ttl`, which this package's deferred
+  # token-endpoint replay claim reads to size the entry it records - against an
+  # older core that key is absent and `commit_replay_claim/2` cannot make the
+  # claim the endpoint owes RFC 9449 §11.1. It also carries `Attesto.Telemetry`,
+  # emitted from the same path, and `Attesto.RedirectURI.unambiguous?/1` with
+  # the CIMD document validation that rejects a parser-ambiguous redirect URI -
+  # without which this package's origin-phrased same-origin check would compile
+  # and then approve a redirect URI a browser resolves to a different host. An
+  # older core would additionally omit the key-bound FAPI algorithm enforcement
+  # and RFC 9864 Edwards identifiers that client authentication, request
+  # objects, and CIBA rely on.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.5.0 and < 2.0.0"}
+      {:attesto, ">= 1.6.0 and < 2.0.0"}
     end
   end
 
