@@ -520,10 +520,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp validate_scope(metadata, config) do
     case Map.get(metadata, "scope") do
       nil ->
-        case Config.registration_default_scope(config) do
-          nil -> {:ok, nil}
-          scopes -> {:ok, Enum.join(scopes, " ")}
-        end
+        default_scope(config)
 
       scope when is_binary(scope) and byte_size(scope) > @max_scope_metadata_bytes ->
         # Registration is unauthenticated when enabled, so an uncapped `scope`
@@ -532,21 +529,33 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
         {:error, error(@error_invalid_client_metadata, "scope metadata is too large")}
 
       scope when is_binary(scope) ->
-        requested = String.split(scope, " ", trim: true)
-        # MapSet membership is O(1) per token; `&(&1 in catalog)` over a list
-        # was O(requested x catalog).
-        catalog = MapSet.new(List.wrap(config.scopes_supported))
-
-        case Enum.reject(requested, &MapSet.member?(catalog, &1)) do
-          [] ->
-            {:ok, scope}
-
-          [unknown | _] ->
-            {:error, error(@error_invalid_client_metadata, "scope #{inspect(unknown)} is unknown")}
-        end
+        check_requested_scope(scope, config)
 
       _ ->
         {:error, error(@error_invalid_client_metadata, "scope must be a space-delimited string")}
+    end
+  end
+
+  # No `scope` requested: assign the configured default (echoed back in the
+  # §3.2.1 response), or none when unconfigured (fail-closed).
+  defp default_scope(config) do
+    case Config.registration_default_scope(config) do
+      nil -> {:ok, nil}
+      scopes -> {:ok, Enum.join(scopes, " ")}
+    end
+  end
+
+  # Every requested scope must be in the catalog. MapSet membership is O(1) per
+  # token; `&(&1 in catalog)` over a list was O(requested x catalog).
+  defp check_requested_scope(scope, config) do
+    catalog = MapSet.new(List.wrap(config.scopes_supported))
+
+    case scope |> String.split(" ", trim: true) |> Enum.reject(&MapSet.member?(catalog, &1)) do
+      [] ->
+        {:ok, scope}
+
+      [unknown | _] ->
+        {:error, error(@error_invalid_client_metadata, "scope #{inspect(unknown)} is unknown")}
     end
   end
 
