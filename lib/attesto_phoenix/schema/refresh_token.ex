@@ -62,14 +62,11 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
 
   import Ecto.Changeset
 
-  alias Plug.Crypto.MessageEncryptor
+  alias AttestoPhoenix.RefreshSuccessorCipher
 
   # RFC 9449 (DPoP): the confirmation member naming the JWK thumbprint of the
   # bound key.
   @cnf_jkt "jkt"
-  @app :attesto_phoenix
-  @successor_aad "attesto_phoenix:refresh_successor:v1"
-
   @type t :: %__MODULE__{}
 
   @primary_key {:id, :binary_id, autogenerate: true}
@@ -273,7 +270,7 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
   defp successor_from_row(nil), do: nil
 
   defp successor_from_row(%{"v" => 1, "ciphertext" => ciphertext}) when is_binary(ciphertext) do
-    case decrypt_successor(ciphertext) do
+    case RefreshSuccessorCipher.decrypt(ciphertext) do
       {:ok, successor} -> successor_from_row(successor)
       :error -> nil
     end
@@ -306,25 +303,4 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
   end
 
   defp value(map, key) when is_map(map), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
-
-  defp decrypt_successor(ciphertext) do
-    with {:ok, enc_key, sign_key} <- successor_keys(),
-         {:ok, encoded} <-
-           MessageEncryptor.decrypt(ciphertext, @successor_aad, enc_key, sign_key) do
-      {:ok, :erlang.binary_to_term(encoded, [:safe])}
-    else
-      _ -> :error
-    end
-  end
-
-  defp successor_keys do
-    case Application.get_env(@app, :refresh_successor_secret) do
-      secret when is_binary(secret) and byte_size(secret) >= 32 ->
-        {:ok, :crypto.hash(:sha256, "refresh-successor:enc:" <> secret),
-         :crypto.hash(:sha256, "refresh-successor:sign:" <> secret)}
-
-      _ ->
-        :error
-    end
-  end
 end

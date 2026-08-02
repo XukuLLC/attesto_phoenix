@@ -47,11 +47,10 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   import Ecto.Query
 
+  alias AttestoPhoenix.RefreshSuccessorCipher
   alias AttestoPhoenix.Schema.RefreshToken
-  alias Plug.Crypto.MessageEncryptor
 
   @app :attesto_phoenix
-  @successor_aad "attesto_phoenix:refresh_successor:v1"
 
   # Namespace (first key of Postgres' two-argument advisory-lock form) for the
   # per-family rotation/revocation serialization locks, so they cannot collide
@@ -241,24 +240,8 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   defp to_datetime(seconds) when is_integer(seconds), do: DateTime.from_unix!(seconds, :second)
 
   defp protect_successor(successor) do
-    with {:ok, enc_key, sign_key} <- successor_keys() do
-      ciphertext =
-        successor
-        |> :erlang.term_to_binary()
-        |> MessageEncryptor.encrypt(@successor_aad, enc_key, sign_key)
-
+    with {:ok, ciphertext} <- RefreshSuccessorCipher.encrypt(successor) do
       {:ok, %{"v" => 1, "ciphertext" => ciphertext}}
-    end
-  end
-
-  defp successor_keys do
-    case Application.get_env(@app, :refresh_successor_secret) do
-      secret when is_binary(secret) and byte_size(secret) >= 32 ->
-        {:ok, :crypto.hash(:sha256, "refresh-successor:enc:" <> secret),
-         :crypto.hash(:sha256, "refresh-successor:sign:" <> secret)}
-
-      _ ->
-        :error
     end
   end
 
