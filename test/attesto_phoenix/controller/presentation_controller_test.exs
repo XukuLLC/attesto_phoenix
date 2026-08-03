@@ -28,8 +28,24 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
   @issuer "https://issuer.example"
   @verifier_client_id "verifier-client-1"
   @query_id "identity"
+  @rsa_signing_pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
 
   defmodule Keystore do
+    @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem do
+      :attesto_phoenix
+      |> Application.fetch_env!(__MODULE__)
+      |> Keyword.fetch!(:signing_pem)
+    end
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule EncryptionKeystore do
     @moduledoc false
     @behaviour Attesto.Keystore
 
@@ -49,10 +65,12 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
     request_pem = X509TestCertificate.private_key_pem()
     request_jwk = public_jwk(request_pem)
+    {encryption_pem, encryption_jwk} = keypair()
     {issuer_pem, issuer_jwk} = keypair()
     {holder_pem, holder_jwk} = keypair()
 
     Application.put_env(:attesto_phoenix, Keystore, signing_pem: request_pem)
+    Application.put_env(:attesto_phoenix, EncryptionKeystore, signing_pem: encryption_pem)
 
     config_opts = [
       issuer: @issuer,
@@ -64,6 +82,7 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
       load_principal: fn _ -> {:error, :not_found} end,
       require_https: false,
       presentation_session_store: Store,
+      verifier_encryption_keystore: EncryptionKeystore,
       verifier_client_id: @verifier_client_id
     ]
 
@@ -81,12 +100,14 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
     on_exit(fn ->
       Application.delete_env(:attesto_phoenix, Keystore)
+      Application.delete_env(:attesto_phoenix, EncryptionKeystore)
       Application.delete_env(:attesto_phoenix, Config)
       Application.delete_env(:attesto_phoenix, :otp_app)
     end)
 
     %{
       config: Config.new(config_opts),
+      encryption_jwk: encryption_jwk,
       holder_pem: holder_pem,
       issuer_jwk: issuer_jwk,
       now: now,
@@ -167,12 +188,24 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert {:ok, %{@query_id => _result}} = Verifier.presentation_result(ctx.config, session.id)
   end
 
-  test "direct_post.jwt decrypts a real response and exposes the host result", %{conn: conn} = ctx do
+  test "direct_post.jwt round-trips with an RSA main keystore and dedicated EC encryption key",
+       %{conn: conn} = ctx do
+    Application.put_env(:attesto_phoenix, Keystore, signing_pem: @rsa_signing_pem)
     config = configure_response_mode(ctx.config, "direct_post.jwt")
     ctx = %{ctx | config: config}
     session = create_request(ctx)
     vp_token = valid_vp_token(ctx, session.nonce)
-    encryption_jwk = advertised_encryption_jwk(session.id, ctx.request_jwk)
+    rsa_public_jwk = public_jwk(@rsa_signing_pem)
+    encryption_jwk = advertised_encryption_jwk(session.id, rsa_public_jwk)
+
+    assert rsa_public_jwk["kty"] == "RSA"
+    assert encryption_jwk["kty"] == "EC"
+    assert encryption_jwk["crv"] == "P-256"
+    assert encryption_jwk["x"] == ctx.encryption_jwk["x"]
+    assert encryption_jwk["y"] == ctx.encryption_jwk["y"]
+
+    assert {:ok, protected} = JWS.peek_json(stored_request_object(session.id), :protected)
+    assert protected["alg"] == "RS256"
 
     encrypted_response =
       encryption_jwk

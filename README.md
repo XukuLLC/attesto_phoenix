@@ -617,7 +617,11 @@ The host drives it through `AttestoPhoenix.Verifier`: `create_presentation_reque
 builds + signs the request object (optionally with an `x509_san_dns` client-id +
 `x5c`), and `presentation_result/2` polls the verified claims. Requires a
 `:presentation_session_store`, `:verifier_client_id` (or the x509 config), and
-the `:keystore`.
+the `:keystore`. Request-object signatures keep using that main keystore and
+derive their `alg` from its configured key. Encrypted `direct_post.jwt`
+responses additionally require a dedicated EC P-256
+`:verifier_encryption_keystore`; there is deliberately no fallback to the main
+signing key.
 
 **`status_list: true`** mounts `GET /oauth/statuslist/:id`, serving a signed
 `statuslist+jwt` built from the `:status_list_store` — the revocation target

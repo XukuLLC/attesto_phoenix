@@ -11,7 +11,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   use Phoenix.Controller, formats: [:json]
 
   alias Attesto.PresentationSession
-  alias AttestoPhoenix.{Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Config, OAuthError, RequestContext, VerifierEncryption}
   alias Plug.Conn.Unfetched
 
   @doc "Verify and atomically complete an OID4VP presentation session."
@@ -53,7 +53,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   defp decrypt_response(encrypted_response, config) when is_binary(encrypted_response) do
     with :ok <- compact_jwe(encrypted_response),
          :ok <- encrypted_response_algorithms(encrypted_response),
-         %JOSE.JWK{} = private_jwk <- JOSE.JWK.from_pem(config.keystore.signing_pem()),
+         {:ok, private_jwk} <- VerifierEncryption.private_jwk(config),
          {plaintext, %JOSE.JWE{}} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
          {:ok, %{} = params} <- JSON.decode(plaintext),
          {:ok, state, vp_token} <- decoded_response(params) do

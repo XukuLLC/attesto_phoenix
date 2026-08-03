@@ -141,6 +141,25 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert holder_jwk == public_map(@holder_key)
     end
 
+    test "defaults SD-JWT VC signing to RS256 with an RSA main keystore and no vc_keystore" do
+      Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @rsa_signing_pem)
+
+      nonce = CNonceStore.issue(60)
+      response = post_credential(mint_token(), credential_request(nonce))
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      issuer_jwt = credential |> String.split("~") |> hd()
+      assert {:ok, %{"alg" => "RS256"}} = Attesto.JWS.peek_json(issuer_jwt, :protected)
+
+      rsa_jwk = @rsa_signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+      assert Config.resolve!() |> Config.vc_keystore() == Keystore
+      assert {:ok, verified} = SdJwtVc.verify(credential, rsa_jwk, accepted_algs: ["RS256"])
+      assert verified.vct == @vct
+      assert verified.cnf == %{"jwk" => public_map(@holder_key)}
+    end
+
     test "signs an SD-JWT VC with a separate ES256 vc_keystore" do
       Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @rsa_signing_pem)
 
@@ -250,6 +269,40 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       assert_receive {:credential_requested, @subject, @mdoc_configuration_id, holder_jwk}
       assert holder_jwk == public_map(@holder_key)
+    end
+
+    test "returns a clean invalid_credential_request when mso_mdoc signing is not EC P-256" do
+      Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @rsa_signing_pem)
+
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      config
+      |> Keyword.put(:credential_configurations_supported, %{
+        @mdoc_configuration_id => %{format: "mso_mdoc", doctype: @mdoc_doc_type}
+      })
+      |> Keyword.put(:build_credential, fn _subject, _credential_configuration_id, _holder_jwk ->
+        {:ok,
+         %{
+           doc_type: @mdoc_doc_type,
+           namespaces: %{@mdoc_namespace => %{"family_name" => "Doe"}}
+         }}
+      end)
+      |> put_config()
+
+      nonce = CNonceStore.issue(60)
+
+      response =
+        post_credential(
+          mint_token(credential_configuration_ids: [@mdoc_configuration_id]),
+          credential_request(nonce, credential_configuration_id: @mdoc_configuration_id)
+        )
+
+      assert response.status == 400
+
+      assert body(response) == %{
+               "error" => "invalid_credential_request",
+               "error_description" => "mso_mdoc issuance requires an EC P-256 (ES256) VC signing key."
+             }
     end
 
     test "returns the plug's 401 challenge without an access token" do

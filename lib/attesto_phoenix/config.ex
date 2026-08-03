@@ -32,6 +32,11 @@ defmodule AttestoPhoenix.Config do
       defaults to `:keystore`. Configure a separate EC/ES256 keystore here to
       issue ES256-signed credentials (e.g. for HAIP) while ID tokens keep their
       own signing key.
+    * `:verifier_encryption_keystore` - a dedicated EC P-256 keystore used only
+      to advertise and decrypt encrypted OID4VP `direct_post.jwt` responses.
+      It has no fallback to `:keystore`; encrypted-response request creation
+      fails closed when this setting is absent or is not a usable private P-256
+      key.
     * `:repo` - `Ecto.Repo` module used by the Ecto-backed code, refresh,
       nonce, and replay stores.
     * `:load_client` - `(client_id -> {:ok, client} | {:error, :not_found} |
@@ -493,7 +498,8 @@ defmodule AttestoPhoenix.Config do
       `:verifier_client_id_scheme` is `"x509_san_dns"`.
     * `:presentation_response_mode` - OID4VP response mode advertised to wallets.
       Defaults to `"direct_post"`; set to `"direct_post.jwt"` to require an
-      encrypted authorization response.
+      encrypted authorization response. That mode also requires a usable
+      `:verifier_encryption_keystore` when a presentation request is created.
     * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`. The
       sweeper is not started if unset.
     * `:table_prefix` - optional Ecto schema/table prefix for the generated
@@ -677,6 +683,7 @@ defmodule AttestoPhoenix.Config do
     :c_nonce_store,
     :status_list_store,
     :presentation_session_store,
+    :verifier_encryption_keystore,
     :verifier_client_id,
     :verifier_client_id_scheme,
     :verifier_x5c,
@@ -843,6 +850,7 @@ defmodule AttestoPhoenix.Config do
           c_nonce_store: module() | nil,
           status_list_store: module() | nil,
           presentation_session_store: module() | nil,
+          verifier_encryption_keystore: module() | nil,
           verifier_client_id: String.t() | nil,
           verifier_client_id_scheme: String.t() | nil,
           verifier_x5c: [binary()] | nil,
@@ -1363,6 +1371,10 @@ defmodule AttestoPhoenix.Config do
   @doc "The configured `Attesto.PresentationSessionStore` module, or `nil`."
   @spec presentation_session_store(t()) :: module() | nil
   def presentation_session_store(%__MODULE__{presentation_session_store: store}), do: store
+
+  @doc "The dedicated EC P-256 keystore for encrypted OID4VP responses, or `nil`."
+  @spec verifier_encryption_keystore(t()) :: module() | nil
+  def verifier_encryption_keystore(%__MODULE__{verifier_encryption_keystore: keystore}), do: keystore
 
   @doc "The verifier client identifier used as the OID4VP presentation audience."
   @spec verifier_client_id(t()) :: String.t() | nil

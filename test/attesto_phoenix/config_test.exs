@@ -25,6 +25,16 @@ defmodule AttestoPhoenix.ConfigTest do
     def verification_pems, do: [signing_pem()]
   end
 
+  defmodule VerifierEncryptionKeystore do
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "verifier-encryption-pem"
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
   # A behaviour module that implements every ClientStore callback the resolver
   # routes through `:client_store`, plus the principal/scope/event/consent/
   # registration callbacks the other behaviour-module keys route through. Each
@@ -1175,6 +1185,7 @@ defmodule AttestoPhoenix.ConfigTest do
         config(
           oauth_path_prefix: "/wallet/oauth",
           presentation_session_store: __MODULE__.PresentationStore,
+          verifier_encryption_keystore: VerifierEncryptionKeystore,
           verifier_client_id: "verifier-client-1",
           verifier_client_id_scheme: "x509_san_dns",
           verifier_x5c: [certificate_der],
@@ -1182,6 +1193,7 @@ defmodule AttestoPhoenix.ConfigTest do
         )
 
       assert Config.presentation_session_store(built) == __MODULE__.PresentationStore
+      assert Config.verifier_encryption_keystore(built) == VerifierEncryptionKeystore
       assert Config.verifier_client_id(built) == "verifier-client-1"
       assert Config.verifier_client_id_scheme(built) == "x509_san_dns"
       assert Config.verifier_x5c(built) == [certificate_der]
@@ -1201,6 +1213,7 @@ defmodule AttestoPhoenix.ConfigTest do
       built = config()
 
       assert Config.presentation_session_store(built) == nil
+      assert Config.verifier_encryption_keystore(built) == nil
       assert Config.verifier_client_id(built) == nil
       assert Config.verifier_client_id_scheme(built) == nil
       assert Config.verifier_x5c(built) == nil

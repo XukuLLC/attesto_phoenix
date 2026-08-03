@@ -10,8 +10,24 @@ defmodule AttestoPhoenix.VerifierTest do
   @verifier_client_id "verifier-client-1"
   @verifier_dns "verifier.example"
   @query_id "identity"
+  @rsa_signing_pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
 
   defmodule Keystore do
+    @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem do
+      :attesto_phoenix
+      |> Application.fetch_env!(__MODULE__)
+      |> Keyword.fetch!(:signing_pem)
+    end
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule EncryptionKeystore do
     @moduledoc false
     @behaviour Attesto.Keystore
 
@@ -31,14 +47,19 @@ defmodule AttestoPhoenix.VerifierTest do
 
     request_pem = X509TestCertificate.private_key_pem()
     request_jwk = public_jwk(request_pem)
+    {encryption_pem, encryption_jwk} = keypair()
     {_issuer_pem, issuer_jwk} = keypair()
     Application.put_env(:attesto_phoenix, Keystore, signing_pem: request_pem)
+    Application.put_env(:attesto_phoenix, EncryptionKeystore, signing_pem: encryption_pem)
 
     config = config()
 
-    on_exit(fn -> Application.delete_env(:attesto_phoenix, Keystore) end)
+    on_exit(fn ->
+      Application.delete_env(:attesto_phoenix, Keystore)
+      Application.delete_env(:attesto_phoenix, EncryptionKeystore)
+    end)
 
-    %{config: config, issuer_jwk: issuer_jwk, request_jwk: request_jwk}
+    %{config: config, encryption_jwk: encryption_jwk, issuer_jwk: issuer_jwk, request_jwk: request_jwk}
   end
 
   test "creates a stored signed request object with convention-derived endpoint URLs", ctx do
@@ -107,6 +128,23 @@ defmodule AttestoPhoenix.VerifierTest do
     assert claims["iss"] == "x509_san_dns:" <> @verifier_dns
   end
 
+  test "derives the request-object algorithm from an RSA main keystore", ctx do
+    Application.put_env(:attesto_phoenix, Keystore, signing_pem: @rsa_signing_pem)
+
+    assert {:ok, %{id: id}} =
+             Verifier.create_presentation_request(ctx.config, request_attrs(ctx))
+
+    assert {:ok, %{data: session}} = Store.get(id)
+    assert {:ok, protected} = JWS.peek_json(session.request_object, :protected)
+
+    expected_alg = @rsa_signing_pem |> Attesto.Key.signing_jwk() |> Attesto.SigningAlg.infer()
+    assert protected["alg"] == expected_alg
+    assert expected_alg == "RS256"
+
+    candidates = @rsa_signing_pem |> public_jwk() |> JWS.verification_candidates()
+    assert {:ok, _claims} = JWS.verify_strict(session.request_object, candidates, claims_map?: true)
+  end
+
   test "direct_post.jwt advertises the verifier public encryption key and algorithms", ctx do
     config = %{ctx.config | presentation_response_mode: "direct_post.jwt"}
 
@@ -129,11 +167,29 @@ defmodule AttestoPhoenix.VerifierTest do
 
     assert encryption_jwk["kty"] == "EC"
     assert encryption_jwk["crv"] == "P-256"
-    assert encryption_jwk["x"] == ctx.request_jwk["x"]
-    assert encryption_jwk["y"] == ctx.request_jwk["y"]
+    assert encryption_jwk["x"] == ctx.encryption_jwk["x"]
+    assert encryption_jwk["y"] == ctx.encryption_jwk["y"]
+    refute encryption_jwk["x"] == ctx.request_jwk["x"]
     assert encryption_jwk["use"] == "enc"
     assert encryption_jwk["alg"] == "ECDH-ES"
     refute Map.has_key?(encryption_jwk, "d")
+  end
+
+  test "direct_post.jwt fails closed without a usable dedicated EC encryption key", ctx do
+    missing = %{
+      ctx.config
+      | presentation_response_mode: "direct_post.jwt",
+        verifier_encryption_keystore: nil
+    }
+
+    assert {:error, :verifier_encryption_keystore_required} =
+             Verifier.create_presentation_request(missing, request_attrs(ctx))
+
+    Application.put_env(:attesto_phoenix, EncryptionKeystore, signing_pem: @rsa_signing_pem)
+    invalid = %{ctx.config | presentation_response_mode: "direct_post.jwt"}
+
+    assert {:error, :invalid_verifier_encryption_key} =
+             Verifier.create_presentation_request(invalid, request_attrs(ctx))
   end
 
   test "returns host-facing errors when verifier configuration or attrs are absent", ctx do
@@ -207,6 +263,7 @@ defmodule AttestoPhoenix.VerifierTest do
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
       presentation_session_store: Store,
+      verifier_encryption_keystore: EncryptionKeystore,
       verifier_client_id: @verifier_client_id
     )
   end

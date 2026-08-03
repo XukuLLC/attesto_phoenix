@@ -6,10 +6,15 @@ defmodule AttestoPhoenix.Verifier do
   published. Wallet responses are verified by the public direct-post
   controller, and hosts poll the completed result through
   `presentation_result/2`.
+
+  Request objects continue to use the main `Config.keystore/1`; their protected
+  `alg` is derived from that key by `Attesto.JWS.sign_current/3`. The separate
+  verifier-encryption keystore is only an ECDH-ES recipient key and never
+  changes request-object signing policy.
   """
 
   alias Attesto.{JWS, PresentationRequest, PresentationSession}
-  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.{Config, VerifierEncryption}
 
   @presentation_ttl_seconds 300
   @self_issued_audience "https://self-issued.me/v2"
@@ -45,9 +50,10 @@ defmodule AttestoPhoenix.Verifier do
       when is_map(dcql_query) do
     with {:ok, store} <- presentation_session_store(config),
          {:ok, client_id} <- verifier_client_id(config),
+         {:ok, response_options} <- response_options(config),
          {:ok, session} <-
            create_session(store, client_id, expected_query_ids, issuer_trust),
-         {:ok, jar} <- sign_request_object(config, client_id, session, dcql_query),
+         {:ok, jar} <- sign_request_object(config, client_id, session, dcql_query, response_options),
          :ok <- PresentationSession.attach_request_object(store, session.id, jar) do
       {:ok,
        %{
@@ -83,7 +89,7 @@ defmodule AttestoPhoenix.Verifier do
     )
   end
 
-  defp sign_request_object(config, client_id, session, dcql_query) do
+  defp sign_request_object(config, client_id, session, dcql_query, response_options) do
     request_options = [
       client_id: client_id,
       nonce: session.nonce,
@@ -92,7 +98,7 @@ defmodule AttestoPhoenix.Verifier do
       state: session.id
     ]
 
-    request = PresentationRequest.build(response_options(config, request_options))
+    request = PresentationRequest.build(Keyword.merge(request_options, response_options))
 
     claims =
       Map.merge(request, %{
@@ -119,34 +125,37 @@ defmodule AttestoPhoenix.Verifier do
     end
   end
 
-  defp response_options(config, options) do
+  defp response_options(config) do
     case Config.presentation_response_mode(config) do
       "direct_post" ->
-        options
+        {:ok, []}
 
       "direct_post.jwt" ->
-        Keyword.merge(options,
-          response_mode: "direct_post.jwt",
-          client_metadata: encrypted_response_metadata(config)
-        )
+        with {:ok, metadata} <- encrypted_response_metadata(config) do
+          {:ok,
+           [
+             response_mode: "direct_post.jwt",
+             client_metadata: metadata
+           ]}
+        end
     end
   end
 
   defp encrypted_response_metadata(config) do
-    private_jwk = JOSE.JWK.from_pem(config.keystore.signing_pem())
-    {_kty, public_jwk} = JOSE.JWK.to_public_map(private_jwk)
+    with {:ok, public_jwk} <- VerifierEncryption.public_jwk(config) do
+      encryption_jwk =
+        Map.merge(public_jwk, %{
+          "use" => "enc",
+          "alg" => @encrypted_response_alg
+        })
 
-    encryption_jwk =
-      Map.merge(public_jwk, %{
-        "use" => "enc",
-        "alg" => @encrypted_response_alg
-      })
-
-    %{
-      "jwks" => %{"keys" => [encryption_jwk]},
-      "authorization_encrypted_response_alg" => @encrypted_response_alg,
-      "authorization_encrypted_response_enc" => @encrypted_response_enc
-    }
+      {:ok,
+       %{
+         "jwks" => %{"keys" => [encryption_jwk]},
+         "authorization_encrypted_response_alg" => @encrypted_response_alg,
+         "authorization_encrypted_response_enc" => @encrypted_response_enc
+       }}
+    end
   end
 
   defp presentation_session_store(config) do

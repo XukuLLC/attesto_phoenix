@@ -18,12 +18,13 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   import Plug.Conn
 
-  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, MapParams, Mdoc, SdJwtVc}
+  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, Key, MapParams, Mdoc, SdJwtVc, SigningAlg}
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
   @credential_configuration_ids_claim "credential_configuration_ids"
+  @mdoc_signing_key_error "mso_mdoc issuance requires an EC P-256 (ES256) VC signing key."
   @sd_jwt_vc_formats ~w(vc+sd-jwt dc+sd-jwt)
 
   @doc """
@@ -148,6 +149,9 @@ defmodule AttestoPhoenix.Controller.CredentialController do
         conn
         |> PhoenixOAuthError.no_store(config)
         |> json(CredentialResponse.build(credentials))
+
+      {:error, :invalid_mdoc_signing_key} ->
+        invalid_request(conn, config, "invalid_credential_request", @mdoc_signing_key_error)
 
       {:error, _reason} ->
         invalid_request(conn, config, "invalid_credential_request", "credential unavailable")
@@ -278,17 +282,35 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     now = System.system_time(:second)
     doc_type = Map.get(result, :doc_type) || configuration_doc_type(credential_configuration)
 
-    Mdoc.issue(
-      doc_type: doc_type,
-      namespaces: result.namespaces,
-      device_key: holder_jwk,
-      issuer_pem: Config.vc_signing_pem(config),
-      validity: %{
-        signed: now,
-        valid_from: Map.get(result, :valid_from, now),
-        valid_until: Map.get(result, :valid_until, now)
-      }
-    )
+    with {:ok, issuer_pem} <- mdoc_signing_pem(config) do
+      Mdoc.issue(
+        doc_type: doc_type,
+        namespaces: result.namespaces,
+        device_key: holder_jwk,
+        issuer_pem: issuer_pem,
+        validity: %{
+          signed: now,
+          valid_from: Map.get(result, :valid_from, now),
+          valid_until: Map.get(result, :valid_until, now)
+        }
+      )
+    end
+  end
+
+  defp mdoc_signing_pem(config) do
+    pem = Config.vc_signing_pem(config)
+
+    pem
+    |> Key.signing_jwk()
+    |> SigningAlg.infer()
+    |> case do
+      "ES256" -> {:ok, pem}
+      _other -> {:error, :invalid_mdoc_signing_key}
+    end
+  rescue
+    _error -> {:error, :invalid_mdoc_signing_key}
+  catch
+    _kind, _reason -> {:error, :invalid_mdoc_signing_key}
   end
 
   defp credential_configuration(config, credential_configuration_id) do
