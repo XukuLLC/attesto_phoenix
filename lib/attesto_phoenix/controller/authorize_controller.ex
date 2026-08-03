@@ -165,6 +165,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          {:ok, request} <- validate_request(config, client, params, par_resolved?) do
       conn
       |> stash_par_request_uri(par_request_uri, par_resolved?)
+      |> stash_credential_configuration_ids(credential_configuration_ids(config, params))
       |> run_flow(config, client, request, authorize_dpop_jkt(request, params, par_resolved?))
     else
       {:error, :insecure_transport} ->
@@ -632,7 +633,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
             # authorized at this endpoint.
             resource: request.resource,
             family_id: generate_family_id(),
-            claims: code_claims(request, subject)
+            claims: code_claims(conn, request, subject)
           }
           |> put_optional(:dpop_jkt, dpop_jkt)
 
@@ -698,7 +699,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # so the misconfiguration is visible rather than silently dropping the claim.
   # Only the keys the host actually supplied are carried, so the token endpoint
   # can distinguish "absent" from a value.
-  defp code_claims(request, subject) do
+  defp code_claims(conn, request, subject) do
     auth_time = Map.get(subject, :auth_time)
 
     if not is_nil(request.max_age) and is_nil(auth_time) do
@@ -715,7 +716,74 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # code's claims so the token endpoint can stamp `sid` on the ID Token and
     # record a back-channel-logout session for the Relying Party.
     |> put_optional("sid", Map.get(subject, :sid))
+    # OID4VCI (draft-ietf-oauth-openid4vci) §5: the `openid_credential`
+    # authorization_details resolved for this request (stashed onto the conn
+    # by `authorize/2` via `stash_credential_configuration_ids/2`), so the
+    # token endpoint can carry the same `credential_configuration_ids` claim
+    # onto the access token that the pre-authorized_code grant uses (see
+    # `AttestoPhoenix.AuthorizationServer.Token`'s `@grant_pre_authorized_code`
+    # dispatch clause).
+    |> put_optional("credential_configuration_ids", Map.get(conn.private, :attesto_credential_configuration_ids))
   end
+
+  # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ───────
+
+  # RFC 9396 §5 `authorization_details`, filtered to `openid_credential`
+  # entries (draft-ietf-oauth-openid4vci §5) naming a
+  # `credential_configuration_id` this issuer actually offers
+  # (`:credential_configurations_supported`). Unconfigured credential
+  # issuance, an absent/malformed parameter, or a named id this issuer does
+  # not offer all resolve to `[]` — none of these fails the (otherwise valid)
+  # authorization request; the wallet simply gets an ordinary access token
+  # with no credential entitlement, exactly as if it had not asked. This is
+  # the SAME entitlement claim the pre-authorized_code grant binds, so the
+  # credential endpoint's entitlement check
+  # (`AttestoPhoenix.Controller.CredentialController.entitled?/2`) works
+  # unchanged regardless of which grant produced the token.
+  #
+  # Read off the (possibly PAR-resolved) `params` map rather than the
+  # validated `%Attesto.AuthorizationRequest{}` struct, which carries no
+  # `authorization_details` field. A request carried as a signed request
+  # object (JAR) is out of scope for this reading: `validate/2` re-merges the
+  # signed object's parameters into the struct, not back onto `params`, so an
+  # `authorization_details` inside a JAR payload is not seen here.
+  defp credential_configuration_ids(config, params) do
+    supported = Config.credential_configurations_supported(config) || %{}
+
+    params
+    |> Map.get("authorization_details")
+    |> parse_authorization_details()
+    |> Enum.filter(&openid_credential_entry?/1)
+    |> Enum.flat_map(&entry_credential_configuration_ids/1)
+    |> Enum.filter(&Map.has_key?(supported, &1))
+    |> Enum.uniq()
+  end
+
+  defp parse_authorization_details(value) when is_binary(value) and value != "" do
+    case JSON.decode(value) do
+      {:ok, list} when is_list(list) -> list
+      _ -> []
+    end
+  end
+
+  defp parse_authorization_details(_value), do: []
+
+  defp openid_credential_entry?(%{"type" => "openid_credential"}), do: true
+  defp openid_credential_entry?(_entry), do: false
+
+  defp entry_credential_configuration_ids(%{"credential_configuration_id" => id}) when is_binary(id) and id != "",
+    do: [id]
+
+  defp entry_credential_configuration_ids(_entry), do: []
+
+  # Stash the resolved credential_configuration_ids (only when non-empty) so
+  # `issue_and_redirect_authorized/5` can read them without threading a new
+  # parameter through the whole authenticate/consent chain — the same idiom
+  # `stash_par_request_uri/3` uses for the PAR reference.
+  defp stash_credential_configuration_ids(conn, []), do: conn
+
+  defp stash_credential_configuration_ids(conn, ids) when is_list(ids),
+    do: Plug.Conn.put_private(conn, :attesto_credential_configuration_ids, ids)
 
   # ── Host callbacks (login / consent) ─────────────────────────────────────
 

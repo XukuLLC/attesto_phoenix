@@ -144,6 +144,33 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     ETS
   end
 
+  # A code carrying the OID4VCI `credential_configuration_ids` claim the
+  # authorize controller would have recorded onto the code after validating
+  # the request's `openid_credential` `authorization_details` (see
+  # `AttestoPhoenix.Controller.AuthorizeController.code_claims/3`).
+  defp start_code_store_with_credential_configuration_ids(subject, scope, credential_configuration_ids) do
+    case start_supervised(ETS) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    ETS.reset()
+
+    {:ok, code} =
+      Attesto.AuthorizationCode.issue(ETS, %{
+        client_id: "client-1",
+        redirect_uri: @redirect_uri,
+        scope: scope,
+        subject: subject,
+        code_challenge: @code_challenge,
+        code_challenge_method: "S256",
+        claims: %{"credential_configuration_ids" => credential_configuration_ids}
+      })
+
+    Process.put(:auth_code, code)
+    ETS
+  end
+
   defp start_refresh_store do
     case start_supervised(Attesto.RefreshStore.ETS) do
       {:ok, _pid} -> :ok
@@ -430,6 +457,60 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :none,
                cnf: nil
              }
+    end
+  end
+
+  describe "OID4VCI authorization_details on the authorization_code grant" do
+    test "a code carrying openid_credential authorization_details mints an access token entitled to them, and the response echoes authorization_details" do
+      code_store =
+        start_code_store_with_credential_configuration_ids(
+          "oc_user-1",
+          ["openid", "credential"],
+          ["UniversityDegreeCredential"]
+        )
+
+      config = config(code_store: code_store)
+
+      request =
+        request(config,
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, request)
+
+      # The same `credential_configuration_ids` claim the pre-authorized_code
+      # grant binds, so `CredentialController.entitled?/2` works unchanged.
+      assert claim!(response.access_token, "credential_configuration_ids") == ["UniversityDegreeCredential"]
+
+      # OID4VCI §6.2: the token response echoes what was granted.
+      assert response.authorization_details == [
+               %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+             ]
+    end
+
+    test "an ordinary authorization_code grant with no credential details is completely unchanged" do
+      code_store = start_code_store("oc_user-1", ["openid"])
+      config = config(code_store: code_store)
+
+      request =
+        request(config,
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, request)
+
+      refute claim!(response.access_token, "credential_configuration_ids")
+      refute Map.has_key?(response, :authorization_details)
     end
   end
 

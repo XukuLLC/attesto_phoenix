@@ -244,6 +244,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          # Authentication Request (granted scope contains `openid`), the token
          # response additionally carries an ID Token.
          {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
+      # OID4VCI (draft-ietf-oauth-openid4vci) §6.2 / RFC 9396 §7: when the
+      # code carried `openid_credential` credential_configuration_ids
+      # (`access_token_claims/1` already folded them into the minted access
+      # token above), echo the granted `authorization_details` on the token
+      # response. Omitted entirely for a plain authorization_code grant that
+      # carried none — this leaves every non-OID4VCI flow byte-identical.
+      response = maybe_echo_credential_authorization_details(response, grant)
       :ok = record_code_access_token(config, grant, response)
       issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
 
@@ -1527,14 +1534,59 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # UserInfo endpoint can later shape its response. Only the `claims` object is
   # propagated; authentication-context values like nonce/auth_time stay code/ID
   # token state and are not access-token claims.
+  #
+  # OID4VCI (draft-ietf-oauth-openid4vci) §5: when the authorization request
+  # carried `authorization_details` naming `openid_credential` configuration
+  # id(s) this issuer offers, `AttestoPhoenix.Controller.AuthorizeController`
+  # validated and recorded them onto the code's claims. Carry them onto the
+  # access token under the SAME `credential_configuration_ids` claim the
+  # `@grant_pre_authorized_code` dispatch clause below binds, so
+  # `AttestoPhoenix.Controller.CredentialController`'s entitlement check works
+  # unchanged for a wallet that used the ordinary authorization_code flow. A
+  # code that carried none (every non-OID4VCI authorization_code grant) adds
+  # no such claim.
   defp access_token_claims(%{claims: claims}) when is_map(claims) do
-    case id_token_claim(claims, "claims") do
-      requested when is_map(requested) -> %{"claims" => requested}
-      _ -> %{}
-    end
+    %{}
+    |> put_optional("claims", requested_userinfo_claims(claims))
+    |> put_optional("credential_configuration_ids", credential_configuration_ids(claims))
   end
 
   defp access_token_claims(_grant), do: %{}
+
+  defp requested_userinfo_claims(claims) do
+    case id_token_claim(claims, "claims") do
+      requested when is_map(requested) -> requested
+      _ -> nil
+    end
+  end
+
+  # The code's claims carry `credential_configuration_ids` as a string-keyed
+  # list (the shape `AttestoPhoenix.Controller.AuthorizeController.code_claims/3`
+  # writes); a non-empty list of ids resolves, anything else (absent,
+  # malformed, empty) resolves to `nil` so `put_optional/2` adds no claim.
+  defp credential_configuration_ids(claims) do
+    case Map.get(claims, "credential_configuration_ids") do
+      [_ | _] = ids -> ids
+      _ -> nil
+    end
+  end
+
+  # OID4VCI §6.2: the token response echoes the `authorization_details` that
+  # were actually granted, each entry naming the `credential_configuration_id`
+  # the resulting access token is entitled to.
+  defp maybe_echo_credential_authorization_details(response, grant) do
+    case credential_configuration_ids(grant.claims) do
+      nil ->
+        response
+
+      ids ->
+        Map.put(response, :authorization_details, Enum.map(ids, &credential_authorization_detail/1))
+    end
+  end
+
+  defp credential_authorization_detail(credential_configuration_id) do
+    %{"type" => "openid_credential", "credential_configuration_id" => credential_configuration_id}
+  end
 
   defp merge_principal_claims(principal, extra_claims) when map_size(extra_claims) == 0, do: principal
 

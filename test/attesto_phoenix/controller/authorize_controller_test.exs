@@ -1454,6 +1454,85 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
   end
 
+  # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ─────────
+
+  describe "OID4VCI authorization_details" do
+    @credential_configurations_supported %{
+      "UniversityDegreeCredential" => %{format: "vc+sd-jwt"}
+    }
+
+    defp authorization_details_json(entries), do: JSON.encode!(entries)
+
+    test "openid_credential authorization_details for a supported configuration id are recorded onto the code" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      details =
+        authorization_details_json([
+          %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      assert record.data.claims["credential_configuration_ids"] == ["UniversityDegreeCredential"]
+    end
+
+    test "an authorization_details entry naming an unconfigured credential id is dropped" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      details =
+        authorization_details_json([
+          %{"type" => "openid_credential", "credential_configuration_id" => "SomeUnofferedCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
+    end
+
+    test "authorization_details is ignored entirely when credential issuance is not configured" do
+      # base_config/1 configures no :credential_configurations_supported.
+      details =
+        authorization_details_json([
+          %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
+    end
+
+    test "a request with no authorization_details is completely unaffected" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      conn = call(valid_params())
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
+    end
+
+    test "a non-openid_credential authorization_details entry is ignored" do
+      put_config(credential_configurations_supported: @credential_configurations_supported)
+
+      details =
+        authorization_details_json([
+          %{"type" => "payment_initiation", "credential_configuration_id" => "UniversityDegreeCredential"}
+        ])
+
+      conn = call(valid_params(%{"authorization_details" => details}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "credential_configuration_ids")
+    end
+  end
+
   # ── RFC 8252 native apps (BCP 212) ─────────────────────────────────────────
 
   describe "loopback interface redirection (RFC 8252 §7.3)" do
