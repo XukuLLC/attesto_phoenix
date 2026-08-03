@@ -98,7 +98,7 @@ defmodule AttestoPhoenix.MixProject do
       # OpenIDDiscovery, the store behaviours, and the base plugs.
       attesto_dep(),
       # ISO 18013-5 mdoc encoding for the mso_mdoc credential issuance path.
-      {:cbor, "~> 1.0"},
+      {:cbor, "~> 1.0", optional: true},
       # Ecto-backed CodeStore/RefreshStore/NonceStore/ReplayCheck + the migration
       # generator.
       {:ecto_sql, "~> 3.10"},
