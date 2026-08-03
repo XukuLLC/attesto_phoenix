@@ -3,9 +3,10 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   OID4VCI Credential Endpoint (`draft-ietf-oauth-openid4vci` §8.2).
 
   This endpoint authenticates the access token, enforces the credential
-  configuration entitlement carried by that token, verifies the wallet's
-  holder-key proof against a server-issued c_nonce, and issues an SD-JWT VC.
-  The host supplies only the credential type and claim values through
+  configuration entitlement carried by that token, verifies each of the
+  wallet's holder-key proofs against a server-issued c_nonce, and issues one
+  SD-JWT VC per verified proof (the OID4VCI `proofs` batch form). The host
+  supplies only the credential type and claim values through
   `:build_credential`; the library owns proof verification, holder binding,
   signing, and response framing.
   """
@@ -23,11 +24,15 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   @credential_configuration_ids_claim "credential_configuration_ids"
 
   @doc """
-  Issue the credential requested by an authenticated wallet.
+  Issue the credential(s) requested by an authenticated wallet.
 
-  The action accepts exactly one `jwt` proof in this slice. Batch issuance,
-  credential identifiers, and any proof or request failure are returned as the
-  OID4VCI JSON error envelope with status 400.
+  The action accepts either the single `proof` form or the batch `proofs`
+  form; each holder-key proof yields its own holder-bound credential in the
+  response. Every proof must verify (fresh c_nonce, correct audience, valid
+  signature) or the whole request fails with the same `invalid_proof` error,
+  regardless of which proof or how many failed. Credential identifiers and any
+  other proof or request failure are returned as the OID4VCI JSON error
+  envelope with status 400.
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
@@ -47,13 +52,13 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     with {:ok, parsed} <- CredentialRequest.parse(request),
          {:ok, credential_configuration_id} <- selector(parsed.selector),
          :ok <- entitled?(claims, credential_configuration_id),
-         {:ok, holder_jwk} <- verify_proof(config, claims, parsed.proofs) do
+         {:ok, holder_jwks} <- verify_proofs(config, claims, parsed.proofs) do
       build_and_issue(
         conn,
         config,
         claims["sub"],
         credential_configuration_id,
-        holder_jwk,
+        holder_jwks,
         resource_metadata
       )
     else
@@ -83,26 +88,34 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp entitled?(_claims, _id), do: {:error, :not_entitled}
 
-  defp verify_proof(_config, _claims, []), do: {:error, :invalid_proof, "A credential proof is required."}
+  defp verify_proofs(_config, _claims, []), do: {:error, :invalid_proof, "A credential proof is required."}
 
-  defp verify_proof(_config, _claims, proofs) when length(proofs) > 1 do
-    {:error, :invalid_proof, "batch issuance not supported yet"}
+  defp verify_proofs(config, claims, proofs) do
+    proofs
+    |> Enum.reduce_while({:ok, []}, fn proof, {:ok, acc} ->
+      case verify_proof(config, claims, proof) do
+        {:ok, holder_jwk} -> {:cont, {:ok, [holder_jwk | acc]}}
+        :error -> {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, holder_jwks} -> {:ok, Enum.reverse(holder_jwks)}
+      :error -> {:error, :invalid_proof, "Invalid credential proof."}
+    end
   end
 
-  defp verify_proof(config, claims, [{"jwt", jwt}]) do
+  defp verify_proof(config, claims, {"jwt", jwt}) do
     with {:ok, payload} <- JWS.peek_json(jwt, :payload),
          nonce when is_binary(nonce) and nonce != "" <- Map.get(payload, "nonce"),
          true <- nonce_valid?(config, nonce),
          {:ok, %{jwk: holder_jwk}} <- CredentialProof.verify_jwt(jwt, proof_opts(config, claims, nonce)) do
       {:ok, holder_jwk}
     else
-      _ -> {:error, :invalid_proof, "Invalid credential proof."}
+      _ -> :error
     end
   end
 
-  defp verify_proof(_config, _claims, [_proof]) do
-    {:error, :invalid_proof, "Only jwt credential proofs are supported."}
-  end
+  defp verify_proof(_config, _claims, _proof), do: :error
 
   defp nonce_valid?(config, nonce) do
     case Config.c_nonce_store(config) do
@@ -124,39 +137,60 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp maybe_put_client_id(opts, _claims), do: opts
 
-  defp build_and_issue(conn, config, subject, credential_configuration_id, holder_jwk, _resource_metadata) do
-    case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
-      {:ok, %{vct: vct, claims: claims} = result}
-      when is_binary(vct) and is_map(claims) ->
-        issue_credential(conn, config, result, holder_jwk)
+  defp build_and_issue(conn, config, subject, credential_configuration_id, holder_jwks, _resource_metadata) do
+    case build_credentials(config, subject, credential_configuration_id, holder_jwks) do
+      {:ok, credentials} ->
+        conn
+        |> PhoenixOAuthError.no_store(config)
+        |> json(CredentialResponse.build(credentials))
 
       {:error, _reason} ->
-        invalid_request(conn, config, "invalid_credential_request", "credential unavailable")
-
-      _other ->
         invalid_request(conn, config, "invalid_credential_request", "credential unavailable")
     end
   end
 
-  defp issue_credential(conn, config, %{vct: vct, claims: claims} = result, holder_jwk) do
-    credential =
-      SdJwtVc.issue(
-        [
-          iss: config.issuer,
-          vct: vct,
-          pem: config.keystore.signing_pem()
-        ],
-        [
-          claims: claims,
-          cnf: %{"jwk" => holder_jwk}
-        ]
-        |> maybe_put_option(:exp, Map.get(result, :valid_until))
-        |> maybe_put_option(:nbf, Map.get(result, :valid_from))
-      )
+  defp build_credentials(config, subject, credential_configuration_id, holder_jwks) do
+    holder_jwks
+    |> Enum.reduce_while({:ok, []}, fn holder_jwk, {:ok, acc} ->
+      case build_credential(config, subject, credential_configuration_id, holder_jwk) do
+        {:ok, credential} -> {:cont, {:ok, [credential | acc]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, credentials} -> {:ok, Enum.reverse(credentials)}
+      error -> error
+    end
+  end
 
-    conn
-    |> PhoenixOAuthError.no_store(config)
-    |> json(CredentialResponse.build([credential]))
+  defp build_credential(config, subject, credential_configuration_id, holder_jwk) do
+    case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
+      {:ok, %{vct: vct, claims: claims} = result}
+      when is_binary(vct) and is_map(claims) ->
+        {:ok, issue_credential(config, result, holder_jwk)}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_credential}
+    end
+  end
+
+  defp issue_credential(config, %{vct: vct, claims: claims} = result, holder_jwk) do
+    SdJwtVc.issue(
+      [
+        iss: config.issuer,
+        vct: vct,
+        pem: config.keystore.signing_pem()
+      ],
+      [
+        claims: claims,
+        cnf: %{"jwk" => holder_jwk}
+      ]
+      |> maybe_put_option(:exp, Map.get(result, :valid_until))
+      |> maybe_put_option(:nbf, Map.get(result, :valid_from))
+    )
   end
 
   defp maybe_put_option(opts, _key, nil), do: opts

@@ -161,6 +161,49 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert body(response)["error"] == "invalid_proof"
     end
 
+    test "issues a batch of holder-bound SD-JWT VCs from the proofs form" do
+      other_holder_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      nonce = CNonceStore.issue(60)
+
+      request = %{
+        "credential_configuration_id" => @configuration_id,
+        "proofs" => %{"jwt" => [proof_jwt(nonce), proof_jwt(nonce, key: other_holder_key)]}
+      }
+
+      response = post_credential(mint_token(), request)
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential1}, %{"credential" => credential2}]} = body(response)
+
+      issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+
+      assert {:ok, verified1} = SdJwtVc.verify(credential1, issuer_jwk)
+      assert verified1.cnf == %{"jwk" => public_map(@holder_key)}
+
+      assert {:ok, verified2} = SdJwtVc.verify(credential2, issuer_jwk)
+      assert verified2.cnf == %{"jwk" => public_map(other_holder_key)}
+
+      assert_receive {:credential_requested, @subject, @configuration_id, holder_jwk1}
+      assert_receive {:credential_requested, @subject, @configuration_id, holder_jwk2}
+
+      assert Enum.sort([holder_jwk1, holder_jwk2]) ==
+               Enum.sort([public_map(@holder_key), public_map(other_holder_key)])
+    end
+
+    test "rejects a batch where one proof has a stale c_nonce" do
+      nonce = CNonceStore.issue(60)
+
+      request = %{
+        "credential_configuration_id" => @configuration_id,
+        "proofs" => %{"jwt" => [proof_jwt(nonce), proof_jwt("never-issued")]}
+      }
+
+      response = post_credential(mint_token(), request)
+
+      assert response.status == 400
+      assert body(response)["error"] == "invalid_proof"
+    end
+
     test "rejects credential_identifier selectors in this slice" do
       response =
         post_credential(mint_token(), %{"credential_identifier" => "credential-123"})
@@ -206,9 +249,11 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   end
 
   defp proof_jwt(nonce, opts \\ []) do
+    key = Keyword.get(opts, :key, @holder_key)
+
     header = %{
       "alg" => "ES256",
-      "jwk" => public_map(@holder_key),
+      "jwk" => public_map(key),
       "typ" => "openid4vci-proof+jwt"
     }
 
@@ -218,7 +263,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       "nonce" => nonce
     }
 
-    @holder_key
+    key
     |> JOSE.JWT.sign(header, claims)
     |> JOSE.JWS.compact()
     |> elem(1)
