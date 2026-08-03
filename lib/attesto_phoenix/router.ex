@@ -55,6 +55,8 @@ defmodule AttestoPhoenix.Router do
       endpoint, mounted only with `presentation: true`.
     * `GET /.well-known/openid-credential-issuer` - OID4VCI Credential Issuer
       Metadata, mounted with `credential_issuance: true`.
+    * `GET /.well-known/jwt-vc-issuer` - SD-JWT VC JWT VC Issuer Metadata,
+      mounted with `credential_issuance: true`.
     * `GET /.well-known/openid-federation` - the signed OpenID Federation
       Entity Configuration, mounted with `federation: true`.
     * `GET` and `POST /oauth/end_session` - the end-session endpoint (OpenID
@@ -175,14 +177,14 @@ defmodule AttestoPhoenix.Router do
       endpoint and verification page. Defaults to `false`.
     * `:credential_issuance` - when `true`, mounts the OID4VCI nonce,
       credential, by-reference credential-offer, deferred-credential, and
-      Credential Issuer Metadata endpoints. Defaults to `false`. The host must
-      also configure `:build_credential`, a `:pre_authorized_code_store`, and
-      `:credential_configurations_supported`. The by-reference credential
-      offer route additionally requires a `:credential_offer_store` (a
-      request answers 404 while it is unconfigured or the id is unknown), and
-      the deferred-credential route requires `:build_deferred_credential`
-      (like `:build_credential`, an unconfigured callback is a hard
-      `ArgumentError` rather than a silent empty response).
+      Credential Issuer Metadata and JWT VC Issuer Metadata endpoints. Defaults
+      to `false`. The host must also configure `:build_credential`, a
+      `:pre_authorized_code_store`, and `:credential_configurations_supported`.
+      The by-reference credential offer route additionally requires a
+      `:credential_offer_store` (a request answers 404 while it is unconfigured
+      or the id is unknown), and the deferred-credential route requires
+      `:build_deferred_credential` (like `:build_credential`, an unconfigured
+      callback is a hard `ArgumentError` rather than a silent empty response).
     * `:federation` - when `true`, mounts the signed OpenID Federation Entity
       Configuration at `/.well-known/openid-federation`. Defaults to `false`.
       Configure `:federation_authority_hints` and
@@ -285,6 +287,7 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.EntityConfigurationController
   alias AttestoPhoenix.Controller.IntrospectionController
   alias AttestoPhoenix.Controller.JWKSController
+  alias AttestoPhoenix.Controller.JwtVcIssuerMetadataController
   alias AttestoPhoenix.Controller.NonceController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
@@ -316,6 +319,10 @@ defmodule AttestoPhoenix.Router do
   # OID4VCI §11.2 anchors Credential Issuer Metadata at the host root, so this
   # route is not subject to the OAuth endpoint `:prefix`.
   @credential_issuer_metadata_path "/.well-known/openid-credential-issuer"
+
+  # SD-JWT VC §5 pins JWT VC Issuer Metadata to this host-root well-known URI,
+  # so it is not subject to the OAuth endpoint `:prefix`.
+  @jwt_vc_issuer_metadata_path "/.well-known/jwt-vc-issuer"
 
   # OpenID Federation 1.0 §8.1 pins the Entity Configuration to this
   # well-known URI at the host root, so it is not subject to `:prefix`.
@@ -378,6 +385,7 @@ defmodule AttestoPhoenix.Router do
   @presentation_request_controller PresentationRequestController
   @presentation_response_controller PresentationResponseController
   @credential_issuer_metadata_controller CredentialIssuerMetadataController
+  @jwt_vc_issuer_metadata_controller JwtVcIssuerMetadataController
   @federation_controller EntityConfigurationController
 
   @doc false
@@ -417,6 +425,7 @@ defmodule AttestoPhoenix.Router do
 
     discovery_path = @discovery_path
     credential_issuer_metadata_path = @credential_issuer_metadata_path
+    jwt_vc_issuer_metadata_path = @jwt_vc_issuer_metadata_path
     federation_path = @federation_path
     openid_configuration_path = @openid_configuration_path
     jwks_path = @jwks_path
@@ -436,6 +445,7 @@ defmodule AttestoPhoenix.Router do
     status_list_path = @status_list_path
     discovery_controller = @discovery_controller
     credential_issuer_metadata_controller = @credential_issuer_metadata_controller
+    jwt_vc_issuer_metadata_controller = @jwt_vc_issuer_metadata_controller
     federation_controller = @federation_controller
     openid_configuration_controller = @openid_configuration_controller
     jwks_controller = @jwks_controller
@@ -548,6 +558,13 @@ defmodule AttestoPhoenix.Router do
         credential_issuance?,
         credential_issuer_metadata_path,
         credential_issuer_metadata_controller
+      )
+
+    jwt_vc_issuer_metadata_route =
+      jwt_vc_issuer_metadata_route(
+        credential_issuance?,
+        jwt_vc_issuer_metadata_path,
+        jwt_vc_issuer_metadata_controller
       )
 
     federation_route = federation_route(federation?, federation_path, federation_controller)
@@ -666,6 +683,7 @@ defmodule AttestoPhoenix.Router do
             get(unquote(discovery_path), unquote(discovery_controller), :show)
             unquote(federation_route)
             unquote(credential_issuer_metadata_route)
+            unquote(jwt_vc_issuer_metadata_route)
             unquote(openid_configuration_route)
             get(unquote(jwks_path), unquote(jwks_controller), :show)
             unquote(protected_resource_root_route)
@@ -735,6 +753,7 @@ defmodule AttestoPhoenix.Router do
           get(unquote(discovery_path), unquote(discovery_controller), :show)
           unquote(federation_route)
           unquote(credential_issuer_metadata_route)
+          unquote(jwt_vc_issuer_metadata_route)
           unquote(openid_configuration_route)
           get(unquote(jwks_path), unquote(jwks_controller), :show)
 
@@ -986,6 +1005,14 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp credential_issuer_metadata_route(false, _path, _controller), do: nil
+
+  defp jwt_vc_issuer_metadata_route(true, path, controller) do
+    quote do
+      get(unquote(path), unquote(controller), :show)
+    end
+  end
+
+  defp jwt_vc_issuer_metadata_route(false, _path, _controller), do: nil
 
   defp federation_route(true, path, controller) do
     quote do
