@@ -28,6 +28,10 @@ defmodule AttestoPhoenix.Config do
       signing key and the verification keys published via JWKS. Use a static
       keystore or a host KMS/HSM/Vault-backed implementation; per-key `alg`
       metadata is supported by the core keystore behaviour.
+    * `:vc_keystore` - the keystore used to sign issued Verifiable Credentials;
+      defaults to `:keystore`. Configure a separate EC/ES256 keystore here to
+      issue ES256-signed credentials (e.g. for HAIP) while ID tokens keep their
+      own signing key.
     * `:repo` - `Ecto.Repo` module used by the Ecto-backed code, refresh,
       nonce, and replay stores.
     * `:load_client` - `(client_id -> {:ok, client} | {:error, :not_found} |
@@ -590,6 +594,7 @@ defmodule AttestoPhoenix.Config do
   defstruct [
     :issuer,
     :keystore,
+    :vc_keystore,
     :repo,
     :load_client,
     :verify_client_secret,
@@ -736,6 +741,7 @@ defmodule AttestoPhoenix.Config do
   @type t :: %__MODULE__{
           issuer: String.t(),
           keystore: module(),
+          vc_keystore: module() | nil,
           repo: module(),
           load_client: callback(),
           verify_client_secret: callback(),
@@ -1135,6 +1141,24 @@ defmodule AttestoPhoenix.Config do
     otp_app = Application.get_env(:attesto_phoenix, :otp_app)
     from_otp_app(otp_app, __MODULE__)
   end
+
+  @doc "The configured keystore used for ID-token and authorization-server signing."
+  @spec keystore(t()) :: module()
+  def keystore(%__MODULE__{keystore: keystore}), do: keystore
+
+  @doc """
+  The keystore used to sign issued Verifiable Credentials; defaults to
+  `:keystore`. Configure a separate EC/ES256 keystore here to issue
+  ES256-signed credentials (e.g. for HAIP) while ID tokens keep their own
+  signing key.
+  """
+  @spec vc_keystore(t()) :: module()
+  def vc_keystore(%__MODULE__{vc_keystore: nil} = config), do: keystore(config)
+  def vc_keystore(%__MODULE__{vc_keystore: vc_keystore}), do: vc_keystore
+
+  @doc "Returns the PEM used to sign issued Verifiable Credentials."
+  @spec vc_signing_pem(t()) :: String.t()
+  def vc_signing_pem(%__MODULE__{} = config), do: vc_keystore(config).signing_pem()
 
   @doc """
   Returns the configured Ecto repository, raising when it is unset.

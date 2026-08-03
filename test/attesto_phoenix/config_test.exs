@@ -5,6 +5,26 @@ defmodule AttestoPhoenix.ConfigTest do
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.Config
 
+  defmodule Keystore do
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "main-pem"
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule VcKeystore do
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "vc-pem"
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
   # A behaviour module that implements every ClientStore callback the resolver
   # routes through `:client_store`, plus the principal/scope/event/consent/
   # registration callbacks the other behaviour-module keys route through. Each
@@ -131,6 +151,24 @@ defmodule AttestoPhoenix.ConfigTest do
     ]
 
     Config.new(Keyword.merge(base, overrides))
+  end
+
+  describe "credential-signing keystore" do
+    test "falls back to the main keystore when vc_keystore is unset" do
+      cfg = config()
+
+      assert Config.keystore(cfg) == Keystore
+      assert Config.vc_keystore(cfg) == Keystore
+      assert Config.vc_signing_pem(cfg) == "main-pem"
+    end
+
+    test "uses a separately configured vc_keystore" do
+      cfg = config(vc_keystore: VcKeystore)
+
+      assert Config.keystore(cfg) == Keystore
+      assert Config.vc_keystore(cfg) == VcKeystore
+      assert Config.vc_signing_pem(cfg) == "vc-pem"
+    end
   end
 
   describe "ecto_repo!/0" do

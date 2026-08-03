@@ -222,7 +222,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       [
         iss: config.issuer,
         vct: vct,
-        pem: config.keystore.signing_pem()
+        pem: Config.vc_signing_pem(config)
       ],
       [
         claims: claims,
@@ -249,7 +249,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       [
         iss: config.issuer,
         sub: subject,
-        pem: config.keystore.signing_pem()
+        pem: Config.vc_signing_pem(config)
       ],
       [
         type: ["VerifiableCredential", result.credential_type],
@@ -282,7 +282,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       doc_type: doc_type,
       namespaces: result.namespaces,
       device_key: holder_jwk,
-      issuer_pem: config.keystore.signing_pem(),
+      issuer_pem: Config.vc_signing_pem(config),
       validity: %{
         signed: now,
         valid_from: Map.get(result, :valid_from, now),

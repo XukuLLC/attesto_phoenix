@@ -14,8 +14,24 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
   @subject "ou_user-123"
   @vct "https://credentials.example/UniversityDegreeCredential"
   @signing_pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
+  @vc_signing_pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
 
   defmodule Keystore do
+    @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem do
+      :attesto_phoenix
+      |> Application.fetch_env!(__MODULE__)
+      |> Keyword.fetch!(:signing_pem)
+    end
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule VcKeystore do
     @moduledoc false
     @behaviour Attesto.Keystore
 
@@ -44,7 +60,12 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
 
   setup do
     Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @signing_pem)
-    on_exit(fn -> Application.delete_env(:attesto_phoenix, __MODULE__.Keystore) end)
+    Application.put_env(:attesto_phoenix, __MODULE__.VcKeystore, signing_pem: @vc_signing_pem)
+
+    on_exit(fn ->
+      Application.delete_env(:attesto_phoenix, __MODULE__.Keystore)
+      Application.delete_env(:attesto_phoenix, __MODULE__.VcKeystore)
+    end)
 
     put_config(
       issuer: @issuer,
@@ -89,6 +110,23 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
       assert verified.claims["student_id"] == "student-123"
 
       assert_receive {:deferred_credential_requested, @subject, "txn-123"}
+    end
+
+    test "signs the completed SD-JWT VC with a separate ES256 vc_keystore" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(config, :vc_keystore, __MODULE__.VcKeystore))
+
+      response = post_deferred(mint_token(), %{"transaction_id" => "txn-123"})
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      vc_jwk = @vc_signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+      main_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+
+      assert {:ok, verified} = SdJwtVc.verify(credential, vc_jwk, accepted_algs: ["ES256"])
+      assert verified.vct == @vct
+      assert {:error, _reason} = SdJwtVc.verify(credential, main_jwk, accepted_algs: ["ES256"])
     end
 
     test "returns the OID4VCI issuance_pending error while the host is still working" do

@@ -22,9 +22,26 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   @mdoc_doc_type "org.iso.18013.5.1.mDL"
   @mdoc_namespace "org.iso.18013.5.1"
   @signing_pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
+  @rsa_signing_pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
+  @vc_signing_pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
   @holder_key JOSE.JWK.generate_key({:ec, "P-256"})
 
   defmodule Keystore do
+    @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem do
+      :attesto_phoenix
+      |> Application.fetch_env!(__MODULE__)
+      |> Keyword.fetch!(:signing_pem)
+    end
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule VcKeystore do
     @moduledoc false
     @behaviour Attesto.Keystore
 
@@ -53,7 +70,12 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
   setup do
     Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @signing_pem)
-    on_exit(fn -> Application.delete_env(:attesto_phoenix, __MODULE__.Keystore) end)
+    Application.put_env(:attesto_phoenix, __MODULE__.VcKeystore, signing_pem: @vc_signing_pem)
+
+    on_exit(fn ->
+      Application.delete_env(:attesto_phoenix, __MODULE__.Keystore)
+      Application.delete_env(:attesto_phoenix, __MODULE__.VcKeystore)
+    end)
 
     start_supervised!(CNonceStore)
     CNonceStore.reset()
@@ -108,7 +130,8 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert is_binary(credential)
 
       issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
-      assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk)
+      assert Config.resolve!() |> Config.vc_keystore() == Keystore
+      assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk, accepted_algs: ["ES256"])
       assert verified.vct == @vct
       assert verified.claims["degree"] == "Bachelor"
       assert verified.claims["student_id"] == "student-123"
@@ -116,6 +139,26 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       assert_receive {:credential_requested, @subject, @configuration_id, holder_jwk}
       assert holder_jwk == public_map(@holder_key)
+    end
+
+    test "signs an SD-JWT VC with a separate ES256 vc_keystore" do
+      Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @rsa_signing_pem)
+
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(config, :vc_keystore, __MODULE__.VcKeystore))
+
+      nonce = CNonceStore.issue(60)
+      response = post_credential(mint_token(), credential_request(nonce))
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      vc_jwk = @vc_signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+      main_jwk = @rsa_signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+
+      assert {:ok, verified} = SdJwtVc.verify(credential, vc_jwk, accepted_algs: ["ES256"])
+      assert verified.vct == @vct
+      assert {:error, _reason} = SdJwtVc.verify(credential, main_jwk, accepted_algs: ["ES256"])
     end
 
     test "issues a holder-bound jwt_vc_json credential" do
