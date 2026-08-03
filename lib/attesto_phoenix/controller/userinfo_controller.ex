@@ -80,16 +80,9 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   import Plug.Conn
 
-  alias Attesto.Plug.Authenticate
-  alias Attesto.Plug.OAuthError
   alias AttestoPhoenix.Callback
-  alias AttestoPhoenix.{Config, DPoP.Adapter}
+  alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
-  alias AttestoPhoenix.RequestContext
-
-  # The conn assign `Attesto.Plug.Authenticate` writes the verified claims
-  # under (its default `:claims_key`).
-  @claims_key :attesto_claims
 
   # OpenID Connect Core §5.3.1: the UserInfo endpoint requires the `openid`
   # scope (OpenID Connect Core §3.1.2.1).
@@ -121,40 +114,16 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
     config = Config.resolve!()
     resource_metadata = Config.resource_metadata_url(config, conn)
 
-    case RequestContext.check_https(conn, config) do
-      :ok ->
-        # Reuse the engine verify path. On failure it halts the conn with the
-        # RFC 6750 / RFC 9449 challenge already written; return it unchanged.
-        conn = Authenticate.call(conn, authenticate_opts(config, resource_metadata))
+    case ProtectedResource.authenticate(conn, config, resource_metadata) do
+      {:ok, conn, claims} ->
+        respond(conn, config, resource_metadata, claims)
 
-        cond do
-          conn.halted ->
-            conn
-
-          access_token_revoked?(config, conn.assigns[@claims_key]) ->
-            OAuthError.unauthorized(
-              conn,
-              scheme_of(conn.assigns[@claims_key]),
-              "invalid_token",
-              error_opts(config, resource_metadata, [])
-            )
-
-          true ->
-            respond(conn, config, resource_metadata)
-        end
-
-      {:error, :insecure_transport} ->
-        OAuthError.unauthorized(
-          conn,
-          :bearer,
-          "invalid_token",
-          error_opts(config, resource_metadata, description: "TLS required")
-        )
+      {:halt, conn} ->
+        conn
     end
   end
 
-  defp respond(conn, config, resource_metadata) do
-    claims = conn.assigns[@claims_key]
+  defp respond(conn, config, resource_metadata, claims) do
     granted_scopes = granted_scopes(claims)
 
     # OpenID Connect Core §5.3.1: the access token must carry the `openid` scope.
@@ -174,7 +143,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
       |> PhoenixOAuthError.no_store(config)
       |> json(userinfo)
     else
-      insufficient_scope(conn, config, scheme_of(claims), resource_metadata)
+      insufficient_scope(conn, config, ProtectedResource.scheme_of(claims), resource_metadata)
     end
   end
 
@@ -219,18 +188,6 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # Absent that, no individual claims are requested.
   defp requested_claims(%{"claims" => requested}) when is_map(requested), do: requested
   defp requested_claims(_claims), do: %{}
-
-  # RFC 9449 §7.1: a DPoP-bound token (carrying `cnf.jkt`) gets a `DPoP`
-  # challenge so the error scheme matches how the client authenticated; a
-  # bearer or mTLS-bound token gets `Bearer`.
-  defp scheme_of(%{"cnf" => %{"jkt" => jkt}}) when is_binary(jkt), do: :dpop
-  defp scheme_of(_claims), do: :bearer
-
-  defp access_token_revoked?(%Config{code_store: store}, %{"jti" => jti}) when is_atom(store) and is_binary(jti) do
-    function_exported?(store, :access_token_revoked?, 1) and store.access_token_revoked?(jti)
-  end
-
-  defp access_token_revoked?(_config, _claims), do: false
 
   # Preserve the released UserInfo-specific error text while applying the same
   # host transport hooks and validated RFC 9728 pointer as every other failure.
@@ -281,40 +238,4 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   defp resource_metadata_param(url) when is_binary(url), do: [{"resource_metadata", url}]
   defp resource_metadata_param(_url), do: []
-
-  # ── Engine verify wiring ─────────────────────────────────────────────────
-
-  # Translate the host's `%AttestoPhoenix.Config{}` into the options
-  # `Attesto.Plug.Authenticate` consumes. The DPoP replay/nonce/cert wiring
-  # mirrors the token endpoint so the userinfo endpoint enforces exactly the
-  # same sender-constraint policy on the presented token.
-  defp authenticate_opts(config, resource_metadata) do
-    [config: attesto_config(config), claims_key: @claims_key]
-    |> Keyword.put(:bearer_methods, config.bearer_methods_supported)
-    |> put_optional(:send_error, config.send_error)
-    |> put_optional(:www_authenticate, config.www_authenticate)
-    |> put_optional(:no_store, config.no_store)
-    |> Keyword.merge(Adapter.protected_resource_opts(config))
-    # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it
-    # must also carry the protected-resource metadata pointer when configured.
-    |> put_optional(:resource_metadata, resource_metadata)
-  end
-
-  # The `Attesto.Config` consumed by `Attesto.Token`, derived from the same
-  # `%AttestoPhoenix.Config{}` and carrying the host's principal-kind policy.
-  defp attesto_config(config), do: Config.to_attesto_config(config)
-
-  defp put_optional(opts, _key, nil), do: opts
-  defp put_optional(opts, key, value), do: Keyword.put(opts, key, value)
-
-  defp error_opts(config, resource_metadata, extra) do
-    [
-      send_error: config.send_error,
-      www_authenticate: config.www_authenticate,
-      no_store: config.no_store,
-      resource_metadata: resource_metadata
-    ]
-    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-    |> Keyword.merge(extra)
-  end
 end

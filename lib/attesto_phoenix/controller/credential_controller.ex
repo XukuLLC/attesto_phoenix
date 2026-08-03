@@ -15,15 +15,11 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   import Plug.Conn
 
   alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, SdJwtVc}
-  alias Attesto.Plug.Authenticate
-  alias Attesto.Plug.OAuthError
   alias AttestoPhoenix.Callback
-  alias AttestoPhoenix.{Config, DPoP.Adapter}
+  alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
-  alias AttestoPhoenix.RequestContext
   alias Plug.Conn.Unfetched
 
-  @claims_key :attesto_claims
   @credential_configuration_ids_claim "credential_configuration_ids"
 
   @doc """
@@ -38,39 +34,16 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     config = Config.resolve!()
     resource_metadata = Config.resource_metadata_url(config, conn)
 
-    case RequestContext.check_https(conn, config) do
-      :ok ->
-        conn = Authenticate.call(conn, authenticate_opts(config, resource_metadata))
+    case ProtectedResource.authenticate(conn, config, resource_metadata) do
+      {:ok, conn, claims} ->
+        issue(conn, config, body_params(conn, params), resource_metadata, claims)
 
-        cond do
-          conn.halted ->
-            conn
-
-          access_token_revoked?(config, conn.assigns[@claims_key]) ->
-            OAuthError.unauthorized(
-              conn,
-              scheme_of(conn.assigns[@claims_key]),
-              "invalid_token",
-              error_opts(config, resource_metadata, [])
-            )
-
-          true ->
-            issue(conn, config, body_params(conn, params), resource_metadata)
-        end
-
-      {:error, :insecure_transport} ->
-        OAuthError.unauthorized(
-          conn,
-          :bearer,
-          "invalid_token",
-          error_opts(config, resource_metadata, description: "TLS required")
-        )
+      {:halt, conn} ->
+        conn
     end
   end
 
-  defp issue(conn, config, request, resource_metadata) do
-    claims = conn.assigns[@claims_key]
-
+  defp issue(conn, config, request, resource_metadata, claims) do
     with {:ok, parsed} <- CredentialRequest.parse(request),
          {:ok, credential_configuration_id} <- selector(parsed.selector),
          :ok <- entitled?(claims, credential_configuration_id),
@@ -198,7 +171,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp not_entitled(conn, config, claims, resource_metadata) do
     description = "The access token does not authorize this credential."
-    scheme = scheme_of(claims)
+    scheme = ProtectedResource.scheme_of(claims)
 
     challenge =
       PhoenixOAuthError.format_challenge(
@@ -218,15 +191,6 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   defp body_params(%Plug.Conn{body_params: %Unfetched{}}, fallback), do: fallback
   defp body_params(%Plug.Conn{body_params: body_params}, _fallback) when is_map(body_params), do: body_params
 
-  defp scheme_of(%{"cnf" => %{"jkt" => jkt}}) when is_binary(jkt), do: :dpop
-  defp scheme_of(_claims), do: :bearer
-
-  defp access_token_revoked?(%Config{code_store: store}, %{"jti" => jti}) when is_atom(store) and is_binary(jti) do
-    function_exported?(store, :access_token_revoked?, 1) and store.access_token_revoked?(jti)
-  end
-
-  defp access_token_revoked?(_config, _claims), do: false
-
   defp apply_www_authenticate(conn, %Config{www_authenticate: nil}, challenge),
     do: put_resp_header(conn, "www-authenticate", challenge)
 
@@ -243,28 +207,4 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp resource_metadata_param(url) when is_binary(url), do: [{"resource_metadata", url}]
   defp resource_metadata_param(_url), do: []
-
-  defp authenticate_opts(config, resource_metadata) do
-    [config: Config.to_attesto_config(config), claims_key: @claims_key]
-    |> Keyword.put(:bearer_methods, config.bearer_methods_supported)
-    |> put_optional(:send_error, config.send_error)
-    |> put_optional(:www_authenticate, config.www_authenticate)
-    |> put_optional(:no_store, config.no_store)
-    |> Keyword.merge(Adapter.protected_resource_opts(config))
-    |> put_optional(:resource_metadata, resource_metadata)
-  end
-
-  defp put_optional(opts, _key, nil), do: opts
-  defp put_optional(opts, key, value), do: Keyword.put(opts, key, value)
-
-  defp error_opts(config, resource_metadata, extra) do
-    [
-      send_error: config.send_error,
-      www_authenticate: config.www_authenticate,
-      no_store: config.no_store,
-      resource_metadata: resource_metadata
-    ]
-    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
-    |> Keyword.merge(extra)
-  end
 end
