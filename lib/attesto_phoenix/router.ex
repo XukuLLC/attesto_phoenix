@@ -38,6 +38,8 @@ defmodule AttestoPhoenix.Router do
     * `GET` and `POST /oauth/userinfo` - the UserInfo endpoint (OpenID Connect
       Core 1.0 §5.3); a bearer-authenticated protected resource (RFC 6750
       §2.1/§2.2), omitted with `userinfo: false`.
+    * `POST /credential` - the OID4VCI Credential endpoint, mounted only with
+      `credential_issuance: true`.
     * `GET` and `POST /oauth/end_session` - the end-session endpoint (OpenID
       Connect RP-Initiated Logout 1.0 §2), mounted only with `logout: true`.
     * `GET /oauth/check_session` - the `check_session_iframe` (OpenID Connect
@@ -152,6 +154,10 @@ defmodule AttestoPhoenix.Router do
       equivalent metadata is served separately.
     * `:device` - when `true`, mounts the RFC 8628 device-authorization
       endpoint and verification page. Defaults to `false`.
+    * `:credential_issuance` - when `true`, mounts `POST /credential`, the
+      token-protected OID4VCI Credential endpoint. Defaults to `false`. The
+      host must also configure `:build_credential` and a
+      `:pre_authorized_code_store`.
     * `:ciba` - when `true`, mounts `POST /oauth/bc-authorize`, the OpenID
       Connect CIBA backchannel authentication endpoint. Defaults to `false`.
       The endpoint still fails closed at request time unless the host also
@@ -228,6 +234,7 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController
   alias AttestoPhoenix.Controller.CheckSessionController
+  alias AttestoPhoenix.Controller.CredentialController
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
@@ -278,6 +285,7 @@ defmodule AttestoPhoenix.Router do
   @backchannel_authentication_path @oauth_prefix <> AttestoPhoenix.Config.backchannel_authentication_tail()
   @end_session_path @oauth_prefix <> AttestoPhoenix.Config.end_session_tail()
   @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
+  @credential_path @oauth_prefix <> AttestoPhoenix.Config.credential_tail()
 
   @route_pipeline_classes [:metadata, :interactive, :protocol]
 
@@ -300,6 +308,7 @@ defmodule AttestoPhoenix.Router do
   @backchannel_authentication_controller BackchannelAuthenticationController
   @end_session_controller EndSessionController
   @check_session_controller CheckSessionController
+  @credential_controller CredentialController
 
   @doc false
   defmacro __using__(_opts) do
@@ -319,6 +328,7 @@ defmodule AttestoPhoenix.Router do
 
     registration? = Keyword.get(opts, :registration, false)
     device? = Keyword.get(opts, :device, false)
+    credential_issuance? = Keyword.get(opts, :credential_issuance, false) == true
     ciba? = Keyword.get(opts, :ciba, false)
     logout? = Keyword.get(opts, :logout, false)
     session_management? = Keyword.get(opts, :session_management, false)
@@ -342,6 +352,7 @@ defmodule AttestoPhoenix.Router do
     introspect_path = @introspect_path
     register_path = @register_path
     userinfo_path = @userinfo_path
+    credential_path = @credential_path
     discovery_controller = @discovery_controller
     openid_configuration_controller = @openid_configuration_controller
     jwks_controller = @jwks_controller
@@ -440,6 +451,8 @@ defmodule AttestoPhoenix.Router do
           )
         end
       end
+
+    credential_route = credential_route(credential_issuance?, prefix, credential_path)
 
     # Route-class expansion needs to split the device grant's non-browser
     # authorization request from its resource-owner verification page while
@@ -575,6 +588,7 @@ defmodule AttestoPhoenix.Router do
             post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
             unquote(registration_route)
             unquote(device_authorization_route)
+            unquote(credential_route)
           end
 
           scope "/" do
@@ -647,6 +661,7 @@ defmodule AttestoPhoenix.Router do
 
           unquote(registration_route)
           unquote(device_route)
+          unquote(credential_route)
           unquote(ciba_route)
           unquote(logout_route)
           unquote(session_management_route)
@@ -777,6 +792,14 @@ defmodule AttestoPhoenix.Router do
   defp classed_device_routes(false, _prefix, _auth_path, _auth_controller, _verify_path, _verify_controller) do
     {nil, nil}
   end
+
+  defp credential_route(true, prefix, credential_path) do
+    quote do
+      post(unquote(prefix <> credential_path), unquote(@credential_controller), :create)
+    end
+  end
+
+  defp credential_route(false, _prefix, _credential_path), do: nil
 
   defp openid_configuration_route(true, true, _local_userinfo_path, path, controller) do
     quote do

@@ -171,6 +171,12 @@ defmodule AttestoPhoenix.Config do
       list of scopes on the access token; `requested_claims` is the per-claim
       request map from the OpenID Connect `claims` parameter (`%{}` when none).
       Required only when the UserInfo endpoint is mounted.
+    * `:build_credential` - `(subject, credential_configuration_id,
+      holder_jwk -> {:ok, credential} | {:error, reason})`. Produces the
+      credential type, subject claim values, and optional validity window for
+      the OID4VCI Credential endpoint. The library binds `holder_jwk` as `cnf`
+      and signs the resulting SD-JWT VC. Required when credential issuance is
+      mounted.
     * `:build_id_token_claims` - `(client, subject, granted_scopes,
       requested_claims -> claims_map)`. Produces the host claims merged into an
       ID Token (OpenID Connect Core §3.1.3.6 / §5.5 `id_token` member). Distinct
@@ -567,6 +573,7 @@ defmodule AttestoPhoenix.Config do
     :principal_kinds,
     :build_principal,
     :build_userinfo_claims,
+    :build_credential,
     :build_id_token_claims,
     :client_id,
     :client_jwks,
@@ -701,6 +708,7 @@ defmodule AttestoPhoenix.Config do
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
           build_principal: callback() | nil,
           build_userinfo_claims: callback() | nil,
+          build_credential: callback() | nil,
           build_id_token_claims: callback() | nil,
           client_id: callback() | nil,
           client_jwks: callback() | nil,
@@ -1692,10 +1700,15 @@ defmodule AttestoPhoenix.Config do
   @backchannel_authentication_tail "/bc-authorize"
   @end_session_tail "/end_session"
   @check_session_tail "/check_session"
+  @credential_tail "/credential"
 
   @doc false
   @spec authorize_tail() :: String.t()
   def authorize_tail, do: @authorize_tail
+
+  @doc false
+  @spec credential_tail() :: String.t()
+  def credential_tail, do: @credential_tail
 
   @doc false
   @spec device_authorization_tail() :: String.t()
@@ -2212,6 +2225,38 @@ defmodule AttestoPhoenix.Config do
 
       callback ->
         Callback.invoke(callback, [subject, scopes, requested])
+    end
+  end
+
+  @typedoc "The host-provided values used to issue one SD-JWT VC."
+  @type credential_result :: %{
+          required(:vct) => String.t(),
+          required(:claims) => map(),
+          optional(:valid_from) => integer(),
+          optional(:valid_until) => integer()
+        }
+
+  @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
+  @spec build_credential_fun(t()) :: callback() | nil
+  def build_credential_fun(%__MODULE__{} = config), do: Callback.config_callback(config, :build_credential)
+
+  @doc """
+  Invokes the host's `:build_credential` callback for the authenticated subject,
+  requested credential configuration, and holder public JWK.
+
+  Raises `ArgumentError` when the callback is not configured, so a mounted
+  Credential endpoint cannot silently issue an empty credential.
+  """
+  @spec build_credential(t(), String.t(), String.t(), map()) ::
+          {:ok, credential_result()} | {:error, term()}
+  def build_credential(%__MODULE__{} = config, subject, credential_configuration_id, holder_jwk) do
+    case build_credential_fun(config) do
+      nil ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :build_credential is required to serve the Credential endpoint"
+
+      callback ->
+        Callback.invoke(callback, [subject, credential_configuration_id, holder_jwk])
     end
   end
 
