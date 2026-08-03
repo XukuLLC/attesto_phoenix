@@ -609,6 +609,9 @@ defmodule AttestoPhoenix.Config do
     :device_authorization_path,
     :device_verification_path,
     :device_code_store,
+    :pre_authorized_code_store,
+    :credential_offer_store,
+    :c_nonce_store,
     :end_session_path,
     :logout_session_store,
     :terminate_session,
@@ -758,6 +761,9 @@ defmodule AttestoPhoenix.Config do
           native_apps: keyword(),
           resource_indicators: keyword(),
           device_code_store: module() | nil,
+          pre_authorized_code_store: module() | nil,
+          credential_offer_store: module() | nil,
+          c_nonce_store: module() | nil,
           authenticate_ciba_user: callback() | nil,
           notify_ciba_user: callback() | nil,
           client_ciba_registration: callback() | nil,
@@ -1232,6 +1238,18 @@ defmodule AttestoPhoenix.Config do
   @doc "The configured `Attesto.DeviceCodeStore` module, or `nil`."
   @spec device_code_store(t()) :: module() | nil
   def device_code_store(%__MODULE__{device_code_store: store}), do: store
+
+  @doc "The configured `Attesto.PreAuthorizedCodeStore` module, or `nil`."
+  @spec pre_authorized_code_store(t()) :: module() | nil
+  def pre_authorized_code_store(%__MODULE__{pre_authorized_code_store: store}), do: store
+
+  @doc "The configured `Attesto.CredentialOfferStore` module, or `nil`."
+  @spec credential_offer_store(t()) :: module() | nil
+  def credential_offer_store(%__MODULE__{credential_offer_store: store}), do: store
+
+  @doc "The configured `Attesto.CNonceStore` module, or `nil`."
+  @spec c_nonce_store(t()) :: module() | nil
+  def c_nonce_store(%__MODULE__{c_nonce_store: store}), do: store
 
   @doc """
   The RFC 8628 §3.2 verification URI shown to the user: the configured
@@ -1921,17 +1939,24 @@ defmodule AttestoPhoenix.Config do
   # is enabled (`jwt_bearer: [enabled: true]`).
   @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
   @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
+  @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
   @grant_ciba "urn:openid:params:grant-type:ciba"
 
   @spec grant_types_supported(t()) :: [String.t()]
   def grant_types_supported(%__MODULE__{grant_types_supported: list} = config) when is_list(list) and list != [],
-    do: list |> maybe_add_jwt_bearer(config) |> maybe_add_device_code(config) |> maybe_add_ciba(config)
+    do:
+      list
+      |> maybe_add_jwt_bearer(config)
+      |> maybe_add_device_code(config)
+      |> maybe_add_pre_authorized_code(config)
+      |> maybe_add_ciba(config)
 
   def grant_types_supported(%__MODULE__{} = config),
     do:
       @default_grant_types_supported
       |> maybe_add_jwt_bearer(config)
       |> maybe_add_device_code(config)
+      |> maybe_add_pre_authorized_code(config)
       |> maybe_add_ciba(config)
 
   defp maybe_add_jwt_bearer(list, %__MODULE__{} = config) do
@@ -1943,6 +1968,12 @@ defmodule AttestoPhoenix.Config do
   defp maybe_add_device_code(list, %__MODULE__{} = config) do
     if device_authorization_enabled?(config) and @grant_device_code not in list,
       do: list ++ [@grant_device_code],
+      else: list
+  end
+
+  defp maybe_add_pre_authorized_code(list, %__MODULE__{} = config) do
+    if pre_authorized_code_store(config) != nil and @grant_pre_authorized_code not in list,
+      do: list ++ [@grant_pre_authorized_code],
       else: list
   end
 

@@ -22,6 +22,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   @code_challenge "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
   @redirect_uri "https://client.example/cb"
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
+  @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
   @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
 
   defmodule Keystore do
@@ -618,6 +619,131 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, _, _} = Token.issue(config, device_request(config, dc))
       assert {:error, %OAuthError{error: :invalid_grant}, _} = Token.issue(config, device_request(config, dc))
+    end
+  end
+
+  describe "OID4VCI pre-authorized_code grant" do
+    setup do
+      start_supervised!(Attesto.PreAuthorizedCodeStore.ETS)
+      Attesto.PreAuthorizedCodeStore.ETS.reset()
+      :ok
+    end
+
+    defp pre_authorized_config(overrides \\ []) do
+      config(
+        [
+          pre_authorized_code_store: Attesto.PreAuthorizedCodeStore.ETS,
+          authorize_scope: fn _client, requested -> {:ok, requested} end
+        ] ++ overrides
+      )
+    end
+
+    defp issue_pre_authorized_code(opts \\ []) do
+      attrs = %{
+        subject: "user-1",
+        credential_configuration_ids: ["UniversityDegreeCredential"],
+        authorized_scopes: ["credential"],
+        tx_code: Keyword.get(opts, :tx_code)
+      }
+
+      {:ok, code} = Attesto.PreAuthorizedCode.issue(Attesto.PreAuthorizedCodeStore.ETS, attrs, opts)
+      code
+    end
+
+    defp pre_authorized_request(config, code, params \\ %{}, overrides \\ []) do
+      request(
+        config,
+        Keyword.merge(
+          [
+            grant_type: @grant_pre_authorized_code,
+            params: Map.put(params, "pre-authorized_code", code)
+          ],
+          overrides
+        )
+      )
+    end
+
+    test "redeems the offer and binds credential_configuration_ids into the access token" do
+      config = pre_authorized_config()
+      code = issue_pre_authorized_code()
+
+      assert {:ok, response, [%Event{name: :token_issued, grant_type: "pre-authorized_code"}]} =
+               Token.issue(config, pre_authorized_request(config, code))
+
+      assert is_binary(response.access_token)
+      assert response.scope == "credential"
+      assert claim!(response.access_token, "sub") == "oc_user-1"
+      assert claim!(response.access_token, "credential_configuration_ids") == ["UniversityDegreeCredential"]
+    end
+
+    test "a public client with no client authentication may redeem the grant" do
+      config = pre_authorized_config()
+      code = issue_pre_authorized_code()
+      public_client = Map.put(@client, :public?, true)
+
+      request =
+        pre_authorized_request(config, code, %{},
+          client: public_client,
+          client_auth_method: :none
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, request)
+      assert response.scope == "credential"
+    end
+
+    test "an unknown or expired code returns invalid_grant" do
+      config = pre_authorized_config()
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+               Token.issue(config, pre_authorized_request(config, "unknown"))
+
+      expired = issue_pre_authorized_code(ttl: 0)
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+               Token.issue(config, pre_authorized_request(config, expired))
+    end
+
+    test "transaction-code failures return invalid_grant and a correct code succeeds" do
+      config = pre_authorized_config()
+
+      required = issue_pre_authorized_code(tx_code: "1234")
+
+      assert {:error, %OAuthError{error: :invalid_grant, error_description: "transaction code required"}, _events} =
+               Token.issue(config, pre_authorized_request(config, required))
+
+      wrong = issue_pre_authorized_code(tx_code: "1234")
+
+      assert {:error, %OAuthError{error: :invalid_grant, error_description: "transaction code mismatch"}, _events} =
+               Token.issue(config, pre_authorized_request(config, wrong, %{"tx_code" => "9999"}))
+
+      correct = issue_pre_authorized_code(tx_code: "1234")
+
+      assert {:ok, response, _events} =
+               Token.issue(config, pre_authorized_request(config, correct, %{"tx_code" => "1234"}))
+
+      assert response.scope == "credential"
+    end
+
+    test "a redeemed code cannot be used twice" do
+      config = pre_authorized_config()
+      code = issue_pre_authorized_code()
+
+      assert {:ok, _response, _events} = Token.issue(config, pre_authorized_request(config, code))
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+               Token.issue(config, pre_authorized_request(config, code))
+    end
+
+    test "grant_types_supported is enabled by the configured store" do
+      assert @grant_pre_authorized_code in Config.grant_types_supported(pre_authorized_config())
+      refute @grant_pre_authorized_code in Config.grant_types_supported(config())
+    end
+
+    test "a missing store reports an unsupported grant" do
+      config = config(grant_types_supported: [@grant_pre_authorized_code])
+
+      assert {:error, %OAuthError{error: :unsupported_grant_type}, _events} =
+               Token.issue(config, pre_authorized_request(config, "unknown"))
     end
   end
 

@@ -77,6 +77,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 8628 §3.4: the device authorization grant token request.
   @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
 
+  # OID4VCI §6.1: the pre-authorized code grant token request.
+  @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+
   # OpenID Connect CIBA Core 1.0 §10.1: the CIBA grant token request.
   @grant_ciba "urn:openid:params:grant-type:ciba"
 
@@ -349,6 +352,34 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
            ) do
       issued = token_issued_event(request, scope, "device_code", token_type, binding)
       maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued], "device_code")
+    end
+  end
+
+  # OID4VCI §6.1: redeem the offer's pre-authorized code and mint the access
+  # token that protects the credential endpoint. This grant is intentionally
+  # available to public clients; the code itself is the wallet's grant
+  # credential. The offer's credential configuration IDs ride in the access
+  # token so the credential endpoint can enforce entitlement.
+  defp dispatch(%Request{grant_type: @grant_pre_authorized_code} = request) do
+    %{config: config, client: client, params: params} = request
+
+    with {:ok, code} <- require_param(params, "pre-authorized_code"),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
+         redemption = redeem_pre_authorized_code(request, code, params),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
+         {:ok, grant} <- redemption,
+         {:ok, scope} <- authorize_scope(config, client, Enum.join(grant.authorized_scopes, " ")),
+         {:ok, response} <-
+           mint(
+             request,
+             grant.subject,
+             scope,
+             token_type,
+             binding,
+             %{"credential_configuration_ids" => grant.credential_configuration_ids},
+             []
+           ) do
+      {:ok, response, [token_issued_event(request, scope, "pre-authorized_code", token_type, binding)]}
     end
   end
 
@@ -729,6 +760,35 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case DeviceCode.redeem(store, device_code, params, interval: interval) do
       {:ok, grant} -> {:ok, grant}
       {:error, reason} -> {:error, device_grant_error(reason)}
+    end
+  end
+
+  defp redeem_pre_authorized_code(%Request{config: config}, code, params) do
+    case grant_store(config, :pre_authorized_code_store) do
+      store when is_atom(store) and not is_nil(store) ->
+        tx_params =
+          if Map.has_key?(params, "tx_code"),
+            do: %{tx_code: params["tx_code"]},
+            else: %{}
+
+        case Attesto.PreAuthorizedCode.redeem(store, code, tx_params) do
+          {:ok, grant} -> {:ok, grant}
+          {:error, reason} -> {:error, pre_authorized_code_error(reason)}
+        end
+
+      _ ->
+        {:error, error(@error_unsupported_grant_type, "pre-authorized_code grant is not configured")}
+    end
+  end
+
+  defp pre_authorized_code_error(reason) do
+    case reason do
+      :invalid_grant -> error(@error_invalid_grant, "the pre-authorized code is invalid")
+      :expired -> error(@error_invalid_grant, "the pre-authorized code has expired")
+      :tx_code_required -> error(@error_invalid_grant, "transaction code required")
+      :tx_code_mismatch -> error(@error_invalid_grant, "transaction code mismatch")
+      :tx_code_unexpected -> error(@error_invalid_grant, "transaction code was not expected")
+      _ -> error(@error_invalid_grant, "the pre-authorized code is invalid")
     end
   end
 
@@ -1286,6 +1346,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `:authorize_scope` callback takes the client and the requested scope and
   # returns the granted scope or `{:error, :invalid_scope}` (RFC 6749 §5.2).
   defp authorize_scope(config, client, requested) do
+    # The OID4VCI pre-authorized grant presents its authorized scopes as one
+    # joined value at the dispatch boundary; callbacks retain the established
+    # list-of-scope-values contract.
+    requested = if is_binary(requested), do: String.split(requested, " ", trim: true), else: requested
+
     case invoke(Config.authorize_scope_fun(config), [host_client(client), requested]) do
       {:ok, scope} when is_list(scope) -> {:ok, scope}
       {:error, _reason} -> {:error, error(@error_invalid_scope, "scope not permitted")}
