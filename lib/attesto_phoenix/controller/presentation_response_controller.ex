@@ -1,0 +1,86 @@
+defmodule AttestoPhoenix.Controller.PresentationResponseController do
+  @moduledoc """
+  Public OID4VP direct-post response endpoint.
+
+  The endpoint accepts the DCQL response map either directly as JSON or as the
+  JSON string carried by an `application/x-www-form-urlencoded` `vp_token`
+  field. All verification failures use the same public error response.
+  """
+
+  use Phoenix.Controller, formats: [:json]
+
+  alias Attesto.PresentationSession
+  alias AttestoPhoenix.{Config, OAuthError, RequestContext}
+  alias Plug.Conn.Unfetched
+
+  @doc "Verify and atomically complete an OID4VP presentation session."
+  @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def create(conn, _params) do
+    config = Config.resolve!()
+    conn = OAuthError.no_store(conn, config)
+
+    with :ok <- check_https(conn, config),
+         {:ok, store} <- presentation_session_store(config),
+         {:ok, state, vp_token} <- response(conn.body_params),
+         {:ok, _results} <- verify_response(store, state, vp_token) do
+      json(conn, %{})
+    else
+      _error -> invalid_request(conn, config)
+    end
+  end
+
+  defp response(%Unfetched{}), do: {:error, :malformed}
+
+  defp response(params) when is_map(params) do
+    with state when is_binary(state) and state != "" <- param(params, "state"),
+         {:ok, vp_token} <- decode_vp_token(param(params, "vp_token")) do
+      {:ok, state, vp_token}
+    else
+      _ -> {:error, :malformed}
+    end
+  end
+
+  defp response(_params), do: {:error, :malformed}
+
+  defp decode_vp_token(%{} = vp_token), do: {:ok, vp_token}
+
+  defp decode_vp_token(vp_token) when is_binary(vp_token) do
+    case JSON.decode(vp_token) do
+      {:ok, %{} = decoded} -> {:ok, decoded}
+      _ -> {:error, :malformed}
+    end
+  end
+
+  defp decode_vp_token(_vp_token), do: {:error, :malformed}
+
+  defp param(params, "state"), do: Map.get(params, "state") || Map.get(params, :state)
+  defp param(params, "vp_token"), do: Map.get(params, "vp_token") || Map.get(params, :vp_token)
+
+  defp verify_response(store, state, vp_token) do
+    PresentationSession.verify_response(
+      store,
+      {:state, state},
+      vp_token,
+      now: System.system_time(:second)
+    )
+  rescue
+    ArgumentError -> {:error, :malformed}
+  end
+
+  defp check_https(conn, config), do: RequestContext.check_https(conn, config)
+
+  defp presentation_session_store(config) do
+    case Config.presentation_session_store(config) do
+      store when is_atom(store) and not is_nil(store) -> {:ok, store}
+      _ -> {:error, :misconfigured}
+    end
+  end
+
+  defp invalid_request(conn, config) do
+    OAuthError.render(
+      conn,
+      OAuthError.new(:invalid_request, nil, status: 400),
+      config: config
+    )
+  end
+end

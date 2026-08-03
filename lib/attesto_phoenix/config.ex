@@ -445,6 +445,13 @@ defmodule AttestoPhoenix.Config do
       Defaults to the single-node ETS replay cache.
     * `:nonce_store` - `Attesto.DPoP.NonceStore` implementation. Defaults to
       the single-node ETS nonce store.
+    * `:presentation_session_store` - module implementing
+      `Attesto.PresentationSessionStore` for verifier-side OID4VP request state.
+      Required when the host mounts the `presentation: true` routes or calls
+      `AttestoPhoenix.Verifier`.
+    * `:verifier_client_id` - verifier identifier placed in the presentation
+      request and used as the holder Key Binding JWT audience. Required when
+      creating verifier presentation requests.
     * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`. The
       sweeper is not started if unset.
     * `:table_prefix` - optional Ecto schema/table prefix for the generated
@@ -623,6 +630,8 @@ defmodule AttestoPhoenix.Config do
     :pre_authorized_code_store,
     :credential_offer_store,
     :c_nonce_store,
+    :presentation_session_store,
+    :verifier_client_id,
     :credential_configurations_supported,
     :end_session_path,
     :logout_session_store,
@@ -777,6 +786,8 @@ defmodule AttestoPhoenix.Config do
           pre_authorized_code_store: module() | nil,
           credential_offer_store: module() | nil,
           c_nonce_store: module() | nil,
+          presentation_session_store: module() | nil,
+          verifier_client_id: String.t() | nil,
           credential_configurations_supported: map() | nil,
           authenticate_ciba_user: callback() | nil,
           notify_ciba_user: callback() | nil,
@@ -1265,6 +1276,14 @@ defmodule AttestoPhoenix.Config do
   @spec c_nonce_store(t()) :: module() | nil
   def c_nonce_store(%__MODULE__{c_nonce_store: store}), do: store
 
+  @doc "The configured `Attesto.PresentationSessionStore` module, or `nil`."
+  @spec presentation_session_store(t()) :: module() | nil
+  def presentation_session_store(%__MODULE__{presentation_session_store: store}), do: store
+
+  @doc "The verifier client identifier used as the OID4VP presentation audience."
+  @spec verifier_client_id(t()) :: String.t() | nil
+  def verifier_client_id(%__MODULE__{verifier_client_id: client_id}), do: client_id
+
   @doc "The configured OID4VCI credential-configuration catalog, or `nil`."
   @spec credential_configurations_supported(t()) :: map() | nil
   def credential_configurations_supported(%__MODULE__{credential_configurations_supported: configurations}),
@@ -1713,6 +1732,8 @@ defmodule AttestoPhoenix.Config do
   @check_session_tail "/check_session"
   @credential_tail "/credential"
   @nonce_tail "/nonce"
+  @presentation_request_tail "/presentation_request"
+  @presentation_response_tail "/presentation_response"
 
   @doc false
   @spec authorize_tail() :: String.t()
@@ -1725,6 +1746,32 @@ defmodule AttestoPhoenix.Config do
   @doc false
   @spec nonce_tail() :: String.t()
   def nonce_tail, do: @nonce_tail
+
+  @doc false
+  @spec presentation_request_tail() :: String.t()
+  def presentation_request_tail, do: @presentation_request_tail
+
+  @doc false
+  @spec presentation_response_tail() :: String.t()
+  def presentation_response_tail, do: @presentation_response_tail
+
+  @doc "The resolved request path of the OID4VP request-object endpoint."
+  @spec presentation_request_path(t()) :: String.t()
+  def presentation_request_path(%__MODULE__{} = config), do: resolve_path(nil, config, @presentation_request_tail)
+
+  @doc "The resolved request path of the OID4VP direct-post response endpoint."
+  @spec presentation_response_path(t()) :: String.t()
+  def presentation_response_path(%__MODULE__{} = config), do: resolve_path(nil, config, @presentation_response_tail)
+
+  @doc "Absolute URL of the OID4VP request-object endpoint."
+  @spec presentation_request_endpoint_url(t()) :: String.t()
+  def presentation_request_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, presentation_request_path(config))
+
+  @doc "Absolute URL of the OID4VP direct-post response endpoint."
+  @spec presentation_response_endpoint_url(t()) :: String.t()
+  def presentation_response_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, presentation_response_path(config))
 
   @doc false
   @spec device_authorization_tail() :: String.t()
@@ -2560,6 +2607,7 @@ defmodule AttestoPhoenix.Config do
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
+    validate_verifier_client_id!(config.verifier_client_id)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
       raise ArgumentError,
@@ -3194,4 +3242,13 @@ defmodule AttestoPhoenix.Config do
   # set it must be an absolute path reference.
   defp validate_optional_path!(_key, nil), do: :ok
   defp validate_optional_path!(key, value), do: validate_path!(key, value)
+
+  defp validate_verifier_client_id!(nil), do: :ok
+  defp validate_verifier_client_id!(client_id) when is_binary(client_id) and client_id != "", do: :ok
+
+  defp validate_verifier_client_id!(client_id) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_client_id must be a non-empty string when configured; " <>
+            "got #{inspect(client_id)}"
+  end
 end

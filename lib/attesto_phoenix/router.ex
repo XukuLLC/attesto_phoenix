@@ -42,6 +42,10 @@ defmodule AttestoPhoenix.Router do
       §2.1/§2.2), omitted with `userinfo: false`.
     * `POST /oauth/credential` - the OID4VCI Credential endpoint, mounted only
       with `credential_issuance: true`.
+    * `GET /oauth/presentation_request/:id` - the OID4VP signed request-object
+      endpoint, mounted only with `presentation: true`.
+    * `POST /oauth/presentation_response` - the OID4VP direct-post response
+      endpoint, mounted only with `presentation: true`.
     * `GET /.well-known/openid-credential-issuer` - OID4VCI Credential Issuer
       Metadata, mounted with `credential_issuance: true`.
     * `GET` and `POST /oauth/end_session` - the end-session endpoint (OpenID
@@ -125,7 +129,7 @@ defmodule AttestoPhoenix.Router do
           and check-session routes.
         * `:protocol` - token, PAR, revocation, introspection, registration
           management, UserInfo, device authorization, and CIBA backchannel
-          authentication routes.
+          authentication routes, plus the public OID4VP wallet endpoints.
 
       Unknown or duplicate class keys and malformed values raise
       `ArgumentError` during router compilation. When this option is absent,
@@ -164,6 +168,10 @@ defmodule AttestoPhoenix.Router do
       `false`. The host must also configure `:build_credential`, a
       `:pre_authorized_code_store`, and
       `:credential_configurations_supported`.
+    * `:presentation` - when `true`, independently mounts the public OID4VP
+      request-object and direct-post response endpoints. Defaults to `false`.
+      The host must configure `:presentation_session_store` and
+      `:verifier_client_id`.
     * `:ciba` - when `true`, mounts `POST /oauth/bc-authorize`, the OpenID
       Connect CIBA backchannel authentication endpoint. Defaults to `false`.
       The endpoint still fails closed at request time unless the host also
@@ -251,6 +259,8 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.NonceController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
+  alias AttestoPhoenix.Controller.PresentationRequestController
+  alias AttestoPhoenix.Controller.PresentationResponseController
   alias AttestoPhoenix.Controller.ProtectedResourceController
   alias AttestoPhoenix.Controller.RegistrationController
   alias AttestoPhoenix.Controller.RevocationController
@@ -299,6 +309,8 @@ defmodule AttestoPhoenix.Router do
   @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
   @credential_path @oauth_prefix <> AttestoPhoenix.Config.credential_tail()
   @nonce_path @oauth_prefix <> AttestoPhoenix.Config.nonce_tail()
+  @presentation_request_path @oauth_prefix <> AttestoPhoenix.Config.presentation_request_tail()
+  @presentation_response_path @oauth_prefix <> AttestoPhoenix.Config.presentation_response_tail()
 
   @route_pipeline_classes [:metadata, :interactive, :protocol]
 
@@ -323,6 +335,8 @@ defmodule AttestoPhoenix.Router do
   @check_session_controller CheckSessionController
   @credential_controller CredentialController
   @nonce_controller NonceController
+  @presentation_request_controller PresentationRequestController
+  @presentation_response_controller PresentationResponseController
   @credential_issuer_metadata_controller CredentialIssuerMetadataController
 
   @doc false
@@ -344,6 +358,7 @@ defmodule AttestoPhoenix.Router do
     registration? = Keyword.get(opts, :registration, false)
     device? = Keyword.get(opts, :device, false)
     credential_issuance? = Keyword.get(opts, :credential_issuance, false) == true
+    presentation? = Keyword.get(opts, :presentation, false) == true
     ciba? = Keyword.get(opts, :ciba, false)
     logout? = Keyword.get(opts, :logout, false)
     session_management? = Keyword.get(opts, :session_management, false)
@@ -368,6 +383,8 @@ defmodule AttestoPhoenix.Router do
     introspect_path = @introspect_path
     register_path = @register_path
     userinfo_path = @userinfo_path
+    presentation_request_path = @presentation_request_path
+    presentation_response_path = @presentation_response_path
     credential_path = @credential_path
     nonce_path = @nonce_path
     discovery_controller = @discovery_controller
@@ -472,6 +489,8 @@ defmodule AttestoPhoenix.Router do
 
     credential_route = credential_route(credential_issuance?, prefix, credential_path)
     nonce_route = nonce_route(credential_issuance?, prefix, nonce_path)
+    presentation_request_route = presentation_request_route(presentation?, prefix, presentation_request_path)
+    presentation_response_route = presentation_response_route(presentation?, prefix, presentation_response_path)
 
     credential_issuer_metadata_route =
       credential_issuer_metadata_route(
@@ -617,6 +636,8 @@ defmodule AttestoPhoenix.Router do
             unquote(device_authorization_route)
             unquote(nonce_route)
             unquote(credential_route)
+            unquote(presentation_request_route)
+            unquote(presentation_response_route)
           end
 
           scope "/" do
@@ -692,6 +713,8 @@ defmodule AttestoPhoenix.Router do
           unquote(device_route)
           unquote(nonce_route)
           unquote(credential_route)
+          unquote(presentation_request_route)
+          unquote(presentation_response_route)
           unquote(ciba_route)
           unquote(logout_route)
           unquote(session_management_route)
@@ -838,6 +861,30 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp nonce_route(false, _prefix, _nonce_path), do: nil
+
+  defp presentation_request_route(true, prefix, presentation_request_path) do
+    quote do
+      get(
+        unquote(prefix <> presentation_request_path <> "/:id"),
+        unquote(@presentation_request_controller),
+        :show
+      )
+    end
+  end
+
+  defp presentation_request_route(false, _prefix, _presentation_request_path), do: nil
+
+  defp presentation_response_route(true, prefix, presentation_response_path) do
+    quote do
+      post(
+        unquote(prefix <> presentation_response_path),
+        unquote(@presentation_response_controller),
+        :create
+      )
+    end
+  end
+
+  defp presentation_response_route(false, _prefix, _presentation_response_path), do: nil
 
   defp credential_issuer_metadata_route(true, path, controller) do
     quote do

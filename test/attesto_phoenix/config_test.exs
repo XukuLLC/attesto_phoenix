@@ -1108,6 +1108,43 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe "OID4VP verifier configuration" do
+    test "exposes the configured store, client id, and convention-derived URLs" do
+      built =
+        config(
+          oauth_path_prefix: "/wallet/oauth",
+          presentation_session_store: __MODULE__.PresentationStore,
+          verifier_client_id: "verifier-client-1"
+        )
+
+      assert Config.presentation_session_store(built) == __MODULE__.PresentationStore
+      assert Config.verifier_client_id(built) == "verifier-client-1"
+      assert Config.presentation_request_path(built) == "/wallet/oauth/presentation_request"
+      assert Config.presentation_response_path(built) == "/wallet/oauth/presentation_response"
+
+      assert Config.presentation_request_endpoint_url(built) ==
+               "https://issuer.example/wallet/oauth/presentation_request"
+
+      assert Config.presentation_response_endpoint_url(built) ==
+               "https://issuer.example/wallet/oauth/presentation_response"
+    end
+
+    test "keeps verifier-only settings optional for non-presentation hosts" do
+      built = config()
+
+      assert Config.presentation_session_store(built) == nil
+      assert Config.verifier_client_id(built) == nil
+    end
+
+    test "rejects a configured verifier client id that is not a non-empty string" do
+      for invalid <- ["", :verifier, 123] do
+        assert_raise ArgumentError, ~r/:verifier_client_id must be a non-empty string/, fn ->
+          config(verifier_client_id: invalid)
+        end
+      end
+    end
+  end
+
   describe "front-channel logout client metadata (Front-Channel Logout 1.0 §2)" do
     test "an https frontchannel_logout_uri is returned" do
       built = config(client_frontchannel_logout_uri: fn client -> client.fc end)
