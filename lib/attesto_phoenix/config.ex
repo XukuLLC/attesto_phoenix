@@ -177,6 +177,10 @@ defmodule AttestoPhoenix.Config do
       the OID4VCI Credential endpoint. The library binds `holder_jwk` as `cnf`
       and signs the resulting SD-JWT VC. Required when credential issuance is
       mounted.
+    * `:credential_configurations_supported` - map of OID4VCI credential
+      configuration identifiers to the configuration metadata advertised by
+      the Credential Issuer Metadata endpoint. Required when credential
+      issuance is mounted.
     * `:build_id_token_claims` - `(client, subject, granted_scopes,
       requested_claims -> claims_map)`. Produces the host claims merged into an
       ID Token (OpenID Connect Core §3.1.3.6 / §5.5 `id_token` member). Distinct
@@ -619,6 +623,7 @@ defmodule AttestoPhoenix.Config do
     :pre_authorized_code_store,
     :credential_offer_store,
     :c_nonce_store,
+    :credential_configurations_supported,
     :end_session_path,
     :logout_session_store,
     :terminate_session,
@@ -772,6 +777,7 @@ defmodule AttestoPhoenix.Config do
           pre_authorized_code_store: module() | nil,
           credential_offer_store: module() | nil,
           c_nonce_store: module() | nil,
+          credential_configurations_supported: map() | nil,
           authenticate_ciba_user: callback() | nil,
           notify_ciba_user: callback() | nil,
           client_ciba_registration: callback() | nil,
@@ -1259,6 +1265,11 @@ defmodule AttestoPhoenix.Config do
   @spec c_nonce_store(t()) :: module() | nil
   def c_nonce_store(%__MODULE__{c_nonce_store: store}), do: store
 
+  @doc "The configured OID4VCI credential-configuration catalog, or `nil`."
+  @spec credential_configurations_supported(t()) :: map() | nil
+  def credential_configurations_supported(%__MODULE__{credential_configurations_supported: configurations}),
+    do: configurations
+
   @doc """
   The RFC 8628 §3.2 verification URI shown to the user: the configured
   `device_authorization: [verification_uri: ...]` override, otherwise the
@@ -1701,6 +1712,7 @@ defmodule AttestoPhoenix.Config do
   @end_session_tail "/end_session"
   @check_session_tail "/check_session"
   @credential_tail "/credential"
+  @nonce_tail "/nonce"
 
   @doc false
   @spec authorize_tail() :: String.t()
@@ -1709,6 +1721,10 @@ defmodule AttestoPhoenix.Config do
   @doc false
   @spec credential_tail() :: String.t()
   def credential_tail, do: @credential_tail
+
+  @doc false
+  @spec nonce_tail() :: String.t()
+  def nonce_tail, do: @nonce_tail
 
   @doc false
   @spec device_authorization_tail() :: String.t()

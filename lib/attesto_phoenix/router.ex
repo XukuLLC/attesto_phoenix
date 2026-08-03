@@ -35,11 +35,15 @@ defmodule AttestoPhoenix.Router do
       mounted only when registration is enabled (see `:registration` below).
     * `DELETE /oauth/register/:client_id` - dynamic client registration
       management cleanup (RFC 7592 §2), mounted with registration.
+    * `POST /oauth/nonce` - the OID4VCI c_nonce endpoint, mounted only with
+      `credential_issuance: true`.
     * `GET` and `POST /oauth/userinfo` - the UserInfo endpoint (OpenID Connect
       Core 1.0 §5.3); a bearer-authenticated protected resource (RFC 6750
       §2.1/§2.2), omitted with `userinfo: false`.
-    * `POST /credential` - the OID4VCI Credential endpoint, mounted only with
-      `credential_issuance: true`.
+    * `POST /oauth/credential` - the OID4VCI Credential endpoint, mounted only
+      with `credential_issuance: true`.
+    * `GET /.well-known/openid-credential-issuer` - OID4VCI Credential Issuer
+      Metadata, mounted with `credential_issuance: true`.
     * `GET` and `POST /oauth/end_session` - the end-session endpoint (OpenID
       Connect RP-Initiated Logout 1.0 §2), mounted only with `logout: true`.
     * `GET /oauth/check_session` - the `check_session_iframe` (OpenID Connect
@@ -115,7 +119,8 @@ defmodule AttestoPhoenix.Router do
       the `:pipeline` default. The classes are:
 
         * `:metadata` - authorization-server discovery, OpenID configuration,
-          JWKS, and protected-resource metadata routes owned by this macro.
+          Credential Issuer Metadata, JWKS, and protected-resource metadata
+          routes owned by this macro.
         * `:interactive` - authorization, device verification, end-session,
           and check-session routes.
         * `:protocol` - token, PAR, revocation, introspection, registration
@@ -154,10 +159,11 @@ defmodule AttestoPhoenix.Router do
       equivalent metadata is served separately.
     * `:device` - when `true`, mounts the RFC 8628 device-authorization
       endpoint and verification page. Defaults to `false`.
-    * `:credential_issuance` - when `true`, mounts `POST /credential`, the
-      token-protected OID4VCI Credential endpoint. Defaults to `false`. The
-      host must also configure `:build_credential` and a
-      `:pre_authorized_code_store`.
+    * `:credential_issuance` - when `true`, mounts the OID4VCI nonce,
+      credential, and Credential Issuer Metadata endpoints. Defaults to
+      `false`. The host must also configure `:build_credential`, a
+      `:pre_authorized_code_store`, and
+      `:credential_configurations_supported`.
     * `:ciba` - when `true`, mounts `POST /oauth/bc-authorize`, the OpenID
       Connect CIBA backchannel authentication endpoint. Defaults to `false`.
       The endpoint still fails closed at request time unless the host also
@@ -235,12 +241,14 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController
   alias AttestoPhoenix.Controller.CheckSessionController
   alias AttestoPhoenix.Controller.CredentialController
+  alias AttestoPhoenix.Controller.CredentialIssuerMetadataController
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
   alias AttestoPhoenix.Controller.EndSessionController
   alias AttestoPhoenix.Controller.IntrospectionController
   alias AttestoPhoenix.Controller.JWKSController
+  alias AttestoPhoenix.Controller.NonceController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
   alias AttestoPhoenix.Controller.PARController
   alias AttestoPhoenix.Controller.ProtectedResourceController
@@ -265,6 +273,10 @@ defmodule AttestoPhoenix.Router do
   # challenge the protected-resource plugs emit.
   @protected_resource_path "/.well-known/oauth-protected-resource"
 
+  # OID4VCI §11.2 anchors Credential Issuer Metadata at the host root, so this
+  # route is not subject to the OAuth endpoint `:prefix`.
+  @credential_issuer_metadata_path "/.well-known/openid-credential-issuer"
+
   # The OAuth endpoints live under the host-chosen `:prefix`. These are the
   # path tails appended to it. They derive from the SAME tail constants
   # `AttestoPhoenix.Config` resolves its advertised endpoint URLs from, joined
@@ -286,6 +298,7 @@ defmodule AttestoPhoenix.Router do
   @end_session_path @oauth_prefix <> AttestoPhoenix.Config.end_session_tail()
   @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
   @credential_path @oauth_prefix <> AttestoPhoenix.Config.credential_tail()
+  @nonce_path @oauth_prefix <> AttestoPhoenix.Config.nonce_tail()
 
   @route_pipeline_classes [:metadata, :interactive, :protocol]
 
@@ -309,6 +322,8 @@ defmodule AttestoPhoenix.Router do
   @end_session_controller EndSessionController
   @check_session_controller CheckSessionController
   @credential_controller CredentialController
+  @nonce_controller NonceController
+  @credential_issuer_metadata_controller CredentialIssuerMetadataController
 
   @doc false
   defmacro __using__(_opts) do
@@ -343,6 +358,7 @@ defmodule AttestoPhoenix.Router do
       |> normalize_protected_resource_paths!()
 
     discovery_path = @discovery_path
+    credential_issuer_metadata_path = @credential_issuer_metadata_path
     openid_configuration_path = @openid_configuration_path
     jwks_path = @jwks_path
     authorize_path = @authorize_path
@@ -353,7 +369,9 @@ defmodule AttestoPhoenix.Router do
     register_path = @register_path
     userinfo_path = @userinfo_path
     credential_path = @credential_path
+    nonce_path = @nonce_path
     discovery_controller = @discovery_controller
+    credential_issuer_metadata_controller = @credential_issuer_metadata_controller
     openid_configuration_controller = @openid_configuration_controller
     jwks_controller = @jwks_controller
     authorize_controller = @authorize_controller
@@ -453,6 +471,14 @@ defmodule AttestoPhoenix.Router do
       end
 
     credential_route = credential_route(credential_issuance?, prefix, credential_path)
+    nonce_route = nonce_route(credential_issuance?, prefix, nonce_path)
+
+    credential_issuer_metadata_route =
+      credential_issuer_metadata_route(
+        credential_issuance?,
+        credential_issuer_metadata_path,
+        credential_issuer_metadata_controller
+      )
 
     # Route-class expansion needs to split the device grant's non-browser
     # authorization request from its resource-owner verification page while
@@ -566,6 +592,7 @@ defmodule AttestoPhoenix.Router do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :metadata))
 
             get(unquote(discovery_path), unquote(discovery_controller), :show)
+            unquote(credential_issuer_metadata_route)
             unquote(openid_configuration_route)
             get(unquote(jwks_path), unquote(jwks_controller), :show)
             unquote(protected_resource_root_route)
@@ -588,6 +615,7 @@ defmodule AttestoPhoenix.Router do
             post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
             unquote(registration_route)
             unquote(device_authorization_route)
+            unquote(nonce_route)
             unquote(credential_route)
           end
 
@@ -627,6 +655,7 @@ defmodule AttestoPhoenix.Router do
           # unauthenticated public documents. A path-bearing issuer requires the
           # host-mounted derived locations documented above.
           get(unquote(discovery_path), unquote(discovery_controller), :show)
+          unquote(credential_issuer_metadata_route)
           unquote(openid_configuration_route)
           get(unquote(jwks_path), unquote(jwks_controller), :show)
 
@@ -661,6 +690,7 @@ defmodule AttestoPhoenix.Router do
 
           unquote(registration_route)
           unquote(device_route)
+          unquote(nonce_route)
           unquote(credential_route)
           unquote(ciba_route)
           unquote(logout_route)
@@ -800,6 +830,22 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp credential_route(false, _prefix, _credential_path), do: nil
+
+  defp nonce_route(true, prefix, nonce_path) do
+    quote do
+      post(unquote(prefix <> nonce_path), unquote(@nonce_controller), :create)
+    end
+  end
+
+  defp nonce_route(false, _prefix, _nonce_path), do: nil
+
+  defp credential_issuer_metadata_route(true, path, controller) do
+    quote do
+      get(unquote(path), unquote(controller), :show)
+    end
+  end
+
+  defp credential_issuer_metadata_route(false, _path, _controller), do: nil
 
   defp openid_configuration_route(true, true, _local_userinfo_path, path, controller) do
     quote do
