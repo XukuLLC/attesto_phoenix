@@ -17,9 +17,6 @@ defmodule AttestoPhoenix.Controller.StatusListController do
   alias Attesto.StatusList
   alias AttestoPhoenix.{Config, OAuthError, RequestContext}
 
-  @oauth_prefix "/oauth"
-  @status_list_path @oauth_prefix <> Config.status_list_tail()
-
   @content_type "application/statuslist+jwt"
 
   # RFC-to-be "ttl" claim / advertised Cache-Control max-age: how long a
@@ -30,7 +27,7 @@ defmodule AttestoPhoenix.Controller.StatusListController do
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
     config = Config.resolve!()
-    uri = endpoint_url(config.issuer, @status_list_path <> "/" <> id)
+    uri = Config.status_list_endpoint_url(config) <> "/" <> id
 
     with :ok <- check_https(conn, config),
          {:ok, store} <- status_list_store(config),
@@ -60,13 +57,6 @@ defmodule AttestoPhoenix.Controller.StatusListController do
       store when is_atom(store) and not is_nil(store) -> {:ok, store}
       _ -> :error
     end
-  end
-
-  defp endpoint_url(issuer, path) do
-    issuer
-    |> URI.parse()
-    |> URI.merge(path)
-    |> URI.to_string()
   end
 
   defp put_cache_control(conn) do

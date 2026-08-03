@@ -330,6 +330,28 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
              }
     end
 
+    test "honors an atom-key nil credential format without falling back to the string key" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      configurations = %{
+        @configuration_id => %{"format" => "vc+sd-jwt", format: nil, vct: @vct}
+      }
+
+      put_config(Keyword.put(config, :credential_configurations_supported, configurations))
+
+      nonce = CNonceStore.issue(60)
+      response = post_credential(mint_token(), credential_request(nonce))
+
+      assert response.status == 400
+
+      assert body(response) == %{
+               "error" => "invalid_credential_request",
+               "error_description" => "credential unavailable"
+             }
+
+      refute_received {:credential_requested, _, _, _}
+    end
+
     test "the opt-in router mounts POST /credential" do
       response = CredentialRouter.call(conn(:post, @endpoint_path), [])
 

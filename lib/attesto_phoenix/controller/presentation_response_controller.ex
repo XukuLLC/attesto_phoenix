@@ -109,8 +109,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
   defp decode_vp_token(_vp_token), do: {:error, :malformed}
 
-  defp param(params, "state"), do: Map.get(params, "state") || Map.get(params, :state)
-  defp param(params, "vp_token"), do: Map.get(params, "vp_token") || Map.get(params, :vp_token)
+  defp param(params, key), do: Map.get(params, key) || Map.get(params, String.to_existing_atom(key))
 
   defp fetch_param(params, name) do
     case Map.fetch(params, name) do

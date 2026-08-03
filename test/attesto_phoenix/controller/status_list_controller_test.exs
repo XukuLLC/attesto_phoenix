@@ -6,6 +6,7 @@ defmodule AttestoPhoenix.Controller.StatusListControllerTest do
 
   alias Attesto.{Key, StatusList, StatusListStore}
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.StatusListController
 
   @issuer "https://issuer.example"
   @oauth_prefix "/oauth"
@@ -103,6 +104,24 @@ defmodule AttestoPhoenix.Controller.StatusListControllerTest do
     response = StatusListRouter.call(conn(:get, @status_list_path <> "/" <> @list_id), [])
 
     assert response.status == 404
+  end
+
+  test "uses a custom OAuth path prefix in the status-list subject URI" do
+    config = Application.fetch_env!(:attesto_phoenix, Config)
+    put_config(Keyword.put(config, :oauth_path_prefix, "/wallet/oauth"))
+
+    uri = @issuer <> "/wallet/oauth/statuslist/" <> @list_id
+    {:ok, 0} = StatusListStore.ETS.allocate(uri)
+
+    response = StatusListController.show(conn(:get, "/wallet/oauth/statuslist/" <> @list_id), %{"id" => @list_id})
+
+    assert response.status == 200
+
+    {_kty, jwk} = @signing_pem |> Key.jwk() |> JOSE.JWK.to_public_map()
+    jwk = Map.merge(jwk, %{"alg" => "ES256", "kid" => Key.kid(@signing_pem)})
+
+    assert {:ok, verified} = StatusList.verify(response.resp_body, %{"keys" => [jwk]})
+    assert verified.sub == uri
   end
 
   defp put_config(opts) do

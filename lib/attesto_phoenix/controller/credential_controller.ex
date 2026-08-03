@@ -13,13 +13,15 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   use Phoenix.Controller, formats: [:json]
 
+  import AttestoPhoenix.Controller.OID4VCIHelpers,
+    only: [body_params: 2, invalid_request: 4, maybe_put_option: 3]
+
   import Plug.Conn
 
-  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, Mdoc, SdJwtVc}
+  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, MapParams, Mdoc, SdJwtVc}
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
-  alias Plug.Conn.Unfetched
 
   @credential_configuration_ids_claim "credential_configuration_ids"
   @sd_jwt_vc_formats ~w(vc+sd-jwt dc+sd-jwt)
@@ -210,11 +212,8 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       when is_binary(vct) and is_map(claims) ->
         {:ok, issue_credential(config, result, holder_jwk)}
 
-      {:error, reason} ->
-        {:error, reason}
-
-      _other ->
-        {:error, :invalid_credential}
+      other ->
+        normalize_build_result(other)
     end
   end
 
@@ -240,11 +239,8 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       when is_binary(credential_type) and is_map(claims) ->
         {:ok, issue_jwt_vc_credential(config, subject, result, holder_jwk)}
 
-      {:error, reason} ->
-        {:error, reason}
-
-      _other ->
-        {:error, :invalid_credential}
+      other ->
+        normalize_build_result(other)
     end
   end
 
@@ -270,13 +266,13 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       {:ok, %{namespaces: namespaces} = result} when is_map(namespaces) ->
         issue_mdoc_credential(config, result, holder_jwk, credential_configuration)
 
-      {:error, reason} ->
-        {:error, reason}
-
-      _other ->
-        {:error, :invalid_credential}
+      other ->
+        normalize_build_result(other)
     end
   end
+
+  defp normalize_build_result({:error, reason}), do: {:error, reason}
+  defp normalize_build_result(_other), do: {:error, :invalid_credential}
 
   defp issue_mdoc_credential(config, result, holder_jwk, credential_configuration) do
     now = System.system_time(:second)
@@ -312,19 +308,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     configuration_value(configuration, :doctype) || configuration_value(configuration, :doc_type)
   end
 
-  defp configuration_value(configuration, key) do
-    Map.get(configuration, key) || Map.get(configuration, Atom.to_string(key))
-  end
-
-  defp maybe_put_option(opts, _key, nil), do: opts
-  defp maybe_put_option(opts, key, value), do: Keyword.put(opts, key, value)
-
-  defp invalid_request(conn, config, error, description) do
-    conn
-    |> PhoenixOAuthError.no_store(config)
-    |> put_status(:bad_request)
-    |> json(%{"error" => error, "error_description" => description})
-  end
+  defp configuration_value(configuration, key), do: MapParams.fetch(configuration, key)
 
   defp not_entitled(conn, config, claims, resource_metadata) do
     description = "The access token does not authorize this credential."
@@ -344,9 +328,6 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     |> apply_www_authenticate(config, challenge)
     |> send_scope_error(config, body)
   end
-
-  defp body_params(%Plug.Conn{body_params: %Unfetched{}}, fallback), do: fallback
-  defp body_params(%Plug.Conn{body_params: body_params}, _fallback) when is_map(body_params), do: body_params
 
   defp apply_www_authenticate(conn, %Config{www_authenticate: nil}, challenge),
     do: put_resp_header(conn, "www-authenticate", challenge)

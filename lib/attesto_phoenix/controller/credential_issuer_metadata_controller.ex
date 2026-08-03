@@ -14,10 +14,6 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   alias Attesto.CredentialIssuerMetadata
   alias AttestoPhoenix.Config
 
-  @oauth_prefix "/oauth"
-  @credential_path @oauth_prefix <> Config.credential_tail()
-  @nonce_path @oauth_prefix <> Config.nonce_tail()
-  @deferred_credential_path @oauth_prefix <> Config.deferred_credential_tail()
   @cache_max_age_seconds 3600
 
   @doc "Render the OID4VCI Credential Issuer Metadata document as JSON."
@@ -28,8 +24,8 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
     metadata =
       CredentialIssuerMetadata.build(
         credential_issuer: config.issuer,
-        credential_endpoint: endpoint_url(config.issuer, @credential_path),
-        nonce_endpoint: endpoint_url(config.issuer, @nonce_path),
+        credential_endpoint: Config.credential_endpoint_url(config),
+        nonce_endpoint: Config.nonce_endpoint_url(config),
         deferred_credential_endpoint: deferred_credential_endpoint(config),
         credential_configurations_supported: Config.credential_configurations_supported(config)
       )
@@ -43,14 +39,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   # completion: an issuer that never defers a credential should not point
   # wallets at an endpoint whose host callback is unconfigured.
   defp deferred_credential_endpoint(config) do
-    if Config.build_deferred_credential_fun(config), do: endpoint_url(config.issuer, @deferred_credential_path)
-  end
-
-  defp endpoint_url(issuer, path) do
-    issuer
-    |> URI.parse()
-    |> URI.merge(path)
-    |> URI.to_string()
+    if Config.build_deferred_credential_fun(config), do: Config.deferred_credential_endpoint_url(config)
   end
 
   defp put_cache_control(conn) do

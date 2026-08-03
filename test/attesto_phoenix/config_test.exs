@@ -1081,6 +1081,18 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.token_path(built) == "/mcp/oauth/token"
       assert Config.par_path(built) == "/mcp/oauth/par"
+      assert Config.credential_path(built) == "/mcp/oauth/credential"
+      assert Config.nonce_path(built) == "/mcp/oauth/nonce"
+      assert Config.status_list_path(built) == "/mcp/oauth/statuslist"
+      assert Config.credential_offer_path(built) == "/mcp/oauth/credential_offer"
+      assert Config.deferred_credential_path(built) == "/mcp/oauth/deferred_credential"
+
+      assert Config.credential_endpoint_url(built) == "https://issuer.example/mcp/oauth/credential"
+      assert Config.nonce_endpoint_url(built) == "https://issuer.example/mcp/oauth/nonce"
+      assert Config.status_list_endpoint_url(built) == "https://issuer.example/mcp/oauth/statuslist"
+
+      assert Config.deferred_credential_endpoint_url(built) ==
+               "https://issuer.example/mcp/oauth/deferred_credential"
     end
 
     test "a custom prefix with an override that stays under the prefix builds" do

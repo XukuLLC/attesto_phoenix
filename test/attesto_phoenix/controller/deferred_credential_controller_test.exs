@@ -119,6 +119,25 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
              }
     end
 
+    test "maps a non-SD-JWT host result to invalid_credential_request" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      callback = fn _subject, _txn ->
+        {:ok, %{credential_type: "UniversityDegreeCredential", claims: %{"degree" => "Bachelor"}}}
+      end
+
+      put_config(Keyword.put(config, :build_deferred_credential, callback))
+
+      response = post_deferred(mint_token(), %{"transaction_id" => "txn-123"})
+
+      assert response.status == 400
+
+      assert body(response) == %{
+               "error" => "invalid_credential_request",
+               "error_description" => "credential unavailable"
+             }
+    end
+
     test "rejects a missing transaction_id" do
       response = post_deferred(mint_token(), %{})
 

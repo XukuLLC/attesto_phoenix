@@ -1854,6 +1854,43 @@ defmodule AttestoPhoenix.Config do
   @spec deferred_credential_tail() :: String.t()
   def deferred_credential_tail, do: @deferred_credential_tail
 
+  @doc "The resolved request path of the OID4VCI credential endpoint."
+  @spec credential_path(t()) :: String.t()
+  def credential_path(%__MODULE__{} = config), do: resolve_path(nil, config, @credential_tail)
+
+  @doc "The resolved request path of the OID4VCI nonce endpoint."
+  @spec nonce_path(t()) :: String.t()
+  def nonce_path(%__MODULE__{} = config), do: resolve_path(nil, config, @nonce_tail)
+
+  @doc "The resolved request path of the Token Status List endpoint."
+  @spec status_list_path(t()) :: String.t()
+  def status_list_path(%__MODULE__{} = config), do: resolve_path(nil, config, @status_list_tail)
+
+  @doc "The resolved request path of the OID4VCI credential-offer endpoint."
+  @spec credential_offer_path(t()) :: String.t()
+  def credential_offer_path(%__MODULE__{} = config), do: resolve_path(nil, config, @credential_offer_tail)
+
+  @doc "The resolved request path of the OID4VCI deferred-credential endpoint."
+  @spec deferred_credential_path(t()) :: String.t()
+  def deferred_credential_path(%__MODULE__{} = config), do: resolve_path(nil, config, @deferred_credential_tail)
+
+  @doc "Absolute URL of the OID4VCI credential endpoint."
+  @spec credential_endpoint_url(t()) :: String.t()
+  def credential_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, credential_path(config))
+
+  @doc "Absolute URL of the OID4VCI nonce endpoint."
+  @spec nonce_endpoint_url(t()) :: String.t()
+  def nonce_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, nonce_path(config))
+
+  @doc "Absolute URL of the Token Status List endpoint."
+  @spec status_list_endpoint_url(t()) :: String.t()
+  def status_list_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, status_list_path(config))
+
+  @doc "Absolute URL of the OID4VCI deferred-credential endpoint."
+  @spec deferred_credential_endpoint_url(t()) :: String.t()
+  def deferred_credential_endpoint_url(%__MODULE__{} = config),
+    do: endpoint_url(config, deferred_credential_path(config))
+
   @doc "The resolved request path of the OID4VP request-object endpoint."
   @spec presentation_request_path(t()) :: String.t()
   def presentation_request_path(%__MODULE__{} = config), do: resolve_path(nil, config, @presentation_request_tail)

@@ -13,12 +13,12 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   use Phoenix.Controller, formats: [:json]
 
-  import Plug.Conn
+  import AttestoPhoenix.Controller.OID4VCIHelpers,
+    only: [body_params: 2, invalid_request: 4, maybe_put_option: 3]
 
   alias Attesto.{CredentialResponse, SdJwtVc}
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
-  alias Plug.Conn.Unfetched
 
   @doc """
   Complete a deferred credential for an authenticated wallet.
@@ -46,10 +46,11 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   defp issue(conn, config, request, claims) do
     with {:ok, transaction_id} <- transaction_id(request),
-         {:ok, result} <- Config.build_deferred_credential(config, claims["sub"], transaction_id) do
+         {:ok, result} <- Config.build_deferred_credential(config, claims["sub"], transaction_id),
+         {:ok, credential} <- issue_credential(config, result) do
       conn
       |> PhoenixOAuthError.no_store(config)
-      |> json(CredentialResponse.build(issue_credential(config, result)))
+      |> json(CredentialResponse.build(credential))
     else
       {:error, :missing_transaction_id} ->
         invalid_request(conn, config, "invalid_credential_request", "transaction_id is required")
@@ -66,28 +67,18 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   defp transaction_id(_request), do: {:error, :missing_transaction_id}
 
   defp issue_credential(config, %{vct: vct, claims: claims} = result) do
-    SdJwtVc.issue(
-      [
-        iss: config.issuer,
-        vct: vct,
-        pem: config.keystore.signing_pem()
-      ],
-      [claims: claims]
-      |> maybe_put_option(:exp, Map.get(result, :valid_until))
-      |> maybe_put_option(:nbf, Map.get(result, :valid_from))
-    )
+    {:ok,
+     SdJwtVc.issue(
+       [
+         iss: config.issuer,
+         vct: vct,
+         pem: config.keystore.signing_pem()
+       ],
+       [claims: claims]
+       |> maybe_put_option(:exp, Map.get(result, :valid_until))
+       |> maybe_put_option(:nbf, Map.get(result, :valid_from))
+     )}
   end
 
-  defp maybe_put_option(opts, _key, nil), do: opts
-  defp maybe_put_option(opts, key, value), do: Keyword.put(opts, key, value)
-
-  defp body_params(%Plug.Conn{body_params: %Unfetched{}}, fallback), do: fallback
-  defp body_params(%Plug.Conn{body_params: body_params}, _fallback) when is_map(body_params), do: body_params
-
-  defp invalid_request(conn, config, error, description) do
-    conn
-    |> PhoenixOAuthError.no_store(config)
-    |> put_status(:bad_request)
-    |> json(%{"error" => error, "error_description" => description})
-  end
+  defp issue_credential(_config, _result), do: {:error, :invalid_credential}
 end

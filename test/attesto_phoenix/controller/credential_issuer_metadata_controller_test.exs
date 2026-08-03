@@ -6,6 +6,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
   import Plug.Test
 
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.CredentialIssuerMetadataController
 
   @issuer "https://issuer.example"
   @metadata_path "/.well-known/openid-credential-issuer"
@@ -70,6 +71,24 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
            }
 
     assert get_resp_header(response, "cache-control") == ["public, max-age=3600"]
+  end
+
+  test "derives wallet endpoint URLs from a custom OAuth path prefix" do
+    config = Application.fetch_env!(:attesto_phoenix, Config)
+
+    config =
+      config
+      |> Keyword.put(:oauth_path_prefix, "/wallet/oauth")
+      |> Keyword.put(:build_deferred_credential, fn _subject, _transaction_id -> {:error, :issuance_pending} end)
+
+    put_config(config)
+
+    response = CredentialIssuerMetadataController.show(conn(:get, @metadata_path), %{})
+    body = JSON.decode!(response.resp_body)
+
+    assert body["credential_endpoint"] == @issuer <> "/wallet/oauth/credential"
+    assert body["nonce_endpoint"] == @issuer <> "/wallet/oauth/nonce"
+    assert body["deferred_credential_endpoint"] == @issuer <> "/wallet/oauth/deferred_credential"
   end
 
   defp put_config(opts) do
