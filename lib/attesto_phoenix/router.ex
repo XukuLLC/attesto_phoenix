@@ -44,6 +44,11 @@ defmodule AttestoPhoenix.Router do
       §2.1/§2.2), omitted with `userinfo: false`.
     * `POST /oauth/credential` - the OID4VCI Credential endpoint, mounted only
       with `credential_issuance: true`.
+    * `GET /oauth/credential_offer/:id` - the OID4VCI by-reference Credential
+      Offer endpoint (`credential_offer_uri` §4.1.3), mounted only with
+      `credential_issuance: true`.
+    * `POST /oauth/deferred_credential` - the OID4VCI Deferred Credential
+      endpoint (§9), mounted only with `credential_issuance: true`.
     * `GET /oauth/presentation_request/:id` - the OID4VP signed request-object
       endpoint, mounted only with `presentation: true`.
     * `POST /oauth/presentation_response` - the OID4VP direct-post response
@@ -167,10 +172,15 @@ defmodule AttestoPhoenix.Router do
     * `:device` - when `true`, mounts the RFC 8628 device-authorization
       endpoint and verification page. Defaults to `false`.
     * `:credential_issuance` - when `true`, mounts the OID4VCI nonce,
-      credential, and Credential Issuer Metadata endpoints. Defaults to
-      `false`. The host must also configure `:build_credential`, a
-      `:pre_authorized_code_store`, and
-      `:credential_configurations_supported`.
+      credential, by-reference credential-offer, deferred-credential, and
+      Credential Issuer Metadata endpoints. Defaults to `false`. The host must
+      also configure `:build_credential`, a `:pre_authorized_code_store`, and
+      `:credential_configurations_supported`. The by-reference credential
+      offer route additionally requires a `:credential_offer_store` (a
+      request answers 404 while it is unconfigured or the id is unknown), and
+      the deferred-credential route requires `:build_deferred_credential`
+      (like `:build_credential`, an unconfigured callback is a hard
+      `ArgumentError` rather than a silent empty response).
     * `:status_list` - when `true`, mounts `GET /oauth/statuslist/:id`, the
       IETF Token Status List endpoint. Defaults to `false`. Independent of
       `:credential_issuance`: a host may issue status-referencing credentials
@@ -259,6 +269,8 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.CheckSessionController
   alias AttestoPhoenix.Controller.CredentialController
   alias AttestoPhoenix.Controller.CredentialIssuerMetadataController
+  alias AttestoPhoenix.Controller.CredentialOfferController
+  alias AttestoPhoenix.Controller.DeferredCredentialController
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
@@ -319,6 +331,8 @@ defmodule AttestoPhoenix.Router do
   @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
   @credential_path @oauth_prefix <> AttestoPhoenix.Config.credential_tail()
   @nonce_path @oauth_prefix <> AttestoPhoenix.Config.nonce_tail()
+  @credential_offer_path @oauth_prefix <> AttestoPhoenix.Config.credential_offer_tail()
+  @deferred_credential_path @oauth_prefix <> AttestoPhoenix.Config.deferred_credential_tail()
   @status_list_path @oauth_prefix <> AttestoPhoenix.Config.status_list_tail()
   @presentation_request_path @oauth_prefix <> AttestoPhoenix.Config.presentation_request_tail()
   @presentation_response_path @oauth_prefix <> AttestoPhoenix.Config.presentation_response_tail()
@@ -346,6 +360,8 @@ defmodule AttestoPhoenix.Router do
   @check_session_controller CheckSessionController
   @credential_controller CredentialController
   @nonce_controller NonceController
+  @credential_offer_controller CredentialOfferController
+  @deferred_credential_controller DeferredCredentialController
   @status_list_controller StatusListController
   @presentation_request_controller PresentationRequestController
   @presentation_response_controller PresentationResponseController
@@ -400,6 +416,8 @@ defmodule AttestoPhoenix.Router do
     presentation_response_path = @presentation_response_path
     credential_path = @credential_path
     nonce_path = @nonce_path
+    credential_offer_path = @credential_offer_path
+    deferred_credential_path = @deferred_credential_path
     status_list_path = @status_list_path
     discovery_controller = @discovery_controller
     credential_issuer_metadata_controller = @credential_issuer_metadata_controller
@@ -503,6 +521,8 @@ defmodule AttestoPhoenix.Router do
 
     credential_route = credential_route(credential_issuance?, prefix, credential_path)
     nonce_route = nonce_route(credential_issuance?, prefix, nonce_path)
+    credential_offer_route = credential_offer_route(credential_issuance?, prefix, credential_offer_path)
+    deferred_credential_route = deferred_credential_route(credential_issuance?, prefix, deferred_credential_path)
     status_list_route = status_list_route(status_list?, prefix, status_list_path)
     presentation_request_route = presentation_request_route(presentation?, prefix, presentation_request_path)
     presentation_response_route = presentation_response_route(presentation?, prefix, presentation_response_path)
@@ -651,6 +671,8 @@ defmodule AttestoPhoenix.Router do
             unquote(device_authorization_route)
             unquote(nonce_route)
             unquote(credential_route)
+            unquote(credential_offer_route)
+            unquote(deferred_credential_route)
             unquote(status_list_route)
             unquote(presentation_request_route)
             unquote(presentation_response_route)
@@ -729,6 +751,8 @@ defmodule AttestoPhoenix.Router do
           unquote(device_route)
           unquote(nonce_route)
           unquote(credential_route)
+          unquote(credential_offer_route)
+          unquote(deferred_credential_route)
           unquote(status_list_route)
           unquote(presentation_request_route)
           unquote(presentation_response_route)
@@ -878,6 +902,26 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp nonce_route(false, _prefix, _nonce_path), do: nil
+
+  defp credential_offer_route(true, prefix, credential_offer_path) do
+    quote do
+      get(
+        unquote(prefix <> credential_offer_path <> "/:id"),
+        unquote(@credential_offer_controller),
+        :show
+      )
+    end
+  end
+
+  defp credential_offer_route(false, _prefix, _credential_offer_path), do: nil
+
+  defp deferred_credential_route(true, prefix, deferred_credential_path) do
+    quote do
+      post(unquote(prefix <> deferred_credential_path), unquote(@deferred_credential_controller), :create)
+    end
+  end
+
+  defp deferred_credential_route(false, _prefix, _deferred_credential_path), do: nil
 
   defp status_list_route(true, prefix, status_list_path) do
     quote do

@@ -177,6 +177,16 @@ defmodule AttestoPhoenix.Config do
       the OID4VCI Credential endpoint. The library binds `holder_jwk` as `cnf`
       and signs the resulting SD-JWT VC. Required when credential issuance is
       mounted.
+    * `:build_deferred_credential` - `(subject, transaction_id -> {:ok,
+      credential} | {:error, :issuance_pending} | {:error, reason})`.
+      Completes a previously deferred credential (OID4VCI §9) for the
+      Deferred Credential endpoint. The returned credential type and claim
+      values are signed into an SD-JWT VC the same way `:build_credential`'s
+      are, minus holder-key binding (the endpoint carries no fresh proof).
+      `{:error, :issuance_pending}` reports the OID4VCI `issuance_pending`
+      error so the wallet retries later; any other error maps to
+      `invalid_credential_request`. Required only when the Deferred
+      Credential endpoint is used.
     * `:credential_configurations_supported` - map of OID4VCI credential
       configuration identifiers to the configuration metadata advertised by
       the Credential Issuer Metadata endpoint. Required when credential
@@ -602,6 +612,7 @@ defmodule AttestoPhoenix.Config do
     :build_principal,
     :build_userinfo_claims,
     :build_credential,
+    :build_deferred_credential,
     :build_id_token_claims,
     :client_id,
     :client_jwks,
@@ -745,6 +756,7 @@ defmodule AttestoPhoenix.Config do
           build_principal: callback() | nil,
           build_userinfo_claims: callback() | nil,
           build_credential: callback() | nil,
+          build_deferred_credential: callback() | nil,
           build_id_token_claims: callback() | nil,
           client_id: callback() | nil,
           client_jwks: callback() | nil,
@@ -1782,6 +1794,8 @@ defmodule AttestoPhoenix.Config do
   @status_list_tail "/statuslist"
   @presentation_request_tail "/presentation_request"
   @presentation_response_tail "/presentation_response"
+  @credential_offer_tail "/credential_offer"
+  @deferred_credential_tail "/deferred_credential"
 
   @doc false
   @spec authorize_tail() :: String.t()
@@ -1806,6 +1820,14 @@ defmodule AttestoPhoenix.Config do
   @doc false
   @spec presentation_response_tail() :: String.t()
   def presentation_response_tail, do: @presentation_response_tail
+
+  @doc false
+  @spec credential_offer_tail() :: String.t()
+  def credential_offer_tail, do: @credential_offer_tail
+
+  @doc false
+  @spec deferred_credential_tail() :: String.t()
+  def deferred_credential_tail, do: @deferred_credential_tail
 
   @doc "The resolved request path of the OID4VP request-object endpoint."
   @spec presentation_request_path(t()) :: String.t()
@@ -2372,6 +2394,32 @@ defmodule AttestoPhoenix.Config do
 
       callback ->
         Callback.invoke(callback, [subject, credential_configuration_id, holder_jwk])
+    end
+  end
+
+  @doc "Returns the configured OID4VCI deferred-credential builder callback, or `nil`."
+  @spec build_deferred_credential_fun(t()) :: callback() | nil
+  def build_deferred_credential_fun(%__MODULE__{} = config),
+    do: Callback.config_callback(config, :build_deferred_credential)
+
+  @doc """
+  Invokes the host's `:build_deferred_credential` callback for the
+  authenticated subject and the transaction id the wallet is polling.
+
+  Raises `ArgumentError` when the callback is not configured, so a Deferred
+  Credential endpoint request cannot silently issue an empty credential.
+  """
+  @spec build_deferred_credential(t(), String.t(), String.t()) ::
+          {:ok, credential_result()} | {:error, :issuance_pending} | {:error, term()}
+  def build_deferred_credential(%__MODULE__{} = config, subject, transaction_id) do
+    case build_deferred_credential_fun(config) do
+      nil ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :build_deferred_credential is required to serve the " <>
+                "Deferred Credential endpoint"
+
+      callback ->
+        Callback.invoke(callback, [subject, transaction_id])
     end
   end
 
