@@ -561,16 +561,17 @@ authorization, PAR, discovery, DPoP, and mTLS implementations.
 OpenID4VP **verifier** roles behind an EUDI-wallet-facing service, targeting the
 [HAIP](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html)
 profile. The protocol logic and cryptography live in
-[`attesto`](https://hexdocs.pm/attesto) (SD-JWT VC + mdoc issue/verify, DCQL,
-Token Status List); these routes wire it to Phoenix. All paths derive from
-configurable `Config` tails (nothing hardcoded) and mount only behind their
-feature flag:
+[`attesto`](https://hexdocs.pm/attesto) (SD-JWT VC + mdoc + jwt_vc_json
+issue/verify, DCQL, Token Status List, SIOPv2, OpenID Federation); these routes
+wire it to Phoenix. All paths derive from configurable `Config` tails (nothing
+hardcoded) and mount only behind their feature flag:
 
 ```elixir
 attesto_routes(
   credential_issuance: true,   # OID4VCI issuer
   presentation: true,          # OID4VP verifier
-  status_list: true            # Token Status List
+  status_list: true,           # Token Status List revocation
+  federation: true             # OpenID Federation entity configuration
 )
 ```
 
@@ -580,16 +581,28 @@ attesto_routes(
 - `POST /oauth/nonce` — the `c_nonce` endpoint (public, OID4VCI §7).
 - `POST /oauth/credential` — the credential endpoint. Access-token protected;
   checks the token's bound `credential_configuration_ids`, verifies the holder
-  key proof (with `c_nonce` freshness), and issues an SD-JWT VC (batch `proofs`
-  supported). Issuance runs through the host `:build_credential` callback.
-- The **pre-authorized_code** grant is added to `POST /oauth/token`
+  key proof(s) (with `c_nonce` freshness), and issues a credential — **SD-JWT VC,
+  ISO mdoc (`mso_mdoc`), or `jwt_vc_json`**, dispatched by the credential
+  configuration's `format` — bound to the holder key. Batch `proofs` supported.
+  Issuance runs through the host `:build_credential` callback.
+- `GET  /oauth/credential_offer/:id` — by-reference credential offer retrieval
+  (the `credential_offer_uri` a wallet dereferences).
+- `POST /oauth/deferred_credential` — deferred issuance (OID4VCI §9);
+  token-protected, driven by the `:build_deferred_credential` callback, which
+  returns `issuance_pending` until the credential is ready.
+- Grants on `POST /oauth/token`: the **pre-authorized_code** grant is added
   automatically when a `:pre_authorized_code_store` is configured; the ordinary
   **authorization_code** flow issues credentials when the request carries
   `openid_credential` `authorization_details`.
 
 Requires: `:build_credential`, `:credential_configurations_supported`, a
-`:pre_authorized_code_store` and `:c_nonce_store`, and the `:keystore` (issuer
-signing key).
+`:pre_authorized_code_store` and `:c_nonce_store`, the `:credential_offer_store`
+(for by-reference offers), and the `:keystore` (issuer signing key).
+
+A wallet may also authenticate to the token endpoint with a **Client Attestation
+JWT + PoP** (`attest_jwt_client_auth`, the `OAuth-Client-Attestation` /
+`-PoP` headers) when `:trusted_wallet_provider_jwks` is configured — advertised
+in `token_endpoint_auth_methods_supported`.
 
 **`presentation: true`** mounts the OID4VP verifier endpoints:
 
@@ -609,6 +622,12 @@ the `:keystore`.
 **`status_list: true`** mounts `GET /oauth/statuslist/:id`, serving a signed
 `statuslist+jwt` built from the `:status_list_store` — the revocation target
 referenced by issued credentials.
+
+**`federation: true`** mounts `GET /.well-known/openid-federation`, serving the
+signed OpenID Federation **Entity Configuration**
+(`application/entity-statement+jwt`) built from `:federation_authority_hints` and
+`:federation_entity_metadata` — the trust-chain anchor a federation resolver
+starts from.
 
 ### Backchannel authentication (CIBA)
 
