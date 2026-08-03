@@ -74,6 +74,12 @@ callbacks.
   — signature, issuer, audience, and DPoP / mTLS sender-constraint — with no
   token database or introspection call on the hot path, so a leaked bearer token
   alone can't call the API.
+- **An EU digital-identity credential issuer and verifier.** Mount the
+  OpenID4VCI issuer and OpenID4VP verifier endpoints for SD-JWT VC and ISO mdoc
+  credentials — credential offers, the credential/nonce endpoints, DCQL
+  presentation requests, `direct_post` responses, and Token Status List
+  revocation — targeting the HAIP profile. See
+  [OpenID for Verifiable Credentials](#openid-for-verifiable-credentials-oid4vc--eu-wallet).
 
 The standards each use case rests on are catalogued below and in
 [the `attesto` core README](https://github.com/XukuLLC/attesto#rfc-coverage);
@@ -101,6 +107,7 @@ authorization server, use `attesto_phoenix`.
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Mounting the routes](#mounting-the-routes)
+  - [OpenID for Verifiable Credentials (OID4VC / EU wallet)](#openid-for-verifiable-credentials-oid4vc--eu-wallet)
 - [Protecting resources](#protecting-resources)
 - [Database migration](#database-migration)
 - [Guides and examples](#guides-and-examples)
@@ -547,6 +554,61 @@ enforcement and JARM; `Attesto.RequestObject.Policy.fapi_message_signing/0`
 provides the request-object policy for that profile. These are coordinated
 settings rather than a single profile switch, and they use the same token,
 authorization, PAR, discovery, DPoP, and mTLS implementations.
+
+### OpenID for Verifiable Credentials (OID4VC / EU wallet)
+
+`attesto_phoenix` mounts the HTTP surface for the OpenID4VCI **issuer** and
+OpenID4VP **verifier** roles behind an EUDI-wallet-facing service, targeting the
+[HAIP](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html)
+profile. The protocol logic and cryptography live in
+[`attesto`](https://hexdocs.pm/attesto) (SD-JWT VC + mdoc issue/verify, DCQL,
+Token Status List); these routes wire it to Phoenix. All paths derive from
+configurable `Config` tails (nothing hardcoded) and mount only behind their
+feature flag:
+
+```elixir
+attesto_routes(
+  credential_issuance: true,   # OID4VCI issuer
+  presentation: true,          # OID4VP verifier
+  status_list: true            # Token Status List
+)
+```
+
+**`credential_issuance: true`** mounts the OID4VCI issuer endpoints:
+
+- `GET  /.well-known/openid-credential-issuer` — Credential Issuer Metadata.
+- `POST /oauth/nonce` — the `c_nonce` endpoint (public, OID4VCI §7).
+- `POST /oauth/credential` — the credential endpoint. Access-token protected;
+  checks the token's bound `credential_configuration_ids`, verifies the holder
+  key proof (with `c_nonce` freshness), and issues an SD-JWT VC (batch `proofs`
+  supported). Issuance runs through the host `:build_credential` callback.
+- The **pre-authorized_code** grant is added to `POST /oauth/token`
+  automatically when a `:pre_authorized_code_store` is configured; the ordinary
+  **authorization_code** flow issues credentials when the request carries
+  `openid_credential` `authorization_details`.
+
+Requires: `:build_credential`, `:credential_configurations_supported`, a
+`:pre_authorized_code_store` and `:c_nonce_store`, and the `:keystore` (issuer
+signing key).
+
+**`presentation: true`** mounts the OID4VP verifier endpoints:
+
+- `GET  /oauth/presentation_request/:id` — serves the signed request object
+  (`application/oauth-authz-req+jwt`).
+- `POST /oauth/presentation_response` — the `direct_post` (and encrypted
+  `direct_post.jwt`) response endpoint; verifies the `vp_token` against the
+  session's bound nonce/audience (single-use, uniform error). SD-JWT VC and
+  mdoc presentations both verify.
+
+The host drives it through `AttestoPhoenix.Verifier`: `create_presentation_request/2`
+builds + signs the request object (optionally with an `x509_san_dns` client-id +
+`x5c`), and `presentation_result/2` polls the verified claims. Requires a
+`:presentation_session_store`, `:verifier_client_id` (or the x509 config), and
+the `:keystore`.
+
+**`status_list: true`** mounts `GET /oauth/statuslist/:id`, serving a signed
+`statuslist+jwt` built from the `:status_list_store` — the revocation target
+referenced by issued credentials.
 
 ### Backchannel authentication (CIBA)
 
