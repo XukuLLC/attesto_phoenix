@@ -1119,6 +1119,7 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.presentation_session_store(built) == __MODULE__.PresentationStore
       assert Config.verifier_client_id(built) == "verifier-client-1"
+      assert Config.presentation_response_mode(built) == "direct_post"
       assert Config.presentation_request_path(built) == "/wallet/oauth/presentation_request"
       assert Config.presentation_response_path(built) == "/wallet/oauth/presentation_response"
 
@@ -1134,12 +1135,24 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.presentation_session_store(built) == nil
       assert Config.verifier_client_id(built) == nil
+      assert Config.presentation_response_mode(built) == "direct_post"
     end
 
     test "rejects a configured verifier client id that is not a non-empty string" do
       for invalid <- ["", :verifier, 123] do
         assert_raise ArgumentError, ~r/:verifier_client_id must be a non-empty string/, fn ->
           config(verifier_client_id: invalid)
+        end
+      end
+    end
+
+    test "accepts only the supported presentation response modes" do
+      assert Config.presentation_response_mode(config(presentation_response_mode: "direct_post.jwt")) ==
+               "direct_post.jwt"
+
+      for invalid <- ["", "query.jwt", :direct_post, nil] do
+        assert_raise ArgumentError, ~r/:presentation_response_mode must be/, fn ->
+          config(presentation_response_mode: invalid)
         end
       end
     end

@@ -452,6 +452,9 @@ defmodule AttestoPhoenix.Config do
     * `:verifier_client_id` - verifier identifier placed in the presentation
       request and used as the holder Key Binding JWT audience. Required when
       creating verifier presentation requests.
+    * `:presentation_response_mode` - OID4VP response mode advertised to wallets.
+      Defaults to `"direct_post"`; set to `"direct_post.jwt"` to require an
+      encrypted authorization response.
     * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`. The
       sweeper is not started if unset.
     * `:table_prefix` - optional Ecto schema/table prefix for the generated
@@ -675,6 +678,7 @@ defmodule AttestoPhoenix.Config do
     ciba_ping_http_client: AttestoPhoenix.CIBAPing.Req,
     logout: [],
     session_management: [],
+    presentation_response_mode: "direct_post",
     basic_realm: "OAuth"
   ]
 
@@ -788,6 +792,7 @@ defmodule AttestoPhoenix.Config do
           c_nonce_store: module() | nil,
           presentation_session_store: module() | nil,
           verifier_client_id: String.t() | nil,
+          presentation_response_mode: String.t(),
           credential_configurations_supported: map() | nil,
           authenticate_ciba_user: callback() | nil,
           notify_ciba_user: callback() | nil,
@@ -1283,6 +1288,10 @@ defmodule AttestoPhoenix.Config do
   @doc "The verifier client identifier used as the OID4VP presentation audience."
   @spec verifier_client_id(t()) :: String.t() | nil
   def verifier_client_id(%__MODULE__{verifier_client_id: client_id}), do: client_id
+
+  @doc "The OID4VP direct-post response mode advertised to wallets."
+  @spec presentation_response_mode(t()) :: String.t()
+  def presentation_response_mode(%__MODULE__{presentation_response_mode: mode}), do: mode
 
   @doc "The configured OID4VCI credential-configuration catalog, or `nil`."
   @spec credential_configurations_supported(t()) :: map() | nil
@@ -2608,6 +2617,7 @@ defmodule AttestoPhoenix.Config do
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
     validate_verifier_client_id!(config.verifier_client_id)
+    validate_presentation_response_mode!(config.presentation_response_mode)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
       raise ArgumentError,
@@ -3250,5 +3260,13 @@ defmodule AttestoPhoenix.Config do
     raise ArgumentError,
           "AttestoPhoenix.Config: :verifier_client_id must be a non-empty string when configured; " <>
             "got #{inspect(client_id)}"
+  end
+
+  defp validate_presentation_response_mode!(mode) when mode in ["direct_post", "direct_post.jwt"], do: :ok
+
+  defp validate_presentation_response_mode!(mode) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :presentation_response_mode must be \"direct_post\" or " <>
+            "\"direct_post.jwt\"; got #{inspect(mode)}"
   end
 end

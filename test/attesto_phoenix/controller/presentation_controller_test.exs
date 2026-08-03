@@ -148,6 +148,55 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert {:ok, %{@query_id => _result}} = Verifier.presentation_result(ctx.config, session.id)
   end
 
+  test "direct_post.jwt decrypts a real response and exposes the host result", %{conn: conn} = ctx do
+    config = configure_response_mode(ctx.config, "direct_post.jwt")
+    ctx = %{ctx | config: config}
+    session = create_request(ctx)
+    vp_token = valid_vp_token(ctx, session.nonce)
+    encryption_jwk = advertised_encryption_jwk(session.id, ctx.request_jwk)
+
+    encrypted_response =
+      encryption_jwk
+      |> JOSE.JWK.from_map()
+      |> encrypt_response(JSON.encode!(%{"vp_token" => vp_token, "state" => session.id}))
+
+    response = post_encrypted_response(conn, config, encrypted_response)
+
+    assert response.status == 200
+    assert json_response(response, 200) == %{}
+
+    assert {:ok, %{@query_id => result}} = Verifier.presentation_result(config, session.id)
+    assert result.claims["given_name"] == "Alice"
+  end
+
+  test "direct_post.jwt rejects undecryptable and plaintext responses without completion",
+       %{
+         conn: conn
+       } = ctx do
+    config = configure_response_mode(ctx.config, "direct_post.jwt")
+    ctx = %{ctx | config: config}
+    undecryptable = create_request(ctx)
+
+    encrypted_response =
+      post_encrypted_response(conn, config, "not.a.valid.compact.jwe")
+
+    assert_invalid_request(encrypted_response)
+    assert_pending(undecryptable.id)
+
+    plaintext = create_request(ctx)
+
+    plaintext_response =
+      post_response(
+        recycle(conn),
+        config,
+        plaintext.id,
+        JSON.encode!(valid_vp_token(ctx, plaintext.nonce))
+      )
+
+    assert_invalid_request(plaintext_response)
+    assert_pending(plaintext.id)
+  end
+
   test "wrong nonce and audience return the same public error without completion", %{conn: conn} = ctx do
     wrong_nonce = create_request(ctx)
 
@@ -273,6 +322,35 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     conn
     |> put_req_header("content-type", "application/json")
     |> post(Config.presentation_response_path(config), body)
+  end
+
+  defp post_encrypted_response(conn, config, encrypted_response) do
+    post(conn, Config.presentation_response_path(config), %{"response" => encrypted_response})
+  end
+
+  defp advertised_encryption_jwk(id, request_jwk) do
+    candidates = JWS.verification_candidates(request_jwk)
+    assert {:ok, claims} = JWS.verify_strict(stored_request_object(id), candidates, claims_map?: true)
+    get_in(claims, ["client_metadata", "jwks", "keys", Access.at(0)])
+  end
+
+  defp encrypt_response(recipient_jwk, plaintext) do
+    ephemeral_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+
+    {recipient_jwk, ephemeral_jwk}
+    |> JOSE.JWE.block_encrypt(plaintext, %{"alg" => "ECDH-ES", "enc" => "A128GCM"})
+    |> JOSE.JWE.compact()
+    |> elem(1)
+  end
+
+  defp configure_response_mode(config, mode) do
+    opts =
+      :attesto_phoenix
+      |> Application.fetch_env!(Config)
+      |> Keyword.put(:presentation_response_mode, mode)
+
+    Application.put_env(:attesto_phoenix, Config, opts)
+    %{config | presentation_response_mode: mode}
   end
 
   defp assert_invalid_request(response) do

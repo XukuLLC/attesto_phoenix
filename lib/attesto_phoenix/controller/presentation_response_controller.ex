@@ -2,9 +2,10 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   @moduledoc """
   Public OID4VP direct-post response endpoint.
 
-  The endpoint accepts the DCQL response map either directly as JSON or as the
-  JSON string carried by an `application/x-www-form-urlencoded` `vp_token`
-  field. All verification failures use the same public error response.
+  The endpoint accepts either an encrypted `direct_post.jwt` `response` JWE or
+  the DCQL response map directly as JSON/the JSON string carried by an
+  `application/x-www-form-urlencoded` `vp_token` field. All decryption and
+  verification failures use the same public error response.
   """
 
   use Phoenix.Controller, formats: [:json]
@@ -21,7 +22,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
     with :ok <- check_https(conn, config),
          {:ok, store} <- presentation_session_store(config),
-         {:ok, state, vp_token} <- response(conn.body_params),
+         {:ok, state, vp_token} <- response(conn.body_params, config),
          {:ok, _results} <- verify_response(store, state, vp_token) do
       json(conn, %{})
     else
@@ -29,9 +30,46 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     end
   end
 
-  defp response(%Unfetched{}), do: {:error, :malformed}
+  defp response(%Unfetched{}, _config), do: {:error, :malformed}
 
-  defp response(params) when is_map(params) do
+  defp response(params, config) when is_map(params) do
+    case fetch_param(params, "response") do
+      {:ok, encrypted_response} -> decrypt_response(encrypted_response, config)
+      :error -> plaintext_response(params, config)
+    end
+  end
+
+  defp response(_params, _config), do: {:error, :malformed}
+
+  defp plaintext_response(params, config) do
+    with "direct_post" <- Config.presentation_response_mode(config),
+         {:ok, state, vp_token} <- decoded_response(params) do
+      {:ok, state, vp_token}
+    else
+      _ -> {:error, :malformed}
+    end
+  end
+
+  defp decrypt_response(encrypted_response, config) when is_binary(encrypted_response) do
+    with :ok <- compact_jwe(encrypted_response),
+         %JOSE.JWK{} = private_jwk <- JOSE.JWK.from_pem(config.keystore.signing_pem()),
+         {plaintext, %JOSE.JWE{} = jwe} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
+         :ok <- encrypted_response_algorithms(jwe),
+         {:ok, %{} = params} <- JSON.decode(plaintext),
+         {:ok, state, vp_token} <- decoded_response(params) do
+      {:ok, state, vp_token}
+    else
+      _ -> {:error, :malformed}
+    end
+  rescue
+    _error -> {:error, :malformed}
+  catch
+    _kind, _reason -> {:error, :malformed}
+  end
+
+  defp decrypt_response(_encrypted_response, _config), do: {:error, :malformed}
+
+  defp decoded_response(params) do
     with state when is_binary(state) and state != "" <- param(params, "state"),
          {:ok, vp_token} <- decode_vp_token(param(params, "vp_token")) do
       {:ok, state, vp_token}
@@ -40,7 +78,19 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     end
   end
 
-  defp response(_params), do: {:error, :malformed}
+  defp compact_jwe(encrypted_response) do
+    case String.split(encrypted_response, ".") do
+      [_protected, _encrypted_key, _iv, _ciphertext, _tag] -> :ok
+      _parts -> {:error, :malformed}
+    end
+  end
+
+  defp encrypted_response_algorithms(jwe) do
+    case JOSE.JWE.to_map(jwe) do
+      {_modules, %{"alg" => "ECDH-ES", "enc" => "A128GCM"}} -> :ok
+      _jwe -> {:error, :malformed}
+    end
+  end
 
   defp decode_vp_token(%{} = vp_token), do: {:ok, vp_token}
 
@@ -55,6 +105,13 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
   defp param(params, "state"), do: Map.get(params, "state") || Map.get(params, :state)
   defp param(params, "vp_token"), do: Map.get(params, "vp_token") || Map.get(params, :vp_token)
+
+  defp fetch_param(params, name) do
+    case Map.fetch(params, name) do
+      {:ok, value} -> {:ok, value}
+      :error -> Map.fetch(params, String.to_existing_atom(name))
+    end
+  end
 
   defp verify_response(store, state, vp_token) do
     PresentationSession.verify_response(

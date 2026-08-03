@@ -74,6 +74,35 @@ defmodule AttestoPhoenix.VerifierTest do
     assert is_integer(claims["exp"])
   end
 
+  test "direct_post.jwt advertises the verifier public encryption key and algorithms", ctx do
+    config = %{ctx.config | presentation_response_mode: "direct_post.jwt"}
+
+    assert {:ok, %{id: id}} =
+             Verifier.create_presentation_request(config, request_attrs(ctx))
+
+    assert {:ok, %{data: session}} = Store.get(id)
+    candidates = JWS.verification_candidates(ctx.request_jwk)
+
+    assert {:ok, claims} =
+             JWS.verify_strict(session.request_object, candidates, claims_map?: true)
+
+    assert claims["response_mode"] == "direct_post.jwt"
+
+    assert %{
+             "jwks" => %{"keys" => [encryption_jwk]},
+             "authorization_encrypted_response_alg" => "ECDH-ES",
+             "authorization_encrypted_response_enc" => "A128GCM"
+           } = claims["client_metadata"]
+
+    assert encryption_jwk["kty"] == "EC"
+    assert encryption_jwk["crv"] == "P-256"
+    assert encryption_jwk["x"] == ctx.request_jwk["x"]
+    assert encryption_jwk["y"] == ctx.request_jwk["y"]
+    assert encryption_jwk["use"] == "enc"
+    assert encryption_jwk["alg"] == "ECDH-ES"
+    refute Map.has_key?(encryption_jwk, "d")
+  end
+
   test "returns host-facing errors when verifier configuration or attrs are absent", ctx do
     missing_store = %{ctx.config | presentation_session_store: nil}
     missing_client_id = %{ctx.config | verifier_client_id: nil}

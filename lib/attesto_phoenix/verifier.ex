@@ -14,6 +14,8 @@ defmodule AttestoPhoenix.Verifier do
   @presentation_ttl_seconds 300
   @self_issued_audience "https://self-issued.me/v2"
   @request_object_type "oauth-authz-req+jwt"
+  @encrypted_response_alg "ECDH-ES"
+  @encrypted_response_enc "A128GCM"
 
   @type create_attrs :: %{
           required(:dcql_query) => map(),
@@ -82,14 +84,15 @@ defmodule AttestoPhoenix.Verifier do
   end
 
   defp sign_request_object(config, client_id, session, dcql_query) do
-    request =
-      PresentationRequest.build(
-        client_id: client_id,
-        nonce: session.nonce,
-        response_uri: Config.presentation_response_endpoint_url(config),
-        dcql_query: dcql_query,
-        state: session.id
-      )
+    request_options = [
+      client_id: client_id,
+      nonce: session.nonce,
+      response_uri: Config.presentation_response_endpoint_url(config),
+      dcql_query: dcql_query,
+      state: session.id
+    ]
+
+    request = PresentationRequest.build(response_options(config, request_options))
 
     claims =
       Map.merge(request, %{
@@ -101,6 +104,36 @@ defmodule AttestoPhoenix.Verifier do
     {:ok, JWS.sign_current(config.keystore, claims, typ: @request_object_type)}
   rescue
     ArgumentError -> {:error, :invalid_attrs}
+  end
+
+  defp response_options(config, options) do
+    case Config.presentation_response_mode(config) do
+      "direct_post" ->
+        options
+
+      "direct_post.jwt" ->
+        Keyword.merge(options,
+          response_mode: "direct_post.jwt",
+          client_metadata: encrypted_response_metadata(config)
+        )
+    end
+  end
+
+  defp encrypted_response_metadata(config) do
+    private_jwk = JOSE.JWK.from_pem(config.keystore.signing_pem())
+    {_kty, public_jwk} = JOSE.JWK.to_public_map(private_jwk)
+
+    encryption_jwk =
+      Map.merge(public_jwk, %{
+        "use" => "enc",
+        "alg" => @encrypted_response_alg
+      })
+
+    %{
+      "jwks" => %{"keys" => [encryption_jwk]},
+      "authorization_encrypted_response_alg" => @encrypted_response_alg,
+      "authorization_encrypted_response_enc" => @encrypted_response_enc
+    }
   end
 
   defp presentation_session_store(config) do
