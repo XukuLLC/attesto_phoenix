@@ -52,9 +52,9 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
   defp decrypt_response(encrypted_response, config) when is_binary(encrypted_response) do
     with :ok <- compact_jwe(encrypted_response),
+         :ok <- encrypted_response_algorithms(encrypted_response),
          %JOSE.JWK{} = private_jwk <- JOSE.JWK.from_pem(config.keystore.signing_pem()),
-         {plaintext, %JOSE.JWE{} = jwe} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
-         :ok <- encrypted_response_algorithms(jwe),
+         {plaintext, %JOSE.JWE{}} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
          {:ok, %{} = params} <- JSON.decode(plaintext),
          {:ok, state, vp_token} <- decoded_response(params) do
       {:ok, state, vp_token}
@@ -85,10 +85,16 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     end
   end
 
-  defp encrypted_response_algorithms(jwe) do
-    case JOSE.JWE.to_map(jwe) do
-      {_modules, %{"alg" => "ECDH-ES", "enc" => "A128GCM"}} -> :ok
-      _jwe -> {:error, :malformed}
+  # Validate the JWE alg/enc from the compact response's protected header — the
+  # first segment is base64url-encoded JSON — before decrypting, rather than
+  # introspecting the decoded %JOSE.JWE{} struct.
+  defp encrypted_response_algorithms(encrypted_response) do
+    with [protected_b64 | _] <- String.split(encrypted_response, "."),
+         {:ok, json} <- Base.url_decode64(protected_b64, padding: false),
+         {:ok, %{"alg" => "ECDH-ES", "enc" => "A128GCM"}} <- JSON.decode(json) do
+      :ok
+    else
+      _ -> {:error, :malformed}
     end
   end
 
