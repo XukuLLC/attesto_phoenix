@@ -192,6 +192,12 @@ defmodule AttestoPhoenix.Config do
       configuration identifiers to the configuration metadata advertised by
       the Credential Issuer Metadata endpoint. Required when credential
       issuance is mounted.
+    * `:federation_authority_hints` - non-empty list of superior OpenID
+      Federation entity identifiers to include in this entity's signed Entity
+      Configuration. Optional; the claim is omitted when unset.
+    * `:federation_entity_metadata` - map of OpenID Federation entity-type
+      identifiers to their metadata. Optional; the claim is omitted from the
+      signed Entity Configuration when unset.
     * `:status_list_store` - module implementing `Attesto.StatusListStore`,
       the allocated-index storage for IETF Token Status List (RFC-to-be)
       credential-status lists. Required when the host mounts the
@@ -671,6 +677,8 @@ defmodule AttestoPhoenix.Config do
     :verifier_x5c,
     :verifier_dns,
     :credential_configurations_supported,
+    :federation_authority_hints,
+    :federation_entity_metadata,
     :end_session_path,
     :logout_session_store,
     :terminate_session,
@@ -835,6 +843,8 @@ defmodule AttestoPhoenix.Config do
           verifier_dns: String.t() | nil,
           presentation_response_mode: String.t(),
           credential_configurations_supported: map() | nil,
+          federation_authority_hints: [String.t()] | nil,
+          federation_entity_metadata: map() | nil,
           authenticate_ciba_user: callback() | nil,
           notify_ciba_user: callback() | nil,
           client_ciba_registration: callback() | nil,
@@ -1354,6 +1364,14 @@ defmodule AttestoPhoenix.Config do
   @spec credential_configurations_supported(t()) :: map() | nil
   def credential_configurations_supported(%__MODULE__{credential_configurations_supported: configurations}),
     do: configurations
+
+  @doc "The OpenID Federation superior entity identifiers, or `nil`."
+  @spec federation_authority_hints(t()) :: [String.t()] | nil
+  def federation_authority_hints(%__MODULE__{federation_authority_hints: authority_hints}), do: authority_hints
+
+  @doc "The OpenID Federation entity-type metadata map, or `nil`."
+  @spec federation_entity_metadata(t()) :: map() | nil
+  def federation_entity_metadata(%__MODULE__{federation_entity_metadata: metadata}), do: metadata
 
   @doc """
   The RFC 8628 §3.2 verification URI shown to the user: the configured

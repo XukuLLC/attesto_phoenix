@@ -55,6 +55,8 @@ defmodule AttestoPhoenix.Router do
       endpoint, mounted only with `presentation: true`.
     * `GET /.well-known/openid-credential-issuer` - OID4VCI Credential Issuer
       Metadata, mounted with `credential_issuance: true`.
+    * `GET /.well-known/openid-federation` - the signed OpenID Federation
+      Entity Configuration, mounted with `federation: true`.
     * `GET` and `POST /oauth/end_session` - the end-session endpoint (OpenID
       Connect RP-Initiated Logout 1.0 §2), mounted only with `logout: true`.
     * `GET /oauth/check_session` - the `check_session_iframe` (OpenID Connect
@@ -130,8 +132,8 @@ defmodule AttestoPhoenix.Router do
       the `:pipeline` default. The classes are:
 
         * `:metadata` - authorization-server discovery, OpenID configuration,
-          Credential Issuer Metadata, JWKS, and protected-resource metadata
-          routes owned by this macro.
+          Credential Issuer Metadata, OpenID Federation Entity Configuration,
+          JWKS, and protected-resource metadata routes owned by this macro.
         * `:interactive` - authorization, device verification, end-session,
           and check-session routes.
         * `:protocol` - token, PAR, revocation, introspection, registration
@@ -181,6 +183,11 @@ defmodule AttestoPhoenix.Router do
       the deferred-credential route requires `:build_deferred_credential`
       (like `:build_credential`, an unconfigured callback is a hard
       `ArgumentError` rather than a silent empty response).
+    * `:federation` - when `true`, mounts the signed OpenID Federation Entity
+      Configuration at `/.well-known/openid-federation`. Defaults to `false`.
+      Configure `:federation_authority_hints` and
+      `:federation_entity_metadata` through `AttestoPhoenix.Config` to include
+      those optional claims.
     * `:status_list` - when `true`, mounts `GET /oauth/statuslist/:id`, the
       IETF Token Status List endpoint. Defaults to `false`. Independent of
       `:credential_issuance`: a host may issue status-referencing credentials
@@ -275,6 +282,7 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
   alias AttestoPhoenix.Controller.EndSessionController
+  alias AttestoPhoenix.Controller.EntityConfigurationController
   alias AttestoPhoenix.Controller.IntrospectionController
   alias AttestoPhoenix.Controller.JWKSController
   alias AttestoPhoenix.Controller.NonceController
@@ -308,6 +316,10 @@ defmodule AttestoPhoenix.Router do
   # OID4VCI §11.2 anchors Credential Issuer Metadata at the host root, so this
   # route is not subject to the OAuth endpoint `:prefix`.
   @credential_issuer_metadata_path "/.well-known/openid-credential-issuer"
+
+  # OpenID Federation 1.0 §8.1 pins the Entity Configuration to this
+  # well-known URI at the host root, so it is not subject to `:prefix`.
+  @federation_path "/.well-known/openid-federation"
 
   # The OAuth endpoints live under the host-chosen `:prefix`. These are the
   # path tails appended to it. They derive from the SAME tail constants
@@ -366,6 +378,7 @@ defmodule AttestoPhoenix.Router do
   @presentation_request_controller PresentationRequestController
   @presentation_response_controller PresentationResponseController
   @credential_issuer_metadata_controller CredentialIssuerMetadataController
+  @federation_controller EntityConfigurationController
 
   @doc false
   defmacro __using__(_opts) do
@@ -386,6 +399,7 @@ defmodule AttestoPhoenix.Router do
     registration? = Keyword.get(opts, :registration, false)
     device? = Keyword.get(opts, :device, false)
     credential_issuance? = Keyword.get(opts, :credential_issuance, false) == true
+    federation? = Keyword.get(opts, :federation, false) == true
     status_list? = Keyword.get(opts, :status_list, false) == true
     presentation? = Keyword.get(opts, :presentation, false) == true
     ciba? = Keyword.get(opts, :ciba, false)
@@ -403,6 +417,7 @@ defmodule AttestoPhoenix.Router do
 
     discovery_path = @discovery_path
     credential_issuer_metadata_path = @credential_issuer_metadata_path
+    federation_path = @federation_path
     openid_configuration_path = @openid_configuration_path
     jwks_path = @jwks_path
     authorize_path = @authorize_path
@@ -421,6 +436,7 @@ defmodule AttestoPhoenix.Router do
     status_list_path = @status_list_path
     discovery_controller = @discovery_controller
     credential_issuer_metadata_controller = @credential_issuer_metadata_controller
+    federation_controller = @federation_controller
     openid_configuration_controller = @openid_configuration_controller
     jwks_controller = @jwks_controller
     authorize_controller = @authorize_controller
@@ -534,6 +550,8 @@ defmodule AttestoPhoenix.Router do
         credential_issuer_metadata_controller
       )
 
+    federation_route = federation_route(federation?, federation_path, federation_controller)
+
     # Route-class expansion needs to split the device grant's non-browser
     # authorization request from its resource-owner verification page while
     # retaining their legacy order. The legacy branch below continues to use
@@ -646,6 +664,7 @@ defmodule AttestoPhoenix.Router do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :metadata))
 
             get(unquote(discovery_path), unquote(discovery_controller), :show)
+            unquote(federation_route)
             unquote(credential_issuer_metadata_route)
             unquote(openid_configuration_route)
             get(unquote(jwks_path), unquote(jwks_controller), :show)
@@ -714,6 +733,7 @@ defmodule AttestoPhoenix.Router do
           # unauthenticated public documents. A path-bearing issuer requires the
           # host-mounted derived locations documented above.
           get(unquote(discovery_path), unquote(discovery_controller), :show)
+          unquote(federation_route)
           unquote(credential_issuer_metadata_route)
           unquote(openid_configuration_route)
           get(unquote(jwks_path), unquote(jwks_controller), :show)
@@ -966,6 +986,14 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp credential_issuer_metadata_route(false, _path, _controller), do: nil
+
+  defp federation_route(true, path, controller) do
+    quote do
+      get(unquote(path), unquote(controller), :show)
+    end
+  end
+
+  defp federation_route(false, _path, _controller), do: nil
 
   defp openid_configuration_route(true, true, _local_userinfo_path, path, controller) do
     quote do

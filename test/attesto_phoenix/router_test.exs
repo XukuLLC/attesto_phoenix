@@ -18,6 +18,7 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
   alias AttestoPhoenix.Controller.EndSessionController
+  alias AttestoPhoenix.Controller.EntityConfigurationController
   alias AttestoPhoenix.Controller.IntrospectionController
   alias AttestoPhoenix.Controller.JWKSController
   alias AttestoPhoenix.Controller.OpenIDConfigurationController
@@ -30,6 +31,8 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
   alias Phoenix.Router.NoRouteError
+
+  @federation_path "/.well-known/openid-federation"
 
   defmodule StubKeystore do
     @moduledoc false
@@ -61,6 +64,15 @@ defmodule AttestoPhoenix.RouterTest do
 
     scope "/" do
       attesto_routes(registration: true)
+    end
+  end
+
+  defmodule FederationRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(prefix: "/auth", federation: true)
     end
   end
 
@@ -653,6 +665,15 @@ defmodule AttestoPhoenix.RouterTest do
     test "does not mount registration by default" do
       refute find_route(DefaultRouter, :post, "/oauth/register")
       refute find_route(DefaultRouter, :delete, "/oauth/register/:client_id")
+    end
+
+    test "mounts the root Entity Configuration only when federation is enabled" do
+      refute find_route(DefaultRouter, :get, @federation_path)
+
+      route = find_route(FederationRouter, :get, @federation_path)
+      assert route.plug == EntityConfigurationController
+      assert route.plug_opts == :show
+      refute find_route(FederationRouter, :get, "/auth" <> @federation_path)
     end
 
     test "mounts registration when enabled" do
