@@ -1,0 +1,16 @@
+defmodule AttestoPhoenix.X509TestCertificate do
+  @moduledoc false
+
+  @der_base64 "MIIBtTCCAVugAwIBAgIUHpuzBhrAyJ2+VGNHr9jkM0JgEYcwCgYIKoZIzj0EAwIwGzEZMBcGA1UEAwwQdmVyaWZpZXIuZXhhbXBsZTAeFw0yNjA4MDMwMzM0NDJaFw0zNjA3MzEwMzM0NDJaMBsxGTAXBgNVBAMMEHZlcmlmaWVyLmV4YW1wbGUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASD0iYxlPwH6Xfuhfre8v1WGi7w/Bcb5J6A4XFtdg6fkBoW5vMeN8cp5eikr1AOxjDoOYKa6AjVAuXU6qrB9yXGo30wezAdBgNVHQ4EFgQUXz3IfkAtIkiIu784G4o3Z2+3DJUwHwYDVR0jBBgwFoAUXz3IfkAtIkiIu784G4o3Z2+3DJUwGwYDVR0RBBQwEoIQdmVyaWZpZXIuZXhhbXBsZTAMBgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIHgDAKBggqhkjOPQQDAgNIADBFAiAbNYybkjNinXXzVuW3hSmzKQ17/P51AeJho4wN4AGamQIhAInRgZi0Is/CSD7PrbN2PfTybUYHYrgje8Nqe7VZEqaG"
+
+  @private_key_pem """
+  -----BEGIN PRIVATE KEY-----
+  MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgssi1FP2tdtt2fOP4
+  gqUhVZ3cQfo7nHdN2CjAiNepG7KhRANCAASD0iYxlPwH6Xfuhfre8v1WGi7w/Bcb
+  5J6A4XFtdg6fkBoW5vMeN8cp5eikr1AOxjDoOYKa6AjVAuXU6qrB9yXG
+  -----END PRIVATE KEY-----
+  """
+
+  def der, do: Base.decode64!(@der_base64)
+  def private_key_pem, do: @private_key_pem
+end

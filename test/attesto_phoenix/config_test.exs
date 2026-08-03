@@ -1109,16 +1109,24 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe "OID4VP verifier configuration" do
-    test "exposes the configured store, client id, and convention-derived URLs" do
+    test "exposes verifier identity settings and convention-derived URLs" do
+      certificate_der = <<1, 2, 3>>
+
       built =
         config(
           oauth_path_prefix: "/wallet/oauth",
           presentation_session_store: __MODULE__.PresentationStore,
-          verifier_client_id: "verifier-client-1"
+          verifier_client_id: "verifier-client-1",
+          verifier_client_id_scheme: "x509_san_dns",
+          verifier_x5c: [certificate_der],
+          verifier_dns: "verifier.example"
         )
 
       assert Config.presentation_session_store(built) == __MODULE__.PresentationStore
       assert Config.verifier_client_id(built) == "verifier-client-1"
+      assert Config.verifier_client_id_scheme(built) == "x509_san_dns"
+      assert Config.verifier_x5c(built) == [certificate_der]
+      assert Config.verifier_dns(built) == "verifier.example"
       assert Config.presentation_response_mode(built) == "direct_post"
       assert Config.presentation_request_path(built) == "/wallet/oauth/presentation_request"
       assert Config.presentation_response_path(built) == "/wallet/oauth/presentation_response"
@@ -1135,6 +1143,9 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.presentation_session_store(built) == nil
       assert Config.verifier_client_id(built) == nil
+      assert Config.verifier_client_id_scheme(built) == nil
+      assert Config.verifier_x5c(built) == nil
+      assert Config.verifier_dns(built) == nil
       assert Config.presentation_response_mode(built) == "direct_post"
     end
 
@@ -1154,6 +1165,35 @@ defmodule AttestoPhoenix.ConfigTest do
         assert_raise ArgumentError, ~r/:presentation_response_mode must be/, fn ->
           config(presentation_response_mode: invalid)
         end
+      end
+    end
+
+    test "accepts only supported verifier client-id schemes" do
+      assert Config.verifier_client_id_scheme(config(verifier_client_id_scheme: "redirect_uri")) ==
+               "redirect_uri"
+
+      assert Config.verifier_client_id_scheme(config(verifier_client_id_scheme: "x509_san_dns")) ==
+               "x509_san_dns"
+
+      for invalid <- ["", "did", :x509_san_dns] do
+        assert_raise ArgumentError, ~r/:verifier_client_id_scheme must be/, fn ->
+          config(verifier_client_id_scheme: invalid)
+        end
+      end
+    end
+
+    test "validates configured verifier certificate and DNS value types" do
+      assert Config.verifier_x5c(config(verifier_x5c: [])) == []
+      assert Config.verifier_dns(config(verifier_dns: "")) == ""
+
+      for invalid <- [:certificate, [""], [123]] do
+        assert_raise ArgumentError, ~r/:verifier_x5c must be/, fn ->
+          config(verifier_x5c: invalid)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:verifier_dns must be/, fn ->
+        config(verifier_dns: :verifier)
       end
     end
   end

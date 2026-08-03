@@ -4,10 +4,11 @@ defmodule AttestoPhoenix.VerifierTest do
 
   alias Attesto.{JWS, PresentationRequest}
   alias Attesto.PresentationSessionStore.ETS, as: Store
-  alias AttestoPhoenix.{Config, Verifier}
+  alias AttestoPhoenix.{Config, Verifier, X509TestCertificate}
 
   @issuer "https://issuer.example"
   @verifier_client_id "verifier-client-1"
+  @verifier_dns "verifier.example"
   @query_id "identity"
 
   defmodule Keystore do
@@ -28,7 +29,8 @@ defmodule AttestoPhoenix.VerifierTest do
   setup do
     start_supervised!(Store)
 
-    {request_pem, request_jwk} = keypair()
+    request_pem = X509TestCertificate.private_key_pem()
+    request_jwk = public_jwk(request_pem)
     {_issuer_pem, issuer_jwk} = keypair()
     Application.put_env(:attesto_phoenix, Keystore, signing_pem: request_pem)
 
@@ -59,8 +61,9 @@ defmodule AttestoPhoenix.VerifierTest do
     assert {:ok, claims} =
              JWS.verify_strict(session.request_object, candidates, claims_map?: true)
 
-    assert {:ok, %{"typ" => "oauth-authz-req+jwt"}} =
-             JWS.peek_json(session.request_object, :protected)
+    assert {:ok, protected} = JWS.peek_json(session.request_object, :protected)
+    assert protected["typ"] == "oauth-authz-req+jwt"
+    refute Map.has_key?(protected, "x5c")
 
     assert claims["client_id"] == @verifier_client_id
     assert claims["iss"] == @verifier_client_id
@@ -72,6 +75,36 @@ defmodule AttestoPhoenix.VerifierTest do
     assert claims["response_type"] == "vp_token"
     assert claims["response_mode"] == "direct_post"
     assert is_integer(claims["exp"])
+  end
+
+  test "x509_san_dns signs with x5c and persists the effective client id", ctx do
+    certificate_der = X509TestCertificate.der()
+
+    config = %{
+      ctx.config
+      | verifier_client_id: nil,
+        verifier_client_id_scheme: "x509_san_dns",
+        verifier_dns: @verifier_dns,
+        verifier_x5c: [certificate_der]
+    }
+
+    assert {:ok, %{id: id}} =
+             Verifier.create_presentation_request(config, request_attrs(ctx))
+
+    assert {:ok, %{data: session}} = Store.get(id)
+    assert session.audience == "x509_san_dns:" <> @verifier_dns
+
+    candidates = JWS.verification_candidates(ctx.request_jwk)
+
+    assert {:ok, claims} =
+             JWS.verify_strict(session.request_object, candidates, claims_map?: true)
+
+    assert {:ok, protected} = JWS.peek_json(session.request_object, :protected)
+    assert [encoded_certificate] = protected["x5c"]
+    assert {:ok, ^certificate_der} = Base.decode64(encoded_certificate)
+
+    assert claims["client_id"] == "x509_san_dns:" <> @verifier_dns
+    assert claims["iss"] == "x509_san_dns:" <> @verifier_dns
   end
 
   test "direct_post.jwt advertises the verifier public encryption key and algorithms", ctx do
@@ -117,6 +150,32 @@ defmodule AttestoPhoenix.VerifierTest do
     assert :error = Verifier.presentation_result(missing_store, "id")
   end
 
+  test "x509_san_dns requires both verifier_dns and a non-empty verifier_x5c", ctx do
+    certificate_der = X509TestCertificate.der()
+
+    incomplete_configs = [
+      %{ctx.config | verifier_client_id_scheme: "x509_san_dns", verifier_x5c: [certificate_der]},
+      %{
+        ctx.config
+        | verifier_client_id_scheme: "x509_san_dns",
+          verifier_dns: "",
+          verifier_x5c: [certificate_der]
+      },
+      %{ctx.config | verifier_client_id_scheme: "x509_san_dns", verifier_dns: @verifier_dns},
+      %{
+        ctx.config
+        | verifier_client_id_scheme: "x509_san_dns",
+          verifier_dns: @verifier_dns,
+          verifier_x5c: []
+      }
+    ]
+
+    for config <- incomplete_configs do
+      assert {:error, :x509_config_required} =
+               Verifier.create_presentation_request(config, request_attrs(ctx))
+    end
+  end
+
   defp request_attrs(ctx) do
     %{
       dcql_query: dcql_query(),
@@ -157,5 +216,10 @@ defmodule AttestoPhoenix.VerifierTest do
     pem = jwk |> JOSE.JWK.to_pem() |> elem(1)
     {_kty, public} = JOSE.JWK.to_public_map(jwk)
     {pem, public}
+  end
+
+  defp public_jwk(pem) do
+    {_kty, public} = pem |> JOSE.JWK.from_pem() |> JOSE.JWK.to_public_map()
+    public
   end
 end

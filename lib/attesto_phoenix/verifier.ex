@@ -101,9 +101,22 @@ defmodule AttestoPhoenix.Verifier do
         "exp" => System.system_time(:second) + @presentation_ttl_seconds
       })
 
-    {:ok, JWS.sign_current(config.keystore, claims, typ: @request_object_type)}
+    {:ok, JWS.sign_current(config.keystore, claims, signing_options(config))}
   rescue
     ArgumentError -> {:error, :invalid_attrs}
+  end
+
+  defp signing_options(config) do
+    options = [typ: @request_object_type]
+
+    case Config.verifier_client_id_scheme(config) do
+      "x509_san_dns" ->
+        x5c = Enum.map(Config.verifier_x5c(config), &Base.encode64/1)
+        Keyword.put(options, :extra_protected, %{"x5c" => x5c})
+
+      _default_scheme ->
+        options
+    end
   end
 
   defp response_options(config, options) do
@@ -144,11 +157,33 @@ defmodule AttestoPhoenix.Verifier do
   end
 
   defp verifier_client_id(config) do
+    case Config.verifier_client_id_scheme(config) do
+      scheme when scheme in [nil, "redirect_uri"] -> configured_verifier_client_id(config)
+      "x509_san_dns" -> x509_verifier_client_id(config)
+    end
+  end
+
+  defp configured_verifier_client_id(config) do
     case Config.verifier_client_id(config) do
       client_id when is_binary(client_id) and client_id != "" -> {:ok, client_id}
       _ -> {:error, :verifier_client_id_required}
     end
   end
+
+  defp x509_verifier_client_id(config) do
+    dns = Config.verifier_dns(config)
+    x5c = Config.verifier_x5c(config)
+
+    if is_binary(dns) and dns != "" and valid_x5c?(x5c) do
+      {:ok, "x509_san_dns:" <> dns}
+    else
+      {:error, :x509_config_required}
+    end
+  end
+
+  defp valid_x5c?(x5c) when is_list(x5c) and x5c != [], do: Enum.all?(x5c, &(is_binary(&1) and &1 != ""))
+
+  defp valid_x5c?(_x5c), do: false
 
   defp request_uri(config, id) do
     Config.presentation_request_endpoint_url(config) <>

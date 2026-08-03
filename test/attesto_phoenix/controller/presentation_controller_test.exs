@@ -23,7 +23,7 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
   alias Attesto.{JWS, PresentationRequest, PresentationSession, SdJwtVc}
   alias Attesto.PresentationSessionStore.ETS, as: Store
-  alias AttestoPhoenix.{Config, Verifier}
+  alias AttestoPhoenix.{Config, Verifier, X509TestCertificate}
 
   @issuer "https://issuer.example"
   @verifier_client_id "verifier-client-1"
@@ -47,7 +47,8 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
   setup do
     start_supervised!(Store)
 
-    {request_pem, request_jwk} = keypair()
+    request_pem = X509TestCertificate.private_key_pem()
+    request_jwk = public_jwk(request_pem)
     {issuer_pem, issuer_jwk} = keypair()
     {holder_pem, holder_jwk} = keypair()
 
@@ -135,6 +136,24 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
     assert result.vct == "identity"
     assert result.iss == @issuer
+    assert result.claims["given_name"] == "Alice"
+  end
+
+  test "x509_san_dns verifies a vp_token bound to the effective client id", %{conn: conn} = ctx do
+    dns = "verifier.example"
+    client_id = "x509_san_dns:" <> dns
+    config = configure_x509(ctx.config, dns)
+    ctx = %{ctx | config: config}
+    session = create_request(ctx)
+    vp_token = valid_vp_token(ctx, session.nonce, client_id)
+
+    response = post_response(conn, config, session.id, JSON.encode!(vp_token))
+
+    assert response.status == 200
+
+    assert {:ok, %{@query_id => result}} =
+             Verifier.presentation_result(config, session.id)
+
     assert result.claims["given_name"] == "Alice"
   end
 
@@ -353,6 +372,26 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     %{config | presentation_response_mode: mode}
   end
 
+  defp configure_x509(config, dns) do
+    x5c = [X509TestCertificate.der()]
+
+    opts =
+      :attesto_phoenix
+      |> Application.fetch_env!(Config)
+      |> Keyword.put(:verifier_client_id_scheme, "x509_san_dns")
+      |> Keyword.put(:verifier_dns, dns)
+      |> Keyword.put(:verifier_x5c, x5c)
+
+    Application.put_env(:attesto_phoenix, Config, opts)
+
+    %{
+      config
+      | verifier_client_id_scheme: "x509_san_dns",
+        verifier_dns: dns,
+        verifier_x5c: x5c
+    }
+  end
+
   defp assert_invalid_request(response) do
     assert response.status == 400
     assert json_response(response, 400) == %{"error" => "invalid_request"}
@@ -376,5 +415,10 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     pem = jwk |> JOSE.JWK.to_pem() |> elem(1)
     {_kty, public} = JOSE.JWK.to_public_map(jwk)
     {pem, public}
+  end
+
+  defp public_jwk(pem) do
+    {_kty, public} = pem |> JOSE.JWK.from_pem() |> JOSE.JWK.to_public_map()
+    public
   end
 end

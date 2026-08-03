@@ -451,7 +451,16 @@ defmodule AttestoPhoenix.Config do
       `AttestoPhoenix.Verifier`.
     * `:verifier_client_id` - verifier identifier placed in the presentation
       request and used as the holder Key Binding JWT audience. Required when
-      creating verifier presentation requests.
+      creating verifier presentation requests with the default or
+      `"redirect_uri"` client-id scheme.
+    * `:verifier_client_id_scheme` - OID4VP verifier client-id scheme. `nil`
+      (the default) and `"redirect_uri"` retain the configured
+      `:verifier_client_id`; `"x509_san_dns"` derives the identifier from
+      `:verifier_dns`.
+    * `:verifier_x5c` - verifier certificate chain as DER binaries, leaf first.
+      Required when `:verifier_client_id_scheme` is `"x509_san_dns"`.
+    * `:verifier_dns` - dNSName advertised by the verifier. Required when
+      `:verifier_client_id_scheme` is `"x509_san_dns"`.
     * `:presentation_response_mode` - OID4VP response mode advertised to wallets.
       Defaults to `"direct_post"`; set to `"direct_post.jwt"` to require an
       encrypted authorization response.
@@ -635,6 +644,9 @@ defmodule AttestoPhoenix.Config do
     :c_nonce_store,
     :presentation_session_store,
     :verifier_client_id,
+    :verifier_client_id_scheme,
+    :verifier_x5c,
+    :verifier_dns,
     :credential_configurations_supported,
     :end_session_path,
     :logout_session_store,
@@ -792,6 +804,9 @@ defmodule AttestoPhoenix.Config do
           c_nonce_store: module() | nil,
           presentation_session_store: module() | nil,
           verifier_client_id: String.t() | nil,
+          verifier_client_id_scheme: String.t() | nil,
+          verifier_x5c: [binary()] | nil,
+          verifier_dns: String.t() | nil,
           presentation_response_mode: String.t(),
           credential_configurations_supported: map() | nil,
           authenticate_ciba_user: callback() | nil,
@@ -1288,6 +1303,18 @@ defmodule AttestoPhoenix.Config do
   @doc "The verifier client identifier used as the OID4VP presentation audience."
   @spec verifier_client_id(t()) :: String.t() | nil
   def verifier_client_id(%__MODULE__{verifier_client_id: client_id}), do: client_id
+
+  @doc "The OID4VP verifier client-id scheme, or `nil` for the default behavior."
+  @spec verifier_client_id_scheme(t()) :: String.t() | nil
+  def verifier_client_id_scheme(%__MODULE__{verifier_client_id_scheme: scheme}), do: scheme
+
+  @doc "The verifier certificate chain as DER binaries, leaf first."
+  @spec verifier_x5c(t()) :: [binary()] | nil
+  def verifier_x5c(%__MODULE__{verifier_x5c: x5c}), do: x5c
+
+  @doc "The dNSName advertised by an `x509_san_dns` verifier."
+  @spec verifier_dns(t()) :: String.t() | nil
+  def verifier_dns(%__MODULE__{verifier_dns: dns}), do: dns
 
   @doc "The OID4VP direct-post response mode advertised to wallets."
   @spec presentation_response_mode(t()) :: String.t()
@@ -2617,6 +2644,9 @@ defmodule AttestoPhoenix.Config do
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
     validate_verifier_client_id!(config.verifier_client_id)
+    validate_verifier_client_id_scheme!(config.verifier_client_id_scheme)
+    validate_verifier_x5c!(config.verifier_x5c)
+    validate_verifier_dns!(config.verifier_dns)
     validate_presentation_response_mode!(config.presentation_response_mode)
 
     if config.mtls_enabled and is_nil(config.cert_der) do
@@ -3260,6 +3290,40 @@ defmodule AttestoPhoenix.Config do
     raise ArgumentError,
           "AttestoPhoenix.Config: :verifier_client_id must be a non-empty string when configured; " <>
             "got #{inspect(client_id)}"
+  end
+
+  defp validate_verifier_client_id_scheme!(scheme) when scheme in [nil, "redirect_uri", "x509_san_dns"], do: :ok
+
+  defp validate_verifier_client_id_scheme!(scheme) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_client_id_scheme must be nil, \"redirect_uri\", or " <>
+            "\"x509_san_dns\"; got #{inspect(scheme)}"
+  end
+
+  defp validate_verifier_x5c!(nil), do: :ok
+
+  defp validate_verifier_x5c!(x5c) when is_list(x5c) do
+    if Enum.all?(x5c, &(is_binary(&1) and &1 != "")) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :verifier_x5c must be a list of non-empty DER binaries; " <>
+              "got #{inspect(x5c)}"
+    end
+  end
+
+  defp validate_verifier_x5c!(x5c) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_x5c must be a list of non-empty DER binaries; " <>
+            "got #{inspect(x5c)}"
+  end
+
+  defp validate_verifier_dns!(dns) when is_binary(dns) or is_nil(dns), do: :ok
+
+  defp validate_verifier_dns!(dns) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_dns must be a string when configured; " <>
+            "got #{inspect(dns)}"
   end
 
   defp validate_presentation_response_mode!(mode) when mode in ["direct_post", "direct_post.jwt"], do: :ok
