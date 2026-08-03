@@ -81,7 +81,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   alias Attesto.OpenIDDiscovery
   alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
-  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.{Callback, Config}
   alias AttestoPhoenix.URLComparison
 
   # The router pipeline installs the AttestoPhoenix.Config here. This is the
@@ -213,8 +213,8 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
          endpoint,
          config.issuer,
          local_route,
-         conn.path_info,
-         conn.script_name
+         Map.get(conn, :path_info),
+         Map.get(conn, :script_name)
        ),
        do: endpoint
   end
@@ -223,6 +223,9 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   defp local_userinfo_endpoint?(endpoint, issuer, {local_segments, metadata_segment_count}, path_info, script_name)
        when is_list(local_segments) and is_integer(metadata_segment_count) and metadata_segment_count >= 0 do
+    endpoint = Callback.map_value(%{endpoint: endpoint}, :endpoint)
+    issuer = Callback.map_value(%{issuer: issuer}, :issuer)
+
     with true <- is_binary(endpoint) and is_binary(issuer),
          {:ok, endpoint_uri} <- URI.new(endpoint),
          {:ok, issuer_uri} <- URI.new(issuer) do

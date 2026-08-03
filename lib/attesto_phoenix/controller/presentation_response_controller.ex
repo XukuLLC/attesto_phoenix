@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
     with :ok <- check_https(conn, config),
          {:ok, store} <- presentation_session_store(config),
-         {:ok, state, vp_token} <- response(conn.body_params, config),
+         {:ok, state, vp_token} <- response(Map.get(conn, :body_params), config),
          {:ok, _results} <- verify_response(store, state, vp_token) do
       json(conn, %{})
     else

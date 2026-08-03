@@ -1093,7 +1093,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # through Phoenix content negotiation) so a user agent that arrived without an
   # `Accept` header still receives the error rather than a 406.
   defp render_direct_error(conn, _config, reason) do
-    description = direct_error_description(reason)
+    description = direct_error_description(Callback.map_value(%{reason: reason}, :reason))
     code = direct_error_code(reason)
 
     if accepts_html?(conn) do

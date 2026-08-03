@@ -389,7 +389,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   # `:headers` so the controller can replay the `DPoP-Nonce` header verbatim,
   # telling the client to retry its proof with the `nonce` claim included.
   defp dpop_nonce_required(config) do
-    nonce = issue_nonce(config)
+    nonce = issue_nonce(Callback.map_value(%{config: config}, :config))
 
     error(@error_use_dpop_nonce, "DPoP proof requires a server-issued nonce",
       status: 400,

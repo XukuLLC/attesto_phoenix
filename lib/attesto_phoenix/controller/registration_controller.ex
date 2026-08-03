@@ -207,8 +207,12 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # RFC 7591 §3.1: the metadata document is the JSON request body. Read it from
   # the parsed body only; a query-string copy would leak into proxy logs and is
   # not part of the wire contract.
-  defp registration_metadata(%Plug.Conn{body_params: body}) when is_map(body), do: body
-  defp registration_metadata(_conn), do: %{}
+  defp registration_metadata(%Plug.Conn{} = conn) do
+    case Map.get(conn, :body_params) do
+      body when is_map(body) -> body
+      _ -> %{}
+    end
+  end
 
   defp check_content_type(conn) do
     case get_req_header(conn, "content-type") do

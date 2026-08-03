@@ -59,8 +59,10 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecision do
   # §10.2: only ping-mode requests are notified, and only when the client has a
   # notification token (poll mode returns nil) and a resolvable endpoint. Async,
   # fire-and-forget: the token is already redeemable at the token endpoint.
-  defp deliver_ping(config, auth_req_id, %{delivery_mode: :ping, client_notification_token: token, client_id: client_id})
+  defp deliver_ping(config, auth_req_id, %{delivery_mode: :ping, client_notification_token: token} = decision)
        when is_binary(token) do
+    client_id = Callback.map_value(decision, :client_id)
+
     case notification_endpoint(config, client_id) do
       endpoint when is_binary(endpoint) and endpoint != "" ->
         post_async(Config.ciba_ping_http_client(config), endpoint, token, auth_req_id)

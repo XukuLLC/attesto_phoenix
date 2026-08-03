@@ -2753,7 +2753,7 @@ defmodule AttestoPhoenix.Config do
     validate_bearer_methods_supported!(config)
     validate_verifier_client_id!(config.verifier_client_id)
     validate_verifier_client_id_scheme!(config.verifier_client_id_scheme)
-    validate_verifier_x5c!(config.verifier_x5c)
+    validate_verifier_x5c!(Callback.config_callback(config, :verifier_x5c))
     validate_verifier_dns!(config.verifier_dns)
     validate_presentation_response_mode!(config.presentation_response_mode)
 
@@ -2928,7 +2928,9 @@ defmodule AttestoPhoenix.Config do
   # `@bearer_methods`. An empty list, a duplicate, or an unaccepted method (e.g.
   # `"query"`, `"cookie"`) would advertise a contract the resource cannot honour
   # (a conformant client could select a rejected method).
-  defp validate_bearer_methods_supported!(%{bearer_methods_supported: methods}) do
+  defp validate_bearer_methods_supported!(%{} = config) do
+    methods = Callback.config_callback(config, :bearer_methods_supported)
+
     if is_list(methods) and methods != [] and methods == Enum.uniq(methods) and
          Enum.all?(methods, &(&1 in @bearer_methods)) do
       :ok

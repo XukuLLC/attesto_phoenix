@@ -9,7 +9,7 @@ defmodule AttestoPhoenix.Controller.NonceController do
 
   use Phoenix.Controller, formats: [:json]
 
-  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.{Callback, Config}
   alias AttestoPhoenix.OAuthError
   alias AttestoPhoenix.RequestContext
 
@@ -38,7 +38,7 @@ defmodule AttestoPhoenix.Controller.NonceController do
   end
 
   defp c_nonce_store(config) do
-    case Config.c_nonce_store(config) do
+    case Callback.config_callback(config, :c_nonce_store) do
       store when is_atom(store) -> {:ok, store}
       _ -> {:error, OAuthError.new(:invalid_request, "c_nonce_store is required", status: 400)}
     end

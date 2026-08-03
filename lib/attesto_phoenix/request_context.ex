@@ -472,12 +472,16 @@ defmodule AttestoPhoenix.RequestContext do
   defp default_port?("http", @http_default_port), do: true
   defp default_port?(_scheme, _port), do: false
 
-  defp remote_ip_string(%Plug.Conn{remote_ip: nil}), do: nil
+  defp remote_ip_string(%Plug.Conn{} = conn) do
+    case Map.get(conn, :remote_ip) do
+      nil ->
+        nil
 
-  defp remote_ip_string(%Plug.Conn{remote_ip: remote_ip}) do
-    case :inet.ntoa(remote_ip) do
-      {:error, _} -> nil
-      charlist -> List.to_string(charlist)
+      remote_ip ->
+        case :inet.ntoa(remote_ip) do
+          {:error, _} -> nil
+          charlist -> List.to_string(charlist)
+        end
     end
   rescue
     _ -> nil

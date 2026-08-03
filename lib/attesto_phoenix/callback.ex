@@ -68,10 +68,18 @@ defmodule AttestoPhoenix.Callback do
   pulling a host callback out of `%AttestoPhoenix.Config{}` (or any struct/map
   carrying it). An absent key reads as `nil`, matching the fail-closed
   resolution used throughout the library; the value is otherwise returned
-  unchanged for an `invoke/2,3` caller to run. It carries no policy.
+  unchanged. The return type is deliberately `any()` because the same reader
+  is also used for module-valued store keys, not only executable callbacks.
+  It carries no policy.
   """
-  @spec config_callback(map(), atom()) :: callback() | nil
-  def config_callback(config, key) when is_map(config) and is_atom(key), do: Map.get(config, key)
+  @spec config_callback(map(), atom()) :: any()
+  def config_callback(config, key) when is_map(config) and is_atom(key), do: map_value(config, key)
+
+  # Runtime data can be broader than a struct or dependency's declared success
+  # type. Keep defensive boundary clauses reachable without changing the value.
+  @doc false
+  @spec map_value(map(), atom()) :: any()
+  def map_value(map, key) when is_map(map) and is_atom(key), do: Map.get(map, key)
 
   @doc """
   Read a boolean policy flag off the config struct by `key`.

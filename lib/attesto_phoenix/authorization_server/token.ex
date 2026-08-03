@@ -238,7 +238,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              # request-time `resource` — never widened by one. RFC 9470: carry
              # the authentication context (`acr`/`auth_time`) the code recorded
              # at authorize onto the access token for step-up enforcement.
-             audience_opts(audience) ++ auth_context_opts(grant.claims)
+             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
            ),
          # OIDC Core §3.1.3.3: when the request was an OpenID Connect
          # Authentication Request (granted scope contains `openid`), the token
@@ -355,7 +355,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              %{},
              # RFC 8707 aud from the bound resource set; RFC 9470 acr/auth_time
              # the verification page recorded onto the approved code.
-             audience_opts(audience) ++ auth_context_opts(grant.claims)
+             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
            ) do
       issued = token_issued_event(request, scope, "device_code", token_type, binding)
       maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued], "device_code")
@@ -789,7 +789,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp pre_authorized_code_error(reason) do
-    case reason do
+    case Callback.map_value(%{reason: reason}, :reason) do
       :invalid_grant -> error(@error_invalid_grant, "the pre-authorized code is invalid")
       :expired -> error(@error_invalid_grant, "the pre-authorized code has expired")
       :tx_code_required -> error(@error_invalid_grant, "transaction code required")
@@ -1545,13 +1545,17 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # unchanged for a wallet that used the ordinary authorization_code flow. A
   # code that carried none (every non-OID4VCI authorization_code grant) adds
   # no such claim.
-  defp access_token_claims(%{claims: claims}) when is_map(claims) do
-    %{}
-    |> put_optional("claims", requested_userinfo_claims(claims))
-    |> put_optional("credential_configuration_ids", credential_configuration_ids(claims))
-  end
+  defp access_token_claims(grant) do
+    case Callback.map_value(grant, :claims) do
+      claims when is_map(claims) ->
+        %{}
+        |> put_optional("claims", requested_userinfo_claims(claims))
+        |> put_optional("credential_configuration_ids", credential_configuration_ids(claims))
 
-  defp access_token_claims(_grant), do: %{}
+      _ ->
+        %{}
+    end
+  end
 
   defp requested_userinfo_claims(claims) do
     case id_token_claim(claims, "claims") do

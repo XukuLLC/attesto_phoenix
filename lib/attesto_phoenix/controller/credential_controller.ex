@@ -50,7 +50,9 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   end
 
   defp issue(conn, config, request, resource_metadata, claims) do
-    with {:ok, parsed} <- CredentialRequest.parse(request),
+    parsed_request = Callback.map_value(%{result: CredentialRequest.parse(request)}, :result)
+
+    with {:ok, parsed} <- parsed_request,
          {:ok, credential_configuration_id} <- selector(parsed.selector),
          :ok <- entitled?(claims, credential_configuration_id),
          {:ok, holder_jwks} <- verify_proofs(config, claims, parsed.proofs) do
@@ -119,7 +121,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   defp verify_proof(_config, _claims, _proof), do: :error
 
   defp nonce_valid?(config, nonce) do
-    case Config.c_nonce_store(config) do
+    case Callback.config_callback(config, :c_nonce_store) do
       store when is_atom(store) ->
         function_exported?(store, :valid?, 1) and store.valid?(nonce)
 
