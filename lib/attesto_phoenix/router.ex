@@ -37,6 +37,8 @@ defmodule AttestoPhoenix.Router do
       management cleanup (RFC 7592 §2), mounted with registration.
     * `POST /oauth/nonce` - the OID4VCI c_nonce endpoint, mounted only with
       `credential_issuance: true`.
+    * `GET /oauth/statuslist/:id` - the IETF Token Status List endpoint,
+      mounted only with `status_list: true`.
     * `GET` and `POST /oauth/userinfo` - the UserInfo endpoint (OpenID Connect
       Core 1.0 §5.3); a bearer-authenticated protected resource (RFC 6750
       §2.1/§2.2), omitted with `userinfo: false`.
@@ -129,7 +131,8 @@ defmodule AttestoPhoenix.Router do
           and check-session routes.
         * `:protocol` - token, PAR, revocation, introspection, registration
           management, UserInfo, device authorization, and CIBA backchannel
-          authentication routes, plus the public OID4VP wallet endpoints.
+          authentication routes, plus the public OID4VCI and OID4VP wallet
+          endpoints.
 
       Unknown or duplicate class keys and malformed values raise
       `ArgumentError` during router compilation. When this option is absent,
@@ -168,6 +171,12 @@ defmodule AttestoPhoenix.Router do
       `false`. The host must also configure `:build_credential`, a
       `:pre_authorized_code_store`, and
       `:credential_configurations_supported`.
+    * `:status_list` - when `true`, mounts `GET /oauth/statuslist/:id`, the
+      IETF Token Status List endpoint. Defaults to `false`. Independent of
+      `:credential_issuance`: a host may issue status-referencing credentials
+      through another channel and only need this endpoint to publish the
+      lists. The host must also configure `:status_list_store`; the endpoint
+      answers 404 for a list it cannot resolve.
     * `:presentation` - when `true`, independently mounts the public OID4VP
       request-object and direct-post response endpoints. Defaults to `false`.
       The host must configure `:presentation_session_store` and
@@ -264,6 +273,7 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.ProtectedResourceController
   alias AttestoPhoenix.Controller.RegistrationController
   alias AttestoPhoenix.Controller.RevocationController
+  alias AttestoPhoenix.Controller.StatusListController
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
   alias Plug.Router.Utils
@@ -309,6 +319,7 @@ defmodule AttestoPhoenix.Router do
   @check_session_path @oauth_prefix <> AttestoPhoenix.Config.check_session_tail()
   @credential_path @oauth_prefix <> AttestoPhoenix.Config.credential_tail()
   @nonce_path @oauth_prefix <> AttestoPhoenix.Config.nonce_tail()
+  @status_list_path @oauth_prefix <> AttestoPhoenix.Config.status_list_tail()
   @presentation_request_path @oauth_prefix <> AttestoPhoenix.Config.presentation_request_tail()
   @presentation_response_path @oauth_prefix <> AttestoPhoenix.Config.presentation_response_tail()
 
@@ -335,6 +346,7 @@ defmodule AttestoPhoenix.Router do
   @check_session_controller CheckSessionController
   @credential_controller CredentialController
   @nonce_controller NonceController
+  @status_list_controller StatusListController
   @presentation_request_controller PresentationRequestController
   @presentation_response_controller PresentationResponseController
   @credential_issuer_metadata_controller CredentialIssuerMetadataController
@@ -358,6 +370,7 @@ defmodule AttestoPhoenix.Router do
     registration? = Keyword.get(opts, :registration, false)
     device? = Keyword.get(opts, :device, false)
     credential_issuance? = Keyword.get(opts, :credential_issuance, false) == true
+    status_list? = Keyword.get(opts, :status_list, false) == true
     presentation? = Keyword.get(opts, :presentation, false) == true
     ciba? = Keyword.get(opts, :ciba, false)
     logout? = Keyword.get(opts, :logout, false)
@@ -387,6 +400,7 @@ defmodule AttestoPhoenix.Router do
     presentation_response_path = @presentation_response_path
     credential_path = @credential_path
     nonce_path = @nonce_path
+    status_list_path = @status_list_path
     discovery_controller = @discovery_controller
     credential_issuer_metadata_controller = @credential_issuer_metadata_controller
     openid_configuration_controller = @openid_configuration_controller
@@ -489,6 +503,7 @@ defmodule AttestoPhoenix.Router do
 
     credential_route = credential_route(credential_issuance?, prefix, credential_path)
     nonce_route = nonce_route(credential_issuance?, prefix, nonce_path)
+    status_list_route = status_list_route(status_list?, prefix, status_list_path)
     presentation_request_route = presentation_request_route(presentation?, prefix, presentation_request_path)
     presentation_response_route = presentation_response_route(presentation?, prefix, presentation_response_path)
 
@@ -636,6 +651,7 @@ defmodule AttestoPhoenix.Router do
             unquote(device_authorization_route)
             unquote(nonce_route)
             unquote(credential_route)
+            unquote(status_list_route)
             unquote(presentation_request_route)
             unquote(presentation_response_route)
           end
@@ -713,6 +729,7 @@ defmodule AttestoPhoenix.Router do
           unquote(device_route)
           unquote(nonce_route)
           unquote(credential_route)
+          unquote(status_list_route)
           unquote(presentation_request_route)
           unquote(presentation_response_route)
           unquote(ciba_route)
@@ -861,6 +878,18 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp nonce_route(false, _prefix, _nonce_path), do: nil
+
+  defp status_list_route(true, prefix, status_list_path) do
+    quote do
+      get(
+        unquote(prefix <> status_list_path <> "/:id"),
+        unquote(@status_list_controller),
+        :show
+      )
+    end
+  end
+
+  defp status_list_route(false, _prefix, _status_list_path), do: nil
 
   defp presentation_request_route(true, prefix, presentation_request_path) do
     quote do

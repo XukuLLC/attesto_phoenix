@@ -181,6 +181,11 @@ defmodule AttestoPhoenix.Config do
       configuration identifiers to the configuration metadata advertised by
       the Credential Issuer Metadata endpoint. Required when credential
       issuance is mounted.
+    * `:status_list_store` - module implementing `Attesto.StatusListStore`,
+      the allocated-index storage for IETF Token Status List (RFC-to-be)
+      credential-status lists. Required when the host mounts the
+      `status_list: true` route; the endpoint answers 404 for a list it
+      cannot resolve through this store.
     * `:build_id_token_claims` - `(client, subject, granted_scopes,
       requested_claims -> claims_map)`. Produces the host claims merged into an
       ID Token (OpenID Connect Core §3.1.3.6 / §5.5 `id_token` member). Distinct
@@ -642,6 +647,7 @@ defmodule AttestoPhoenix.Config do
     :pre_authorized_code_store,
     :credential_offer_store,
     :c_nonce_store,
+    :status_list_store,
     :presentation_session_store,
     :verifier_client_id,
     :verifier_client_id_scheme,
@@ -802,6 +808,7 @@ defmodule AttestoPhoenix.Config do
           pre_authorized_code_store: module() | nil,
           credential_offer_store: module() | nil,
           c_nonce_store: module() | nil,
+          status_list_store: module() | nil,
           presentation_session_store: module() | nil,
           verifier_client_id: String.t() | nil,
           verifier_client_id_scheme: String.t() | nil,
@@ -1296,6 +1303,10 @@ defmodule AttestoPhoenix.Config do
   @spec c_nonce_store(t()) :: module() | nil
   def c_nonce_store(%__MODULE__{c_nonce_store: store}), do: store
 
+  @doc "The configured `Attesto.StatusListStore` module, or `nil`."
+  @spec status_list_store(t()) :: module() | nil
+  def status_list_store(%__MODULE__{status_list_store: store}), do: store
+
   @doc "The configured `Attesto.PresentationSessionStore` module, or `nil`."
   @spec presentation_session_store(t()) :: module() | nil
   def presentation_session_store(%__MODULE__{presentation_session_store: store}), do: store
@@ -1768,6 +1779,7 @@ defmodule AttestoPhoenix.Config do
   @check_session_tail "/check_session"
   @credential_tail "/credential"
   @nonce_tail "/nonce"
+  @status_list_tail "/statuslist"
   @presentation_request_tail "/presentation_request"
   @presentation_response_tail "/presentation_response"
 
@@ -1782,6 +1794,10 @@ defmodule AttestoPhoenix.Config do
   @doc false
   @spec nonce_tail() :: String.t()
   def nonce_tail, do: @nonce_tail
+
+  @doc false
+  @spec status_list_tail() :: String.t()
+  def status_list_tail, do: @status_list_tail
 
   @doc false
   @spec presentation_request_tail() :: String.t()
