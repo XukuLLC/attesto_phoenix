@@ -5,23 +5,24 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   This endpoint authenticates the access token, enforces the credential
   configuration entitlement carried by that token, verifies each of the
   wallet's holder-key proofs against a server-issued c_nonce, and issues one
-  SD-JWT VC per verified proof (the OID4VCI `proofs` batch form). The host
-  supplies only the credential type and claim values through
+  holder-bound credential per verified proof (the OID4VCI `proofs` batch
+  form). The host supplies only the credential type and claim values through
   `:build_credential`; the library owns proof verification, holder binding,
-  signing, and response framing.
+  signing, format-specific issuance, and response framing.
   """
 
   use Phoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
-  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, SdJwtVc}
+  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, Mdoc, SdJwtVc}
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
   alias Plug.Conn.Unfetched
 
   @credential_configuration_ids_claim "credential_configuration_ids"
+  @sd_jwt_vc_formats ~w(vc+sd-jwt dc+sd-jwt)
 
   @doc """
   Issue the credential(s) requested by an authenticated wallet.
@@ -150,9 +151,31 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   end
 
   defp build_credentials(config, subject, credential_configuration_id, holder_jwks) do
+    with {:ok, credential_configuration} <-
+           credential_configuration(config, credential_configuration_id) do
+      build_credentials(
+        config,
+        subject,
+        credential_configuration_id,
+        holder_jwks,
+        credential_configuration
+      )
+    end
+  end
+
+  defp build_credentials(config, subject, credential_configuration_id, holder_jwks, credential_configuration) do
+    format = configuration_value(credential_configuration, :format)
+
     holder_jwks
     |> Enum.reduce_while({:ok, []}, fn holder_jwk, {:ok, acc} ->
-      case build_credential(config, subject, credential_configuration_id, holder_jwk) do
+      case build_credential(
+             config,
+             subject,
+             credential_configuration_id,
+             holder_jwk,
+             format,
+             credential_configuration
+           ) do
         {:ok, credential} -> {:cont, {:ok, [credential | acc]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
@@ -162,6 +185,18 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       error -> error
     end
   end
+
+  defp build_credential(config, subject, credential_configuration_id, holder_jwk, format, _configuration)
+       when format in @sd_jwt_vc_formats do
+    build_credential(config, subject, credential_configuration_id, holder_jwk)
+  end
+
+  defp build_credential(config, subject, credential_configuration_id, holder_jwk, "mso_mdoc", credential_configuration) do
+    build_mdoc_credential(config, subject, credential_configuration_id, holder_jwk, credential_configuration)
+  end
+
+  defp build_credential(_config, _subject, _credential_configuration_id, _holder_jwk, _format, _configuration),
+    do: {:error, :unsupported_credential_format}
 
   defp build_credential(config, subject, credential_configuration_id, holder_jwk) do
     case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
@@ -191,6 +226,57 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       |> maybe_put_option(:exp, Map.get(result, :valid_until))
       |> maybe_put_option(:nbf, Map.get(result, :valid_from))
     )
+  end
+
+  defp build_mdoc_credential(config, subject, credential_configuration_id, holder_jwk, credential_configuration) do
+    case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
+      {:ok, %{namespaces: namespaces} = result} when is_map(namespaces) ->
+        issue_mdoc_credential(config, result, holder_jwk, credential_configuration)
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_credential}
+    end
+  end
+
+  defp issue_mdoc_credential(config, result, holder_jwk, credential_configuration) do
+    now = System.system_time(:second)
+    doc_type = Map.get(result, :doc_type) || configuration_doc_type(credential_configuration)
+
+    Mdoc.issue(
+      doc_type: doc_type,
+      namespaces: result.namespaces,
+      device_key: holder_jwk,
+      issuer_pem: config.keystore.signing_pem(),
+      validity: %{
+        signed: now,
+        valid_from: Map.get(result, :valid_from, now),
+        valid_until: Map.get(result, :valid_until, now)
+      }
+    )
+  end
+
+  defp credential_configuration(config, credential_configuration_id) do
+    case Config.credential_configurations_supported(config) do
+      configurations when is_map(configurations) ->
+        case Map.fetch(configurations, credential_configuration_id) do
+          {:ok, configuration} when is_map(configuration) -> {:ok, configuration}
+          _other -> {:error, :unsupported_credential_configuration}
+        end
+
+      _other ->
+        {:error, :unsupported_credential_configuration}
+    end
+  end
+
+  defp configuration_doc_type(configuration) do
+    configuration_value(configuration, :doctype) || configuration_value(configuration, :doc_type)
+  end
+
+  defp configuration_value(configuration, key) do
+    Map.get(configuration, key) || Map.get(configuration, Atom.to_string(key))
   end
 
   defp maybe_put_option(opts, _key, nil), do: opts

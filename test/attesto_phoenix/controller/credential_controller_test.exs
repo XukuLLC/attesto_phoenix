@@ -6,8 +6,8 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   import Plug.Test
 
   alias Attesto.CNonceStore.ETS, as: CNonceStore
+  alias Attesto.{Mdoc, SdJwtVc, Token}
   alias Attesto.PreAuthorizedCodeStore.ETS
-  alias Attesto.{SdJwtVc, Token}
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.CredentialController
 
@@ -16,6 +16,9 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   @subject "ou_user-123"
   @configuration_id "UniversityDegreeCredential"
   @vct "https://credentials.example/UniversityDegreeCredential"
+  @mdoc_configuration_id "org.iso.18013.5.1.mDL"
+  @mdoc_doc_type "org.iso.18013.5.1.mDL"
+  @mdoc_namespace "org.iso.18013.5.1"
   @signing_pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
   @holder_key JOSE.JWK.generate_key({:ec, "P-256"})
 
@@ -66,6 +69,9 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       require_https: false,
       pre_authorized_code_store: ETS,
       c_nonce_store: CNonceStore,
+      credential_configurations_supported: %{
+        @configuration_id => %{format: "vc+sd-jwt", vct: @vct}
+      },
       build_credential: fn subject, credential_configuration_id, holder_jwk ->
         send(self(), {:credential_requested, subject, credential_configuration_id, holder_jwk})
 
@@ -107,6 +113,47 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert verified.cnf == %{"jwk" => public_map(@holder_key)}
 
       assert_receive {:credential_requested, @subject, @configuration_id, holder_jwk}
+      assert holder_jwk == public_map(@holder_key)
+    end
+
+    test "issues a holder-bound mso_mdoc credential" do
+      namespaces = %{
+        @mdoc_namespace => %{
+          "family_name" => "Doe",
+          "given_name" => "Jane"
+        }
+      }
+
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      config
+      |> Keyword.put(:credential_configurations_supported, %{
+        @mdoc_configuration_id => %{format: "mso_mdoc", doctype: @mdoc_doc_type}
+      })
+      |> Keyword.put(:build_credential, fn subject, credential_configuration_id, holder_jwk ->
+        send(self(), {:credential_requested, subject, credential_configuration_id, holder_jwk})
+        {:ok, %{doc_type: @mdoc_doc_type, namespaces: namespaces}}
+      end)
+      |> put_config()
+
+      nonce = CNonceStore.issue(60)
+
+      response =
+        post_credential(
+          mint_token(credential_configuration_ids: [@mdoc_configuration_id]),
+          credential_request(nonce, credential_configuration_id: @mdoc_configuration_id)
+        )
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+      assert {:ok, verified} = Mdoc.verify(credential, issuer_jwk)
+      assert verified.doc_type == @mdoc_doc_type
+      assert verified.namespaces == namespaces
+      assert verified.device_key == public_map(@holder_key)
+
+      assert_receive {:credential_requested, @subject, @mdoc_configuration_id, holder_jwk}
       assert holder_jwk == public_map(@holder_key)
     end
 
@@ -241,9 +288,10 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
   defp credential_request(nonce, opts \\ []) do
     proof = Keyword.get(opts, :proof, proof_jwt(nonce))
+    credential_configuration_id = Keyword.get(opts, :credential_configuration_id, @configuration_id)
 
     %{
-      "credential_configuration_id" => @configuration_id,
+      "credential_configuration_id" => credential_configuration_id,
       "proof" => %{"proof_type" => "jwt", "jwt" => proof}
     }
   end

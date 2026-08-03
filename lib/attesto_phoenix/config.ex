@@ -173,10 +173,11 @@ defmodule AttestoPhoenix.Config do
       Required only when the UserInfo endpoint is mounted.
     * `:build_credential` - `(subject, credential_configuration_id,
       holder_jwk -> {:ok, credential} | {:error, reason})`. Produces the
-      credential type, subject claim values, and optional validity window for
-      the OID4VCI Credential endpoint. The library binds `holder_jwk` as `cnf`
-      and signs the resulting SD-JWT VC. Required when credential issuance is
-      mounted.
+      format-specific claim material and optional validity window for the
+      OID4VCI Credential endpoint. For SD-JWT VC, the library binds
+      `holder_jwk` as `cnf`; for mdoc, it binds the key as the MSO device key.
+      The library signs the resulting credential. Required when credential
+      issuance is mounted.
     * `:build_deferred_credential` - `(subject, transaction_id -> {:ok,
       credential} | {:error, :issuance_pending} | {:error, reason})`.
       Completes a previously deferred credential (OID4VCI §9) for the
@@ -2366,12 +2367,22 @@ defmodule AttestoPhoenix.Config do
   end
 
   @typedoc "The host-provided values used to issue one SD-JWT VC."
-  @type credential_result :: %{
+  @type sd_jwt_credential_result :: %{
           required(:vct) => String.t(),
           required(:claims) => map(),
           optional(:valid_from) => integer(),
           optional(:valid_until) => integer()
         }
+
+  @typedoc "The host-provided values used to issue one mdoc credential."
+  @type mdoc_credential_result :: %{
+          required(:namespaces) => %{String.t() => %{String.t() => term()}},
+          optional(:doc_type) => String.t(),
+          optional(:valid_from) => integer(),
+          optional(:valid_until) => integer()
+        }
+
+  @type credential_result :: sd_jwt_credential_result() | mdoc_credential_result()
 
   @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
   @spec build_credential_fun(t()) :: callback() | nil
