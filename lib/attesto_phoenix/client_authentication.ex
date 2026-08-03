@@ -13,16 +13,19 @@ defmodule AttestoPhoenix.ClientAuthentication do
   ## Methods
 
   Accepts HTTP Basic credentials (RFC 6749 §2.3.1, RFC 7617), request-body
-  credentials (RFC 6749 §2.3.1), and `private_key_jwt` assertions (RFC 7523 /
-  OIDC Core §9). Presenting more than one client-authentication method is
-  rejected (RFC 6749 §2.3).
+  credentials (RFC 6749 §2.3.1), `private_key_jwt` assertions (RFC 7523 / OIDC
+  Core §9), and Client Attestation JWT + PoP header pairs. Presenting more than
+  one client-authentication method is rejected (RFC 6749 §2.3).
 
   ## Native apps (RFC 8252 §8.4)
 
-  A client the host marks native (`:client_native?`) may only authenticate with
-  `none`. A native app cannot keep a credential confidential - its binary is on
-  the end user's device - so presenting a client secret or an assertion is
-  refused with the same generic `invalid_client` message as any other failure.
+  A client the host marks native (`:client_native?`) may authenticate with
+  `none` or with `attest_jwt_client_auth`, whose Wallet Provider attestation and
+  per-instance key prove possession without relying on an app-wide secret. A
+  native app cannot keep a static credential confidential - its binary is on
+  the end user's device - so presenting a client secret or `private_key_jwt`
+  assertion is refused with the same generic `invalid_client` message as any
+  other failure.
 
   The one exception is the one §8.4 makes: a native client the host
   *explicitly* classifies as confidential (`:client_public?` returning `false`)
@@ -84,10 +87,13 @@ defmodule AttestoPhoenix.ClientAuthentication do
   `{:error, %AttestoPhoenix.OAuthError{}}`. `authenticate_with_context/4`
   keeps the same successful return and adds transport context to errors for
   endpoints that must distinguish `Authorization`-header authentication attempts
-  while rendering. Both functions read only data: the
-  `Authorization` header values and the parsed body params. It never touches a
-  conn and never emits an event - the caller renders the result/error and
-  emits whatever audit event it owns.
+  while rendering. Both functions read only data: request header values and
+  parsed body params. For backward compatibility, their first argument may be
+  the existing list of `Authorization` values. Callers that support
+  `attest_jwt_client_auth` pass a map with `:authorization`,
+  `:oauth_client_attestation`, and `:oauth_client_attestation_pop` lists. It
+  never touches a conn and never emits an event - the caller renders the
+  result/error and emits whatever audit event it owns.
 
   ## Security details preserved
 
@@ -101,7 +107,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
       `invalid_request` (RFC 6749 §2.3).
   """
 
-  alias Attesto.ClientAssertion
+  alias Attesto.{ClientAssertion, WalletAttestation}
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
@@ -127,9 +133,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
             honor_configured_methods: boolean()
           }
 
-    @type method :: :client_secret_basic | :client_secret_post | :private_key_jwt | :none
+    @type method ::
+            :client_secret_basic | :client_secret_post | :private_key_jwt | :attest_jwt_client_auth | :none
 
-    @all_methods [:client_secret_basic, :client_secret_post, :private_key_jwt, :none]
+    @all_methods [:client_secret_basic, :client_secret_post, :private_key_jwt, :attest_jwt_client_auth, :none]
 
     @enforce_keys [
       :allow_public,
@@ -229,11 +236,12 @@ defmodule AttestoPhoenix.ClientAuthentication do
     results therefore always contain a non-empty `client_id`; the field remains
     optional on the public struct for source compatibility. `:method` is the
     RFC 6749 §2.3 / OIDC Core §9 authentication method
-    (`:client_secret_basic`, `:client_secret_post`, `:private_key_jwt`, or
-    `:none` for the public-client path).
+    (`:client_secret_basic`, `:client_secret_post`, `:private_key_jwt`,
+    `:attest_jwt_client_auth`, or `:none` for the public-client path).
     """
 
-    @type method :: :client_secret_basic | :client_secret_post | :private_key_jwt | :none
+    @type method ::
+            :client_secret_basic | :client_secret_post | :private_key_jwt | :attest_jwt_client_auth | :none
 
     @type t :: %__MODULE__{
             client: term(),
@@ -274,20 +282,29 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # an unknown client from a wrong secret.
   @client_auth_failed "client authentication failed"
 
+  @type request_headers ::
+          [String.t()]
+          | %{
+              optional(:authorization) => [String.t()],
+              optional(:oauth_client_attestation) => [String.t()],
+              optional(:oauth_client_attestation_pop) => [String.t()]
+            }
+
   @doc """
   Authenticate the client from the request's `Authorization` header values and
   body params (RFC 6749 §2.3).
 
-  `authorization_headers` is the list of `Authorization` header values (as
-  returned by `Plug.Conn.get_req_header(conn, "authorization")`). `params` is
-  the parsed request body. Returns `{:ok, %Result{}}` or
+  `request_headers` may be the list of `Authorization` header values (the
+  backward-compatible form) or a map containing `:authorization`,
+  `:oauth_client_attestation`, and `:oauth_client_attestation_pop` value lists.
+  `params` is the parsed request body. Returns `{:ok, %Result{}}` or
   `{:error, %AttestoPhoenix.OAuthError{}}`.
   """
-  @spec authenticate([String.t()], map(), Config.t(), Policy.t()) ::
+  @spec authenticate(request_headers(), map(), Config.t(), Policy.t()) ::
           {:ok, Result.t()} | {:error, OAuthError.t()}
-  def authenticate(authorization_headers, params, %Config{} = config, %Policy{} = policy)
-      when is_list(authorization_headers) and is_map(params) do
-    case authenticate_with_context(authorization_headers, params, config, policy) do
+  def authenticate(request_headers, params, %Config{} = config, %Policy{} = policy)
+      when (is_list(request_headers) or is_map(request_headers)) and is_map(params) do
+    case authenticate_with_context(request_headers, params, config, policy) do
       {:ok, %Result{} = result} -> {:ok, result}
       {:error, %OAuthError{} = err, %ErrorContext{}} -> {:error, err}
     end
@@ -302,20 +319,21 @@ defmodule AttestoPhoenix.ClientAuthentication do
   header authentication; token-endpoint callers use it to apply RFC 6749 §5.2
   401 challenge rules without re-reading the conn.
   """
-  @spec authenticate_with_context([String.t()], map(), Config.t(), Policy.t()) ::
+  @spec authenticate_with_context(request_headers(), map(), Config.t(), Policy.t()) ::
           {:ok, Result.t()} | {:error, OAuthError.t(), ErrorContext.t()}
-  def authenticate_with_context(authorization_headers, params, %Config{} = config, %Policy{} = policy)
-      when is_list(authorization_headers) and is_map(params) do
-    context = error_context(authorization_headers)
+  def authenticate_with_context(request_headers, params, %Config{} = config, %Policy{} = policy)
+      when (is_list(request_headers) or is_map(request_headers)) and is_map(params) do
+    request_headers = normalize_request_headers(request_headers)
+    context = error_context(request_headers.authorization)
 
-    case do_authenticate(authorization_headers, params, config, policy) do
+    case do_authenticate(request_headers, params, config, policy) do
       {:ok, %Result{} = result} -> {:ok, result}
       {:error, %OAuthError{} = err} -> {:error, err, context}
     end
   end
 
-  defp do_authenticate(authorization_headers, params, config, policy) do
-    case fetch_client_credentials(authorization_headers, params, policy) do
+  defp do_authenticate(request_headers, params, config, policy) do
+    case fetch_client_credentials(request_headers, params, policy) do
       {:ok, :none, client_id} ->
         # RFC 6749 §2.1: identified but unauthenticated. Permitted only for
         # public clients, which must compensate with PKCE (RFC 7636).
@@ -338,8 +356,34 @@ defmodule AttestoPhoenix.ClientAuthentication do
           verify_private_key_jwt_client(config, policy, assertion)
         end
 
+      {:ok, :attest_jwt_client_auth, attestation, pop, presented_client_id} ->
+        with :ok <- require_client_auth_method(config, policy, :attest_jwt_client_auth) do
+          verify_attested_client(config, policy, attestation, pop, presented_client_id)
+        end
+
       {:error, _} = err ->
         err
+    end
+  end
+
+  defp normalize_request_headers(headers) when is_list(headers) do
+    %{authorization: headers, oauth_client_attestation: [], oauth_client_attestation_pop: []}
+  end
+
+  defp normalize_request_headers(headers) when is_map(headers) do
+    %{
+      authorization: header_values(headers, :authorization, "authorization"),
+      oauth_client_attestation: header_values(headers, :oauth_client_attestation, "oauth-client-attestation"),
+      oauth_client_attestation_pop:
+        header_values(headers, :oauth_client_attestation_pop, "oauth-client-attestation-pop")
+    }
+  end
+
+  defp header_values(headers, atom_key, string_key) do
+    case Map.get(headers, atom_key, Map.get(headers, string_key, [])) do
+      values when is_list(values) -> values
+      value when is_binary(value) -> [value]
+      _other -> []
     end
   end
 
@@ -380,7 +424,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `client_id`, so a body `client_id` is permitted iff it agrees with it; a
   # conflicting body `client_id` is an internally inconsistent request and is
   # rejected before any credential is verified.
-  defp fetch_client_credentials(header, params, %Policy{basic_precedence: true} = policy) do
+  defp fetch_client_credentials(
+         %{authorization: header} = request_headers,
+         params,
+         %Policy{basic_precedence: true} = policy
+       ) do
     case header do
       ["Basic " <> encoded | _rest] ->
         # RFC 7009's established behavior is intentionally Basic-first: body
@@ -389,12 +437,21 @@ defmodule AttestoPhoenix.ClientAuthentication do
         decode_basic_credentials(encoded)
 
       _other ->
-        fetch_body_credentials(params, policy)
+        fetch_non_basic_credentials(request_headers, params, policy)
     end
   end
 
-  defp fetch_client_credentials(header, params, policy) do
+  defp fetch_client_credentials(request_headers, params, policy) do
+    fetch_non_basic_credentials(request_headers, params, policy)
+  end
+
+  defp fetch_non_basic_credentials(request_headers, params, policy) do
+    header = request_headers.authorization
+
     cond do
+      wallet_attestation_credentials?(request_headers) ->
+        fetch_wallet_attestation_credentials(request_headers, params)
+
       assertion_credentials?(params) ->
         fetch_assertion_credentials(header, params)
 
@@ -408,6 +465,29 @@ defmodule AttestoPhoenix.ClientAuthentication do
         {:error, error(@error_invalid_client, "unsupported client authentication scheme")}
     end
   end
+
+  defp wallet_attestation_credentials?(request_headers) do
+    request_headers.oauth_client_attestation != [] or request_headers.oauth_client_attestation_pop != []
+  end
+
+  defp fetch_wallet_attestation_credentials(request_headers, params) do
+    if request_headers.authorization != [] or has_body_auth_credential?(params) do
+      {:error, error(@error_invalid_request, "multiple client authentication methods")}
+    else
+      case {request_headers.oauth_client_attestation, request_headers.oauth_client_attestation_pop} do
+        {[attestation], [pop]} when is_binary(attestation) and attestation != "" and is_binary(pop) and pop != "" ->
+          {:ok, :attest_jwt_client_auth, attestation, pop, presented_client_id(params)}
+
+        _other ->
+          {:error, error(@error_invalid_client, @client_auth_failed)}
+      end
+    end
+  end
+
+  defp has_body_auth_credential?(params), do: has_body_secret?(params) or assertion_credentials?(params)
+
+  defp presented_client_id(%{"client_id" => client_id}) when is_binary(client_id) and client_id != "", do: client_id
+  defp presented_client_id(_params), do: nil
 
   defp assertion_credentials?(%{"client_assertion" => assertion}) when is_binary(assertion) and assertion != "",
     do: true
@@ -570,6 +650,55 @@ defmodule AttestoPhoenix.ClientAuthentication do
       {:ok, result}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp verify_attested_client(config, policy, attestation, pop, presented_client_id) do
+    with trusted_jwks when not is_nil(trusted_jwks) <- Config.trusted_wallet_provider_jwks(config),
+         {:ok, verified} <-
+           WalletAttestation.verify(
+             attestation,
+             pop,
+             wallet_attestation_verify_opts(config, policy, trusted_jwks, presented_client_id)
+           ),
+         client_id when is_binary(client_id) and client_id != "" <-
+           get_in(verified, [:attestation_claims, "sub"]),
+         {:ok, client} <- resolve_client(config, client_id),
+         {:ok, result} <- result(config, client, client_id, :attest_jwt_client_auth),
+         :ok <- consume_wallet_attestation_replay(config, verified) do
+      {:ok, result}
+    else
+      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp wallet_attestation_verify_opts(config, policy, trusted_jwks, presented_client_id) do
+    opts = [
+      trusted_wallet_provider_jwks: trusted_jwks,
+      audience: config.issuer,
+      accepted_algs: policy.assertion_signing_algs
+    ]
+
+    opts =
+      case policy.assertion_enforce_fapi_alg_policy do
+        value when is_boolean(value) -> Keyword.put(opts, :enforce_fapi_alg_policy, value)
+        nil -> opts
+      end
+
+    maybe_put_client_id(opts, presented_client_id)
+  end
+
+  defp maybe_put_client_id(opts, client_id) when is_binary(client_id) and client_id != "",
+    do: Keyword.put(opts, :client_id, client_id)
+
+  defp maybe_put_client_id(opts, _client_id), do: opts
+
+  defp consume_wallet_attestation_replay(config, %{replay_key: replay_key, replay_ttl: replay_ttl}) do
+    replay_check = Adapter.replay_check(config)
+
+    case invoke(replay_check, ["client_attestation:" <> replay_key, replay_ttl]) do
+      :ok -> :ok
+      _other -> {:error, :attestation_replay}
     end
   end
 
@@ -762,6 +891,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # alone, and it is why the host must say so explicitly - see
   # `native_client_public?/2`.
   defp native_client_auth_permitted?(_config, _client, :none), do: true
+  defp native_client_auth_permitted?(_config, _client, :attest_jwt_client_auth), do: true
 
   defp native_client_auth_permitted?(config, client, _method) do
     not native_secret_refused?(config, client)

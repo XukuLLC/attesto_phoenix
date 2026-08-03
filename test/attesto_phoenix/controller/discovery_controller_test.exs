@@ -310,6 +310,20 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       assert body["token_endpoint_auth_methods_supported"] == ["private_key_jwt"]
     end
 
+    test "advertises attest_jwt_client_auth only when Wallet Provider keys are configured" do
+      without_keys = call_show(host_config(), protocol_config()) |> decode_body()
+
+      with_keys =
+        call_show(
+          host_config(trusted_wallet_provider_jwks: %{"keys" => [%{"kty" => "EC"}]}),
+          protocol_config()
+        )
+        |> decode_body()
+
+      refute "attest_jwt_client_auth" in without_keys["token_endpoint_auth_methods_supported"]
+      assert "attest_jwt_client_auth" in with_keys["token_endpoint_auth_methods_supported"]
+    end
+
     test "advertises private_key_jwt signing algorithms for client assertions" do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 

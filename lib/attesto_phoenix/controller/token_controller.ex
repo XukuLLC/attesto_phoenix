@@ -24,12 +24,12 @@ defmodule AttestoPhoenix.Controller.TokenController do
   ## Client authentication
 
   Accepts HTTP Basic credentials (RFC 6749 §2.3.1, RFC 7617), request-body
-  credentials (RFC 6749 §2.3.1), and `private_key_jwt` assertions (RFC 7523 /
-  OIDC Core §9). Presenting more than one client-authentication method is
-  rejected (RFC 6749 §2.3). Confidential clients must authenticate; a client
-  identified without a secret/assertion is admitted only when the host's
-  `:client_public?` callback marks it public, in which case it relies on PKCE
-  (RFC 7636) instead.
+  credentials (RFC 6749 §2.3.1), `private_key_jwt` assertions (RFC 7523 / OIDC
+  Core §9), and Client Attestation JWT + PoP header pairs. Presenting more than
+  one client-authentication method is rejected (RFC 6749 §2.3). Confidential
+  clients must authenticate; a client identified without a secret/assertion is
+  admitted only when the host's `:client_public?` callback marks it public, in
+  which case it relies on PKCE (RFC 7636) instead.
 
   ## Responses
 
@@ -73,6 +73,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
   # to the core as data.
   @dpop_request_header "dpop"
+  @client_attestation_header "oauth-client-attestation"
+  @client_attestation_pop_header "oauth-client-attestation-pop"
 
   # RFC 9449 §4.2: the token endpoint is reached by POST, so the proof's `htm`
   # claim must equal this.
@@ -297,7 +299,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
     policy = ClientAuthentication.Policy.for_endpoint(config, :token)
 
     case ClientAuthentication.authenticate_with_context(
-           get_req_header(conn, "authorization"),
+           %{
+             authorization: get_req_header(conn, "authorization"),
+             oauth_client_attestation: get_req_header(conn, @client_attestation_header),
+             oauth_client_attestation_pop: get_req_header(conn, @client_attestation_pop_header)
+           },
            params,
            config,
            policy

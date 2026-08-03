@@ -409,6 +409,30 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    test "accepts Client Attestation JWT + PoP headers as attest_jwt_client_auth" do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      put_config(trusted_wallet_provider_jwks: %{"keys" => [public_jwk(wallet_provider_key)]})
+
+      {attestation, pop} =
+        wallet_attestation_pair(wallet_provider_key, instance_key, "confidential-1")
+
+      params = %{"grant_type" => "unsupported"}
+
+      conn =
+        :post
+        |> conn(@endpoint_path, params)
+        |> put_token_content_type()
+        |> put_req_header("oauth-client-attestation", attestation)
+        |> put_req_header("oauth-client-attestation-pop", pop)
+        |> TokenController.create(params)
+
+      # Authentication succeeded; only the intentionally unsupported grant is
+      # rejected downstream. The conn-free test asserts the resolved client_id.
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
     test "rejects a private_key_jwt assertion signed with an alg outside :client_auth_signing_algs" do
       # The ES256 assertion authenticates by default, but configuring
       # :client_auth_signing_algs to a set that excludes ES256 must reject it -
@@ -2739,6 +2763,44 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       )
 
     header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    compact
+  end
+
+  defp wallet_attestation_pair(wallet_provider_key, instance_key, client_id) do
+    now = System.system_time(:second)
+
+    attestation =
+      sign_jwt(
+        wallet_provider_key,
+        %{
+          "alg" => "ES256",
+          "typ" => "oauth-client-attestation+jwt",
+          "kid" => JOSE.JWK.thumbprint(wallet_provider_key)
+        },
+        %{
+          "sub" => client_id,
+          "iat" => now,
+          "exp" => now + 300,
+          "cnf" => %{"jwk" => public_jwk(instance_key)}
+        }
+      )
+
+    pop =
+      sign_jwt(
+        instance_key,
+        %{"alg" => "ES256", "typ" => "oauth-client-attestation-pop+jwt"},
+        %{
+          "aud" => "https://issuer.example",
+          "iat" => now,
+          "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+        }
+      )
+
+    {attestation, pop}
+  end
+
+  defp sign_jwt(jwk, header, claims) do
     {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
     compact
   end

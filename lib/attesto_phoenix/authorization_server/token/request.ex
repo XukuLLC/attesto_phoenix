@@ -40,7 +40,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
   @type t :: %__MODULE__{
           config: Config.t(),
           client: term(),
-          client_auth_method: :client_secret_basic | :client_secret_post | :private_key_jwt | :none,
+          client_auth_method:
+            :client_secret_basic | :client_secret_post | :private_key_jwt | :attest_jwt_client_auth | :none,
           grant_type: String.t(),
           params: map(),
           sender_constraint_input: SenderConstraint.input(),

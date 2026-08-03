@@ -22,6 +22,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     "private_key_jwt",
     "none"
   ]
+  @wallet_attestation_auth_method "attest_jwt_client_auth"
 
   @doc """
   Add the metadata fields shared by both discovery documents.
@@ -103,13 +104,28 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   defp put_if_present(metadata, _key, nil), do: metadata
   defp put_if_present(metadata, key, value), do: Map.put(metadata, key, value)
 
-  defp token_endpoint_auth_methods_supported(%Config{token_endpoint_auth_methods_supported: methods})
-       when is_list(methods) and methods != [], do: methods
+  defp token_endpoint_auth_methods_supported(%Config{token_endpoint_auth_methods_supported: methods} = config)
+       when is_list(methods) and methods != [] do
+    maybe_enable_wallet_attestation(methods, config, false)
+  end
 
-  defp token_endpoint_auth_methods_supported(%Config{}), do: @token_endpoint_auth_methods_supported
+  defp token_endpoint_auth_methods_supported(%Config{} = config) do
+    maybe_enable_wallet_attestation(@token_endpoint_auth_methods_supported, config, true)
+  end
+
+  defp maybe_enable_wallet_attestation(methods, config, add_when_configured?) do
+    case Config.trusted_wallet_provider_jwks(config) do
+      nil -> Enum.reject(methods, &(&1 == @wallet_attestation_auth_method))
+      _jwks when add_when_configured? -> methods ++ [@wallet_attestation_auth_method]
+      _jwks -> methods
+    end
+  end
 
   defp introspection_auth_methods(config) do
-    Enum.reject(token_endpoint_auth_methods_supported(config), &(&1 == "none"))
+    Enum.reject(
+      token_endpoint_auth_methods_supported(config),
+      &(&1 in ["none", @wallet_attestation_auth_method])
+    )
   end
 
   defp require_pushed_authorization_requests(%Config{require_pushed_authorization_requests: true}), do: true

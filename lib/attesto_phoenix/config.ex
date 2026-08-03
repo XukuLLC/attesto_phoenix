@@ -286,6 +286,10 @@ defmodule AttestoPhoenix.Config do
       advertised/accepted by dynamic client registration and by the token/PAR
       endpoints when configured. When unset, all package-supported methods are
       accepted.
+    * `:trusted_wallet_provider_jwks` - trusted Wallet Provider public keys for
+      `attest_jwt_client_auth`, as an RFC 7517 JWK Set, a single public JWK map,
+      or a list of public JWK maps. The method is disabled and omitted from
+      discovery metadata when this is unset.
 
   ### Optional values (with defaults)
 
@@ -594,6 +598,7 @@ defmodule AttestoPhoenix.Config do
     :client_auth_signing_algs,
     :client_auth_enforce_fapi_alg_policy,
     :client_assertion_audiences,
+    :trusted_wallet_provider_jwks,
     :request_object_policy,
     :audience,
     :authorize_scope,
@@ -737,6 +742,7 @@ defmodule AttestoPhoenix.Config do
           client_auth_signing_algs: [String.t()] | nil,
           client_auth_enforce_fapi_alg_policy: boolean() | nil,
           client_assertion_audiences: [String.t()] | (t() -> [String.t()]) | nil,
+          trusted_wallet_provider_jwks: map() | [map()] | nil,
           request_object_policy: Policy.t() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
@@ -2040,6 +2046,15 @@ defmodule AttestoPhoenix.Config do
       audiences when is_list(audiences) and audiences != [] -> audiences
     end
   end
+
+  @doc """
+  Trusted Wallet Provider keys for attestation-based client authentication.
+
+  Returns an RFC 7517 JWK Set, a single public JWK map, a list of public JWK
+  maps, or `nil` when `attest_jwt_client_auth` is disabled.
+  """
+  @spec trusted_wallet_provider_jwks(t()) :: map() | [map()] | nil
+  def trusted_wallet_provider_jwks(%__MODULE__{trusted_wallet_provider_jwks: jwks}), do: jwks
 
   @doc """
   Absolute URL of the pushed-authorization-request endpoint: the issuer merged

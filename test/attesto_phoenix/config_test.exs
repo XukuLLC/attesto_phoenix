@@ -676,6 +676,15 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe ":trusted_wallet_provider_jwks" do
+    test "is optional and exposes configured Wallet Provider keys" do
+      jwks = %{"keys" => [%{"kty" => "EC", "crv" => "P-256", "x" => "x", "y" => "y"}]}
+
+      assert Config.trusted_wallet_provider_jwks(config()) == nil
+      assert Config.trusted_wallet_provider_jwks(config(trusted_wallet_provider_jwks: jwks)) == jwks
+    end
+  end
+
   describe "CIBA algorithm policy" do
     test "the default FAPI-CIBA allowlist retains the FAPI key gate" do
       opts = Config.ciba(config())
