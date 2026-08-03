@@ -16,6 +16,8 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   @subject "ou_user-123"
   @configuration_id "UniversityDegreeCredential"
   @vct "https://credentials.example/UniversityDegreeCredential"
+  @jwt_vc_configuration_id "UniversityDegreeCredentialJwtVc"
+  @jwt_vc_credential_type "UniversityDegreeCredential"
   @mdoc_configuration_id "org.iso.18013.5.1.mDL"
   @mdoc_doc_type "org.iso.18013.5.1.mDL"
   @mdoc_namespace "org.iso.18013.5.1"
@@ -113,6 +115,56 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert verified.cnf == %{"jwk" => public_map(@holder_key)}
 
       assert_receive {:credential_requested, @subject, @configuration_id, holder_jwk}
+      assert holder_jwk == public_map(@holder_key)
+    end
+
+    test "issues a holder-bound jwt_vc_json credential" do
+      claims = %{"degree" => "Bachelor", "student_id" => "student-123"}
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      config
+      |> Keyword.put(:credential_configurations_supported, %{
+        @jwt_vc_configuration_id => %{format: "jwt_vc_json"}
+      })
+      |> Keyword.put(:build_credential, fn subject, credential_configuration_id, holder_jwk ->
+        send(self(), {:credential_requested, subject, credential_configuration_id, holder_jwk})
+
+        {:ok,
+         %{
+           credential_type: @jwt_vc_credential_type,
+           claims: claims,
+           valid_from: System.system_time(:second) - 1,
+           valid_until: System.system_time(:second) + 3600
+         }}
+      end)
+      |> put_config()
+
+      nonce = CNonceStore.issue(60)
+
+      response =
+        post_credential(
+          mint_token(credential_configuration_ids: [@jwt_vc_configuration_id]),
+          credential_request(nonce, credential_configuration_id: @jwt_vc_configuration_id)
+        )
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      issuer_jwk =
+        @signing_pem
+        |> Attesto.Key.jwk()
+        |> JOSE.JWK.to_public_map()
+        |> elem(1)
+        |> Map.merge(%{"alg" => "ES256", "kid" => Attesto.Key.kid(@signing_pem), "use" => "sig"})
+
+      assert {:ok, verified} = Attesto.JwtVc.verify(credential, issuer_jwk)
+      assert verified.iss == @issuer
+      assert verified.sub == @subject
+      assert verified.vc["type"] == ["VerifiableCredential", @jwt_vc_credential_type]
+      assert verified.claims == claims
+      assert verified.cnf == %{"jwk" => public_map(@holder_key)}
+
+      assert_receive {:credential_requested, @subject, @jwt_vc_configuration_id, holder_jwk}
       assert holder_jwk == public_map(@holder_key)
     end
 

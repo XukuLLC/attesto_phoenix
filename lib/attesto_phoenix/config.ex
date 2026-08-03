@@ -174,7 +174,7 @@ defmodule AttestoPhoenix.Config do
     * `:build_credential` - `(subject, credential_configuration_id,
       holder_jwk -> {:ok, credential} | {:error, reason})`. Produces the
       format-specific claim material and optional validity window for the
-      OID4VCI Credential endpoint. For SD-JWT VC, the library binds
+      OID4VCI Credential endpoint. For SD-JWT VC and JWT VC, the library binds
       `holder_jwk` as `cnf`; for mdoc, it binds the key as the MSO device key.
       The library signs the resulting credential. Required when credential
       issuance is mounted.
@@ -2407,6 +2407,14 @@ defmodule AttestoPhoenix.Config do
           optional(:valid_until) => integer()
         }
 
+  @typedoc "The host-provided values used to issue one JWT VC."
+  @type jwt_vc_credential_result :: %{
+          required(:credential_type) => String.t(),
+          required(:claims) => map(),
+          optional(:valid_from) => integer(),
+          optional(:valid_until) => integer()
+        }
+
   @typedoc "The host-provided values used to issue one mdoc credential."
   @type mdoc_credential_result :: %{
           required(:namespaces) => %{String.t() => %{String.t() => term()}},
@@ -2415,7 +2423,7 @@ defmodule AttestoPhoenix.Config do
           optional(:valid_until) => integer()
         }
 
-  @type credential_result :: sd_jwt_credential_result() | mdoc_credential_result()
+  @type credential_result :: sd_jwt_credential_result() | jwt_vc_credential_result() | mdoc_credential_result()
 
   @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
   @spec build_credential_fun(t()) :: callback() | nil

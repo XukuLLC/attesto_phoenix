@@ -193,6 +193,10 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     build_credential(config, subject, credential_configuration_id, holder_jwk)
   end
 
+  defp build_credential(config, subject, credential_configuration_id, holder_jwk, "jwt_vc_json", _configuration) do
+    build_jwt_vc_credential(config, subject, credential_configuration_id, holder_jwk)
+  end
+
   defp build_credential(config, subject, credential_configuration_id, holder_jwk, "mso_mdoc", credential_configuration) do
     build_mdoc_credential(config, subject, credential_configuration_id, holder_jwk, credential_configuration)
   end
@@ -223,6 +227,37 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       ],
       [
         claims: claims,
+        cnf: %{"jwk" => holder_jwk}
+      ]
+      |> maybe_put_option(:exp, Map.get(result, :valid_until))
+      |> maybe_put_option(:nbf, Map.get(result, :valid_from))
+    )
+  end
+
+  defp build_jwt_vc_credential(config, subject, credential_configuration_id, holder_jwk) do
+    case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
+      {:ok, %{credential_type: credential_type, claims: claims} = result}
+      when is_binary(credential_type) and is_map(claims) ->
+        {:ok, issue_jwt_vc_credential(config, subject, result, holder_jwk)}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_credential}
+    end
+  end
+
+  defp issue_jwt_vc_credential(config, subject, result, holder_jwk) do
+    Attesto.JwtVc.issue(
+      [
+        iss: config.issuer,
+        sub: subject,
+        pem: config.keystore.signing_pem()
+      ],
+      [
+        type: ["VerifiableCredential", result.credential_type],
+        claims: result.claims,
         cnf: %{"jwk" => holder_jwk}
       ]
       |> maybe_put_option(:exp, Map.get(result, :valid_until))
