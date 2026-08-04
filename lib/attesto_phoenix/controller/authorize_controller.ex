@@ -347,7 +347,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       not same_origin_required? ->
         :ok
 
-      ClientIdMetadata.loopback_redirect_uri?(redirect_uri) ->
+      # The exemption must recognize loopback with the same mode the redirect
+      # match uses: under the localhost opt-in, `http://localhost:<port>/cb` is
+      # a loopback redirect and has to be exempt here too, or it passes the
+      # match only to be refused as non-same-origin one step later.
+      ClientIdMetadata.loopback_redirect_uri?(redirect_uri, Config.native_app_loopback_matching(config)) ->
         :ok
 
       ClientIdMetadata.same_origin_redirect_uri?(

@@ -78,7 +78,11 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   marked this client native via `:client_native?`, in which case it gets
   `:exact_allow_loopback_port` and its `http://127.0.0.1/...` /
   `http://[::1]/...` redirect URI matches on any port (see `Attesto.RedirectURI`
-  for exactly how narrow that exception is).
+  for exactly how narrow that exception is). With
+  `native_apps: [loopback_include_localhost: true]` the loopback mode is
+  `:exact_allow_loopback_port_including_localhost` instead, extending the same
+  port allowance to the bare `localhost` name
+  (`Config.native_app_loopback_matching/1`).
 
   Marking the client native is the whole decision. RFC 8252 §7.3 says the
   authorization server MUST allow any port for a loopback redirect URI, so
@@ -116,8 +120,15 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   """
   @spec redirect_uri_matching(Config.t(), term()) :: RedirectURI.matching()
   def redirect_uri_matching(config, %CIMDClient{metadata: metadata}) do
-    if Config.native_app_loopback_redirect?(config) and ClientIdMetadata.loopback_redirect_uris?(metadata) do
-      :exact_allow_loopback_port
+    # The mode decides the predicate as well as the match: under the localhost
+    # opt-in a document declaring only `http://localhost/callback` IS declaring
+    # a loopback redirect URI, so the native signal must be read with the same
+    # mode the match will use or the two disagree about the same URI.
+    mode = Config.native_app_loopback_matching(config)
+
+    if Config.native_app_loopback_redirect?(config) and
+         ClientIdMetadata.loopback_redirect_uris?(metadata, mode) do
+      mode
     else
       :exact
     end
@@ -125,7 +136,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
 
   def redirect_uri_matching(config, client) do
     if client_native?(config, client) and Config.native_app_loopback_redirect?(config) do
-      :exact_allow_loopback_port
+      Config.native_app_loopback_matching(config)
     else
       :exact
     end
