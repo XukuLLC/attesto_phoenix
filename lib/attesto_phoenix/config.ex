@@ -305,6 +305,13 @@ defmodule AttestoPhoenix.Config do
       `attest_jwt_client_auth`, as an RFC 7517 JWK Set, a single public JWK map,
       or a list of public JWK maps. The method is disabled and omitted from
       discovery metadata when this is unset.
+    * `:key_attestation_trusted_jwks` - trusted keys for verifying a
+      `key_attestation` header carried in a credential proof (OID4VCI key
+      attestation), same shapes as `:trusted_wallet_provider_jwks`. When unset,
+      a present `key_attestation` header is not inspected.
+    * `:require_key_attestation` - when `true`, the credential endpoint rejects a
+      proof that carries no `key_attestation` header (HAIP). Only meaningful with
+      `:key_attestation_trusted_jwks`; defaults to `false`.
 
   ### Optional values (with defaults)
 
@@ -616,6 +623,8 @@ defmodule AttestoPhoenix.Config do
     :client_auth_enforce_fapi_alg_policy,
     :client_assertion_audiences,
     :trusted_wallet_provider_jwks,
+    :key_attestation_trusted_jwks,
+    :require_key_attestation,
     :request_object_policy,
     :audience,
     :authorize_scope,
@@ -764,6 +773,8 @@ defmodule AttestoPhoenix.Config do
           client_auth_enforce_fapi_alg_policy: boolean() | nil,
           client_assertion_audiences: [String.t()] | (t() -> [String.t()]) | nil,
           trusted_wallet_provider_jwks: map() | [map()] | nil,
+          key_attestation_trusted_jwks: map() | [map()] | nil,
+          require_key_attestation: boolean() | nil,
           request_object_policy: Policy.t() | nil,
           audience: String.t() | [String.t()] | nil,
           authorize_scope: callback() | nil,
@@ -1167,6 +1178,19 @@ defmodule AttestoPhoenix.Config do
   @doc "Returns the PEM used to sign issued Verifiable Credentials."
   @spec vc_signing_pem(t()) :: String.t()
   def vc_signing_pem(%__MODULE__{} = config), do: vc_keystore(config).signing_pem()
+
+  @doc """
+  The VC signing key's X.509 certificate chain, or `nil`.
+
+  A list of base64 DER certificate strings stamped as the issued credential's
+  JOSE `x5c` header (HAIP), sourced from the VC keystore's optional `x5c/0`
+  callback. `nil` when the keystore does not provide one.
+  """
+  @spec vc_signing_x5c(t()) :: [String.t()] | nil
+  def vc_signing_x5c(%__MODULE__{} = config) do
+    keystore = vc_keystore(config)
+    if function_exported?(keystore, :x5c, 0), do: keystore.x5c()
+  end
 
   @doc """
   Returns the configured Ecto repository, raising when it is unset.
@@ -2146,6 +2170,22 @@ defmodule AttestoPhoenix.Config do
   """
   @spec trusted_wallet_provider_jwks(t()) :: map() | [map()] | nil
   def trusted_wallet_provider_jwks(%__MODULE__{trusted_wallet_provider_jwks: jwks}), do: jwks
+
+  @doc """
+  Trusted keys for verifying a `key_attestation` header in a credential proof.
+
+  Returns an RFC 7517 JWK Set, a single public JWK map, a list of public JWK
+  maps, or `nil` when key-attestation verification is disabled.
+  """
+  @spec key_attestation_trusted_jwks(t()) :: map() | [map()] | nil
+  def key_attestation_trusted_jwks(%__MODULE__{key_attestation_trusted_jwks: jwks}), do: jwks
+
+  @doc """
+  Whether a credential proof MUST carry a verified `key_attestation` header.
+  """
+  @spec require_key_attestation?(t()) :: boolean()
+  def require_key_attestation?(%__MODULE__{require_key_attestation: true}), do: true
+  def require_key_attestation?(%__MODULE__{}), do: false
 
   @doc """
   Absolute URL of the pushed-authorization-request endpoint: the issuer merged

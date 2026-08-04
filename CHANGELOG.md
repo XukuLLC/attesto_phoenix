@@ -4,7 +4,26 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.6.0] - 2026-08-02
+## [2.6.0] - 2026-08-03
+
+### Added
+
+- **OpenID for Verifiable Credentials (OID4VC / EU wallet) HTTP surface**,
+  wiring the `attesto` 1.7.0 core to Phoenix behind feature flags. Set
+  `credential_issuance: true` to mount the OID4VCI **issuer** endpoints
+  (Credential, `c_nonce`, Credential Offer + `credential_offer_uri`, Deferred
+  Credential, Credential Issuer Metadata incl. a signed variant); set
+  `presentation: true` for the OID4VP **verifier** endpoints (request object by
+  reference + `direct_post` / encrypted `direct_post.jwt` response), targeting
+  the HAIP profile.
+- The authorization server advertises the OID4VC surface on its metadata:
+  `authorization_details_types_supported: ["openid_credential"]` when a
+  credential issuer is configured, and the client-attestation signing-alg values
+  when `attest_jwt_client_auth` is enabled; the token/PAR endpoints accept
+  **attestation-based client authentication** (OAuth-Client-Attestation[-PoP]).
+  The verifier advertises a fresh per-request response-encryption key for
+  `direct_post.jwt` and supports the `x509_san_dns` / `x509_hash` client_id
+  schemes.
 
 ### Security
 

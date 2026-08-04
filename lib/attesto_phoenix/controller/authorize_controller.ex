@@ -750,14 +750,37 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp credential_configuration_ids(config, params) do
     supported = Config.credential_configurations_supported(config) || %{}
 
-    params
-    |> Map.get("authorization_details")
-    |> parse_authorization_details()
-    |> Enum.filter(&openid_credential_entry?/1)
-    |> Enum.flat_map(&entry_credential_configuration_ids/1)
-    |> Enum.filter(&Map.has_key?(supported, &1))
-    |> Enum.uniq()
+    from_authorization_details =
+      params
+      |> Map.get("authorization_details")
+      |> parse_authorization_details()
+      |> Enum.filter(&openid_credential_entry?/1)
+      |> Enum.flat_map(&entry_credential_configuration_ids/1)
+      |> Enum.filter(&Map.has_key?(supported, &1))
+
+    Enum.uniq(from_authorization_details ++ credential_configuration_ids_from_scope(supported, params))
   end
+
+  # OID4VCI §5.1.2 / HAIP §4.1: a requested `scope` matching a credential
+  # configuration's advertised `scope` authorizes that configuration - the
+  # scope-based alternative to naming it in `authorization_details`. Both feed
+  # the SAME `credential_configuration_ids` entitlement claim.
+  defp credential_configuration_ids_from_scope(supported, params) do
+    requested = params |> Map.get("scope") |> parse_scope_list()
+
+    for {id, configuration} <- supported,
+        scope = configuration_scope(configuration),
+        scope in requested,
+        do: id
+  end
+
+  defp parse_scope_list(scope) when is_binary(scope), do: String.split(scope, " ", trim: true)
+  defp parse_scope_list(_scope), do: []
+
+  defp configuration_scope(configuration) when is_map(configuration),
+    do: Map.get(configuration, :scope) || Map.get(configuration, "scope")
+
+  defp configuration_scope(_configuration), do: nil
 
   defp parse_authorization_details(value) when is_binary(value) and value != "" do
     case JSON.decode(value) do

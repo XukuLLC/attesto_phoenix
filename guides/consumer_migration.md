@@ -1,8 +1,8 @@
-# Migrating to Attesto from Boruta or a custom OAuth provider
+# Migrating to Attesto from an existing OAuth provider
 
-A checklist for replacing an existing OAuth/OIDC provider (Boruta, a
-hand-rolled provider, or an `ex_oauth2_provider`-style library) with the
-`attesto` / `attesto_phoenix` stack.
+A checklist for replacing an existing OAuth/OIDC provider (a hand-rolled
+provider or an `ex_oauth2_provider`-style library) with the `attesto` /
+`attesto_phoenix` stack.
 
 ## 1. Mount the routes
 

@@ -1577,7 +1577,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # OID4VCI §6.2: the token response echoes the `authorization_details` that
   # were actually granted, each entry naming the `credential_configuration_id`
-  # the resulting access token is entitled to.
+  # the resulting access token is entitled to and the `credential_identifiers`
+  # the wallet then presents at the credential endpoint. This issuer maps each
+  # granted configuration to a single credential_identifier equal to its
+  # `credential_configuration_id` (a 1:1 mapping the credential endpoint accepts
+  # verbatim), which the HAIP profile requires to be present.
   defp maybe_echo_credential_authorization_details(response, grant) do
     case credential_configuration_ids(grant.claims) do
       nil ->
@@ -1589,7 +1593,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp credential_authorization_detail(credential_configuration_id) do
-    %{"type" => "openid_credential", "credential_configuration_id" => credential_configuration_id}
+    %{
+      "type" => "openid_credential",
+      "credential_configuration_id" => credential_configuration_id,
+      "credential_identifiers" => [credential_configuration_id]
+    }
   end
 
   defp merge_principal_claims(principal, extra_claims) when map_size(extra_claims) == 0, do: principal

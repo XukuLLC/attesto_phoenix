@@ -129,6 +129,10 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert %{"credentials" => [%{"credential" => credential}]} = body(response)
       assert is_binary(credential)
 
+      # The JOSE `typ` header follows the credential configuration's `format`.
+      issuer_jwt = credential |> String.split("~") |> hd()
+      assert {:ok, %{"typ" => "vc+sd-jwt"}} = Attesto.JWS.peek_json(issuer_jwt, :protected)
+
       issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
       assert Config.resolve!() |> Config.vc_keystore() == Keystore
       assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk, accepted_algs: ["ES256"])
@@ -139,6 +143,32 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       assert_receive {:credential_requested, @subject, @configuration_id, holder_jwk}
       assert holder_jwk == public_map(@holder_key)
+    end
+
+    test "stamps the JOSE typ from a dc+sd-jwt credential configuration format" do
+      # OID4VCI/HAIP moved the SD-JWT VC media type from `vc+sd-jwt` to
+      # `dc+sd-jwt`; the issued credential's `typ` MUST follow the configured
+      # format, or a conformance verifier rejects the resolved configuration.
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      put_config(
+        Keyword.put(config, :credential_configurations_supported, %{
+          @configuration_id => %{format: "dc+sd-jwt", vct: @vct}
+        })
+      )
+
+      nonce = CNonceStore.issue(60)
+      response = post_credential(mint_token(), credential_request(nonce))
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      issuer_jwt = credential |> String.split("~") |> hd()
+      assert {:ok, %{"typ" => "dc+sd-jwt"}} = Attesto.JWS.peek_json(issuer_jwt, :protected)
+
+      issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+      assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk, accepted_algs: ["ES256"])
+      assert verified.vct == @vct
     end
 
     test "defaults SD-JWT VC signing to RS256 with an RSA main keystore and no vc_keystore" do
@@ -324,8 +354,10 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       token = mint_token(credential_configuration_ids: ["OtherCredential"])
       response = post_credential(token, %{"credential_configuration_id" => @configuration_id})
 
-      assert response.status == 403
-      assert body(response)["error"] in ["insufficient_scope", "invalid_credential_request"]
+      # OID4VCI §8.3.1: the token is a valid credential token but names a
+      # credential_configuration_id it was not granted.
+      assert response.status == 400
+      assert body(response)["error"] == "unknown_credential_configuration"
     end
 
     test "rejects a missing proof" do
@@ -338,8 +370,9 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
     test "rejects a c_nonce not issued by the configured store" do
       response = post_credential(mint_token(), credential_request("never-issued"))
 
+      # OID4VCI §8.3: an invalid/expired proof nonce is `invalid_nonce`.
       assert response.status == 400
-      assert body(response)["error"] == "invalid_proof"
+      assert body(response)["error"] == "invalid_nonce"
     end
 
     test "rejects a proof with the wrong audience" do
@@ -395,20 +428,42 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       response = post_credential(mint_token(), request)
 
+      # A stale nonce on any proof in the batch is `invalid_nonce`.
       assert response.status == 400
-      assert body(response)["error"] == "invalid_proof"
+      assert body(response)["error"] == "invalid_nonce"
     end
 
-    test "rejects credential_identifier selectors in this slice" do
-      response =
-        post_credential(mint_token(), %{"credential_identifier" => "credential-123"})
+    test "issues for a credential_identifier the access token was granted" do
+      # OID4VCI §6.2/§8.2: the token response returns credential_identifiers 1:1
+      # with the granted credential_configuration_id, and the wallet presents one
+      # as `credential_identifier`. It resolves to the same configuration.
+      nonce = CNonceStore.issue(60)
+
+      request = %{
+        "credential_identifier" => @configuration_id,
+        "proof" => %{"proof_type" => "jwt", "jwt" => proof_jwt(nonce)}
+      }
+
+      response = post_credential(mint_token(), request)
+
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+      assert is_binary(credential)
+      assert_receive {:credential_requested, @subject, @configuration_id, _holder_jwk}
+    end
+
+    test "rejects a credential_identifier the access token was not granted" do
+      nonce = CNonceStore.issue(60)
+
+      request = %{
+        "credential_identifier" => "credential-not-granted",
+        "proof" => %{"proof_type" => "jwt", "jwt" => proof_jwt(nonce)}
+      }
+
+      response = post_credential(mint_token(), request)
 
       assert response.status == 400
-
-      assert body(response) == %{
-               "error" => "invalid_credential_request",
-               "error_description" => "credential_identifier not supported"
-             }
+      assert body(response)["error"] == "unknown_credential_identifier"
     end
 
     test "maps a host credential-builder error to invalid_credential_request" do

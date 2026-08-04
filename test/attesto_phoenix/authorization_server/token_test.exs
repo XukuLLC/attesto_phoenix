@@ -489,7 +489,11 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       # OID4VCI §6.2: the token response echoes what was granted.
       assert response.authorization_details == [
-               %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+               %{
+                 "type" => "openid_credential",
+                 "credential_configuration_id" => "UniversityDegreeCredential",
+                 "credential_identifiers" => ["UniversityDegreeCredential"]
+               }
              ]
     end
 

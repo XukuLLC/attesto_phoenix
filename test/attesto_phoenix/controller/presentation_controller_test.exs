@@ -149,7 +149,11 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     response = post_response(conn, ctx.config, session.id, JSON.encode!(vp_token))
 
     assert response.status == 200
-    assert json_response(response, 200) == %{}
+
+    assert json_response(response, 200) == %{
+             "redirect_uri" => @issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(session.id)
+           }
+
     assert get_resp_header(response, "cache-control") == ["no-store"]
 
     assert {:ok, %{@query_id => result}} =
@@ -201,21 +205,26 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert rsa_public_jwk["kty"] == "RSA"
     assert encryption_jwk["kty"] == "EC"
     assert encryption_jwk["crv"] == "P-256"
-    assert encryption_jwk["x"] == ctx.encryption_jwk["x"]
-    assert encryption_jwk["y"] == ctx.encryption_jwk["y"]
+    # The response-encryption key is a fresh ephemeral EC key per request, keyed
+    # by the session id (HAIP §5: verifiers MUST NOT reuse it) - not the static
+    # keystore key.
+    assert encryption_jwk["kid"] == session.id
+    refute encryption_jwk["x"] == ctx.encryption_jwk["x"]
+    refute Map.has_key?(encryption_jwk, "d")
 
     assert {:ok, protected} = JWS.peek_json(stored_request_object(session.id), :protected)
     assert protected["alg"] == "RS256"
 
     encrypted_response =
-      encryption_jwk
-      |> JOSE.JWK.from_map()
-      |> encrypt_response(JSON.encode!(%{"vp_token" => vp_token, "state" => session.id}))
+      encrypt_response(encryption_jwk, JSON.encode!(%{"vp_token" => vp_token, "state" => session.id}))
 
     response = post_encrypted_response(conn, config, encrypted_response)
 
     assert response.status == 200
-    assert json_response(response, 200) == %{}
+
+    assert json_response(response, 200) == %{
+             "redirect_uri" => @issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(session.id)
+           }
 
     assert {:ok, %{@query_id => result}} = Verifier.presentation_result(config, session.id)
     assert result.claims["given_name"] == "Alice"
@@ -386,11 +395,16 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     get_in(claims, ["client_metadata", "jwks", "keys", Access.at(0)])
   end
 
-  defp encrypt_response(recipient_jwk, plaintext) do
+  defp encrypt_response(recipient_map, plaintext) do
     ephemeral_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
 
-    {recipient_jwk, ephemeral_jwk}
-    |> JOSE.JWE.block_encrypt(plaintext, %{"alg" => "ECDH-ES", "enc" => "A128GCM"})
+    # A wallet references the verifier's advertised per-request key by its `kid`
+    # in the JWE header; the verifier recovers the matching session (and its
+    # ephemeral private key) from that kid.
+    header = %{"alg" => "ECDH-ES", "enc" => "A128GCM", "kid" => recipient_map["kid"]}
+
+    {JOSE.JWK.from_map(recipient_map), ephemeral_jwk}
+    |> JOSE.JWE.block_encrypt(plaintext, header)
     |> JOSE.JWE.compact()
     |> elem(1)
   end

@@ -11,7 +11,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   use Phoenix.Controller, formats: [:json]
 
   alias Attesto.PresentationSession
-  alias AttestoPhoenix.{Config, OAuthError, RequestContext, VerifierEncryption}
+  alias AttestoPhoenix.{Config, OAuthError, RequestContext}
   alias Plug.Conn.Unfetched
 
   @doc "Verify and atomically complete an OID4VP presentation session."
@@ -22,24 +22,31 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
     with :ok <- check_https(conn, config),
          {:ok, store} <- presentation_session_store(config),
-         {:ok, state, vp_token} <- response(Map.get(conn, :body_params), config),
+         {:ok, state, vp_token} <- response(Map.get(conn, :body_params), config, store),
          {:ok, _results} <- verify_response(store, state, vp_token) do
-      json(conn, %{})
+      # OID4VP §8.2 permits, and HAIP §5.1 requires, a `redirect_uri` carrying a
+      # `response_code` so the wallet returns the user to the verifier front-end,
+      # which then retrieves the completed presentation result.
+      json(conn, %{"redirect_uri" => redirect_uri(config, state)})
     else
       _error -> invalid_request(conn, config)
     end
   end
 
-  defp response(%Unfetched{}, _config), do: {:error, :malformed}
+  defp redirect_uri(config, state) do
+    config.issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(state)
+  end
 
-  defp response(params, config) when is_map(params) do
+  defp response(%Unfetched{}, _config, _store), do: {:error, :malformed}
+
+  defp response(params, config, store) when is_map(params) do
     case fetch_param(params, "response") do
-      {:ok, encrypted_response} -> decrypt_response(encrypted_response, config)
+      {:ok, encrypted_response} -> decrypt_response(encrypted_response, store)
       :error -> plaintext_response(params, config)
     end
   end
 
-  defp response(_params, _config), do: {:error, :malformed}
+  defp response(_params, _config, _store), do: {:error, :malformed}
 
   defp plaintext_response(params, config) do
     with "direct_post" <- Config.presentation_response_mode(config),
@@ -50,10 +57,15 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     end
   end
 
-  defp decrypt_response(encrypted_response, config) when is_binary(encrypted_response) do
+  defp decrypt_response(encrypted_response, store) when is_binary(encrypted_response) do
+    # The JWE `kid` is the presentation session id (the verifier advertised a
+    # fresh, per-request encryption key keyed by it); recover that session's
+    # private key to decrypt.
     with :ok <- compact_jwe(encrypted_response),
          :ok <- encrypted_response_algorithms(encrypted_response),
-         {:ok, private_jwk} <- VerifierEncryption.private_jwk(config),
+         {:ok, kid} <- jwe_kid(encrypted_response),
+         {:ok, jwk_map} <- PresentationSession.response_encryption_jwk(store, kid),
+         %JOSE.JWK{} = private_jwk <- JOSE.JWK.from_map(jwk_map),
          {plaintext, %JOSE.JWE{}} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
          {:ok, %{} = params} <- JSON.decode(plaintext),
          {:ok, state, vp_token} <- decoded_response(params) do
@@ -67,7 +79,17 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     _kind, _reason -> {:error, :malformed}
   end
 
-  defp decrypt_response(_encrypted_response, _config), do: {:error, :malformed}
+  defp decrypt_response(_encrypted_response, _store), do: {:error, :malformed}
+
+  defp jwe_kid(encrypted_response) do
+    with [protected_b64 | _] <- String.split(encrypted_response, "."),
+         {:ok, json} <- Base.url_decode64(protected_b64, padding: false),
+         {:ok, %{"kid" => kid}} when is_binary(kid) and kid != "" <- JSON.decode(json) do
+      {:ok, kid}
+    else
+      _ -> {:error, :malformed}
+    end
+  end
 
   defp decoded_response(params) do
     with state when is_binary(state) and state != "" <- param(params, "state"),
@@ -88,10 +110,13 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   # Validate the JWE alg/enc from the compact response's protected header — the
   # first segment is base64url-encoded JSON — before decrypting, rather than
   # introspecting the decoded %JOSE.JWE{} struct.
+  @accepted_response_encs ~w(A128GCM A256GCM)
+
   defp encrypted_response_algorithms(encrypted_response) do
     with [protected_b64 | _] <- String.split(encrypted_response, "."),
          {:ok, json} <- Base.url_decode64(protected_b64, padding: false),
-         {:ok, %{"alg" => "ECDH-ES", "enc" => "A128GCM"}} <- JSON.decode(json) do
+         {:ok, %{"alg" => "ECDH-ES", "enc" => enc}} when enc in @accepted_response_encs <-
+           JSON.decode(json) do
       :ok
     else
       _ -> {:error, :malformed}

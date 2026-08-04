@@ -161,35 +161,41 @@ defmodule AttestoPhoenix.VerifierTest do
 
     assert %{
              "jwks" => %{"keys" => [encryption_jwk]},
-             "authorization_encrypted_response_alg" => "ECDH-ES",
-             "authorization_encrypted_response_enc" => "A128GCM"
+             "encrypted_response_enc_values_supported" => ["A128GCM", "A256GCM"]
            } = claims["client_metadata"]
 
     assert encryption_jwk["kty"] == "EC"
     assert encryption_jwk["crv"] == "P-256"
-    assert encryption_jwk["x"] == ctx.encryption_jwk["x"]
-    assert encryption_jwk["y"] == ctx.encryption_jwk["y"]
-    refute encryption_jwk["x"] == ctx.request_jwk["x"]
     assert encryption_jwk["use"] == "enc"
     assert encryption_jwk["alg"] == "ECDH-ES"
+    # The advertised key is ephemeral (per-request), keyed by the session id.
+    assert encryption_jwk["kid"] == id
+    refute encryption_jwk["x"] == ctx.request_jwk["x"]
     refute Map.has_key?(encryption_jwk, "d")
+
+    # Its private half is persisted on the session so the direct-post endpoint
+    # can decrypt.
+    assert %{"kty" => "EC", "crv" => "P-256", "kid" => ^id, "d" => d} =
+             session.response_encryption_jwk
+
+    assert is_binary(d)
+    assert session.response_encryption_jwk["x"] == encryption_jwk["x"]
   end
 
-  test "direct_post.jwt fails closed without a usable dedicated EC encryption key", ctx do
-    missing = %{
-      ctx.config
-      | presentation_response_mode: "direct_post.jwt",
-        verifier_encryption_keystore: nil
-    }
+  test "direct_post.jwt supplies a fresh ephemeral encryption key per request", ctx do
+    # OID4VP 1.0 final / HAIP §5: verifiers MUST NOT reuse a response-encryption
+    # key across Authorization Requests.
+    config = %{ctx.config | presentation_response_mode: "direct_post.jwt"}
 
-    assert {:error, :verifier_encryption_keystore_required} =
-             Verifier.create_presentation_request(missing, request_attrs(ctx))
+    assert {:ok, %{id: id1}} = Verifier.create_presentation_request(config, request_attrs(ctx))
+    assert {:ok, %{id: id2}} = Verifier.create_presentation_request(config, request_attrs(ctx))
 
-    Application.put_env(:attesto_phoenix, EncryptionKeystore, signing_pem: @rsa_signing_pem)
-    invalid = %{ctx.config | presentation_response_mode: "direct_post.jwt"}
+    assert {:ok, %{data: %{response_encryption_jwk: jwk1}}} = Store.get(id1)
+    assert {:ok, %{data: %{response_encryption_jwk: jwk2}}} = Store.get(id2)
 
-    assert {:error, :invalid_verifier_encryption_key} =
-             Verifier.create_presentation_request(invalid, request_attrs(ctx))
+    refute jwk1["x"] == jwk2["x"]
+    assert jwk1["kid"] == id1
+    assert jwk2["kid"] == id2
   end
 
   test "returns host-facing errors when verifier configuration or attrs are absent", ctx do

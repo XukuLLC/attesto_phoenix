@@ -68,6 +68,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     |> put_if_present("require_signed_request_object", RequestObjectMetadata.require_signed(config))
     |> put_if_present("client_id_metadata_document_supported", client_id_metadata_document_supported(config))
     |> put_if_present(
+      "authorization_details_types_supported",
+      authorization_details_types_supported(config)
+    )
+    |> put_if_present(
+      "client_attestation_signing_alg_values_supported",
+      client_attestation_alg_values_supported(config)
+    )
+    |> put_if_present(
+      "client_attestation_pop_signing_alg_values_supported",
+      client_attestation_alg_values_supported(config)
+    )
+    |> put_if_present(
       "authorization_response_iss_parameter_supported",
       authorization_response_iss_parameter_supported(config)
     )
@@ -168,6 +180,28 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
 
   defp client_id_metadata_document_supported(%Config{} = config) do
     if Config.client_id_metadata_enabled?(config), do: true
+  end
+
+  # RFC 9396 §11 / OID4VCI §11.2.3: an OP that issues credentials advertises the
+  # `openid_credential` authorization_details type on its AS metadata so a wallet
+  # requesting a scope-less credential configuration via `authorization_details`
+  # can discover support. Derived from the issuer being configured (a non-empty
+  # `credential_configurations_supported`) rather than a separate knob.
+  defp authorization_details_types_supported(%Config{} = config) do
+    case Config.credential_configurations_supported(config) do
+      map when is_map(map) and map_size(map) > 0 -> ["openid_credential"]
+      _other -> nil
+    end
+  end
+
+  # draft-ietf-oauth-attestation-based-client-auth: when `attest_jwt_client_auth`
+  # is advertised, the AS MUST publish the attestation and PoP signing algorithm
+  # values it accepts. These mirror the client-authentication signing algs.
+  defp client_attestation_alg_values_supported(%Config{} = config) do
+    # token_endpoint_auth_methods_supported/1 always returns a list.
+    if "attest_jwt_client_auth" in token_endpoint_auth_methods_supported(config) do
+      config.client_auth_signing_algs
+    end
   end
 
   defp authorization_response_iss_parameter_supported(%Config{authorization_response_iss: true}), do: true

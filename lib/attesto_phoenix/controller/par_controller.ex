@@ -58,7 +58,14 @@ defmodule AttestoPhoenix.Controller.PARController do
     policy = ClientAuthentication.Policy.for_endpoint(config, :par)
 
     case ClientAuthentication.authenticate(
-           get_req_header(conn, "authorization"),
+           %{
+             authorization: get_req_header(conn, "authorization"),
+             # attest_jwt_client_auth (HAIP) authenticates the pushed request with
+             # a Wallet Provider attestation carried in these headers, exactly as
+             # at the token endpoint.
+             oauth_client_attestation: get_req_header(conn, "oauth-client-attestation"),
+             oauth_client_attestation_pop: get_req_header(conn, "oauth-client-attestation-pop")
+           },
            params,
            config,
            policy

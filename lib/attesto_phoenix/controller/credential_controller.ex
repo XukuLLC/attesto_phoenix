@@ -57,7 +57,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
     with {:ok, parsed} <- parsed_request,
          {:ok, credential_configuration_id} <- selector(parsed.selector),
-         :ok <- entitled?(claims, credential_configuration_id),
+         :ok <- entitled?(claims, parsed.selector, credential_configuration_id),
          {:ok, holder_jwks} <- verify_proofs(config, claims, parsed.proofs) do
       build_and_issue(
         conn,
@@ -68,11 +68,31 @@ defmodule AttestoPhoenix.Controller.CredentialController do
         resource_metadata
       )
     else
-      {:error, :unsupported_credential_identifier} ->
-        invalid_request(conn, config, "invalid_credential_request", "credential_identifier not supported")
-
       {:error, :not_entitled} ->
         not_entitled(conn, config, claims, resource_metadata)
+
+      {:error, :unknown_credential_configuration} ->
+        # OID4VCI §8.3.1: the request names a credential_configuration_id the
+        # access token was not granted (or the issuer does not support).
+        invalid_request(
+          conn,
+          config,
+          "unknown_credential_configuration",
+          "The access token does not authorize the requested credential_configuration_id."
+        )
+
+      {:error, :unknown_credential_identifier} ->
+        # OID4VCI §8.3.1: the request names a credential_identifier that was not
+        # returned in this access token's authorization_details.
+        invalid_request(
+          conn,
+          config,
+          "unknown_credential_identifier",
+          "The access token does not authorize the requested credential_identifier."
+        )
+
+      {:error, :invalid_nonce, description} ->
+        invalid_request(conn, config, "invalid_nonce", description)
 
       {:error, :invalid_proof, description} ->
         invalid_request(conn, config, "invalid_proof", description)
@@ -86,13 +106,28 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   end
 
   defp selector({:configuration_id, id}), do: {:ok, id}
-  defp selector({:credential_identifier, _id}), do: {:error, :unsupported_credential_identifier}
+  # OID4VCI §6.2/§8.2: when the token response returned `credential_identifiers`,
+  # the wallet presents one as `credential_identifier`. This issuer maps each
+  # identifier 1:1 onto its `credential_configuration_id` (see the token
+  # endpoint's `credential_authorization_detail/1`), so it resolves to the same
+  # id; `entitled?/2` still gates it against the access token's granted set, so
+  # an identifier the token was not issued for is rejected.
+  defp selector({:credential_identifier, id}), do: {:ok, id}
 
-  defp entitled?(%{@credential_configuration_ids_claim => ids}, id) when is_list(ids) do
-    if id in ids, do: :ok, else: {:error, :not_entitled}
+  # A token that carries the credential entitlement claim but not this id names a
+  # credential the wallet was not authorized for: a bad request (400) whose error
+  # code names which selector was unknown (OID4VCI §8.3.1). A token with no
+  # entitlement claim at all is not a credential-issuance token, which is the
+  # genuine insufficient-scope (403) condition.
+  defp entitled?(%{@credential_configuration_ids_claim => ids}, selector, id) when is_list(ids) do
+    cond do
+      id in ids -> :ok
+      match?({:credential_identifier, _}, selector) -> {:error, :unknown_credential_identifier}
+      true -> {:error, :unknown_credential_configuration}
+    end
   end
 
-  defp entitled?(_claims, _id), do: {:error, :not_entitled}
+  defp entitled?(_claims, _selector, _id), do: {:error, :not_entitled}
 
   defp verify_proofs(_config, _claims, []), do: {:error, :invalid_proof, "A credential proof is required."}
 
@@ -101,27 +136,54 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     |> Enum.reduce_while({:ok, []}, fn proof, {:ok, acc} ->
       case verify_proof(config, claims, proof) do
         {:ok, holder_jwk} -> {:cont, {:ok, [holder_jwk | acc]}}
-        :error -> {:halt, :error}
+        {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
     |> case do
-      {:ok, holder_jwks} -> {:ok, Enum.reverse(holder_jwks)}
-      :error -> {:error, :invalid_proof, "Invalid credential proof."}
+      {:ok, holder_jwks} ->
+        {:ok, Enum.reverse(holder_jwks)}
+
+      # OID4VCI §8.3: an invalid or expired proof nonce is `invalid_nonce`,
+      # distinct from an otherwise malformed or wrongly-signed proof.
+      {:error, :invalid_nonce} ->
+        {:error, :invalid_nonce, "The proof nonce is invalid or has expired."}
+
+      {:error, :invalid_proof} ->
+        {:error, :invalid_proof, "Invalid credential proof."}
     end
   end
 
   defp verify_proof(config, claims, {"jwt", jwt}) do
-    with {:ok, payload} <- JWS.peek_json(jwt, :payload),
-         nonce when is_binary(nonce) and nonce != "" <- Map.get(payload, "nonce"),
-         true <- nonce_valid?(config, nonce),
+    with {:ok, payload} <- peek_proof_payload(jwt),
+         {:ok, nonce} <- proof_nonce(payload),
+         :ok <- check_nonce(config, nonce),
          {:ok, %{jwk: holder_jwk}} <- CredentialProof.verify_jwt(jwt, proof_opts(config, claims, nonce)) do
       {:ok, holder_jwk}
     else
-      _ -> :error
+      {:error, :invalid_nonce} -> {:error, :invalid_nonce}
+      _other -> {:error, :invalid_proof}
     end
   end
 
-  defp verify_proof(_config, _claims, _proof), do: :error
+  defp verify_proof(_config, _claims, _proof), do: {:error, :invalid_proof}
+
+  defp peek_proof_payload(jwt) do
+    case JWS.peek_json(jwt, :payload) do
+      {:ok, payload} when is_map(payload) -> {:ok, payload}
+      _other -> {:error, :invalid_proof}
+    end
+  end
+
+  defp proof_nonce(payload) do
+    case Map.get(payload, "nonce") do
+      nonce when is_binary(nonce) and nonce != "" -> {:ok, nonce}
+      _other -> {:error, :invalid_proof}
+    end
+  end
+
+  defp check_nonce(config, nonce) do
+    if nonce_valid?(config, nonce), do: :ok, else: {:error, :invalid_nonce}
+  end
 
   defp nonce_valid?(config, nonce) do
     case Callback.config_callback(config, :c_nonce_store) do
@@ -136,6 +198,21 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   defp proof_opts(config, claims, nonce) do
     [issuer: config.issuer, nonce: nonce]
     |> maybe_put_client_id(claims)
+    |> maybe_put_key_attestation(config)
+  end
+
+  # When the host configures trusted key-attestation keys, verify a
+  # `key_attestation` header carried by the proof and (under HAIP) require one.
+  defp maybe_put_key_attestation(opts, config) do
+    case Config.key_attestation_trusted_jwks(config) do
+      nil ->
+        opts
+
+      jwks ->
+        opts
+        |> Keyword.put(:key_attestation_trusted_jwks, jwks)
+        |> Keyword.put(:require_key_attestation, Config.require_key_attestation?(config))
+    end
   end
 
   defp maybe_put_client_id(opts, %{"grant_type" => "authorization_code", "client_id" => client_id})
@@ -196,7 +273,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp build_credential(config, subject, credential_configuration_id, holder_jwk, format, _configuration)
        when format in @sd_jwt_vc_formats do
-    build_credential(config, subject, credential_configuration_id, holder_jwk)
+    build_credential(config, subject, credential_configuration_id, holder_jwk, format)
   end
 
   defp build_credential(config, subject, credential_configuration_id, holder_jwk, "jwt_vc_json", _configuration) do
@@ -210,18 +287,18 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   defp build_credential(_config, _subject, _credential_configuration_id, _holder_jwk, _format, _configuration),
     do: {:error, :unsupported_credential_format}
 
-  defp build_credential(config, subject, credential_configuration_id, holder_jwk) do
+  defp build_credential(config, subject, credential_configuration_id, holder_jwk, format) do
     case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
       {:ok, %{vct: vct, claims: claims} = result}
       when is_binary(vct) and is_map(claims) ->
-        {:ok, issue_credential(config, result, holder_jwk)}
+        {:ok, issue_credential(config, result, holder_jwk, format)}
 
       other ->
         normalize_build_result(other)
     end
   end
 
-  defp issue_credential(config, %{vct: vct, claims: claims} = result, holder_jwk) do
+  defp issue_credential(config, %{vct: vct, claims: claims} = result, holder_jwk, format) do
     SdJwtVc.issue(
       [
         iss: config.issuer,
@@ -230,8 +307,10 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       ],
       [
         claims: claims,
-        cnf: %{"jwk" => holder_jwk}
+        cnf: %{"jwk" => holder_jwk},
+        typ: format
       ]
+      |> maybe_put_option(:x5c, Config.vc_signing_x5c(config))
       |> maybe_put_option(:exp, Map.get(result, :valid_until))
       |> maybe_put_option(:nbf, Map.get(result, :valid_from))
     )
