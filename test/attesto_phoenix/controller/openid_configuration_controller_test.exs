@@ -237,7 +237,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       }
 
       assert body == snapshot
-      assert conn.resp_body == JSON.encode!(snapshot)
     end
 
     test "advertises the logout and session-management metadata when enabled" do

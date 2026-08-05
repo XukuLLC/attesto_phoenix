@@ -46,9 +46,9 @@ defmodule AttestoPhoenix.RefreshSuccessorCipherTest do
 
   test "decrypt rejects a tampered ciphertext" do
     assert {:ok, ciphertext} = RefreshSuccessorCipher.encrypt(@successor)
-    last_byte = binary_part(ciphertext, byte_size(ciphertext) - 1, 1)
-    replacement = if last_byte == "A", do: "B", else: "A"
-    tampered = binary_part(ciphertext, 0, byte_size(ciphertext) - 1) <> replacement
+    <<"XCP.", first_encoded_byte, rest::binary>> = ciphertext
+    replacement = if first_encoded_byte == ?A, do: ?B, else: ?A
+    tampered = <<"XCP.", replacement, rest::binary>>
 
     assert :error = RefreshSuccessorCipher.decrypt(tampered)
   end
