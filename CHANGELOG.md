@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`native_apps: [loopback_include_localhost: true]`**, an opt-in that widens
+  the RFC 8252 §7.3 loopback port allowance to the bare hostname `localhost`,
+  selecting `attesto`'s `:exact_allow_loopback_port_including_localhost`
+  matching mode wherever `:exact_allow_loopback_port` would have been selected
+  (for hosts marked native via `:client_native?`, and for CIMD clients whose
+  document declares a loopback redirect URI).
+
+  Real native clients register a portless `http://localhost/callback` in their
+  client-id metadata document and bind an ephemeral port at runtime — Claude
+  Code's published document is one — and no strict deployment could serve them:
+  exact comparison fails on the port and the §7.3 exception is scoped to the IP
+  literals. §8.3 recommends the literal over the name, but its reasons are all
+  client-side (which interface the client binds, its firewall, its host-name
+  resolution); a server refusing the request changes none of them.
+
+  The opt-in threads through all three places that must agree about what
+  counts as loopback: the redirect-URI match itself, the CIMD native signal
+  (`AttestoPhoenix.ClientIdMetadata.loopback_redirect_uris?/2` — a
+  localhost-only document now declares loopback under the widened mode), and
+  the authorization endpoint's same-origin exemption (a `localhost` redirect
+  is exempt exactly as the IP literals are). `loopback_redirect_uri?/1` and
+  `loopback_redirect_uris?/1` gained an optional matching-mode argument,
+  defaulting to the strict mode — existing callers are unaffected.
+
+  **Off by default; no behavior change unless selected.** The flag is
+  subordinate to the `loopback_redirect: false` kill switch, `localhost` never
+  cross-matches `127.0.0.1` or `[::1]`, and lookalike hosts
+  (`localhost.evil.example`, `sub.localhost`, `evil-localhost`) stay outside —
+  the anchoring lives in `Attesto.RedirectURI` and is exercised end-to-end in
+  the authorize-controller tests. Requires `attesto` 1.9.0 or later, the first
+  release carrying the `:exact_allow_loopback_port_including_localhost` mode.
+
 ## [2.7.0] - 2026-08-03
 
 ### Added

@@ -69,4 +69,48 @@ defmodule AttestoPhoenix.ClientIdMetadataTest do
       refute ClientIdMetadata.same_origin_redirect_uri?(@client_id, nil)
     end
   end
+
+  describe "loopback_redirect_uri?/2" do
+    test "the IP literals are loopback under both modes" do
+      for mode <- [:exact_allow_loopback_port, :exact_allow_loopback_port_including_localhost] do
+        assert ClientIdMetadata.loopback_redirect_uri?("http://127.0.0.1/cb", mode)
+        assert ClientIdMetadata.loopback_redirect_uri?("http://[::1]:8080/cb", mode)
+      end
+    end
+
+    test "the localhost name is loopback only under the widened mode" do
+      refute ClientIdMetadata.loopback_redirect_uri?("http://localhost/cb", :exact_allow_loopback_port)
+      refute ClientIdMetadata.loopback_redirect_uri?("http://localhost:3118/cb", :exact_allow_loopback_port)
+
+      assert ClientIdMetadata.loopback_redirect_uri?(
+               "http://localhost/cb",
+               :exact_allow_loopback_port_including_localhost
+             )
+
+      assert ClientIdMetadata.loopback_redirect_uri?(
+               "http://localhost:3118/cb",
+               :exact_allow_loopback_port_including_localhost
+             )
+    end
+
+    # The widened mode admits the bare name and nothing near it: the anchored
+    # authority the core matcher enforces must reach through the probe.
+    test "lookalike hosts and non-http schemes stay outside the widened mode" do
+      for uri <- [
+            "http://localhost.evil.example/cb",
+            "http://sub.localhost/cb",
+            "http://evil-localhost/cb",
+            "https://localhost/cb",
+            "http://127.0.0.2/cb"
+          ] do
+        refute ClientIdMetadata.loopback_redirect_uri?(uri, :exact_allow_loopback_port_including_localhost),
+               "expected #{uri} not to count as loopback"
+      end
+    end
+
+    test "the default mode is the strict one" do
+      assert ClientIdMetadata.loopback_redirect_uri?("http://127.0.0.1/cb")
+      refute ClientIdMetadata.loopback_redirect_uri?("http://localhost/cb")
+    end
+  end
 end

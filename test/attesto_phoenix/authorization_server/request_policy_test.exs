@@ -223,6 +223,43 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
       assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact
     end
 
+    # The localhost opt-in has to widen the native signal along with the match:
+    # a localhost-only document is not loopback under the default mode, so the
+    # mode the predicate reads with must be the mode the match will use.
+    test "the localhost opt-in extends the exception to a localhost-only CIMD document" do
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["http://localhost/callback"]}}
+      config = config(native_apps: [loopback_include_localhost: true])
+
+      assert RequestPolicy.redirect_uri_matching(config, cimd) ==
+               :exact_allow_loopback_port_including_localhost
+    end
+
+    test "the localhost opt-in changes the mode for a native registered client too" do
+      config = config(native_apps: [loopback_include_localhost: true])
+
+      assert RequestPolicy.redirect_uri_matching(config, @native_public) ==
+               :exact_allow_loopback_port_including_localhost
+
+      # A client the host has not marked native still gets exact matching:
+      # the opt-in widens the loopback mode, never who receives it.
+      assert RequestPolicy.redirect_uri_matching(config, @confidential) == :exact
+    end
+
+    test "the localhost opt-in stays subordinate to the server-wide opt-out" do
+      config = config(native_apps: [loopback_redirect: false, loopback_include_localhost: true])
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["http://localhost/callback"]}}
+
+      assert RequestPolicy.redirect_uri_matching(config, @native_public) == :exact
+      assert RequestPolicy.redirect_uri_matching(config, cimd) == :exact
+    end
+
+    test "a CIMD client declaring only web redirect URIs stays exact under the opt-in" do
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["https://app.example/cb"]}}
+      config = config(native_apps: [loopback_include_localhost: true])
+
+      assert RequestPolicy.redirect_uri_matching(config, cimd) == :exact
+    end
+
     test "a malformed or empty CIMD document does not" do
       assert RequestPolicy.redirect_uri_matching(config([]), %CIMDClient{metadata: %{}}) == :exact
       assert RequestPolicy.redirect_uri_matching(config([]), %CIMDClient{metadata: %{"redirect_uris" => []}}) == :exact

@@ -876,6 +876,9 @@ defmodule AttestoPhoenix.ConfigTest do
       assert native_apps[:loopback_redirect] == true
       # §8.12 is a heuristic SHOULD, so it stays a genuine opt-in.
       assert native_apps[:reject_embedded_user_agents] == false
+      # Widening §7.3 to the `localhost` name goes past the MUST, so it too is
+      # a genuine opt-in.
+      assert native_apps[:loopback_include_localhost] == false
     end
 
     test "merges host overrides over the defaults, leaving unset members defaulted" do
@@ -898,6 +901,23 @@ defmodule AttestoPhoenix.ConfigTest do
       refute Config.reject_embedded_user_agents?(config())
       refute Config.reject_embedded_user_agents?(config(native_apps: [loopback_redirect: true]))
       assert Config.reject_embedded_user_agents?(config(native_apps: [reject_embedded_user_agents: true]))
+    end
+
+    test "native_app_loopback_matching/1 is an opt-in for the localhost name" do
+      assert Config.native_app_loopback_matching(config()) == :exact_allow_loopback_port
+      assert Config.native_app_loopback_matching(config(native_apps: [])) == :exact_allow_loopback_port
+
+      assert Config.native_app_loopback_matching(config(native_apps: [loopback_include_localhost: false])) ==
+               :exact_allow_loopback_port
+
+      assert Config.native_app_loopback_matching(config(native_apps: [loopback_include_localhost: true])) ==
+               :exact_allow_loopback_port_including_localhost
+    end
+
+    test "rejects a non-boolean :loopback_include_localhost rather than failing open" do
+      assert_raise ArgumentError, ~r/:native_apps :loopback_include_localhost must be true or false/, fn ->
+        config(native_apps: [loopback_include_localhost: "true"])
+      end
     end
 
     # `:loopback_redirect` is the switch an operator reaches for to FORBID a
@@ -925,7 +945,7 @@ defmodule AttestoPhoenix.ConfigTest do
       end
     end
 
-    test "the two members are independent" do
+    test "the loopback opt-out and embedded-user-agent flag are independent" do
       config = config(native_apps: [loopback_redirect: false, reject_embedded_user_agents: true])
 
       refute Config.native_app_loopback_redirect?(config)

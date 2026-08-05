@@ -122,7 +122,8 @@ defmodule AttestoPhoenix.Config do
       that client may target. The same policy governs issuance, introspection,
       and token-exchange subject-token verification.
     * `:native_apps` - RFC 8252 (BCP 212) native-app profile options as
-      `[loopback_redirect: true, reject_embedded_user_agents: false]`.
+      `[loopback_redirect: true, loopback_include_localhost: false,
+      reject_embedded_user_agents: false]`.
 
       The profile as a whole is off until the host classifies a client with
       `:client_native?`, which defaults to `false`. That callback — not
@@ -140,6 +141,22 @@ defmodule AttestoPhoenix.Config do
       exact redirect-URI matching (the OpenID Connect and FAPI profiles do).
       Such a deployment normally has no native clients to begin with, so the
       usual answer is simply not to mark any.
+
+      `:loopback_include_localhost` is an **opt-in**, defaulting to `false`. It
+      widens the §7.3 port allowance to the bare hostname `localhost`, selecting
+      `Attesto.RedirectURI`'s `:exact_allow_loopback_port_including_localhost`
+      mode wherever `:exact_allow_loopback_port` would have been selected. §8.3
+      recommends the IP literal over the name, but its reasons are all about
+      what the *client* binds and how the user's device resolves names - a
+      server refusing the request changes none of them - and real native
+      clients (Claude Code's published metadata document among them) register a
+      portless `http://localhost/callback` and bind an ephemeral port, which no
+      strict deployment can serve at all. The name stays a distinct host
+      identity: `localhost` never cross-matches `127.0.0.1` or `[::1]`, and
+      everything else about the exception keeps its exact-match discipline (see
+      `Attesto.RedirectURI` for the full constraint list). It is subordinate to
+      `:loopback_redirect`: when that kill switch is `false`, this option has
+      no effect.
 
       `:reject_embedded_user_agents` enables the RFC 8252 §8.12 recommendation
       that the authorization endpoint refuse requests made from an in-app
@@ -1013,7 +1030,16 @@ defmodule AttestoPhoenix.Config do
   #
   # The §8.1 PKCE and §8.4 client-authentication rules take no flag at all: they
   # are restrictions that follow from `:client_native?` alone.
-  @native_apps_defaults [loopback_redirect: true, reject_embedded_user_agents: false]
+  #
+  # `:loopback_include_localhost` is a genuine opt-in too, defaulting to
+  # `false`: §7.3's MUST is scoped to the IP literals, so extending the port
+  # allowance to the `localhost` name is a deliberate interoperability decision
+  # (see `Attesto.RedirectURI`), never a default.
+  @native_apps_defaults [
+    loopback_redirect: true,
+    loopback_include_localhost: false,
+    reject_embedded_user_agents: false
+  ]
 
   defp normalize_native_apps(nil), do: @native_apps_defaults
 
@@ -1254,8 +1280,8 @@ defmodule AttestoPhoenix.Config do
 
   @doc """
   Returns the merged, defaulted RFC 8252 native-app profile options, so every
-  recognized member (`:loopback_redirect`, `:reject_embedded_user_agents`) is
-  always present.
+  recognized member (`:loopback_redirect`, `:loopback_include_localhost`,
+  `:reject_embedded_user_agents`) is always present.
   """
   @spec native_apps(t()) :: keyword()
   def native_apps(%__MODULE__{native_apps: opts}), do: opts
@@ -1280,6 +1306,26 @@ defmodule AttestoPhoenix.Config do
     # here through `new/1`, which refuses it at boot; should one arrive on a
     # struct built by hand, it disables the relaxation rather than granting it.
     config |> native_apps() |> Keyword.get(:loopback_redirect, true) == true
+  end
+
+  @doc """
+  The redirect-URI matching mode a loopback-capable client gets: RFC 8252 §7.3
+  port flexibility for the IP literals, widened to the bare `localhost` name
+  iff the host opted in with `native_apps: [loopback_include_localhost: true]`.
+
+  This resolves WHICH loopback mode applies, not WHETHER one does - the caller
+  (`AttestoPhoenix.AuthorizationServer.RequestPolicy.redirect_uri_matching/2`)
+  still gates on the client being native (or a CIMD document declaring a
+  loopback redirect URI) and on `native_app_loopback_redirect?/1`, and resolves
+  `:exact` when either gate refuses.
+  """
+  @spec native_app_loopback_matching(t()) :: Attesto.RedirectURI.matching()
+  def native_app_loopback_matching(%__MODULE__{} = config) do
+    if config |> native_apps() |> Keyword.get(:loopback_include_localhost, false) == true do
+      :exact_allow_loopback_port_including_localhost
+    else
+      :exact_allow_loopback_port
+    end
   end
 
   @doc """
@@ -2926,11 +2972,11 @@ defmodule AttestoPhoenix.Config do
     config
   end
 
-  # `:native_apps` carries exactly two members, both booleans, and one of them
+  # `:native_apps` carries exactly three members, all booleans, and one of them
   # (`:loopback_redirect`) is an opt-OUT: it is the switch an operator reaches
   # for to FORBID the RFC 8252 §7.3 relaxation. A silently-ignored value there
   # fails open - the operator believes the relaxation is off while the server
-  # still grants it - so both a non-boolean value and an unrecognized member
+  # still grants it - so a non-boolean value and an unrecognized member
   # (a typo'd `:loopbak_redirect`, say) are refused at boot rather than at the
   # first authorization request.
   #
