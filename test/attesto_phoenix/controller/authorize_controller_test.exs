@@ -558,6 +558,39 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert location(conn) =~ "http://localhost:51353/callback"
     end
 
+    test "the loopback kill switch disables the localhost same-origin exemption" do
+      client_id = unique_cimd_client_id()
+      redirect_uri = "http://localhost:51353/callback"
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [redirect_uri]}))
+
+      put_config(
+        client_id_metadata: cimd_config(),
+        native_apps: [loopback_redirect: false, loopback_include_localhost: true]
+      )
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => redirect_uri}))
+
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    test "the kill switch preserves the exact IP-literal same-origin exemption" do
+      client_id = unique_cimd_client_id()
+      redirect_uri = "http://127.0.0.1:51353/callback"
+      script_doc(client_id, cimd_doc(%{"redirect_uris" => [redirect_uri]}))
+
+      put_config(
+        client_id_metadata: cimd_config(),
+        native_apps: [loopback_redirect: false, loopback_include_localhost: true]
+      )
+
+      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => redirect_uri}))
+
+      assert conn.status == 302
+      assert location(conn) =~ redirect_uri
+      assert is_binary(location_query(conn)["code"])
+    end
+
     # The opt-in widens which hosts count as loopback, nothing else: an https
     # redirect from a CIMD document is still held to same origin, and a
     # lookalike host gets neither port flexibility nor the exemption.

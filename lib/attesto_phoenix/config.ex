@@ -1280,8 +1280,8 @@ defmodule AttestoPhoenix.Config do
 
   @doc """
   Returns the merged, defaulted RFC 8252 native-app profile options, so every
-  recognized member (`:loopback_redirect`, `:reject_embedded_user_agents`) is
-  always present.
+  recognized member (`:loopback_redirect`, `:loopback_include_localhost`,
+  `:reject_embedded_user_agents`) is always present.
   """
   @spec native_apps(t()) :: keyword()
   def native_apps(%__MODULE__{native_apps: opts}), do: opts
@@ -2972,11 +2972,11 @@ defmodule AttestoPhoenix.Config do
     config
   end
 
-  # `:native_apps` carries exactly two members, both booleans, and one of them
+  # `:native_apps` carries exactly three members, all booleans, and one of them
   # (`:loopback_redirect`) is an opt-OUT: it is the switch an operator reaches
   # for to FORBID the RFC 8252 §7.3 relaxation. A silently-ignored value there
   # fails open - the operator believes the relaxation is off while the server
-  # still grants it - so both a non-boolean value and an unrecognized member
+  # still grants it - so a non-boolean value and an unrecognized member
   # (a typo'd `:loopbak_redirect`, say) are refused at boot rather than at the
   # first authorization request.
   #

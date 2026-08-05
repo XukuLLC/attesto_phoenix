@@ -945,7 +945,7 @@ defmodule AttestoPhoenix.ConfigTest do
       end
     end
 
-    test "the two members are independent" do
+    test "the loopback opt-out and embedded-user-agent flag are independent" do
       config = config(native_apps: [loopback_redirect: false, reject_embedded_user_agents: true])
 
       refute Config.native_app_loopback_redirect?(config)

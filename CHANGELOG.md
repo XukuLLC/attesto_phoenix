@@ -37,8 +37,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cross-matches `127.0.0.1` or `[::1]`, and lookalike hosts
   (`localhost.evil.example`, `sub.localhost`, `evil-localhost`) stay outside —
   the anchoring lives in `Attesto.RedirectURI` and is exercised end-to-end in
-  the authorize-controller tests. Requires an `attesto` release carrying the
-  `:exact_allow_loopback_port_including_localhost` mode.
+  the authorize-controller tests. Requires `attesto` 1.9.0 or later, the first
+  release carrying the `:exact_allow_loopback_port_including_localhost` mode.
 
 ## [2.7.0] - 2026-08-03
 

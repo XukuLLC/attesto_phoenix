@@ -347,11 +347,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       not same_origin_required? ->
         :ok
 
-      # The exemption must recognize loopback with the same mode the redirect
-      # match uses: under the localhost opt-in, `http://localhost:<port>/cb` is
-      # a loopback redirect and has to be exempt here too, or it passes the
-      # match only to be refused as non-same-origin one step later.
-      ClientIdMetadata.loopback_redirect_uri?(redirect_uri, Config.native_app_loopback_matching(config)) ->
+      # While the port allowance is active, the exemption recognizes the same
+      # explicit host set as the matcher. With the kill switch off, retain the
+      # pre-existing IP-literal exemption for exact callbacks but do not let the
+      # subordinate localhost opt-in affect policy.
+      ClientIdMetadata.loopback_redirect_uri?(redirect_uri, same_origin_loopback_matching(config)) ->
         :ok
 
       ClientIdMetadata.same_origin_redirect_uri?(
@@ -366,6 +366,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp require_same_origin_redirect_uri(_config, _client, _redirect_uri), do: :ok
+
+  defp same_origin_loopback_matching(config) do
+    if Config.native_app_loopback_redirect?(config) do
+      Config.native_app_loopback_matching(config)
+    else
+      :exact_allow_loopback_port
+    end
+  end
 
   defp resolve_request_uri(config, %{"request_uri" => request_uri} = params)
        when is_binary(request_uri) and request_uri != "" do
