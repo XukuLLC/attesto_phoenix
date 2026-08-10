@@ -26,7 +26,10 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
          {:ok, _results} <- verify_response(store, state, vp_token) do
       # OID4VP §8.2 permits, and HAIP §5.1 requires, a `redirect_uri` carrying a
       # `response_code` so the wallet returns the user to the verifier front-end,
-      # which then retrieves the completed presentation result.
+      # which then retrieves the completed presentation result. That read is
+      # single-use (`AttestoPhoenix.Verifier.presentation_result/2` consumes the
+      # session), so this browser-borne `response_code` cannot be replayed from
+      # history/logs to re-read the presented claims.
       json(conn, %{"redirect_uri" => redirect_uri(config, state)})
     else
       _error -> invalid_request(conn, config)

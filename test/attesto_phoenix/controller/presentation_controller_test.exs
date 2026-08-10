@@ -315,16 +315,22 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert_invalid_request(expired_response)
   end
 
-  test "double submit rejects the second response and preserves the first result", %{conn: conn} = ctx do
+  test "double submit is rejected, and the result read is single-use", %{conn: conn} = ctx do
     session = create_request(ctx)
     encoded = session |> valid_vp_token_for_session(ctx) |> JSON.encode!()
 
     assert post_response(conn, ctx.config, session.id, encoded).status == 200
-    assert {:ok, first_result} = Verifier.presentation_result(ctx.config, session.id)
 
+    # Replay of the direct-post is rejected while the completed session is still
+    # unread (the pending -> completed guard, not merely a missing session).
     second = post_response(recycle(conn), ctx.config, session.id, encoded)
     assert_invalid_request(second)
-    assert {:ok, ^first_result} = Verifier.presentation_result(ctx.config, session.id)
+
+    # The verified result is readable exactly once: the read consumes the
+    # session, so a `response_code` captured from the browser channel cannot be
+    # replayed to re-read the presented claims.
+    assert {:ok, _first_result} = Verifier.presentation_result(ctx.config, session.id)
+    assert :error = Verifier.presentation_result(ctx.config, session.id)
   end
 
   test "malformed vp_token returns invalid_request without verification details", %{conn: conn} = ctx do

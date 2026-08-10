@@ -4,7 +4,32 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.9.0] - 2026-08-10
+
+Pairs with the `attesto` 1.10.0 security-hardening release and now requires it
+(`>= 1.10.0`). The behavioral fixes live in `attesto` core; this release carries
+the matching HTTP-surface guidance.
+
+### Security
+
+- **Deferred Credential endpoint — documented the ownership check.** The
+  endpoint authenticates the caller and passes the token's verified `subject` to
+  `:build_deferred_credential`, but the callback owns binding the
+  `transaction_id` to that subject. The moduledoc and the callback contract now
+  state, in the strongest terms, that resolving a `transaction_id` without
+  scoping to `subject` is an IDOR (any authenticated wallet could poll another's
+  `transaction_id` and receive its credential) and that `transaction_id` must be
+  minted with a CSPRNG.
+- **Credential-offer creation guidance.** The by-reference offer controller doc
+  now points hosts at `Attesto.CredentialOffer.store_by_reference/3` (which
+  generates the unguessable id) instead of minting their own.
+
+### Changed
+
+- Requires `attesto >= 1.10.0`. `AttestoPhoenix.Verifier.presentation_result/2`
+  is now single-use (it consumes the session) — a `response_code` captured from
+  the browser cannot be replayed to re-read the presented claims. Read the
+  result once on the completion redirect.
 
 ## [2.8.0] - 2026-08-05
 
@@ -41,7 +66,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the anchoring lives in `Attesto.RedirectURI` and is exercised end-to-end in
   the authorize-controller tests. Requires `attesto` 1.9.0 or later, the first
   release carrying the `:exact_allow_loopback_port_including_localhost` mode.
-
 ## [2.7.0] - 2026-08-03
 
 ### Added

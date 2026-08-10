@@ -4,8 +4,8 @@ defmodule AttestoPhoenix.Verifier do
 
   Presentation requests are persisted before their signed request object is
   published. Wallet responses are verified by the public direct-post
-  controller, and hosts poll the completed result through
-  `presentation_result/2`.
+  controller, and hosts read the completed result once through
+  `presentation_result/2` (single-use: the read consumes the session).
 
   Request objects continue to use the main `Config.keystore/1`; their protected
   `alg` is derived from that key by `Attesto.JWS.sign_current/3`. The separate
@@ -75,7 +75,14 @@ defmodule AttestoPhoenix.Verifier do
 
   def create_presentation_request(%Config{}, _attrs), do: {:error, :invalid_attrs}
 
-  @doc "Read the verified result of a completed presentation session."
+  @doc """
+  Read and consume the verified result of a completed presentation session.
+
+  Single-use: the completed session is removed on read, so the `response_code`
+  the browser carries to the completion page cannot be replayed to re-read the
+  presented claims. Returns `:error` on a second read, or an unknown, pending,
+  or expired session.
+  """
   @spec presentation_result(Config.t(), String.t()) :: {:ok, map()} | :error
   def presentation_result(%Config{} = config, id) when is_binary(id) do
     case Config.presentation_session_store(config) do

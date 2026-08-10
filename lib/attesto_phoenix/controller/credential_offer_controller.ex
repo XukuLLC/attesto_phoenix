@@ -5,9 +5,12 @@ defmodule AttestoPhoenix.Controller.CredentialOfferController do
 
   Serves the stored Credential Offer object a wallet dereferences from a
   `credential_offer_uri`. The offer is created and stored elsewhere - by the
-  host, through `Attesto.CredentialOfferStore.put/1` - when it hands the
-  wallet the offer link; this endpoint only serves the document back,
-  non-consuming, until it expires or is unknown.
+  host, through `Attesto.CredentialOffer.store_by_reference/3`, which generates
+  the unguessable id it embeds in the link - when it hands the wallet the offer
+  link; this endpoint only serves the document back, non-consuming, until it
+  expires or is unknown. Because the endpoint is unauthenticated and the offer
+  may carry a redeemable `pre-authorized_code`, that generated id is the sole
+  capability protecting it - hosts must not mint their own.
   """
 
   use Phoenix.Controller, formats: [:json]

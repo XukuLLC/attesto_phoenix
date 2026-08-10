@@ -214,6 +214,18 @@ defmodule AttestoPhoenix.Config do
       error so the wallet retries later; any other error maps to
       `invalid_credential_request`. Required only when the Deferred
       Credential endpoint is used.
+
+      **Security — this callback owns the ownership check.** The library
+      authenticates the caller's access token and passes you its verified
+      `subject`, but it does not (and cannot) know which subject a
+      `transaction_id` belongs to — deferred-issuance state lives in your
+      store. You MUST resolve the transaction scoped to `subject` and return an
+      error (not the credential) when the `transaction_id` was not issued to
+      that subject. Resolving by `transaction_id` alone is an IDOR: any
+      authenticated wallet could poll another wallet's `transaction_id` and
+      receive that holder's credential. Additionally, mint the `transaction_id`
+      with a CSPRNG (e.g. `Attesto.Secret.generate/0`, 256-bit) so it cannot be
+      guessed or enumerated.
     * `:credential_configurations_supported` - map of OID4VCI credential
       configuration identifiers to the configuration metadata advertised by
       the Credential Issuer Metadata endpoint. Required when credential

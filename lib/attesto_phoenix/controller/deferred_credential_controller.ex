@@ -4,11 +4,18 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   Completes a credential whose issuance was deferred at the Credential
   endpoint. The wallet polls this endpoint with the same access token and the
-  `transaction_id` it was given at deferral, protected exactly like the
-  Credential endpoint (RFC 6750 bearer token via
-  `AttestoPhoenix.ProtectedResource`). Issuance completion is host policy
-  through `:build_deferred_credential`; the library owns access-token
-  verification and SD-JWT VC signing/response framing.
+  `transaction_id` it was given at deferral. The library owns access-token
+  verification (RFC 6750 bearer / RFC 9449 DPoP via
+  `AttestoPhoenix.ProtectedResource`) and SD-JWT VC signing/response framing,
+  and passes the token's verified `subject` to the host callback.
+
+  Issuance completion is host policy through `:build_deferred_credential`.
+  Bearer auth alone is NOT sufficient authorization here: it proves the caller
+  holds *some* valid token, not that the `transaction_id` is theirs. The host
+  callback MUST bind the `transaction_id` to that `subject` and refuse a
+  mismatch — otherwise any authenticated wallet can poll another's
+  `transaction_id` and receive its credential (IDOR). See
+  `t:AttestoPhoenix.Config`'s `:build_deferred_credential` for the contract.
   """
 
   use Phoenix.Controller, formats: [:json]

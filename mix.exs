@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.8.0"
+  @version "2.9.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -71,7 +71,7 @@ defmodule AttestoPhoenix.MixProject do
   # default - including every publish - resolves the published version
   # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
   #
-  # The 1.9.0 floor is load-bearing, not housekeeping. It carries
+  # The 1.10.0 floor is load-bearing, not housekeeping. 1.9.0 carried
   # `Attesto.RedirectURI`'s
   # `:exact_allow_loopback_port_including_localhost` mode, which the native-app
   # policy selects when the host enables `:loopback_include_localhost`. An
@@ -87,12 +87,18 @@ defmodule AttestoPhoenix.MixProject do
   # and then approve a redirect URI a browser resolves to a different host. An
   # older core would additionally omit the key-bound FAPI algorithm enforcement
   # and RFC 9864 Edwards identifiers that client authentication, request
-  # objects, and CIBA rely on.
+  # objects, and CIBA rely on. 1.10.0 raises the floor for the OID4VC security
+  # hardening this package's HTTP surface documents and relies on: the
+  # library-generated credential-offer id
+  # (`Attesto.CredentialOffer.store_by_reference/3`), the single-use
+  # presentation result (`AttestoPhoenix.Verifier.presentation_result/2`
+  # consuming through the store's now-required `take/1`), and the bounded
+  # Credential Request `proofs`.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.9.0 and < 2.0.0"}
+      {:attesto, ">= 1.10.0 and < 2.0.0"}
     end
   end
 
