@@ -230,6 +230,20 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert result.claims["given_name"] == "Alice"
   end
 
+  test "direct_post.jwt rejects a compressed (zip) JWE before decrypting - decompression-bomb guard",
+       %{conn: conn} = ctx do
+    config = configure_response_mode(ctx.config, "direct_post.jwt")
+    ctx = %{ctx | config: config}
+    session = create_request(ctx)
+
+    # A `zip:"DEF"` JWE would have JOSE inflate a tiny ciphertext into GBs during
+    # block_decrypt; the guard must reject on the protected header, before decrypt.
+    response = post_encrypted_response(conn, config, zip_bomb_jwe())
+
+    assert_invalid_request(response)
+    assert_pending(session.id)
+  end
+
   test "direct_post.jwt rejects undecryptable and plaintext responses without completion",
        %{
          conn: conn
@@ -399,6 +413,21 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     candidates = JWS.verification_candidates(request_jwk)
     assert {:ok, claims} = JWS.verify_strict(stored_request_object(id), candidates, claims_map?: true)
     get_in(claims, ["client_metadata", "jwks", "keys", Access.at(0)])
+  end
+
+  # A compact JWE with `alg`/`enc` in the accepted set but a `zip:"DEF"` header.
+  # The recipient key is a throwaway - the guard rejects on the header before any
+  # kid lookup or decryption, so the session it targets is irrelevant.
+  defp zip_bomb_jwe do
+    recipient = JOSE.JWK.generate_key({:ec, "P-256"})
+    {_kty, recipient_pub} = JOSE.JWK.to_public_map(recipient)
+    ephemeral_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+    header = %{"alg" => "ECDH-ES", "enc" => "A128GCM", "zip" => "DEF", "kid" => "irrelevant"}
+
+    {JOSE.JWK.from_map(recipient_pub), ephemeral_jwk}
+    |> JOSE.JWE.block_encrypt(:binary.copy(<<0>>, 1024), header)
+    |> JOSE.JWE.compact()
+    |> elem(1)
   end
 
   defp encrypt_response(recipient_map, plaintext) do

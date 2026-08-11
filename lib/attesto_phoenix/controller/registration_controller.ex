@@ -127,7 +127,14 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # through to the host store. `post_logout_redirect_uris` (OpenID Connect
   # RP-Initiated Logout 1.0 §3) is the registered set the end-session endpoint
   # exact-matches the request `post_logout_redirect_uri` against.
-  @string_array_metadata ~w(contacts post_logout_redirect_uris)
+  @string_array_metadata ~w(contacts)
+
+  # `post_logout_redirect_uris` is an array like `contacts`, but each entry is a
+  # redirect target the end-session endpoint will later render into a link /
+  # meta-refresh, so it gets URL+scheme validation - not merely is_binary - to
+  # keep `javascript:`/`data:` out of that sink (the same class as
+  # `redirect_uris`).
+  @redirect_uri_array_metadata ~w(post_logout_redirect_uris)
 
   # RFC 7591 §2 `jwks`: the client's inline public JWK Set. It is carried
   # through to the host store so authorization and token endpoints can verify
@@ -290,6 +297,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp passthrough_specs do
     Enum.map(@display_string_metadata, &{&1, :string}) ++
       Enum.map(@string_array_metadata, &{&1, :string_array}) ++
+      Enum.map(@redirect_uri_array_metadata, &{&1, :redirect_uri_array}) ++
       Enum.map(@map_metadata, &{&1, :map}) ++
       Enum.map(@boolean_metadata, &{&1, :boolean})
   end
@@ -319,6 +327,22 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     {:error, error(@error_invalid_client_metadata, "#{key} must be an array (RFC 7591 §2)")}
   end
 
+  defp validate_passthrough_value(key, :redirect_uri_array, value) when is_list(value) do
+    if Enum.all?(value, &acceptable_logout_redirect_uri?/1) do
+      {:ok, value}
+    else
+      {:error,
+       error(
+         @error_invalid_client_metadata,
+         "#{key} entries must be http(s) absolute URIs without a fragment (RFC 7591 §2)"
+       )}
+    end
+  end
+
+  defp validate_passthrough_value(key, :redirect_uri_array, _value) do
+    {:error, error(@error_invalid_client_metadata, "#{key} must be an array (RFC 7591 §2)")}
+  end
+
   defp validate_passthrough_value(_key, :map, value) when is_map(value), do: {:ok, value}
 
   defp validate_passthrough_value(key, :map, _value) do
@@ -330,6 +354,23 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp validate_passthrough_value(key, :boolean, _value) do
     {:error, error(@error_invalid_client_metadata, "#{key} must be a boolean")}
   end
+
+  # A post-logout redirect target is rendered into a link / meta-refresh by the
+  # end-session endpoint, so it must be an http/https absolute URI with no
+  # fragment - never a `javascript:`/`data:`/`vbscript:` payload (which
+  # `is_binary/1` alone would wave through into that sink).
+  defp acceptable_logout_redirect_uri?(value) when is_binary(value) and value != "" do
+    case URI.new(value) do
+      {:ok, %URI{scheme: scheme, host: host, fragment: nil}}
+      when scheme in ["https", "http"] and is_binary(host) and host != "" ->
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp acceptable_logout_redirect_uri?(_value), do: false
 
   # RFC 7591 §2 / RFC 6749 §2.3.1: the token-endpoint auth method must be one
   # the server supports. Absent, it defaults to client_secret_basic.
@@ -501,9 +542,16 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # component." True of every client type, checked before anything else.
   defp acceptable_redirect_uri?(%URI{fragment: fragment}, _application_type) when not is_nil(fragment), do: false
 
-  # The ordinary form: scheme + authority.
+  # The ordinary form: scheme + authority. The scheme MUST be http/https. A
+  # non-http(s) scheme WITH an authority - `javascript://x/%0aalert(document.domain)//`
+  # parses to scheme "javascript", host "x", no fragment - would otherwise
+  # register as a "trusted" redirect target and later be rendered into an
+  # auto-executing sink (the `form_post`/`form_post.jwt` self-submitting form,
+  # the logout continue-link / meta-refresh) as stored XSS in the AS origin.
+  # Restricting the authority form to http/https closes that; native private-use
+  # and loopback forms are handled by the clauses below.
   defp acceptable_redirect_uri?(%URI{scheme: scheme, host: host}, _application_type)
-       when is_binary(scheme) and scheme != "" and is_binary(host) and host != "", do: true
+       when scheme in ["https", "http"] and is_binary(host) and host != "", do: true
 
   # RFC 8252 §7.1 private-use scheme: no authority, reverse-DNS scheme, and a
   # real path to call back to.

@@ -13,7 +13,7 @@ defmodule AttestoPhoenix.Verifier do
   changes request-object signing policy.
   """
 
-  alias Attesto.{JWS, PresentationRequest, PresentationSession}
+  alias Attesto.{JWS, PresentationRequest, PresentationSession, VpToken}
   alias AttestoPhoenix.Config
 
   @presentation_ttl_seconds 300
@@ -58,7 +58,7 @@ defmodule AttestoPhoenix.Verifier do
     with {:ok, store} <- presentation_session_store(config),
          {:ok, client_id} <- verifier_client_id(config, scheme),
          {:ok, session} <-
-           create_session(store, config, client_id, expected_query_ids, issuer_trust),
+           create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query),
          {:ok, response_options} <- response_options(store, session, response_mode),
          {:ok, jar} <-
            sign_request_object(config, client_id, session, dcql_query, response_options, scheme),
@@ -93,7 +93,7 @@ defmodule AttestoPhoenix.Verifier do
 
   def presentation_result(%Config{}, _id), do: :error
 
-  defp create_session(store, config, client_id, expected_query_ids, issuer_trust) do
+  defp create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query) do
     PresentationSession.create(
       store,
       %{
@@ -102,7 +102,11 @@ defmodule AttestoPhoenix.Verifier do
         issuer_trust: issuer_trust,
         # The response_uri the wallet's mdoc DeviceResponse binds to via its
         # OpenID4VPHandover SessionTranscript; harmless (unused) for SD-JWT VC.
-        response_uri: Config.presentation_response_endpoint_url(config)
+        response_uri: Config.presentation_response_endpoint_url(config),
+        # Bind each presentation to its DCQL query's type/claim-value constraints
+        # (enforced by VpToken after signature + holder binding), so a
+        # validly-signed wrong-type credential cannot satisfy the request.
+        query_constraints: VpToken.constraints_from_dcql(dcql_query)
       },
       ttl: @presentation_ttl_seconds
     )

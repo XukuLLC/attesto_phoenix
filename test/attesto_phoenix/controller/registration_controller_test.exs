@@ -236,6 +236,57 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     end
   end
 
+  describe "redirect-scheme injection (XSS-sink hardening)" do
+    # `javascript://x/%0a…` parses to scheme "javascript" WITH a host, so it is
+    # not authority-less and slipped past the reverse-DNS gate; the authority
+    # form must be http/https or it lands in an auto-executing sink as XSS.
+    test "rejects an authority-form javascript: redirect_uri for web and native" do
+      for app <- ["web", "native"] do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["authorization_code"],
+            "application_type" => app,
+            "redirect_uris" => ["javascript://x/%0aalert(document.domain)//"]
+          })
+
+        assert conn.status == 400, "expected authority-form javascript: refused for #{app}"
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+    end
+
+    test "rejects non-http(s) schemes in post_logout_redirect_uris" do
+      for uri <- [
+            "javascript:alert(1)",
+            "javascript://x/%0aalert(1)//",
+            "data:text/html,x",
+            "vbscript:msgbox(1)",
+            "https://ok.example/x#frag"
+          ] do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["authorization_code"],
+            "redirect_uris" => ["https://client.example/cb"],
+            "post_logout_redirect_uris" => [uri]
+          })
+
+        assert conn.status == 400, "expected #{uri} refused in post_logout_redirect_uris"
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
+    test "accepts an https post_logout_redirect_uri" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/cb"],
+          "post_logout_redirect_uris" => ["https://client.example/after-logout"]
+        })
+
+      assert conn.status == 201, conn.resp_body
+      assert body(conn)["post_logout_redirect_uris"] == ["https://client.example/after-logout"]
+    end
+  end
+
   describe "oversized scope metadata (DoS hardening)" do
     test "a scope metadata value beyond the size cap is rejected as invalid_client_metadata" do
       huge = Enum.map_join(1..200_000, " ", fn i -> "s#{rem(i, 100)}" end)

@@ -62,4 +62,11 @@ if ecto_included? do
 end
 
 {:ok, _started} = Application.ensure_all_started(:bandit)
+
+# The back-channel-logout / CIBA-ping deliverers SSRF-screen and IP-pin their
+# targets, which blocks loopback in production. The suite delivers to local
+# Bandit servers on 127.0.0.1, so enable the documented dev/test escape hatch
+# globally here (off by default everywhere else).
+Application.put_env(:attesto_phoenix, :allow_loopback_delivery, true)
+
 ExUnit.start()

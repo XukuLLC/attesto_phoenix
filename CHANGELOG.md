@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-08-10
+
+Pairs with the `attesto` 1.11.0 security-hardening release and now requires it
+(`>= 1.11.0`). Carries the HTTP-surface fixes from the same audit rounds.
+
+### Security
+
+- **JWE decompression-bomb guard on the OID4VP response endpoint.** The
+  `direct_post.jwt` path (`presentation_response_controller`) rejects any JWE
+  whose protected header carries a `zip` member before `JOSE.JWE.block_decrypt`,
+  so a compressed response cannot inflate a tiny ciphertext into gigabytes on the
+  unauthenticated endpoint.
+- **Dynamic Client Registration scheme allowlist.** `redirect_uris` in the
+  ordinary (authority) form must be `http`/`https`, and `post_logout_redirect_uris`
+  are validated as `http`/`https` absolute URIs without a fragment — closing a
+  `javascript:`/`data:`/`vbscript:` scheme-injection that reached the
+  auto-executing `form_post` / logout-continuation sinks as stored XSS.
+- **Server-side request forgery guard on outbound deliverers.** The
+  back-channel-logout and CIBA-ping deliverers screen the target through the new
+  `AttestoPhoenix.SSRFGuard` — reject any resolved special-use IP (RFC 6890) and
+  pin the socket to the checked address (Mint `:hostname` keeps TLS SNI /
+  certificate verification / `Host` on the real name), closing the DNS-rebinding
+  window. The shared special-use-IP table gained the missing IANA IPv6 ranges
+  (`100::/64`, `2001:2::/48`, `3fff::/20`, `5f00::/16`), which also hardens the
+  Client ID Metadata fetcher.
+- **Deferred Credential ownership contract + c_nonce single-use.** The
+  credential endpoint now consumes the request's c_nonce once (after the whole
+  proof batch verifies) via the store's `consume/1`, failing closed if the store
+  cannot; a captured proof can no longer be replayed for another credential. The
+  deferred-credential callback contract documents that it MUST bind the
+  `transaction_id` to the token subject.
+
+### Changed
+
+- Requires `attesto >= 1.11.0`.
+- A dev/test escape hatch, `config :attesto_phoenix, allow_loopback_delivery: true`,
+  lets the outbound deliverers target a loopback server (off by default; keep it
+  off in production).
+
 ## [2.9.0] - 2026-08-10
 
 Pairs with the `attesto` 1.10.0 security-hardening release and now requires it

@@ -23,22 +23,31 @@ if Code.ensure_loaded?(Req) do
     @impl AttestoPhoenix.BackChannelLogout
     @spec post(String.t(), String.t()) :: :ok | {:error, term()}
     def post(backchannel_logout_uri, logout_token) when is_binary(backchannel_logout_uri) and is_binary(logout_token) do
-      [
-        url: backchannel_logout_uri,
-        method: :post,
-        form: [logout_token: logout_token],
-        headers: [{"accept", "application/json"}],
-        redirect: false,
-        retry: false,
-        receive_timeout: @timeout_ms,
-        decode_body: false
-      ]
-      |> Req.new()
-      |> Req.request()
-      |> case do
-        {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
-        {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
-        {:error, reason} -> {:error, reason}
+      # SSRF screen the registered URI and pin the socket to the checked IP
+      # (connect-time, so a DNS rebind can't slip an internal address past a
+      # registration-time check). TLS SNI / cert / Host stay on the real host.
+      screen_opts = [allow_loopback: Application.get_env(:attesto_phoenix, :allow_loopback_delivery, false)]
+
+      with {:ok, %{url: url, host: host, authority: authority}} <-
+             AttestoPhoenix.SSRFGuard.screen(backchannel_logout_uri, screen_opts) do
+        [
+          url: url,
+          method: :post,
+          form: [logout_token: logout_token],
+          headers: [{"accept", "application/json"}, {"host", authority}],
+          redirect: false,
+          retry: false,
+          receive_timeout: @timeout_ms,
+          decode_body: false,
+          connect_options: [hostname: host]
+        ]
+        |> Req.new()
+        |> Req.request()
+        |> case do
+          {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
+          {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
+          {:error, reason} -> {:error, reason}
+        end
       end
     end
   end

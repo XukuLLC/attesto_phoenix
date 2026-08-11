@@ -375,6 +375,19 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert body(response)["error"] == "invalid_nonce"
     end
 
+    test "c_nonce is single-use: replaying a proof with a spent nonce is rejected" do
+      nonce = CNonceStore.issue(60)
+
+      first = post_credential(mint_token(), credential_request(nonce))
+      assert first.status == 200
+
+      # The nonce was consumed by the first request; the same proof replayed to
+      # mint a second credential must fail (not silently issue a duplicate).
+      replay = post_credential(mint_token(), credential_request(nonce))
+      assert replay.status == 400
+      assert body(replay)["error"] == "invalid_nonce"
+    end
+
     test "rejects a proof with the wrong audience" do
       nonce = CNonceStore.issue(60)
       proof = proof_jwt(nonce, aud: "https://other-issuer.example")

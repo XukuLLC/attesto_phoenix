@@ -118,8 +118,16 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   defp encrypted_response_algorithms(encrypted_response) do
     with [protected_b64 | _] <- String.split(encrypted_response, "."),
          {:ok, json} <- Base.url_decode64(protected_b64, padding: false),
-         {:ok, %{"alg" => "ECDH-ES", "enc" => enc}} when enc in @accepted_response_encs <-
-           JSON.decode(json) do
+         {:ok, %{"alg" => "ECDH-ES", "enc" => enc} = header} when enc in @accepted_response_encs <-
+           JSON.decode(json),
+         # Reject a compressed JWE (`zip`, RFC 7516 §4.1.3) BEFORE decrypting. The
+         # recipient key is the per-session key we advertise to the wallet, so
+         # anyone can mint a valid `direct_post.jwt`; a `zip:"DEF"` payload would
+         # have JOSE `zlib:inflate` a tiny ciphertext into hundreds of MB/GB (a
+         # ~1000:1 decompression bomb) inside `block_decrypt`, before any size
+         # check - an unauthenticated OOM on a public endpoint. No `zip` is used
+         # on this response, so its presence is always malformed.
+         false <- Map.has_key?(header, "zip") do
       :ok
     else
       _ -> {:error, :malformed}

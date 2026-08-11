@@ -113,7 +113,16 @@ if Code.ensure_loaded?(Req) do
       # guard - it never reaches a destination the IPv4 table would screen.
       {{0x2001, 0x0000, 0, 0, 0, 0, 0, 0}, 32},
       {{0x2001, 0x0020, 0, 0, 0, 0, 0, 0}, 28},
-      {{0x2001, 0xDB8, 0, 0, 0, 0, 0, 0}, 32}
+      {{0x2001, 0xDB8, 0, 0, 0, 0, 0, 0}, 32},
+      # Remaining IANA IPv6 special-purpose ranges (RFC 6890 registry): discard-
+      # only 100::/64 (RFC 6666), benchmarking 2001:2::/48 (RFC 5180),
+      # documentation 3fff::/20 (RFC 9637), and SRv6 SIDs 5f00::/16 (RFC 9602).
+      # Internal services are occasionally routed on these, so an AS must not
+      # dereference them.
+      {{0x0100, 0, 0, 0, 0, 0, 0, 0}, 64},
+      {{0x2001, 0x0002, 0, 0, 0, 0, 0, 0}, 48},
+      {{0x3FFF, 0, 0, 0, 0, 0, 0, 0}, 20},
+      {{0x5F00, 0, 0, 0, 0, 0, 0, 0}, 16}
     ]
 
     @doc """

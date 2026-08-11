@@ -133,23 +133,53 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp verify_proofs(config, claims, proofs) do
     proofs
-    |> Enum.reduce_while({:ok, []}, fn proof, {:ok, acc} ->
+    |> Enum.reduce_while({:ok, [], []}, fn proof, {:ok, jwks, nonces} ->
       case verify_proof(config, claims, proof) do
-        {:ok, holder_jwk} -> {:cont, {:ok, [holder_jwk | acc]}}
+        {:ok, holder_jwk, nonce} -> {:cont, {:ok, [holder_jwk | jwks], [nonce | nonces]}}
         {:error, reason} -> {:halt, {:error, reason}}
       end
     end)
     |> case do
-      {:ok, holder_jwks} ->
-        {:ok, Enum.reverse(holder_jwks)}
+      # Every proof verified against a live c_nonce. Now single-use it once for
+      # the whole request (OID4VCI `proofs` share one nonce, so consuming
+      # per-proof would fail the second) so a captured proof cannot be replayed.
+      {:ok, holder_jwks, nonces} ->
+        case consume_nonces(config, Enum.uniq(nonces)) do
+          :ok -> {:ok, Enum.reverse(holder_jwks)}
+          {:error, :invalid_nonce} -> invalid_nonce_error()
+        end
 
       # OID4VCI §8.3: an invalid or expired proof nonce is `invalid_nonce`,
       # distinct from an otherwise malformed or wrongly-signed proof.
       {:error, :invalid_nonce} ->
-        {:error, :invalid_nonce, "The proof nonce is invalid or has expired."}
+        invalid_nonce_error()
 
       {:error, :invalid_proof} ->
         {:error, :invalid_proof, "Invalid credential proof."}
+    end
+  end
+
+  defp invalid_nonce_error, do: {:error, :invalid_nonce, "The proof nonce is invalid or has expired."}
+
+  # Atomically single-use the request's c_nonce(s) after the batch verifies. A
+  # store that cannot `consume/1` (only `valid?/1`) must not be used for
+  # issuance - fail closed rather than leave the nonce replayable.
+  defp consume_nonces(config, nonces) do
+    case Callback.config_callback(config, :c_nonce_store) do
+      store when is_atom(store) and not is_nil(store) ->
+        if function_exported?(store, :consume, 1) do
+          Enum.reduce_while(nonces, :ok, fn nonce, :ok ->
+            case store.consume(nonce) do
+              :ok -> {:cont, :ok}
+              {:error, _reason} -> {:halt, {:error, :invalid_nonce}}
+            end
+          end)
+        else
+          {:error, :invalid_nonce}
+        end
+
+      _store ->
+        {:error, :invalid_nonce}
     end
   end
 
@@ -158,7 +188,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
          {:ok, nonce} <- proof_nonce(payload),
          :ok <- check_nonce(config, nonce),
          {:ok, %{jwk: holder_jwk}} <- CredentialProof.verify_jwt(jwt, proof_opts(config, claims, nonce)) do
-      {:ok, holder_jwk}
+      {:ok, holder_jwk, nonce}
     else
       {:error, :invalid_nonce} -> {:error, :invalid_nonce}
       _other -> {:error, :invalid_proof}

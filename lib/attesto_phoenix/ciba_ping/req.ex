@@ -31,32 +31,41 @@ if Code.ensure_loaded?(Req) do
     @spec post(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
     def post(endpoint, client_notification_token, auth_req_id)
         when is_binary(endpoint) and is_binary(client_notification_token) and is_binary(auth_req_id) do
-      [
-        url: endpoint,
-        method: :post,
-        json: %{auth_req_id: auth_req_id},
-        headers: [
-          {"authorization", "Bearer " <> client_notification_token},
-          {"accept", "application/json"}
-        ],
-        # SSRF posture: a 3xx from the notification endpoint is a failure, never
-        # followed. No retry on any status (including 401/403 - the flow outcome
-        # is unaffected). The body is ignored.
-        redirect: false,
-        retry: false,
-        receive_timeout: @timeout_ms,
-        decode_body: false,
-        # FAPI transport: the notification is a server-to-server FAPI channel, so
-        # offer TLS 1.3 (FAPI 1.0 Advanced §8.5 / FAPI-CIBA), preferring it while
-        # still allowing 1.2 for endpoints that don't yet support 1.3.
-        connect_options: [transport_opts: [versions: [:"tlsv1.3", :"tlsv1.2"]]]
-      ]
-      |> Req.new()
-      |> Req.request()
-      |> case do
-        {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
-        {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
-        {:error, reason} -> {:error, reason}
+      # SSRF screen the registered notification endpoint and pin the socket to
+      # the checked IP at connect time (rebind-proof); TLS SNI / cert / Host stay
+      # on the real host.
+      screen_opts = [allow_loopback: Application.get_env(:attesto_phoenix, :allow_loopback_delivery, false)]
+
+      with {:ok, %{url: url, host: host, authority: authority}} <-
+             AttestoPhoenix.SSRFGuard.screen(endpoint, screen_opts) do
+        [
+          url: url,
+          method: :post,
+          json: %{auth_req_id: auth_req_id},
+          headers: [
+            {"authorization", "Bearer " <> client_notification_token},
+            {"accept", "application/json"},
+            {"host", authority}
+          ],
+          # SSRF posture: a 3xx from the notification endpoint is a failure, never
+          # followed. No retry on any status (including 401/403 - the flow outcome
+          # is unaffected). The body is ignored.
+          redirect: false,
+          retry: false,
+          receive_timeout: @timeout_ms,
+          decode_body: false,
+          # Pin to the checked IP (`:hostname` keeps SNI/cert/Host on the real
+          # host). FAPI transport: offer TLS 1.3 (FAPI 1.0 Advanced §8.5 /
+          # FAPI-CIBA), preferring it while still allowing 1.2.
+          connect_options: [hostname: host, transport_opts: [versions: [:"tlsv1.3", :"tlsv1.2"]]]
+        ]
+        |> Req.new()
+        |> Req.request()
+        |> case do
+          {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
+          {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
+          {:error, reason} -> {:error, reason}
+        end
       end
     end
   end
