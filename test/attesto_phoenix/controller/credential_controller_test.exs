@@ -13,6 +13,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
   @endpoint_path "/oauth/credential"
   @issuer "https://issuer.example"
+  @default_client_id "test-client"
   @subject "ou_user-123"
   @configuration_id "UniversityDegreeCredential"
   @vct "https://credentials.example/UniversityDegreeCredential"
@@ -388,6 +389,47 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert body(replay)["error"] == "invalid_nonce"
     end
 
+    test "binds a proof's iss to the authenticated client, rejecting a cross-client or absent iss" do
+      # The access token was minted for "client-A"; RFC 9068 guarantees its
+      # "client_id" claim carries that. A proof whose `iss` names a different
+      # client (or omits `iss` entirely) must be rejected - otherwise a proof
+      # captured/forged under one client could be replayed against another
+      # client's authenticated token.
+      token = mint_token(client_id: "client-A")
+
+      wrong_client_nonce = CNonceStore.issue(60)
+
+      wrong_client_response =
+        post_credential(
+          token,
+          credential_request(wrong_client_nonce, proof: proof_jwt(wrong_client_nonce, iss: "client-B"))
+        )
+
+      assert wrong_client_response.status == 400
+      assert body(wrong_client_response)["error"] == "invalid_proof"
+
+      absent_iss_nonce = CNonceStore.issue(60)
+
+      absent_iss_response =
+        post_credential(
+          token,
+          credential_request(absent_iss_nonce, proof: proof_jwt(absent_iss_nonce, iss: nil))
+        )
+
+      assert absent_iss_response.status == 400
+      assert body(absent_iss_response)["error"] == "invalid_proof"
+
+      matching_nonce = CNonceStore.issue(60)
+
+      matching_response =
+        post_credential(
+          token,
+          credential_request(matching_nonce, proof: proof_jwt(matching_nonce, iss: "client-A"))
+        )
+
+      assert matching_response.status == 200
+    end
+
     test "rejects a proof with the wrong audience" do
       nonce = CNonceStore.issue(60)
       proof = proof_jwt(nonce, aud: "https://other-issuer.example")
@@ -516,6 +558,28 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       refute_received {:credential_requested, _, _, _}
     end
 
+    test "rejects a request that requires credential_response_encryption instead of silently returning plaintext" do
+      # This issuer does not implement Credential Response encryption and never
+      # advertises it in its metadata. Silently issuing a plaintext credential
+      # when the wallet required an encrypted response would be a silent
+      # confidentiality downgrade, so the request must fail closed instead.
+      nonce = CNonceStore.issue(60)
+
+      request =
+        credential_request(nonce)
+        |> Map.put("credential_response_encryption", %{
+          "jwk" => public_map(@holder_key),
+          "alg" => "ECDH-ES",
+          "enc" => "A128GCM"
+        })
+
+      response = post_credential(mint_token(), request)
+
+      assert response.status == 400
+      assert body(response)["error"] == "invalid_encryption_parameters"
+      refute_received {:credential_requested, _, _, _}
+    end
+
     test "the opt-in router mounts POST /credential" do
       response = CredentialRouter.call(conn(:post, @endpoint_path), [])
 
@@ -543,16 +607,30 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       "typ" => "openid4vci-proof+jwt"
     }
 
-    claims = %{
-      "aud" => Keyword.get(opts, :aud, @issuer),
-      "iat" => System.system_time(:second),
-      "nonce" => nonce
-    }
+    claims =
+      %{
+        "aud" => Keyword.get(opts, :aud, @issuer),
+        "iat" => System.system_time(:second),
+        "nonce" => nonce
+      }
+      |> maybe_put_iss(opts)
 
     key
     |> JOSE.JWT.sign(header, claims)
     |> JOSE.JWS.compact()
     |> elem(1)
+  end
+
+  # Every existing proof-related test fixture predates the iss-binding fix and
+  # relies on the token's default client_id ("test-client"); default the proof's
+  # `iss` to that so the fix doesn't require touching every call site. Pass
+  # `iss: nil` explicitly to omit `iss` (testing the absent-iss rejection), or
+  # a different value to test a mismatched client.
+  defp maybe_put_iss(claims, opts) do
+    case Keyword.get(opts, :iss, @default_client_id) do
+      nil -> claims
+      iss -> Map.put(claims, "iss", iss)
+    end
   end
 
   defp mint_token(opts \\ []) do
@@ -565,13 +643,14 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       )
 
     credential_configuration_ids = Keyword.get(opts, :credential_configuration_ids, [@configuration_id])
+    client_id = Keyword.get(opts, :client_id, @default_client_id)
 
     principal = %{
       kind: "user",
       sub: @subject,
       scopes: ["credential"],
       claims: %{
-        "client_id" => "test-client",
+        "client_id" => client_id,
         "credential_configuration_ids" => credential_configuration_ids
       }
     }

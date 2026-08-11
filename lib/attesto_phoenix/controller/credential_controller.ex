@@ -56,6 +56,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     parsed_request = Callback.map_value(%{result: CredentialRequest.parse(request)}, :result)
 
     with {:ok, parsed} <- parsed_request,
+         :ok <- reject_response_encryption(parsed.response_encryption),
          {:ok, credential_configuration_id} <- selector(parsed.selector),
          :ok <- entitled?(claims, parsed.selector, credential_configuration_id),
          {:ok, holder_jwks} <- verify_proofs(config, claims, parsed.proofs) do
@@ -100,9 +101,26 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       {:error, :invalid_credential_request, description} ->
         invalid_request(conn, config, "invalid_credential_request", description)
 
+      {:error, :response_encryption_not_supported, description} ->
+        invalid_request(conn, config, "invalid_encryption_parameters", description)
+
       {:error, _reason} ->
         invalid_request(conn, config, "invalid_credential_request", "Invalid credential request.")
     end
+  end
+
+  # `Attesto.CredentialRequest.parse` accepts and normalizes a wallet's
+  # `credential_response_encryption` request per OID4VCI §8.2, but this issuer
+  # does not implement Credential Response encryption (a future feature) and
+  # its metadata never advertises it as supported. Silently returning a
+  # plaintext credential when the wallet explicitly required an encrypted
+  # response would be a silent confidentiality downgrade, so fail closed with
+  # a clear OID4VCI error instead.
+  defp reject_response_encryption(nil), do: :ok
+
+  defp reject_response_encryption(%{}) do
+    {:error, :response_encryption_not_supported,
+     "This credential issuer does not support Credential Response encryption."}
   end
 
   defp selector({:configuration_id, id}), do: {:ok, id}
@@ -251,8 +269,14 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     end
   end
 
-  defp maybe_put_client_id(opts, %{"grant_type" => "authorization_code", "client_id" => client_id})
-       when is_binary(client_id), do: Keyword.put(opts, :client_id, client_id)
+  # RFC 9068 §2.2 guarantees every access token JWT carries a `client_id`
+  # claim, so this binds every credential-request proof's `iss` to the
+  # authenticated client regardless of grant type. (Previously this only
+  # fired for a `"grant_type" => "authorization_code"` claim that no token
+  # minting path ever wrote, so the iss-binding check was permanently
+  # dead code and a forged/absent proof `iss` was accepted.)
+  defp maybe_put_client_id(opts, %{"client_id" => client_id}) when is_binary(client_id),
+    do: Keyword.put(opts, :client_id, client_id)
 
   defp maybe_put_client_id(opts, _claims), do: opts
 

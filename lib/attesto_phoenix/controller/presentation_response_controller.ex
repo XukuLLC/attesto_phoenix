@@ -45,15 +45,24 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   defp response(params, config, store) when is_map(params) do
     case fetch_param(params, "response") do
       {:ok, encrypted_response} -> decrypt_response(encrypted_response, store)
-      :error -> plaintext_response(params, config)
+      :error -> plaintext_response(params, config, store)
     end
   end
 
   defp response(_params, _config, _store), do: {:error, :malformed}
 
-  defp plaintext_response(params, config) do
+  defp plaintext_response(params, config, store) do
+    # A session created with a per-session `direct_post.jwt` override (via
+    # AttestoPhoenix.Verifier's `response_mode` attr) has an ephemeral
+    # response-encryption key attached to it even when the GLOBAL config mode
+    # is "direct_post". Accepting a plaintext submission for such a session
+    # would let a wallet (or attacker) silently downgrade that session's
+    # confidentiality requirement, so a session with an encryption key MUST
+    # reject plaintext, regardless of the global mode. `decoded_response/1`
+    # must run first to recover `state` before this lookup is possible.
     with "direct_post" <- Config.presentation_response_mode(config),
-         {:ok, state, vp_token} <- decoded_response(params) do
+         {:ok, state, vp_token} <- decoded_response(params),
+         :error <- PresentationSession.response_encryption_jwk(store, state) do
       {:ok, state, vp_token}
     else
       _ -> {:error, :malformed}

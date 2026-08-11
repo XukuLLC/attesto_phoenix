@@ -272,6 +272,46 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert_pending(plaintext.id)
   end
 
+  test "a session-level direct_post.jwt override rejects a plaintext submission even though the " <>
+         "global response mode is direct_post",
+       %{conn: conn} = ctx do
+    # Global config mode is "direct_post" (plaintext allowed by default), but
+    # this session was created with a per-session `response_mode:
+    # "direct_post.jwt"` override, so it has an ephemeral response-encryption
+    # key attached. A plaintext submission for THIS session must be rejected
+    # - accepting it would silently downgrade the session's confidentiality
+    # requirement - regardless of the global mode.
+    assert Config.presentation_response_mode(ctx.config) == "direct_post"
+
+    assert {:ok, session} =
+             Verifier.create_presentation_request(ctx.config, %{
+               dcql_query: dcql_query(),
+               expected_query_ids: [@query_id],
+               issuer_trust: {:issuer_jwks, ctx.issuer_jwk},
+               response_mode: "direct_post.jwt"
+             })
+
+    vp_token = valid_vp_token(ctx, session.nonce)
+
+    response = post_response(conn, ctx.config, session.id, JSON.encode!(vp_token))
+
+    assert_invalid_request(response)
+    assert_pending(session.id)
+    assert :error = Verifier.presentation_result(ctx.config, session.id)
+  end
+
+  test "a session with no session-level override still accepts plaintext under the global direct_post mode",
+       %{conn: conn} = ctx do
+    assert Config.presentation_response_mode(ctx.config) == "direct_post"
+    session = create_request(ctx)
+    vp_token = valid_vp_token(ctx, session.nonce)
+
+    response = post_response(conn, ctx.config, session.id, JSON.encode!(vp_token))
+
+    assert response.status == 200
+    assert {:ok, %{@query_id => _result}} = Verifier.presentation_result(ctx.config, session.id)
+  end
+
   test "wrong nonce and audience return the same public error without completion", %{conn: conn} = ctx do
     wrong_nonce = create_request(ctx)
 
