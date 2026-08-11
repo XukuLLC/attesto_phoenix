@@ -82,7 +82,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   `native_apps: [loopback_include_localhost: true]` the loopback mode is
   `:exact_allow_loopback_port_including_localhost` instead, extending the same
   port allowance to the bare `localhost` name
-  (`Config.native_app_loopback_matching/1`).
+  (`AttestoPhoenix.Config.native_app_loopback_matching/1`).
 
   Marking the client native is the whole decision. RFC 8252 §7.3 says the
   authorization server MUST allow any port for a loopback redirect URI, so

@@ -7,8 +7,8 @@ defmodule AttestoPhoenix.Verifier do
   controller, and hosts read the completed result once through
   `presentation_result/2` (single-use: the read consumes the session).
 
-  Request objects continue to use the main `Config.keystore/1`; their protected
-  `alg` is derived from that key by `Attesto.JWS.sign_current/3`. The separate
+  Request objects continue to use the main `AttestoPhoenix.Config.keystore/1`; their protected
+  `alg` is derived from that key by `Attesto.JWS.sign_current`. The separate
   verifier-encryption keystore is only an ECDH-ES recipient key and never
   changes request-object signing policy.
   """
