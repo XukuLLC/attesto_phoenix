@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] - 2026-08-10
+
+Pairs with the `attesto` 1.12.1 wallet-surface security-hardening release and
+now requires it (`>= 1.12.1`). Carries the HTTP-surface fixes from the same
+6-front adversarial sweep of the EU-wallet code.
+
+### Security
+
+- **OID4VP `direct_post.jwt` downgrade**: the direct-post response endpoint now
+  rejects a plaintext submission when the session mandated encryption (an
+  ephemeral response-encryption key is attached), instead of gating only on the
+  global response mode. Closes a silent per-session confidentiality downgrade of
+  the vp_token to any post-TLS intermediary.
+- **Credential-proof `iss` binding**: the credential endpoint now binds the
+  proof's `iss` to the access token's `client_id` unconditionally (RFC 9068).
+  Previously the check keyed off a `grant_type` token claim that is never
+  written, so a forged/absent `iss` was accepted on the authorization_code flow.
+- **`credential_response_encryption`**: a request that asks for response
+  encryption is now rejected (`invalid_encryption_parameters`) rather than
+  silently answered with a plaintext credential.
+
 ## [2.10.0] - 2026-08-10
 
 Pairs with the `attesto` 1.11.0 security-hardening release and now requires it
