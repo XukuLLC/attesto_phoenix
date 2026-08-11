@@ -165,22 +165,28 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   # store that cannot `consume/1` (only `valid?/1`) must not be used for
   # issuance - fail closed rather than leave the nonce replayable.
   defp consume_nonces(config, nonces) do
+    with {:ok, store} <- consuming_nonce_store(config) do
+      consume_each(store, nonces)
+    end
+  end
+
+  defp consuming_nonce_store(config) do
     case Callback.config_callback(config, :c_nonce_store) do
       store when is_atom(store) and not is_nil(store) ->
-        if function_exported?(store, :consume, 1) do
-          Enum.reduce_while(nonces, :ok, fn nonce, :ok ->
-            case store.consume(nonce) do
-              :ok -> {:cont, :ok}
-              {:error, _reason} -> {:halt, {:error, :invalid_nonce}}
-            end
-          end)
-        else
-          {:error, :invalid_nonce}
-        end
+        if function_exported?(store, :consume, 1), do: {:ok, store}, else: {:error, :invalid_nonce}
 
       _store ->
         {:error, :invalid_nonce}
     end
+  end
+
+  defp consume_each(store, nonces) do
+    Enum.reduce_while(nonces, :ok, fn nonce, :ok ->
+      case store.consume(nonce) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} -> {:halt, {:error, :invalid_nonce}}
+      end
+    end)
   end
 
   defp verify_proof(config, claims, {"jwt", jwt}) do
