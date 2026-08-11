@@ -64,12 +64,14 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   end
 
   @doc """
-  Atomically fetches and deletes the record for `code_hash`.
+  Atomically fetches and consumes the record for `code_hash`.
 
-  Returns `{:ok, entry}` when the row existed (and is now gone), or `:error`
-  when it was absent. The fetch and the delete are one indivisible statement
-  (`DELETE ... RETURNING`), so the single-use contract of `Attesto.CodeStore`
-  holds against concurrent redemptions.
+  Returns `{:ok, entry}` when the row existed and was still live,
+  `{:error, :consumed, meta}` when it was already successfully redeemed, or
+  `:error` when it was absent. The fetch and the consume mark are one
+  indivisible statement (`UPDATE ... WHERE consumed_at IS NULL RETURNING ...`),
+  so the single-use contract of `Attesto.CodeStore` holds against concurrent
+  redemptions.
 
   The loaded row is folded back into the `:code_hash` / `:data` /
   `:expires_at` (unix seconds) map via
@@ -79,7 +81,8 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   an expired-but-present code is still spent on first presentation.
   """
   @impl Attesto.CodeStore
-  @spec take(Attesto.CodeStore.code_hash()) :: {:ok, Attesto.CodeStore.entry()} | :error
+  @spec take(Attesto.CodeStore.code_hash()) ::
+          {:ok, Attesto.CodeStore.entry()} | :error | {:error, :consumed, Attesto.CodeStore.consumed_meta()}
   def take(code_hash) when is_binary(code_hash) do
     consumed_at = DateTime.utc_now() |> DateTime.truncate(:second)
 
