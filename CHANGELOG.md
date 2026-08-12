@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-08-11
+
+### Security
+
+- Require `attesto >= 1.12.2`, keeping the Phoenix HTTP surface on the complete
+  current core hardening baseline.
+- Refresh the test-only Postgrex lock past its stream-comment SQL-injection
+  advisory; the driver does not enter this package's runtime closure.
+
 ## [2.11.0] - 2026-08-10
 
 Pairs with the `attesto` 1.12.1 wallet-surface security-hardening release and
