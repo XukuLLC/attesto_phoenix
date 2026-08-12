@@ -484,7 +484,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp dispatch(%Request{grant_type: @grant_jwt_bearer} = request) do
     %{config: config, client: client, params: params} = request
 
-    with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: claims, replay_claim: assertion_replay}} <-
+    with {:ok, %{scope_ceiling: ceiling, claims: claims, replay_claim: assertion_replay}} <-
            jwt_bearer_authorize(config, token_client_id(request), params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          :ok <- require_jwt_bearer_cnf(claims, binding),
@@ -494,6 +494,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, scope} <- authorize_scope(config, client, requested),
          :ok <- require_scope_within_ceiling(scope, ceiling),
          :ok <- require_granted_scope_within_request(scope, requested),
+         {:ok, subject} <- resolve_jwt_bearer_subject(config, claims),
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          :ok <- commit_jwt_bearer_replay(config, assertion_replay),
          {:ok, response} <-
@@ -529,6 +530,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
       {:error, _reason} ->
         {:error, error(@error_invalid_grant, "the identity assertion is invalid")}
+    end
+  end
+
+  defp resolve_jwt_bearer_subject(config, claims) do
+    case JwtBearer.resolve_subject(config, claims) do
+      {:ok, subject} -> {:ok, subject}
+      {:error, _reason} -> {:error, error(@error_invalid_grant, "the identity assertion is invalid")}
     end
   end
 

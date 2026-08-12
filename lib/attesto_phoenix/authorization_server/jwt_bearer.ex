@@ -20,8 +20,9 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     * **`jti` replay** - prepares an issuer-scoped, fixed-size identity for the
       configured `:replay_check` seam; the token core claims it only after all
       exchange policy has passed, and before minting.
-    * **subject resolution** - the host's `:resolve_jwt_bearer_subject` callback
-      maps the validated claims to a local principal subject (or denies).
+    * **subject resolution** - after request policy passes, the host's
+      `:resolve_jwt_bearer_subject` callback maps the validated claims to a local
+      principal subject (or denies).
 
   Every failure returns `{:error, atom}`; the token core
   (`AttestoPhoenix.AuthorizationServer.Token`) maps a missing `assertion`
@@ -54,7 +55,6 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   @type pending_claim :: {String.t(), pos_integer()}
 
   @type prepared_result :: %{
-          subject: String.t(),
           scope_ceiling: [String.t()] | nil,
           claims: IdentityAssertion.claims(),
           replay_claim: pending_claim()
@@ -80,19 +80,22 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   @spec authorize(Config.t(), String.t() | nil, map()) :: {:ok, result()} | {:error, error()}
   def authorize(%Config{} = config, client_id, params) when is_map(params) do
     with {:ok, prepared} <- prepare(config, client_id, params),
+         {:ok, subject} <- resolve_subject(config, prepared.claims),
          :ok <- commit_replay_claim(config, prepared.replay_claim) do
-      {:ok, Map.delete(prepared, :replay_claim)}
+      {:ok, prepared |> Map.delete(:replay_claim) |> Map.put(:subject, subject)}
     end
   end
 
   @doc """
-  Validate and resolve an ID-JAG while deferring its atomic replay claim.
+  Validate an ID-JAG while deferring subject resolution and its atomic replay
+  claim.
 
   The token core uses this variant so sender binding, resource, scope, and host
-  policy can finish before consuming the assertion. A caller of this function
-  MUST pass the returned `:replay_claim` to `commit_replay_claim/2` before
-  minting or releasing any authorization result. Most callers should use
-  `authorize/3`, which performs that claim itself.
+  policy can finish before invoking a potentially side-effecting subject
+  resolver or consuming the assertion. A caller MUST then call
+  `resolve_subject/2` and pass `:replay_claim` to `commit_replay_claim/2` before
+  minting or releasing an authorization result. Most callers should use
+  `authorize/3`, which performs both steps itself.
   """
   @spec prepare(Config.t(), String.t() | nil, map()) ::
           {:ok, prepared_result()} | {:error, error()}
@@ -104,15 +107,29 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
          {:ok, issuer_opts} <- trusted_issuer(opts, issuer),
          {:ok, jwks} <- resolve_jwks(opts, issuer, issuer_opts),
          {:ok, claims} <- verify(config, opts, assertion, issuer, issuer_opts, jwks, client_id),
-         {:ok, subject} <- resolve_subject(config, claims),
          {:ok, replay_claim} <- prepare_replay(opts, claims) do
       {:ok,
        %{
-         subject: subject,
          scope_ceiling: scope_ceiling(claims),
          claims: claims,
          replay_claim: replay_claim
        }}
+    end
+  end
+
+  @doc """
+  Resolve verified ID-JAG claims to a local principal subject.
+
+  Required when the feature is enabled (`Config.validate!/1` enforces this), so
+  an unset callback is a configuration fault rather than a per-request denial.
+  """
+  @spec resolve_subject(Config.t(), IdentityAssertion.claims()) ::
+          {:ok, String.t()} | {:error, :subject_denied}
+  def resolve_subject(%Config{} = config, claims) when is_map(claims) do
+    case Callback.invoke(Config.resolve_jwt_bearer_subject_fun(config), [claims], :no_callback) do
+      {:ok, subject} when is_binary(subject) and subject != "" -> {:ok, subject}
+      subject when is_binary(subject) and subject != "" -> {:ok, subject}
+      _ -> {:error, :subject_denied}
     end
   end
 
@@ -289,17 +306,6 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     remaining = exp - System.system_time(:second)
     ceiling = Keyword.get(opts, :assertion_max_lifetime_seconds) || 300
     remaining |> min(ceiling) |> max(1)
-  end
-
-  # The host maps the validated claims to a local principal subject. Required
-  # when the feature is enabled (`Config.validate!/1` enforces this), so an
-  # unset callback is a config fault rather than a per-request deny.
-  defp resolve_subject(config, claims) do
-    case Callback.invoke(Config.resolve_jwt_bearer_subject_fun(config), [claims], :no_callback) do
-      {:ok, subject} when is_binary(subject) and subject != "" -> {:ok, subject}
-      subject when is_binary(subject) and subject != "" -> {:ok, subject}
-      _ -> {:error, :subject_denied}
-    end
   end
 
   # draft §6.1: `scope` is OPTIONAL. When present it is the UPPER bound on what

@@ -460,6 +460,50 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert response.scope == "mcp:read"
     end
 
+    test "invalid binding, resource, and scope requests do not invoke the subject resolver" do
+      test_pid = self()
+      resource = "https://api.example/signed"
+
+      config =
+        config(
+          dpop_enabled: true,
+          resource_indicators: [allowed_resources: [resource]],
+          resolve_jwt_bearer_subject: fn claims ->
+            send(test_pid, {:resolved, claims["jti"]})
+            {:ok, claims["sub"]}
+          end
+        )
+
+      {_proof, jkt} = dpop_proof_and_jkt()
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(config, %{
+                 "assertion" => assertion(%{"jti" => "bad-binding", "cnf" => %{"jkt" => jkt}})
+               })
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} =
+               issue(config, %{
+                 "assertion" => assertion(%{"jti" => "bad-resource", "resource" => resource}),
+                 "resource" => @as_issuer
+               })
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _} =
+               issue(config, %{
+                 "assertion" => assertion(%{"jti" => "bad-scope", "scope" => "mcp:read"}),
+                 "scope" => "mcp:admin"
+               })
+
+      refute_received {:resolved, _jti}
+
+      assert {:ok, _response, _events} =
+               issue(config, %{
+                 "assertion" => assertion(%{"jti" => "valid-policy", "scope" => "mcp:read"}),
+                 "scope" => "mcp:read"
+               })
+
+      assert_received {:resolved, "valid-policy"}
+    end
+
     test "host scope policy cannot widen the signed or requested ceiling" do
       config = config(authorize_scope: fn _client, _requested -> {:ok, ["mcp:admin"]} end)
 

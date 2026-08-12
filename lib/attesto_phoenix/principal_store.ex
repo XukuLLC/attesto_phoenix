@@ -54,9 +54,13 @@ defmodule AttestoPhoenix.PrincipalStore do
   subject for the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant
   (`draft-ietf-oauth-identity-assertion-authz-grant-04`).
 
-  Receives the string-keyed, already-verified assertion claims (the signature,
-  trusted `iss`, `aud`, `client_id` binding, `exp`/`iat`, and `jti` replay have
-  all been checked). The host maps the asserted external identity - typically
+  Receives the string-keyed, already-verified assertion claims after sender
+  binding, resource, scope, and host policy have passed. The signature, trusted
+  `iss`, `aud`, `client_id` binding, and `exp`/`iat` have all been checked; the
+  atomic `jti` replay claim follows this callback because the replay-store seam
+  has no non-consuming reservation operation. A validly signed replay can
+  therefore reach this callback before rejection, so callbacks with side
+  effects must be idempotent. The host maps the asserted external identity - typically
   `claims["sub"]` (unique when scoped with `claims["iss"]`) and/or
   `claims["email"]` - to the local subject the issued token is minted for, the
   same subject string `build_principal/3` then receives.

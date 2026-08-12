@@ -99,9 +99,12 @@ as you would for DPoP.
 ## Wiring the subject-resolution callback
 
 The asserted `sub` is the IdP's identifier for the user; you map it to your
-local subject. The callback receives the **validated** claims (signature, trust,
-`client_id` binding, `jti` replay already checked) and returns the local subject
-or denies. It is also installable as `resolve_jwt_bearer_subject/1` on an
+local subject. The callback receives the **validated** claims after sender
+binding, resource, scope, and host policy pass, and returns the local subject or
+denies. The atomic `jti` replay claim follows the callback because the store seam
+has no non-consuming reservation operation; a validly signed replay can reach
+the callback before rejection, so any side effects must be idempotent. It is
+also installable as `resolve_jwt_bearer_subject/1` on an
 `AttestoPhoenix.PrincipalStore` module.
 
 ```elixir

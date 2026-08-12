@@ -37,25 +37,26 @@ equivalent on this side.
 
 ### Added
 
-- `AttestoPhoenix.AuthorizationServer.JwtBearer.prepare/3` and
-  `commit_replay_claim/2`: a two-phase variant of `authorize/3` that defers the
-  atomic replay claim so sender binding, resource, scope, and host policy can be
-  evaluated first. A caller of `prepare/3` MUST pass the returned `:replay_claim`
-  to `commit_replay_claim/2` before minting. `authorize/3` is unchanged for
-  existing callers and still claims replay before returning.
+- `AttestoPhoenix.AuthorizationServer.JwtBearer.prepare/3`,
+  `resolve_subject/2`, and `commit_replay_claim/2`: a staged variant of
+  `authorize/3` that defers the host subject callback and atomic replay claim so
+  sender binding, resource, scope, and host policy can be evaluated first. A
+  caller of `prepare/3` MUST resolve its verified claims and commit the returned
+  `:replay_claim` before minting. `authorize/3` remains the one-call API.
 
 ### Changed
 
 - A rejected ID-JAG exchange no longer consumes the assertion's `jti`: the
   replay claim is committed only once every check has passed, so a policy
   denial does not burn an otherwise valid assertion.
-- **Host-callback ordering**: because the replay seam is atomically
-  check-and-record (there is no non-consuming probe), deferring the claim moves
-  the `:resolve_jwt_bearer_subject` callback ahead of replay consumption. A
-  replayed — but validly signed and unexpired — assertion therefore reaches that
-  callback before being rejected. Hosts whose callback has side effects
-  (just-in-time provisioning, audit writes, upstream directory lookups) should
-  make it idempotent. Token issuance itself remains replay-protected.
+- **Host-callback ordering**: the token endpoint now invokes
+  `:resolve_jwt_bearer_subject` only after sender binding, resource, scope, and
+  host policy succeed, preventing invalid requests from triggering JIT
+  provisioning, audit writes, or upstream lookups. Because the replay seam is
+  atomically check-and-record (there is no non-consuming reservation), a validly
+  signed replay can still reach the callback before replay rejection; callbacks
+  with side effects should remain idempotent. Token issuance remains
+  replay-protected.
 - **Upgrade note**: the replay-store key format changed (see above). Entries
   written by an earlier release are not recognized after upgrade, so during a
   rolling deploy an assertion already seen by an old node could be accepted once
