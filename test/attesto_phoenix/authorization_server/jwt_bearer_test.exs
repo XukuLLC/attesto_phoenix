@@ -7,6 +7,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   use ExUnit.Case, async: false
 
   alias Attesto.DPoP.ReplayCache
+  alias AttestoPhoenix.AuthorizationServer.JwtBearer, as: JwtBearerGrant
   alias AttestoPhoenix.AuthorizationServer.JwtBearerTest
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
@@ -149,6 +150,31 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     Token.issue(config, request(config, params, req_overrides))
   end
 
+  defp dpop_proof_and_jkt do
+    jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+    {_, public_map} = JOSE.JWK.to_public_map(jwk)
+
+    payload = %{
+      "htm" => "POST",
+      "htu" => "#{@as_issuer}/oauth/token",
+      "iat" => System.system_time(:second),
+      "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    }
+
+    header = %{"alg" => "ES256", "typ" => "dpop+jwt", "jwk" => public_map}
+    {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, header, payload))
+    {compact, Attesto.DPoP.compute_jkt(public_map)}
+  end
+
+  defp dpop_request_input(proof) do
+    %{
+      dpop_proof: proof,
+      mtls_cert_der: nil,
+      http_uri: "#{@as_issuer}/oauth/token",
+      http_method: "POST"
+    }
+  end
+
   # Read the minted access token's `aud`. The token is signed by the suite's
   # keystore, so the signature-verifying peek suffices (we assert on `aud`, not
   # on `aud`-equality, which `verify/3` would itself enforce against
@@ -234,6 +260,36 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
 
       assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
       assert access_token_aud(config, response) == @as_issuer
+    end
+
+    test "an absent request resource uses the assertion's signed resource" do
+      resource = "https://api.example/signed"
+      config = config(resource_indicators: [allowed_resources: [resource]])
+      params = %{"assertion" => assertion(%{"resource" => resource})}
+
+      assert {:ok, response, _} = issue(config, params)
+      assert access_token_aud(config, response) == resource
+    end
+
+    test "a request may narrow but not widen the assertion's signed resources" do
+      a = "https://api.example/a"
+      b = "https://api.example/b"
+      config = config(resource_indicators: [allowed_resources: [a, b]])
+
+      narrow = %{
+        "assertion" => assertion(%{"resource" => [a, b]}),
+        "resource" => a
+      }
+
+      assert {:ok, response, _} = issue(config, narrow)
+      assert access_token_aud(config, response) == a
+
+      widen = %{
+        "assertion" => assertion(%{"resource" => a}),
+        "resource" => b
+      }
+
+      assert {:error, %OAuthError{error: :invalid_target}, _} = issue(config, widen)
     end
 
     test "a resource with a fragment is invalid_target" do
@@ -342,6 +398,37 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
                issue(config, %{"assertion" => jwt})
     end
 
+    test "the public authorize API still commits replay before returning" do
+      config = config()
+      params = %{"assertion" => assertion(%{"jti" => "direct-api-jti"})}
+
+      assert {:ok, result} = JwtBearerGrant.authorize(config, @cid, params)
+      refute Map.has_key?(result, :replay_claim)
+      assert {:error, :replay} = JwtBearerGrant.authorize(config, @cid, params)
+    end
+
+    test "the same jti from two trusted issuers does not collide" do
+      second_idp = "https://second-idp.example"
+
+      config =
+        config(
+          jwt_bearer: [
+            issuers: %{
+              @idp => [jwks: idp_jwks(), allowed_algs: ["RS256"]],
+              second_idp => [jwks: idp_jwks(), allowed_algs: ["RS256"]]
+            }
+          ]
+        )
+
+      assert {:ok, _, _} =
+               issue(config, %{"assertion" => assertion(%{"jti" => "shared-idp-jti"})})
+
+      assert {:ok, _, _} =
+               issue(config, %{
+                 "assertion" => assertion(%{"iss" => second_idp, "jti" => "shared-idp-jti"})
+               })
+    end
+
     test "a subject-resolution deny is invalid_grant" do
       config = config(resolve_jwt_bearer_subject: fn _claims -> {:error, :no_such_user} end)
 
@@ -360,6 +447,57 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       params = %{"assertion" => assertion(%{"scope" => "mcp:read"}), "scope" => "mcp:read mcp:admin"}
 
       assert {:error, %OAuthError{error: :invalid_scope}, _} = issue(config, params)
+    end
+
+    test "a failed policy check does not consume an otherwise valid assertion" do
+      config = config()
+      jwt = assertion(%{"scope" => "mcp:read"})
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _} =
+               issue(config, %{"assertion" => jwt, "scope" => "mcp:admin"})
+
+      assert {:ok, response, _} = issue(config, %{"assertion" => jwt, "scope" => "mcp:read"})
+      assert response.scope == "mcp:read"
+    end
+
+    test "host scope policy cannot widen the signed or requested ceiling" do
+      config = config(authorize_scope: fn _client, _requested -> {:ok, ["mcp:admin"]} end)
+
+      params = %{
+        "assertion" => assertion(%{"scope" => "mcp:read mcp:write"}),
+        "scope" => "mcp:read"
+      }
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _} = issue(config, params)
+    end
+
+    test "cnf.jkt requires a matching DPoP proof and binds the issued token" do
+      {proof, jkt} = dpop_proof_and_jkt()
+      jwt = assertion(%{"cnf" => %{"jkt" => jkt}})
+      config = config(dpop_enabled: true)
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(config, %{"assertion" => jwt})
+
+      assert {:ok, response, _} =
+               issue(config, %{"assertion" => jwt}, sender_constraint_input: dpop_request_input(proof))
+
+      assert response.token_type == "DPoP"
+      {:ok, claims} = Attesto.Token.peek_signed_claims(Config.to_attesto_config(config), response.access_token)
+      assert claims["cnf"] == %{"jkt" => jkt}
+    end
+
+    test "cnf.jkt rejects a proof made with a different key" do
+      {_matching_proof, expected_jkt} = dpop_proof_and_jkt()
+      {wrong_proof, _wrong_jkt} = dpop_proof_and_jkt()
+      config = config(dpop_enabled: true)
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(
+                 config,
+                 %{"assertion" => assertion(%{"cnf" => %{"jkt" => expected_jkt}})},
+                 sender_constraint_input: dpop_request_input(wrong_proof)
+               )
     end
 
     test "the grant is rejected when the client is not registered for it" do

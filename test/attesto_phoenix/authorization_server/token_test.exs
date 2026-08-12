@@ -997,6 +997,29 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
              }
     end
 
+    test "scope policy cannot widen the subject token or replace the requested subset" do
+      base_config = config()
+      subject_request = request(base_config, params: %{"scope" => "read write"})
+      assert {:ok, subject_response, _} = Token.issue(base_config, subject_request)
+
+      exchange = fn granted ->
+        exchange_config = config(authorize_scope: fn _client, _requested -> {:ok, granted} end)
+
+        request(exchange_config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+        |> then(&Token.issue(exchange_config, &1))
+      end
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _} = exchange.(["write"])
+      assert {:error, %OAuthError{error: :invalid_scope}, _} = exchange.(["admin"])
+    end
+
     test "RFC 8707: token exchange cannot widen audience beyond the subject token" do
       a = "https://api.example/a"
       b = "https://api.example/b"

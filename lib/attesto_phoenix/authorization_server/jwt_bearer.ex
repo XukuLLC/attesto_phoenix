@@ -17,8 +17,9 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
       without revealing which issuers are trusted.
     * **JWKS resolution** - static keys, a cached `jwks_uri` fetch (reusing the
       SSRF-guarded CIMD fetcher + cache), or a custom `:jwks_resolver`.
-    * **`jti` replay** - via the configured `:replay_check` (the same seam DPoP
-      uses), namespaced so an ID-JAG `jti` never collides with a DPoP proof's.
+    * **`jti` replay** - prepares an issuer-scoped, fixed-size identity for the
+      configured `:replay_check` seam; the token core claims it only after all
+      exchange policy has passed, and before minting.
     * **subject resolution** - the host's `:resolve_jwt_bearer_subject` callback
       maps the validated claims to a local principal subject (or denies).
 
@@ -49,6 +50,16 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
           claims: IdentityAssertion.claims()
         }
 
+  @typedoc "A verified assertion's fixed-size replay identity and remaining acceptance window."
+  @type pending_claim :: {String.t(), pos_integer()}
+
+  @type prepared_result :: %{
+          subject: String.t(),
+          scope_ceiling: [String.t()] | nil,
+          claims: IdentityAssertion.claims(),
+          replay_claim: pending_claim()
+        }
+
   @type error ::
           :missing_assertion
           | :untrusted_issuer
@@ -58,7 +69,8 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
           | :subject_denied
 
   @doc """
-  Validate the ID-JAG `assertion` and resolve the local subject.
+  Validate the ID-JAG `assertion`, claim its replay identity, and resolve the
+  local subject.
 
   `client_id` is the already-authenticated client's identifier (the token
   endpoint resolved it from client authentication); the assertion's `client_id`
@@ -67,6 +79,24 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   """
   @spec authorize(Config.t(), String.t() | nil, map()) :: {:ok, result()} | {:error, error()}
   def authorize(%Config{} = config, client_id, params) when is_map(params) do
+    with {:ok, prepared} <- prepare(config, client_id, params),
+         :ok <- commit_replay_claim(config, prepared.replay_claim) do
+      {:ok, Map.delete(prepared, :replay_claim)}
+    end
+  end
+
+  @doc """
+  Validate and resolve an ID-JAG while deferring its atomic replay claim.
+
+  The token core uses this variant so sender binding, resource, scope, and host
+  policy can finish before consuming the assertion. A caller of this function
+  MUST pass the returned `:replay_claim` to `commit_replay_claim/2` before
+  minting or releasing any authorization result. Most callers should use
+  `authorize/3`, which performs that claim itself.
+  """
+  @spec prepare(Config.t(), String.t() | nil, map()) ::
+          {:ok, prepared_result()} | {:error, error()}
+  def prepare(%Config{} = config, client_id, params) when is_map(params) do
     opts = Config.jwt_bearer(config)
 
     with {:ok, assertion} <- require_assertion(params),
@@ -74,9 +104,24 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
          {:ok, issuer_opts} <- trusted_issuer(opts, issuer),
          {:ok, jwks} <- resolve_jwks(opts, issuer, issuer_opts),
          {:ok, claims} <- verify(config, opts, assertion, issuer, issuer_opts, jwks, client_id),
-         :ok <- check_replay(config, opts, claims),
-         {:ok, subject} <- resolve_subject(config, claims) do
-      {:ok, %{subject: subject, scope_ceiling: scope_ceiling(claims), claims: claims}}
+         {:ok, subject} <- resolve_subject(config, claims),
+         {:ok, replay_claim} <- prepare_replay(opts, claims) do
+      {:ok,
+       %{
+         subject: subject,
+         scope_ceiling: scope_ceiling(claims),
+         claims: claims,
+         replay_claim: replay_claim
+       }}
+    end
+  end
+
+  @doc "Atomically claim a replay identity returned by `prepare/3` before minting."
+  @spec commit_replay_claim(Config.t(), pending_claim()) :: :ok | {:error, :replay}
+  def commit_replay_claim(%Config{} = config, {key, ttl}) when is_binary(key) and is_integer(ttl) do
+    case Callback.invoke(Adapter.replay_check(config), [key, ttl]) do
+      :ok -> :ok
+      _other -> {:error, :replay}
     end
   end
 
@@ -226,19 +271,19 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     end
   end
 
-  # draft §6.1: the assertion `jti` MUST be replay-protected. Reuse the host's
-  # configured `:replay_check` (the DPoP seam), namespaced so an ID-JAG jti can
-  # never collide with a DPoP proof jti. Remember it for the assertion's
-  # remaining lifetime - past `exp` the assertion is rejected on `exp` anyway.
-  defp check_replay(config, opts, %{"jti" => jti, "exp" => exp}) when is_binary(jti) and is_integer(exp) do
-    ttl = replay_ttl(exp, opts)
-
-    case Callback.invoke(Adapter.replay_check(config), [@jti_namespace <> jti, ttl]) do
-      :ok -> :ok
-      {:error, :replay} -> {:error, :replay}
-      _other -> {:error, :replay}
-    end
+  # draft §6.1: the assertion `jti` MUST be replay-protected. RFC 7519 scopes
+  # `jti` uniqueness to its issuer. Hash the verified issuer
+  # and bounded `jti` into an opaque, fixed-size store key: two trusted IdPs may
+  # legitimately choose the same identifier without colliding, while raw IdP
+  # input never reaches a database key.
+  defp prepare_replay(opts, %{"iss" => issuer, "jti" => jti, "exp" => exp})
+       when is_binary(issuer) and is_binary(jti) and is_integer(exp) do
+    material = <<byte_size(issuer)::unsigned-big-64, issuer::binary, jti::binary>>
+    digest = :crypto.hash(:sha256, material) |> Base.url_encode64(padding: false)
+    {:ok, {@jti_namespace <> digest, replay_ttl(exp, opts)}}
   end
+
+  defp prepare_replay(_opts, _claims), do: {:error, :invalid_assertion}
 
   defp replay_ttl(exp, opts) do
     remaining = exp - System.system_time(:second)

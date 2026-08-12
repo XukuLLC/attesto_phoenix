@@ -6,12 +6,61 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.12.0] - 2026-08-11
 
+Hardening of the ID-JAG (`urn:ietf:params:oauth:grant-type:jwt-bearer`)
+exchange at the token endpoint. Pairs with `attesto` 1.13.0 and now requires
+it: the core release supplies the assertion-claim validation this enforcement
+builds on, including the `authorization_details` rejection, which has no
+equivalent on this side.
+
 ### Security
 
-- Require `attesto >= 1.12.2`, keeping the Phoenix HTTP surface on the complete
+- **Signed `resource` is an audience ceiling.** The exchange previously ignored
+  the assertion's `resource` claim, so a client could exchange into any other
+  locally permitted audience. A request omitting `resource` now defaults to the
+  signed set, and one supplying it may narrow that set but never widen it.
+- **Signed `cnf.jkt` requires matching proof-of-possession.** An assertion
+  carrying `cnf.jkt` is proof-of-possession authority, not a bearer credential;
+  the token request must demonstrate the same DPoP key. A missing, mTLS, or
+  different-key binding is now `invalid_grant` (draft §6.1, RFC 9449).
+- **Scope ceilings are rechecked after host policy.** A `:authorize_scope`
+  callback could previously re-add an unrequested scope or exceed the ID-JAG /
+  token-exchange ceiling. The granted result is now re-validated against both
+  the signed ceiling and the requested set.
+- **Replay identities are fixed-size and issuer-scoped.** The store key is now
+  `sha256(iss ‖ jti)` rather than the raw `jti`, so unbounded IdP input never
+  becomes a database key and two trusted IdPs choosing the same identifier do
+  not collide (RFC 7519 scopes `jti` uniqueness to its issuer).
+- Require `attesto >= 1.13.0`, keeping the Phoenix HTTP surface on the complete
   current core hardening baseline.
 - Refresh the test-only Postgrex lock past its stream-comment SQL-injection
   advisory; the driver does not enter this package's runtime closure.
+
+### Added
+
+- `AttestoPhoenix.AuthorizationServer.JwtBearer.prepare/3` and
+  `commit_replay_claim/2`: a two-phase variant of `authorize/3` that defers the
+  atomic replay claim so sender binding, resource, scope, and host policy can be
+  evaluated first. A caller of `prepare/3` MUST pass the returned `:replay_claim`
+  to `commit_replay_claim/2` before minting. `authorize/3` is unchanged for
+  existing callers and still claims replay before returning.
+
+### Changed
+
+- A rejected ID-JAG exchange no longer consumes the assertion's `jti`: the
+  replay claim is committed only once every check has passed, so a policy
+  denial does not burn an otherwise valid assertion.
+- **Host-callback ordering**: because the replay seam is atomically
+  check-and-record (there is no non-consuming probe), deferring the claim moves
+  the `:resolve_jwt_bearer_subject` callback ahead of replay consumption. A
+  replayed — but validly signed and unexpired — assertion therefore reaches that
+  callback before being rejected. Hosts whose callback has side effects
+  (just-in-time provisioning, audit writes, upstream directory lookups) should
+  make it idempotent. Token issuance itself remains replay-protected.
+- **Upgrade note**: the replay-store key format changed (see above). Entries
+  written by an earlier release are not recognized after upgrade, so during a
+  rolling deploy an assertion already seen by an old node could be accepted once
+  by a new one. The window is bounded by the assertion's remaining lifetime
+  (at most `:assertion_max_lifetime_seconds`, default 300s).
 
 ## [2.11.0] - 2026-08-10
 

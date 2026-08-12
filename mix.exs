@@ -96,11 +96,18 @@ defmodule AttestoPhoenix.MixProject do
   # Credential Request `proofs`. 1.11.0 adds the required `Attesto.CNonceStore`
   # `consume/1` callback, which the credential endpoint now calls to single-use
   # the c_nonce - an older core lacks it and the endpoint fails closed.
+  # 1.13.0 supplies the ID-JAG assertion-claim validation the token endpoint's
+  # JWT-bearer enforcement builds on. Most of it is defence in depth (this
+  # package re-validates the signed `resource` and matches `cnf.jkt` itself),
+  # but the `authorization_details` rejection lives ONLY in core: on an older
+  # release an assertion carrying RFC 9396 constraints is accepted and treated
+  # as broader scope-only authority, which is exactly the widening 2.12.0
+  # closes. The floor is therefore load-bearing, not cosmetic.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.12.2 and < 2.0.0"}
+      {:attesto, ">= 1.13.0 and < 2.0.0"}
     end
   end
 

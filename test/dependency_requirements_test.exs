@@ -4,8 +4,12 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "Attesto and test-only Postgrex reject their affected predecessors" do
     case dependency!(:attesto) do
       {:attesto, requirement} when is_binary(requirement) ->
-        assert Version.match?("1.12.2", requirement)
-        refute Version.match?("1.12.1", requirement)
+        assert Version.match?("1.13.0", requirement)
+        # 1.12.2 rejects neither an ID-JAG `authorization_details` claim nor a
+        # malformed signed constraint, and this package has no equivalent check
+        # on the JWT-bearer path — resolving it would silently reinstate the
+        # widening that 2.12.0 closes.
+        refute Version.match?("1.12.2", requirement)
 
       {:attesto, opts} when is_list(opts) ->
         assert opts[:path], "expected the explicit ATTESTO_PATH development dependency"

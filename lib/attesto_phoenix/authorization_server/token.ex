@@ -459,6 +459,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          requested = requested_exchange_scope(params, claims),
          :ok <- require_scope_within_subject_token(requested, claims),
          {:ok, scope} <- authorize_scope(config, client, requested),
+         :ok <- require_scope_within_subject_token(scope, claims),
+         :ok <- require_granted_scope_within_request(scope, requested),
          {:ok, audience} <- exchange_resource_audience(config, client, params, claims),
          {:ok, response} <- mint_exchanged_token(request, claims, scope, token_type, binding, audience) do
       response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
@@ -474,7 +476,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # (signed by a trusted enterprise IdP, asserting one user for this resource
   # application) in the `assertion` parameter and receives a normal access token.
   # `AttestoPhoenix.AuthorizationServer.JwtBearer` validates the assertion
-  # (signature against the trusted issuer's JWKS, claims, `jti` replay) and maps
+  # (signature against the trusted issuer's JWKS and claims) and maps
   # its `client_id` claim to the authenticated client, then resolves the local
   # subject via the host `:resolve_jwt_bearer_subject` callback. The assertion's
   # `scope` claim, when present, is the ceiling on what may be granted (draft
@@ -482,14 +484,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp dispatch(%Request{grant_type: @grant_jwt_bearer} = request) do
     %{config: config, client: client, params: params} = request
 
-    with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: _claims}} <-
+    with {:ok, %{subject: subject, scope_ceiling: ceiling, claims: claims, replay_claim: assertion_replay}} <-
            jwt_bearer_authorize(config, token_client_id(request), params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
-         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
-         {:ok, audience} <- request_resource_audience(config, client, params),
+         :ok <- require_jwt_bearer_cnf(claims, binding),
+         {:ok, audience} <- jwt_bearer_resource_audience(config, client, params, claims),
          requested = jwt_bearer_requested_scope(params, ceiling),
          :ok <- require_scope_within_ceiling(requested, ceiling),
          {:ok, scope} <- authorize_scope(config, client, requested),
+         :ok <- require_scope_within_ceiling(scope, ceiling),
+         :ok <- require_granted_scope_within_request(scope, requested),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
+         :ok <- commit_jwt_bearer_replay(config, assertion_replay),
          {:ok, response} <-
            mint(request, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
       # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: this
@@ -514,7 +520,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # subject was denied. The authenticated client's identifier is passed so the
   # handler can enforce the `client_id`-claim binding.
   defp jwt_bearer_authorize(config, authenticated_client_id, params) do
-    case JwtBearer.authorize(config, authenticated_client_id, params) do
+    case JwtBearer.prepare(config, authenticated_client_id, params) do
       {:ok, result} ->
         {:ok, result}
 
@@ -547,6 +553,66 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       [] -> :ok
       _exceeded -> {:error, error(@error_invalid_scope, "requested scope exceeds the assertion")}
     end
+  end
+
+  # RFC 6749 §3.3: host policy may narrow the requested scope but cannot add a
+  # value the client did not request. An empty request retains OAuth's normal
+  # server-defined default-scope behavior; signed/grant-specific ceilings are
+  # enforced separately even in that case.
+  defp require_granted_scope_within_request(_granted, []), do: :ok
+
+  defp require_granted_scope_within_request(granted, requested) do
+    case granted -- requested do
+      [] -> :ok
+      _added -> {:error, error(@error_invalid_scope, "scope policy exceeded the requested scope")}
+    end
+  end
+
+  # draft §6.1 / RFC 9449: an ID-JAG carrying `cnf.jkt` is proof-of-possession
+  # authority, not a bearer assertion. The token request must demonstrate the
+  # same DPoP key; a missing, mTLS, or different-key binding is invalid_grant.
+  defp require_jwt_bearer_cnf(%{"cnf" => %{"jkt" => expected}}, binding) do
+    if SenderConstraint.binding_jkt(binding) == expected,
+      do: :ok,
+      else: {:error, error(@error_invalid_grant, "the identity assertion sender binding is invalid")}
+  end
+
+  defp require_jwt_bearer_cnf(_claims, _binding), do: :ok
+
+  defp commit_jwt_bearer_replay(config, replay_claim) do
+    case JwtBearer.commit_replay_claim(config, replay_claim) do
+      :ok -> :ok
+      {:error, :replay} -> {:error, error(@error_invalid_grant, "the identity assertion is invalid")}
+    end
+  end
+
+  # The signed `resource` claim is an authorization ceiling. If the token
+  # request omits `resource`, use the assertion's set; if it supplies one, it
+  # may narrow that set but must never select another locally allowed resource.
+  defp jwt_bearer_resource_audience(config, client, params, %{"resource" => signed}) do
+    with {:ok, signed_resources} <- validate_assertion_resources(signed),
+         {:ok, requested} <- validate_resource_param(params),
+         selected = if(requested == [], do: signed_resources, else: requested),
+         :ok <- require_resource_within_assertion(selected, signed_resources) do
+      authorize_resources(config, client, selected)
+    end
+  end
+
+  defp jwt_bearer_resource_audience(config, client, params, _claims) do
+    request_resource_audience(config, client, params)
+  end
+
+  defp validate_assertion_resources(resource) do
+    case ResourceIndicator.validate(resource) do
+      {:ok, [_ | _] = resources} -> {:ok, resources}
+      _ -> {:error, error(@error_invalid_grant, "the identity assertion resource is invalid")}
+    end
+  end
+
+  defp require_resource_within_assertion(requested, signed) do
+    if Enum.all?(requested, &(&1 in signed)),
+      do: :ok,
+      else: {:error, error(@error_invalid_target, "the requested resource exceeds the identity assertion")}
   end
 
   # RFC 8707 §2: the request-time `resource` indicator(s) scope the issued access
