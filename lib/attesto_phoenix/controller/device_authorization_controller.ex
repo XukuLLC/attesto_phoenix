@@ -82,7 +82,12 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   defp authenticate_client(config, conn, params) do
     policy = ClientAuthentication.Policy.for_endpoint(config, :device_authorization)
 
-    case ClientAuthentication.authenticate_with_context(get_req_header(conn, "authorization"), params, config, policy) do
+    case ClientAuthentication.authenticate_with_context(
+           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
+           params,
+           config,
+           policy
+         ) do
       {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}
       {:error, %OAuthError{} = err, _context} -> {:error, err}
     end

@@ -91,8 +91,32 @@ defmodule AttestoPhoenix.Config do
       Default `"OAuth"`.
     * `:htu` - `(conn -> canonical_url_string)`. Overrides how the DPoP `htu`
       is computed behind proxies. Defaults to derivation from `:trusted_proxies`.
-    * `:cert_der` - `(conn -> der_binary | nil)`. Extracts the client mTLS
-      certificate DER. Required only when `:mtls_enabled`.
+    * `:cert_der` - `(conn -> der_binary | nil)`. Deprecated compatibility alias
+      for terminator-provided certificate extraction. It is invoked only when
+      the adapter-reported immediate socket peer matches `:trusted_proxies`.
+      Migrate header readers to `:forwarded_cert_der`. Direct TLS adapters
+      expose the authenticated certificate through `Plug.Conn.get_peer_data/1`
+      and need no callback.
+    * `:forwarded_cert_der` - `(conn -> der_binary | nil)`. Extracts a client
+      certificate forwarded by a TLS terminator. Unlike `:cert_der`, this
+      callback is invoked only when the immediate peer matches
+      `:trusted_proxies`; an untrusted request can never make its certificate
+      header authoritative. The terminator MUST remove any client-supplied
+      copy of the header and replace it only after a successful client TLS
+      handshake; the application listener SHOULD be network-reachable only
+      from those trusted terminators.
+    * `:client_certificate_chain_validated?` - `(conn, der -> boolean)`.
+      Confirms that the TLS terminator validated the presented certificate's
+      PKI chain, validity, and applicable revocation policy. Required for
+      `tls_client_auth`; the self-signed method does not use PKI validation.
+    * `:client_mtls_metadata` -
+      `(client -> map | {:ok, map} | nil | {:error, reason})`. Returns the
+      client's RFC 8705 registration metadata, including
+      `token_endpoint_auth_method` and exactly one PKI subject field for
+      `tls_client_auth`. Return `nil` only when the client has no mTLS
+      registration; errors and malformed results fail authentication closed.
+      For `self_signed_tls_client_auth`, `:client_jwks` supplies the resolved
+      JWK Set.
     * `:register_client` - `(metadata -> {:ok, client} | {:error, reason})`.
       Persists a dynamically registered client. Required only when
       `:registration_enabled`.
@@ -464,6 +488,9 @@ defmodule AttestoPhoenix.Config do
     * `:dpop_enabled` - enable DPoP sender-constraint support. Default `true`.
     * `:dpop_nonce_required` - require server-issued DPoP nonces. Default `false`.
     * `:mtls_enabled` - enable mTLS (RFC 8705) `cnf` binding. Default `false`.
+    * `:mtls_endpoint_aliases` - RFC 8705 §5 endpoint-name-to-HTTPS-URL map for
+      a listener that requests client certificates separately from conventional
+      endpoints. Omitted by default.
     * `:registration_enabled` - enable `/oauth/register`. Default `false`.
     * `:registration_default_scope` - the scope assigned to a dynamically
       registered client (RFC 7591 §2) when its request omits `scope`, echoed
@@ -665,6 +692,9 @@ defmodule AttestoPhoenix.Config do
     :resource_metadata_resolver,
     :htu,
     :cert_der,
+    :forwarded_cert_der,
+    :client_certificate_chain_validated?,
+    :client_mtls_metadata,
     :register_client,
     :unregister_client,
     :client_registration_access_token_hash,
@@ -739,6 +769,7 @@ defmodule AttestoPhoenix.Config do
     :client_frontchannel_logout_uri,
     :client_frontchannel_logout_session_required,
     :check_session_path,
+    :mtls_endpoint_aliases,
     oauth_path_prefix: "/oauth",
     scopes_supported: [],
     registration_default_scope: nil,
@@ -816,6 +847,9 @@ defmodule AttestoPhoenix.Config do
           basic_realm: String.t(),
           htu: callback() | nil,
           cert_der: callback() | nil,
+          forwarded_cert_der: callback() | nil,
+          client_certificate_chain_validated?: callback() | nil,
+          client_mtls_metadata: callback() | nil,
           register_client: callback() | nil,
           unregister_client: callback() | nil,
           client_registration_access_token_hash: callback() | nil,
@@ -879,6 +913,7 @@ defmodule AttestoPhoenix.Config do
           dpop_enabled: boolean(),
           dpop_nonce_required: boolean(),
           mtls_enabled: boolean(),
+          mtls_endpoint_aliases: %{optional(String.t()) => String.t()} | nil,
           registration_enabled: boolean(),
           client_id_metadata: keyword(),
           jwt_bearer: keyword(),
@@ -964,6 +999,7 @@ defmodule AttestoPhoenix.Config do
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
         native_apps: normalize_native_apps(config.native_apps),
         resource_indicators: normalize_resource_indicators(config.resource_indicators),
+        mtls_endpoint_aliases: normalize_mtls_endpoint_aliases(config.mtls_endpoint_aliases),
         device_authorization: normalize_device_authorization(config.device_authorization),
         ciba: normalize_ciba(config.ciba),
         logout: normalize_logout(config.logout),
@@ -2445,6 +2481,7 @@ defmodule AttestoPhoenix.Config do
     verify_client_secret: {:client_store, :verify_client_secret, 2},
     client_id: {:client_store, :client_id, 1},
     client_jwks: {:client_store, :client_jwks, 1},
+    client_mtls_metadata: {:client_store, :client_mtls_metadata, 1},
     client_redirect_uris: {:client_store, :client_redirect_uris, 1},
     client_post_logout_redirect_uris: {:client_store, :client_post_logout_redirect_uris, 1},
     client_backchannel_logout_uri: {:client_store, :client_backchannel_logout_uri, 1},
@@ -2935,14 +2972,8 @@ defmodule AttestoPhoenix.Config do
     validate_verifier_x5c!(Callback.config_callback(config, :verifier_x5c))
     validate_verifier_dns!(config.verifier_dns)
     validate_presentation_response_mode!(config.presentation_response_mode)
-
-    if config.mtls_enabled and is_nil(config.cert_der) do
-      raise ArgumentError,
-            "AttestoPhoenix.Config: :cert_der is required when :mtls_enabled is true. " <>
-              "Add a `cert_der: &MyApp.AuthZ.cert_der/1` callback " <>
-              "(implements AttestoPhoenix.ClientStore-adjacent mTLS extraction) " <>
-              "or set `mtls_enabled: false`."
-    end
+    validate_mtls_endpoint_aliases!(config.mtls_endpoint_aliases)
+    validate_mtls_client_auth!(config)
 
     if config.registration_enabled and is_nil(register_client_fun(config)) do
       raise ArgumentError,
@@ -2982,6 +3013,65 @@ defmodule AttestoPhoenix.Config do
     validate_native_apps!(config)
 
     config
+  end
+
+  defp validate_mtls_client_auth!(%__MODULE__{} = config) do
+    methods = List.wrap(config.token_endpoint_auth_methods_supported)
+    mtls_methods = methods -- (methods -- ["tls_client_auth", "self_signed_tls_client_auth"])
+
+    if mtls_methods != [] and is_nil(client_mtls_metadata_fun(config)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: RFC 8705 client authentication requires " <>
+              ":client_mtls_metadata (or ClientStore.client_mtls_metadata/1) when " <>
+              "token_endpoint_auth_methods_supported includes an mTLS method."
+    end
+
+    if "self_signed_tls_client_auth" in mtls_methods and is_nil(client_jwks_fun(config)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: self_signed_tls_client_auth requires :client_jwks " <>
+              "to resolve the registered x5c JWK Set."
+    end
+
+    :ok
+  end
+
+  @mtls_alias_endpoint_names ~w(
+    token_endpoint
+    revocation_endpoint
+    introspection_endpoint
+    pushed_authorization_request_endpoint
+    device_authorization_endpoint
+    backchannel_authentication_endpoint
+  )
+
+  defp normalize_mtls_endpoint_aliases(nil), do: nil
+
+  defp normalize_mtls_endpoint_aliases(aliases) when is_list(aliases) do
+    Map.new(aliases, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp normalize_mtls_endpoint_aliases(aliases) when is_map(aliases) do
+    Map.new(aliases, fn {key, value} -> {to_string(key), value} end)
+  end
+
+  defp normalize_mtls_endpoint_aliases(other), do: other
+
+  defp validate_mtls_endpoint_aliases!(nil), do: :ok
+
+  defp validate_mtls_endpoint_aliases!(aliases) when is_map(aliases) and map_size(aliases) > 0 do
+    Enum.each(aliases, fn {name, url} ->
+      if name not in @mtls_alias_endpoint_names or not absolute_resource_url?(url) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :mtls_endpoint_aliases entries must use a supported " <>
+                "RFC 8705 endpoint name and an absolute HTTPS URL; got #{inspect({name, url})}."
+      end
+    end)
+  end
+
+  defp validate_mtls_endpoint_aliases!(other) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :mtls_endpoint_aliases must be a non-empty map/keyword list or nil; " <>
+            "got #{inspect(other)}."
   end
 
   # `:native_apps` carries exactly three members, all booleans, and one of them

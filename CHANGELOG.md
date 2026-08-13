@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [2.13.0] - 2026-08-13
+
+### Added
+
+- RFC 8705 §2 token-endpoint authentication with both `tls_client_auth` and
+  `self_signed_tls_client_auth`, shared by the server's client-authentication
+  service. PKI clients match one registered DN/SAN identity; self-signed
+  clients match an exact registered `x5c` leaf.
+- RFC 8705 metadata integration for both auth methods,
+  `tls_client_certificate_bound_access_tokens`, and validated
+  `mtls_endpoint_aliases`.
+- Trusted-terminator certificate transport: `:forwarded_cert_der` is invoked
+  only for an immediate peer in `:trusted_proxies`, while
+  `:client_certificate_chain_validated?` makes PKI validation an explicit host
+  assertion.
+
+### Security
+
+- Forwarded client-certificate headers are no longer an implicit extension of
+  the generic certificate callback. The supported forwarded path is guarded by
+  the trusted-proxy allowlist and tested against direct header spoofing. The
+  documented deployment contract requires the terminator to overwrite the
+  header and the application listener to be isolated from untrusted peers.
+- The legacy `:cert_der` callback is now subject to the same trusted-proxy gate
+  as `:forwarded_cert_der`. Existing deployments that used `:cert_der` to read
+  a terminator header must configure `:trusted_proxies` and migrate to
+  `:forwarded_cert_der`; otherwise certificate binding fails closed. Direct TLS
+  certificates are read from adapter peer data and need no callback.
+- Trusted-proxy decisions use `Plug.Conn.get_peer_data/1`'s socket address,
+  never the middleware-rewriteable `conn.remote_ip`. A forged
+  `X-Forwarded-For` therefore cannot authorize an XFCC-style certificate.
+- Untrusted requests also recover direct transport and authority facts when
+  standard forwarded headers have already been applied by `Plug.RewriteOn`:
+  adapter SSL data controls HTTPS, the raw Host header controls authority, and
+  socket peer data controls client IP. Forged forwarded headers cannot satisfy
+  the HTTPS gate or redirect DPoP `htu` verification.
+- Certificate-bearing public clients now remain subject to each endpoint's
+  `allow_public` policy. PAR, introspection, and CIBA cannot be changed from
+  authenticated-only to public-client access merely by presenting a
+  certificate.
+- mTLS client-metadata lookup errors and malformed callback results now fail
+  authentication closed. Only an absent callback or an explicit `nil` result
+  means the client has no mTLS authentication registration and may enter the
+  endpoint's public-client path.
+- JWS credential and signed-metadata issuance now passes keystore modules into
+  core, enabling `Attesto.Signer` non-extractable custody without changing PEM
+  deployments. COSE mdoc signing and verifier decryption continue to require
+  direct private-key access and are outside the JWS signer contract.
+- Require `attesto >= 1.15.0`; the RFC 8705 identity matcher and signer dispatch
+  are runtime dependencies, so the floor is load-bearing.
+
 ## [2.12.0] - 2026-08-11
 
 Hardening of the ID-JAG (`urn:ietf:params:oauth:grant-type:jwt-bearer`)

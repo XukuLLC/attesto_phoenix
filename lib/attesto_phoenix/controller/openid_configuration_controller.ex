@@ -167,10 +167,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   @spec discovery_opts(Config.t(), Plug.Conn.t()) :: keyword()
   defp discovery_opts(%Config{} = config, %Plug.Conn{} = conn) do
     [
-      # RFC 8705 §3.3: advertise certificate-bound access token support only when
-      # mTLS `cnf` binding is enabled; nil-dropped otherwise so a non-mTLS OP
-      # stays silent (FAPI / FAPI-CIBA read this from the provider metadata).
-      tls_client_certificate_bound_access_tokens: tls_client_certificate_bound_access_tokens(config),
       userinfo_endpoint: userinfo_endpoint(config, conn),
       revocation_endpoint: Config.revocation_endpoint_url(config),
       frontchannel_logout_supported: frontchannel_logout_supported(config),
@@ -194,11 +190,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       ui_locales_supported: presence(config.ui_locales_supported)
     ]
   end
-
-  # RFC 8705 §3.3: `true` iff the OP mTLS-binds access tokens (nil-dropped
-  # otherwise by the shared metadata builder).
-  defp tls_client_certificate_bound_access_tokens(%Config{mtls_enabled: true}), do: true
-  defp tls_client_certificate_bound_access_tokens(%Config{}), do: nil
 
   # Bridge the macro's compile-time local route decision into request-time
   # metadata without overriding a deliberate host declaration. The released

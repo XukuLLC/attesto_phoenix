@@ -201,7 +201,16 @@ config :my_app, AttestoPhoenix.Config,
   authorization_code_ttl: 60,
   dpop_enabled: true,
   dpop_nonce_required: false,
-  mtls_enabled: false,                 # if true, also set :cert_der
+  mtls_enabled: false,                 # RFC 8705 certificate-bound tokens
+  # The terminator must overwrite, never append/forward, the client-cert header.
+  # This callback is invoked only from trusted_proxies:
+  forwarded_cert_der: &MyApp.TLS.forwarded_client_cert_der/1,
+  client_certificate_chain_validated?: &MyApp.TLS.chain_validated?/2,
+  token_endpoint_auth_methods_supported: ["private_key_jwt", "tls_client_auth"],
+  client_mtls_metadata: &MyApp.OAuth.Clients.mtls_metadata/1,
+  mtls_endpoint_aliases: %{
+    "token_endpoint" => "https://mtls.auth.example.com/oauth/token"
+  },
   registration_enabled: false,         # if true, also set registration callbacks
 
   # RFC 8707 resource indicators (optional; see below)
@@ -217,9 +226,9 @@ Build the validated struct wherever you need it:
 config = AttestoPhoenix.Config.from_otp_app(:my_app)
 ```
 
-Required keys are validated at build time; a missing key (or a missing
-dependency such as `:cert_der` when mTLS is enabled) raises immediately so
-misconfiguration fails fast.
+Required keys are validated at build time so misconfiguration fails fast.
+Direct mTLS adapters expose the authenticated certificate through peer data;
+TLS terminators configure `:forwarded_cert_der` plus `:trusted_proxies`.
 
 ### Resource indicators (RFC 8707)
 
@@ -502,8 +511,27 @@ endpoints sit under its path.
 Discovery and JWKS are public; the token and revocation endpoints authenticate
 the client via your `:load_client` / `:verify_client_secret` callbacks.
 The token endpoint also accepts `private_key_jwt` when `:client_jwks` is wired,
-and supports authorization-code, refresh-token, client-credentials, OAuth
-token-exchange, and JWT-assertion (`jwt-bearer`) grants. The PAR endpoint accepts the same confidential-client
+and RFC 8705 `tls_client_auth` / `self_signed_tls_client_auth` when
+`:client_mtls_metadata` is wired (the self-signed method also uses
+`:client_jwks`). That callback returns `nil` only for a client without an mTLS
+authentication registration; lookup errors and malformed results fail client
+authentication closed. A forwarded certificate is read only through
+`:forwarded_cert_der` from an adapter-reported immediate socket peer in
+`:trusted_proxies`; public requests cannot make an XFCC-style header
+authoritative, even if middleware rewrites `conn.remote_ip` from a forwarded
+header. Standard scheme/host/port rewrites are likewise ignored for an
+untrusted socket peer when deriving HTTPS and DPoP `htu`. The deprecated
+`:cert_der` callback is subject to the same gate so
+older header-based deployments fail closed until they configure their proxy
+allowlist and migrate. PKI authentication
+also requires `:client_certificate_chain_validated?` to return `true`. The TLS
+terminator must delete any client-supplied certificate header and replace it
+only from a successful client-certificate handshake; the application listener
+should be network-isolated so only the configured trusted terminators can
+reach it. TLS passthrough/direct peer certificates avoid this header boundary
+and are preferred when the deployment permits them. The
+token endpoint supports authorization-code, refresh-token, client-credentials,
+OAuth token-exchange, and JWT-assertion (`jwt-bearer`) grants. The PAR endpoint accepts the same confidential-client
 secret methods plus `private_key_jwt`, then stores the authorization request
 behind a one-time `request_uri`.
 

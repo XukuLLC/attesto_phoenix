@@ -79,7 +79,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
        [
          iss: config.issuer,
          vct: vct,
-         pem: Config.vc_signing_pem(config)
+         keystore: Config.vc_keystore(config)
        ],
        [claims: claims]
        |> maybe_put_option(:exp, Map.get(result, :valid_until))

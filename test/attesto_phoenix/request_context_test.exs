@@ -22,8 +22,8 @@ defmodule AttestoPhoenix.RequestContextTest do
   end
 
   # Build a Plug.Conn without booting an endpoint. `Plug.Test.conn/3` yields a
-  # conn whose `remote_ip` defaults to loopback and `scheme` to `:http`; tests
-  # override those fields directly to exercise the trust gate.
+  # conn whose socket peer defaults to loopback and `scheme` to `:http`; tests
+  # can set socket and rewritten remote addresses independently.
   defp build_conn(method, path, opts \\ []) do
     conn = Plug.Test.conn(method, path)
 
@@ -32,11 +32,23 @@ defmodule AttestoPhoenix.RequestContextTest do
         Plug.Conn.put_req_header(acc, k, v)
       end)
 
+    remote_ip = opts[:remote_ip] || {127, 0, 0, 1}
+    peer_ip = Keyword.get(opts, :peer_ip, remote_ip)
+
+    scheme = opts[:scheme] || :http
+
     conn
-    |> Map.put(:remote_ip, opts[:remote_ip] || {127, 0, 0, 1})
-    |> Map.put(:scheme, opts[:scheme] || :http)
+    |> put_peer_data(peer_ip, opts[:ssl_cert], scheme)
+    |> Map.put(:remote_ip, remote_ip)
+    |> Map.put(:scheme, scheme)
     |> Map.put(:host, opts[:host] || "internal.app")
     |> Map.put(:port, opts[:port] || 80)
+  end
+
+  defp put_peer_data(%Plug.Conn{adapter: {adapter, state}} = conn, address, ssl_cert, scheme) do
+    peer_data = %{address: address, port: 111_317, ssl_cert: ssl_cert}
+    state = state |> Map.put(:peer_data, peer_data) |> Map.put(:ssl_data, if(scheme == :https, do: %{}))
+    %{conn | adapter: {adapter, state}}
   end
 
   describe "from_trusted_proxy?/2" do
@@ -158,10 +170,50 @@ defmodule AttestoPhoenix.RequestContextTest do
              )
     end
 
-    test "nil remote_ip is never trusted" do
+    test "missing socket peer address is never trusted" do
       cfg = config(trusted_proxies: [:any])
-      conn = %{build_conn(:get, "/") | remote_ip: nil}
+      conn = build_conn(:get, "/", peer_ip: nil)
       refute RequestContext.from_trusted_proxy?(conn, cfg)
+    end
+
+    test "a rewritten remote_ip cannot forge the immediate socket peer" do
+      cfg = config(trusted_proxies: ["10.0.0.0/8"])
+
+      conn =
+        build_conn(:get, "/",
+          remote_ip: {10, 1, 2, 3},
+          peer_ip: {203, 0, 113, 9}
+        )
+
+      refute RequestContext.from_trusted_proxy?(conn, cfg)
+    end
+
+    test "Plug.RewriteOn cannot turn public forwarded headers into trusted transport facts" do
+      cfg = config(trusted_proxies: ["10.0.0.0/8"])
+
+      conn =
+        :get
+        |> build_conn("/resource",
+          host: "api.example.com",
+          headers: [
+            {"x-forwarded-for", "10.1.2.3"},
+            {"x-forwarded-proto", "https"},
+            {"x-forwarded-host", "victim.example"},
+            {"x-forwarded-port", "443"}
+          ]
+        )
+        |> Map.update!(:req_headers, &[{"host", "api.example.com"} | &1])
+        |> Plug.RewriteOn.call([
+          :x_forwarded_for,
+          :x_forwarded_proto,
+          :x_forwarded_host,
+          :x_forwarded_port
+        ])
+
+      refute RequestContext.from_trusted_proxy?(conn, cfg)
+      refute RequestContext.https?(conn, cfg)
+      assert RequestContext.client_ip(conn, cfg) == "127.0.0.1"
+      assert RequestContext.canonical_url(conn, cfg) == "http://api.example.com/resource"
     end
   end
 
@@ -234,7 +286,7 @@ defmodule AttestoPhoenix.RequestContextTest do
   end
 
   describe "client_ip/2" do
-    test "uses remote_ip when no forwarded header" do
+    test "uses the socket peer when no forwarded header" do
       cfg = config(trusted_proxies: [:loopback])
 
       assert RequestContext.client_ip(build_conn(:get, "/", remote_ip: {127, 0, 0, 1}), cfg) ==
@@ -259,6 +311,19 @@ defmodule AttestoPhoenix.RequestContextTest do
       conn =
         build_conn(:get, "/",
           remote_ip: {203, 0, 113, 9},
+          headers: [{"x-forwarded-for", "198.51.100.7"}]
+        )
+
+      assert RequestContext.client_ip(conn, cfg) == "203.0.113.9"
+    end
+
+    test "ignores a middleware-rewritten remote_ip for an untrusted peer" do
+      cfg = config(trusted_proxies: ["10.0.0.0/8"])
+
+      conn =
+        build_conn(:get, "/",
+          remote_ip: {10, 1, 2, 3},
+          peer_ip: {203, 0, 113, 9},
           headers: [{"x-forwarded-for", "198.51.100.7"}]
         )
 
@@ -345,19 +410,122 @@ defmodule AttestoPhoenix.RequestContextTest do
       assert RequestContext.cert_der(build_conn(:get, "/"), cfg) == nil
     end
 
-    test "config.cert_der callback extracts the DER" do
-      cfg = config(cert_der: fn _conn -> "DER-BYTES" end, mtls_enabled: true)
+    test "legacy config.cert_der callback is gated to a trusted socket peer" do
+      cfg = config(cert_der: fn _conn -> "DER-BYTES" end, mtls_enabled: true, trusted_proxies: [:loopback])
       assert RequestContext.cert_der(build_conn(:get, "/"), cfg) == "DER-BYTES"
     end
 
+    test "legacy config.cert_der callback is never invoked for an untrusted socket peer" do
+      owner = self()
+
+      cfg =
+        config(
+          cert_der: fn _conn ->
+            send(owner, :legacy_cert_callback_invoked)
+            "FORGED-DER"
+          end,
+          mtls_enabled: true,
+          trusted_proxies: ["10.0.0.0/8"]
+        )
+
+      conn = build_conn(:get, "/", remote_ip: {10, 1, 2, 3}, peer_ip: {203, 0, 113, 9})
+      assert RequestContext.cert_der(conn, cfg) == nil
+      refute_received :legacy_cert_callback_invoked
+    end
+
     test "callback returning an empty binary is treated as no certificate" do
-      cfg = config(cert_der: fn _conn -> "" end, mtls_enabled: true)
+      cfg = config(cert_der: fn _conn -> "" end, mtls_enabled: true, trusted_proxies: [:loopback])
       assert RequestContext.cert_der(build_conn(:get, "/"), cfg) == nil
     end
 
     test "callback returning a non-binary is treated as no certificate" do
-      cfg = config(cert_der: fn _conn -> :no_cert end, mtls_enabled: true)
+      cfg = config(cert_der: fn _conn -> :no_cert end, mtls_enabled: true, trusted_proxies: [:loopback])
       assert RequestContext.cert_der(build_conn(:get, "/"), cfg) == nil
+    end
+  end
+
+  describe "client_certificate/2 trusted-terminator boundary" do
+    test "never invokes a forwarded-certificate callback for an untrusted peer" do
+      owner = self()
+
+      cfg =
+        config(
+          trusted_proxies: ["10.0.0.0/8"],
+          forwarded_cert_der: fn _conn ->
+            send(owner, :forwarded_cert_callback_invoked)
+            "FORGED-DER"
+          end
+        )
+
+      conn = build_conn(:post, "/oauth/token", remote_ip: {203, 0, 113, 9})
+      assert RequestContext.client_certificate(conn, cfg) == nil
+      refute_received :forwarded_cert_callback_invoked
+    end
+
+    test "accepts a forwarded certificate only from a trusted terminator and records PKI validation" do
+      cfg =
+        config(
+          trusted_proxies: ["10.0.0.0/8"],
+          forwarded_cert_der: fn _conn -> "CLIENT-DER" end,
+          client_certificate_chain_validated?: fn _conn, der -> der == "CLIENT-DER" end
+        )
+
+      conn = build_conn(:post, "/oauth/token", remote_ip: {10, 2, 3, 4})
+
+      assert RequestContext.client_certificate(conn, cfg) == %{
+               der: "CLIENT-DER",
+               source: :trusted_terminator,
+               proof_of_possession: true,
+               chain_validated: true
+             }
+    end
+
+    test "rewritten remote_ip and forged certificate header cannot cross the terminator gate" do
+      owner = self()
+
+      cfg =
+        config(
+          trusted_proxies: ["10.0.0.0/8"],
+          forwarded_cert_der: fn _conn ->
+            send(owner, :forwarded_cert_callback_invoked)
+            "FORGED-DER"
+          end
+        )
+
+      conn =
+        build_conn(:post, "/oauth/token",
+          remote_ip: {10, 2, 3, 4},
+          peer_ip: {203, 0, 113, 9},
+          headers: [{"x-forwarded-client-cert", "victim"}]
+        )
+
+      assert RequestContext.client_certificate(conn, cfg) == nil
+      refute_received :forwarded_cert_callback_invoked
+    end
+
+    test "client-auth header context carries the trusted certificate and attestation headers" do
+      cfg =
+        config(
+          trusted_proxies: [:loopback],
+          forwarded_cert_der: fn _conn -> "CLIENT-DER" end
+        )
+
+      headers =
+        :post
+        |> build_conn("/oauth/token",
+          headers: [
+            {"authorization", "Basic abc"},
+            {"oauth-client-attestation", "attestation"},
+            {"oauth-client-attestation-pop", "pop"}
+          ]
+        )
+        |> RequestContext.client_auth_headers(cfg)
+
+      assert headers.authorization == ["Basic abc"]
+      assert headers.oauth_client_attestation == ["attestation"]
+      assert headers.oauth_client_attestation_pop == ["pop"]
+      assert headers.client_certificate.source == :trusted_terminator
+      assert headers.client_certificate.chain_validated == false
     end
   end
 

@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.12.0"
+  @version "2.13.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -102,12 +102,16 @@ defmodule AttestoPhoenix.MixProject do
   # but the `authorization_details` rejection lives ONLY in core: on an older
   # release an assertion carrying RFC 9396 constraints is accepted and treated
   # as broader scope-only authority, which is exactly the widening 2.12.0
-  # closes. The floor is therefore load-bearing, not cosmetic.
+  # closes. 1.15.0 supplies the RFC 8705 §2 certificate-identity matcher and
+  # non-extractable `Attesto.Signer` path now invoked by this package; resolving
+  # an older core would leave advertised mTLS authentication and JWS credential
+  # issuance pointing at missing runtime functions. The floor is therefore
+  # load-bearing, not cosmetic.
   defp attesto_dep do
     if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
       {:attesto, path: "../attesto"}
     else
-      {:attesto, ">= 1.13.0 and < 2.0.0"}
+      {:attesto, ">= 1.15.0 and < 2.0.0"}
     end
   end
 

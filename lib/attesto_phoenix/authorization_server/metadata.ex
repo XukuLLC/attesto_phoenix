@@ -83,6 +83,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       "authorization_response_iss_parameter_supported",
       authorization_response_iss_parameter_supported(config)
     )
+    |> put_if_present(
+      "tls_client_certificate_bound_access_tokens",
+      tls_client_certificate_bound_access_tokens(config)
+    )
+    |> put_if_present("mtls_endpoint_aliases", config.mtls_endpoint_aliases)
     |> put_signing_alg_metadata(signing_alg_values)
     |> put_introspection_auth_signing_alg_values_supported(config)
   end
@@ -206,4 +211,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
 
   defp authorization_response_iss_parameter_supported(%Config{authorization_response_iss: true}), do: true
   defp authorization_response_iss_parameter_supported(%Config{}), do: nil
+
+  defp tls_client_certificate_bound_access_tokens(%Config{mtls_enabled: true}), do: true
+  defp tls_client_certificate_bound_access_tokens(%Config{}), do: nil
 end

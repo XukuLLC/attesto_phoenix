@@ -68,11 +68,11 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
   alias AttestoPhoenix.OAuthError
-  alias AttestoPhoenix.RequestContext
 
   # Dispatch through the action plug so the module is a complete `Plug`
   # (`init/1` + `call/2`): the router invokes it as a plug, selecting the
   # action from `conn.private[:phoenix_action]` set by `init/1`.
+  alias AttestoPhoenix.RequestContext
   alias AttestoPhoenix.Store.EctoRefreshStore
 
   plug :action
@@ -201,7 +201,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     policy = ClientAuthentication.Policy.for_endpoint(config, :revocation)
 
     ClientAuthentication.authenticate(
-      get_req_header(conn, "authorization"),
+      AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
       params,
       config,
       policy

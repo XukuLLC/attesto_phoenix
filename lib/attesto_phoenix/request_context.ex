@@ -133,8 +133,9 @@ defmodule AttestoPhoenix.RequestContext do
   When the request comes from a trusted proxy and carries `X-Forwarded-For`, the
   left-most entry (the original client per RFC 7239 / the de-facto
   `X-Forwarded-For` convention) is returned. Otherwise the direct connection's
-  `remote_ip` is used. An untrusted peer cannot forge the client IP this way: its
-  `X-Forwarded-For` is ignored entirely.
+  adapter-reported socket peer address is used. An untrusted peer cannot forge
+  the client IP this way: its `X-Forwarded-For` is ignored entirely, and a
+  middleware-rewritten `conn.remote_ip` is not authoritative.
   """
   @spec client_ip(Plug.Conn.t(), Config.t()) :: String.t() | nil
   def client_ip(%Plug.Conn{} = conn, %Config{} = config) do
@@ -145,7 +146,7 @@ defmodule AttestoPhoenix.RequestContext do
 
     case forwarded do
       ip when is_binary(ip) -> ip
-      _ -> remote_ip_string(conn)
+      _ -> socket_peer_ip_string(conn)
     end
   end
 
@@ -312,8 +313,9 @@ defmodule AttestoPhoenix.RequestContext do
   def canonical_url(%Plug.Conn{} = conn, %Config{} = config) do
     trusted? = from_trusted_proxy?(conn, config)
     scheme = effective_scheme(conn, config)
-    host = (trusted? && forwarded_host(conn)) || conn.host
-    port = (trusted? && forwarded_port(conn)) || conn.port
+    {direct_host, direct_port} = direct_authority(conn, scheme)
+    host = (trusted? && forwarded_host(conn)) || direct_host
+    port = (trusted? && forwarded_port(conn)) || direct_port
 
     authority =
       if default_port?(scheme, port) do
@@ -329,43 +331,135 @@ defmodule AttestoPhoenix.RequestContext do
   Returns the peer certificate DER for the RFC 8705 §3 mutual-TLS `cnf` binding,
   or `nil` when no client certificate was presented.
 
-  When `config.cert_der` is set (required by `AttestoPhoenix.Config` whenever
-  `mtls_enabled` is true), that callback extracts the DER; this is the supported
-  override for proxy topologies that surface the client certificate in a header
-  rather than on the TLS socket. Otherwise the certificate is read from the
-  connection's peer data, which the underlying adapter populates when the TLS
-  socket negotiated client authentication.
+  Direct TLS peer data wins. Configured certificate callbacks are consulted
+  only for an immediate socket peer in `:trusted_proxies`. The legacy
+  `:cert_der` callback remains as a gated compatibility alias for deployments
+  that previously used it to read a terminator header; new deployments use
+  `:forwarded_cert_der`.
   """
   @spec cert_der(Plug.Conn.t(), Config.t()) :: binary() | nil
-  def cert_der(%Plug.Conn{} = conn, %Config{cert_der: cert_der}) when not is_nil(cert_der) do
-    case Callback.invoke(cert_der, [conn]) do
-      der when is_binary(der) and byte_size(der) > 0 -> der
-      _ -> nil
+  def cert_der(%Plug.Conn{} = conn, %Config{} = config) do
+    case direct_peer_certificate(conn) || forwarded_client_certificate_der(conn, config) ||
+           legacy_forwarded_certificate_der(conn, config) do
+      der when is_binary(der) -> der
+      nil -> nil
     end
   end
 
-  def cert_der(%Plug.Conn{} = conn, %Config{}) do
+  @typedoc "Authenticated client-certificate transport facts for RFC 8705 §2."
+  @type client_certificate :: %{
+          der: binary(),
+          source: :tls_socket | :trusted_terminator,
+          proof_of_possession: true,
+          chain_validated: boolean()
+        }
+
+  @doc """
+  Return an authenticated client certificate for RFC 8705 §2, or `nil`.
+
+  A certificate surfaced directly by the TLS adapter is accepted as proof that
+  the peer completed CertificateVerify. A certificate forwarded by a TLS
+  terminator is accepted only when the immediate peer matches
+  `config.trusted_proxies`; the `:forwarded_cert_der` callback is never invoked
+  for an untrusted peer. This prevents a public client from forging an
+  XFCC-style header and turning it into an OAuth credential.
+
+  PKI trust is a separate fact. `:client_certificate_chain_validated?` must
+  explicitly return `true` for `tls_client_auth`; absence or any other return is
+  fail-closed. `self_signed_tls_client_auth` authenticates against the client's
+  registered `x5c` certificate and does not require PKI chain validation.
+  """
+  @spec client_certificate(Plug.Conn.t(), Config.t()) :: client_certificate() | nil
+  def client_certificate(%Plug.Conn{} = conn, %Config{} = config) do
+    case direct_peer_certificate(conn) do
+      der when is_binary(der) -> certificate_context(conn, config, der, :tls_socket)
+      nil -> forwarded_client_certificate(conn, config)
+    end
+  end
+
+  @doc false
+  @spec client_auth_headers(Plug.Conn.t(), Config.t()) :: map()
+  def client_auth_headers(%Plug.Conn{} = conn, %Config{} = config) do
+    %{
+      authorization: Plug.Conn.get_req_header(conn, "authorization"),
+      oauth_client_attestation: Plug.Conn.get_req_header(conn, "oauth-client-attestation"),
+      oauth_client_attestation_pop: Plug.Conn.get_req_header(conn, "oauth-client-attestation-pop"),
+      client_certificate: client_certificate(conn, config)
+    }
+  end
+
+  defp direct_peer_certificate(conn) do
     case Plug.Conn.get_peer_data(conn) do
       %{ssl_cert: der} when is_binary(der) and byte_size(der) > 0 -> der
-      _ -> nil
+      _other -> nil
     end
   rescue
     _ -> nil
   end
 
+  defp forwarded_client_certificate(conn, config) do
+    case forwarded_client_certificate_der(conn, config) do
+      der when is_binary(der) -> certificate_context(conn, config, der, :trusted_terminator)
+      nil -> nil
+    end
+  end
+
+  defp forwarded_client_certificate_der(conn, config) do
+    if from_trusted_proxy?(conn, config) and not is_nil(config.forwarded_cert_der) do
+      case Callback.invoke(config.forwarded_cert_der, [conn]) do
+        der when is_binary(der) and byte_size(der) > 0 -> der
+        _other -> nil
+      end
+    end
+  end
+
+  defp legacy_forwarded_certificate_der(conn, config) do
+    if from_trusted_proxy?(conn, config) and not is_nil(config.cert_der) do
+      case Callback.invoke(config.cert_der, [conn]) do
+        der when is_binary(der) and byte_size(der) > 0 -> der
+        _other -> nil
+      end
+    end
+  end
+
+  defp certificate_context(conn, config, der, source) do
+    chain_validated =
+      case config.client_certificate_chain_validated? do
+        nil -> false
+        callback -> Callback.invoke(callback, [conn, der]) == true
+      end
+
+    %{
+      der: der,
+      source: source,
+      proof_of_possession: true,
+      chain_validated: chain_validated
+    }
+  end
+
   @doc """
-  Returns `true` when `conn.remote_ip` falls inside `config.trusted_proxies`.
+  Returns `true` when the adapter-reported socket peer address falls inside
+  `config.trusted_proxies`.
 
   This is the single trust gate that governs whether any `X-Forwarded-*` header
   is honored. It is exposed so callers that need a custom forwarded-header read
   can apply the same boundary rather than re-implementing it and risking drift.
   """
   @spec from_trusted_proxy?(Plug.Conn.t(), Config.t()) :: boolean()
-  def from_trusted_proxy?(%Plug.Conn{remote_ip: remote_ip}, %Config{trusted_proxies: proxies}) do
+  def from_trusted_proxy?(%Plug.Conn{} = conn, %Config{trusted_proxies: proxies}) do
     # A connection with no resolved peer address is never trusted: there is no
-    # IP to test against the allowlist, so it fails closed.
-    ip = normalize_peer_ip(remote_ip)
+    # IP to test against the allowlist, so it fails closed. `conn.remote_ip` is
+    # intentionally not authoritative here: middleware may rewrite that plain
+    # struct field from an untrusted X-Forwarded-For header.
+    ip = conn |> socket_peer_ip() |> normalize_peer_ip()
     is_tuple(ip) and Enum.any?(List.wrap(proxies), &peer_matches?(ip, &1))
+  end
+
+  defp socket_peer_ip(conn) do
+    %{address: address} = Plug.Conn.get_peer_data(conn)
+    address
+  rescue
+    _ -> nil
   end
 
   # A dual-stack IPv6 listener (e.g. an app bound on `::` behind a reverse proxy
@@ -384,12 +478,37 @@ defmodule AttestoPhoenix.RequestContext do
   # ----- effective scheme -----
 
   defp effective_scheme(conn, config) do
-    forwarded = from_trusted_proxy?(conn, config) && forwarded_scheme(conn)
+    trusted? = from_trusted_proxy?(conn, config)
+    forwarded = trusted? && forwarded_scheme(conn)
 
     case forwarded do
       scheme when is_binary(scheme) -> scheme
-      _ -> Atom.to_string(conn.scheme)
+      _ -> direct_scheme(conn, trusted?)
     end
+  end
+
+  # Plug.RewriteOn can mutate conn.scheme from X-Forwarded-Proto before this
+  # module runs. For an untrusted socket peer that supplied that header, recover
+  # the direct transport fact from adapter SSL data instead of accepting the
+  # rewritten struct field. Without a forwarded header, conn.scheme remains the
+  # adapter's normal direct-transport value.
+  defp direct_scheme(conn, false) do
+    if is_binary(first_header(conn, @forwarded_proto_header)) do
+      if direct_tls?(conn), do: "https", else: "http"
+    else
+      Atom.to_string(conn.scheme)
+    end
+  end
+
+  defp direct_scheme(conn, true), do: Atom.to_string(conn.scheme)
+
+  defp direct_tls?(conn) do
+    case Plug.Conn.get_ssl_data(conn) do
+      nil -> is_binary(Map.get(Plug.Conn.get_peer_data(conn), :ssl_cert))
+      _ssl_data -> true
+    end
+  rescue
+    _ -> false
   end
 
   # ----- forwarded-header parsing -----
@@ -468,17 +587,38 @@ defmodule AttestoPhoenix.RequestContext do
 
   # ----- authority helpers -----
 
+  # The raw Host header is not modified by Plug.RewriteOn, whereas conn.host
+  # and conn.port may already reflect attacker-supplied forwarded headers. A
+  # valid raw authority therefore wins; the struct fields remain the fallback
+  # for adapters/tests that do not retain Host in req_headers.
+  defp direct_authority(conn, scheme) do
+    case first_header(conn, "host") do
+      host_header when is_binary(host_header) and host_header != "" ->
+        case URI.parse("#{scheme}://#{host_header}") do
+          %URI{host: host, port: port, userinfo: nil, path: nil, query: nil, fragment: nil}
+          when is_binary(host) and is_integer(port) ->
+            {host, port}
+
+          _other ->
+            {conn.host, conn.port}
+        end
+
+      _other ->
+        {conn.host, conn.port}
+    end
+  end
+
   defp default_port?("https", @https_default_port), do: true
   defp default_port?("http", @http_default_port), do: true
   defp default_port?(_scheme, _port), do: false
 
-  defp remote_ip_string(%Plug.Conn{} = conn) do
-    case Map.get(conn, :remote_ip) do
+  defp socket_peer_ip_string(%Plug.Conn{} = conn) do
+    case socket_peer_ip(conn) do
       nil ->
         nil
 
-      remote_ip ->
-        case :inet.ntoa(remote_ip) do
+      peer_ip ->
+        case :inet.ntoa(peer_ip) do
           {:error, _} -> nil
           charlist -> List.to_string(charlist)
         end

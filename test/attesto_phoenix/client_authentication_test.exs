@@ -21,6 +21,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
   @confidential %{id: "confidential-1", secret: "s3cr3t"}
   @public %{id: "public-1", public?: true}
+  @pki_mtls %{id: "pki-mtls-1"}
+  @self_signed_mtls %{id: "self-signed-mtls-1"}
 
   # RFC 8252 §8.4. The native public client is deliberately given a secret the
   # host registry WILL verify: the point is that a correct secret is still
@@ -39,7 +41,11 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   setup do
-    clients = Map.new([@confidential, @public, @native_public, @native_confidential], &{&1.id, &1})
+    clients =
+      Map.new(
+        [@confidential, @public, @native_public, @native_confidential, @pki_mtls, @self_signed_mtls],
+        &{&1.id, &1}
+      )
 
     config = %Config{
       issuer: "https://issuer.example",
@@ -62,6 +68,164 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     }
 
     {:ok, config: config}
+  end
+
+  describe "RFC 8705 mutual-TLS client authentication" do
+    test "authenticates tls_client_auth only with a validated chain and matching registered identity", %{
+      config: config
+    } do
+      der = mtls_certificate_der()
+
+      config =
+        %{
+          config
+          | token_endpoint_auth_methods_supported: ["tls_client_auth"],
+            client_mtls_metadata: fn @pki_mtls ->
+              %{
+                "token_endpoint_auth_method" => "tls_client_auth",
+                "tls_client_auth_san_dns" => "client.example.com"
+              }
+            end
+        }
+
+      assert {:ok, %Result{client: @pki_mtls, method: :tls_client_auth}} =
+               authenticate(
+                 mtls_headers(der, chain_validated: true),
+                 %{"client_id" => @pki_mtls.id},
+                 config,
+                 allow_public: false
+               )
+
+      assert_generic_invalid_client(
+        authenticate(
+          mtls_headers(der, chain_validated: false),
+          %{"client_id" => @pki_mtls.id},
+          config,
+          allow_public: false
+        )
+      )
+    end
+
+    test "authenticates self_signed_tls_client_auth against the registered x5c leaf", %{config: config} do
+      der = mtls_certificate_der()
+      other_der = mtls_certificate_der("other.example.com")
+
+      config =
+        %{
+          config
+          | token_endpoint_auth_methods_supported: ["self_signed_tls_client_auth"],
+            client_mtls_metadata: fn @self_signed_mtls ->
+              %{"token_endpoint_auth_method" => "self_signed_tls_client_auth"}
+            end,
+            client_jwks: fn @self_signed_mtls ->
+              %{"keys" => [%{"kty" => "EC", "x5c" => [Base.encode64(der)]}]}
+            end
+        }
+
+      assert {:ok, %Result{client: @self_signed_mtls, method: :self_signed_tls_client_auth}} =
+               authenticate(
+                 mtls_headers(der, chain_validated: false),
+                 %{"client_id" => @self_signed_mtls.id},
+                 config,
+                 allow_public: false
+               )
+
+      assert_generic_invalid_client(
+        authenticate(
+          mtls_headers(other_der, chain_validated: false),
+          %{"client_id" => @self_signed_mtls.id},
+          config,
+          allow_public: false
+        )
+      )
+    end
+
+    test "treats a certificate as sender constraint when another client credential authenticates", %{config: config} do
+      der = mtls_certificate_der()
+
+      assert {:ok, %Result{method: :client_secret_post}} =
+               authenticate(
+                 mtls_headers(der),
+                 %{"client_id" => @confidential.id, "client_secret" => @confidential.secret},
+                 config,
+                 allow_public: true
+               )
+
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               authenticate(
+                 Map.put(mtls_headers(der), :authorization, basic(@confidential.id, @confidential.secret)),
+                 %{"client_id" => @confidential.id},
+                 config,
+                 allow_public: true
+               )
+    end
+
+    test "allows a public client to use a certificate only as proof of possession", %{config: config} do
+      assert {:ok, %Result{client: @public, method: :none}} =
+               authenticate(
+                 mtls_headers(mtls_certificate_der()),
+                 %{"client_id" => @public.id},
+                 config,
+                 allow_public: true
+               )
+    end
+
+    test "treats only nil mTLS metadata as an unregistered public client", %{config: config} do
+      config = %{config | client_mtls_metadata: fn @public -> nil end}
+
+      assert {:ok, %Result{client: @public, method: :none}} =
+               authenticate(
+                 mtls_headers(mtls_certificate_der()),
+                 %{"client_id" => @public.id},
+                 config,
+                 allow_public: true
+               )
+    end
+
+    test "fails closed when the mTLS metadata store fails or returns malformed output", %{config: config} do
+      client = Map.put(@pki_mtls, :public?, true)
+
+      config = %{
+        config
+        | load_client: fn "pki-mtls-1" -> client end,
+          client_mtls_metadata: fn ^client -> {:error, :db_timeout} end
+      }
+
+      assert_generic_invalid_client(
+        authenticate(
+          mtls_headers(mtls_certificate_der()),
+          %{"client_id" => @pki_mtls.id},
+          config,
+          allow_public: true
+        )
+      )
+
+      config = %{config | client_mtls_metadata: fn ^client -> :malformed end}
+
+      assert_generic_invalid_client(
+        authenticate(
+          mtls_headers(mtls_certificate_der()),
+          %{"client_id" => @pki_mtls.id},
+          config,
+          allow_public: true
+        )
+      )
+    end
+
+    test "a certificate cannot make a public client eligible when the endpoint forbids public clients", %{
+      config: config
+    } do
+      for endpoint <- [:par, :introspection, :backchannel_authentication] do
+        assert_generic_invalid_client(
+          ClientAuthentication.authenticate(
+            mtls_headers(mtls_certificate_der()),
+            %{"client_id" => @public.id},
+            config,
+            Policy.for_endpoint(config, endpoint)
+          )
+        )
+      end
+    end
   end
 
   describe "classification: Basic header, no body credential (allow_public: true)" do
@@ -783,6 +947,30 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
   defp basic(client_id, secret) do
     ["Basic " <> Base.encode64("#{client_id}:#{secret}")]
+  end
+
+  defp mtls_headers(der, opts \\ []) do
+    %{
+      authorization: [],
+      oauth_client_attestation: [],
+      oauth_client_attestation_pop: [],
+      client_certificate: %{
+        der: der,
+        source: :tls_socket,
+        proof_of_possession: true,
+        chain_validated: Keyword.get(opts, :chain_validated, true)
+      }
+    }
+  end
+
+  defp mtls_certificate_der(dns \\ "client.example.com") do
+    extension = {:Extension, {2, 5, 29, 17}, false, [{:dNSName, String.to_charlist(dns)}]}
+
+    :public_key.pkix_test_data(%{
+      root: [],
+      intermediates: [],
+      peer: [extensions: [extension]]
+    })[:cert]
   end
 
   defp assert_generic_invalid_client(result) do

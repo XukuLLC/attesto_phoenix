@@ -181,6 +181,55 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe "RFC 8705 client authentication configuration" do
+    test "requires client registration metadata for either mTLS auth method" do
+      assert_raise ArgumentError, ~r/requires :client_mtls_metadata/, fn ->
+        config(token_endpoint_auth_methods_supported: ["tls_client_auth"])
+      end
+    end
+
+    test "self-signed authentication additionally requires resolved client JWKS" do
+      assert_raise ArgumentError, ~r/requires :client_jwks/, fn ->
+        config(
+          token_endpoint_auth_methods_supported: ["self_signed_tls_client_auth"],
+          client_mtls_metadata: fn _client -> %{} end
+        )
+      end
+
+      assert %Config{} =
+               config(
+                 token_endpoint_auth_methods_supported: ["self_signed_tls_client_auth"],
+                 client_mtls_metadata: fn _client -> %{} end,
+                 client_jwks: fn _client -> %{"keys" => []} end
+               )
+    end
+
+    test "normalizes and validates RFC 8705 endpoint aliases" do
+      config =
+        config(
+          mtls_endpoint_aliases: [
+            token_endpoint: "https://mtls.issuer.example/oauth/token",
+            introspection_endpoint: "https://mtls.issuer.example/oauth/introspect"
+          ]
+        )
+
+      assert config.mtls_endpoint_aliases == %{
+               "token_endpoint" => "https://mtls.issuer.example/oauth/token",
+               "introspection_endpoint" => "https://mtls.issuer.example/oauth/introspect"
+             }
+
+      for invalid <- [
+            %{},
+            %{"unknown_endpoint" => "https://mtls.issuer.example/unknown"},
+            %{"token_endpoint" => "http://insecure.example/token"}
+          ] do
+        assert_raise ArgumentError, ~r/:mtls_endpoint_aliases/, fn ->
+          config(mtls_endpoint_aliases: invalid)
+        end
+      end
+    end
+  end
+
   describe "ecto_repo!/0" do
     setup do
       previous = Application.get_env(:attesto_phoenix, :repo)

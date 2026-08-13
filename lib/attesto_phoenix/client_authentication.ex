@@ -14,8 +14,18 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   Accepts HTTP Basic credentials (RFC 6749 §2.3.1, RFC 7617), request-body
   credentials (RFC 6749 §2.3.1), `private_key_jwt` assertions (RFC 7523 / OIDC
-  Core §9), and Client Attestation JWT + PoP header pairs. Presenting more than
-  one client-authentication method is rejected (RFC 6749 §2.3).
+  Core §9), RFC 8705 `tls_client_auth` and `self_signed_tls_client_auth`, and
+  Client Attestation JWT + PoP header pairs. Presenting more than one
+  client-authentication method is rejected (RFC 6749 §2.3).
+
+  A presented client certificate is not inherently a second authentication
+  method: RFC 8705 certificate-bound tokens use it independently as
+  proof-of-possession. Explicit Basic, post-body, JWT, or attestation
+  credentials therefore retain their normal classification while the token
+  service consumes the certificate separately as a sender constraint. With no
+  other credential, the registered mTLS method authenticates the client; a
+  public client may instead remain on the `none` path and use the certificate
+  only for binding.
 
   ## Native apps (RFC 8252 §8.4)
 
@@ -107,7 +117,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
       `invalid_request` (RFC 6749 §2.3).
   """
 
-  alias Attesto.{ClientAssertion, WalletAttestation}
+  alias Attesto.{ClientAssertion, MTLS, WalletAttestation}
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
@@ -134,9 +144,23 @@ defmodule AttestoPhoenix.ClientAuthentication do
           }
 
     @type method ::
-            :client_secret_basic | :client_secret_post | :private_key_jwt | :attest_jwt_client_auth | :none
+            :client_secret_basic
+            | :client_secret_post
+            | :private_key_jwt
+            | :attest_jwt_client_auth
+            | :tls_client_auth
+            | :self_signed_tls_client_auth
+            | :none
 
-    @all_methods [:client_secret_basic, :client_secret_post, :private_key_jwt, :attest_jwt_client_auth, :none]
+    @all_methods [
+      :client_secret_basic,
+      :client_secret_post,
+      :private_key_jwt,
+      :attest_jwt_client_auth,
+      :tls_client_auth,
+      :self_signed_tls_client_auth,
+      :none
+    ]
 
     @enforce_keys [
       :allow_public,
@@ -237,11 +261,18 @@ defmodule AttestoPhoenix.ClientAuthentication do
     optional on the public struct for source compatibility. `:method` is the
     RFC 6749 §2.3 / OIDC Core §9 authentication method
     (`:client_secret_basic`, `:client_secret_post`, `:private_key_jwt`,
+    `:tls_client_auth`, `:self_signed_tls_client_auth`,
     `:attest_jwt_client_auth`, or `:none` for the public-client path).
     """
 
     @type method ::
-            :client_secret_basic | :client_secret_post | :private_key_jwt | :attest_jwt_client_auth | :none
+            :client_secret_basic
+            | :client_secret_post
+            | :private_key_jwt
+            | :attest_jwt_client_auth
+            | :tls_client_auth
+            | :self_signed_tls_client_auth
+            | :none
 
     @type t :: %__MODULE__{
             client: term(),
@@ -287,7 +318,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
           | %{
               optional(:authorization) => [String.t()],
               optional(:oauth_client_attestation) => [String.t()],
-              optional(:oauth_client_attestation_pop) => [String.t()]
+              optional(:oauth_client_attestation_pop) => [String.t()],
+              optional(:client_certificate) => map() | nil
             }
 
   @doc """
@@ -361,13 +393,21 @@ defmodule AttestoPhoenix.ClientAuthentication do
           verify_attested_client(config, policy, attestation, pop, presented_client_id)
         end
 
+      {:ok, :mtls_client_auth, client_id, certificate} ->
+        verify_mtls_client(config, policy, client_id, certificate)
+
       {:error, _} = err ->
         err
     end
   end
 
   defp normalize_request_headers(headers) when is_list(headers) do
-    %{authorization: headers, oauth_client_attestation: [], oauth_client_attestation_pop: []}
+    %{
+      authorization: headers,
+      oauth_client_attestation: [],
+      oauth_client_attestation_pop: [],
+      client_certificate: nil
+    }
   end
 
   defp normalize_request_headers(headers) when is_map(headers) do
@@ -375,7 +415,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
       authorization: header_values(headers, :authorization, "authorization"),
       oauth_client_attestation: header_values(headers, :oauth_client_attestation, "oauth-client-attestation"),
       oauth_client_attestation_pop:
-        header_values(headers, :oauth_client_attestation_pop, "oauth-client-attestation-pop")
+        header_values(headers, :oauth_client_attestation_pop, "oauth-client-attestation-pop"),
+      client_certificate: Map.get(headers, :client_certificate, Map.get(headers, "client_certificate"))
     }
   end
 
@@ -458,11 +499,30 @@ defmodule AttestoPhoenix.ClientAuthentication do
       basic_credentials?(header) ->
         fetch_basic_credentials(header, params)
 
-      header == [] ->
+      header != [] ->
+        {:error, error(@error_invalid_client, "unsupported client authentication scheme")}
+
+      has_body_secret?(params) ->
         fetch_body_credentials(params, policy)
 
+      mtls_credentials?(request_headers) ->
+        fetch_mtls_credentials(request_headers, params)
+
       true ->
-        {:error, error(@error_invalid_client, "unsupported client authentication scheme")}
+        fetch_body_credentials(params, policy)
+    end
+  end
+
+  defp mtls_credentials?(%{client_certificate: certificate}), do: not is_nil(certificate)
+
+  defp fetch_mtls_credentials(request_headers, params) do
+    case {presented_client_id(params), request_headers.client_certificate} do
+      {client_id, %{der: der, proof_of_possession: true} = certificate}
+      when is_binary(client_id) and client_id != "" and is_binary(der) and byte_size(der) > 0 ->
+        {:ok, :mtls_client_auth, client_id, certificate}
+
+      _other ->
+        {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
 
@@ -669,6 +729,84 @@ defmodule AttestoPhoenix.ClientAuthentication do
       {:ok, result}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp verify_mtls_client(config, policy, client_id, certificate) do
+    case resolve_client(config, client_id) do
+      {:ok, client} -> authenticate_certificate_client(config, policy, client, client_id, certificate)
+      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp authenticate_certificate_client(config, policy, client, client_id, certificate) do
+    case client_mtls_metadata(config, client) do
+      {:ok, metadata} -> authenticate_registered_mtls_client(config, policy, client, client_id, certificate, metadata)
+      :not_registered -> authenticate_certificate_bearing_public(config, policy, client, client_id)
+      {:error, _reason} -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp authenticate_registered_mtls_client(config, policy, client, client_id, certificate, metadata) do
+    with {:ok, method} <- mtls_method(metadata),
+         :ok <- require_client_auth_method(config, policy, method),
+         :ok <- require_mtls_transport(method, certificate),
+         {:ok, metadata} <- maybe_resolve_self_signed_jwks(config, client, method, metadata),
+         :ok <- MTLS.authenticate_client(certificate.der, method, metadata),
+         {:ok, result} <- result(config, client, client_id, method) do
+      {:ok, result}
+    else
+      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp authenticate_certificate_bearing_public(config, policy, client, client_id) do
+    with true <- policy.allow_public,
+         :ok <- require_client_auth_method(config, policy, :none),
+         true <- client_public?(config, client),
+         {:ok, result} <- result(config, client, client_id, :none) do
+      {:ok, result}
+    else
+      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp client_mtls_metadata(config, client) do
+    case Config.client_mtls_metadata_fun(config) do
+      nil ->
+        :not_registered
+
+      callback ->
+        case invoke(callback, [client]) do
+          {:ok, metadata} when is_map(metadata) -> {:ok, metadata}
+          metadata when is_map(metadata) -> {:ok, metadata}
+          nil -> :not_registered
+          {:error, _reason} -> {:error, :metadata_lookup_failed}
+          _other -> {:error, :invalid_metadata_result}
+        end
+    end
+  end
+
+  defp mtls_method(metadata) do
+    case Map.get(metadata, "token_endpoint_auth_method", Map.get(metadata, :token_endpoint_auth_method)) do
+      "tls_client_auth" -> {:ok, :tls_client_auth}
+      :tls_client_auth -> {:ok, :tls_client_auth}
+      "self_signed_tls_client_auth" -> {:ok, :self_signed_tls_client_auth}
+      :self_signed_tls_client_auth -> {:ok, :self_signed_tls_client_auth}
+      _other -> {:error, :invalid_mtls_method}
+    end
+  end
+
+  defp require_mtls_transport(:tls_client_auth, %{proof_of_possession: true, chain_validated: true}), do: :ok
+  defp require_mtls_transport(:self_signed_tls_client_auth, %{proof_of_possession: true}), do: :ok
+  defp require_mtls_transport(_method, _certificate), do: {:error, :untrusted_client_certificate}
+
+  defp maybe_resolve_self_signed_jwks(_config, _client, :tls_client_auth, metadata), do: {:ok, metadata}
+
+  defp maybe_resolve_self_signed_jwks(config, client, :self_signed_tls_client_auth, metadata) do
+    case client_jwks(config, client) do
+      {:ok, jwks} -> {:ok, Map.put(metadata, "jwks", jwks)}
+      {:error, _reason} = error -> error
     end
   end
 

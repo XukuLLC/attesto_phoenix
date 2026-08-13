@@ -543,7 +543,13 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
     Process.put(:attesto_phoenix_test_cert_der, der)
 
-    config = %{config | mtls_enabled: true, cert_der: {__MODULE__.CertCallbacks, :cert_der}}
+    config = %{
+      config
+      | mtls_enabled: true,
+        cert_der: {__MODULE__.CertCallbacks, :cert_der},
+        trusted_proxies: [:loopback]
+    }
+
     token = mint(config, scope: "openid", mtls_cert_thumbprint: thumbprint)
 
     conn =

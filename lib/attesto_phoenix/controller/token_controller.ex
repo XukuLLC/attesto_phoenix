@@ -73,8 +73,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
   # to the core as data.
   @dpop_request_header "dpop"
-  @client_attestation_header "oauth-client-attestation"
-  @client_attestation_pop_header "oauth-client-attestation-pop"
 
   # RFC 9449 §4.2: the token endpoint is reached by POST, so the proof's `htm`
   # claim must equal this.
@@ -299,11 +297,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
     policy = ClientAuthentication.Policy.for_endpoint(config, :token)
 
     case ClientAuthentication.authenticate_with_context(
-           %{
-             authorization: get_req_header(conn, "authorization"),
-             oauth_client_attestation: get_req_header(conn, @client_attestation_header),
-             oauth_client_attestation_pop: get_req_header(conn, @client_attestation_pop_header)
-           },
+           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
            params,
            config,
            policy

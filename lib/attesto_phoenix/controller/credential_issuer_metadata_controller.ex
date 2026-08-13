@@ -41,7 +41,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
     conn = put_cache_control(conn)
 
     if wants_signed_metadata?(conn) do
-      signed = CredentialIssuerMetadata.signed(metadata, pem: Config.vc_signing_pem(config))
+      signed = CredentialIssuerMetadata.signed(metadata, keystore: Config.vc_keystore(config))
 
       conn
       |> put_resp_content_type(@signed_metadata_content_type)

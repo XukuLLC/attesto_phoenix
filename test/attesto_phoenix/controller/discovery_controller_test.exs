@@ -190,7 +190,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
           "ES256",
           "EdDSA",
           "Ed25519"
-        ]
+        ],
+        "tls_client_certificate_bound_access_tokens" => true
       }
 
       assert body == snapshot
@@ -308,6 +309,33 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       body = call_show(host, protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+    end
+
+    test "advertises both RFC 8705 methods, certificate-bound tokens, and mTLS endpoint aliases" do
+      aliases = %{
+        "token_endpoint" => "https://mtls.issuer.example/oauth/token",
+        "introspection_endpoint" => "https://mtls.issuer.example/oauth/introspect"
+      }
+
+      host =
+        host_config(
+          token_endpoint_auth_methods_supported: ["tls_client_auth", "self_signed_tls_client_auth"],
+          client_mtls_metadata: fn _client -> %{} end,
+          client_jwks: fn _client -> %{"keys" => []} end,
+          mtls_enabled: true,
+          cert_der: fn _conn -> nil end,
+          mtls_endpoint_aliases: aliases
+        )
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["token_endpoint_auth_methods_supported"] == [
+               "tls_client_auth",
+               "self_signed_tls_client_auth"
+             ]
+
+      assert body["tls_client_certificate_bound_access_tokens"] == true
+      assert body["mtls_endpoint_aliases"] == aliases
     end
 
     test "advertises attest_jwt_client_auth only when Wallet Provider keys are configured" do

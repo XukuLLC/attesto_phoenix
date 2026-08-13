@@ -192,7 +192,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     # Return the full Result; the caller reads the authenticated client_id (the
     # RFC 9701 audience) from it.
     ClientAuthentication.authenticate(
-      get_req_header(conn, "authorization"),
+      AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
       params,
       config,
       policy

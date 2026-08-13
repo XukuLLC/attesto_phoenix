@@ -18,6 +18,7 @@ defmodule AttestoPhoenix.ClientStore do
     * `verify_client_secret/2` (`:verify_client_secret`, required)
     * `client_id/1` (`:client_id`)
     * `client_jwks/1` (`:client_jwks`)
+    * `client_mtls_metadata/1` (`:client_mtls_metadata`)
     * `client_redirect_uris/1` (`:client_redirect_uris`)
     * `client_public?/1` (`:client_public?`)
     * `client_native?/1` (`:client_native?`)
@@ -63,6 +64,20 @@ defmodule AttestoPhoenix.ClientStore do
   client that does not authenticate with a signed assertion.
   """
   @callback client_jwks(client()) :: map() | nil
+
+  @doc """
+  The client's RFC 8705 mutual-TLS authentication registration metadata.
+
+  The map carries `token_endpoint_auth_method` set to `tls_client_auth` or
+  `self_signed_tls_client_auth`. PKI clients also carry exactly one of the five
+  `tls_client_auth_*` identity fields from RFC 8705 §2.1.2. Self-signed clients
+  resolve their registered certificates through `client_jwks/1`.
+
+  Return `nil` only when the client has no mTLS authentication registration.
+  Storage and lookup failures must return `{:error, reason}`; authentication
+  fails closed for those results and for malformed callback output.
+  """
+  @callback client_mtls_metadata(client()) :: map() | {:ok, map()} | nil | {:error, term()}
 
   @doc """
   The client's registered redirect URIs (RFC 6749 §3.1.2.2). The authorization
@@ -204,6 +219,7 @@ defmodule AttestoPhoenix.ClientStore do
 
   @optional_callbacks client_id: 1,
                       client_jwks: 1,
+                      client_mtls_metadata: 1,
                       client_redirect_uris: 1,
                       client_public?: 1,
                       client_native?: 1,

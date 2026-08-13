@@ -94,8 +94,7 @@ defmodule AttestoPhoenix.DPoP.Adapter do
   callback form.
   """
   @spec cert_der(Config.t()) :: (Plug.Conn.t() -> binary() | nil) | nil
-  def cert_der(%Config{mtls_enabled: true, cert_der: callback}) when not is_nil(callback),
-    do: Callback.to_fun1(callback)
+  def cert_der(%Config{mtls_enabled: true} = config), do: fn conn -> RequestContext.cert_der(conn, config) end
 
   def cert_der(%Config{}), do: nil
 

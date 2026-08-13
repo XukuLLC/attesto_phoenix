@@ -686,6 +686,53 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
   end
 
+  describe "RFC 8705 section 2 token-endpoint authentication" do
+    test "authenticates tls_client_auth end to end through a trusted TLS terminator" do
+      enable_minting()
+      der = mtls_auth_cert_der()
+      mtls_client = %{id: "mtls-client-1"}
+
+      put_config(
+        load_client: fn
+          "mtls-client-1" -> {:ok, mtls_client}
+          _other -> {:error, :not_found}
+        end,
+        token_endpoint_auth_methods_supported: ["tls_client_auth"],
+        client_mtls_metadata: fn ^mtls_client ->
+          %{
+            "token_endpoint_auth_method" => "tls_client_auth",
+            "tls_client_auth_san_dns" => "client.example.com"
+          }
+        end,
+        trusted_proxies: [:loopback],
+        forwarded_cert_der: fn conn ->
+          case get_req_header(conn, "x-forwarded-client-cert-der") do
+            [encoded] -> Base.decode64!(encoded)
+            _other -> nil
+          end
+        end,
+        client_certificate_chain_validated?: fn _conn, presented -> presented == der end
+      )
+
+      params = %{
+        "grant_type" => "client_credentials",
+        "client_id" => "mtls-client-1",
+        "scope" => "read"
+      }
+
+      conn =
+        :post
+        |> conn(@endpoint_path, params)
+        |> put_token_content_type()
+        |> put_req_header("x-forwarded-client-cert-der", Base.encode64(der))
+        |> TokenController.create(params)
+
+      assert conn.status == 200
+      assert is_binary(body(conn)["access_token"])
+      assert body(conn)["token_type"] == "Bearer"
+    end
+  end
+
   describe "grant-type validation (RFC 6749 §4)" do
     test "rejects a missing grant_type" do
       conn = post_token(%{"client_id" => "confidential-1", "client_secret" => "s3cr3t"})
@@ -1169,6 +1216,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       put_config(
         mtls_enabled: true,
         cert_der: fn _conn -> der end,
+        trusted_proxies: [:loopback],
         client_requires_mtls?: fn _client -> true end
       )
 
@@ -1194,6 +1242,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       put_config(
         mtls_enabled: true,
         cert_der: fn _conn -> nil end,
+        trusted_proxies: [:loopback],
         client_requires_mtls?: fn _client -> true end
       )
 
@@ -2692,6 +2741,16 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   defp self_signed_cert_der do
     %{cert: der} = :public_key.pkix_test_root_cert(~c"CN=attesto-test", [])
     der
+  end
+
+  defp mtls_auth_cert_der do
+    extension = {:Extension, {2, 5, 29, 17}, false, [{:dNSName, ~c"client.example.com"}]}
+
+    :public_key.pkix_test_data(%{
+      root: [],
+      intermediates: [],
+      peer: [extensions: [extension]]
+    })[:cert]
   end
 
   defp client_credentials_params do

@@ -36,6 +36,8 @@ defmodule AttestoPhoenix.RouterTest do
 
   defmodule StubKeystore do
     @moduledoc false
+    def signing_pem, do: "unused"
+    def verification_pems, do: ["unused"]
   end
 
   defmodule HostUserInfoPlug do

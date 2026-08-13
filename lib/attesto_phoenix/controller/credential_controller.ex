@@ -363,7 +363,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       [
         iss: config.issuer,
         vct: vct,
-        pem: Config.vc_signing_pem(config)
+        keystore: Config.vc_keystore(config)
       ],
       [
         claims: claims,
@@ -392,7 +392,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
       [
         iss: config.issuer,
         sub: subject,
-        pem: Config.vc_signing_pem(config)
+        keystore: Config.vc_keystore(config)
       ],
       [
         type: ["VerifiableCredential", result.credential_type],

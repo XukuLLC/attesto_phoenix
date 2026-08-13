@@ -73,8 +73,8 @@ defmodule AttestoPhoenix do
     * audit / telemetry -> `:on_event` (optional, no-op by default)
     * dynamic client persistence -> `:register_client` (only when
       registration is enabled)
-    * mTLS certificate extraction -> `:cert_der` (only when mTLS is
-      enabled)
+    * mTLS certificate extraction -> adapter peer data or gated
+      `:forwarded_cert_der` (only when mTLS is enabled)
     * HTTPS / proxy trust -> `:require_https` and `:trusted_proxies`
 
   See `AttestoPhoenix.Config` for the full key reference and the default

@@ -31,7 +31,7 @@ defmodule AttestoPhoenix.DPoP.AdapterTest do
   defmodule CertificateCallbacks do
     @moduledoc false
 
-    def cert_der(conn, marker), do: {conn.request_path, marker}
+    def cert_der(conn, marker), do: marker <> conn.request_path
   end
 
   defmodule HtuCallbacks do
@@ -97,6 +97,7 @@ defmodule AttestoPhoenix.DPoP.AdapterTest do
         nonce_store: NonceCallbacks,
         mtls_enabled: true,
         cert_der: {CertificateCallbacks, :cert_der, ["from-mfa"]},
+        trusted_proxies: [:loopback],
         htu: {HtuCallbacks, :htu}
       )
 
@@ -106,8 +107,20 @@ defmodule AttestoPhoenix.DPoP.AdapterTest do
     assert opts[:replay_check].("key", 5) == {"key", 5}
     assert opts[:nonce_check].("live:https://issuer.example") == :ok
     assert opts[:nonce_issue].() == "issued:https://issuer.example:300"
-    assert opts[:cert_der].(conn) == {"/reports", "from-mfa"}
+    assert opts[:cert_der].(conn) == "from-mfa/reports"
     assert opts[:htu].(conn) == "https://configured.example/reports"
+  end
+
+  test "legacy certificate extraction cannot constrain a token from an untrusted socket peer" do
+    config =
+      config(
+        mtls_enabled: true,
+        cert_der: {CertificateCallbacks, :cert_der, ["forged"]},
+        trusted_proxies: ["10.0.0.0/8"]
+      )
+
+    opts = Adapter.protected_resource_opts(config)
+    assert opts[:cert_der].(conn(:get, "/reports")) == nil
   end
 
   test "protected-resource replay is disabled with DPoP disabled" do

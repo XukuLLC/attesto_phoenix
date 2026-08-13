@@ -15,10 +15,12 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
   @authorization_endpoint "https://issuer.example/authorize"
   @userinfo_endpoint "https://issuer.example/userinfo"
 
-  # A keystore module reference is all Attesto.Config validation requires
-  # (it checks the value is a module, not that it implements anything).
+  # Metadata tests do not consume key material, but the protocol config still
+  # validates the keystore callback contract at construction.
   defmodule StubKeystore do
     @moduledoc false
+    def signing_pem, do: "unused"
+    def verification_pems, do: ["unused"]
   end
 
   # A module reference is all the logout-metadata advertisement reads (the
