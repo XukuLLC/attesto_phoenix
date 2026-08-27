@@ -206,6 +206,7 @@ config :my_app, AttestoPhoenix.Config,
   access_token_ttl: 900,
   refresh_token_ttl: 1_209_600,
   authorization_code_ttl: 60,
+  authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id",
   dpop_enabled: true,
   dpop_nonce_required: false,
   mtls_enabled: false,                 # RFC 8705 certificate-bound tokens
@@ -238,6 +239,32 @@ Required keys are validated at build time so misconfiguration fails fast.
 places both the host config and its derived `Attesto.Config` in `conn.private`.
 Direct mTLS adapters expose the authenticated certificate through peer data;
 TLS terminators configure `:forwarded_cert_der` plus `:trusted_proxies`.
+
+### Authorization-grant identity
+
+Set `:authorization_grant_id_claim` when a protected resource needs a stable
+signed correlation handle for access tokens descended from one authorization
+code:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id"
+```
+
+The feature is disabled by default. When configured, Attesto Phoenix generates
+a 128-bit authorization family ID (22 unpadded Base64URL characters), stores it
+as the authorization code's `family_id`, and signs that exact value into the
+initial and refreshed access tokens. Refresh rotation and lost-response retry
+preserve the family ID while every access token receives a fresh `jti`.
+
+The library owns the value: host principal/code claims cannot replace it, and
+other grant types strip the configured claim instead of signing a fabricated or
+inherited value. An authorization-code grant that does not issue a refresh token
+still receives the access-token claim but creates no refresh row. The claim is a
+correlation handle, not proof that a refresh family exists or remains active.
+No migration is required because issuance reuses the existing `family_id`
+fields. Use a private claim name under a namespace you control; do not use OIDC
+`sid`, which identifies an OP browser session with a different lifecycle.
 
 ### Resource indicators (RFC 8707)
 

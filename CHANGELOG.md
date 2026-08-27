@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Add opt-in `:authorization_grant_id_claim` configuration for a stable,
+  library-owned authorization-code family claim on initial and refreshed access
+  tokens. The claim reuses the 128-bit refresh `family_id`, survives rotation
+  and lost-response retry while `jti` changes, is omitted from other grants, and
+  remains disabled by default without requiring a migration.
+
 ## [2.14.1] - 2026-08-27
 
 ### Security

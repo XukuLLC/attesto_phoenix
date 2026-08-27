@@ -232,7 +232,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             access_token_claims(grant),
+             Map.merge(
+               access_token_claims(grant),
+               authorization_grant_id_claims(config, grant.family_id)
+             ),
              # RFC 8707 §2.2: the access token's `aud` is the resource set the
              # user authorized (bound to the code), optionally narrowed by a
              # request-time `resource` — never widened by one. RFC 9470: carry
@@ -302,7 +305,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             %{},
+             authorization_grant_id_claims(config, rotated.family_id),
              # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
              # (never re-stamped on rotation), so the refreshed access token
              # reports the real authentication event.
@@ -1454,7 +1457,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          mint_extra_opts
        ) do
     with {:ok, principal} <- build_principal(config, client, subject, scope),
-         principal = merge_principal_claims(principal, extra_claims),
+         principal = merge_principal_claims(config, principal, extra_claims),
          {:ok, principal} <- put_access_token_client_id(principal, token_client_id(request)),
          {:ok, minted} <-
            Attesto.Token.mint(
@@ -1516,7 +1519,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
            scopes: scope,
            claims:
              claims
-             |> exchange_extra_claims(kind_claim)
+             |> exchange_extra_claims(kind_claim, config)
              |> Map.put("client_id", authenticated_client_id)
          },
          {:ok, minted} <-
@@ -1539,12 +1542,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp exchange_extra_claims(claims, principal_kind_claim) do
+  defp exchange_extra_claims(claims, principal_kind_claim, config) do
     # `acr` / `auth_time` are reserved: an exchanged (machine-authorized) token
     # must not inherit the subject token's authentication context, which would
     # let token exchange forge a step-up-satisfying token (RFC 9470).
     reserved =
-      MapSet.new(~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++ [principal_kind_claim])
+      MapSet.new(
+        ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++
+          [principal_kind_claim] ++ List.wrap(Config.authorization_grant_id_claim(config))
+      )
 
     claims
     |> Enum.reject(fn {key, _value} -> MapSet.member?(reserved, key) end)
@@ -1674,16 +1680,48 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     }
   end
 
-  defp merge_principal_claims(principal, extra_claims) when map_size(extra_claims) == 0, do: principal
+  defp authorization_grant_id_claims(config, family_id) when is_binary(family_id) and family_id != "" do
+    case Config.authorization_grant_id_claim(config) do
+      nil -> %{}
+      claim -> %{claim => family_id}
+    end
+  end
 
-  defp merge_principal_claims(principal, extra_claims) do
+  defp authorization_grant_id_claims(_config, _family_id), do: %{}
+
+  # The configured claim is protocol-owned. Unsupported grants pass no trusted
+  # value and therefore remove any host-fabricated value; authorization-code and
+  # refresh paths merge their authoritative family id after that removal.
+  defp merge_principal_claims(config, principal, extra_claims) when map_size(extra_claims) == 0 do
+    case {Config.authorization_grant_id_claim(config), Map.fetch(principal, :claims)} do
+      {claim, {:ok, claims}} when is_binary(claim) and is_map(claims) ->
+        Map.put(principal, :claims, Map.delete(claims, claim))
+
+      _ ->
+        principal
+    end
+  end
+
+  defp merge_principal_claims(config, principal, extra_claims) do
     claims =
       case Map.get(principal, :claims) do
-        claims when is_map(claims) -> Map.merge(claims, extra_claims)
-        _ -> extra_claims
+        claims when is_map(claims) ->
+          claims
+          |> drop_authorization_grant_id_claim(config)
+          |> Map.merge(extra_claims)
+
+        _ ->
+          extra_claims
       end
 
     Map.put(principal, :claims, claims)
+  end
+
+  defp drop_authorization_grant_id_claim(claims, config) do
+    case Config.authorization_grant_id_claim(config) do
+      nil -> claims
+      claim -> Map.delete(claims, claim)
+    end
   end
 
   # ── Sender-constraint resolution (RFC 9449 / RFC 8705) ───────────────────
