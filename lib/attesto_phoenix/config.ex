@@ -1227,7 +1227,9 @@ defmodule AttestoPhoenix.Config do
   Resolves the validated config from the library's configured `:otp_app`.
 
   This is the shared resolution path for controllers that read the global
-  application configuration.
+  application configuration. Configure the pointer with
+  `config :attesto_phoenix, otp_app: :my_app`; the Igniter installer writes it
+  together with the repo used by the bundled Ecto stores.
   """
   @spec resolve!() :: t()
   def resolve! do

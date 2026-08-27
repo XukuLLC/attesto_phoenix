@@ -87,11 +87,21 @@ defmodule AttestoPhoenix.Router do
   HTTPS-enforcing plug), and use `:route_pipelines` when the interactive,
   metadata, and non-browser protocol surfaces need different host pipelines.
 
-      scope "/" do
-        attesto_routes()
+      pipeline :attesto_phoenix_config do
+        plug AttestoPhoenix.Plug.PutConfig, otp_app: :my_app
       end
 
-      # or with a host pipeline and a mount prefix:
+      scope "/" do
+        attesto_routes(pipeline: :attesto_phoenix_config)
+      end
+
+      # or with that config plug plus other shared transport concerns and a
+      # mount prefix:
+      pipeline :oauth_server do
+        plug AttestoPhoenix.Plug.PutConfig, otp_app: :my_app
+        plug MyAppWeb.RequireHTTPS
+      end
+
       scope "/" do
         attesto_routes(pipeline: :oauth_server, prefix: "/auth")
       end
@@ -107,7 +117,9 @@ defmodule AttestoPhoenix.Router do
         )
       end
 
-  A route-class override is the complete ordered pipeline list for that class;
+  The config-loading plug is required unless an enclosing scope or another host
+  pipeline has already put both validated configs in `conn.private`. A
+  route-class override is the complete ordered pipeline list for that class;
   Attesto does not append or prepend the `:pipeline` default. The host remains
   responsible for the policy inside those pipelines. In particular, externally
   submitted OAuth POST requests must not accidentally inherit a generic browser
@@ -124,9 +136,10 @@ defmodule AttestoPhoenix.Router do
       path-bearing issuer requires the host to mount the distinct OIDC
       Discovery and RFC 8414 derived locations explicitly.
     * `:pipeline` - a pipeline name (atom) or list of pipeline names to
-      `pipe_through` for the mounted routes. Defaults to `[]` (no extra
-      pipeline; the surrounding `scope`'s `pipe_through`, if any, still
-      applies).
+      `pipe_through` for the mounted routes. It normally includes
+      `AttestoPhoenix.Plug.PutConfig`; the Igniter installer creates that
+      pipeline automatically. Defaults to `[]` for compatibility (the
+      surrounding `scope`'s `pipe_through`, if any, still applies).
     * `:route_pipelines` - optional route-class overrides. Accepts a keyword
       list whose keys are `:metadata`, `:interactive`, or `:protocol`, and
       whose values are a pipeline atom or an ordered list of pipeline atoms.

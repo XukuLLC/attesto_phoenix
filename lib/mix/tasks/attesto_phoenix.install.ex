@@ -15,11 +15,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
     Wires the OAuth 2.0 / OpenID Connect authorization-server layer this library
     provides into the host Phoenix application:
 
-      * adds an `AttestoPhoenix.Config` config skeleton (issuer, keystore, repo,
-        the Ecto-backed token stores, a chosen `:oauth_path_prefix`, and neutral
-        defaults) to the host config,
+      * adds an `AttestoPhoenix.Config` config skeleton (issuer, audience,
+        keystore, repo, principal kinds, the Ecto-backed token stores, a chosen
+        `:oauth_path_prefix`, and neutral defaults) to the host config, and
+        points the library's global resolver and stores at that OTP app/repo,
       * mounts the server routes (`attesto_routes/1`) at the chosen prefix into
-        the host router,
+        the host router behind a generated config-loading pipeline,
       * scaffolds host callback modules implementing the recommended production
         behaviours (`AttestoPhoenix.ClientStore`, `PrincipalStore`,
         `ScopePolicy`, `ConsentPolicy`, `RegistrationStore`, `EventSink`) with
@@ -68,6 +69,7 @@ if Code.ensure_loaded?(Igniter) do
 
     use Igniter.Mix.Task
 
+    alias AttestoPhoenix.Plug.PutConfig
     # `AttestoPhoenix.Config` is referenced only as a config-path module name (a
     # plain atom Igniter writes into the host config), never as a struct, so it
     # is NOT aliased: aliasing it would make this Mix task a compile-time
@@ -76,6 +78,7 @@ if Code.ensure_loaded?(Igniter) do
     # single compile pass.
     alias Igniter.Code.Common
     alias Igniter.Code.Function
+    alias Igniter.Code.Keyword, as: CodeKeyword
     alias Igniter.Libs.Phoenix
     alias Igniter.Mix.Task.Info
     alias Igniter.Project.Config, as: ProjectConfig
@@ -86,6 +89,7 @@ if Code.ensure_loaded?(Igniter) do
     # (`AttestoPhoenix.Config`'s `:oauth_path_prefix` default). A host may
     # relocate it with `--oauth-path-prefix`.
     @default_oauth_path_prefix "/oauth"
+    @config_pipeline :attesto_phoenix_config
 
     # The recommended production behaviours and the callbacks each scaffolded
     # module implements. Each tuple is `{submodule, behaviour, [{function,
@@ -94,7 +98,8 @@ if Code.ensure_loaded?(Igniter) do
     # `AttestoPhoenix.Config` keys the config skeleton wires.
     @scaffolds [
       {ClientStore, AttestoPhoenix.ClientStore, [{:load_client, 1}, {:verify_client_secret, 2}]},
-      {PrincipalStore, AttestoPhoenix.PrincipalStore, [{:load_principal, 1}, {:build_principal, 3}]},
+      {PrincipalStore, AttestoPhoenix.PrincipalStore,
+       [{:load_principal, 1}, {:principal_kinds, 0}, {:build_principal, 3}]},
       {ScopePolicy, AttestoPhoenix.ScopePolicy, [{:authorize_scope, 2}]},
       {ConsentPolicy, AttestoPhoenix.ConsentPolicy, [{:authenticate_resource_owner, 3}, {:consent, 3}]},
       {RegistrationStore, AttestoPhoenix.RegistrationStore,
@@ -131,7 +136,7 @@ if Code.ensure_loaded?(Igniter) do
       igniter
       |> scaffold_callback_modules(callbacks_module)
       |> configure_attesto_phoenix(app, oauth_path_prefix, callbacks_module, repo)
-      |> mount_routes(oauth_path_prefix)
+      |> mount_routes(app, oauth_path_prefix)
       |> add_next_step_notices(app, oauth_path_prefix, callbacks_module, repo)
     end
 
@@ -158,13 +163,33 @@ if Code.ensure_loaded?(Igniter) do
     # wiring `AttestoPhoenix.Config.from_otp_app/2` reads at boot.
     defp configure_attesto_phoenix(igniter, app, oauth_path_prefix, callbacks_module, repo) do
       config = config_skeleton(oauth_path_prefix, callbacks_module, repo)
+      principal_store = Module.concat(callbacks_module, PrincipalStore)
 
-      ProjectConfig.configure_new(
-        igniter,
+      igniter
+      |> ProjectConfig.configure_new(
         "config.exs",
         app,
         [AttestoPhoenix.Config],
         {:code, config}
+      )
+      |> ProjectConfig.configure_new(
+        "config.exs",
+        app,
+        [AttestoPhoenix.Config, :audience],
+        {:code, audience_default()}
+      )
+      |> ProjectConfig.configure_new(
+        "config.exs",
+        app,
+        [AttestoPhoenix.Config, :principal_kinds],
+        {:code, quote(do: {unquote(principal_store), :principal_kinds})}
+      )
+      |> ProjectConfig.configure_new("config.exs", :attesto_phoenix, [:otp_app], app)
+      |> ProjectConfig.configure_new(
+        "config.exs",
+        :attesto_phoenix,
+        [:repo],
+        {:code, quote(do: unquote(repo))}
       )
     end
 
@@ -183,6 +208,11 @@ if Code.ensure_loaded?(Igniter) do
           # endpoint URL. Prefer overriding it in config/runtime.exs per
           # deployment.
           issuer: System.get_env("ATTESTO_ISSUER") || "https://localhost",
+          # The protected resource identifier carried in access-token `aud`.
+          # A co-located single-resource development server may use its issuer;
+          # deployments serving another resource must set ATTESTO_AUDIENCE (or
+          # replace this value) with that resource's absolute https URL.
+          audience: unquote(audience_default()),
           # A module implementing the Attesto.Keystore behaviour (the signing key
           # and the JWKS verification keys). Scaffold or wire your own.
           keystore: unquote(keystore),
@@ -192,6 +222,7 @@ if Code.ensure_loaded?(Igniter) do
           load_client: {unquote(client_store), :load_client},
           verify_client_secret: {unquote(client_store), :verify_client_secret},
           load_principal: {unquote(principal_store), :load_principal},
+          principal_kinds: {unquote(principal_store), :principal_kinds},
           # Recommended host callbacks (RFC 6749 §3.3/§4.1.1, OIDC Core §3.1.2).
           build_principal: {unquote(principal_store), :build_principal},
           authorize_scope: {unquote(scope_policy), :authorize_scope},
@@ -233,6 +264,13 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp audience_default do
+      quote do
+        System.get_env("ATTESTO_AUDIENCE") || System.get_env("ATTESTO_ISSUER") ||
+          "https://localhost"
+      end
+    end
+
     # ------------------------------------------------------------------
     # Router
     # ------------------------------------------------------------------
@@ -243,10 +281,12 @@ if Code.ensure_loaded?(Igniter) do
     # `use AttestoPhoenix.Router` nor adds a second server scope. When no router
     # is found (a non-Phoenix host), a notice tells the host how to mount the
     # routes by hand.
-    defp mount_routes(igniter, oauth_path_prefix) do
+    defp mount_routes(igniter, app, oauth_path_prefix) do
       case Phoenix.list_routers(igniter) do
         {igniter, [router | _]} ->
-          mount_routes_into(igniter, router, oauth_path_prefix)
+          igniter
+          |> ensure_config_pipeline(router, app)
+          |> mount_routes_into(router, oauth_path_prefix)
 
         {igniter, []} ->
           Igniter.add_notice(igniter, """
@@ -255,20 +295,75 @@ if Code.ensure_loaded?(Igniter) do
 
               use AttestoPhoenix.Router
 
+              pipeline #{inspect(@config_pipeline)} do
+                plug AttestoPhoenix.Plug.PutConfig, otp_app: #{inspect(app)}
+              end
+
               scope "/" do
-                attesto_routes(prefix: "#{router_prefix(oauth_path_prefix)}")
+                #{router_scope_body(oauth_path_prefix)}
               end
           """)
       end
     end
 
-    # The router is edited in a SINGLE `find_and_update_module!` visit: when the
-    # router already contains an `attesto_routes/1` call the zipper is returned
-    # unchanged (the re-run no-op), otherwise both the `use AttestoPhoenix.Router`
-    # and the server `scope` are added. Doing the whole edit in one visit (rather
-    # than a separate read-only "is it mounted?" pass) avoids re-including and
-    # reformatting the source, which a second pass would otherwise count as a
-    # change and break idempotency.
+    # Installs the pipeline that resolves both immutable configs and puts them in
+    # conn.private. An old installer output may already contain the pipeline
+    # name, so add only the missing plug rather than replacing host edits.
+    defp ensure_config_pipeline(igniter, router, app) do
+      plug_code = "plug AttestoPhoenix.Plug.PutConfig, otp_app: #{inspect(app)}"
+      pipeline_code = "pipeline #{inspect(@config_pipeline)} do\n  #{plug_code}\nend"
+
+      ProjectModule.find_and_update_module!(igniter, router, fn zipper ->
+        case move_to_config_pipeline(zipper) do
+          {:ok, pipeline_zipper} ->
+            ensure_config_plug(zipper, pipeline_zipper, plug_code)
+
+          :error ->
+            {:ok, Common.add_code(zipper, pipeline_code)}
+        end
+      end)
+    end
+
+    defp ensure_config_plug(module_zipper, pipeline_zipper, plug_code) do
+      case Common.move_to_do_block(pipeline_zipper) do
+        {:ok, block_zipper} -> maybe_add_config_plug(module_zipper, block_zipper, plug_code)
+        :error -> {:ok, module_zipper}
+      end
+    end
+
+    defp maybe_add_config_plug(module_zipper, block_zipper, plug_code) do
+      if config_plug_present?(block_zipper) do
+        {:ok, module_zipper}
+      else
+        {:ok, Common.add_code(block_zipper, plug_code)}
+      end
+    end
+
+    defp move_to_config_pipeline(zipper) do
+      Function.move_to_function_call_in_current_scope(
+        zipper,
+        :pipeline,
+        2,
+        &Function.argument_equals?(&1, 0, @config_pipeline)
+      )
+    end
+
+    defp config_plug_present?(zipper) do
+      case Function.move_to_function_call_in_current_scope(
+             zipper,
+             :plug,
+             [1, 2],
+             &Function.argument_equals?(&1, 0, PutConfig)
+           ) do
+        {:ok, _plug} -> true
+        :error -> false
+      end
+    end
+
+    # The router edit repairs old installer output as well as creating a fresh
+    # mount. An existing literal attesto_routes call with no host pipeline gets
+    # the generated config pipeline; a host-managed pipeline declaration remains
+    # authoritative.
     defp mount_routes_into(igniter, router, oauth_path_prefix) do
       scope_code = """
       scope "/" do
@@ -277,20 +372,43 @@ if Code.ensure_loaded?(Igniter) do
       """
 
       ProjectModule.find_and_update_module!(igniter, router, fn zipper ->
-        if router_mounted?(zipper) do
-          {:ok, zipper}
-        else
-          {:ok, zipper |> add_router_use() |> Common.add_code(scope_code)}
+        zipper = add_router_use(zipper)
+
+        case move_to_attesto_routes(zipper) do
+          {:ok, routes_zipper} -> ensure_route_pipeline(routes_zipper)
+          :error -> {:ok, Common.add_code(zipper, scope_code)}
         end
       end)
     end
 
-    # True when the router module already calls `attesto_routes/1` (in any scope),
-    # so a re-run is a no-op.
-    defp router_mounted?(zipper) do
-      case Function.move_to_function_call(zipper, :attesto_routes, [0, 1]) do
-        {:ok, _zipper} -> true
-        _ -> false
+    defp move_to_attesto_routes(zipper), do: Function.move_to_function_call(zipper, :attesto_routes, [0, 1])
+
+    defp ensure_route_pipeline(routes_zipper) do
+      case routes_zipper.node do
+        {:attesto_routes, _meta, []} ->
+          Function.append_argument(routes_zipper, pipeline: @config_pipeline)
+
+        {:attesto_routes, _meta, [_opts]} ->
+          Function.update_nth_argument(routes_zipper, 0, &put_config_pipeline/1)
+
+        _other ->
+          {:ok, routes_zipper}
+      end
+    end
+
+    defp put_config_pipeline(opts_zipper) do
+      if CodeKeyword.keyword_has_path?(opts_zipper, [:pipeline]) or
+           CodeKeyword.keyword_has_path?(opts_zipper, [:route_pipelines]) do
+        {:ok, opts_zipper}
+      else
+        add_config_pipeline_option(opts_zipper)
+      end
+    end
+
+    defp add_config_pipeline_option(opts_zipper) do
+      case CodeKeyword.put_in_keyword(opts_zipper, [:pipeline], @config_pipeline) do
+        {:ok, updated} -> {:ok, updated}
+        :error -> {:ok, opts_zipper}
       end
     end
 
@@ -314,8 +432,8 @@ if Code.ensure_loaded?(Igniter) do
     # at the host root regardless (RFC 8615).
     defp router_scope_body(oauth_path_prefix) do
       case router_prefix(oauth_path_prefix) do
-        "" -> "attesto_routes()"
-        prefix -> ~s|attesto_routes(prefix: "#{prefix}")|
+        "" -> "attesto_routes(pipeline: #{inspect(@config_pipeline)})"
+        prefix -> ~s|attesto_routes(prefix: "#{prefix}", pipeline: #{inspect(@config_pipeline)})|
       end
     end
 
@@ -343,18 +461,43 @@ if Code.ensure_loaded?(Igniter) do
     # `module_exists?/2` (deprecated) so the task compiles under
     # `--warnings-as-errors`.
     defp scaffold_callback_modules(igniter, callbacks_module) do
-      Enum.reduce(@scaffolds, igniter, fn {submodule, behaviour, callbacks}, igniter ->
-        module = Module.concat(callbacks_module, submodule)
-        path = ProjectModule.proper_location(igniter, module)
+      igniter =
+        Enum.reduce(@scaffolds, igniter, fn {submodule, behaviour, callbacks}, igniter ->
+          module = Module.concat(callbacks_module, submodule)
+          path = ProjectModule.proper_location(igniter, module)
 
-        if Igniter.exists?(igniter, path) do
-          igniter
-        else
-          ProjectModule.create_module(
-            igniter,
-            module,
-            scaffold_contents(behaviour, callbacks)
-          )
+          if Igniter.exists?(igniter, path) do
+            igniter
+          else
+            ProjectModule.create_module(
+              igniter,
+              module,
+              scaffold_contents(behaviour, callbacks)
+            )
+          end
+        end)
+
+      ensure_principal_kinds_callback(igniter, callbacks_module)
+    end
+
+    # Older installer output already has a host-owned PrincipalStore module but
+    # predates the principal-kind catalog callback. Add only that missing
+    # function, leaving every existing definition untouched.
+    defp ensure_principal_kinds_callback(igniter, callbacks_module) do
+      principal_store = Module.concat(callbacks_module, PrincipalStore)
+
+      ProjectModule.find_and_update_module!(igniter, principal_store, fn zipper ->
+        case Function.move_to_def(zipper, :principal_kinds, 0, target: :at) do
+          {:ok, _definition} ->
+            {:ok, zipper}
+
+          :error ->
+            {:ok,
+             Common.add_code(zipper, """
+             def principal_kinds do
+               raise "implement principal_kinds/0 (generated by mix attesto_phoenix.install)"
+             end
+             """)}
         end
       end)
     end
@@ -411,10 +554,15 @@ if Code.ensure_loaded?(Igniter) do
            Each module documents its contract; the governing RFC is cited per
            callback in the corresponding behaviour module.
 
+           In particular, `#{inspect(callbacks_module)}.PrincipalStore` must
+           return the deployment's non-empty `Attesto.PrincipalKind` catalog
+           from `principal_kinds/0`.
+
         2. Provide a keystore: set :keystore in `config :#{app},
            AttestoPhoenix.Config` to a module implementing Attesto.Keystore (the
-           signing key plus the JWKS verification keys), and set :issuer to your
-           https issuer URL (prefer config/runtime.exs per deployment).
+           signing key plus the JWKS verification keys), set :issuer to your
+           https issuer URL, and set :audience to the protected resource URL
+           (prefer config/runtime.exs per deployment).
 
         3. Create the Ecto tables the bundled stores read:
 

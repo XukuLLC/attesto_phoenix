@@ -13,8 +13,12 @@ prefix:
 ```elixir
 use AttestoPhoenix.Router
 
+pipeline :attesto_phoenix_config do
+  plug AttestoPhoenix.Plug.PutConfig, otp_app: :my_app
+end
+
 scope "/" do
-  attesto_routes(registration: true)
+  attesto_routes(pipeline: :attesto_phoenix_config, registration: true)
 end
 ```
 
@@ -25,6 +29,12 @@ behaviours - `AttestoPhoenix.ClientStore`, `AttestoPhoenix.PrincipalStore`,
 `AttestoPhoenix.ScopePolicy`, `AttestoPhoenix.ConsentPolicy`,
 `AttestoPhoenix.RegistrationStore`, `AttestoPhoenix.EventSink` - wired into the
 matching Config keys. See `guides/examples.md` for minimal configs.
+
+Point the library's global resolver and Ecto-backed stores at the same host:
+
+```elixir
+config :attesto_phoenix, otp_app: :my_app, repo: MyApp.Repo
+```
 
 ## 3. Map your existing client store
 

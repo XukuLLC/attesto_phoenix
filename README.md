@@ -169,11 +169,18 @@ inherently application policy is a neutral callback rather than a baked-in
 assumption.
 
 ```elixir
+# Points controllers and Ecto-backed stores at the host application.
+config :attesto_phoenix,
+  otp_app: :my_app,
+  repo: MyApp.Repo
+
 config :my_app, AttestoPhoenix.Config,
   # --- required ---
   issuer: "https://auth.example.com",
+  audience: "https://api.example.com",
   keystore: MyApp.Keystore,            # implements Attesto.Keystore
   repo: MyApp.Repo,                    # Ecto.Repo for the token stores
+  principal_kinds: {MyApp.OAuth.PrincipalStore, :principal_kinds},
 
   # host policy modules (preferred install surface)
   client_store: MyApp.OAuth.ClientStore,
@@ -227,6 +234,8 @@ config = AttestoPhoenix.Config.from_otp_app(:my_app)
 ```
 
 Required keys are validated at build time so misconfiguration fails fast.
+`AttestoPhoenix.Plug.PutConfig` performs that resolution for mounted routes and
+places both the host config and its derived `Attesto.Config` in `conn.private`.
 Direct mTLS adapters expose the authenticated certificate through peer data;
 TLS terminators configure `:forwarded_cert_der` plus `:trusted_proxies`.
 
@@ -313,14 +322,23 @@ Marking a client native applies three rules to it:
 >    simply not to mark any — but `native_apps: [loopback_redirect: false]`
 >    forbids the exception server-wide if you need a hard switch.
 
-One further rule is genuinely opt-in, because unlike the three above it is a
-server-wide posture rather than a per-client property:
+Two compatibility/posture rules are genuinely opt-in, because unlike the three
+above they apply server-wide rather than expressing a per-client fact:
 
 ```elixir
 config :my_app, AttestoPhoenix.Config,
-  native_apps: [reject_embedded_user_agents: true]   # RFC 8252 §8.12
+  native_apps: [
+    loopback_include_localhost: true,
+    reject_embedded_user_agents: true
+  ]
 ```
 
+- **`loopback_include_localhost: true`** accepts a varying port for a registered
+  `http://localhost/...` loopback redirect while keeping scheme, hostname,
+  path, and query exact. RFC 8252 §8.3 prefers literal loopback IP addresses,
+  so the default remains `false`; enable it for deployed native clients that
+  publish a portless `localhost` callback and bind an ephemeral port at runtime.
+  `localhost` never cross-matches `127.0.0.1` or `[::1]`.
 - **`reject_embedded_user_agents: true` (§8.12)** refuses an authorization
   request that appears to come from an in-app webview, whose host application
   can read the page and capture the user's credentials. Detection is a
@@ -333,6 +351,28 @@ config :my_app, AttestoPhoenix.Config,
 Serving the platform association files (`apple-app-site-association`,
 `assetlinks.json`) that claim HTTPS app links is app distribution, not OAuth,
 and is left to the host.
+
+### URL client metadata for native clients
+
+Some clients identify themselves with an HTTPS Client ID Metadata Document URL
+instead of a row in the host client registry. Enable CIMD only when that client
+class is required:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  client_id_metadata: [
+    enabled: true,
+    allowed_hosts: ["client.example"]
+  ],
+  native_apps: [loopback_include_localhost: true]
+```
+
+The default CIMD fetcher requires the package's optional `Req` dependency. The
+resolver validates the HTTPS client ID, applies DNS/IP SSRF controls, bounds the
+document and timeout, validates redirect URIs and keys, and caches only the
+validated result. Keep `allowed_hosts` narrow when the clients are known in
+advance. The `localhost` option affects only redirect matching; it does not
+allow loopback client-metadata URLs or weaken the outbound fetch guard.
 
 ### Host policy modules
 
@@ -369,16 +409,20 @@ defmodule MyAppWeb.Router do
   use MyAppWeb, :router
   use AttestoPhoenix.Router
 
-  pipeline :oauth do
-    plug :accepts, ["json"]
+  pipeline :attesto_phoenix_config do
+    plug AttestoPhoenix.Plug.PutConfig, otp_app: :my_app
   end
 
   scope "/" do
-    pipe_through :oauth
-    attesto_routes()
+    attesto_routes(pipeline: :attesto_phoenix_config)
   end
 end
 ```
+
+The installer writes this pipeline and repairs route output from older
+installer releases that mounted `attesto_routes/1` without it. Add any shared
+transport-only plugs to the same pipeline; use `:route_pipelines` for browser
+session or content-negotiation differences.
 
 When interactive routes need host session/resource-owner support that protocol
 clients must not inherit, classify the generated routes without hand-writing

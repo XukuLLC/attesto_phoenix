@@ -13,6 +13,7 @@ defmodule AttestoPhoenix.PrincipalStore do
   key:
 
     * `load_principal/1` (`:load_principal`, required)
+    * `principal_kinds/0` (`:principal_kinds`)
     * `build_principal/3` (`:build_principal`)
     * `resolve_jwt_bearer_subject/1` (`:resolve_jwt_bearer_subject`, required only
       when the ID-JAG `jwt-bearer` grant is enabled)
@@ -27,6 +28,15 @@ defmodule AttestoPhoenix.PrincipalStore do
   """
   @callback load_principal(subject_id :: String.t()) ::
               {:ok, principal()} | {:error, :not_found}
+
+  @doc """
+  Return the non-empty principal-kind catalog passed to `Attesto.Config`.
+
+  Each kind gives a token subject class its claim value and unambiguous `sub`
+  prefix. This is host identity policy; the library cannot infer it from an
+  Ecto schema or client record.
+  """
+  @callback principal_kinds() :: [Attesto.PrincipalKind.t(), ...]
 
   @doc """
   Build the principal map passed to `Attesto.Token.mint/3` for an
@@ -73,5 +83,5 @@ defmodule AttestoPhoenix.PrincipalStore do
   @callback resolve_jwt_bearer_subject(claims :: map()) ::
               {:ok, subject :: String.t()} | String.t() | {:error, term()}
 
-  @optional_callbacks build_principal: 3, resolve_jwt_bearer_subject: 1
+  @optional_callbacks principal_kinds: 0, build_principal: 3, resolve_jwt_bearer_subject: 1
 end

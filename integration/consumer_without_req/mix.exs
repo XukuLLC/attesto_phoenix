@@ -15,7 +15,7 @@ defmodule AttestoPhoenix.ConsumerWithoutReq.MixProject do
   defp deps do
     [
       {:attesto_phoenix, path: "../.."},
-      {:attesto, "== 1.11.0", override: true},
+      {:attesto, "== 1.15.0", override: true},
       {:phoenix, "== 1.7.24", override: true},
       {:plug, "== 1.16.6", override: true}
     ]

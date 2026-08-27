@@ -10,6 +10,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
   alias AttestoPhoenix.OpenAPI.TokenEndpoint
+  alias AttestoPhoenix.Plug.PutConfig
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Schema.DPoPNonce
   alias AttestoPhoenix.Schema.DPoPReplay
@@ -21,7 +22,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.13.0"
+  @version "2.14.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
 
@@ -71,7 +72,7 @@ defmodule AttestoPhoenix.MixProject do
   # default - including every publish - resolves the published version
   # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
   #
-  # The 1.11.0 floor is load-bearing, not housekeeping. 1.9.0 carried
+  # The 1.15.0 floor is load-bearing, not housekeeping. 1.9.0 carried
   # `Attesto.RedirectURI`'s
   # `:exact_allow_loopback_port_including_localhost` mode, which the native-app
   # policy selects when the host enables `:loopback_include_localhost`. An
@@ -208,7 +209,12 @@ defmodule AttestoPhoenix.MixProject do
         License: ~r/LICENSE/
       ],
       groups_for_modules: [
-        Setup: [AttestoPhoenix, AttestoPhoenix.Config, AttestoPhoenix.Router],
+        Setup: [
+          AttestoPhoenix,
+          AttestoPhoenix.Config,
+          PutConfig,
+          AttestoPhoenix.Router
+        ],
         "Host contracts (behaviours)": [
           AttestoPhoenix.ClientStore,
           AttestoPhoenix.PrincipalStore,

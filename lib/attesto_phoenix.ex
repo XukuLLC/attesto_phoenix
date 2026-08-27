@@ -84,6 +84,9 @@ defmodule AttestoPhoenix do
 
   `AttestoPhoenix.Router` provides the `attesto_routes/1` macro, which
   mounts the authorization-server endpoints under a scope the host chooses.
+  `AttestoPhoenix.Plug.PutConfig` loads the host's validated config and its
+  derived protocol config into `conn.private`; pass its pipeline to the route
+  macro (the Igniter installer wires this automatically).
   Hosts declaratively select optional route mounts and route pipeline classes;
   application authentication and consent remain callbacks. The same
   routing and controller plumbing supports public-client OAuth and strict FAPI
@@ -97,6 +100,8 @@ defmodule AttestoPhoenix do
     * `AttestoPhoenix.Config` - the validated configuration every
       controller and plug reads, and the derivation of the protocol
       `Attesto.Config`.
+    * `AttestoPhoenix.Plug.PutConfig` - the router-pipeline bridge that loads
+      both immutable configs into `conn.private`.
     * `AttestoPhoenix.Router` - the `attesto_routes/1` macro that mounts
       the HTTP surface.
 

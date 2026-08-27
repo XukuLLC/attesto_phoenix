@@ -6,6 +6,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.14.0] - 2026-08-27
+
+### Added
+
+- `AttestoPhoenix.Plug.PutConfig`, a fail-closed router-pipeline bridge that
+  loads the host's validated `AttestoPhoenix.Config`, derives `Attesto.Config`,
+  and installs both under their documented `conn.private` keys while preserving
+  correctly typed request-specific overrides.
+- `principal_kinds/0` on `AttestoPhoenix.PrincipalStore` as an optional
+  host-contract callback and installer scaffold for the principal-kind catalog
+  required by the protocol configuration.
+
+### Fixed
+
+- The Igniter installer now writes `config :attesto_phoenix, otp_app: ...,
+  repo: ...`, generates the config-loading router pipeline, passes it to
+  `attesto_routes/1`, and repairs older installer route output that omitted the
+  pipeline. Generated authorization, metadata, JWKS, and store paths therefore
+  resolve the same host application instead of failing on missing config keys.
+- The generated host config now includes the required access-token `:audience`
+  and wires the scaffolded `principal_kinds/0` provider. Re-running the
+  installer repairs both missing keys and adds only the missing callback stub
+  to older scaffolded principal stores without replacing host definitions.
+- Direct-TLS detection remains warning-free and functional on every supported
+  Plug line, using adapter peer data when the newer SSL-data helper is absent.
+
+### Documentation
+
+- Document the required global OTP-app/repo pointer and config-loading pipeline,
+  and add the explicit CIMD plus `localhost` loopback compatibility settings for
+  native clients that publish URL metadata and bind an ephemeral callback port.
+
 ## [2.13.0] - 2026-08-13
 
 ### Added

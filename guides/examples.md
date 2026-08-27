@@ -1,7 +1,18 @@
 # Example configurations
 
-Two minimal `AttestoPhoenix.Config` setups. Both assume the host has wired the
-router macro and a pipeline that installs the config on the connection.
+Three minimal `AttestoPhoenix.Config` setups. They use the host wiring below:
+
+```elixir
+config :attesto_phoenix, otp_app: :my_app, repo: MyApp.Repo
+
+pipeline :attesto_phoenix_config do
+  plug AttestoPhoenix.Plug.PutConfig, otp_app: :my_app
+end
+
+scope "/" do
+  attesto_routes(pipeline: :attesto_phoenix_config)
+end
+```
 
 ## Confidential client (server-side app, client secret)
 
@@ -12,8 +23,10 @@ authorization-code grant and serves discovery.
 ```elixir
 AttestoPhoenix.Config.new(
   issuer: "https://auth.example",
+  audience: "https://api.example",
   keystore: MyApp.Keystore,
   repo: MyApp.Repo,
+  principal_kinds: &MyApp.AuthZ.principal_kinds/0,
 
   # Client registry (AttestoPhoenix.ClientStore).
   load_client: &MyApp.AuthZ.load_client/1,
@@ -53,8 +66,10 @@ code with PKCE (RFC 7636). It authenticates at the token endpoint with
 ```elixir
 AttestoPhoenix.Config.new(
   issuer: "https://auth.example",
+  audience: "https://api.example",
   keystore: MyApp.Keystore,
   repo: MyApp.Repo,
+  principal_kinds: &MyApp.AuthZ.principal_kinds/0,
 
   load_client: &MyApp.AuthZ.load_client/1,
   # A public client presents no secret; verification always fails closed if a
@@ -95,15 +110,17 @@ native clients in the first place, in which case nothing is needed at all.
 ```elixir
 AttestoPhoenix.Config.new(
   issuer: "https://auth.example",
+  audience: "https://api.example",
   keystore: MyApp.Keystore,
   repo: MyApp.Repo,
+  principal_kinds: &MyApp.AuthZ.principal_kinds/0,
 
   load_client: &MyApp.AuthZ.load_client/1,
   verify_client_secret: fn _client, _secret -> false end,
   client_id: &MyApp.AuthZ.client_id/1,
   # Registered as `http://127.0.0.1:0/cb` (and/or `http://[::1]:0/cb`) - the
-  # port is ignored under §7.3, so any placeholder will do. `localhost` is NOT
-  # acceptable (§8.3); register the literal IP.
+  # port is ignored under §7.3, so any placeholder will do. Prefer the literal
+  # IP; clients fixed to a localhost callback require the explicit option below.
   client_redirect_uris: &MyApp.AuthZ.client_redirect_uris/1,
   client_public?: fn _client -> true end,
   client_native?: &MyApp.AuthZ.client_native?/1,
@@ -111,7 +128,10 @@ AttestoPhoenix.Config.new(
   # Optional §8.12 in-app-webview refusal; a User-Agent heuristic, so it can
   # misjudge honest browsers. Unlike the rest of the profile this is a
   # server-wide posture, so it is a flag rather than a per-client property.
-  native_apps: [reject_embedded_user_agents: false],
+  native_apps: [
+    loopback_include_localhost: false,
+    reject_embedded_user_agents: false
+  ],
 
   load_principal: &MyApp.AuthZ.load_principal/1,
   build_principal: &MyApp.AuthZ.build_principal/3,

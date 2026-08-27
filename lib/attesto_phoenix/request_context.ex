@@ -47,6 +47,11 @@ defmodule AttestoPhoenix.RequestContext do
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
 
+  # Plug 1.20 exposes adapter SSL data directly. Older supported Plug lines do
+  # not, so the guarded call falls back to peer data without producing a
+  # compile-time undefined-function warning for those consumers.
+  @compile {:no_warn_undefined, {Plug.Conn, :get_ssl_data, 1}}
+
   # RFC 9449 §4.3: `htu` is the HTTP target URI of the request to which the DPoP
   # proof is attached, without query or fragment. The scheme/host/port that make
   # up that URI are the client-observed values, which behind a TLS-terminating
@@ -503,7 +508,12 @@ defmodule AttestoPhoenix.RequestContext do
   defp direct_scheme(conn, true), do: Atom.to_string(conn.scheme)
 
   defp direct_tls?(conn) do
-    case Plug.Conn.get_ssl_data(conn) do
+    ssl_data =
+      if function_exported?(Plug.Conn, :get_ssl_data, 1) do
+        Plug.Conn.get_ssl_data(conn)
+      end
+
+    case ssl_data do
       nil -> is_binary(Map.get(Plug.Conn.get_peer_data(conn), :ssl_cert))
       _ssl_data -> true
     end

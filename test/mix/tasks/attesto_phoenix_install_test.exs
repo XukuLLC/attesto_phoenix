@@ -17,6 +17,10 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
 
   import Igniter.Test
 
+  alias Attesto.PrincipalKind
+  alias AttestoPhoenix.Config, as: PhoenixConfig
+  alias Test.AuthZ.PrincipalStore
+
   @task "attesto_phoenix.install"
 
   # The synthetic project's app is `:test` with module prefix `Test`, so the
@@ -43,6 +47,51 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   end
   """
 
+  defmodule Keystore do
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "test-only"
+
+    @impl true
+    def verification_pems, do: ["test-only"]
+  end
+
+  @old_installer_router_fixture """
+  defmodule TestWeb.Router do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes()
+    end
+  end
+  """
+
+  @old_installer_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example",
+    keystore: Test.AuthZ.Keystore,
+    repo: Test.Repo,
+    load_client: {Test.AuthZ.ClientStore, :load_client},
+    verify_client_secret: {Test.AuthZ.ClientStore, :verify_client_secret},
+    load_principal: {Test.AuthZ.PrincipalStore, :load_principal}
+  """
+
+  @old_principal_store_fixture """
+  defmodule Test.AuthZ.PrincipalStore do
+    @behaviour AttestoPhoenix.PrincipalStore
+
+    @impl true
+    def load_principal(_subject_id), do: {:error, :not_found}
+
+    @impl true
+    def build_principal(_subject, _client, _scopes), do: %{}
+  end
+  """
+
   defp project do
     test_project(files: %{@router_path => @router_fixture})
   end
@@ -65,6 +114,11 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       # The AttestoPhoenix.Config skeleton is written under the host's otp_app.
       config = source_content(applied, @config_path)
       assert config =~ "config :test, AttestoPhoenix.Config"
+      assert config =~ "config :attesto_phoenix"
+      assert config =~ "otp_app: :test"
+      assert config =~ "repo: Test.Repo"
+      assert config =~ "audience:"
+      assert config =~ "principal_kinds: {Test.AuthZ.PrincipalStore, :principal_kinds}"
       assert config =~ "oauth_path_prefix: \"/oauth\""
       assert config =~ "code_store: AttestoPhoenix.Store.EctoCodeStore"
       assert config =~ "load_client: {Test.AuthZ.ClientStore, :load_client}"
@@ -72,13 +126,46 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       # The router gains the server scope mounting attesto_routes/1 and the use.
       router = source_content(applied, @router_path)
       assert router =~ "use AttestoPhoenix.Router"
-      assert router =~ "attesto_routes()"
+      assert router =~ "pipeline :attesto_phoenix_config do"
+      assert router =~ "plug(AttestoPhoenix.Plug.PutConfig, otp_app: :test)"
+      assert router =~ "attesto_routes(pipeline: :attesto_phoenix_config)"
 
       # A scaffolded module tags the behaviour and stubs each callback.
       client_store = source_content(applied, @client_store_path)
       assert client_store =~ "@behaviour AttestoPhoenix.ClientStore"
       assert client_store =~ "def load_client(_arg1) do"
       assert client_store =~ "def verify_client_secret(_arg1, _arg2) do"
+
+      principal_store = source_content(applied, @principal_store_path)
+      assert principal_store =~ "def principal_kinds() do"
+    end
+
+    test "generated config contains every value needed to build both configs" do
+      applied =
+        project()
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      evaluated = Config.Reader.eval!(@config_path, source_content(applied, @config_path))
+      host_options = evaluated |> Keyword.fetch!(:test) |> Keyword.fetch!(PhoenixConfig)
+      library_options = Keyword.fetch!(evaluated, :attesto_phoenix)
+
+      assert library_options[:otp_app] == :test
+      assert library_options[:repo] == Test.Repo
+
+      host_config =
+        PhoenixConfig.new(
+          Keyword.merge(host_options,
+            keystore: Keystore,
+            principal_kinds: [PrincipalKind.new("user", "usr_")],
+            load_client: fn _client_id -> {:error, :not_found} end,
+            verify_client_secret: fn _client, _secret -> false end,
+            load_principal: fn _subject -> {:error, :not_found} end
+          )
+        )
+
+      assert %PhoenixConfig{repo: Test.Repo} = host_config
+      assert %Attesto.Config{keystore: Keystore} = PhoenixConfig.to_attesto_config(host_config)
     end
 
     test "honors a relocated --oauth-path-prefix" do
@@ -88,7 +175,53 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
         |> apply_igniter!()
 
       assert source_content(applied, @config_path) =~ "oauth_path_prefix: \"/mcp/oauth\""
-      assert source_content(applied, @router_path) =~ "attesto_routes(prefix: \"/mcp\")"
+
+      assert source_content(applied, @router_path) =~
+               "attesto_routes(prefix: \"/mcp\", pipeline: :attesto_phoenix_config)"
+    end
+
+    test "repairs router output from installers that predate the config pipeline" do
+      applied =
+        test_project(files: %{@router_path => @old_installer_router_fixture})
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      router = source_content(applied, @router_path)
+      assert router =~ "pipeline :attesto_phoenix_config do"
+      assert router =~ "plug(AttestoPhoenix.Plug.PutConfig, otp_app: :test)"
+      assert router =~ "attesto_routes(pipeline: :attesto_phoenix_config)"
+    end
+
+    test "repairs required config omitted by older installer output" do
+      applied =
+        test_project(
+          files: %{
+            @router_path => @old_installer_router_fixture,
+            @config_path => @old_installer_config_fixture,
+            @principal_store_path => @old_principal_store_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      evaluated = Config.Reader.eval!(@config_path, source_content(applied, @config_path))
+      host_options = evaluated |> Keyword.fetch!(:test) |> Keyword.fetch!(PhoenixConfig)
+
+      assert Keyword.fetch!(host_options, :audience)
+
+      assert Keyword.fetch!(host_options, :principal_kinds) ==
+               {PrincipalStore, :principal_kinds}
+
+      assert evaluated[:attesto_phoenix][:otp_app] == :test
+      assert evaluated[:attesto_phoenix][:repo] == Test.Repo
+
+      principal_store = source_content(applied, @principal_store_path)
+      assert principal_store =~ "def principal_kinds do"
+      assert principal_store =~ "def load_principal(_subject_id)"
+
+      applied
+      |> Igniter.compose_task(@task, [])
+      |> assert_unchanged()
     end
   end
 

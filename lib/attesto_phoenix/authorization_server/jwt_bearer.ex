@@ -120,7 +120,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   @doc """
   Resolve verified ID-JAG claims to a local principal subject.
 
-  Required when the feature is enabled (`Config.validate!/1` enforces this), so
+  Required when the feature is enabled (configuration validation enforces this), so
   an unset callback is a configuration fault rather than a per-request denial.
   """
   @spec resolve_subject(Config.t(), IdentityAssertion.claims()) ::
