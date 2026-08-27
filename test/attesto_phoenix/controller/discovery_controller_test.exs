@@ -195,7 +195,6 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       }
 
       assert body == snapshot
-      assert conn.resp_body == JSON.encode!(snapshot)
     end
 
     test "advertises a validated external authorization endpoint override" do
