@@ -270,10 +270,11 @@ A code issued without a `family_id` — possible only when a host mints codes
 itself rather than through the authorization endpoint — is permanently
 ineligible. Neither its initial nor any refreshed access token carries the
 claim, so claim presence never changes within one family. Redemption may still
-create an internal refresh family, and refresh-token rotation and refresh-token
-reuse detection continue to revoke that family normally. Authorization-code
-replay, however, cannot revoke it: the code carries no `family_id` linking it to
-the descendant family, so there is nothing for reuse detection to match on. The
+create an internal refresh family. Refresh-token rotation continues normally,
+and refresh-token reuse detection continues to revoke that family.
+Authorization-code replay, however, cannot revoke it: the code carries no
+`family_id` linking it to the descendant family, so there is nothing for reuse
+detection to match on. The
 claim is a
 correlation handle, not proof that a refresh family exists or remains active.
 No migration is required because issuance reuses the existing `family_id`

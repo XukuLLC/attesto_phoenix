@@ -508,8 +508,9 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
   # The public grant-ID claim is eligible only when the ORIGINAL code carried a
   # usable family. A code without one still gets a core-generated internal
-  # refresh family (rotation and reuse revocation keep working), and that
-  # generated value must never be mistaken for eligibility on the first refresh.
+  # refresh family. Rotation continues normally and reuse detection can still
+  # revoke that family; the generated value must never be mistaken for
+  # eligibility on the first refresh.
   describe "authorization grant ID claim origin eligibility" do
     test "a code with a nil family_id omits the claim on the initial AND refreshed access tokens" do
       claim = "https://api.example.com/claims/oauth_grant_id"

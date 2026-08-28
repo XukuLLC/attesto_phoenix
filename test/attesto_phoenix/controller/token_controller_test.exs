@@ -1796,7 +1796,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       refute Map.has_key?(peek_claims(initial_body["access_token"]), @authorization_grant_id_claim)
 
       # The refresh family IS generated and persisted - only the public claim is
-      # gated. Rotation and reuse revocation keep working on a nil-origin grant.
+      # gated. Refresh rotation continues normally, and refresh reuse detection
+      # still revokes the family on a nil-origin grant.
       assert {:ok, initial_refresh} =
                EctoRefreshStore.get(Attesto.Secret.hash(initial_body["refresh_token"]))
 

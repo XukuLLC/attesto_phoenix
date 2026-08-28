@@ -1924,10 +1924,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # configuration cannot introduce a family claim that the initial token lacked.
   #
   # `family_id` is the ORIGINAL code's family, not the refresh family: a code
-  # that carried none still gets a core-generated internal refresh family, which
-  # refresh rotation and refresh reuse detection revoke normally - but which
-  # code replay cannot reach, since the code holds no id linking it to that
-  # family. Such a grant must stay permanently ineligible for the public claim.
+  # that carried none still gets a core-generated internal refresh family.
+  # Refresh rotation continues normally, and refresh reuse detection revokes
+  # that family. Code replay cannot reach it, since the code holds no ID linking
+  # it to that family. Such a grant must stay permanently ineligible for the
+  # public claim.
   # Gating the marker on the origin family is what stops the generated one from
   # being mistaken for eligibility on the first rotation.
   defp put_refresh_grant_provenance(context, config, grant_type, family_id) do
