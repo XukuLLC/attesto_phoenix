@@ -257,15 +257,24 @@ as the authorization code's `family_id`, and signs that exact value into the
 initial and refreshed access tokens. Refresh rotation and lost-response retry
 preserve the family ID while every access token receives a fresh `jti`.
 
-The library owns the value: host principal/code claims cannot replace it, and
-other grant types strip the configured claim instead of signing a fabricated or
-inherited value. An authorization-code grant that does not issue a refresh token
-still receives the access-token claim but creates no refresh row. A code issued
-without a `family_id` — possible only when a host mints codes itself rather than
-through the authorization endpoint — is permanently ineligible: it still starts
-an internal refresh family so rotation and reuse revocation keep working, but
-neither its initial nor any refreshed access token carries the claim, so claim
-presence never changes within one family. The claim is a
+Within access tokens the library owns the value: host principal/code claims
+cannot replace it, and other grant types strip the configured claim instead of
+signing a fabricated or inherited value. That ownership is access-token
+specific — `:build_id_token_claims` and `:build_userinfo_claims` are trusted
+host callbacks whose output is not filtered, so a host that stamps the same
+claim name into an ID Token or UserInfo response owns that value itself. An
+authorization-code grant that does not issue a refresh token still receives the
+access-token claim but creates no refresh row.
+
+A code issued without a `family_id` — possible only when a host mints codes
+itself rather than through the authorization endpoint — is permanently
+ineligible. Neither its initial nor any refreshed access token carries the
+claim, so claim presence never changes within one family. Redemption may still
+create an internal refresh family, and refresh-token rotation and refresh-token
+reuse detection continue to revoke that family normally. Authorization-code
+replay, however, cannot revoke it: the code carries no `family_id` linking it to
+the descendant family, so there is nothing for reuse detection to match on. The
+claim is a
 correlation handle, not proof that a refresh family exists or remains active.
 No migration is required because issuance reuses the existing `family_id`
 fields. Use a private claim name under a namespace you control; do not use OIDC

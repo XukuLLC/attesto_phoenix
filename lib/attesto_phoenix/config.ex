@@ -215,8 +215,13 @@ defmodule AttestoPhoenix.Config do
     * `:authorization_grant_id_claim` - optional access-token claim name for a
       stable, opaque authorization-code family identifier. When configured,
       authorization-code and descendant refresh access tokens carry the
-      authoritative `family_id`; all other grant types omit the claim. The
-      library strips a host-supplied value before signing. Disabled by default.
+      authoritative `family_id`; all other grant types omit the claim. A code
+      that carried no usable `family_id` is permanently ineligible: redemption
+      may still create an internal refresh family, but neither its initial nor
+      any refreshed access token carries the claim. Within access tokens the
+      library owns the value and strips a host-supplied one before signing;
+      ID Token and UserInfo callback output is host-owned and unfiltered.
+      Disabled by default.
     * `:build_userinfo_claims` - `(subject, granted_scopes, requested_claims ->
       claims_map)`. Produces the claim values the UserInfo endpoint
       (OpenID Connect Core §5.3) returns for the authenticated subject. The
