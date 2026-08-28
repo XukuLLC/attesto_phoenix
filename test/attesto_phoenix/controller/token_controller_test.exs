@@ -1772,6 +1772,52 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       refute retry_claims["jti"] in [initial_claims["jti"], rotated_claims["jti"]]
     end
 
+    @tag :ecto
+    test "a code with no family_id keeps the claim absent through rotation, while still starting a refresh family" do
+      enable_minting()
+
+      # No `family_id:` - `Attesto.AuthorizationCode.issue/2` never generates
+      # one, so this is the host-driven "code carried no family" state.
+      code_store = start_code_store("oc_sub-1", ["read", "offline_access"])
+
+      code_hash = Process.get(:auth_code) |> Attesto.Secret.hash()
+      assert {:ok, authorization} = code_store.get(code_hash)
+      assert is_nil(authorization.data.family_id)
+
+      put_config(
+        refresh_store: EctoRefreshStore,
+        code_store: code_store,
+        authorization_grant_id_claim: @authorization_grant_id_claim
+      )
+
+      initial = post_auth_code()
+      assert initial.status == 200
+      initial_body = body(initial)
+      refute Map.has_key?(peek_claims(initial_body["access_token"]), @authorization_grant_id_claim)
+
+      # The refresh family IS generated and persisted - only the public claim is
+      # gated. Rotation and reuse revocation keep working on a nil-origin grant.
+      assert {:ok, initial_refresh} =
+               EctoRefreshStore.get(Attesto.Secret.hash(initial_body["refresh_token"]))
+
+      assert is_binary(initial_refresh.family_id)
+      assert initial_refresh.family_id != ""
+
+      rotated =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "public-1",
+          "refresh_token" => initial_body["refresh_token"]
+        })
+
+      assert rotated.status == 200
+      rotated_claims = peek_claims(body(rotated)["access_token"])
+
+      # The generated refresh family must NOT be mistaken for eligibility.
+      refute Map.has_key?(rotated_claims, @authorization_grant_id_claim)
+      refute rotated_claims[@authorization_grant_id_claim] == initial_refresh.family_id
+    end
+
     test "ETS refresh rotation preserves authorization-code provenance and the family claim" do
       enable_minting()
       refresh_store = start_refresh_store()

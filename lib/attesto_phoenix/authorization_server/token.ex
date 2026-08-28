@@ -1155,7 +1155,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
       |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
       |> put_optional(:dpop_jkt, SenderConstraint.refresh_binding_jkt(config, client, binding))
-      |> put_refresh_grant_provenance(config, grant_type)
+      |> put_refresh_grant_provenance(config, grant_type, Map.get(grant, :family_id))
 
     # OAuth 2.0 Security BCP §4.13: mint the initial token into the code's
     # `family_id` so the spent code and its descendant tokens share one
@@ -1686,14 +1686,20 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     }
   end
 
-  defp authorization_grant_id_claims(config, family_id) when is_binary(family_id) and family_id != "" do
-    case Config.authorization_grant_id_claim(config) do
-      nil -> %{}
-      claim -> %{claim => family_id}
+  # The single eligibility rule for the public grant-ID claim: the ORIGINAL
+  # authorization code must have carried a usable family id. Initial emission
+  # and refresh provenance both consult this one predicate so the two can never
+  # disagree about whether a family is eligible.
+  defp eligible_grant_family_id?(family_id), do: is_binary(family_id) and family_id != ""
+
+  defp authorization_grant_id_claims(config, family_id) do
+    with true <- eligible_grant_family_id?(family_id),
+         claim when is_binary(claim) <- Config.authorization_grant_id_claim(config) do
+      %{claim => family_id}
+    else
+      _ -> %{}
     end
   end
-
-  defp authorization_grant_id_claims(_config, _family_id), do: %{}
 
   defp refresh_authorization_grant_id_claims(config, %{
          family_id: family_id,
@@ -1916,8 +1922,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # host principal/grant claims are never copied into this internal claims map.
   # If the feature is disabled when the family starts, omit the marker so later
   # configuration cannot introduce a family claim that the initial token lacked.
-  defp put_refresh_grant_provenance(context, config, grant_type) do
-    if Config.authorization_grant_id_claim(config) do
+  #
+  # `family_id` is the ORIGINAL code's family, not the refresh family: a code
+  # that carried none still gets a core-generated internal refresh family (so
+  # rotation and reuse revocation keep working), but it must stay permanently
+  # ineligible for the public claim. Gating the marker on the origin family is
+  # what stops the generated one from being mistaken for eligibility on the
+  # first rotation.
+  defp put_refresh_grant_provenance(context, config, grant_type, family_id) do
+    if Config.authorization_grant_id_claim(config) && eligible_grant_family_id?(family_id) do
       Map.put(context, :claims, %{@refresh_grant_type_claim => grant_type})
     else
       context
