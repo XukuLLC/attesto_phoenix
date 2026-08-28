@@ -45,6 +45,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       client_ciba_registration: fn client -> Map.get(client, :ciba, %{}) end,
       authenticate_ciba_user: fn _request -> {:ok, "user:alice"} end,
       ciba_store: Store,
+      replay_check: fn _key, _ttl -> :ok end,
       ciba: [enabled: true, require_signed_request: false]
     ]
     |> Keyword.merge(overrides)
@@ -199,6 +200,129 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
                )
     end
 
+    test "rejects a repeated signed request through the configured replay boundary" do
+      {jwk, pub_map} = es256_key()
+
+      client = %{
+        id: "cli-1",
+        jwks: %{"keys" => [pub_map]},
+        ciba: %{token_delivery_mode: :poll, request_signing_alg: "ES256"}
+      }
+
+      counter = :atomics.new(1, [])
+      parent = self()
+
+      replay_check = fn key, ttl ->
+        send(parent, {:ciba_replay_key, key, ttl})
+        if :atomics.add_get(counter, 1, 1) == 1, do: :ok, else: {:error, :replay}
+      end
+
+      config =
+        config(
+          ciba: [enabled: true, require_signed_request: true],
+          replay_check: replay_check
+        )
+
+      request = request(client, %{"request" => signed_request(jwk, signed_claims())})
+
+      assert {:ok, _ack} = BackchannelAuthentication.request(config, request)
+
+      assert {:error, %OAuthError{error: :invalid_request}} =
+               BackchannelAuthentication.request(config, request)
+
+      assert_receive {:ciba_replay_key, first_key, first_ttl}
+      assert_receive {:ciba_replay_key, second_key, second_ttl}
+      assert first_key == second_key
+      assert String.starts_with?(first_key, "ciba:")
+      assert byte_size(first_key) == 48
+      assert first_ttl in 1..300
+      assert second_ttl in 1..first_ttl
+    end
+
+    test "scopes bounded replay keys by client even for a long shared jti" do
+      shared_jti = String.duplicate("long-jti-", 512)
+      parent = self()
+
+      replay_check = fn key, _ttl ->
+        send(parent, {:client_scoped_replay_key, key})
+        :ok
+      end
+
+      config =
+        config(
+          ciba: [enabled: true, require_signed_request: true],
+          replay_check: replay_check
+        )
+
+      {first_jwk, first_public} = es256_key()
+      {second_jwk, second_public} = es256_key()
+
+      first_client = es256_client("client-one", first_public)
+      second_client = es256_client("client-two", second_public)
+
+      first_jwt =
+        signed_request(first_jwk, Map.put(signed_claims("client-one"), "jti", shared_jti))
+
+      second_jwt =
+        signed_request(second_jwk, Map.put(signed_claims("client-two"), "jti", shared_jti))
+
+      assert {:ok, _ack} =
+               BackchannelAuthentication.request(
+                 config,
+                 request(first_client, %{"request" => first_jwt})
+               )
+
+      assert {:ok, _ack} =
+               BackchannelAuthentication.request(
+                 config,
+                 request(second_client, %{"request" => second_jwt})
+               )
+
+      assert_receive {:client_scoped_replay_key, first_key}
+      assert_receive {:client_scoped_replay_key, second_key}
+      assert byte_size(first_key) == 48
+      assert byte_size(second_key) == 48
+      refute first_key == second_key
+    end
+
+    test "rejects an optional signed request when replay protection is unavailable" do
+      {jwk, pub_map} = es256_key()
+
+      client = %{
+        id: "cli-1",
+        jwks: %{"keys" => [pub_map]},
+        ciba: %{token_delivery_mode: :poll, request_signing_alg: "ES256"}
+      }
+
+      config = config(ciba: [enabled: true, require_signed_request: false], replay_check: nil)
+      request = request(client, %{"request" => signed_request(jwk, signed_claims())})
+
+      assert {:error, %OAuthError{error: :invalid_request}} =
+               BackchannelAuthentication.request(config, request)
+    end
+
+    test "raises a clear configuration error for an invalid replay callback result" do
+      {jwk, pub_map} = es256_key()
+
+      client = %{
+        id: "cli-1",
+        jwks: %{"keys" => [pub_map]},
+        ciba: %{token_delivery_mode: :poll, request_signing_alg: "ES256"}
+      }
+
+      config =
+        config(
+          ciba: [enabled: true, require_signed_request: true],
+          replay_check: fn _key, _ttl -> :unexpected end
+        )
+
+      request = request(client, %{"request" => signed_request(jwk, signed_claims())})
+
+      assert_raise ArgumentError, ~r/:replay_check must return :ok or/, fn ->
+        BackchannelAuthentication.request(config, request)
+      end
+    end
+
     test "rejects weak PS256 by default and preserves an explicit non-FAPI opt-in" do
       jwk = JOSE.JWK.generate_key({:rsa, 1024})
       client = signing_client(jwk, "PS256")
@@ -285,9 +409,17 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
     }
   end
 
-  defp signed_claims do
+  defp es256_client(id, public) do
     %{
-      "iss" => "cli-1",
+      id: id,
+      jwks: %{"keys" => [Map.put(public, "alg", "ES256")]},
+      ciba: %{token_delivery_mode: :poll, request_signing_alg: "ES256"}
+    }
+  end
+
+  defp signed_claims(client_id \\ "cli-1") do
+    %{
+      "iss" => client_id,
       "aud" => @issuer,
       "scope" => "openid",
       "login_hint" => "alice@example.test"

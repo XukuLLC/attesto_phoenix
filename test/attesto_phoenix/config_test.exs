@@ -131,6 +131,14 @@ defmodule AttestoPhoenix.ConfigTest do
     def wrong_arity, do: nil
   end
 
+  defmodule ReplayCallbacks do
+    @moduledoc false
+
+    def check(_key, _ttl), do: :ok
+    def check_with_partition(_key, _ttl, _partition), do: :ok
+    def wrong_arity(_key), do: :ok
+  end
+
   # The minimal required-key set. Required callbacks stay flat (this phase keeps
   # the flat keys as the required surface); overrides layer behaviour-module
   # keys or competing flat callbacks on top.
@@ -806,6 +814,14 @@ defmodule AttestoPhoenix.ConfigTest do
       end
     end
 
+    test "rejects a non-boolean signed-request policy at boot" do
+      for invalid <- [nil, "true", :yes, 1] do
+        assert_raise ArgumentError, ~r/ciba: \[:require_signed_request\] must be a boolean/, fn ->
+          config(ciba: [require_signed_request: invalid])
+        end
+      end
+    end
+
     test "an enforced CIBA list is limited to the FAPI-CIBA PS256/ES256 set" do
       for alg <- ["EdDSA", "Ed448"] do
         assert_raise ArgumentError, ~r/ciba: \[:request_signing_algs\].*outside.*FAPI-CIBA/s, fn ->
@@ -1042,7 +1058,8 @@ defmodule AttestoPhoenix.ConfigTest do
           ciba: [enabled: true, delivery_modes: [:ping]],
           ciba_store: EmptyModule,
           ciba_ping_http_client: EmptyModule,
-          authenticate_ciba_user: fn _request -> {:error, :not_found} end
+          authenticate_ciba_user: fn _request -> {:error, :not_found} end,
+          replay_check: fn _key, _ttl -> :ok end
         )
       end
     end
@@ -1062,6 +1079,59 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe "CIBA delivery-mode boot validation" do
+    test "requires replay protection when signed authentication requests are required" do
+      assert_raise ArgumentError,
+                   ~r/:replay_check is required when CIBA signed authentication requests are required/,
+                   fn ->
+                     config(
+                       ciba: [enabled: true, require_signed_request: true],
+                       ciba_store: EmptyModule,
+                       authenticate_ciba_user: fn _request -> {:error, :not_found} end
+                     )
+                   end
+
+      assert %Config{} =
+               config(
+                 ciba: [enabled: true, require_signed_request: true],
+                 ciba_store: EmptyModule,
+                 authenticate_ciba_user: fn _request -> {:error, :not_found} end,
+                 replay_check: fn _key, _ttl -> :ok end
+               )
+    end
+
+    test "allows an explicitly unsigned CIBA profile without replay storage" do
+      assert %Config{} =
+               config(
+                 ciba: [enabled: true, require_signed_request: false],
+                 ciba_store: EmptyModule,
+                 authenticate_ciba_user: fn _request -> {:error, :not_found} end
+               )
+    end
+
+    test "validates every configured replay callback before serving requests" do
+      invalid_callbacks = [
+        false,
+        :typo,
+        fn _key -> :ok end,
+        {ReplayCallbacks, :wrong_arity},
+        {EmptyModule, :check},
+        {Module.concat(__MODULE__, MissingReplayCallback), :check},
+        EmptyModule
+      ]
+
+      Enum.each(invalid_callbacks, fn replay_check ->
+        assert_raise ArgumentError, ~r/:replay_check must be a two-argument callback/, fn ->
+          config(replay_check: replay_check)
+        end
+      end)
+
+      assert %Config{} = config(replay_check: &ReplayCallbacks.check/2)
+      assert %Config{} = config(replay_check: {ReplayCallbacks, :check})
+
+      assert %Config{} =
+               config(replay_check: {ReplayCallbacks, :check_with_partition, [:primary]})
+    end
+
     test "rejects :push because no push deliverer is implemented" do
       assert_raise ArgumentError, ~r/CIBA :push delivery is not implemented/, fn ->
         config(

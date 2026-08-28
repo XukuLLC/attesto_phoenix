@@ -31,6 +31,19 @@ Wire a shared store that every node reads and writes:
 
         replay_check: &AttestoPhoenix.Store.EctoReplayCheck.check_and_record/2
 
+    The same callback records a fixed-length, client-scoped digest for each
+    signed CIBA authentication-request `jti`. A CIBA configuration that
+    requires signed requests fails when `AttestoPhoenix.Config` is constructed
+    without this boundary. An optional signed request also fails closed at
+    runtime when the callback is absent; plain requests in an explicitly
+    unsigned profile remain available.
+
+    When upgrading from `2.14.0`, do not mix old and new nodes while signed
+    CIBA requests remain live. Drain the old nodes and wait until every signed
+    request JWT they accepted has expired—conservatively 61 minutes—before
+    starting `2.14.1`, because the replay identity changed from a raw value to
+    the bounded client-scoped digest.
+
   * **Nonce store** - set `:nonce_store` to a shared
     `Attesto.DPoP.NonceStore` implementation. The library ships
     `AttestoPhoenix.Store.EctoNonceStore`:

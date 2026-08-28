@@ -39,7 +39,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
           repo: __MODULE__.StubRepo,
           load_client: fn _ -> {:error, :not_found} end,
           verify_client_secret: fn _, _ -> false end,
-          load_principal: fn _ -> {:error, :not_found} end
+          load_principal: fn _ -> {:error, :not_found} end,
+          replay_check: fn _key, _ttl -> :ok end
         ],
         overrides
       )

@@ -15,8 +15,8 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   3. validating the request via `Attesto.CIBA.Request.validate/3` (scope, the
      exactly-one-hint rule, `binding_message`, and - for FAPI-CIBA - the
      mandatory signed `request` JWT against the client's JWKS);
-  4. guarding a signed request's `jti` against replay when the host wired a
-     `:replay_check` seam (FAPI-CIBA §5.2.2 host obligation);
+  4. guarding every required signed request's `jti` against replay through the
+     host's explicit `:replay_check` seam (FAPI-CIBA §5.2.2);
   5. resolving the request's hint to an end-user through the host
      `:authenticate_ciba_user` callback (CIBA §7.1: the user is identified
      BEFORE the acknowledgement is returned) - which also verifies any
@@ -160,27 +160,50 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
 
   # FAPI-CIBA §5.2.2 replay defense: the core verifies a signed request's `jti`
   # / `exp` but is stateless by design, so the host MUST reject a repeated
-  # `jti` within the request's lifetime. This is opt-in hardening: when the host
-  # wired a `:replay_check` seam (the same store-backed callback the DPoP proof
-  # cache uses) we record the verified `request_jti` (namespaced so it never
-  # collides with a DPoP proof `jti`) until `request_exp`, and a repeat is
-  # `invalid_request`. A host that wired none, or a plain (unsigned) request with
-  # no `jti`, is not guarded here.
-  defp guard_replay(%Config{replay_check: nil}, _request), do: :ok
-
+  # `jti` within the request's lifetime. Record a fixed-length digest of the
+  # authenticated client identifier and verified `request_jti` (namespaced so
+  # it never collides with a DPoP proof key) until `request_exp`; a repeat is
+  # `invalid_request`. Scoping by client prevents one client from causing false
+  # replay collisions for another, while hashing bounds the shared-store key
+  # even when a signed JWT carries a very long `jti`. Config validation requires
+  # an explicit replay callback whenever signed requests are mandatory,
+  # avoiding a silently unsupervised or node-local fallback in a FAPI-CIBA
+  # deployment.
   defp guard_replay(_config, %CIBA.Request{signed?: false}), do: :ok
 
-  defp guard_replay(config, %CIBA.Request{request_jti: jti, request_exp: exp})
-       when is_binary(jti) and is_integer(exp) do
+  defp guard_replay(%Config{replay_check: nil}, %CIBA.Request{signed?: true}) do
+    {:error, error(:invalid_request, "signed authentication request replay protection is unavailable")}
+  end
+
+  defp guard_replay(config, %CIBA.Request{signed?: true, client_id: client_id, request_jti: jti, request_exp: exp})
+       when is_binary(client_id) and is_binary(jti) and is_integer(exp) do
     ttl = max(exp - System.system_time(:second), 1)
 
-    case Callback.to_fun2(config.replay_check).("ciba:" <> jti, ttl) do
-      :ok -> :ok
-      {:error, :replay} -> {:error, error(:invalid_request, "the signed authentication request was replayed")}
+    case Callback.to_fun2(config.replay_check).(ciba_replay_key(client_id, jti), ttl) do
+      :ok ->
+        :ok
+
+      {:error, :replay} ->
+        {:error, error(:invalid_request, "the signed authentication request was replayed")}
+
+      other ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: :replay_check must return :ok or " <>
+                "{:error, :replay}; got #{inspect(other)}"
     end
   end
 
-  defp guard_replay(_config, _request), do: :ok
+  defp guard_replay(_config, %CIBA.Request{signed?: true}) do
+    {:error, error(:invalid_request, "the signed authentication request has no replay identifier")}
+  end
+
+  # Length-prefix the client identifier so the pair encoding is unambiguous,
+  # then hash it to the same bounded base64url form used by other replay
+  # identities. The `ciba:` namespace keeps callback stores shared safely.
+  defp ciba_replay_key(client_id, jti) do
+    material = <<byte_size(client_id)::unsigned-big-64, client_id::binary, jti::binary>>
+    "ciba:" <> Base.url_encode64(:crypto.hash(:sha256, material), padding: false)
+  end
 
   # CIBA §7.1: resolve the request's hint to an end-user (the host owns the hint
   # format and the user directory) and verify any `user_code`. The host returns

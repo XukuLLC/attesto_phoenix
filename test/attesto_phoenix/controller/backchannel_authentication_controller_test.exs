@@ -60,6 +60,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
       authenticate_ciba_user: fn _ -> {:ok, "user:alice"} end,
       require_https: false,
       ciba_store: Store,
+      replay_check: fn _key, _ttl -> :ok end,
       ciba: [enabled: true, require_signed_request: false]
     ]
 

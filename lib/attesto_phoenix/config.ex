@@ -539,8 +539,12 @@ defmodule AttestoPhoenix.Config do
           fetcher's SSRF guard). Default `nil`.
         * `:blocked_hosts` - hostnames a CIMD `client_id` URL must never resolve
           through, checked before any network work. Default `[]`.
-    * `:replay_check` - DPoP `jti` replay check (module or `{module, fun}`).
-      Defaults to the single-node ETS replay cache.
+    * `:replay_check` - DPoP `jti` replay check as a two-argument function,
+      `{module, function}`, or `{module, function, extra_args}` callback.
+      DPoP defaults to the single-node ETS replay cache. CIBA configurations
+      that require signed authentication requests must set this explicitly so
+      request-JWT replay protection cannot be omitted or left unsupervised. An
+      optional signed request is rejected at runtime when this callback is nil.
     * `:nonce_store` - `Attesto.DPoP.NonceStore` implementation. Defaults to
       the single-node ETS nonce store.
     * `:presentation_session_store` - module implementing
@@ -882,7 +886,7 @@ defmodule AttestoPhoenix.Config do
           authorization_response_iss: boolean(),
           authorization_endpoint: String.t() | nil,
           userinfo_endpoint: String.t() | :derived | nil,
-          replay_check: callback() | module() | nil,
+          replay_check: callback() | nil,
           nonce_store: module() | nil,
           sweep_interval_ms: pos_integer() | nil,
           table_prefix: String.t() | nil,
@@ -2731,6 +2735,16 @@ defmodule AttestoPhoenix.Config do
                 "callback that resolves the request's login hint to a subject (and checks any user_code) — " <>
                 "the library cannot identify the end-user a backchannel request names. Or disable CIBA."
       end
+
+      if Keyword.get(ciba(config), :require_signed_request, true) == true and
+           is_nil(config.replay_check) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :replay_check is required when CIBA signed authentication " <>
+                "requests are required (ciba: [enabled: true, require_signed_request: true]). " <>
+                "Configure `{AttestoPhoenix.Store.EctoReplayCheck, :check_and_record}` for a " <>
+                "cluster-safe atomic replay boundary, or explicitly configure and supervise a " <>
+                "single-node implementation."
+      end
     end
   end
 
@@ -2966,6 +2980,7 @@ defmodule AttestoPhoenix.Config do
     validate_resource_indicators!(config)
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
+    validate_replay_check!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
@@ -3170,6 +3185,18 @@ defmodule AttestoPhoenix.Config do
       raise ArgumentError,
             "AttestoPhoenix.Config: :resource_metadata_resolver must be a one-argument " <>
               "callback in a supported form or nil; got #{inspect(resolver)}."
+    end
+  end
+
+  defp validate_replay_check!(%__MODULE__{replay_check: nil}), do: :ok
+
+  defp validate_replay_check!(%__MODULE__{replay_check: replay_check}) do
+    if callback_with_call_arity?(replay_check, 2) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :replay_check must be a two-argument callback " <>
+              "in a supported function or MFA form; got #{inspect(replay_check)}."
     end
   end
 
@@ -3468,6 +3495,13 @@ defmodule AttestoPhoenix.Config do
 
     ciba_opts = ciba(config)
     ciba_enforcement = Keyword.get(ciba_opts, :enforce_fapi_alg_policy)
+    ciba_require_signed_request = Keyword.get(ciba_opts, :require_signed_request)
+
+    if !is_boolean(ciba_require_signed_request) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: ciba: [:require_signed_request] must be a boolean; " <>
+              "got #{inspect(ciba_require_signed_request)}."
+    end
 
     if !is_boolean(ciba_enforcement) do
       raise ArgumentError,

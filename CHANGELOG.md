@@ -6,6 +6,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.14.1] - 2026-08-27
+
+### Security
+
+- CIBA configurations that require signed authentication requests now fail
+  when `AttestoPhoenix.Config` is constructed unless an explicit atomic
+  `:replay_check` callback is configured.
+  Replay identities derived from verified request-JWT `jti` values are recorded
+  through that boundary until their `exp`; a repeated signed request is
+  rejected as `invalid_request`. An optional signed request also fails closed
+  without that callback. Plain
+  requests in explicitly unsigned generic CIBA profiles remain compatible.
+- CIBA replay identities are now fixed-length digests scoped to the
+  authenticated client, preventing oversized store keys and cross-client
+  false replay collisions.
+- Configured replay callbacks are now validated during configuration
+  construction for a callable two-argument function or MFA contract, rather
+  than failing on the first protected request.
+- CIBA `:require_signed_request` now rejects non-boolean configuration values
+  during configuration construction so string or null environment values
+  cannot disable request signing.
+
+### Upgrade notes
+
+- Do not run `2.14.0` and `2.14.1` nodes together while accepting signed CIBA
+  authentication requests. Drain the `2.14.0` nodes and wait until every signed
+  request JWT accepted by them has expired—conservatively 61 minutes—before
+  starting `2.14.1`; the fixed replay identity introduced here is intentionally
+  different from the raw key used by `2.14.0`.
+
 ## [2.14.0] - 2026-08-27
 
 ### Added

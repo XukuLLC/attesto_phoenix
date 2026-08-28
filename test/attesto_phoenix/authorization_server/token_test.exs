@@ -847,6 +847,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
           # Required by config validation when CIBA is enabled (the token
           # endpoint itself never calls it - it is the backchannel endpoint's).
           authenticate_ciba_user: fn _request -> {:ok, "user-1"} end,
+          replay_check: fn _key, _ttl -> :ok end,
           authorize_scope: fn _client, requested -> {:ok, requested} end
         ] ++ overrides
       )

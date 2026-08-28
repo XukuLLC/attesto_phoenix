@@ -54,6 +54,7 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecisionTest do
       client_ciba_registration: fn c -> Map.get(c, :ciba, %{}) end,
       authenticate_ciba_user: fn _ -> {:ok, "user:alice"} end,
       ciba_store: Store,
+      replay_check: fn _key, _ttl -> :ok end,
       ciba_ping_http_client: StubPing,
       ciba: [enabled: true]
     ]

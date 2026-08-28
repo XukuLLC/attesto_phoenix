@@ -42,6 +42,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
           load_client: fn _ -> {:error, :not_found} end,
           verify_client_secret: fn _, _ -> false end,
           load_principal: fn _ -> {:error, :not_found} end,
+          replay_check: fn _key, _ttl -> :ok end,
           authorization_endpoint: @authorization_endpoint,
           userinfo_endpoint: @userinfo_endpoint,
           scopes_supported: ["profile", "email"],

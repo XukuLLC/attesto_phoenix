@@ -722,6 +722,15 @@ is treated as non-FAPI unless paired with `enforce_fapi_alg_policy: true`; this
 lets a generic deployment opt into additional algorithms without weakening a
 narrowed FAPI policy accidentally. An enforced FAPI-CIBA list is limited to
 `PS256` and `ES256`, as required by the profile.
+Because signed CIBA request JWTs carry replay-sensitive `jti` values, enabling
+the default signed-request policy also requires an explicit atomic
+`:replay_check`; the installer configures the cluster-safe Ecto implementation.
+The stored replay identity is a fixed-length digest scoped to the authenticated
+client, not the raw `jti`.
+An intentionally unsigned generic profile may opt out with
+`ciba: [enabled: true, require_signed_request: false]`; if that profile accepts
+an optional signed request, the request is still rejected unless a replay
+callback is configured.
 
 ### Device Authorization Grant (RFC 8628)
 
@@ -906,8 +915,11 @@ replay_check:  {AttestoPhoenix.Store.EctoReplayCheck, :check_and_record},
 par_store:     AttestoPhoenix.Store.EctoPARStore
 ```
 
-Single-node deployments may instead leave the defaults (in-memory ETS for
-nonces, replay, and PAR); the Ecto variants exist for clustered correctness.
+Single-node deployments may instead use the in-memory ETS implementations for
+nonces, replay, and PAR; the Ecto variants exist for clustered correctness.
+Signed CIBA still requires an explicit `:replay_check`, so a single-node host
+using ETS must supervise `Attesto.DPoP.ReplayCache` and point the callback at
+`&Attesto.DPoP.ReplayCache.check_and_record/2`.
 **PAR is the one to watch**: its default is single-node ETS, but FAPI 2.0
 *requires* PAR, so a clustered FAPI deployment must set
 `par_store: AttestoPhoenix.Store.EctoPARStore` or a pushed `request_uri` will not
