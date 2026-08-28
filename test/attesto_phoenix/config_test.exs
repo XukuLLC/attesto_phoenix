@@ -558,14 +558,27 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.authorization_grant_id_claim(config(authorization_grant_id_claim: claim)) == claim
     end
 
-    test "rejects empty, non-string, and reserved claim names" do
-      reserved =
+    test "rejects empty and non-string claim names" do
+      for invalid <- ["", :grant_id, 123, %{}] do
+        assert_raise ArgumentError, ~r/:authorization_grant_id_claim/, fn ->
+          config(authorization_grant_id_claim: invalid)
+        end
+      end
+    end
+
+    test "rejects registered and library-owned access-token claim names" do
+      reserved_claims =
         ~w(
-          iss aud exp iat nbf jti sub scope typ cnf acr auth_time principal_kind
-          client_id claims credential_configuration_ids sid
+          iss sub aud exp nbf iat jti
+          auth_time acr amr cnf client_id scope
+          name given_name family_name middle_name nickname preferred_username
+          profile picture website email email_verified gender birthdate zoneinfo
+          locale phone_number phone_number_verified address updated_at
+          roles groups entitlements act may_act authorization_details
+          typ principal_kind claims credential_configuration_ids sid
         )
 
-      for invalid <- ["", :grant_id, 123, %{}] ++ reserved do
+      for invalid <- reserved_claims do
         assert_raise ArgumentError, ~r/:authorization_grant_id_claim/, fn ->
           config(authorization_grant_id_claim: invalid)
         end

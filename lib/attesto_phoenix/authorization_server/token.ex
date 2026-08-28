@@ -83,6 +83,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # OpenID Connect CIBA Core 1.0 §10.1: the CIBA grant token request.
   @grant_ciba "urn:openid:params:grant-type:ciba"
 
+  # Library-owned refresh-context provenance. This is persisted inside the
+  # refresh token's opaque claims map so it survives store round-trips without
+  # becoming an access-token claim or requiring store/schema changes.
+  @refresh_grant_type_claim "attesto_phoenix.authorization_grant_type"
+
   # RFC 8628 §3.5: the polling errors that MUST be rendered with their own error
   # codes (NOT collapsed to invalid_grant) — clients depend on distinguishing
   # authorization_pending / slow_down from a terminal failure.
@@ -305,7 +310,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             authorization_grant_id_claims(config, rotated.family_id),
+             refresh_authorization_grant_id_claims(config, rotated),
              # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
              # (never re-stamped on rotation), so the refreshed access token
              # reports the real authentication event.
@@ -1150,6 +1155,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
       |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
       |> put_optional(:dpop_jkt, SenderConstraint.refresh_binding_jkt(config, client, binding))
+      |> put_refresh_grant_provenance(config, grant_type)
 
     # OAuth 2.0 Security BCP §4.13: mint the initial token into the code's
     # `family_id` so the spent code and its descendant tokens share one
@@ -1689,6 +1695,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp authorization_grant_id_claims(_config, _family_id), do: %{}
 
+  defp refresh_authorization_grant_id_claims(config, %{
+         family_id: family_id,
+         context: %{claims: %{@refresh_grant_type_claim => "authorization_code"}}
+       }) do
+    authorization_grant_id_claims(config, family_id)
+  end
+
+  defp refresh_authorization_grant_id_claims(_config, _rotated), do: %{}
+
   # The configured claim is protocol-owned. Unsupported grants pass no trusted
   # value and therefore remove any host-fabricated value; authorization-code and
   # refresh paths merge their authoritative family id after that removal.
@@ -1894,6 +1909,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case params[key] do
       value when is_binary(value) and value != "" -> value
       _ -> nil
+    end
+  end
+
+  # The marker is derived only from the library-controlled dispatch grant type;
+  # host principal/grant claims are never copied into this internal claims map.
+  # If the feature is disabled when the family starts, omit the marker so later
+  # configuration cannot introduce a family claim that the initial token lacked.
+  defp put_refresh_grant_provenance(context, config, grant_type) do
+    if Config.authorization_grant_id_claim(config) do
+      Map.put(context, :claims, %{@refresh_grant_type_claim => grant_type})
+    else
+      context
     end
   end
 

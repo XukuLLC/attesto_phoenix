@@ -686,6 +686,33 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.access_token, "sub") == "oc_user-1"
     end
 
+    test "initial and refreshed access tokens omit the configured authorization grant ID claim" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+
+      config =
+        device_config(
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: claim
+        )
+
+      %{device_code: dc, user_code: uc} = issue_device_code(["read"])
+      :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
+
+      assert {:ok, initial, _events} = Token.issue(config, device_request(config, dc))
+      assert is_binary(initial.refresh_token)
+      refute claim!(initial.access_token, claim)
+
+      refresh_request =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => initial.refresh_token}
+        )
+
+      assert {:ok, refreshed, _events} = Token.issue(config, refresh_request)
+      refute claim!(refreshed.access_token, claim)
+    end
+
     test "an authenticated snapshot redeems without a host client_id callback" do
       config = device_config(client_id: nil)
       %{device_code: dc, user_code: uc} = issue_device_code(["read"])
@@ -925,6 +952,33 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.id_token, "auth_time") == auth_time
       # RFC 9470: the access token carries acr for step-up enforcement.
       assert claim!(response.access_token, "acr") == "urn:mace:incommon:iap:silver"
+    end
+
+    test "initial and refreshed access tokens omit the configured authorization grant ID claim" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+
+      config =
+        ciba_config(
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: claim
+        )
+
+      %{auth_req_id: arid} = issue_ciba(["openid"])
+      {:ok, _} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, arid, %{subject: "user-1", scope: ["openid"]})
+
+      assert {:ok, initial, _events} = Token.issue(config, ciba_request(config, arid))
+      assert is_binary(initial.refresh_token)
+      refute claim!(initial.access_token, claim)
+
+      refresh_request =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => initial.refresh_token}
+        )
+
+      assert {:ok, refreshed, _events} = Token.issue(config, refresh_request)
+      refute claim!(refreshed.access_token, claim)
     end
 
     test "an authenticated snapshot binds CIBA access and ID Tokens without a host callback" do

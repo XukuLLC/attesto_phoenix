@@ -3044,10 +3044,25 @@ defmodule AttestoPhoenix.Config do
     config
   end
 
-  @authorization_grant_id_claim_conflicts ~w(
-    iss aud exp iat nbf jti sub scope typ cnf acr auth_time principal_kind
-    client_id claims credential_configuration_ids sid
+  # RFC 9068 §2.2 access-token claims, including its referenced OIDC identity
+  # and authorization claim names, plus OAuth extensions used in access tokens:
+  # RFC 7800 `cnf`, RFC 8693 `act`/`may_act`, and RFC 9396
+  # `authorization_details`.
+  @registered_access_token_claims ~w(
+    iss sub aud exp nbf iat jti
+    auth_time acr amr cnf client_id scope
+    name given_name family_name middle_name nickname preferred_username
+    profile picture website email email_verified gender birthdate zoneinfo
+    locale phone_number phone_number_verified address updated_at
+    roles groups entitlements act may_act authorization_details
   )
+
+  @library_owned_access_token_claims ~w(
+    typ principal_kind claims credential_configuration_ids sid
+  )
+
+  @authorization_grant_id_claim_conflicts @registered_access_token_claims ++
+                                            @library_owned_access_token_claims
 
   defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: nil}), do: :ok
 

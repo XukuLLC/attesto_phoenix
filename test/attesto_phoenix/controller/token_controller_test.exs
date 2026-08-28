@@ -1772,6 +1772,34 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       refute retry_claims["jti"] in [initial_claims["jti"], rotated_claims["jti"]]
     end
 
+    test "ETS refresh rotation preserves authorization-code provenance and the family claim" do
+      enable_minting()
+      refresh_store = start_refresh_store()
+      family_id = "DDDDDDDDDDDDDDDDDDDDDD"
+      code_store = start_code_store("oc_sub-1", ["read", "offline_access"], family_id: family_id)
+
+      put_config(
+        refresh_store: refresh_store,
+        code_store: code_store,
+        authorization_grant_id_claim: @authorization_grant_id_claim
+      )
+
+      initial = post_auth_code()
+      assert initial.status == 200
+      initial_body = body(initial)
+      assert peek_claims(initial_body["access_token"])[@authorization_grant_id_claim] == family_id
+
+      rotated =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "public-1",
+          "refresh_token" => initial_body["refresh_token"]
+        })
+
+      assert rotated.status == 200
+      assert peek_claims(body(rotated)["access_token"])[@authorization_grant_id_claim] == family_id
+    end
+
     test "access-only authorization codes get the claim without a refresh row" do
       enable_minting()
       start_refresh_store()
