@@ -10,6 +10,10 @@ defmodule AttestoPhoenix.ConsumerWithoutReq do
   defmodule Store do
   end
 
+  # This script constructs configurations only. If a request ever reaches this
+  # placeholder, fail closed instead of pretending to provide replay storage.
+  def replay_check(_key, _ttl), do: raise("minimum-consumer replay callback was invoked")
+
   def config(overrides \\ []) do
     base = [
       issuer: "https://issuer.example",
@@ -107,6 +111,7 @@ Consumer.config(
 Consumer.config(
   ciba: [enabled: true, delivery_modes: [:poll]],
   ciba_store: Consumer.Store,
+  replay_check: {Consumer, :replay_check},
   authenticate_ciba_user: fn _request -> {:error, :not_found} end
 )
 
@@ -144,6 +149,7 @@ Consumer.assert_req_failure!(
   "ciba_ping_http_client: ...",
   ciba: [enabled: true, delivery_modes: [:ping]],
   ciba_store: Consumer.Store,
+  replay_check: {Consumer, :replay_check},
   authenticate_ciba_user: fn _request -> {:error, :not_found} end
 )
 
@@ -165,6 +171,7 @@ Consumer.config(
   terminate_session: fn _conn, _params -> :ok end,
   ciba: [enabled: true, delivery_modes: [:ping]],
   ciba_store: Consumer.Store,
+  replay_check: {Consumer, :replay_check},
   ciba_ping_http_client: Consumer.Adapter,
   authenticate_ciba_user: fn _request -> {:error, :not_found} end,
   jwt_bearer: [
