@@ -12,7 +12,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   Host policy is supplied as a real `%AttestoPhoenix.Config{}` resolved from
   the application environment, exactly as a deployment supplies it, so no live
-  datastore is required.
+  datastore is required for the default suite. The encrypted refresh-retry case
+  is tagged `:ecto` and runs against the test repository.
   """
   use ExUnit.Case, async: false
 
@@ -23,6 +24,9 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   alias Attesto.CodeStore.ETS
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.Controller.TokenController
+  alias AttestoPhoenix.Schema.RefreshToken
+  alias AttestoPhoenix.Store.EctoRefreshStore
+  alias Ecto.Adapters.SQL.Sandbox
   alias Plug.Conn.Unfetched
 
   @endpoint_path "/oauth/token"
@@ -33,6 +37,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   @code_verifier "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
   @code_challenge "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
   @redirect_uri "https://client.example/cb"
+  @authorization_grant_id_claim "https://api.example.com/claims/oauth_grant_id"
 
   # A throwaway RSA keypair generated once for this test module. Used by the
   # paths that actually mint a token (public-client success, mTLS binding,
@@ -165,9 +170,14 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   @public_client %{id: "public-1", public?: true}
   @confidential_client %{id: "confidential-1", secret: "s3cr3t"}
 
-  setup do
+  setup context do
     Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @signing_pem)
     on_exit(fn -> Application.delete_env(:attesto_phoenix, __MODULE__.Keystore) end)
+
+    if context[:ecto] do
+      owner = Sandbox.start_owner!(AttestoPhoenix.TestRepo, shared: true)
+      on_exit(fn -> Sandbox.stop_owner(owner) end)
+    end
 
     # The CIMD cache outlives the process that created it, so a document cached
     # by an earlier case would otherwise be served here — and the CIMD cases
@@ -1583,13 +1593,17 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   describe "token exchange grant (RFC 8693)" do
     test "exchanges an Attesto access token into a downscoped access token" do
       enable_minting()
+      put_config(authorization_grant_id_claim: @authorization_grant_id_claim)
 
       {:ok, %{access_token: subject_token}} =
         Attesto.Token.mint(attesto_config(), %{
           kind: "client",
           sub: "oc_subject",
           scopes: ["documents.read", "documents.write"],
-          claims: %{"client_id" => "subject-client"}
+          claims: %{
+            "client_id" => "subject-client",
+            @authorization_grant_id_claim => "subject-token-spoof"
+          }
         })
 
       conn =
@@ -1609,6 +1623,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert {:ok, claims} = Attesto.Token.verify(attesto_config(), response["access_token"])
       assert claims["sub"] == "oc_subject"
       assert claims["scope"] == "documents.read"
+      refute Map.has_key?(claims, @authorization_grant_id_claim)
     end
 
     test "rejects a requested scope beyond the subject token (RFC 8693 §2.1)" do
@@ -1682,6 +1697,205 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client"
+    end
+  end
+
+  describe "authorization-grant ID claim" do
+    @tag :ecto
+    test "matches the authorization and refresh family through rotation and retry" do
+      enable_minting()
+      family_id = "AAAAAAAAAAAAAAAAAAAAAA"
+
+      code_store =
+        start_code_store("oc_sub-1", ["read", "offline_access"],
+          family_id: family_id,
+          claims: %{@authorization_grant_id_claim => "code-spoof"}
+        )
+
+      code_hash = Process.get(:auth_code) |> Attesto.Secret.hash()
+      assert {:ok, authorization} = code_store.get(code_hash)
+      assert authorization.data.family_id == family_id
+
+      put_config(
+        refresh_store: EctoRefreshStore,
+        code_store: code_store,
+        authorization_grant_id_claim: @authorization_grant_id_claim,
+        build_principal: fn _client, subject, scope ->
+          %{
+            kind: "client",
+            sub: ensure_sub(subject),
+            scopes: scope,
+            claims: %{@authorization_grant_id_claim => "principal-spoof"}
+          }
+        end
+      )
+
+      initial = post_auth_code()
+      assert initial.status == 200
+      initial_body = body(initial)
+      initial_claims = peek_claims(initial_body["access_token"])
+      assert initial_claims[@authorization_grant_id_claim] == family_id
+
+      assert {:ok, initial_refresh} =
+               EctoRefreshStore.get(Attesto.Secret.hash(initial_body["refresh_token"]))
+
+      assert initial_refresh.family_id == family_id
+
+      refresh_params = %{
+        "grant_type" => "refresh_token",
+        "client_id" => "public-1",
+        "refresh_token" => initial_body["refresh_token"]
+      }
+
+      rotated = post_token(refresh_params)
+      assert rotated.status == 200
+      rotated_body = body(rotated)
+      rotated_claims = peek_claims(rotated_body["access_token"])
+      assert rotated_claims[@authorization_grant_id_claim] == family_id
+      refute rotated_claims["jti"] == initial_claims["jti"]
+
+      parent =
+        AttestoPhoenix.TestRepo.get_by!(RefreshToken,
+          token_hash: Attesto.Secret.hash(initial_body["refresh_token"])
+        )
+
+      assert %{"v" => 1, "ciphertext" => ciphertext} = parent.successor
+      assert is_binary(ciphertext)
+      refute inspect(parent.successor) =~ rotated_body["refresh_token"]
+
+      retry = post_token(refresh_params)
+      assert retry.status == 200
+      retry_body = body(retry)
+      retry_claims = peek_claims(retry_body["access_token"])
+      assert retry_body["refresh_token"] == rotated_body["refresh_token"]
+      assert retry_claims[@authorization_grant_id_claim] == family_id
+      refute retry_claims["jti"] in [initial_claims["jti"], rotated_claims["jti"]]
+    end
+
+    @tag :ecto
+    test "a code with no family_id keeps the claim absent through rotation, while still starting a refresh family" do
+      enable_minting()
+
+      # No `family_id:` - `Attesto.AuthorizationCode.issue/2` never generates
+      # one, so this is the host-driven "code carried no family" state.
+      code_store = start_code_store("oc_sub-1", ["read", "offline_access"])
+
+      code_hash = Process.get(:auth_code) |> Attesto.Secret.hash()
+      assert {:ok, authorization} = code_store.get(code_hash)
+      assert is_nil(authorization.data.family_id)
+
+      put_config(
+        refresh_store: EctoRefreshStore,
+        code_store: code_store,
+        authorization_grant_id_claim: @authorization_grant_id_claim
+      )
+
+      initial = post_auth_code()
+      assert initial.status == 200
+      initial_body = body(initial)
+      refute Map.has_key?(peek_claims(initial_body["access_token"]), @authorization_grant_id_claim)
+
+      # The refresh family IS generated and persisted - only the public claim is
+      # gated. Refresh rotation continues normally, and refresh reuse detection
+      # still revokes the family on a nil-origin grant.
+      assert {:ok, initial_refresh} =
+               EctoRefreshStore.get(Attesto.Secret.hash(initial_body["refresh_token"]))
+
+      assert is_binary(initial_refresh.family_id)
+      assert initial_refresh.family_id != ""
+
+      rotated =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "public-1",
+          "refresh_token" => initial_body["refresh_token"]
+        })
+
+      assert rotated.status == 200
+      rotated_claims = peek_claims(body(rotated)["access_token"])
+
+      # The generated refresh family must NOT be mistaken for eligibility.
+      refute Map.has_key?(rotated_claims, @authorization_grant_id_claim)
+      refute rotated_claims[@authorization_grant_id_claim] == initial_refresh.family_id
+    end
+
+    test "ETS refresh rotation preserves authorization-code provenance and the family claim" do
+      enable_minting()
+      refresh_store = start_refresh_store()
+      family_id = "DDDDDDDDDDDDDDDDDDDDDD"
+      code_store = start_code_store("oc_sub-1", ["read", "offline_access"], family_id: family_id)
+
+      put_config(
+        refresh_store: refresh_store,
+        code_store: code_store,
+        authorization_grant_id_claim: @authorization_grant_id_claim
+      )
+
+      initial = post_auth_code()
+      assert initial.status == 200
+      initial_body = body(initial)
+      assert peek_claims(initial_body["access_token"])[@authorization_grant_id_claim] == family_id
+
+      rotated =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "public-1",
+          "refresh_token" => initial_body["refresh_token"]
+        })
+
+      assert rotated.status == 200
+      assert peek_claims(body(rotated)["access_token"])[@authorization_grant_id_claim] == family_id
+    end
+
+    test "access-only authorization codes get the claim without a refresh row" do
+      enable_minting()
+      start_refresh_store()
+      family_id = "BBBBBBBBBBBBBBBBBBBBBB"
+      code_store = start_code_store("oc_sub-1", ["read"], family_id: family_id)
+
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: code_store,
+        authorization_grant_id_claim: @authorization_grant_id_claim,
+        issue_refresh_token?: fn _client, _scope -> false end
+      )
+
+      response = post_auth_code()
+      assert response.status == 200
+      response_body = body(response)
+      assert peek_claims(response_body["access_token"])[@authorization_grant_id_claim] == family_id
+      refute Map.has_key?(response_body, "refresh_token")
+      assert :ets.tab2list(Attesto.RefreshStore.ETS) == []
+    end
+
+    test "is not emitted when unconfigured" do
+      enable_minting()
+      code_store = start_code_store("oc_sub-1", ["read"], family_id: "CCCCCCCCCCCCCCCCCCCCCC")
+      put_config(code_store: code_store)
+
+      response = post_auth_code()
+      assert response.status == 200
+      refute Map.has_key?(peek_claims(body(response)["access_token"]), @authorization_grant_id_claim)
+    end
+
+    test "unsupported grants strip a host-fabricated value" do
+      enable_minting()
+
+      put_config(
+        authorization_grant_id_claim: @authorization_grant_id_claim,
+        build_principal: fn _client, subject, scope ->
+          %{
+            kind: "client",
+            sub: ensure_sub(subject),
+            scopes: scope,
+            claims: %{@authorization_grant_id_claim => "principal-spoof"}
+          }
+        end
+      )
+
+      response = post_token(client_credentials_params())
+      assert response.status == 200
+      refute Map.has_key?(peek_claims(body(response)["access_token"]), @authorization_grant_id_claim)
     end
   end
 
@@ -2422,18 +2636,24 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   end
 
   # A pre-seeded code store: redeeming the issued code returns the given grant.
-  defp start_code_store(subject, scope) do
+  defp start_code_store(subject, scope, opts \\ []) do
     store = ensure_started(ETS)
 
+    attrs =
+      Map.merge(
+        %{
+          client_id: "public-1",
+          redirect_uri: @redirect_uri,
+          scope: scope,
+          subject: subject,
+          code_challenge: @code_challenge,
+          code_challenge_method: "S256"
+        },
+        Map.new(opts)
+      )
+
     {:ok, code} =
-      Attesto.AuthorizationCode.issue(store, %{
-        client_id: "public-1",
-        redirect_uri: @redirect_uri,
-        scope: scope,
-        subject: subject,
-        code_challenge: @code_challenge,
-        code_challenge_method: "S256"
-      })
+      Attesto.AuthorizationCode.issue(store, attrs)
 
     Process.put(:auth_code, code)
     store

@@ -212,6 +212,16 @@ defmodule AttestoPhoenix.Config do
       The protocol layer injects the authenticated OAuth `client_id` claim
       required by RFC 9068; the callback may omit it or return the same value,
       but a conflicting value fails issuance.
+    * `:authorization_grant_id_claim` - optional access-token claim name for a
+      stable, opaque authorization-code family identifier. When configured,
+      authorization-code and descendant refresh access tokens carry the
+      authoritative `family_id`; all other grant types omit the claim. A code
+      that carried no usable `family_id` is permanently ineligible: redemption
+      may still create an internal refresh family, but neither its initial nor
+      any refreshed access token carries the claim. Within access tokens the
+      library owns the value and strips a host-supplied one before signing;
+      ID Token and UserInfo callback output is host-owned and unfiltered.
+      Disabled by default.
     * `:build_userinfo_claims` - `(subject, granted_scopes, requested_claims ->
       claims_map)`. Produces the claim values the UserInfo endpoint
       (OpenID Connect Core §5.3) returns for the authenticated subject. The
@@ -705,6 +715,7 @@ defmodule AttestoPhoenix.Config do
     :introspection_authorize,
     :principal_kinds,
     :build_principal,
+    :authorization_grant_id_claim,
     :build_userinfo_claims,
     :build_credential,
     :build_deferred_credential,
@@ -860,6 +871,7 @@ defmodule AttestoPhoenix.Config do
           introspection_authorize: callback() | nil,
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
           build_principal: callback() | nil,
+          authorization_grant_id_claim: String.t() | nil,
           build_userinfo_claims: callback() | nil,
           build_credential: callback() | nil,
           build_deferred_credential: callback() | nil,
@@ -1532,6 +1544,10 @@ defmodule AttestoPhoenix.Config do
   @doc "The OpenID Federation entity-type metadata map, or `nil`."
   @spec federation_entity_metadata(t()) :: map() | nil
   def federation_entity_metadata(%__MODULE__{federation_entity_metadata: metadata}), do: metadata
+
+  @doc "The configured authorization-grant ID access-token claim, or `nil` when disabled."
+  @spec authorization_grant_id_claim(t()) :: String.t() | nil
+  def authorization_grant_id_claim(%__MODULE__{authorization_grant_id_claim: claim}), do: claim
 
   @doc """
   The RFC 8628 §3.2 verification URI shown to the user: the configured
@@ -2981,6 +2997,7 @@ defmodule AttestoPhoenix.Config do
     validate_resource_metadata!(config)
     validate_resource_metadata_resolver!(config)
     validate_replay_check!(config)
+    validate_authorization_grant_id_claim!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
@@ -3030,6 +3047,45 @@ defmodule AttestoPhoenix.Config do
     validate_native_apps!(config)
 
     config
+  end
+
+  # RFC 9068 §2.2 access-token claims, including its referenced OIDC identity
+  # and authorization claim names, plus OAuth extensions used in access tokens:
+  # RFC 7800 `cnf`, RFC 8693 `act`/`may_act`, and RFC 9396
+  # `authorization_details`.
+  @registered_access_token_claims ~w(
+    iss sub aud exp nbf iat jti
+    auth_time acr amr cnf client_id scope
+    name given_name family_name middle_name nickname preferred_username
+    profile picture website email email_verified gender birthdate zoneinfo
+    locale phone_number phone_number_verified address updated_at
+    roles groups entitlements act may_act authorization_details
+  )
+
+  @library_owned_access_token_claims ~w(
+    typ principal_kind claims credential_configuration_ids sid
+  )
+
+  @authorization_grant_id_claim_conflicts @registered_access_token_claims ++
+                                            @library_owned_access_token_claims
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: nil}), do: :ok
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: claim})
+       when is_binary(claim) and claim != "" do
+    if claim in @authorization_grant_id_claim_conflicts do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :authorization_grant_id_claim #{inspect(claim)} collides " <>
+              "with a protocol- or library-owned claim"
+    end
+
+    :ok
+  end
+
+  defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: claim}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :authorization_grant_id_claim must be nil or a non-empty " <>
+            "string; got #{inspect(claim)}"
   end
 
   defp validate_mtls_client_auth!(%__MODULE__{} = config) do

@@ -677,8 +677,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # generated per issued code. `Attesto.AuthorizationCode` rides it onto the
   # redeemed grant so the token endpoint mints the refresh-token family under
   # this id, and code-reuse detection replays it to revoke the descendant
-  # family. Generated with the same secret generator the codes themselves use.
-  defp generate_family_id, do: Secret.generate()
+  # family. Sixteen random bytes match the refresh-family identifiers generated
+  # by `Attesto.RefreshToken` and encode to 22 unpadded Base64URL characters.
+  defp generate_family_id, do: Secret.generate(16)
 
   # RFC 9449 §10: the DPoP key thumbprint the issued code is sender-constrained
   # to. Two sources, by path:

@@ -1517,13 +1517,18 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   # ── family_id (OAuth 2.0 Security BCP §4.13 / §4.14) ───────────────────────
 
   describe "family_id" do
-    test "a non-empty family_id is threaded into the issued code" do
+    test "a canonical 16-byte family_id is threaded into the issued code" do
       conn = call(valid_params())
       code = location_query(conn)["code"]
 
       record = TestStore.peek(code)
-      assert is_binary(record.data.family_id)
-      assert record.data.family_id != ""
+      family_id = record.data.family_id
+
+      assert byte_size(family_id) == 22
+      assert family_id =~ ~r/\A[A-Za-z0-9_-]{22}\z/
+      assert {:ok, decoded} = Base.url_decode64(family_id, padding: false)
+      assert byte_size(decoded) == 16
+      assert Base.url_encode64(decoded, padding: false) == family_id
     end
 
     test "each issued code gets a distinct family_id" do

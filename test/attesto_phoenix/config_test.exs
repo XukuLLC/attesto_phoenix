@@ -550,6 +550,42 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe ":authorization_grant_id_claim" do
+    test "is disabled by default and exposes a configured claim name" do
+      assert Config.authorization_grant_id_claim(config()) == nil
+
+      claim = "https://api.example.com/claims/oauth_grant_id"
+      assert Config.authorization_grant_id_claim(config(authorization_grant_id_claim: claim)) == claim
+    end
+
+    test "rejects empty and non-string claim names" do
+      for invalid <- ["", :grant_id, 123, %{}] do
+        assert_raise ArgumentError, ~r/:authorization_grant_id_claim/, fn ->
+          config(authorization_grant_id_claim: invalid)
+        end
+      end
+    end
+
+    test "rejects registered and library-owned access-token claim names" do
+      reserved_claims =
+        ~w(
+          iss sub aud exp nbf iat jti
+          auth_time acr amr cnf client_id scope
+          name given_name family_name middle_name nickname preferred_username
+          profile picture website email email_verified gender birthdate zoneinfo
+          locale phone_number phone_number_verified address updated_at
+          roles groups entitlements act may_act authorization_details
+          typ principal_kind claims credential_configuration_ids sid
+        )
+
+      for invalid <- reserved_claims do
+        assert_raise ArgumentError, ~r/:authorization_grant_id_claim/, fn ->
+          config(authorization_grant_id_claim: invalid)
+        end
+      end
+    end
+  end
+
   describe ":audience boot gate (RFC 9068 §3 aud)" do
     # The required-key/capability checks all pass here; only :audience is
     # missing, so this isolates the audience gate from the other boot checks.

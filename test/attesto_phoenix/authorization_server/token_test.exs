@@ -119,6 +119,52 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     ETS
   end
 
+  # A code carrying an explicit `family_id`. `Attesto.AuthorizationCode.issue/2`
+  # never generates one, so `start_code_store/2` above yields `family_id: nil`;
+  # this variant is how a test opts into a real authorization-code family.
+  defp start_code_store_with_family(subject, scope, family_id) do
+    case start_supervised(ETS) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
+    end
+
+    ETS.reset()
+
+    {:ok, code} =
+      Attesto.AuthorizationCode.issue(ETS, %{
+        client_id: "client-1",
+        redirect_uri: @redirect_uri,
+        scope: scope,
+        subject: subject,
+        code_challenge: @code_challenge,
+        code_challenge_method: "S256",
+        family_id: family_id
+      })
+
+    Process.put(:auth_code, code)
+    ETS
+  end
+
+  defp grant_id_code_request(config) do
+    request(config,
+      request_client_id: "client-1",
+      grant_type: "authorization_code",
+      params: %{
+        "code" => Process.get(:auth_code),
+        "code_verifier" => @code_verifier,
+        "redirect_uri" => @redirect_uri
+      }
+    )
+  end
+
+  defp grant_id_refresh_request(config, refresh_token) do
+    request(config,
+      request_client_id: "client-1",
+      grant_type: "refresh_token",
+      params: %{"refresh_token" => refresh_token}
+    )
+  end
+
   # A code carrying the RFC 9470 authentication context the authorize controller
   # would have recorded (acr/auth_time in the code's claims).
   defp start_code_store_with_auth_context(subject, scope, acr, auth_time) do
@@ -460,6 +506,99 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     end
   end
 
+  # The public grant-ID claim is eligible only when the ORIGINAL code carried a
+  # usable family. A code without one still gets a core-generated internal
+  # refresh family. Rotation continues normally and reuse detection can still
+  # revoke that family; the generated value must never be mistaken for
+  # eligibility on the first refresh.
+  describe "authorization grant ID claim origin eligibility" do
+    test "a code with a nil family_id omits the claim on the initial AND refreshed access tokens" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+
+      config =
+        config(
+          code_store: start_code_store_with_family("oc_user-1", ["openid", "offline_access"], nil),
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: claim
+        )
+
+      assert {:ok, initial, _events} = Token.issue(config, grant_id_code_request(config))
+      refute claim!(initial.access_token, claim)
+
+      # The refresh token still issues - only the public claim is gated.
+      assert is_binary(initial.refresh_token)
+
+      assert {:ok, refreshed, _events} =
+               Token.issue(config, grant_id_refresh_request(config, initial.refresh_token))
+
+      refute claim!(refreshed.access_token, claim)
+    end
+
+    # `""` cannot reach the token endpoint through `Attesto.AuthorizationCode`:
+    # it is rejected at issuance, so `nil` is the only reachable "no family"
+    # state for a library-issued code. The empty-string arm of
+    # `eligible_grant_family_id?/1` therefore defends the custom-code-store
+    # path, where a host's `take/1` can hand back any binary it likes.
+    test "an empty family_id is refused at code issuance, so only a custom store can produce one" do
+      assert {:error, :invalid_family_id} =
+               Attesto.AuthorizationCode.issue(ETS, %{
+                 client_id: "client-1",
+                 redirect_uri: @redirect_uri,
+                 scope: ["openid"],
+                 subject: "oc_user-1",
+                 code_challenge: @code_challenge,
+                 code_challenge_method: "S256",
+                 family_id: ""
+               })
+    end
+
+    test "a code with a family_id carries that same claim on the initial AND refreshed access tokens" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+
+      config =
+        config(
+          code_store: start_code_store_with_family("oc_user-1", ["openid", "offline_access"], "fam-1"),
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: claim
+        )
+
+      assert {:ok, initial, _events} = Token.issue(config, grant_id_code_request(config))
+      assert claim!(initial.access_token, claim) == "fam-1"
+
+      assert {:ok, refreshed, _events} =
+               Token.issue(config, grant_id_refresh_request(config, initial.refresh_token))
+
+      assert claim!(refreshed.access_token, claim) == "fam-1"
+    end
+
+    test "a family started while the feature was disabled stays ineligible once it is enabled" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+      code_store = start_code_store_with_family("oc_user-1", ["openid", "offline_access"], "fam-1")
+      refresh_store = start_refresh_store()
+
+      disabled =
+        config(
+          code_store: code_store,
+          refresh_store: refresh_store,
+          issue_refresh_token?: fn _client, _scope -> true end
+        )
+
+      assert {:ok, initial, _events} = Token.issue(disabled, grant_id_code_request(disabled))
+      refute claim!(initial.access_token, claim)
+
+      # Enabled only after the family started: the provenance marker was never
+      # written, so no rotation in this family may introduce the claim.
+      enabled = %{disabled | authorization_grant_id_claim: claim}
+
+      assert {:ok, refreshed, _events} =
+               Token.issue(enabled, grant_id_refresh_request(enabled, initial.refresh_token))
+
+      refute claim!(refreshed.access_token, claim)
+    end
+  end
+
   describe "OID4VCI authorization_details on the authorization_code grant" do
     test "a code carrying openid_credential authorization_details mints an access token entitled to them, and the response echoes authorization_details" do
       code_store =
@@ -684,6 +823,33 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert is_binary(response.access_token)
       assert response.scope == "read"
       assert claim!(response.access_token, "sub") == "oc_user-1"
+    end
+
+    test "initial and refreshed access tokens omit the configured authorization grant ID claim" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+
+      config =
+        device_config(
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: claim
+        )
+
+      %{device_code: dc, user_code: uc} = issue_device_code(["read"])
+      :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
+
+      assert {:ok, initial, _events} = Token.issue(config, device_request(config, dc))
+      assert is_binary(initial.refresh_token)
+      refute claim!(initial.access_token, claim)
+
+      refresh_request =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => initial.refresh_token}
+        )
+
+      assert {:ok, refreshed, _events} = Token.issue(config, refresh_request)
+      refute claim!(refreshed.access_token, claim)
     end
 
     test "an authenticated snapshot redeems without a host client_id callback" do
@@ -925,6 +1091,33 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.id_token, "auth_time") == auth_time
       # RFC 9470: the access token carries acr for step-up enforcement.
       assert claim!(response.access_token, "acr") == "urn:mace:incommon:iap:silver"
+    end
+
+    test "initial and refreshed access tokens omit the configured authorization grant ID claim" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+
+      config =
+        ciba_config(
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end,
+          authorization_grant_id_claim: claim
+        )
+
+      %{auth_req_id: arid} = issue_ciba(["openid"])
+      {:ok, _} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, arid, %{subject: "user-1", scope: ["openid"]})
+
+      assert {:ok, initial, _events} = Token.issue(config, ciba_request(config, arid))
+      assert is_binary(initial.refresh_token)
+      refute claim!(initial.access_token, claim)
+
+      refresh_request =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => initial.refresh_token}
+        )
+
+      assert {:ok, refreshed, _events} = Token.issue(config, refresh_request)
+      refute claim!(refreshed.access_token, claim)
     end
 
     test "an authenticated snapshot binds CIBA access and ID Tokens without a host callback" do
