@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Controller.NonceController do
   @doc "Issue a fresh c_nonce for a wallet credential proof."
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),

@@ -42,7 +42,7 @@ defmodule AttestoPhoenix.Controller.CheckSessionController do
 
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     if Config.session_management_enabled?(config) do
       conn

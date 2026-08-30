@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Controller.EntityConfigurationController do
   @doc "Serve the signed OpenID Federation Entity Configuration."
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     entity_configuration =
       EntityStatement.entity_configuration(

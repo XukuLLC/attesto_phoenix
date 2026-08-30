@@ -39,7 +39,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     resource_metadata = Config.resource_metadata_url(config, conn)
 
     case ProtectedResource.authenticate(conn, config, resource_metadata) do

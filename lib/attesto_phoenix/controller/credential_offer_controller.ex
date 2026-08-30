@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.Controller.CredentialOfferController do
   @doc "Serve the stored Credential Offer object for `:id`."
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),

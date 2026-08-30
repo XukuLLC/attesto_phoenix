@@ -27,7 +27,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   """
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     metadata =
       CredentialIssuerMetadata.build(

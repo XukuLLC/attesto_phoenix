@@ -23,6 +23,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   alias Attesto.CodeStore.ETS
   alias Attesto.DPoP.ReplayCache
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Schema.RefreshToken
   alias AttestoPhoenix.Store.EctoRefreshStore
@@ -235,6 +236,45 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert log =~ "token endpoint denied"
       assert log =~ "invalid_client"
+    end
+  end
+
+  describe "request-scoped configuration" do
+    test "concurrent token requests never cross profiles" do
+      base = Application.fetch_env!(:attesto_phoenix, Config)
+
+      profiles =
+        for profile <- ["first", "second"] do
+          config =
+            Config.new(
+              Keyword.put(base, :no_store, fn conn ->
+                put_resp_header(conn, "x-attesto-profile", profile)
+              end)
+            )
+
+          {config, profile}
+        end
+
+      results =
+        profiles
+        |> List.duplicate(25)
+        |> List.flatten()
+        |> Task.async_stream(
+          fn {config, profile} ->
+            response =
+              :post
+              |> conn(@endpoint_path, %{})
+              |> put_private(:attesto_phoenix_config, config)
+              |> TokenController.create(%{})
+
+            {get_resp_header(response, "x-attesto-profile"), profile}
+          end,
+          max_concurrency: 10,
+          ordered: false
+        )
+        |> Enum.map(fn {:ok, result} -> result end)
+
+      assert Enum.all?(results, fn {header, profile} -> header == [profile] end)
     end
   end
 

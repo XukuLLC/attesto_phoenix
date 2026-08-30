@@ -20,7 +20,7 @@ defmodule AttestoPhoenix.Controller.JwtVcIssuerMetadataController do
   @doc "Render the JWT VC Issuer Metadata document as JSON."
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     metadata = %{
       "issuer" => config.issuer,

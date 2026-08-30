@@ -104,7 +104,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   @spec end_session(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def end_session(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),

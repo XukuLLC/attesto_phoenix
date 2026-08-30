@@ -153,7 +153,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   """
   @spec authorize(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def authorize(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     # Capture the PAR reference before resolution rebinds `params` to the stored
     # set, so it can be consumed once (and only once) a code is issued.
     par_request_uri = params["request_uri"]

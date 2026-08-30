@@ -1253,6 +1253,30 @@ defmodule AttestoPhoenix.Config do
     from_otp_app(otp_app, __MODULE__)
   end
 
+  @doc """
+  Resolves the validated config for a request.
+
+  A config installed by `AttestoPhoenix.Plug.PutConfig` always takes
+  precedence. The global resolver remains a compatibility fallback for hosts
+  that call controllers directly without the router pipeline. A reserved
+  private value of the wrong type fails closed.
+  """
+  @spec resolve!(Plug.Conn.t()) :: t()
+  def resolve!(%Plug.Conn{private: private}) do
+    case Map.fetch(private, :attesto_phoenix_config) do
+      {:ok, %__MODULE__{} = config} ->
+        config
+
+      {:ok, other} ->
+        raise ArgumentError,
+              "expected conn.private[:attesto_phoenix_config] to contain " <>
+                "%#{inspect(__MODULE__)}{}; got #{inspect(other)}"
+
+      :error ->
+        resolve!()
+    end
+  end
+
   @doc "The configured keystore used for ID-token and authorization-server signing."
   @spec keystore(t()) :: module()
   def keystore(%__MODULE__{keystore: keystore}), do: keystore

@@ -74,6 +74,45 @@ defmodule AttestoPhoenix.Plug.PutConfigTest do
     assert result.private[:attesto_protocol_config] === protocol_config
   end
 
+  test "request resolution isolates concurrent profiles" do
+    Application.put_env(:attesto_phoenix, :otp_app, @otp_app)
+
+    profiles =
+      for issuer <- ["https://first.example", "https://second.example"] do
+        config = Config.new(Keyword.put(host_options(), :issuer, issuer))
+
+        conn(:get, "/")
+        |> put_private(:attesto_phoenix_config, config)
+        |> then(&{&1, issuer})
+      end
+
+    results =
+      profiles
+      |> List.duplicate(50)
+      |> List.flatten()
+      |> Task.async_stream(
+        fn {request, issuer} -> {Config.resolve!(request).issuer, issuer} end,
+        max_concurrency: 20,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, fn {resolved, expected} -> resolved == expected end)
+    assert Config.resolve!().issuer == "https://issuer.example"
+  end
+
+  test "request resolution falls back only when private config is absent" do
+    Application.put_env(:attesto_phoenix, :otp_app, @otp_app)
+
+    assert Config.resolve!(conn(:get, "/")).issuer == "https://issuer.example"
+
+    request = put_private(conn(:get, "/"), :attesto_phoenix_config, :wrong)
+
+    assert_raise ArgumentError, ~r/conn\.private\[:attesto_phoenix_config\]/, fn ->
+      Config.resolve!(request)
+    end
+  end
+
   test "fails closed when a reserved private key contains the wrong type" do
     input = put_private(conn(:get, "/"), :attesto_phoenix_config, :wrong)
 

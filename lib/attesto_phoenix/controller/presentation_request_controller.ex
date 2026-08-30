@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
   @doc "Serve a pending presentation session's signed request object."
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),

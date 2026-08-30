@@ -17,7 +17,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   @doc "Verify and atomically complete an OID4VP presentation session."
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),

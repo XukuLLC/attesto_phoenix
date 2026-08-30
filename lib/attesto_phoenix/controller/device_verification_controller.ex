@@ -47,7 +47,7 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
 
   @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def verify(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),

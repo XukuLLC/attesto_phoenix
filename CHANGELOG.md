@@ -6,6 +6,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Controllers now consume the validated request-specific configuration
+  installed by `AttestoPhoenix.Plug.PutConfig` instead of reloading the global
+  profile. Concurrent route mounts can therefore enforce distinct endpoint,
+  client-authentication, PAR, DPoP, and native-app policies without crossing
+  profiles. Direct controller calls without the pipeline retain the global
+  compatibility fallback, while malformed reserved private values fail closed.
+
 ## [2.14.2] - 2026-08-28
 
 ### Added
