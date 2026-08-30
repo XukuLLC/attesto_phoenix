@@ -10,6 +10,11 @@
 An opinionated Phoenix/Ecto OAuth 2.0 / OIDC authorization server on top of
 [attesto](https://hex.pm/packages/attesto).
 
+For a batteries-included authenticated MCP server integration, use
+[`attesto_mcp_server`](https://hex.pm/packages/attesto_mcp_server). It reuses
+AttestoPhoenix issuer, verification, revocation, principal, DPoP, and mTLS
+policy.
+
 <a href="https://openid.net/certification/certified-openid-connect-implementations/"><img src="https://openid.net/wordpress-content/uploads/2016/04/oid-l-certification-mark-l-rgb-150dpi-90mm.png" alt="OpenID Certified" width="180" align="right"></a>
 
 An authorization server built from `attesto` + `attesto_phoenix` is
@@ -64,9 +69,10 @@ callbacks.
   discovery. `attesto_phoenix` mounts that whole surface with one router macro,
   so your app can expose tools and data to an assistant without hand-rolling an
   OAuth server. Pair it with
-  [`attesto_mcp`](https://github.com/XukuLLC/attesto_mcp) to protect the MCP
-  endpoint itself as an OAuth resource server — the `WWW-Authenticate` challenge
-  and protected-resource metadata (RFC 9728) that assistant clients discover.
+  [`attesto_mcp_server`](https://hex.pm/packages/attesto_mcp_server) for the MCP
+  server, Phoenix installer, protected-resource metadata, and Attesto-backed
+  authorization. Applications with a custom MCP transport can instead use the
+  lower-level [`attesto_mcp`](https://hex.pm/packages/attesto_mcp) boundary.
 - **Your own authorization server.** Issue short-lived, scoped JWT access tokens
   and OIDC ID tokens for first-party apps and machine clients, instead of
   outsourcing to a hosted identity provider.
@@ -306,8 +312,10 @@ per-client scoping. With neither set and no `resource` requested, issuance keeps
 the single configured `:audience` — so single-resource deployments need no
 change. This is the issuer half of the RFC 9728 ↔ RFC 8707 chain: a resource
 advertises its identifier via protected-resource metadata, the client echoes it
-as `resource`, the AS mints that `aud`, and the resource server validates it
-(see `attesto_mcp` for the resource-server half).
+as `resource`, the AS mints that `aud`, and the resource server validates it.
+See [`attesto_mcp_server`](https://hex.pm/packages/attesto_mcp_server) for the
+complete MCP integration or [`attesto_mcp`](https://hex.pm/packages/attesto_mcp)
+for only the lower-level resource boundary.
 
 ### Native apps (RFC 8252)
 
