@@ -712,6 +712,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp code_claims_with_private_context(config, request, conn, subject, subject_id, family_id) do
     claims = code_claims(conn, request, subject)
 
+    # `code_claims/3` currently builds a closed library-owned key set, so this
+    # cannot be reached through a supported host callback. Keep the check at the
+    # ownership boundary as defense in depth if host-provided code claims are
+    # added later.
     if PrivateContext.reserved?(claims) do
       {:error, :reserved_private_context_claim}
     else

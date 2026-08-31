@@ -625,33 +625,34 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   # The host wrapper is trusted policy, but continuation cardinality is a
-  # protocol invariant rather than a convention. A unique process-dictionary
-  # key scopes this closure to the callback invocation without starting a
-  # process or publishing global state. The closure checks its owner and live
-  # marker, consumes the marker BEFORE completion, and the outer `after` closes
-  # it on every callback return or exception.
+  # protocol invariant rather than a convention. A private atomic gate scopes
+  # the closure to this callback without process-dictionary or global state.
+  # The closure checks its owner and consumes the gate BEFORE completion; the
+  # outer `after` closes it on every callback return or exception.
   defp with_authorization_code_continuation(completion, callback) do
     owner = self()
-    key = {__MODULE__, :authorization_code_continuation, make_ref()}
-    Process.put(key, :available)
+    ref = make_ref()
+    gate = :atomics.new(1, signed: false)
 
-    continuation = fn -> run_authorization_code_continuation(owner, key, completion) end
+    continuation = fn -> run_authorization_code_continuation(owner, ref, gate, completion) end
 
     try do
-      callback.(continuation, key)
+      callback.(continuation, ref)
     after
-      Process.delete(key)
+      :atomics.put(gate, 1, 2)
+      discard_authorization_code_continuation_marker(ref)
     end
   end
 
   # Cardinality alone bounded the callback to AT MOST one invocation. The marker
-  # additionally records the exact term the continuation produced, which supplies
-  # the missing lower bound and provenance: a callback that never calls the
+  # message additionally carries a digest and outcome of the continuation's
+  # result, which supplies the missing lower bound and provenance without keeping
+  # minted token strings in process state. A callback that never calls the
   # continuation, or that substitutes a fabricated `{:ok, response, events}` for
   # the real one, is detected by `normalize_authorization_code_completion/2`.
   # The host still sees the plain result, so it can branch on success/failure to
   # decide whether to commit or roll back.
-  defp run_authorization_code_continuation(owner, key, completion) do
+  defp run_authorization_code_continuation(owner, ref, gate, completion) do
     cond do
       self() != owner ->
         # A continuation invoked from another process is a host bug with
@@ -664,7 +665,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
         {:error, error(@error_invalid_request, "unable to issue token")}
 
-      Process.get(key) != :available ->
+      :atomics.compare_exchange(gate, 1, 0, 1) != :ok ->
         Logger.error(
           "authorization code continuation was invoked more than once or after its scope " <>
             "ended; no token was issued"
@@ -673,11 +674,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         {:error, error(@error_invalid_request, "unable to issue token")}
 
       true ->
-        # Marked before running so a re-entrant call from inside `completion`
-        # cannot pass the gate.
-        Process.put(key, :running)
         result = completion.()
-        Process.put(key, {:produced, result})
+
+        send(
+          owner,
+          {ref, :authorization_code_continuation_produced, completion_result_digest(result),
+           completion_result_outcome(result)}
+        )
+
         result
     end
   end
@@ -696,21 +700,43 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   #     refresh insert, and code finalization with it, so unwrap rather than
   #     failing a request whose code is now finalized - failing would score the
   #     client's retry as a replay and revoke the whole family.
-  defp normalize_authorization_code_completion(result, key) do
-    case Process.get(key) do
-      {:produced, ^result} ->
-        normalize_completion_result(result)
-
-      {:produced, produced} when result == {:ok, produced} ->
-        normalize_completion_result(produced)
-
-      {:produced, produced} ->
-        normalize_substituted_completion(result, produced)
-
-      _never_ran ->
+  defp normalize_authorization_code_completion(result, ref) do
+    receive do
+      {^ref, :authorization_code_continuation_produced, digest, outcome} ->
+        normalize_produced_completion(result, digest, outcome)
+    after
+      0 ->
         normalize_incomplete_completion(result)
     end
   end
+
+  defp discard_authorization_code_continuation_marker(ref) do
+    receive do
+      {^ref, :authorization_code_continuation_produced, _digest, _outcome} -> :ok
+    after
+      0 -> :ok
+    end
+  end
+
+  defp normalize_produced_completion(result, digest, outcome) do
+    cond do
+      completion_result_digest(result) == digest ->
+        normalize_completion_result(result)
+
+      match?({:ok, _inner}, result) and completion_result_digest(elem(result, 1)) == digest ->
+        result |> elem(1) |> normalize_completion_result()
+
+      true ->
+        normalize_substituted_completion(result, outcome)
+    end
+  end
+
+  defp completion_result_digest(result) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(result, [:deterministic]))
+  end
+
+  defp completion_result_outcome({:ok, _response, _events}), do: :succeeded
+  defp completion_result_outcome(_result), do: :failed
 
   # The continuation ran but the host returned something else.
   #
@@ -719,8 +745,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # this library cannot tell them apart from the inside:
   #
   #   * the host rolled its transaction back, so the mint, refresh insert, and
-  #     finalization went with it. The error is honest and the code is live
-  #     again - the client's retry succeeds.
+  #     finalization went with it. The error is honest and the earlier code
+  #     claim remains spent but unfinalized; a retry is refused without being
+  #     scored as reuse.
   #   * the host COMMITTED and then returned an error anyway. The code is now
   #     finalized, so the client's retry presents a successfully-consumed code,
   #     which code-reuse detection correctly scores as a replay and answers by
@@ -732,7 +759,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # documented, legitimate pattern - and logged at error level with the
   # consequence named, so an operator can find the commit-then-error bug instead
   # of chasing phantom replay revocations.
-  defp normalize_substituted_completion({:error, %OAuthError{}} = error, {:ok, _response, _events}) do
+  defp normalize_substituted_completion({:error, %OAuthError{}} = error, :succeeded) do
     Logger.error(
       "authorization code completion callback returned an error after the continuation " <>
         "succeeded; if the callback committed rather than rolled back, the code is finalized " <>
@@ -744,7 +771,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # The continuation itself failed and the host remapped the reason. Nothing was
   # minted or finalized, so there is no retry hazard to report.
-  defp normalize_substituted_completion({:error, %OAuthError{}} = error, _produced), do: error
+  defp normalize_substituted_completion({:error, %OAuthError{}} = error, :failed), do: error
 
   defp normalize_substituted_completion({:error, _reason}, _produced) do
     Logger.error("authorization code completion callback failed")
@@ -2023,9 +2050,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # `acr` / `auth_time` are reserved: an exchanged (machine-authorized) token
     # must not inherit the subject token's authentication context, which would
     # let token exchange forge a step-up-satisfying token (RFC 9470).
+    # `credential_configuration_ids` is also grant-bound: RFC 8693 exchange
+    # creates a new grant boundary and must not turn an OID4VCI subject-token
+    # entitlement into an exchanger entitlement.
     reserved =
       MapSet.new(
-        ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++
+        ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id credential_configuration_ids) ++
           [principal_kind_claim] ++ List.wrap(Config.authorization_grant_id_claim(config))
       )
 

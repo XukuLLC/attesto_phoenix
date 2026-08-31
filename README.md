@@ -534,11 +534,13 @@ code or a minted token secret.
 The continuation is bound to the callback's process and permits exactly one
 invocation; a second, cross-process, or escaped call is refused before anything
 is minted or persisted. The callback must return the first invocation's result
-unchanged. This is enforced by provenance, not by shape: a callback that never
-invokes the continuation cannot pass off a fabricated `{:ok, response, events}`
-as a token set. The `{:ok, _}` wrapper `Repo.transaction/1` puts around a
-committed return is unwrapped rather than refused, because that commit already
-carried the mint, refresh insert, and finalization.
+unchanged. This is enforced by a private atomic gate plus a digest/outcome
+provenance marker — no token string is retained in the process dictionary. A
+callback that never invokes the continuation cannot pass off a fabricated
+`{:ok, response, events}` as a token set. The `{:ok, _}` wrapper
+`Repo.transaction/1` puts around a committed return is unwrapped rather than
+refused, because that commit already carried the mint, refresh insert, and
+finalization.
 
 > #### Roll back, do not commit-then-refuse {: .warning}
 >
@@ -549,6 +551,11 @@ carried the mint, refresh insert, and finalization.
 > as replay and answers by revoking the whole grant family. Roll the
 > transaction back instead. The library logs this case at error level naming the
 > consequence, so check your logs for it.
+
+The authorization code is atomically claimed before the callback runs. A host
+refusal, malformed private context, missing callback for a context-bearing code,
+or callback failure therefore leaves it spent but unfinalized: `consumed_at` is
+set, `consumed_success` remains false, and no refresh family is recorded.
 
 #### Host-private authorization state
 

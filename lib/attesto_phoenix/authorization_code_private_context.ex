@@ -86,10 +86,15 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
   """
   @spec pop(map()) :: {t() | nil | :invalid, map()}
   def pop(claims) when is_map(claims) do
-    case Map.pop(claims, @claims_key) do
-      {nil, rest} -> {nil, rest}
-      {value, rest} when is_map(value) -> {value, rest}
-      {_value, rest} -> {:invalid, rest}
+    case Map.fetch(claims, @claims_key) do
+      :error ->
+        {nil, claims}
+
+      {:ok, value} when is_map(value) ->
+        {value, Map.delete(claims, @claims_key)}
+
+      {:ok, _value} ->
+        {:invalid, Map.delete(claims, @claims_key)}
     end
   end
 
@@ -104,7 +109,5 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
 
   defp encoded_size(private_context) do
     private_context |> JSON.encode!() |> byte_size()
-  rescue
-    _ -> @max_encoded_bytes + 1
   end
 end

@@ -285,6 +285,17 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     TestRepo.delete_all(Authorization)
 
     Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @signing_pem)
+
+    # These tests drive the bundled stores through the package-level `:repo`
+    # contract. A synthetic host's `:otp_app` pointer left behind by another
+    # test would send `Config.table_prefix/0` down `resolve!/0`, which builds a
+    # full host config and raises on the missing `:issuer`/`:keystore`/`:repo`.
+    # Pin both for the duration rather than inheriting whatever global state the
+    # async phase happened to leave.
+    previous_otp_app = Application.fetch_env(:attesto_phoenix, :otp_app)
+    Application.delete_env(:attesto_phoenix, :otp_app)
+    Application.put_env(:attesto_phoenix, :repo, TestRepo)
+
     Process.put(:authorization_code_completion_test_pid, self())
 
     on_exit(fn ->
@@ -294,6 +305,13 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       TestRepo.delete_all(Authorization)
       Sandbox.stop_owner(owner)
       Application.delete_env(:attesto_phoenix, __MODULE__.Keystore)
+
+      case previous_otp_app do
+        {:ok, value} -> Application.put_env(:attesto_phoenix, :otp_app, value)
+        :error -> Application.delete_env(:attesto_phoenix, :otp_app)
+      end
+
+      Application.put_env(:attesto_phoenix, :repo, TestRepo)
     end)
 
     :ok
@@ -405,10 +423,14 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
     config = config(authorization_code_completion: callback)
 
-    capture_log(fn ->
-      assert {:error, %OAuthError{error: :invalid_request}, _events} =
-               Token.issue(config, code_request(config, code))
-    end)
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    assert log =~ "authorization code completion callback failed"
+    refute log =~ "host_policy_changed"
 
     assert_spent_without_completion(family_id)
   end
@@ -453,6 +475,50 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert id_claims["auth_time"] == 1_700_000_000
     assert id_claims["acr"] == "urn:example:loa:2"
     assert id_claims["amr"] == ["pwd"]
+
+    assert {:ok, refreshed, _events} = Token.issue(config, refresh_request(config, response.refresh_token))
+    refreshed_claims = claims!(refreshed.access_token)
+    refute Map.has_key?(refreshed_claims, "mobile_auth_security_epoch")
+    refute Map.has_key?(refreshed_claims, "marker")
+    refute Map.has_key?(refreshed_claims, "private_context")
+    refute Map.has_key?(refreshed_claims, PrivateContext.claims_key())
+    refute_received {:private_context_at_completion, _context}
+  end
+
+  test "continuation provenance keeps only a digest outside the process dictionary" do
+    test_pid = self()
+    family_id = "family-digest-marker"
+    code = issue_code(family_id)
+
+    callback = fn _context, continuation ->
+      {:ok, response, _events} = result = continuation.()
+      {:messages, messages} = Process.info(self(), :messages)
+
+      marker =
+        Enum.find(messages, fn
+          {_ref, :authorization_code_continuation_produced, digest, :succeeded}
+          when is_binary(digest) and byte_size(digest) == 32 ->
+            true
+
+          _other ->
+            false
+        end)
+
+      refute is_nil(marker)
+      refute inspect(marker) =~ response.access_token
+      refute Enum.any?(Process.get_keys(), &match?({Token, :authorization_code_continuation, _ref}, &1))
+      send(test_pid, {:continuation_marker, marker})
+      result
+    end
+
+    config = config(authorization_code_completion: callback)
+    assert {:ok, response, _events} = Token.issue(config, code_request(config, code))
+    assert is_binary(response.access_token)
+
+    assert_receive {:continuation_marker, {ref, :authorization_code_continuation_produced, digest, :succeeded}}
+
+    assert is_reference(ref)
+    assert byte_size(digest) == 32
   end
 
   test "a callback refusal runs before principal construction and leaves completion empty" do
@@ -593,9 +659,13 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         end
       )
 
-    assert {:error, %OAuthError{error: :invalid_request}, _events} =
-             Token.issue(config, code_request(config, code))
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
 
+    assert log =~ "does not own it"
     assert_spent_without_completion(family_id)
   end
 
@@ -662,6 +732,34 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert row.consumed_success
     assert row.access_token_jti
     assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 1
+  end
+
+  test "a Repo.transaction wrapper around a failed continuation is unwrapped" do
+    family_id = "family-failed-transaction-wrapper"
+    code = issue_code(family_id)
+
+    callback = fn _context, continuation ->
+      TestRepo.transaction(fn -> continuation.() end)
+    end
+
+    config =
+      config(
+        refresh_store: FailingRefreshStore,
+        authorization_code_completion: callback
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    refute log =~ "authorization code completion callback failed"
+    row = authorization!(family_id)
+    assert row.consumed_at
+    refute row.consumed_success
+    assert is_binary(row.access_token_jti)
+    assert TestRepo.aggregate(RefreshToken, :count) == 0
   end
 
   test "a callback that substitutes a different result after running the continuation is refused" do
@@ -826,6 +924,13 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
     assert log =~ "returned an error after the continuation succeeded"
     assert log =~ "revoke the grant family"
+
+    row = authorization_by_code!(code)
+    assert row.consumed_success
+    assert is_binary(row.access_token_jti)
+    assert is_binary(row.family_id)
+    refute row.family_id == family_id
+    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 1
   end
 
   test "an error remapped after a FAILED continuation is not reported as a revocation hazard" do
@@ -1009,6 +1114,23 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     }
   end
 
+  defp refresh_request(config, refresh_token) do
+    %Request{
+      config: config,
+      client: @client,
+      client_auth_method: :client_secret_basic,
+      grant_type: "refresh_token",
+      params: %{"refresh_token" => refresh_token},
+      request_client_id: "client-1",
+      sender_constraint_input: %{
+        dpop_proof: nil,
+        mtls_cert_der: nil,
+        http_uri: "https://issuer.example/oauth/token",
+        http_method: "POST"
+      }
+    }
+  end
+
   defp transactional_completion(test_pid) do
     fn context, continuation ->
       send(test_pid, {:completion_context, context})
@@ -1056,7 +1178,11 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert row.consumed_at
     refute row.consumed_success
     refute row.access_token_jti
-    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^family_id), :count) == 0
+    # Table-wide, not `where: family_id == ^family_id`: core 2.0 mints a FRESH
+    # refresh family on finalization, so filtering by the authorization
+    # provenance id would count zero whether or not a refresh row was written -
+    # an assertion that cannot fail. `setup` truncates the table.
+    assert TestRepo.aggregate(RefreshToken, :count) == 0
     assert TestRepo.aggregate(LogoutSession, :count) == 0
   end
 

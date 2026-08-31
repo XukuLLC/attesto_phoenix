@@ -43,6 +43,14 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
       end
     end
 
+    test "non-JSON nested values and invalid UTF-8 are refused before encoding" do
+      assert PrivateContext.put(%{}, %{"tuple" => {:not, "json"}}) ==
+               {:error, :invalid_private_context}
+
+      assert PrivateContext.put(%{}, %{"invalid_utf8" => <<255>>}) ==
+               {:error, :invalid_private_context}
+    end
+
     test "a value over the encoded bound is refused rather than truncated" do
       oversized = %{"blob" => String.duplicate("x", PrivateContext.max_encoded_bytes())}
 
@@ -57,6 +65,14 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
       assert byte_size(JSON.encode!(sized)) == PrivateContext.max_encoded_bytes()
       assert {:ok, claims} = PrivateContext.put(%{}, sized)
       assert claims[PrivateContext.claims_key()] == sized
+    end
+
+    test "an exactly 4097-byte encoded value is refused" do
+      # {"blob":"xxx..."} contributes 11 bytes around the value.
+      sized = %{"blob" => String.duplicate("x", PrivateContext.max_encoded_bytes() - 10)}
+
+      assert byte_size(JSON.encode!(sized)) == PrivateContext.max_encoded_bytes() + 1
+      assert PrivateContext.put(%{}, sized) == {:error, :private_context_too_large}
     end
   end
 
@@ -74,13 +90,15 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
       assert PrivateContext.pop(%{"nonce" => "n-1"}) == {nil, %{"nonce" => "n-1"}}
     end
 
-    test "a reserved key holding a non-map is reported invalid, not passed through" do
+    test "a reserved key holding a non-map or JSON null is reported invalid, not passed through" do
       # A tampered or corrupted row must fail closed at the token endpoint
       # rather than reach the completion callback as if it were host state.
-      claims = %{PrivateContext.claims_key() => "not-a-map", "nonce" => "n-1"}
+      for value <- ["not-a-map", nil] do
+        claims = %{PrivateContext.claims_key() => value, "nonce" => "n-1"}
 
-      assert {:invalid, remaining} = PrivateContext.pop(claims)
-      assert remaining == %{"nonce" => "n-1"}
+        assert {:invalid, remaining} = PrivateContext.pop(claims)
+        assert remaining == %{"nonce" => "n-1"}
+      end
     end
   end
 

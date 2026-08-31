@@ -17,6 +17,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
+  alias AttestoPhoenix.TestRepo
   alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag :ecto

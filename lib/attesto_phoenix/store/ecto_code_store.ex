@@ -37,11 +37,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   The `claims` column carries the authentication context and, for a host that
   configures `:authorization_code_private_context`, that host's private
   authorization state. Ecto SQL query telemetry reports params, cast params,
-  and decoded results, so the operations that bind or return the whole row
-  (`put/1`, `take/1`, `get/1`) suppress both application SQL logging and the
-  `[:my_app, :repo, :query]` telemetry event. Lifecycle updates and the
-  reuse-detection read select only the columns they report, carry no claims,
-  and keep normal observability - code-replay detection stays visible to APM.
+  and decoded results, and every authorization-row query carries at least one
+  security-sensitive value - a code hash, subject, family ID, or access-token
+  JTI - even when it does not touch the `claims` column. So every operation in
+  this store suppresses both application SQL logging and the
+  `[:my_app, :repo, :query]` telemetry event. The reuse-detection reads
+  additionally select only the columns they report, keeping the `claims` JSONB
+  out of the decoded row as defence in depth.
 
   > #### Suppression is unconditional {: .warning}
   >
@@ -59,10 +61,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
 
-  # Ecto SQL query telemetry includes params/cast_params and decoded results, so
-  # suppress both application logging and telemetry for the calls that insert or
-  # return the full row. The lifecycle updates below bind and return no claims
-  # and keep normal observability.
+  # Ecto SQL query telemetry includes params/cast_params and decoded results.
+  # Every authorization-row query carries at least one security-sensitive value
+  # - a code hash, subject, family ID, or access-token JTI - even when it does
+  # not select the private-context column, so all of them suppress application
+  # logging and telemetry.
   @claims_query_opts [log: false, telemetry_event: nil]
 
   @doc """
@@ -297,12 +300,16 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     end
   end
 
+  # Selects only the linkage column it inspects, for the same reason as
+  # `consumed_or_missing/2`: a whole-row read would publish `claims` through
+  # query telemetry.
   defp legacy_or_missing_revoke(code_hash, prefix) do
-    case repo().get_by(Authorization, [code_hash: code_hash],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
+    query =
+      from a in Authorization,
+        where: a.code_hash == ^code_hash,
+        select: [:access_token_jti]
+
+    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
       nil ->
         :ok
 
@@ -334,12 +341,19 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     repo().exists?(query, prefix: prefix, log: false, telemetry_event: nil)
   end
 
+  # Selects only the three columns it reports, and suppresses logging and
+  # telemetry like every other authorization-row query. The narrow select is
+  # defence in depth: it keeps the `claims` JSONB - which carries host private
+  # context - out of the decoded row entirely, so re-enabling observability here
+  # could not leak it. `redact: true` would not help; telemetry carries the raw
+  # row, not the struct.
   defp consumed_or_missing(code_hash, prefix) do
-    case repo().get_by(Authorization, [code_hash: code_hash],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
+    query =
+      from a in Authorization,
+        where: a.code_hash == ^code_hash,
+        select: [:family_id, :subject, :consumed_success]
+
+    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
       %Authorization{consumed_success: true} = row ->
         {:error, :consumed, Authorization.consumed_meta(row)}
 

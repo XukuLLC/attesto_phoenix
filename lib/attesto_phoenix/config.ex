@@ -388,7 +388,8 @@ defmodule AttestoPhoenix.Config do
       or escaped invocation is rejected before token minting or persistence. The
       callback must return the first invocation's `{:ok, response, events}` or
       `{:error, oauth_error}` result unchanged. This is enforced, not merely
-      documented: the continuation's exact result is recorded and compared, so a
+      documented: a digest and outcome of the continuation's result are recorded
+      and compared without retaining token strings in process state, so a
       callback that never invokes the continuation cannot pass off a fabricated
       `{:ok, response, events}` as a token set, and a callback that substitutes a
       different success is refused. The `{:ok, _}` wrapper `Repo.transaction/1`
@@ -399,11 +400,16 @@ defmodule AttestoPhoenix.Config do
       Only stores participating in that same transaction can roll back
       atomically; external or independently transactional custom stores remain
       outside this boundary. A callback may decline to continue with
-      `{:error, reason}`; non-OAuth failures are rendered as a generic
-      token-issuance error without logging the reason. Exceptions are not
-      rescued. When unset, the continuation runs directly, preserving existing
-      behavior. This wrapper is authorization-code-specific: refresh rotation
-      and every other grant type bypass it.
+      `{:error, reason}`; an `AttestoPhoenix.OAuthError` passes through, while any
+      other failure is rendered as a generic token-issuance error without
+      logging the reason. Exceptions are not rescued. The code has already been
+      claimed before this callback runs, so refusal, malformed persisted private
+      context, a missing callback for a context-bearing code, or any callback
+      failure leaves it spent but unfinalized (`consumed_at` set,
+      `consumed_success: false`, with no refresh family). When unset, the
+      continuation runs directly, preserving existing behavior. This wrapper is
+      authorization-code-specific: refresh rotation and every other grant type
+      bypass it.
     * `:code_store` - module implementing `Attesto.CodeStore`.
     * `:refresh_store` - module implementing `Attesto.RefreshStore`.
       `AttestoPhoenix.Store.EctoRefreshStore` with a non-zero rotation grace
