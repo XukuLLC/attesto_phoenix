@@ -160,10 +160,8 @@ if Code.ensure_loaded?(Igniter) do
       repo = Module.concat(app_module, Repo)
       options = igniter.args.options
 
-      oauth_path_prefix =
-        validate_oauth_path_prefix!(options[:oauth_path_prefix] || @default_oauth_path_prefix)
-
       schema_prefix = schema_prefix(options, igniter, app)
+      oauth_path_prefix = oauth_path_prefix(options, igniter, app)
       callbacks_module = callbacks_module(options, app_module)
       refresh_successor_secret = generate_refresh_successor_secret()
 
@@ -203,6 +201,190 @@ if Code.ensure_loaded?(Igniter) do
         nil -> Module.concat(app_module, AuthZ)
         explicit -> ProjectModule.parse(explicit)
       end
+    end
+
+    defp oauth_path_prefix(options, igniter, app) do
+      case options[:oauth_path_prefix] do
+        nil ->
+          igniter
+          |> configured_oauth_path_prefix(app)
+          |> Kernel.||(@default_oauth_path_prefix)
+          |> validate_oauth_path_prefix!()
+
+        explicit ->
+          validate_oauth_path_prefix!(explicit)
+      end
+    end
+
+    # Keep a flagless rerun aligned with the literal value the installer wrote
+    # previously. Config is inspected as data rather than evaluated so installer
+    # execution cannot run arbitrary host code. Anything ambiguous fails closed.
+    defp configured_oauth_path_prefix(igniter, app) do
+      config_path = ProjectApplication.config_path(igniter)
+      config_dir = config_path |> Path.dirname() |> Path.expand()
+      config_glob = Path.join(config_dir, "**/*.exs")
+      igniter = Igniter.include_glob(igniter, config_glob)
+      config_dir_parts = Path.split(config_dir)
+
+      results =
+        igniter.rewrite
+        |> Rewrite.sources()
+        |> Enum.flat_map(&configured_oauth_path_prefix_source(&1, app, config_dir_parts))
+
+      configured_oauth_path_prefix_results(results)
+    end
+
+    defp configured_oauth_path_prefix_source(source, app, config_dir_parts) do
+      if config_source?(source.path, config_dir_parts) do
+        configured_oauth_path_prefix_in_source(source.content, app)
+      else
+        []
+      end
+    end
+
+    defp configured_oauth_path_prefix_in_source(content, app) when is_binary(content) do
+      case Code.string_to_quoted(content, emit_warnings: false) do
+        {:ok, ast} -> configured_oauth_path_prefix_ast_results(ast, app)
+        {:error, error} -> [{:dynamic, "unparseable config source (#{inspect(error)})"}]
+      end
+    end
+
+    defp configured_oauth_path_prefix_ast_results(ast, app) do
+      aliases = config_aliases(ast)
+
+      {_ast, results} =
+        Macro.prewalk(ast, [], fn node, results ->
+          case configured_oauth_path_prefix_node(node, app, aliases) do
+            :not_found -> {node, results}
+            node_results -> {node, node_results ++ results}
+          end
+        end)
+
+      Enum.reverse(results)
+    end
+
+    defp configured_oauth_path_prefix_node({:config, _meta, [configured_app, config_module, config_opts]}, app, aliases) do
+      case configured_app do
+        ^app ->
+          configured_oauth_path_prefix_for_app(config_module, config_opts, aliases)
+
+        configured_app when is_atom(configured_app) ->
+          :not_found
+
+        dynamic_app ->
+          configured_oauth_path_prefix_for_dynamic_app(dynamic_app, config_module, config_opts, aliases)
+      end
+    end
+
+    defp configured_oauth_path_prefix_node(_node, _app, _aliases), do: :not_found
+
+    defp configured_oauth_path_prefix_for_app(config_module, config_opts, aliases) do
+      cond do
+        attesto_config_module_ast?(config_module, aliases) ->
+          configured_oauth_path_prefix_config(config_opts)
+
+        ambiguous_config_module_ast?(config_module, aliases) and
+            oauth_path_prefix_option_possible?(config_opts) ->
+          [{:dynamic, "ambiguous config module #{Macro.to_string(config_module)}"}]
+
+        true ->
+          :not_found
+      end
+    end
+
+    defp configured_oauth_path_prefix_for_dynamic_app(dynamic_app, config_module, config_opts, aliases) do
+      if attesto_config_module_ast?(config_module, aliases) and
+           oauth_path_prefix_option_possible?(config_opts) do
+        [{:dynamic, "ambiguous config app #{Macro.to_string(dynamic_app)}"}]
+      else
+        :not_found
+      end
+    end
+
+    defp configured_oauth_path_prefix_config(opts) when is_list(opts) do
+      configured_oauth_path_prefix_pairs(opts)
+    end
+
+    defp configured_oauth_path_prefix_config({:%{}, _meta, pairs}) when is_list(pairs) do
+      configured_oauth_path_prefix_pairs(pairs)
+    end
+
+    defp configured_oauth_path_prefix_config(opts), do: [{:dynamic, Macro.to_string(opts)}]
+
+    defp configured_oauth_path_prefix_pairs(pairs) do
+      results = Enum.flat_map(pairs, &oauth_path_prefix_pair_result/1)
+
+      cond do
+        results != [] -> results
+        Enum.any?(pairs, &dynamic_config_option?/1) -> [{:dynamic, Macro.to_string(pairs)}]
+        true -> :not_found
+      end
+    end
+
+    defp oauth_path_prefix_pair_result({key, value}) do
+      case static_config_key(key) do
+        :oauth_path_prefix -> [{:found, configured_oauth_path_prefix_value(value)}]
+        "oauth_path_prefix" -> [{:invalid, "string key \"oauth_path_prefix\""}]
+        _other -> []
+      end
+    end
+
+    defp oauth_path_prefix_pair_result(_other), do: []
+
+    defp configured_oauth_path_prefix_value(value) when is_binary(value), do: value
+    defp configured_oauth_path_prefix_value(value), do: {:invalid, Macro.to_string(value)}
+
+    defp oauth_path_prefix_option_possible?(opts) when is_list(opts) do
+      Enum.any?(opts, fn
+        {key, _value} -> static_config_key(key) in [:oauth_path_prefix, "oauth_path_prefix", nil]
+        _dynamic -> true
+      end)
+    end
+
+    defp oauth_path_prefix_option_possible?({:%{}, _meta, pairs}) when is_list(pairs) do
+      oauth_path_prefix_option_possible?(pairs)
+    end
+
+    defp oauth_path_prefix_option_possible?(_dynamic), do: true
+
+    defp configured_oauth_path_prefix_results(results) do
+      case Enum.find(results, &match?({kind, _value} when kind in [:dynamic, :invalid], &1)) do
+        {:dynamic, expression} -> raise_dynamic_oauth_path_prefix(expression)
+        {:invalid, value} -> raise_invalid_configured_oauth_path_prefix(value)
+        nil -> configured_oauth_path_prefix_literals(results)
+      end
+    end
+
+    defp configured_oauth_path_prefix_literals(results) do
+      prefixes = for {:found, prefix} <- results, do: prefix
+
+      case Enum.uniq(prefixes) do
+        [] -> nil
+        [prefix] -> prefix
+        prefixes -> raise_ambiguous_oauth_path_prefix(prefixes)
+      end
+    end
+
+    defp raise_dynamic_oauth_path_prefix(expression) do
+      raise Mix.Error,
+        message:
+          "could not determine configured :oauth_path_prefix expression #{expression}; " <>
+            "pass --oauth-path-prefix explicitly so routing cannot silently drift"
+    end
+
+    defp raise_invalid_configured_oauth_path_prefix(value) do
+      raise Mix.Error,
+        message:
+          "invalid configured :oauth_path_prefix in the host config: expected a literal " <>
+            "binary, got #{value}; pass --oauth-path-prefix explicitly"
+    end
+
+    defp raise_ambiguous_oauth_path_prefix(prefixes) do
+      raise Mix.Error,
+        message:
+          "could not determine a single configured :oauth_path_prefix in the host config; " <>
+            "found multiple literal values #{inspect(prefixes)}; pass --oauth-path-prefix " <>
+            "explicitly so routing cannot silently drift"
     end
 
     # ------------------------------------------------------------------
@@ -1073,6 +1255,21 @@ if Code.ensure_loaded?(Igniter) do
 
     defp collect_scope_prefix(zipper, prefixes), do: collect_scope_prefix(Zipper.up(zipper), prefixes)
 
+    defp literal_scope_prefix([options | _rest]) when is_list(options) do
+      if Enum.all?(options, &static_keyword_ast_pair?/1) do
+        path_values =
+          for {key, value} <- options, keyword_ast_key(key) == :path, do: value
+
+        case path_values do
+          [] -> ""
+          [path] -> literal_scope_prefix(path)
+          _multiple -> :dynamic
+        end
+      else
+        :dynamic
+      end
+    end
+
     defp literal_scope_prefix([path | _rest]), do: literal_scope_prefix(path)
     defp literal_scope_prefix([]), do: :dynamic
 
@@ -1085,6 +1282,9 @@ if Code.ensure_loaded?(Igniter) do
     end
 
     defp literal_scope_prefix(_dynamic), do: :dynamic
+
+    defp static_keyword_ast_pair?({key, _value}), do: is_atom(keyword_ast_key(key))
+    defp static_keyword_ast_pair?(_other), do: false
 
     defp join_route_prefixes(prefixes) do
       segments =
@@ -1126,7 +1326,7 @@ if Code.ensure_loaded?(Igniter) do
 
     defp literal_route_prefix({:__block__, _meta, [prefix]}), do: literal_route_prefix(prefix)
 
-    defp literal_route_prefix(""), do: ""
+    defp literal_route_prefix(prefix) when prefix in ["", "/"], do: ""
 
     defp literal_route_prefix(prefix) when is_binary(prefix) do
       if Regex.match?(~r/\A\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\z/, prefix), do: prefix, else: :dynamic

@@ -166,6 +166,28 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   end
   """
 
+  @host_only_scope_router_fixture """
+  defmodule TestWeb.Router do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope host: "auth.example.com" do
+      attesto_routes()
+    end
+  end
+  """
+
+  @root_route_prefix_router_fixture """
+  defmodule TestWeb.Router do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(prefix: "/")
+    end
+  end
+  """
+
   @old_installer_config_fixture """
   import Config
 
@@ -480,6 +502,17 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                "attesto_routes(prefix: \"/mcp\", pipeline: :attesto_phoenix_config)"
     end
 
+    test "flagless rerun preserves a relocated oauth path prefix" do
+      first =
+        project()
+        |> Igniter.compose_task(@task, ["--oauth-path-prefix", "/mcp/oauth"])
+        |> apply_igniter!()
+
+      first
+      |> Igniter.compose_task(@task, [])
+      |> assert_unchanged()
+    end
+
     test "rejects a prefix with endpoint tails the bundled router does not mount" do
       igniter = project()
       router_before = source_content(igniter, @router_path)
@@ -653,6 +686,38 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
 
       assert source_content(igniter, @router_path) == router_before
       refute Igniter.exists?(igniter, @client_store_path)
+    end
+
+    test "accepts a host-only enclosing scope as a root path" do
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @host_only_scope_router_fixture,
+            @application_path => @application_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      assert source_content(applied, @router_path) =~
+               "attesto_routes(pipeline: :attesto_phoenix_config)"
+    end
+
+    test "accepts a slash-only route prefix as the root path" do
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @root_route_prefix_router_fixture,
+            @application_path => @application_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      assert source_content(applied, @router_path) =~
+               "attesto_routes(prefix: \"/\", pipeline: :attesto_phoenix_config)"
     end
 
     test "writes an explicit PostgreSQL schema prefix" do
