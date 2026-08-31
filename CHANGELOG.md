@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `:authorization_code_completion` - an optional synchronous wrapper around the
+  tail of an authorization-code redemption (principal construction, access- and
+  ID-token minting, access-token `jti` recording, optional generation-0 refresh
+  issuance, and code finalization). A host may run it inside its own
+  `Repo.transaction/1` to serialize token issuance with a subject-authorization
+  re-check. The continuation is bound to the callback's process and permits
+  exactly one invocation; a second, cross-process, or escaped call is refused
+  before anything is minted or persisted. The callback's return is verified by
+  provenance rather than shape, so a callback that never invokes the
+  continuation cannot substitute a fabricated `{:ok, response, events}` for a
+  real token set. The `{:ok, _}` wrapper `Repo.transaction/1` places around a
+  committed return is unwrapped instead of failing a request whose code is
+  already finalized. Refresh rotation and every other grant type bypass the
+  wrapper.
+- `:authorization_code_private_context` - an optional trusted issuance callback
+  for host-private authorization state. It receives exactly the authorized
+  `:client_id`, `:subject`, and the freshly generated `:family_id`, and its
+  return value is supplied back as `:private_context` in the completion
+  callback's context. The value must be a portable JSON object of at most 4 KiB
+  encoded; it rides with the code inside the canonical grant `claims` under a
+  reserved namespaced key, and is lifted off the grant before principal
+  construction so it never reaches an access token, ID Token, refresh token, or
+  token-exchange input. **No migration is required.** Configuring it without
+  `:authorization_code_completion` is refused at boot, and a code that carries
+  private context is refused with `invalid_grant` on a node whose completion
+  callback is missing, so config skew cannot silently skip the host's policy.
+
+### Security
+
+- Mark `claims` `redact: true` on `AttestoPhoenix.Schema.Authorization`. The
+  column carries the authentication context (`nonce`, `acr`, `amr`, `sid`) and,
+  for hosts using `:authorization_code_private_context`, host-private state;
+  none of it belongs in an `Ecto.InvalidChangesetError`, a crash report, or a
+  `Plug.Debugger` page.
+- Suppress application SQL logging and Ecto query telemetry for the
+  `AttestoPhoenix.Store.EctoCodeStore` operations that bind or return the whole
+  authorization row (`put/1`, `take/1`, `get/1`), so claims cannot be disclosed
+  through query params, cast params, or decoded results. Lifecycle updates and
+  the reuse-detection read select only the columns they report and keep normal
+  observability, so code-replay detection stays visible to APM. The suppression
+  is unconditional: the store resolves its repo from
+  `config :attesto_phoenix, :repo` and never receives an `AttestoPhoenix.Config`
+  struct, so it cannot detect whether the hook is enabled. Custom stores and
+  database-server logging remain the host's responsibility.
+
 ## [3.0.0] - 2026-08-31
 
 ### Breaking

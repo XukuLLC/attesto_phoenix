@@ -31,6 +31,25 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   the `:attesto_phoenix` app) and is read at call time. A store with no
   backing repository can make no guarantees, so a missing `:repo` fails
   closed rather than silently no-opping.
+
+  ## Query observability
+
+  The `claims` column carries the authentication context and, for a host that
+  configures `:authorization_code_private_context`, that host's private
+  authorization state. Ecto SQL query telemetry reports params, cast params,
+  and decoded results, so the operations that bind or return the whole row
+  (`put/1`, `take/1`, `get/1`) suppress both application SQL logging and the
+  `[:my_app, :repo, :query]` telemetry event. Lifecycle updates and the
+  reuse-detection read select only the columns they report, carry no claims,
+  and keep normal observability - code-replay detection stays visible to APM.
+
+  > #### Suppression is unconditional {: .warning}
+  >
+  > It applies to every deployment, including one that never enables
+  > `:authorization_code_private_context`. The store resolves its repository
+  > from `config :attesto_phoenix, :repo` and never receives an
+  > `AttestoPhoenix.Config` struct, so it cannot detect whether the hook is on.
+  > Custom stores and database-server logging remain the host's responsibility.
   """
 
   @behaviour Attesto.CodeStore
@@ -39,6 +58,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
+
+  # Ecto SQL query telemetry includes params/cast_params and decoded results, so
+  # suppress both application logging and telemetry for the calls that insert or
+  # return the full row. The lifecycle updates below bind and return no claims
+  # and keep normal observability.
+  @claims_query_opts [log: false, telemetry_event: nil]
 
   @doc """
   Persists an authorization-code record keyed by its `:code_hash`.
@@ -66,7 +91,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
     record
     |> Authorization.from_record(prefix: prefix)
-    |> repo().insert!(prefix: prefix, log: false, telemetry_event: nil)
+    |> repo().insert!([prefix: prefix] ++ @claims_query_opts)
 
     :ok
   end
@@ -100,11 +125,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().update_all(query, [set: [consumed_at: consumed_at]],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
+    case repo().update_all(query, [set: [consumed_at: consumed_at]], [prefix: prefix] ++ @claims_query_opts) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
       {0, _} -> consumed_or_missing(code_hash, prefix)
     end
@@ -128,7 +149,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().one(query, prefix: prefix, log: false, telemetry_event: nil) do
+    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
       nil -> :error
       row -> {:ok, Authorization.to_record(row)}
     end

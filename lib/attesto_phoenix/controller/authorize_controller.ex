@@ -111,6 +111,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias Attesto.ResourceIndicator
   alias Attesto.Secret
   alias Attesto.SessionState
+  alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.{BrowserState, Callback, Config, Event, RequestContext}
   alias AttestoPhoenix.ClientIdMetadata
@@ -636,35 +637,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # each mint a code from one pushed request - exactly one wins the claim.
     case claim_par_request_uri(conn, config) do
       :ok ->
-        attrs =
-          %{
-            client_id: request.client_id,
-            redirect_uri: request.redirect_uri,
-            code_challenge: request.code_challenge,
-            code_challenge_method: request.code_challenge_method,
-            subject: subject_id(subject),
-            scope: request.scope,
-            # RFC 8707 §2.2: bind the authorized resource indicator(s) to the
-            # code so the token endpoint mints `aud` from what the user actually
-            # authorized at this endpoint.
-            resource: request.resource,
-            family_id: generate_family_id(),
-            claims: code_claims(conn, request, subject)
-          }
-          |> put_optional(:dpop_jkt, dpop_jkt)
-
-        case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
-          {:ok, code} ->
-            emit_code_issued(conn, config, request.client_id, request.scope)
-            emit_success(conn, config, request, subject, code)
-
-          {:error, reason} ->
-            # Issuance failing on a validated request is a server/config fault,
-            # not a client error (RFC 6749 §4.1.2.1 server_error). Do not leak
-            # detail.
-            Logger.error("authorization code issuance failed: #{inspect(reason)}")
-            emit_error(conn, config, request, @error_server_error)
-        end
+        issue_claimed_request(conn, config, request, subject, dpop_jkt)
 
       :error ->
         # RFC 9126 §2.2/§2.3: the single-use claim was lost - a concurrent
@@ -674,6 +647,83 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # the other completion-phase failures.
         emit_failure(conn, config, @error_invalid_request_uri)
         emit_error(conn, config, request, @error_invalid_request_uri)
+    end
+  end
+
+  defp issue_claimed_request(conn, config, request, subject, dpop_jkt) do
+    # Generated before the private-context callback so the host sees the same
+    # family id the code is minted under.
+    family_id = generate_family_id()
+    subject_id = subject_id(subject)
+
+    case code_claims_with_private_context(config, request, conn, subject, subject_id, family_id) do
+      {:ok, claims} ->
+        attrs =
+          %{
+            client_id: request.client_id,
+            redirect_uri: request.redirect_uri,
+            code_challenge: request.code_challenge,
+            code_challenge_method: request.code_challenge_method,
+            subject: subject_id,
+            scope: request.scope,
+            # RFC 8707 §2.2: bind the authorized resource indicator(s) to the
+            # code so the token endpoint mints `aud` from what the user actually
+            # authorized at this endpoint.
+            resource: request.resource,
+            family_id: family_id,
+            claims: claims
+          }
+          |> put_optional(:dpop_jkt, dpop_jkt)
+
+        mint_code_and_redirect(conn, config, request, subject, attrs)
+
+      {:error, reason} ->
+        # The host's private-context callback returned something the claims
+        # column cannot round-trip. This is a server/config fault on an
+        # otherwise valid request, and it must fail closed: issuing a code
+        # without the state the completion callback will demand would strand
+        # the redemption.
+        Logger.error("authorization code private context rejected: #{inspect(reason)}")
+        emit_error(conn, config, request, @error_server_error)
+    end
+  end
+
+  defp mint_code_and_redirect(conn, config, request, subject, attrs) do
+    case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
+      {:ok, code} ->
+        emit_code_issued(conn, config, request.client_id, request.scope)
+        emit_success(conn, config, request, subject, code)
+
+      {:error, reason} ->
+        # Issuance failing on a validated request is a server/config fault,
+        # not a client error (RFC 6749 §4.1.2.1 server_error). Do not leak
+        # detail.
+        Logger.error("authorization code issuance failed: #{inspect(reason)}")
+        emit_error(conn, config, request, @error_server_error)
+    end
+  end
+
+  # The host's `:authorization_code_private_context` callback (when configured)
+  # is given exactly the authorized client, subject, and the freshly generated
+  # family id - no request parameters, no token secrets. Its result rides with
+  # the code inside `:claims` under a reserved namespaced key, because
+  # `Attesto.AuthorizationCode` admits no sibling key beside the nine canonical
+  # ones.
+  defp code_claims_with_private_context(config, request, conn, subject, subject_id, family_id) do
+    claims = code_claims(conn, request, subject)
+
+    if PrivateContext.reserved?(claims) do
+      {:error, :reserved_private_context_claim}
+    else
+      case Config.authorization_code_private_context_fun(config) do
+        nil ->
+          {:ok, claims}
+
+        callback ->
+          context = %{client_id: request.client_id, subject: subject_id, family_id: family_id}
+
+          PrivateContext.put(claims, Callback.invoke(callback, [context]))
+      end
     end
   end
 

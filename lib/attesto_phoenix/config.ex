@@ -351,6 +351,59 @@ defmodule AttestoPhoenix.Config do
       refresh token (RFC 6749 §6). When unset, the token controller issues one
       iff the granted scope contains `offline_access` (OIDC Core §11) and a
       `:refresh_store` is configured.
+    * `:authorization_code_private_context` - `(context -> map | nil)`.
+      Optional trusted issuance callback for host-private authorization state.
+      `context` contains exactly the authorized `:client_id`, `:subject`, and
+      freshly generated `:family_id`; it contains no request parameters or
+      token secrets. A returned map must be a portable JSON object
+      (`Attesto.Claims.portable_json_object?/1`: string keys at every level and
+      JSON-safe values) and is limited to 4 KiB once encoded. It rides with the
+      authorization code inside the canonical grant `:claims` under a reserved
+      namespaced key, and is supplied only as `:private_context` in the
+      completion callback context. It is stripped from the redeemed core grant
+      before principal construction, so it never reaches an access token, ID
+      Token, refresh token, or token-exchange input. `nil` stores nothing.
+      Configure this only together with `:authorization_code_completion`;
+      missing state remains valid so the host can apply flow-specific
+      fail-closed policy at completion. The reverse skew fails closed on the
+      library's side: a code that DOES carry private context is refused with
+      `invalid_grant` when no `:authorization_code_completion` callback is
+      configured, so a node that lost the callback (a rolling deploy, an
+      unloaded behaviour module) cannot issue tokens with the host's completion
+      policy silently skipped.
+    * `:authorization_code_completion` - `(context, continuation -> result)`.
+      Optional synchronous wrapper around authorization-code completion. It is
+      invoked after the code has been redeemed and before `:build_principal` or
+      token minting. `context` contains only the authenticated `:client_id`, the
+      grant `:subject`, its `:family_id`, and the host's `:private_context` map
+      (or `nil`); it never contains the authorization code or minted token
+      secrets. The zero-arity continuation performs principal construction,
+      access- and ID-token minting, access-token `jti` recording, optional
+      generation-0 refresh-token insertion, and successful code finalization. A
+      host may run it inside its own database transaction after locking and
+      revalidating the subject's authorization policy.
+
+      AttestoPhoenix binds the continuation to the callback's process and
+      dynamic scope and permits exactly one invocation; a second, cross-process,
+      or escaped invocation is rejected before token minting or persistence. The
+      callback must return the first invocation's `{:ok, response, events}` or
+      `{:error, oauth_error}` result unchanged. This is enforced, not merely
+      documented: the continuation's exact result is recorded and compared, so a
+      callback that never invokes the continuation cannot pass off a fabricated
+      `{:ok, response, events}` as a token set, and a callback that substitutes a
+      different success is refused. The `{:ok, _}` wrapper `Repo.transaction/1`
+      places around a committed return is also accepted and unwrapped, because
+      that commit already carried the mint, refresh insertion, and finalization.
+      If the continuation returns an error inside a transaction, the callback
+      must roll that transaction back rather than commit the normal error tuple.
+      Only stores participating in that same transaction can roll back
+      atomically; external or independently transactional custom stores remain
+      outside this boundary. A callback may decline to continue with
+      `{:error, reason}`; non-OAuth failures are rendered as a generic
+      token-issuance error without logging the reason. Exceptions are not
+      rescued. When unset, the continuation runs directly, preserving existing
+      behavior. This wrapper is authorization-code-specific: refresh rotation
+      and every other grant type bypass it.
     * `:code_store` - module implementing `Attesto.CodeStore`.
     * `:refresh_store` - module implementing `Attesto.RefreshStore`.
       `AttestoPhoenix.Store.EctoRefreshStore` with a non-zero rotation grace
@@ -792,6 +845,8 @@ defmodule AttestoPhoenix.Config do
     :client_requires_dpop?,
     :client_grant_types,
     :issue_refresh_token?,
+    :authorization_code_private_context,
+    :authorization_code_completion,
     :resolve_jwt_bearer_subject,
     :code_store,
     :refresh_store,
@@ -941,6 +996,8 @@ defmodule AttestoPhoenix.Config do
           client_requires_dpop?: callback() | nil,
           client_grant_types: callback() | nil,
           issue_refresh_token?: callback() | nil,
+          authorization_code_private_context: callback() | nil,
+          authorization_code_completion: callback() | nil,
           resolve_jwt_bearer_subject: callback() | nil,
           code_store: module() | nil,
           refresh_store: module() | nil,
@@ -2891,6 +2948,8 @@ defmodule AttestoPhoenix.Config do
     authenticate_ciba_user: 1,
     notify_ciba_user: 3,
     issue_refresh_token?: 2,
+    authorization_code_private_context: 1,
+    authorization_code_completion: 2,
     replay_check: 2,
     terminate_session: 2,
     render_logged_out: 2
@@ -3196,6 +3255,27 @@ defmodule AttestoPhoenix.Config do
 
   @type credential_result ::
           sd_jwt_credential_result() | jwt_vc_credential_result() | mdoc_credential_result()
+
+  @doc """
+  Returns the configured authorization-code private-context callback, or `nil`.
+
+  See the `:authorization_code_private_context` option. The value the callback
+  returns rides with the code inside the canonical grant `:claims` and is
+  surfaced only to `:authorization_code_completion`.
+  """
+  @spec authorization_code_private_context_fun(t()) :: callback() | nil
+  def authorization_code_private_context_fun(%__MODULE__{} = config),
+    do: Callback.config_callback(config, :authorization_code_private_context)
+
+  @doc """
+  Returns the configured authorization-code completion callback, or `nil`.
+
+  See the `:authorization_code_completion` option. When `nil`, the token
+  endpoint runs the completion continuation directly.
+  """
+  @spec authorization_code_completion_fun(t()) :: callback() | nil
+  def authorization_code_completion_fun(%__MODULE__{} = config),
+    do: Callback.config_callback(config, :authorization_code_completion)
 
   @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
   @spec build_credential_fun(t()) :: callback() | nil
@@ -3571,6 +3651,7 @@ defmodule AttestoPhoenix.Config do
     validate_dpop_nonce!(config)
     validate_key_attestation!(config)
     validate_authorization_grant_id_claim!(config)
+    validate_authorization_code_private_context!(config)
     validate_supported_value_lists!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
@@ -3646,6 +3727,20 @@ defmodule AttestoPhoenix.Config do
 
   @authorization_grant_id_claim_conflicts @registered_access_token_claims ++
                                             @library_owned_access_token_claims
+
+  # `:authorization_code_private_context` without `:authorization_code_completion`
+  # would persist host state that nothing ever reads: the issuance half of the
+  # feature is only meaningful paired with the redemption half. Arity is checked
+  # centrally via @flat_callback_arities; this is the cross-field rule.
+  defp validate_authorization_code_private_context!(%__MODULE__{authorization_code_private_context: nil}), do: :ok
+
+  defp validate_authorization_code_private_context!(%__MODULE__{authorization_code_completion: nil}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :authorization_code_private_context requires " <>
+            ":authorization_code_completion so persisted private state is enforced."
+  end
+
+  defp validate_authorization_code_private_context!(%__MODULE__{}), do: :ok
 
   defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: nil}), do: :ok
 

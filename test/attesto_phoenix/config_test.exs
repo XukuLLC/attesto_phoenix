@@ -993,6 +993,52 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe ":authorization_code_completion" do
+    test "is absent by default and accepts a two-argument callback" do
+      assert Config.authorization_code_completion_fun(config()) == nil
+
+      callback = fn _context, continuation -> continuation.() end
+      built = config(authorization_code_completion: callback)
+
+      assert Config.authorization_code_completion_fun(built) == callback
+    end
+
+    test "rejects callbacks with the wrong arity or unsupported forms" do
+      for invalid <- [fn _context -> :ok end, :not_a_callback, {__MODULE__, :missing_callback}] do
+        assert_raise ArgumentError, ~r/:authorization_code_completion must be a two-argument callback/, fn ->
+          config(authorization_code_completion: invalid)
+        end
+      end
+    end
+
+    test "accepts a private-context builder only with the completion callback" do
+      completion = fn _context, continuation -> continuation.() end
+      builder = fn _context -> %{"security_epoch" => 42} end
+
+      built =
+        config(
+          authorization_code_completion: completion,
+          authorization_code_private_context: builder
+        )
+
+      assert Config.authorization_code_private_context_fun(built) == builder
+    end
+
+    test "rejects an invalid or unenforced private-context builder" do
+      assert_raise ArgumentError, ~r/:authorization_code_private_context must be a one-argument callback/, fn ->
+        config(
+          authorization_code_completion: fn _context, continuation -> continuation.() end,
+          authorization_code_private_context: fn _context, _extra -> %{} end
+        )
+      end
+
+      # Issuance without enforcement would persist host state nothing reads.
+      assert_raise ArgumentError, ~r/:authorization_code_private_context requires :authorization_code_completion/, fn ->
+        config(authorization_code_private_context: fn _context -> %{} end)
+      end
+    end
+  end
+
   describe ":audience boot gate (RFC 9068 §3 aud)" do
     # The required-key/capability checks all pass here; only :audience is
     # missing, so this isolates the audience gate from the other boot checks.

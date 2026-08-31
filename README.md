@@ -494,6 +494,103 @@ No migration is required because issuance reuses the existing `family_id`
 fields. Use a private claim name under a namespace you control; do not use OIDC
 `sid`, which identifies an OP browser session with a different lifecycle.
 
+### Transactional authorization-code completion
+
+Wrap the whole tail of an authorization-code redemption — principal
+construction, access- and ID-token minting, access-token `jti` recording,
+optional generation-0 refresh issuance, and code finalization — in one
+synchronous callback, so a host can serialize it with its own database
+transaction:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  authorization_code_completion: fn context, continuation ->
+    MyApp.Repo.transaction(fn ->
+      # Lock and revalidate the subject's authorization under the same
+      # transaction the token issuance will commit in.
+      case MyApp.Policy.still_authorized?(context.subject, context.private_context) do
+        true ->
+          case continuation.() do
+            {:ok, _response, _events} = ok -> ok
+            {:error, _oauth_error} = error -> MyApp.Repo.rollback(error)
+          end
+
+        false ->
+          MyApp.Repo.rollback({:error, :subject_revoked})
+      end
+    end)
+    |> case do
+      {:ok, result} -> result
+      {:error, {:error, _} = failure} -> failure
+      {:error, reason} -> {:error, reason}
+    end
+  end
+```
+
+`context` carries only the authenticated `:client_id`, the grant `:subject`,
+its `:family_id`, and the host's `:private_context` — never the authorization
+code or a minted token secret.
+
+The continuation is bound to the callback's process and permits exactly one
+invocation; a second, cross-process, or escaped call is refused before anything
+is minted or persisted. The callback must return the first invocation's result
+unchanged. This is enforced by provenance, not by shape: a callback that never
+invokes the continuation cannot pass off a fabricated `{:ok, response, events}`
+as a token set. The `{:ok, _}` wrapper `Repo.transaction/1` puts around a
+committed return is unwrapped rather than refused, because that commit already
+carried the mint, refresh insert, and finalization.
+
+> #### Roll back, do not commit-then-refuse {: .warning}
+>
+> If the continuation succeeds and your callback then returns an error, the
+> library honours the error but cannot see whether you committed. If you did,
+> the code is finalized while the client got a failure — and the client's retry
+> presents a successfully-consumed code, which reuse detection correctly scores
+> as replay and answers by revoking the whole grant family. Roll the
+> transaction back instead. The library logs this case at error level naming the
+> consequence, so check your logs for it.
+
+#### Host-private authorization state
+
+`:authorization_code_private_context` lets the host attach trusted state at the
+authorization endpoint and read it back at completion:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  authorization_code_private_context: fn context ->
+    %{"security_epoch" => MyApp.Policy.epoch_for(context.subject)}
+  end,
+  authorization_code_completion: &MyApp.Policy.complete/2
+```
+
+The issuance callback sees exactly the authorized `:client_id`, `:subject`, and
+the freshly generated `:family_id` — no request parameters, no token secrets.
+Its return value must be a portable JSON object (string keys at every level,
+JSON-safe values) of at most 4 KiB encoded; anything else refuses the request
+with `server_error` rather than issuing a code whose completion policy could
+never run.
+
+The value rides with the code inside the canonical grant `claims` under a
+reserved namespaced key, because `Attesto.AuthorizationCode` admits no sibling
+key beside its nine canonical ones. It is lifted off the grant before principal
+construction, so it never reaches an access token, ID Token, refresh token, or
+token-exchange input, and it is never surfaced as an OIDC claim. **No migration
+is required** — the existing `claims` column carries it.
+
+Configure the two options together. `:authorization_code_private_context`
+without `:authorization_code_completion` is refused at boot, since it would
+persist state nothing ever reads.
+
+The reverse skew fails closed at redemption: a code that carries private context
+is refused with `invalid_grant` when this node has no
+`:authorization_code_completion` callback configured, so a node that lost the
+callback cannot issue tokens with the host's policy silently skipped. That is
+the *config-skew* failure mode. The **version-skew** hazard is unchanged and is
+not handled by the library: an AttestoPhoenix node running a release without
+this feature has no such refusal branch at all, so it will redeem a code
+carrying private context and complete normally. Deploy every token-endpoint
+node before enabling the hook.
+
 ### Resource indicators (RFC 8707)
 
 When one authorization server fronts more than one protected resource (say an
