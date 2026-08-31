@@ -581,6 +581,46 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
       assert_parent_unchanged(parent)
     end
 
+    test "core rejects an expired consumed parent before its retry deadline" do
+      now = 1_900_000_001
+      parent_token = "expired-consumed-parent-#{System.unique_integer([:positive])}"
+      parent = entry(%{token_hash: Attesto.Secret.hash(parent_token), expires_at: now + 1})
+      family_id = parent.family_id
+      child_token = "expired-consumed-child-#{System.unique_integer([:positive])}"
+      child = child(parent, child_token, %{expires_at: now + 100})
+      retry_state = successor(child, child_token, now + 10)
+
+      assert :ok = EctoRefreshStore.insert(parent)
+
+      assert {:ok, _committed_parent, _committed_child} =
+               EctoRefreshStore.rotate(parent.token_hash, child, retry_state, now: now)
+
+      # The store returns the consumed snapshot, even after parent expiry, so
+      # the core can apply its authoritative parent-expiry check.
+      assert {:reuse, consumed} =
+               EctoRefreshStore.rotate(parent.token_hash, child, retry_state, now: now + 2)
+
+      assert consumed.consumed
+      assert consumed.expires_at == now + 1
+      assert consumed.successor.retry_until == now + 10
+
+      # Attesto 2 checks the parent expiry before attempting successor
+      # recovery. It rejects the retry and revokes the family; the later retry
+      # deadline never extends the parent's lifetime.
+      assert {:error, :reuse_detected} =
+               CoreRefreshToken.rotate(EctoRefreshStore, parent_token,
+                 client_id: "client-1",
+                 rotation_grace_seconds: 60,
+                 ttl: 60,
+                 now: now + 2
+               )
+
+      assert :error = EctoRefreshStore.get(parent.token_hash)
+      assert :error = EctoRefreshStore.get(child.token_hash)
+
+      assert %RefreshFamilyRevocation{family_id: ^family_id} = TestRepo.get(RefreshFamilyRevocation, family_id)
+    end
+
     test "rejects a malformed rotation without consuming the parent" do
       parent = entry()
       token = "invalid-#{System.unique_integer([:positive])}"

@@ -8,7 +8,9 @@ defmodule AttestoPhoenix.Store.EctoReplayCheckTest do
   `test/test_helper.exs`).
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
+
+  import ExUnit.CaptureLog
 
   alias AttestoPhoenix.Schema.DPoPReplay
   alias AttestoPhoenix.Store.EctoReplayCheck
@@ -105,6 +107,28 @@ defmodule AttestoPhoenix.Store.EctoReplayCheckTest do
       assert EctoReplayCheck.sweep() == 1
       assert EctoReplayCheck.check_and_record("recyclable", 60) == :ok
     end
+  end
+
+  test "record and sweep operations emit no query telemetry or debug SQL" do
+    insert_replay("telemetry-expired", DateTime.add(DateTime.utc_now(), -60, :second))
+
+    capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+    on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+    {_id, ref} = capture
+
+    assert is_integer(TestRepo.aggregate(DPoPReplay, :count, :jti))
+    assert AttestoPhoenix.TestTelemetryCapture.collect(ref) != []
+
+    log =
+      capture_log([level: :debug], fn ->
+        assert :ok = EctoReplayCheck.check_and_record("telemetry-fresh", 60)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert EctoReplayCheck.sweep() == 1
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+      end)
+
+    refute log =~ "telemetry-expired"
+    refute log =~ "telemetry-fresh"
   end
 
   defp insert_replay(jti, expires_at) do

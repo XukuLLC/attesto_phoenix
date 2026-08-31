@@ -102,3 +102,11 @@ the core config for you. A consumer that previously hand-passed
 that argument once `:oauth_path_prefix` is set, since the resolver now derives
 it. (Explicit per-endpoint overrides such as `:token_path` still win if you
 need a path that does not follow the prefix.)
+
+The bundled `attesto_routes/1` macro mounts fixed `/oauth/*` tails. For this
+prefix, mount it with `prefix: "/mcp"` (or put it in a surrounding `/mcp`
+scope), so the physical routes and advertised URLs agree. An explicit override
+such as `token_path: "/mcp/oauth/token2"` changes metadata only; add a matching
+host route when using one. The installer accepts only `/oauth` or a prefix that
+ends in `/oauth`, using literal slash-separated segments with letters, digits,
+`_`, or `-`; it rejects other values before changing files.

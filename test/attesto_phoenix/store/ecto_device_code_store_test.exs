@@ -250,6 +250,10 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStoreTest do
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert {:ok, _} = Store.poll(r.device_code_hash, %{now: now, interval: 0})
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:error, :slow_down} = Store.poll(r.device_code_hash, %{now: now + 1, interval: 5})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :error = Store.poll("telemetry-device-missing", %{now: now, interval: 5})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
 
         assert {:ok, _} =
                  Store.approve(

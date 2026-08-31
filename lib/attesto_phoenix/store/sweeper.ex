@@ -40,7 +40,9 @@ defmodule AttestoPhoenix.Store.Sweeper do
   yet been swept is never honored: an expired authorization code is rejected, an
   expired nonce is rejected, and an expired replay record no longer blocks a
   fresh `jti`. Those deletes only bound table growth by reclaiming rows that can
-  no longer affect any decision.
+  no longer affect any decision. A consumed code's expired row can still carry
+  the replay-revocation link for a live access token, so that row is retained
+  until the linked token expires.
 
   The process also irreversibly redacts refresh-successor ciphertext whose
   short retry deadline has passed, on the next scheduled sweep. When the Ecto
@@ -49,17 +51,19 @@ defmodule AttestoPhoenix.Store.Sweeper do
   installer adds it to the host supervision tree automatically; manually wired
   applications MUST supervise it with a positive `:sweep_interval_ms`.
 
-  The remaining work is generic TTL housekeeping: it issues a single `DELETE
-  ... WHERE expires_at < $now` per swept table.
+  The remaining work is TTL housekeeping: it issues one delete per swept table
+  using `expires_at < $now`. Authorization-code cleanup additionally keeps a
+  row while its non-empty access-token link has a future
+  `access_token_expires_at`, preserving replay revocation until that token dies.
 
   ## Comparison boundary (fail-closed)
 
-  Deletion uses a strict `<` comparison against a single `DateTime` captured
+  Row expiry uses a strict `<` comparison against a single `DateTime` captured
   once per sweep (`DateTime.utc_now/0`) and reused across every table, so a
   sweep applies one consistent boundary. A row whose `expires_at` equals "now"
-  is retained, never deleted, so the sweeper can only ever remove rows that the
-  stores themselves already treat as expired. The sweeper widens no acceptance
-  window.
+  is retained. For an already-expired authorization-code row, however, a
+  linked access token whose own expiry equals "now" is no longer live and does
+  not delay cleanup. The sweeper widens no acceptance window.
 
   ## Configuration
 
@@ -216,9 +220,18 @@ defmodule AttestoPhoenix.Store.Sweeper do
   end
 
   # `from/2` requires a literal string source, so each generated table gets its
-  # own clause keyed off the compile-time module attribute. All five clauses are
-  # the identical strict `WHERE expires_at < $now` predicate.
-  defp expired_query(@authorization_codes, now), do: from(r in @authorization_codes, where: r.expires_at < ^now)
+  # own clause keyed off the compile-time module attribute. Authorization-code
+  # rows carry replay-revocation provenance after successful redemption. Keep a
+  # code row until its linked access token is no longer live; otherwise a replay
+  # can no longer find the row and revoke the issued token.
+  defp expired_query(@authorization_codes, now) do
+    from(r in @authorization_codes,
+      where:
+        r.expires_at < ^now and
+          (is_nil(r.access_token_jti) or r.access_token_jti == "" or
+             is_nil(r.access_token_expires_at) or r.access_token_expires_at <= ^now)
+    )
+  end
 
   defp expired_query(@refresh_tokens, now), do: from(r in @refresh_tokens, where: r.expires_at < ^now)
 
@@ -244,7 +257,13 @@ defmodule AttestoPhoenix.Store.Sweeper do
   defp refresh_expired_query(now), do: from(r in @refresh_tokens, where: r.expires_at < ^now)
 
   defp delete_expired(repo, query, prefix) do
-    {deleted, _} = repo.delete_all(query, prefix: prefix)
+    {deleted, _} =
+      repo.delete_all(query,
+        prefix: prefix,
+        log: false,
+        telemetry_event: nil
+      )
+
     deleted
   end
 

@@ -76,10 +76,12 @@ config :my_app, AttestoPhoenix.Config,
   resolve_jwt_bearer_subject: &MyApp.AuthZ.resolve_jwt_bearer_subject/1
 ```
 
-When enabled, `urn:ietf:params:oauth:grant-type:jwt-bearer` is added to
-`grant_types_supported` (both discovery documents and the token endpoint honour
-it). Config validation fails closed at boot if you enable the grant without a
-trusted-issuer source or without the subject-resolution callback.
+When enabled and `grant_types_supported` is unset, the
+`urn:ietf:params:oauth:grant-type:jwt-bearer` grant is added to the catalog
+(both discovery documents and the token endpoint honour it). If you configured
+an explicit catalog, add that exact URN yourself. Config validation fails closed
+at boot if you enable the grant without a trusted-issuer source or without the
+subject-resolution callback.
 
 ### `:jwt_bearer` options
 

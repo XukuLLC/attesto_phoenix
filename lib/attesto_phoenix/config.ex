@@ -375,12 +375,20 @@ defmodule AttestoPhoenix.Config do
     * `:grant_types_supported` - the grant types the server supports. Advertised
       as `grant_types_supported` (RFC 8414 §2), enforced by the token endpoint (a
       `grant_type` outside the set is rejected), and the accepted set for dynamic
-      registration. Defaults to every implemented grant; narrow it to disable one
-      (e.g. drop token-exchange) everywhere at once. See `grant_types_supported/1`.
+      registration. When unset, defaults to every implemented grant, including
+      enabled optional grants; when set, the list is exact, including `[]`.
+      Include the exact CIBA, device, JWT-bearer, or pre-authorized-code URN when
+      enabling one of those features with an explicit catalog. See
+      `grant_types_supported/1`.
     * `:token_endpoint_auth_methods_supported` - client authentication methods
       advertised/accepted by dynamic client registration and by the token/PAR
-      endpoints when configured. When unset, all package-supported methods are
-      accepted.
+      endpoints when configured. When unset, the default is the exact four
+      methods `client_secret_basic`, `client_secret_post`, `private_key_jwt`, and
+      `none`. Add `tls_client_auth` and/or `self_signed_tls_client_auth`
+      explicitly, together with the required mTLS callbacks, when those methods
+      are retained. Any non-`nil` list, including `[]`, is exact, except that
+      `attest_jwt_client_auth` is omitted when trusted Wallet Provider keys are
+      absent.
     * `:trusted_wallet_provider_jwks` - trusted Wallet Provider public keys for
       `attest_jwt_client_auth`, as an RFC 7517 JWK Set, a single public JWK map,
       or a list of public JWK maps. The method is disabled and omitted from
@@ -651,8 +659,9 @@ defmodule AttestoPhoenix.Config do
   `revocation_endpoint_url/1`, `registration_endpoint_url/1`,
   `userinfo_endpoint_url/1`, `authorize_endpoint_url/1`, `jwks_uri/1`, and the
   resolved-path helpers `token_path/1` and friends) rather than re-deriving the
-  URLs in callers; the router macro derives its mounted-route tails from the
-  same source so the mounted routes and the advertised routes cannot drift.
+  URLs in callers. The bundled router macro mounts fixed `/oauth/*` tails and
+  takes the path before that segment as its `:prefix`; hosts that use an
+  explicit endpoint override must mount a matching route themselves.
 
   ## Recommended production callback contracts
 
@@ -1193,9 +1202,11 @@ defmodule AttestoPhoenix.Config do
   end
 
   # RFC 8628 device authorization grant. `enabled: true` adds `device_code` to
-  # `grant_types_supported/1` and advertises the `device_authorization_endpoint`
-  # — the host MUST ALSO pass `device: true` to `attesto_routes/1` to mount the
-  # endpoints, or discovery will advertise a route that is not served.
+  # `grant_types_supported/1` only when that setting is nil, and advertises the
+  # `device_authorization_endpoint` — the host MUST ALSO pass `device: true` to
+  # `attesto_routes/1` to mount the endpoints, or discovery will advertise a
+  # route that is not served. An explicit grant catalog must include
+  # `urn:ietf:params:oauth:grant-type:device_code` when this feature is used.
   # `:verification_uri` is the URL shown to the user (defaults to the
   # issuer-derived device-verification path). `:code_ttl_seconds` and
   # `:poll_interval_seconds` are the §3.2 `expires_in` / `interval`. Off by
@@ -1213,11 +1224,13 @@ defmodule AttestoPhoenix.Config do
   defp normalize_device_authorization(opts) when is_list(opts), do: Keyword.merge(@device_authorization_defaults, opts)
 
   # OpenID Connect CIBA Core 1.0. `enabled: true` adds
-  # `urn:openid:params:grant-type:ciba` to `grant_types_supported/1` and
-  # advertises the `backchannel_authentication_endpoint` + CIBA capability
-  # metadata — the host MUST ALSO pass `ciba: true` to `attesto_routes/1` to
-  # mount the endpoint, and supply a `:ciba_store` + `:authenticate_ciba_user`
-  # callback. `:delivery_modes` are the advertised + enforced
+  # `urn:openid:params:grant-type:ciba` to `grant_types_supported/1` only when
+  # that setting is nil, and advertises the `backchannel_authentication_endpoint`
+  # + CIBA capability metadata — the host MUST ALSO pass `ciba: true` to
+  # `attesto_routes/1` to mount the endpoint, and supply a `:ciba_store` +
+  # `:authenticate_ciba_user` callback. An explicit grant catalog must include
+  # the CIBA URN when this feature is used.
+  # `:delivery_modes` are the advertised + enforced
   # `backchannel_token_delivery_modes_supported`. Poll and ping are implemented;
   # push is rejected at boot because this package has no push deliverer (and the
   # FAPI-CIBA profile forbids push in any case, §5.2.1). `:require_signed_request`
@@ -1733,8 +1746,10 @@ defmodule AttestoPhoenix.Config do
   `jwt-bearer`) is enabled.
 
   The feature is off unless the host sets `jwt_bearer: [enabled: true, ...]`.
-  When enabled, `urn:ietf:params:oauth:grant-type:jwt-bearer` is added to
+  When enabled and `grant_types_supported` is nil,
+  `urn:ietf:params:oauth:grant-type:jwt-bearer` is added to
   `grant_types_supported/1` (so both discovery and the token endpoint honour it).
+  An explicit grant catalog must include that URN when this feature is used.
   """
   @spec jwt_bearer_enabled?(t()) :: boolean()
   def jwt_bearer_enabled?(%__MODULE__{} = config) do
@@ -1748,8 +1763,9 @@ defmodule AttestoPhoenix.Config do
   @doc """
   Returns `true` iff the RFC 8628 device authorization grant is enabled
   (`device_authorization: [enabled: true]`). When enabled, `device_code` is
-  added to `grant_types_supported/1` and the `device_authorization_endpoint` is
-  advertised.
+  added to `grant_types_supported/1` only when that setting is nil, and the
+  `device_authorization_endpoint` is advertised. An explicit grant catalog
+  must include `urn:ietf:params:oauth:grant-type:device_code`.
   """
   @spec device_authorization_enabled?(t()) :: boolean()
   def device_authorization_enabled?(%__MODULE__{} = config) do
@@ -1843,10 +1859,11 @@ defmodule AttestoPhoenix.Config do
 
   @doc """
   Returns `true` iff OpenID Connect CIBA is enabled (`ciba: [enabled: true]`).
-  When enabled, `urn:openid:params:grant-type:ciba` is added to
-  `grant_types_supported/1` and the `backchannel_authentication_endpoint` +
-  CIBA capability metadata are advertised. The host MUST ALSO pass
-  `ciba: true` to `attesto_routes/1` to mount the endpoint.
+  When enabled and `grant_types_supported` is nil,
+  `urn:openid:params:grant-type:ciba` is added to `grant_types_supported/1` and
+  the `backchannel_authentication_endpoint` + CIBA capability metadata are
+  advertised. An explicit grant catalog must include the CIBA URN. The host
+  MUST ALSO pass `ciba: true` to `attesto_routes/1` to mount the endpoint.
   """
   @spec ciba_enabled?(t()) :: boolean()
   def ciba_enabled?(%__MODULE__{} = config) do
@@ -2609,7 +2626,8 @@ defmodule AttestoPhoenix.Config do
 
   # Every grant type the token endpoint implements: RFC 6749 authorization_code /
   # refresh_token / client_credentials and RFC 8693 token-exchange. This is the
-  # default advertised + accepted set; `:grant_types_supported` narrows it.
+  # default advertised + accepted set; `:grant_types_supported` is an exact
+  # override, including when optional feature grants are enabled.
   @default_grant_types_supported [
     "authorization_code",
     "refresh_token",
@@ -2622,11 +2640,12 @@ defmodule AttestoPhoenix.Config do
 
   Advertised as `grant_types_supported` (RFC 8414 §2) by both discovery documents
   and enforced by the token endpoint — a `grant_type` outside this set is rejected
-  as `unsupported_grant_type` before dispatch. Defaults to every grant the token
-  endpoint implements (#{inspect(@default_grant_types_supported)}); configure
-  `:grant_types_supported` to narrow it, e.g. drop
-  `urn:ietf:params:oauth:grant-type:token-exchange` to disable token exchange
-  across discovery, the token endpoint, and dynamic registration at once.
+  as `unsupported_grant_type` before dispatch. When unset, defaults to every
+  grant the token endpoint implements (#{inspect(@default_grant_types_supported)})
+  plus enabled optional-feature grants. When set, the list is exact, including
+  `[]`; include the exact optional-feature URN yourself when the feature is
+  enabled. This same catalog drives discovery, endpoint enforcement, and
+  dynamic registration.
   """
   # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
   # JWT-bearer authorization grant, advertised + accepted only when the feature
@@ -2669,8 +2688,9 @@ defmodule AttestoPhoenix.Config do
   This is the single catalog used by endpoint enforcement, discovery, and
   dynamic registration. When no explicit catalog is configured, wallet
   attestation is added only when trusted Wallet Provider keys are available.
-  An explicitly configured catalog is never widened, and wallet attestation is
-  removed when its verification keys are absent.
+  An explicitly configured catalog is never widened. The wallet-attestation
+  method is omitted whenever its trusted verification keys are absent, including
+  from an explicit list.
   """
   @spec token_endpoint_auth_methods_supported(t()) :: [String.t()]
   def token_endpoint_auth_methods_supported(%__MODULE__{token_endpoint_auth_methods_supported: methods} = config)

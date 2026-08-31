@@ -67,7 +67,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
         where: c.url == ^url and c.expires_at > ^now,
         select: c.metadata
 
-    case repo().one(query, prefix: prefix) do
+    case repo().one(query, prefix: prefix, log: false, telemetry_event: nil) do
       nil -> :miss
       metadata -> {:ok, metadata}
     end
@@ -96,7 +96,9 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
     |> repo().insert!(
       on_conflict: [set: [metadata: metadata, expires_at: expires_at]],
       conflict_target: :url,
-      prefix: prefix
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
     )
 
     :ok
@@ -114,7 +116,12 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete(String.t()) :: :ok
   def delete(url) when is_binary(url) do
-    repo().delete_all(from(c in ClientIdMetadata, where: c.url == ^url), prefix: Config.table_prefix())
+    repo().delete_all(from(c in ClientIdMetadata, where: c.url == ^url),
+      prefix: Config.table_prefix(),
+      log: false,
+      telemetry_event: nil
+    )
+
     :ok
   end
 
@@ -124,7 +131,12 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete_all() :: :ok
   def delete_all do
-    repo().delete_all(ClientIdMetadata, prefix: Config.table_prefix())
+    repo().delete_all(ClientIdMetadata,
+      prefix: Config.table_prefix(),
+      log: false,
+      telemetry_event: nil
+    )
+
     :ok
   end
 

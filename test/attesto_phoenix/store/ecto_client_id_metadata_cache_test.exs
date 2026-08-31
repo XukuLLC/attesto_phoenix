@@ -9,7 +9,9 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
   which `AttestoPhoenix.DataCase` points at the sandboxed test repo.
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
+
+  import ExUnit.CaptureLog
 
   alias AttestoPhoenix.ClientIdMetadata.Cache, as: CacheAPI
   alias AttestoPhoenix.ClientIdMetadata.Cache.Ecto, as: Cache
@@ -148,5 +150,34 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
       assert CacheAPI.evict(NoEvictCache, @url) == {:error, :not_supported}
       assert CacheAPI.evict_all(NoEvictCache) == {:error, :not_supported}
     end
+  end
+
+  test "sensitive cache operations emit no query telemetry or debug SQL" do
+    capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+    on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+    {_id, ref} = capture
+
+    assert is_integer(TestRepo.aggregate(ClientIdMetadata, :count, :url))
+    assert AttestoPhoenix.TestTelemetryCapture.collect(ref) != []
+
+    url = "https://telemetry.example/client-metadata.json"
+    metadata = %{"client_id" => url, "client_name" => "telemetry-metadata-sentinel"}
+
+    log =
+      capture_log([level: :debug], fn ->
+        assert :ok = Cache.put(url, metadata, soon())
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, ^metadata} = Cache.get(url)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :ok = Cache.delete(url)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :ok = Cache.put(url, metadata, soon())
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :ok = Cache.delete_all()
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+      end)
+
+    refute log =~ url
+    refute log =~ "telemetry-metadata-sentinel"
   end
 end

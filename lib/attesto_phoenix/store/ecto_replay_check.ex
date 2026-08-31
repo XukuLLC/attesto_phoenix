@@ -112,7 +112,7 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
     changeset =
       DPoPReplay.changeset(%DPoPReplay{}, %{jti: jti, expires_at: expires_at}, prefix: prefix)
 
-    case repo().insert(changeset, prefix: prefix) do
+    case repo().insert(changeset, prefix: prefix, log: false, telemetry_event: nil) do
       {:ok, _record} ->
         :ok
 
@@ -147,7 +147,11 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
     now = DateTime.utc_now()
 
     {deleted, _} =
-      repo().delete_all(from(r in DPoPReplay, where: r.expires_at < ^now), prefix: prefix)
+      repo().delete_all(from(r in DPoPReplay, where: r.expires_at < ^now),
+        prefix: prefix,
+        log: false,
+        telemetry_event: nil
+      )
 
     deleted
   end

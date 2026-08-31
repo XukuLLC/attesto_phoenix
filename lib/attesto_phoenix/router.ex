@@ -115,6 +115,12 @@ defmodule AttestoPhoenix.Router do
         attesto_routes(pipeline: :oauth_server, prefix: "/auth")
       end
 
+  Here `:prefix` is the path before the macro's fixed `/oauth/*` tails, so the
+  corresponding configuration for this example is
+  `oauth_path_prefix: "/auth/oauth"`. A host that advertises a different
+  endpoint suffix must mount that route itself and configure the matching
+  advertised path.
+
       # or classify browser-facing routes separately while retaining shared
       # transport policy on every class:
       scope "/" do

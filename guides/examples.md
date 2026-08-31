@@ -30,6 +30,22 @@ deployments. A single-node development setup may instead use an explicit
 development-only value. Production should fail at startup when the environment
 variable is absent.
 
+Because these examples use the bundled Ecto stores with positive retry grace,
+supervise the sweeper after the repository:
+
+```elixir
+# lib/my_app/application.ex
+children = [
+  MyApp.Repo,
+  {AttestoPhoenix.Store.Sweeper,
+   config: AttestoPhoenix.Config.from_otp_app(:my_app)}
+]
+```
+
+The `sweep_interval_ms` setting controls the interval but does not start this
+process. The installer adds the child automatically; manually wired hosts
+must add it themselves.
+
 ## Confidential client (server-side app, client secret)
 
 A confidential client authenticates with a secret at the token endpoint
@@ -171,5 +187,17 @@ different mount (for example `/mcp/oauth`), add a single key:
 ```elixir
 oauth_path_prefix: "/mcp/oauth"
 ```
+
+When using the installer, pass the same full client-visible prefix:
+
+```bash
+mix attesto_phoenix.install --oauth-path-prefix /mcp/oauth
+```
+
+This generates `attesto_routes(prefix: "/mcp")`, whose fixed `/oauth/*` tails
+match the advertised `/mcp/oauth/*` paths. The installer rejects prefixes such
+as `/auth` that would not match those tails. A different suffix or an explicit
+per-endpoint override requires a host-mounted route with the exact advertised
+path; configure that manually rather than relying on the generated mount.
 
 See `guides/consumer_migration.md` for the details.

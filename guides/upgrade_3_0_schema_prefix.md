@@ -160,6 +160,12 @@ data-reconciliation plan before continuing.
 An empty stale candidate may remain for later audit, but record it and do not
 use it as a source. The 3.0 cutover moves only a verified source relation.
 
+Candidate relations may be absent during inventory, but absence is not valid
+after cutover: every table in the selected ten-table 2.x source set must exist
+exactly once in the target schema under its canonical name. A missing source or
+target is a stop condition. Only an audited, empty stale candidate may remain
+outside the target layout.
+
 ## 2. Select one 3.0 target layout
 
 Choose one PostgreSQL schema for all Ecto-backed Attesto tables:
@@ -167,6 +173,11 @@ Choose one PostgreSQL schema for all Ecto-backed Attesto tables:
 * use `public` with `schema_prefix: nil` (the Ecto default), or
 * use one application-owned schema, such as `oauth`, with
   `schema_prefix: "oauth"`.
+
+The target is exact: after the move, all ten bundled 2.x tables must be the
+canonical names in this one schema. A canonical relation is not optional merely
+because an alternate literal-prefixed relation exists; select and move the
+verified source, then stop on any missing or colliding canonical target.
 
 Create a non-public schema only after checking ownership and privileges. Before
 moving any source, verify that every target canonical relation is absent or is
@@ -282,10 +293,12 @@ With writers still stopped:
    the same schema as their tables.
 4. Confirm no unreviewed non-empty candidate relation remains. Keep empty stale
    relations until they have been audited; do not let them influence 3.0.
-5. Restore the backed-up 2.14.2 deployment against the rehearsal database and
-   confirm that the observed source record explains its reads and writes. Then
-   confirm that 3.0 resolves every store to the one target schema and canonical
-   table name.
+5. Do not start the old 2.14.2 deployment after moving relations. Its stores
+   can miss the moved canonical tables or write stale literal-prefixed
+   candidates. The 2.14.2 replay/observation belongs in the inventory phase
+   against an untouched database clone. Post-move verification must use only
+   3.0 and must confirm that every store resolves to the one target schema and
+   canonical table name.
 
 Only after these checks pass, remove every old `:table_prefix` setting and
 configure the public 3.0 key:

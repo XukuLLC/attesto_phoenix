@@ -42,9 +42,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The default dynamic-registration grant catalog now includes the implemented
   OAuth token-exchange grant. Hosts that do not want to register clients for it
   must explicitly narrow `:grant_types_supported`.
+- Optional CIBA, device-authorization, JWT-bearer, and pre-authorized-code
+  grants are added to the default catalog only when `:grant_types_supported` is
+  unset. An explicit catalog is now exact, so 2.14.2 deployments that enabled
+  one of these features must add its exact grant URN before upgrading.
+- Client-authentication method policy is exact in 3.0. In 2.14.2, an unset or
+  empty `:token_endpoint_auth_methods_supported` value did not restrict endpoint
+  authentication, so mTLS could work when its callbacks were wired. In 3.0,
+  `nil` defaults to `client_secret_basic`, `client_secret_post`,
+  `private_key_jwt`, and `none`; `tls_client_auth` and
+  `self_signed_tls_client_auth` must be listed explicitly, with their required
+  callbacks, when retained. Any non-`nil` list, including `[]`, is exact;
+  wallet attestation remains conditional on trusted Wallet Provider keys.
 
 ### Security
 
+- Retain an expired authorization-code row while its linked access token is
+  still live, so replay detection and access-token revocation remain enforceable.
+  Unlinked rows, malformed rows, and rows whose linked token has expired are still
+  reclaimed by the sweeper.
 - Suppress both Ecto Logger output and repository query telemetry for
   credential-bearing and privacy-sensitive values, including consent tokens,
   DPoP nonces, device user codes, PAR request URIs, CIBA notification tokens,

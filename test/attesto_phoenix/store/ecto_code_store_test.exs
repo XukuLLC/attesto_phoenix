@@ -11,7 +11,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   backend is available (see `test/test_helper.exs`).
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
+
+  import ExUnit.CaptureLog
 
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
@@ -304,6 +306,59 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
       assert_raise RuntimeError, ~r/record_access_token failed to update exactly one authorization record/, fn ->
         EctoCodeStore.record_access_token("fam-missing", "jti-missing", expires_at)
+      end
+    end
+  end
+
+  describe "query observability" do
+    test "sensitive operations emit no query telemetry or debug SQL" do
+      capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+      on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+      {_id, ref} = capture
+
+      assert is_integer(TestRepo.aggregate(Authorization, :count, :code_hash))
+      assert AttestoPhoenix.TestTelemetryCapture.collect(ref) != []
+
+      now = System.system_time(:second)
+      code_hash = "telemetry-code-#{System.unique_integer([:positive])}"
+      family_id = "telemetry-family-#{System.unique_integer([:positive])}"
+      code_jti = "telemetry-code-jti-#{System.unique_integer([:positive])}"
+      family_jti = "telemetry-family-jti-#{System.unique_integer([:positive])}"
+      expires_at = now + 600
+
+      log =
+        capture_log([level: :debug], fn ->
+          assert :ok = EctoCodeStore.put(entry(code_hash, grant_data(%{family_id: nil}), expires_at))
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert {:ok, _} = EctoCodeStore.get(code_hash)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert {:ok, _} = EctoCodeStore.take(code_hash)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert :ok = EctoCodeStore.mark_consumed(code_hash, %{family_id: family_id})
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+
+          assert :ok = EctoCodeStore.record_access_token_for_code(code_hash, code_jti, expires_at)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert :ok = EctoCodeStore.record_access_token(family_id, family_jti, expires_at)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert :ok = EctoCodeStore.revoke_family_access_tokens(family_id)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert EctoCodeStore.access_token_revoked?(family_jti)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert :ok = EctoCodeStore.revoke_access_token_for_code(code_hash)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert :ok = EctoCodeStore.revoke_access_token_for_code("telemetry-code-missing")
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert {:error, :consumed, _} = EctoCodeStore.take(code_hash)
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert :error = EctoCodeStore.get("telemetry-code-missing")
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+          assert :error = EctoCodeStore.take("telemetry-code-missing")
+          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        end)
+
+      for sentinel <- [code_hash, family_id, code_jti, family_jti] do
+        refute log =~ sentinel
       end
     end
   end

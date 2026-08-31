@@ -66,7 +66,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
     record
     |> Authorization.from_record(prefix: prefix)
-    |> repo().insert!(prefix: prefix)
+    |> repo().insert!(prefix: prefix, log: false, telemetry_event: nil)
 
     :ok
   end
@@ -100,7 +100,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().update_all(query, [set: [consumed_at: consumed_at]], prefix: prefix) do
+    case repo().update_all(query, [set: [consumed_at: consumed_at]],
+           prefix: prefix,
+           log: false,
+           telemetry_event: nil
+         ) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
       {0, _} -> consumed_or_missing(code_hash, prefix)
     end
@@ -124,7 +128,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().one(query, prefix: prefix) do
+    case repo().one(query, prefix: prefix, log: false, telemetry_event: nil) do
       nil -> :error
       row -> {:ok, Authorization.to_record(row)}
     end
@@ -170,7 +174,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     updates = [consumed_success: true] ++ family_updates
 
     query
-    |> repo().update_all([set: updates], prefix: prefix)
+    |> repo().update_all([set: updates], prefix: prefix, log: false, telemetry_event: nil)
     |> expect_one_updated!(:mark_consumed)
   end
 
@@ -208,7 +212,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
             access_token_expires_at: DateTime.from_unix!(expires_at)
           ]
         ],
-        prefix: prefix
+        prefix: prefix,
+        log: false,
+        telemetry_event: nil
       ),
       :record_access_token
     )
@@ -224,7 +230,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
       from a in Authorization,
         where: a.family_id == ^family_id and not is_nil(a.access_token_jti)
 
-    repo().update_all(query, [set: [access_token_revoked_at: now]], prefix: prefix)
+    repo().update_all(query, [set: [access_token_revoked_at: now]],
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
+    )
+
     :ok
   end
 
@@ -245,7 +256,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
           a.code_hash == ^code_hash and not is_nil(a.access_token_jti) and
             a.access_token_jti != ^""
 
-    case repo().update_all(query, [set: [access_token_revoked_at: now]], prefix: prefix) do
+    case repo().update_all(query, [set: [access_token_revoked_at: now]],
+           prefix: prefix,
+           log: false,
+           telemetry_event: nil
+         ) do
       {1, _rows} ->
         :ok
 
@@ -262,7 +277,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   end
 
   defp legacy_or_missing_revoke(code_hash, prefix) do
-    case repo().get_by(Authorization, [code_hash: code_hash], prefix: prefix) do
+    case repo().get_by(Authorization, [code_hash: code_hash],
+           prefix: prefix,
+           log: false,
+           telemetry_event: nil
+         ) do
       nil ->
         :ok
 
@@ -291,11 +310,15 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
           a.access_token_jti == ^jti and not is_nil(a.access_token_revoked_at) and
             a.access_token_expires_at > ^now
 
-    repo().exists?(query, prefix: prefix)
+    repo().exists?(query, prefix: prefix, log: false, telemetry_event: nil)
   end
 
   defp consumed_or_missing(code_hash, prefix) do
-    case repo().get_by(Authorization, [code_hash: code_hash], prefix: prefix) do
+    case repo().get_by(Authorization, [code_hash: code_hash],
+           prefix: prefix,
+           log: false,
+           telemetry_event: nil
+         ) do
       %Authorization{consumed_success: true} = row ->
         {:error, :consumed, Authorization.consumed_meta(row)}
 

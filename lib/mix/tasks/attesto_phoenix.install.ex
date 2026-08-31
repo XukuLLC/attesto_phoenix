@@ -53,14 +53,18 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
 
     ## Options
 
-      * `--oauth-path-prefix` - the client-visible mount prefix for the OAuth
-        endpoints (RFC 8414 §3 advertises the absolute URLs; the mounted routes
-        and the advertised metadata derive from the same prefix so they cannot
-        drift). Defaults to `/oauth`, reproducing the historic surface. A host
-        avoiding a collision with a legacy provider may pass, for example,
-        `--oauth-path-prefix /mcp/oauth`. The well-known documents (RFC 8615)
-        and the JWKS document stay anchored at the host root and are NOT
-        relocated by this prefix.
+      * `--oauth-path-prefix` - the full client-visible mount prefix for the
+        bundled OAuth endpoints (RFC 8414 §3 advertises the absolute URLs). It
+        must be `/oauth` or end in `/oauth`, because the bundled router has
+        fixed `/oauth/*` endpoint tails; for example,
+        `--oauth-path-prefix /mcp/oauth` generates
+        `attesto_routes(prefix: "/mcp")` and advertises `/mcp/oauth/*`.
+        Unsupported values such as `/auth` are rejected before any files are
+        changed. If a host needs a different endpoint suffix or an explicit
+        per-endpoint route override, wire the routes manually and set matching
+        advertised paths instead of relying on the generated mount. The
+        well-known documents (RFC 8615) and the JWKS document stay anchored at
+        the host root and are NOT relocated by this prefix.
       * `--schema-prefix` - the PostgreSQL schema selected by Ecto's `prefix:`
         option for every generated table and index. The migration generator
         uses the same value. The legacy 2.x `--table-prefix` option is rejected
@@ -104,6 +108,7 @@ if Code.ensure_loaded?(Igniter) do
     alias Igniter.Project.Config, as: ProjectConfig
     alias Igniter.Project.Module, as: ProjectModule
     alias Mix.Tasks.AttestoPhoenix.Install.Docs
+    alias Sourceror.Zipper
 
     # The default OAuth mount prefix reproduces the historic `/oauth/*` surface
     # (`AttestoPhoenix.Config`'s `:oauth_path_prefix` default). A host may
@@ -155,7 +160,9 @@ if Code.ensure_loaded?(Igniter) do
       repo = Module.concat(app_module, Repo)
       options = igniter.args.options
 
-      oauth_path_prefix = options[:oauth_path_prefix] || @default_oauth_path_prefix
+      oauth_path_prefix =
+        validate_oauth_path_prefix!(options[:oauth_path_prefix] || @default_oauth_path_prefix)
+
       schema_prefix = schema_prefix(options, igniter, app)
       callbacks_module = callbacks_module(options, app_module)
       refresh_successor_secret = generate_refresh_successor_secret()
@@ -395,8 +402,9 @@ if Code.ensure_loaded?(Igniter) do
 
     # An installer rerun must keep notices and generated migration commands
     # aligned with an already-configured host schema. Read literal values from
-    # the host config AST without evaluating arbitrary config code; dynamic
-    # expressions remain host-owned and are left for runtime resolution.
+    # the host config AST without evaluating arbitrary config code. Dynamic or
+    # ambiguous expressions fail closed: guessing `public` would make generated
+    # migration instructions disagree with the runtime database layout.
     defp configured_schema_prefix(igniter, app) do
       config_path = ProjectApplication.config_path(igniter)
       config_dir = config_path |> Path.dirname() |> Path.expand()
@@ -487,18 +495,22 @@ if Code.ensure_loaded?(Igniter) do
           |> configured_schema_prefix_ast_results(app)
           |> Enum.map(&format_configured_schema_prefix_result/1)
 
-        _error ->
-          []
+        {:error, error} ->
+          [{:dynamic, "unparseable config source (#{inspect(error)})"}]
       end
     end
 
     defp configured_schema_prefix_ast_results(ast, app) do
-      {_ast, results} = Macro.prewalk(ast, [], &configured_schema_prefix_ast_node(&1, &2, app))
+      aliases = config_aliases(ast)
+
+      {_ast, results} =
+        Macro.prewalk(ast, [], &configured_schema_prefix_ast_node(&1, &2, app, aliases))
+
       Enum.reverse(results)
     end
 
-    defp configured_schema_prefix_ast_node(node, results, app) do
-      node_result = configured_schema_prefix_node(node, app)
+    defp configured_schema_prefix_ast_node(node, results, app, aliases) do
+      node_result = configured_schema_prefix_node(node, app, aliases)
 
       case node_result do
         {^node, :not_found} -> {node, results}
@@ -506,15 +518,56 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
-    defp configured_schema_prefix_node({:config, _meta, [configured_app, config_module, config_opts]} = node, app) do
-      if configured_app == app and attesto_config_module_ast?(config_module) do
+    defp configured_schema_prefix_node(
+           {:config, _meta, [configured_app, config_module, config_opts]} = node,
+           app,
+           aliases
+         ) do
+      case configured_app do
+        ^app ->
+          configured_schema_prefix_node_for_app(node, config_module, config_opts, aliases)
+
+        configured_app when is_atom(configured_app) ->
+          {node, :not_found}
+
+        _dynamic_app ->
+          configured_schema_prefix_node_for_dynamic_app(
+            node,
+            configured_app,
+            config_module,
+            config_opts,
+            aliases
+          )
+      end
+    end
+
+    defp configured_schema_prefix_node(node, _app, _aliases), do: {node, :not_found}
+
+    defp configured_schema_prefix_node_for_app(node, config_module, config_opts, aliases) do
+      if attesto_config_module_ast?(config_module, aliases) do
         configured_schema_prefix_config(node, config_opts)
+      else
+        configured_schema_prefix_node_for_ambiguous_module(node, config_module, config_opts, aliases)
+      end
+    end
+
+    defp configured_schema_prefix_node_for_dynamic_app(node, configured_app, config_module, config_opts, aliases) do
+      if attesto_config_module_ast?(config_module, aliases) and
+           ambiguous_schema_prefix_options?(config_opts) do
+        {node, [{:dynamic, "ambiguous config app #{Macro.to_string(configured_app)}"}]}
       else
         {node, :not_found}
       end
     end
 
-    defp configured_schema_prefix_node(node, _app), do: {node, :not_found}
+    defp configured_schema_prefix_node_for_ambiguous_module(node, config_module, config_opts, aliases) do
+      if ambiguous_config_module_ast?(config_module, aliases) and
+           ambiguous_schema_prefix_options?(config_opts) do
+        {node, [{:dynamic, "ambiguous config module #{Macro.to_string(config_module)}"}]}
+      else
+        {node, :not_found}
+      end
+    end
 
     defp configured_schema_prefix_config(node, opts) when is_list(opts) do
       configured_schema_prefix_option(node, opts)
@@ -524,24 +577,46 @@ if Code.ensure_loaded?(Igniter) do
       configured_schema_prefix_map_option(node, pairs)
     end
 
-    defp configured_schema_prefix_config(node, _opts), do: {node, :not_found}
+    defp configured_schema_prefix_config(node, opts), do: {node, [{:dynamic, Macro.to_string(opts)}]}
 
     defp configured_schema_prefix_map_option(node, pairs) do
-      case Enum.flat_map(pairs, &schema_prefix_map_option_result/1) do
-        [] -> {node, :not_found}
-        results -> {node, results}
+      results = Enum.flat_map(pairs, &schema_prefix_map_option_result/1)
+
+      cond do
+        results != [] ->
+          {node, results}
+
+        Enum.any?(pairs, &dynamic_config_map_pair?/1) ->
+          {node, [{:dynamic, Macro.to_string({:%{}, [], pairs})}]}
+
+        true ->
+          {node, :not_found}
       end
     end
 
-    defp schema_prefix_map_option_result({:schema_prefix, value}), do: [{:found, configured_schema_prefix_value(value)}]
+    defp schema_prefix_map_option_result({key, value}) do
+      case static_config_key(key) do
+        :schema_prefix ->
+          [{:found, configured_schema_prefix_value(value)}]
 
-    defp schema_prefix_map_option_result({key, value}) when key in ["schema_prefix", :table_prefix, "table_prefix"],
-      do: [{:found, {:string_key, key, value}}]
+        key when key in ["schema_prefix", :table_prefix, "table_prefix"] ->
+          [{:found, {:string_key, key, value}}]
+
+        _other ->
+          []
+      end
+    end
 
     defp schema_prefix_map_option_result(_other), do: []
 
+    defp dynamic_config_map_pair?({key, _value}), do: is_nil(static_config_key(key))
+    defp dynamic_config_map_pair?(_other), do: true
+
     defp format_configured_schema_prefix_result(result) do
       case result do
+        {:dynamic, expression} ->
+          {:dynamic, expression}
+
         {:found, {:dynamic, expression}} ->
           {:dynamic, expression}
 
@@ -560,19 +635,37 @@ if Code.ensure_loaded?(Igniter) do
     end
 
     defp configured_schema_prefix_option(node, opts) do
-      case Enum.flat_map(opts, &schema_prefix_option_result/1) do
-        [] -> {node, :not_found}
-        results -> {node, results}
+      results = Enum.flat_map(opts, &schema_prefix_option_result/1)
+
+      cond do
+        results != [] ->
+          {node, results}
+
+        Enum.any?(opts, &dynamic_config_option?/1) ->
+          {node, [{:dynamic, Macro.to_string(opts)}]}
+
+        true ->
+          {node, :not_found}
       end
     end
 
-    defp schema_prefix_option_result({:schema_prefix, value}), do: [{:found, configured_schema_prefix_value(value)}]
+    defp dynamic_config_option?({key, _value}), do: is_nil(static_config_key(key))
+    defp dynamic_config_option?(_other), do: true
 
-    defp schema_prefix_option_result({"schema_prefix", value}), do: [{:found, {:string_key, "schema_prefix", value}}]
-
-    defp schema_prefix_option_result({"table_prefix", value}), do: [{:found, {:string_key, "table_prefix", value}}]
+    defp schema_prefix_option_result({key, value}) do
+      case static_config_key(key) do
+        :schema_prefix -> [{:found, configured_schema_prefix_value(value)}]
+        "schema_prefix" -> [{:found, {:string_key, "schema_prefix", value}}]
+        "table_prefix" -> [{:found, {:string_key, "table_prefix", value}}]
+        _other -> []
+      end
+    end
 
     defp schema_prefix_option_result(_other), do: []
+
+    defp static_config_key({:__block__, _meta, [key]}) when is_atom(key) or is_binary(key), do: key
+    defp static_config_key(key) when is_atom(key) or is_binary(key), do: key
+    defp static_config_key(_dynamic), do: nil
 
     defp configured_schema_prefix_value(value) when is_binary(value) or is_nil(value), do: value
 
@@ -580,11 +673,117 @@ if Code.ensure_loaded?(Igniter) do
 
     defp configured_schema_prefix_value(value), do: {:dynamic, Macro.to_string(value)}
 
-    defp attesto_config_module_ast?(AttestoPhoenix.Config), do: true
+    defp config_aliases(ast) do
+      {_ast, aliases} =
+        Macro.prewalk(ast, %{}, fn
+          {:alias, _meta, [target]} = node, aliases ->
+            {node, put_config_alias(aliases, target, nil)}
 
-    defp attesto_config_module_ast?({:__aliases__, _meta, [:AttestoPhoenix, :Config]}), do: true
+          {:alias, _meta, [target, opts]} = node, aliases when is_list(opts) ->
+            {node, put_config_alias(aliases, target, Keyword.get(opts, :as))}
 
-    defp attesto_config_module_ast?(_other), do: false
+          node, aliases ->
+            {node, aliases}
+        end)
+
+      aliases
+    end
+
+    defp put_config_alias(aliases, {:__aliases__, _meta, target_parts}, as) when is_list(target_parts) do
+      alias_name = alias_name(target_parts, as)
+
+      if is_atom(alias_name) do
+        case Map.get(aliases, alias_name) do
+          nil -> Map.put(aliases, alias_name, target_parts)
+          ^target_parts -> aliases
+          _other -> Map.put(aliases, alias_name, :ambiguous)
+        end
+      else
+        aliases
+      end
+    end
+
+    defp put_config_alias(aliases, _target, _as), do: aliases
+
+    defp alias_name(target_parts, nil), do: List.last(target_parts)
+
+    defp alias_name(_target_parts, {:__aliases__, _meta, [alias_name]}), do: alias_name
+    defp alias_name(_target_parts, _invalid), do: nil
+
+    defp attesto_config_module_ast?(module, aliases) do
+      case module_alias_parts(module, aliases) do
+        [:AttestoPhoenix, :Config] -> true
+        _other -> false
+      end
+    end
+
+    defp module_alias_parts({:__aliases__, _meta, [:AttestoPhoenix, :Config]}, _aliases), do: [:AttestoPhoenix, :Config]
+
+    defp module_alias_parts({:__aliases__, _meta, [first | rest]}, aliases) do
+      case Map.get(aliases, first) do
+        nil -> nil
+        :ambiguous -> nil
+        target -> target ++ rest
+      end
+    end
+
+    defp module_alias_parts(_module, _aliases), do: nil
+
+    defp ambiguous_config_module_ast?(module, aliases), do: is_nil(module_alias_parts(module, aliases))
+
+    defp ambiguous_schema_prefix_options?(opts) when is_list(opts) do
+      Enum.any?(opts, fn
+        {key, _value} when key in [:schema_prefix, "schema_prefix", :table_prefix, "table_prefix"] ->
+          true
+
+        {_key, _value} ->
+          false
+
+        _dynamic ->
+          true
+      end)
+    end
+
+    defp ambiguous_schema_prefix_options?({:%{}, _meta, pairs}) when is_list(pairs) do
+      Enum.any?(pairs, fn
+        {key, _value} when key in [:schema_prefix, "schema_prefix", :table_prefix, "table_prefix"] ->
+          true
+
+        _other ->
+          false
+      end)
+    end
+
+    defp ambiguous_schema_prefix_options?(_dynamic), do: true
+
+    defp validate_oauth_path_prefix!(prefix) when is_binary(prefix) do
+      trimmed = String.trim_trailing(prefix, "/")
+
+      cond do
+        trimmed == "" or not String.starts_with?(trimmed, "/") ->
+          raise_invalid_oauth_path_prefix(prefix)
+
+        String.contains?(prefix, "//") or
+            not Regex.match?(~r/\A\/(?:[A-Za-z0-9_-]+\/)*oauth\z/, trimmed) ->
+          raise_invalid_oauth_path_prefix(prefix)
+
+        true ->
+          trimmed
+      end
+    end
+
+    defp validate_oauth_path_prefix!(prefix), do: raise_invalid_oauth_path_prefix(prefix)
+
+    defp raise_invalid_oauth_path_prefix(prefix) do
+      raise Mix.Error,
+        message:
+          "unsupported --oauth-path-prefix #{inspect(prefix)}: the bundled router mounts " <>
+            "fixed /oauth/* endpoint tails. Use /oauth or slash-separated literal " <>
+            "segments containing only letters, digits, `_`, or `-`, ending in /oauth " <>
+            "(for example /mcp/oauth, which generates attesto_routes(prefix: \"/mcp\")). " <>
+            "For a different suffix or explicit endpoint paths, mount the routes manually " <>
+            "and configure matching advertised paths; the installer made no changes."
+    end
 
     defp validate_schema_prefix!(prefix) do
       cond do
@@ -805,7 +1004,7 @@ if Code.ensure_loaded?(Igniter) do
         zipper = add_router_use(zipper)
 
         case move_to_attesto_routes(zipper) do
-          {:ok, routes_zipper} -> ensure_route_pipeline(routes_zipper)
+          {:ok, routes_zipper} -> ensure_route_pipeline(routes_zipper, oauth_path_prefix)
           :error -> {:ok, Common.add_code(zipper, scope_code)}
         end
       end)
@@ -813,7 +1012,9 @@ if Code.ensure_loaded?(Igniter) do
 
     defp move_to_attesto_routes(zipper), do: Function.move_to_function_call(zipper, :attesto_routes, [0, 1])
 
-    defp ensure_route_pipeline(routes_zipper) do
+    defp ensure_route_pipeline(routes_zipper, oauth_path_prefix) do
+      validate_existing_route_prefix!(routes_zipper, oauth_path_prefix)
+
       case routes_zipper.node do
         {:attesto_routes, _meta, []} ->
           Function.append_argument(routes_zipper, pipeline: @config_pipeline)
@@ -825,6 +1026,113 @@ if Code.ensure_loaded?(Igniter) do
           {:ok, routes_zipper}
       end
     end
+
+    defp validate_existing_route_prefix!(%{node: {:attesto_routes, _meta, args}} = routes_zipper, expected_oauth_prefix) do
+      with macro_prefix when is_binary(macro_prefix) <- existing_route_prefix(args),
+           {:ok, scope_prefix} <- enclosing_scope_prefix(routes_zipper) do
+        actual_oauth_prefix = join_route_prefixes([scope_prefix, macro_prefix]) <> "/oauth"
+
+        if actual_oauth_prefix == expected_oauth_prefix do
+          :ok
+        else
+          raise_existing_route_prefix_error(actual_oauth_prefix, expected_oauth_prefix)
+        end
+      else
+        :dynamic -> raise_existing_route_prefix_error(:dynamic, expected_oauth_prefix)
+        {:error, reason} -> raise_existing_route_scope_error(reason, expected_oauth_prefix)
+      end
+    end
+
+    defp existing_route_prefix([]), do: ""
+
+    defp existing_route_prefix([opts]) when is_list(opts) do
+      case Enum.find(opts, fn
+             {key, _value} -> keyword_ast_key(key) == :prefix
+             _other -> false
+           end) do
+        nil -> ""
+        {_key, value} -> literal_route_prefix(value)
+      end
+    end
+
+    defp existing_route_prefix(_dynamic), do: :dynamic
+
+    defp enclosing_scope_prefix(routes_zipper), do: collect_scope_prefix(Zipper.up(routes_zipper), [])
+
+    defp collect_scope_prefix(nil, prefixes), do: {:ok, join_route_prefixes(prefixes)}
+
+    defp collect_scope_prefix(%{node: {:scope, _meta, args}} = scope_zipper, prefixes) do
+      case literal_scope_prefix(args) do
+        prefix when is_binary(prefix) ->
+          collect_scope_prefix(Zipper.up(scope_zipper), [prefix | prefixes])
+
+        :dynamic ->
+          {:error, :dynamic_or_ambiguous_scope}
+      end
+    end
+
+    defp collect_scope_prefix(zipper, prefixes), do: collect_scope_prefix(Zipper.up(zipper), prefixes)
+
+    defp literal_scope_prefix([path | _rest]), do: literal_scope_prefix(path)
+    defp literal_scope_prefix([]), do: :dynamic
+
+    defp literal_scope_prefix({:__block__, _meta, [prefix]}), do: literal_scope_prefix(prefix)
+
+    defp literal_scope_prefix(prefix) when prefix in ["", "/"], do: ""
+
+    defp literal_scope_prefix(prefix) when is_binary(prefix) do
+      if Regex.match?(~r/\A\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\z/, prefix), do: prefix, else: :dynamic
+    end
+
+    defp literal_scope_prefix(_dynamic), do: :dynamic
+
+    defp join_route_prefixes(prefixes) do
+      segments =
+        prefixes
+        |> Enum.map(&String.trim(&1, "/"))
+        |> Enum.reject(&(&1 == ""))
+
+      case segments do
+        [] -> ""
+        segments -> "/" <> Enum.join(segments, "/")
+      end
+    end
+
+    defp raise_existing_route_prefix_error(actual_prefix, expected_oauth_prefix) do
+      actual = if is_binary(actual_prefix), do: actual_prefix <> "/*", else: "<dynamic>"
+
+      raise Mix.Error,
+        message:
+          "existing attesto_routes/1 mounts #{inspect(actual)}, but " <>
+            "--oauth-path-prefix expects #{inspect(expected_oauth_prefix <> "/*")} for the " <>
+            "bundled fixed /oauth/* tails. Update the enclosing scope, route prefix, and " <>
+            "advertised :oauth_path_prefix together, or mount the routes manually; the " <>
+            "installer made no changes."
+    end
+
+    defp raise_existing_route_scope_error(reason, expected_oauth_prefix) do
+      raise Mix.Error,
+        message:
+          "could not prove the enclosing Phoenix scope for existing attesto_routes/1 " <>
+            "(#{inspect(reason)}); --oauth-path-prefix #{inspect(expected_oauth_prefix)} " <>
+            "requires a statically matching route mount. Update the scope and advertised " <>
+            ":oauth_path_prefix together, or mount the routes manually; the installer made " <>
+            "no changes."
+    end
+
+    defp keyword_ast_key({:__block__, _meta, [key]}) when is_atom(key), do: key
+    defp keyword_ast_key(key) when is_atom(key), do: key
+    defp keyword_ast_key(_key), do: nil
+
+    defp literal_route_prefix({:__block__, _meta, [prefix]}), do: literal_route_prefix(prefix)
+
+    defp literal_route_prefix(""), do: ""
+
+    defp literal_route_prefix(prefix) when is_binary(prefix) do
+      if Regex.match?(~r/\A\/(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\z/, prefix), do: prefix, else: :dynamic
+    end
+
+    defp literal_route_prefix(_dynamic), do: :dynamic
 
     defp put_config_pipeline(opts_zipper) do
       if CodeKeyword.keyword_has_path?(opts_zipper, [:pipeline]) or

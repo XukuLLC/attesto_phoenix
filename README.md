@@ -184,6 +184,20 @@ guide](guides/upgrade_3_0_schema_prefix.md); do not infer it from configuration.
   or `token_endpoint_auth_methods_supported: []` remains empty; it does not
   fall back to the package defaults. Set an explicit narrowed catalog before
   deployment when token exchange must remain unavailable.
+- Client-authentication method policy is exact in 3.0. In 2.14.2, an unset or
+  empty `token_endpoint_auth_methods_supported` value did not restrict endpoint
+  authentication, so mTLS could work when its callbacks were wired. In 3.0,
+  `nil` defaults to `client_secret_basic`, `client_secret_post`,
+  `private_key_jwt`, and `none`; `tls_client_auth` and
+  `self_signed_tls_client_auth` are not implicit. Add either mTLS method to
+  the list explicitly, together with its required callbacks, if the deployment
+  retains it. Any non-`nil` list, including `[]`, is an exact allowlist, except
+  that `attest_jwt_client_auth` remains conditional on trusted Wallet Provider
+  keys.
+- Optional CIBA, device-authorization, JWT-bearer, and pre-authorized-code
+  features add their grant URNs only when `grant_types_supported` is `nil`.
+  When migrating an explicit 2.14.2 list, add each enabled feature's exact URN
+  yourself; 3.0 no longer widens an explicit catalog.
 
 Before deploying, apply a forward Ecto migration for the unique
 `(family_id, generation)` index on `attesto_refresh_tokens` if your existing
@@ -283,6 +297,14 @@ Use `--oauth-path-prefix` when the OAuth endpoints should not live under
 ```bash
 mix attesto_phoenix.install --oauth-path-prefix /mcp/oauth
 ```
+
+The installer accepts `/oauth` or a prefix ending in `/oauth` only, with
+slash-separated literal segments containing only letters, digits, `_`, or `-`.
+The bundled router owns fixed `/oauth/*` endpoint tails. `/mcp/oauth` therefore
+generates `attesto_routes(prefix: "/mcp")` and advertises the routes it mounts;
+an arbitrary suffix such as `/auth` is rejected before any files change. If a
+deployment needs a different suffix or a per-endpoint path override, mount the
+matching routes manually and configure the advertised paths together.
 
 For a fresh installation in a non-default PostgreSQL schema, pass the same
 validated schema to the installer and migration generator:
@@ -654,6 +676,13 @@ defmodule MyAppWeb.Router do
 end
 ```
 
+The macro's `:prefix` is the path before its fixed `/oauth/*` tails. For the
+usual `/mcp/oauth/*` mount, use `attesto_routes(prefix: "/mcp", ...)` and set
+`oauth_path_prefix: "/mcp/oauth"`. Per-endpoint path overrides are supported
+for hosts that manually mount the corresponding route; they do not add or move
+routes in the bundled macro, so a custom advertised path must have a matching
+host route.
+
 The installer writes this pipeline and repairs route output from older
 installer releases that mounted `attesto_routes/1` without it. Add any shared
 transport-only plugs to the same pipeline; use `:route_pipelines` for browser
@@ -719,6 +748,7 @@ without losing discovery:
 
 ```elixir
 scope "/" do
+  pipe_through :attesto_phoenix_config
   attesto_routes(userinfo: false)
   get "/oauth/userinfo", MyAppWeb.UserInfoController, :show
 end
@@ -791,7 +821,8 @@ Discovery and JWKS are public; the token and revocation endpoints authenticate
 the client via your `:load_client` / `:verify_client_secret` callbacks.
 The token endpoint also accepts `private_key_jwt` when `:client_jwks` is wired,
 and RFC 8705 `tls_client_auth` / `self_signed_tls_client_auth` when
-`:client_mtls_metadata` is wired (the self-signed method also uses
+`:client_mtls_metadata` is wired and the method is included in
+`:token_endpoint_auth_methods_supported` (the self-signed method also uses
 `:client_jwks`). That callback returns `nil` only for a client without an mTLS
 authentication registration; lookup errors and malformed results fail client
 authentication closed. A forwarded certificate is read only through
@@ -898,7 +929,9 @@ attesto_routes(
   token-protected, driven by the `:build_deferred_credential` callback, which
   returns `issuance_pending` until the credential is ready.
 - Grants on `POST /oauth/token`: the **pre-authorized_code** grant is added
-  automatically when a `:pre_authorized_code_store` is configured; the ordinary
+  automatically when a `:pre_authorized_code_store` is configured and
+  `:grant_types_supported` is `nil`; an explicit catalog must include
+  `urn:ietf:params:oauth:grant-type:pre-authorized_code`. The ordinary
   **authorization_code** flow issues credentials when the request carries
   `openid_credential` `authorization_details`.
 
@@ -946,7 +979,9 @@ For **decoupled authentication** — where the device consuming the API is not t
 device the user approves on, such as a call-center agent's console, a POS
 terminal, or an AI agent acting on a user's behalf — mount CIBA with
 `attesto_routes(ciba: true)` and enable it in `AttestoPhoenix.Config`
-(`ciba: [enabled: true]`). The client calls `POST /oauth/bc-authorize` to start a
+(`ciba: [enabled: true]`). With an explicit `grant_types_supported` list, also
+include `urn:openid:params:grant-type:ciba`; only an unset catalog adds it
+automatically. The client calls `POST /oauth/bc-authorize` to start a
 flow the user approves out of band on their own phone, then collects the tokens
 at the token endpoint: in `poll` mode the client polls until the user approves,
 and in `ping` mode the AS calls the client's notification endpoint when the
@@ -971,7 +1006,10 @@ callback is configured.
 
 For **sign-in on input-constrained devices** — a smart TV, a CLI, an IoT box with
 no browser or keyboard — mount the device grant with `attesto_routes(device:
-true)`. `POST /oauth/device_authorization` returns a `device_code` and a short
+true)` and enable `device_authorization: [enabled: true]`. With an explicit
+`grant_types_supported` list, also include
+`urn:ietf:params:oauth:grant-type:device_code`; only an unset catalog adds it
+automatically. `POST /oauth/device_authorization` returns a `device_code` and a short
 human-typable `user_code`; the user enters that code on a second device at the
 verification page (`/oauth/device_verification`), while the device polls the
 token endpoint with the `device_code` until the user approves.
@@ -1003,11 +1041,15 @@ pipeline :api_protected do
   plug AttestoPhoenix.Plug.Authenticate
 end
 
+pipeline :reports_read do
+  plug AttestoPhoenix.Plug.RequireScopes, "read:reports"
+end
+
 scope "/api", MyAppWeb do
   pipe_through [:api, :api_protected]
 
   scope "/reports" do
-    plug AttestoPhoenix.Plug.RequireScopes, "read:reports"
+    pipe_through :reports_read
     get "/", ReportController, :index
   end
 end

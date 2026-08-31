@@ -245,7 +245,7 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
       auth_req_id_hash: "telemetry-ciba-#{System.unique_integer([:positive])}",
       data: put_data(delivery_mode: :ping, client_notification_token: "notification-token-secret"),
       status: :pending,
-      interval: 0,
+      interval: 5,
       expires_at: now + 120,
       last_polled_at: nil
     }
@@ -257,6 +257,10 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
         assert {:ok, _} = Store.lookup(r.auth_req_id_hash)
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert {:ok, _} = Store.poll(r.auth_req_id_hash, %{now: now})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:error, :slow_down} = Store.poll(r.auth_req_id_hash, %{now: now + 1})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :error = Store.poll("telemetry-ciba-missing", %{now: now})
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert {:ok, _} = Store.approve(r.auth_req_id_hash, %{subject: "user:alice"}, %{now: now})
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []

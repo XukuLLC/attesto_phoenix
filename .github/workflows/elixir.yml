@@ -21,10 +21,10 @@ jobs:
         include:
           - elixir: "1.18.4"
             otp: "28.0"
-          - elixir: "1.19.4"
-            otp: "28.3"
-          - elixir: "1.20.1"
-            otp: "29.0.2"
+          - elixir: "1.19.6"
+            otp: "28.5.0.5"
+          - elixir: "1.20.4"
+            otp: "29.0.5"
             lint: true
 
     services:
@@ -52,40 +52,40 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Checkout Attesto core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
         with:
           repository: XukuLLC/attesto
-          ref: e83e879fe84cdaaa878013ea60b5e92689b720fe
+          ref: 614832dd2b3c6365afe6b0047ffdde44bed78882
           path: attesto
 
       - name: Verify Attesto core revision
         working-directory: attesto
-        run: test "$(git rev-parse HEAD)" = "e83e879fe84cdaaa878013ea60b5e92689b720fe"
+        run: test "$(git rev-parse HEAD)" = "614832dd2b3c6365afe6b0047ffdde44bed78882"
 
       - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v1.24.1
         with:
           elixir-version: ${{ matrix.elixir }}
           otp-version: ${{ matrix.otp }}
 
       - name: Restore dependencies cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: deps
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-614832dd2b3c6365afe6b0047ffdde44bed78882-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-mix-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-614832dd2b3c6365afe6b0047ffdde44bed78882-${{ hashFiles('attesto/**') }}-mix-
 
       - name: Restore build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: _build
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-614832dd2b3c6365afe6b0047ffdde44bed78882-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-build-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-614832dd2b3c6365afe6b0047ffdde44bed78882-${{ hashFiles('attesto/**') }}-build-
 
       - name: Install dependencies
         run: |
@@ -98,13 +98,13 @@ jobs:
         run: mix hex.audit
 
       - name: Install Phoenix installer archive
-        run: mix archive.install hex phx_new --force
+        run: mix archive.install hex phx_new 1.8.13 --force
 
       # The RFC 8252 native-app end-to-end test (@moduletag :e2e) drives the
       # real `openid-client` against a live Bandit server. Node ships on the
       # runner; install the JS deps so the test runs rather than self-skipping.
       - name: Install Node end-to-end dependencies (openid-client)
-        run: npm install --no-audit --no-fund --prefix test/support/js
+        run: npm ci --no-audit --no-fund --prefix test/support/js
 
       - name: Compile (warnings as errors)
         run: mix compile --warnings-as-errors
@@ -156,13 +156,13 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
       - name: Set up Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@v1.24.1
         with:
-          elixir-version: "1.20.1"
-          otp-version: "29.0.2"
+          elixir-version: "1.20.4"
+          otp-version: "29.0.5"
 
       - name: Compile minimum consumer against released Attesto 2.0.0
         # Attesto 2.0.0 is published before the Phoenix release tag is created.

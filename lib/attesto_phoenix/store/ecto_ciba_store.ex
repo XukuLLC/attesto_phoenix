@@ -188,9 +188,13 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   defp slow_down_or_missing(hash) do
     prefix = Config.table_prefix()
 
-    if repo().exists?(from(c in CIBARequest, where: c.auth_req_id_hash == ^hash), prefix: prefix),
-      do: {:error, :slow_down},
-      else: :error
+    if repo().exists?(from(c in CIBARequest, where: c.auth_req_id_hash == ^hash),
+         prefix: prefix,
+         log: false,
+         telemetry_event: nil
+       ),
+       do: {:error, :slow_down},
+       else: :error
   end
 
   defp decision_now(opts), do: Map.get(opts, :now, System.system_time(:second))

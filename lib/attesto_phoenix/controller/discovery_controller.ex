@@ -20,9 +20,13 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   (every grant the token endpoint dispatches by default — `authorization_code`,
   `refresh_token`, `client_credentials`, and OAuth token exchange — narrowed when
   the host configures `:grant_types_supported`, and the token endpoint enforces
-  the same set); `token_endpoint_auth_methods_supported` lists the client-authentication
-  methods it accepts (`client_secret_basic`, `client_secret_post`,
-  `private_key_jwt`, and `none` for PKCE-using public clients). The PAR
+  the same set; enabled optional grants are added only when that setting is nil,
+  while an explicit list must contain their exact URNs);
+  `token_endpoint_auth_methods_supported` lists the client-authentication
+  methods it accepts. Its default is `client_secret_basic`,
+  `client_secret_post`, `private_key_jwt`, and `none` for PKCE-using public
+  clients; an explicit config list may add mTLS or wallet-attestation methods.
+  The PAR
   endpoint is advertised separately as `pushed_authorization_request_endpoint`.
 
   The host-specific members - the supported scopes (`scopes_supported`),

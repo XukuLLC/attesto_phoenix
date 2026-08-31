@@ -25,7 +25,14 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       table = query_source(query)
 
       Agent.update(__MODULE__, fn state ->
-        %{state | updates: state.updates ++ [%{table: table, prefix: opts[:prefix]}]}
+        call = %{
+          table: table,
+          prefix: opts[:prefix],
+          log: opts[:log],
+          telemetry_event: opts[:telemetry_event]
+        }
+
+        %{state | updates: state.updates ++ [call]}
       end)
 
       {0, nil}
@@ -34,9 +41,19 @@ defmodule AttestoPhoenix.Store.SweeperTest do
     def delete_all(%Ecto.Query{} = query, opts) do
       table = query_source(query)
       now = where_now(query)
+      expr = where_expr(query)
 
       Agent.update(__MODULE__, fn state ->
-        %{state | calls: state.calls ++ [%{table: table, prefix: opts[:prefix], now: now}]}
+        call = %{
+          table: table,
+          prefix: opts[:prefix],
+          now: now,
+          expr: expr,
+          log: opts[:log],
+          telemetry_event: opts[:telemetry_event]
+        }
+
+        %{state | calls: state.calls ++ [call]}
       end)
 
       count = Agent.get(__MODULE__, fn state -> Map.get(state.deleted, table, 0) end)
@@ -53,6 +70,8 @@ defmodule AttestoPhoenix.Store.SweeperTest do
         _ -> nil
       end
     end
+
+    defp where_expr(%Ecto.Query{wheres: [%{expr: expr} | _]}), do: expr
   end
 
   defmodule FakeKeystore do
@@ -213,9 +232,35 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       assert swept == Enum.sort(@swept_tables)
 
       assert RecordingRepo.updates() == [
-               %{table: "attesto_refresh_tokens", prefix: nil},
-               %{table: "attesto_refresh_tokens", prefix: nil}
+               %{
+                 table: "attesto_refresh_tokens",
+                 prefix: nil,
+                 log: false,
+                 telemetry_event: nil
+               },
+               %{
+                 table: "attesto_refresh_tokens",
+                 prefix: nil,
+                 log: false,
+                 telemetry_event: nil
+               }
              ]
+    end
+
+    test "suppresses SQL logging and repo telemetry for every housekeeping query" do
+      start_recorder(%{})
+      config = valid_config(sweep_interval_ms: 60_000)
+      pid = start_sweeper(config)
+
+      Sweeper.sweep_now(pid)
+
+      assert Enum.all?(RecordingRepo.calls(), fn call ->
+               call.log == false and call.telemetry_event == nil
+             end)
+
+      assert Enum.all?(RecordingRepo.updates(), fn call ->
+               call.log == false and call.telemetry_event == nil
+             end)
     end
 
     test "forwards :schema_prefix to every delete" do
@@ -261,6 +306,62 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       end)
     end
 
+    test "authorization-code query preserves live linked access tokens" do
+      start_recorder(%{})
+      config = valid_config(sweep_interval_ms: 60_000)
+      pid = start_sweeper(config)
+
+      Sweeper.sweep_now(pid)
+
+      authorization_call =
+        RecordingRepo.calls()
+        |> Enum.find(&(&1.table == "attesto_authorization_codes"))
+
+      assert %DateTime{} = authorization_call.now
+
+      assert {:and, _,
+              [
+                {:<, _, [expires_at, {:^, _, [0]}]},
+                token_liveness
+              ]} = authorization_call.expr
+
+      assert field_name(expires_at) == :expires_at
+
+      assert token_liveness
+             |> flatten_or()
+             |> Enum.any?(fn
+               {:is_nil, _, [field]} -> field_name(field) == :access_token_jti
+               _ -> false
+             end)
+
+      assert token_liveness
+             |> flatten_or()
+             |> Enum.any?(fn
+               {:==, _, [field, %Ecto.Query.Tagged{value: ""}]} ->
+                 field_name(field) == :access_token_jti
+
+               _ ->
+                 false
+             end)
+
+      assert token_liveness
+             |> flatten_or()
+             |> Enum.any?(fn
+               {:is_nil, _, [field]} -> field_name(field) == :access_token_expires_at
+               _ -> false
+             end)
+
+      assert token_liveness
+             |> flatten_or()
+             |> Enum.any?(fn
+               {:<=, _, [field, {:^, _, [1]}]} ->
+                 field_name(field) == :access_token_expires_at
+
+               _ ->
+                 false
+             end)
+    end
+
     test "handle_info(:sweep, state) runs a sweep and reschedules" do
       start_recorder(%{"dpop_replays" => 2})
       config = valid_config(sweep_interval_ms: 60_000)
@@ -289,4 +390,10 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       refute Sweeper.child_spec(config: first).id == Sweeper.child_spec(config: other).id
     end
   end
+
+  defp field_name({{:., _, [{:&, _, [_binding]}, field]}, _, []}), do: field
+  defp field_name(_), do: nil
+
+  defp flatten_or({:or, _, [left, right]}), do: flatten_or(left) ++ flatten_or(right)
+  defp flatten_or(expression), do: [expression]
 end
