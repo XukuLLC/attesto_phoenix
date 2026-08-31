@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   `t:AttestoPhoenix.Config`'s `:build_deferred_credential` for the contract.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import AttestoPhoenix.Controller.OID4VCIHelpers,
     only: [body_params: 2, invalid_request: 4, maybe_put_option: 3]
@@ -26,6 +26,11 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   alias Attesto.{CredentialResponse, SdJwtVc}
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
+
+  require Logger
+
+  @builder_failure "AttestoPhoenix deferred credential builder callback failed"
+  @invalid_builder_result_warning "AttestoPhoenix deferred credential builder returned an invalid result; credential issuance denied"
 
   @doc """
   Complete a deferred credential for an authenticated wallet.
@@ -39,7 +44,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     resource_metadata = Config.resource_metadata_url(config, conn)
 
     case ProtectedResource.authenticate(conn, config, resource_metadata) do
@@ -53,7 +58,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   defp issue(conn, config, request, claims) do
     with {:ok, transaction_id} <- transaction_id(request),
-         {:ok, result} <- Config.build_deferred_credential(config, claims["sub"], transaction_id),
+         {:ok, result} <- build_deferred_credential(config, claims["sub"], transaction_id),
          {:ok, credential} <- issue_credential(config, result) do
       conn
       |> PhoenixOAuthError.no_store(config)
@@ -73,6 +78,27 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   defp transaction_id(%{"transaction_id" => id}) when is_binary(id) and id != "", do: {:ok, id}
   defp transaction_id(_request), do: {:error, :missing_transaction_id}
 
+  defp build_deferred_credential(config, subject, transaction_id) do
+    case invoke_deferred_builder(config, subject, transaction_id) do
+      {:returned, result} -> validate_deferred_builder_result(result)
+      :failed -> raise RuntimeError, @builder_failure
+    end
+  end
+
+  defp invoke_deferred_builder(config, subject, transaction_id) do
+    {:returned, Config.build_deferred_credential(config, subject, transaction_id)}
+  catch
+    _kind, _reason -> :failed
+  end
+
+  defp validate_deferred_builder_result(result) do
+    case result do
+      {:ok, _credential} = success -> success
+      {:error, _reason} = error -> error
+      _unexpected -> invalid_builder_result()
+    end
+  end
+
   defp issue_credential(config, %{vct: vct, claims: claims} = result) do
     {:ok,
      SdJwtVc.issue(
@@ -87,5 +113,10 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
      )}
   end
 
-  defp issue_credential(_config, _result), do: {:error, :invalid_credential}
+  defp issue_credential(_config, _result), do: invalid_builder_result()
+
+  defp invalid_builder_result do
+    Logger.warning(@invalid_builder_result_warning)
+    {:error, :invalid_credential}
+  end
 end

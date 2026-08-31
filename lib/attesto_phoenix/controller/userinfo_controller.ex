@@ -76,7 +76,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
       stores, threaded into `Attesto.Plug.Authenticate`.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
@@ -111,7 +111,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   """
   @spec userinfo(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def userinfo(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     resource_metadata = Config.resource_metadata_url(config, conn)
 
     case ProtectedResource.authenticate(conn, config, resource_metadata) do

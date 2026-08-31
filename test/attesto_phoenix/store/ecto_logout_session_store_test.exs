@@ -10,13 +10,15 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStoreTest do
   Tagged `:ecto` so the suite runs only when a SQL backend is available.
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
+
+  import ExUnit.CaptureLog
 
   alias AttestoPhoenix.Store.EctoLogoutSessionStore, as: Store
 
   @moduletag :ecto
 
-  defp record(overrides \\ %{}) do
+  defp record(overrides) do
     now = System.system_time(:second)
 
     entry =
@@ -109,7 +111,7 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStoreTest do
   test "a record with neither logout URI is refused (nothing to notify)" do
     now = System.system_time(:second)
 
-    :ok =
+    assert_raise Ecto.InvalidChangesetError, fn ->
       Store.record(%{
         sid: "s-none",
         subject: "usr-1",
@@ -117,6 +119,7 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStoreTest do
         backchannel_logout_uri: nil,
         expires_at: now + 3600
       })
+    end
 
     assert [] = Store.targets(%{sid: "s-none"})
   end
@@ -202,5 +205,36 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStoreTest do
       assert [] = Store.take_targets(%{})
       assert [_] = Store.targets(%{sid: "t3"})
     end
+  end
+
+  test "query telemetry is suppressed for session identifiers and logout targets" do
+    capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+    on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+    {_id, ref} = capture
+
+    e = %{
+      sid: "private-session-id",
+      subject: "private-subject",
+      client_id: "private-client-id",
+      backchannel_logout_uri: "https://private.example/logout",
+      session_required: false,
+      expires_at: System.system_time(:second) + 3600
+    }
+
+    log =
+      capture_log([level: :debug], fn ->
+        assert :ok = Store.record(e)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert [target] = Store.targets(%{sid: e.sid})
+        assert target.sid == e.sid
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :ok = Store.delete(%{sid: e.sid})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+      end)
+
+    refute log =~ e.sid
+    refute log =~ e.subject
+    refute log =~ e.client_id
+    refute log =~ e.backchannel_logout_uri
   end
 end

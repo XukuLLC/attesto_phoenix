@@ -2,6 +2,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
@@ -10,6 +11,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   alias Attesto.PreAuthorizedCodeStore.ETS
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.CredentialController
+  alias AttestoPhoenix.Plug.PutConfig
 
   @endpoint_path "/oauth/credential"
   @issuer "https://issuer.example"
@@ -57,13 +59,29 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
     def verification_pems, do: [signing_pem()]
   end
 
+  defmodule InvalidCNonceStore do
+    @moduledoc false
+
+    def valid?(_nonce), do: return(Process.get({__MODULE__, :valid_result}, Process.get({__MODULE__, :result})))
+    def consume(_nonce), do: return(Process.get({__MODULE__, :consume_result}))
+
+    defp return({:raise, reason}), do: raise(RuntimeError, reason)
+    defp return({:throw, reason}), do: throw(reason)
+    defp return({:exit, reason}), do: exit(reason)
+    defp return(result), do: result
+  end
+
   defmodule CredentialRouter do
     @moduledoc false
     use Phoenix.Router
     use AttestoPhoenix.Router
 
+    pipeline :attesto_phoenix_config do
+      plug PutConfig, otp_app: :attesto_phoenix
+    end
+
     scope "/" do
-      attesto_routes(credential_issuance: true)
+      attesto_routes(pipeline: :attesto_phoenix_config, credential_issuance: true)
     end
   end
 
@@ -376,6 +394,74 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert body(response)["error"] == "invalid_nonce"
     end
 
+    test "fails loudly when the c_nonce store violates its boolean contract" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(config, :c_nonce_store, InvalidCNonceStore))
+
+      for invalid <- [
+            :error,
+            {:error, :backend_unavailable},
+            "sensitive-result-sentinel",
+            {:raise, "sensitive-result-sentinel"},
+            {:throw, "sensitive-result-sentinel"},
+            {:exit, "sensitive-result-sentinel"}
+          ] do
+        Process.put({InvalidCNonceStore, :result}, invalid)
+
+        error =
+          assert_raise RuntimeError, "c_nonce_store valid?/1 must return true or false", fn ->
+            post_credential(mint_token(), credential_request("candidate-nonce"))
+          end
+
+        refute Exception.message(error) =~ "sensitive-result-sentinel"
+        refute_received {:credential_requested, _, _, _}
+      end
+    end
+
+    test "treats every declared c_nonce consume error as a spent or invalid nonce" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(config, :c_nonce_store, InvalidCNonceStore))
+      Process.put({InvalidCNonceStore, :valid_result}, true)
+
+      for {store_error, index} <-
+            Enum.with_index([{:error, :used}, {:error, :expired}, {:error, :unknown}, {:error, :offline}]) do
+        Process.put({InvalidCNonceStore, :consume_result}, store_error)
+        nonce = "candidate-nonce-#{index}"
+        response = post_credential(mint_token(), credential_request(nonce))
+
+        assert response.status == 400
+        assert body(response)["error"] == "invalid_nonce"
+        refute_received {:credential_requested, _, _, _}
+      end
+    end
+
+    test "fails loudly without values when c_nonce consume violates its contract or fails" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(config, :c_nonce_store, InvalidCNonceStore))
+      Process.put({InvalidCNonceStore, :valid_result}, true)
+
+      for {invalid, index} <-
+            Enum.with_index([
+              :error,
+              false,
+              "sensitive-result-sentinel",
+              {:raise, "sensitive-result-sentinel"},
+              {:throw, "sensitive-result-sentinel"},
+              {:exit, "sensitive-result-sentinel"}
+            ]) do
+        Process.put({InvalidCNonceStore, :consume_result}, invalid)
+        nonce = "candidate-nonce-#{index}"
+
+        error =
+          assert_raise RuntimeError, "c_nonce_store consume/1 must return :ok or {:error, reason}", fn ->
+            post_credential(mint_token(), credential_request(nonce))
+          end
+
+        refute Exception.message(error) =~ "sensitive-result-sentinel"
+        refute_received {:credential_requested, _, _, _}
+      end
+    end
+
     test "c_nonce is single-use: replaying a proof with a spent nonce is rejected" do
       nonce = CNonceStore.issue(60)
 
@@ -523,17 +609,68 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
     test "maps a host credential-builder error to invalid_credential_request" do
       config = Application.fetch_env!(:attesto_phoenix, Config)
-      put_config(Keyword.put(config, :build_credential, fn _, _, _ -> {:error, :not_found} end))
+      put_config(Keyword.put(config, :build_credential, fn _, _, _ -> {:error, "sensitive-domain-error"} end))
 
       nonce = CNonceStore.issue(60)
-      response = post_credential(mint_token(), credential_request(nonce))
 
-      assert response.status == 400
+      log =
+        capture_log(fn ->
+          response = post_credential(mint_token(), credential_request(nonce))
 
-      assert body(response) == %{
-               "error" => "invalid_credential_request",
-               "error_description" => "credential unavailable"
-             }
+          assert response.status == 400
+
+          assert body(response) == %{
+                   "error" => "invalid_credential_request",
+                   "error_description" => "credential unavailable"
+                 }
+        end)
+
+      refute log =~ "sensitive-domain-error"
+      refute log =~ "credential builder returned an invalid result"
+    end
+
+    test "reports a malformed credential-builder result without logging its value" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      put_config(
+        Keyword.put(config, :build_credential, fn _, _, _ ->
+          "sensitive-result-sentinel"
+        end)
+      )
+
+      nonce = CNonceStore.issue(60)
+
+      log =
+        capture_log(fn ->
+          response = post_credential(mint_token(), credential_request(nonce))
+
+          assert response.status == 400
+          assert body(response)["error"] == "invalid_credential_request"
+        end)
+
+      assert log =~ "AttestoPhoenix credential builder returned an invalid result; credential issuance denied"
+      refute log =~ "sensitive-result-sentinel"
+    end
+
+    test "sanitizes a credential-builder failure while leaving it loud" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      for failure <- [:raise, :throw, :exit] do
+        put_config(
+          Keyword.put(config, :build_credential, fn _, _, _ ->
+            fail_builder(failure)
+          end)
+        )
+
+        nonce = CNonceStore.issue(60)
+
+        error =
+          assert_raise RuntimeError, "AttestoPhoenix credential builder callback failed", fn ->
+            post_credential(mint_token(), credential_request(nonce))
+          end
+
+        refute Exception.message(error) =~ "sensitive-builder-failure"
+      end
     end
 
     test "honors an atom-key nil credential format without falling back to the string key" do
@@ -633,6 +770,10 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
     end
   end
 
+  defp fail_builder(:raise), do: raise("sensitive-builder-failure")
+  defp fail_builder(:throw), do: throw("sensitive-builder-failure")
+  defp fail_builder(:exit), do: exit("sensitive-builder-failure")
+
   defp mint_token(opts \\ []) do
     config =
       Attesto.Config.new(
@@ -667,6 +808,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
     conn =
       :post
       |> conn(@endpoint_path)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
       |> maybe_authorization(token)
 
     CredentialController.create(%{conn | body_params: request}, request)

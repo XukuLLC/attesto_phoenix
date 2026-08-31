@@ -37,4 +37,25 @@ defmodule AttestoPhoenix.CallbackTest do
       assert fun.("jti-3", 120) == {:check, "jti-3", 120, :tag}
     end
   end
+
+  describe "invoke_boolean/4" do
+    test "uses the declared default only when the callback is absent" do
+      assert Callback.invoke_boolean(nil, [:ignored], true, :policy?)
+      refute Callback.invoke_boolean(nil, [:ignored], false, :policy?)
+    end
+
+    test "accepts exact booleans and rejects other results without disclosing them" do
+      assert Callback.invoke_boolean(fn _ -> true end, [:arg], false, :policy?)
+      refute Callback.invoke_boolean(fn _ -> false end, [:arg], true, :policy?)
+
+      private_result = {:error, "private-callback-value"}
+
+      error =
+        assert_raise ArgumentError, ~r/:policy\? callback must return true or false/, fn ->
+          Callback.invoke_boolean(fn _ -> private_result end, [:arg], false, :policy?)
+        end
+
+      refute error.message =~ "private-callback-value"
+    end
+  end
 end

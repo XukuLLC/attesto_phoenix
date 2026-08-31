@@ -61,6 +61,11 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   alias Attesto.ClientIdMetadata
   alias AttestoPhoenix.Config
 
+  require Logger
+
+  @cache_read_warning "AttestoPhoenix CIMD cache failed; fetching fresh client metadata"
+  @cache_write_warning "AttestoPhoenix CIMD cache failed; fresh client metadata was not cached"
+
   @typedoc """
   A reason `resolve/2` refused to produce a client. `:invalid_client_id` and
   `:blocked_host` are local policy failures (no network); `{:fetch, reason}`
@@ -85,6 +90,10 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   """
   @spec resolve(String.t(), Config.t()) :: {:ok, map()} | {:error, error()}
   def resolve(client_id, %Config{} = config) when is_binary(client_id) do
+    Config.with_request_config(config, fn -> do_resolve(client_id, config) end)
+  end
+
+  defp do_resolve(client_id, %Config{} = config) do
     opts = Config.client_id_metadata(config)
 
     with {:ok, uri} <- validate_client_id(client_id),
@@ -115,14 +124,35 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
     end
   end
 
-  # Cache short-circuit: a live entry is the client. The cache holds only
-  # validated documents, so a hit is returned without re-validation or a fetch.
+  # Cache short-circuit: a live entry is the client. The shipped caches hold
+  # validated documents, but a custom backend can violate that contract; run
+  # the same pure validation at this boundary so malformed hits are observable
+  # and cannot bypass document policy.
   defp resolve_cached(client_id, opts) do
     cache = Keyword.fetch!(opts, :cache)
 
-    case cache.get(client_id) do
+    case cache_get(cache, client_id) do
       {:ok, metadata} -> {:ok, metadata}
       :miss -> fetch_and_validate(client_id, opts)
+    end
+  end
+
+  defp cache_get(cache, client_id) do
+    case cache.get(client_id) do
+      {:ok, metadata} when is_map(metadata) -> validate_cached_metadata(client_id, metadata)
+      :miss -> :miss
+      _fault -> warn_cache_read_fault()
+    end
+  rescue
+    _exception -> warn_cache_read_fault()
+  catch
+    _kind, _reason -> warn_cache_read_fault()
+  end
+
+  defp validate_cached_metadata(client_id, metadata) do
+    case ClientIdMetadata.validate_document(client_id, metadata) do
+      {:ok, normalized} -> {:ok, normalized}
+      {:error, _reason} -> warn_cache_read_fault()
     end
   end
 
@@ -161,18 +191,40 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   end
 
   defp cache_put(client_id, metadata, cache_control, opts) do
-    cache = Keyword.fetch!(opts, :cache)
-    expires_at = expires_at(cache_control, opts)
-    cache.put(client_id, metadata, expires_at)
+    if Keyword.get(cache_control, :no_store, false) or
+         Keyword.get(cache_control, :no_cache, false) do
+      :ok
+    else
+      cache = Keyword.fetch!(opts, :cache)
+      expires_at = expires_at(cache_control, opts)
+
+      case cache.put(client_id, metadata, expires_at) do
+        :ok -> :ok
+        _fault -> warn_cache_write_fault()
+      end
+    end
+  rescue
+    _exception -> warn_cache_write_fault()
+  catch
+    _kind, _reason -> warn_cache_write_fault()
+  end
+
+  defp warn_cache_read_fault do
+    Logger.warning(@cache_read_warning)
+    :miss
+  end
+
+  defp warn_cache_write_fault do
+    Logger.warning(@cache_write_warning)
+    :ok
   end
 
   # Derive `expires_at` from the response's RFC 9111 freshness directives and
   # clamp it to the configured `{min, max}` bounds. `Cache-Control: max-age`
   # wins; an `Expires` date is the fallback; absent both, the minimum bound is
-  # used so a document is still cached (the draft permits a self-chosen TTL). A
-  # `no-store` / `no-cache` directive collapses the lifetime to the minimum
-  # bound rather than skipping the cache, keeping the per-node fetch fan-out
-  # bounded while still honoring near-zero freshness.
+  # used so a document is still cached (the draft permits a self-chosen TTL).
+  # Explicit `no-store` / `no-cache` directives are handled by `cache_put/4`
+  # before this helper and therefore never reach a cache backend.
   defp expires_at(cache_control, opts) do
     {min, max} = Keyword.fetch!(opts, :cache_ttl_bounds)
 

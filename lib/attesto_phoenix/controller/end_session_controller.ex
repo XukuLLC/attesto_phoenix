@@ -86,7 +86,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   `check_session_iframe` observes `changed`.
   """
 
-  use Phoenix.Controller, formats: [:html, :json]
+  use AttestoPhoenix.Controller, formats: [:html, :json]
 
   alias Attesto.EndSession
   alias Attesto.FrontChannelLogout
@@ -104,7 +104,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   @spec end_session(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def end_session(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
@@ -131,9 +131,14 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   defp parse(config, params) do
     case EndSession.parse(Config.to_attesto_config(config), params) do
-      {:ok, request} -> {:ok, request}
-      {:error, :invalid_id_token_hint} -> {:error, 400, error_body("invalid id_token_hint")}
-      {:error, :client_id_mismatch} -> {:error, 400, error_body("client_id does not match id_token_hint")}
+      {:ok, request} ->
+        {:ok, request}
+
+      {:error, :invalid_id_token_hint} ->
+        {:error, 400, error_body("invalid id_token_hint")}
+
+      {:error, :client_id_mismatch} ->
+        {:error, 400, error_body("client_id does not match id_token_hint")}
     end
   end
 
@@ -143,8 +148,11 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     registered = registered_post_logout_uris(config, request.client_id)
 
     case EndSession.confirm_redirect(request, registered) do
-      {:ok, target} -> {:ok, target}
-      {:error, :invalid_post_logout_redirect_uri} -> {:error, 400, error_body("invalid post_logout_redirect_uri")}
+      {:ok, target} ->
+        {:ok, target}
+
+      {:error, :invalid_post_logout_redirect_uri} ->
+        {:error, 400, error_body("invalid post_logout_redirect_uri")}
     end
   end
 
@@ -187,7 +195,9 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   # RP polling the check_session_iframe observes `changed`. A no-op unless the
   # host enabled Session Management.
   defp expire_browser_state(conn, config) do
-    if Config.session_management_enabled?(config), do: BrowserState.expire(conn, config), else: conn
+    if Config.session_management_enabled?(config),
+      do: BrowserState.expire(conn, config),
+      else: conn
   end
 
   # The host is the session authority. A missing callback is fail-closed: a
@@ -197,6 +207,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     case config.terminate_session do
       nil ->
         Logger.error("end_session: no :terminate_session callback configured")
+
         {:error, 500, %{error: "server_error", error_description: "logout is not fully configured"}}
 
       callback ->
@@ -329,6 +340,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   # unescapes it before getAttribute returns), so the URL never lands inside a
   # script string where it could break out.
   defp continue_attribute(redirect) when is_binary(redirect), do: ~s( data-continue="#{esc(redirect)}")
+
   defp continue_attribute(:no_redirect), do: ""
 
   defp meta_refresh(redirect) when is_binary(redirect) do
@@ -445,8 +457,8 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       []
     end
   rescue
-    e ->
-      Logger.warning("logout session take failed: #{inspect(e)}")
+    _exception ->
+      Logger.warning("logout session store failed; back-channel targets were not loaded")
       []
   end
 
@@ -459,7 +471,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     |> Enum.filter(&is_binary(&1.backchannel_logout_uri))
     |> Enum.each(&deliver(attesto_config, http, session, &1))
   rescue
-    e -> Logger.warning("back-channel logout fan-out failed: #{inspect(e)}")
+    _exception -> Logger.warning("back-channel logout fan-out failed")
   end
 
   defp deliver(attesto_config, http, session, target) do
@@ -472,8 +484,8 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
          :ok <- http.post(target.backchannel_logout_uri, token) do
       :ok
     else
-      {:error, reason} ->
-        Logger.warning("back-channel logout to #{target.client_id} failed: #{inspect(reason)}")
+      {:error, _reason} ->
+        Logger.warning("back-channel logout delivery failed")
         :error
     end
   end

@@ -3,8 +3,14 @@ defmodule AttestoPhoenix.JwtVcIssuerMetadataTestRouter do
   use Phoenix.Router
   use AttestoPhoenix.Router
 
+  alias AttestoPhoenix.Plug.PutConfig
+
+  pipeline :attesto_phoenix_config do
+    plug PutConfig, otp_app: :attesto_phoenix
+  end
+
   scope "/" do
-    attesto_routes(prefix: "/wallet", credential_issuance: true)
+    attesto_routes(pipeline: :attesto_phoenix_config, prefix: "/wallet", credential_issuance: true)
   end
 end
 
@@ -57,7 +63,8 @@ defmodule AttestoPhoenix.Controller.JwtVcIssuerMetadataControllerTest do
       repo: __MODULE__.Repo,
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
-      load_principal: fn _ -> {:error, :not_found} end
+      load_principal: fn _ -> {:error, :not_found} end,
+      principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")]
     )
 
     on_exit(fn ->

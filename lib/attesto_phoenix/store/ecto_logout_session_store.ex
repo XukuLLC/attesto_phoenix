@@ -29,9 +29,11 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
   @impl Attesto.LogoutSessionStore
   @spec record(Attesto.LogoutSessionStore.entry()) :: :ok
   def record(%{sid: sid, client_id: client_id} = entry) when is_binary(sid) and is_binary(client_id) do
+    prefix = Config.table_prefix()
+
     entry
-    |> LogoutSession.from_record()
-    |> repo().insert(
+    |> LogoutSession.from_record(prefix: prefix)
+    |> repo().insert!(
       on_conflict:
         {:replace,
          [
@@ -42,7 +44,10 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
            :frontchannel_session_required,
            :expires_at
          ]},
-      conflict_target: [:sid, :client_id]
+      conflict_target: [:sid, :client_id],
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
     )
 
     :ok
@@ -57,10 +62,11 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
 
       filter ->
         now = now_dt()
+        prefix = Config.table_prefix()
 
         from(l in LogoutSession, where: l.expires_at > ^now)
         |> filter.()
-        |> repo().all()
+        |> repo().all(prefix: prefix, log: false, telemetry_event: nil)
         |> Enum.map(&LogoutSession.to_target/1)
     end
   end
@@ -73,9 +79,11 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
         :ok
 
       filter ->
+        prefix = Config.table_prefix()
+
         LogoutSession
         |> filter.()
-        |> repo().delete_all()
+        |> repo().delete_all(prefix: prefix, log: false, telemetry_event: nil)
 
         :ok
     end
@@ -90,6 +98,7 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
 
       filter ->
         now = now_dt()
+        prefix = Config.table_prefix()
 
         # `DELETE ... RETURNING`: enumerate and remove the live rows in one
         # statement, so concurrent logouts cannot both deliver the same session.
@@ -97,7 +106,9 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
           from(l in LogoutSession, where: l.expires_at > ^now, select: l)
           |> filter.()
 
-        {_count, rows} = repo().delete_all(query)
+        {_count, rows} =
+          repo().delete_all(query, prefix: prefix, log: false, telemetry_event: nil)
+
         Enum.map(rows || [], &LogoutSession.to_target/1)
     end
   end

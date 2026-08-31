@@ -12,6 +12,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
   import Plug.Test
 
   alias Attesto.CIBAStore.ETS, as: Store
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController, as: Controller
 
   @config_key AttestoPhoenix.Config
@@ -157,6 +158,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
     conn =
       :post
       |> conn(@path, params)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
       |> put_req_header("content-type", "application/x-www-form-urlencoded")
 
     conn = Enum.reduce(headers, conn, fn {k, v}, c -> put_req_header(c, k, v) end)

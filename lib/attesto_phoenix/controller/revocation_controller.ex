@@ -47,7 +47,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
     * `:load_client` - resolve an OAuth client by `client_id`.
     * `:verify_client_secret` - constant-time client-secret comparison.
-    * `:on_event` (optional) - audit/telemetry hook; receives a
+    * `:on_event` or `:event_sink` (optional) - audit/telemetry hook; receives a
       `:token_revoked` `AttestoPhoenix.Event` after a successful revocation
       request.
 
@@ -58,24 +58,17 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   putting a module under `conn.private[:attesto_phoenix_refresh_store]`.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
   alias Attesto.Revocation
-  alias AttestoPhoenix.Callback
   alias AttestoPhoenix.ClientAuthentication
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
   alias AttestoPhoenix.OAuthError
-
-  # Dispatch through the action plug so the module is a complete `Plug`
-  # (`init/1` + `call/2`): the router invokes it as a plug, selecting the
-  # action from `conn.private[:phoenix_action]` set by `init/1`.
   alias AttestoPhoenix.RequestContext
   alias AttestoPhoenix.Store.EctoRefreshStore
-
-  plug :action
 
   # RFC 7009 §2.2: a successful revocation request returns HTTP 200 with an
   # empty body.
@@ -97,8 +90,6 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   # The configured AttestoPhoenix.Config is threaded through the connection's
   # private storage by the host pipeline.
-  @config_key :attesto_phoenix_config
-
   # The Attesto.RefreshStore module revocation runs over. The package ships
   # an Ecto-backed implementation (parameterized by the configured repo) as
   # the default; the host pipeline may override it through conn.private to
@@ -115,7 +106,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) when is_map(params) do
-    config = fetch_config!(conn)
+    config = Config.resolve!(conn)
     # RFC 6749 §5.1: success and error responses alike carry no-store.
     conn = OAuthError.no_store(conn, config)
 
@@ -220,21 +211,15 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   end
 
   # Audit/telemetry hook (RFC 7009 leaves auditing to the deployment). The
-  # `:on_event` callback is optional, so a config without one is a silent
+  # resolved event callback is optional, so a config without one is a silent
   # no-op. The event is emitted only after a successful, authenticated
   # revocation request; its metadata carries the optional `token_type_hint`
   # for context but never the token value.
-  defp emit_revoked(%Config{on_event: nil}, _client_id, _params), do: :ok
-
-  defp emit_revoked(%Config{on_event: on_event}, client_id, params) do
-    event =
-      Event.new(:token_revoked,
-        client_id: client_id,
-        metadata: %{token_type_hint: Map.get(params, @token_type_hint_param)}
-      )
-
-    Callback.invoke(on_event, [event])
-    :ok
+  defp emit_revoked(%Config{} = config, client_id, params) do
+    Event.emit(config, :token_revoked,
+      client_id: client_id,
+      metadata: %{token_type_hint: Map.get(params, @token_type_hint_param)}
+    )
   end
 
   # RFC 6749 §5.2: all revocation errors use the shared JSON envelope. The
@@ -250,17 +235,5 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   defp refresh_store(conn) do
     Map.get(conn.private, @refresh_store_key, @default_refresh_store)
-  end
-
-  defp fetch_config!(conn) do
-    case conn.private do
-      %{@config_key => %Config{} = config} ->
-        config
-
-      _missing ->
-        raise ArgumentError,
-              "AttestoPhoenix.Controller.RevocationController: no %AttestoPhoenix.Config{} " <>
-                "in conn.private[#{inspect(@config_key)}]; wire the host pipeline that assigns it"
-    end
   end
 end

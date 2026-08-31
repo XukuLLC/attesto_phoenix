@@ -11,9 +11,11 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       client_id: "client-123",
       subject: "subject-abc",
       scope: ["read", "write"],
+      resource: [],
       redirect_uri: "https://rp.example/cb",
       code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-      code_challenge_method: "S256",
+      dpop_jkt: nil,
+      family_id: nil,
       claims: %{"acr" => "phr"}
     }
   end
@@ -37,6 +39,38 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       assert Ecto.Changeset.get_change(changeset, :scope) == ["read", "write"]
       assert Ecto.Changeset.get_change(changeset, :redirect_uri) == "https://rp.example/cb"
       assert Ecto.Changeset.get_change(changeset, :claims) == %{"acr" => "phr"}
+    end
+
+    test "preserves portable nested claims and exact-range integer boundaries" do
+      claims = %{
+        "nested" => %{
+          "minimum" => -9_007_199_254_740_991,
+          "maximum" => 9_007_199_254_740_991,
+          "values" => [nil, true, "text", %{"leaf" => 42}]
+        }
+      }
+
+      changeset = Authorization.from_record(base_record(%{claims: claims}), now: @now)
+
+      assert changeset.valid?
+      assert Ecto.Changeset.get_change(changeset, :claims) == claims
+    end
+
+    test "rejects non-portable claims before Ecto projection" do
+      invalid_claims = [
+        %{atom_key: "value"},
+        %{"nested" => %{atom_key: "value"}},
+        %{"float" => 1.5},
+        %{"nul" => "a\0b"},
+        %{"large" => 9_007_199_254_740_992},
+        nested_claims(64)
+      ]
+
+      Enum.each(invalid_claims, fn claims ->
+        assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
+          Authorization.from_record(base_record(%{claims: claims}), now: @now)
+        end
+      end)
     end
 
     test "carries the grant family id for descendant revocation" do
@@ -77,12 +111,11 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       refute Ecto.Changeset.get_change(changeset, :cnf)
     end
 
-    test "carries the OIDC nonce" do
-      changeset =
+    test "rejects a legacy top-level nonce in the core data map" do
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
         base_record(%{nonce: "n-0S6_WzA2Mj"})
         |> Authorization.from_record(now: @now)
-
-      assert Ecto.Changeset.get_change(changeset, :nonce) == "n-0S6_WzA2Mj"
+      end
     end
 
     test "applies the :prefix option to the row" do
@@ -107,23 +140,19 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
     end
 
     test "fails closed when the client_id is absent" do
-      changeset =
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
         base_record()
         |> put_in([:data], Map.delete(base_data(), :client_id))
         |> Authorization.from_record(now: @now)
-
-      refute changeset.valid?
-      assert %{client_id: ["can't be blank"]} = errors_on(changeset)
+      end
     end
 
     test "fails closed when the redirect_uri is absent" do
-      changeset =
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
         base_record()
         |> put_in([:data], Map.delete(base_data(), :redirect_uri))
         |> Authorization.from_record(now: @now)
-
-      refute changeset.valid?
-      assert %{redirect_uri: ["can't be blank"]} = errors_on(changeset)
+      end
     end
 
     test "accepts an absent PKCE challenge and stores no method (RFC 9700 confidential-client relaxation)" do
@@ -133,7 +162,7 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       # a NULL method - never a spurious "S256" for a challenge that is not there.
       data =
         base_data()
-        |> Map.drop([:code_challenge, :code_challenge_method])
+        |> Map.put(:code_challenge, nil)
 
       changeset =
         base_record()
@@ -146,17 +175,28 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
     end
 
     test "rejects a non-S256 code-challenge method (RFC 7636 §4.3)" do
-      changeset =
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
         base_record(%{code_challenge_method: "plain"})
         |> Authorization.from_record(now: @now)
+      end
+    end
 
-      refute changeset.valid?
-      assert %{code_challenge_method: ["is invalid"]} = errors_on(changeset)
+    test "rejects an extra canonical data key before projecting it into columns" do
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
+        base_record(%{adapter_metadata: "must stay opaque"})
+        |> Authorization.from_record(now: @now)
+      end
+    end
+
+    test "rejects a missing data map before projecting defaults" do
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
+        base_record() |> Map.delete(:data) |> Authorization.from_record(now: @now)
+      end
     end
   end
 
   describe "to_record/1" do
-    test "rebuilds the grant :data shape expected by the protocol layer" do
+    test "rebuilds the exact canonical grant data expected by the protocol layer" do
       row = %Authorization{
         code_hash: "hash-of-the-code",
         client_id: "client-123",
@@ -177,6 +217,19 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       assert record.code_hash == "hash-of-the-code"
       assert record.expires_at == @expires_unix
 
+      assert Map.keys(record.data) |> Enum.sort() ==
+               [
+                 :claims,
+                 :client_id,
+                 :code_challenge,
+                 :dpop_jkt,
+                 :family_id,
+                 :redirect_uri,
+                 :resource,
+                 :scope,
+                 :subject
+               ]
+
       assert record.data == %{
                client_id: "client-123",
                subject: "subject-abc",
@@ -184,12 +237,77 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
                resource: [],
                redirect_uri: "https://rp.example/cb",
                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-               code_challenge_method: "S256",
                dpop_jkt: nil,
-               nonce: "n-0S6_WzA2Mj",
-               claims: %{"acr" => "phr"},
+               claims: %{"acr" => "phr", "nonce" => "n-0S6_WzA2Mj"},
                family_id: "fam-record"
              }
+    end
+
+    test "legacy nonce overrides nil or conflicting atom and string claim keys" do
+      claims_variants = [
+        %{"acr" => "phr", "nonce" => nil, nonce: "claim-atom"},
+        %{"acr" => "phr", "nonce" => "claim-string", nonce: nil},
+        %{"acr" => "phr", "nonce" => "claim-string", nonce: "claim-atom"}
+      ]
+
+      Enum.each(claims_variants, fn claims ->
+        row = %Authorization{
+          code_hash: "h",
+          client_id: "c",
+          subject: "s",
+          scope: [],
+          resource: [],
+          redirect_uri: "https://rp.example/cb",
+          code_challenge: "chal",
+          code_challenge_method: "S256",
+          cnf: nil,
+          nonce: "legacy-nonce",
+          claims: claims,
+          expires_at: ~U[2024-01-01 00:01:00Z]
+        }
+
+        assert Authorization.to_record(row).data.claims == %{"acr" => "phr", "nonce" => "legacy-nonce"}
+      end)
+    end
+
+    test "preserves a canonical string nonce when the legacy nonce column is nil" do
+      row = %Authorization{
+        code_hash: "h",
+        client_id: "c",
+        subject: "s",
+        scope: [],
+        resource: [],
+        redirect_uri: "https://rp.example/cb",
+        code_challenge: "chal",
+        code_challenge_method: "S256",
+        cnf: nil,
+        nonce: nil,
+        claims: %{"nonce" => "canonical-nonce"},
+        expires_at: ~U[2024-01-01 00:01:00Z]
+      }
+
+      assert Authorization.to_record(row).data.claims == %{"nonce" => "canonical-nonce"}
+    end
+
+    test "leaves atom and mixed nonce maps malformed when the legacy nonce column is nil" do
+      for claims <- [%{nonce: "atom-nonce"}, %{"nonce" => "string-nonce", nonce: "atom-nonce"}] do
+        row = %Authorization{
+          code_hash: "h",
+          client_id: "c",
+          subject: "s",
+          scope: [],
+          resource: [],
+          redirect_uri: "https://rp.example/cb",
+          code_challenge: "chal",
+          code_challenge_method: "S256",
+          cnf: nil,
+          nonce: nil,
+          claims: claims,
+          expires_at: ~U[2024-01-01 00:01:00Z]
+        }
+
+        assert Authorization.to_record(row).data.claims == claims
+      end
     end
 
     test "flattens a cnf binding back to dpop_jkt" do
@@ -211,7 +329,66 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       assert record.data.dpop_jkt == "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
     end
 
-    test "defaults nil scope and claims to empty containers" do
+    test "accepts the legacy atom-key cnf binding" do
+      row = %Authorization{
+        code_hash: "h",
+        client_id: "c",
+        subject: "s",
+        scope: [],
+        resource: [],
+        redirect_uri: "https://rp.example/cb",
+        code_challenge: "chal",
+        code_challenge_method: "S256",
+        cnf: %{jkt: "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"},
+        claims: %{},
+        expires_at: ~U[2024-01-01 00:01:00Z]
+      }
+
+      assert Authorization.to_record(row).data.dpop_jkt ==
+               "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
+    end
+
+    test "rejects malformed cnf instead of treating a bound code as unbound" do
+      row = %Authorization{
+        code_hash: "h",
+        client_id: "c",
+        subject: "s",
+        scope: [],
+        resource: [],
+        redirect_uri: "https://rp.example/cb",
+        code_challenge: "chal",
+        code_challenge_method: "S256",
+        cnf: %{"jkt" => "not-a-thumbprint"},
+        claims: %{},
+        expires_at: ~U[2024-01-01 00:01:00Z]
+      }
+
+      assert_raise ArgumentError, "authorization code record has invalid confirmation binding", fn ->
+        Authorization.to_record(row)
+      end
+    end
+
+    test "rejects cnf maps with unsupported or extra binding keys" do
+      row = %Authorization{
+        code_hash: "h",
+        client_id: "c",
+        subject: "s",
+        scope: [],
+        resource: [],
+        redirect_uri: "https://rp.example/cb",
+        code_challenge: "chal",
+        code_challenge_method: "S256",
+        cnf: %{"jkt" => "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I", "x5t#S256" => "x"},
+        claims: %{},
+        expires_at: ~U[2024-01-01 00:01:00Z]
+      }
+
+      assert_raise ArgumentError, "authorization code record has invalid confirmation binding", fn ->
+        Authorization.to_record(row)
+      end
+    end
+
+    test "preserves malformed nil claims for core read validation" do
       row = %Authorization{
         code_hash: "h",
         client_id: "c",
@@ -221,21 +398,61 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
         code_challenge: "chal",
         code_challenge_method: "S256",
         cnf: nil,
+        nonce: "legacy-nonce",
         claims: nil,
         expires_at: ~U[2024-01-01 00:01:00Z]
       }
 
       record = Authorization.to_record(row)
 
-      assert record.data.scope == []
-      assert record.data.claims == %{}
+      assert record.data.scope == nil
+      assert record.data.claims == nil
+    end
+
+    test "preserves malformed nil claims when the legacy nonce column is nil" do
+      row = %Authorization{
+        code_hash: "h",
+        client_id: "c",
+        subject: "s",
+        scope: [],
+        resource: [],
+        redirect_uri: "https://rp.example/cb",
+        code_challenge: "chal",
+        code_challenge_method: "S256",
+        cnf: nil,
+        nonce: nil,
+        claims: nil,
+        expires_at: ~U[2024-01-01 00:01:00Z]
+      }
+
+      assert Authorization.to_record(row).data.claims == nil
     end
   end
 
   describe "from_record/2 then to_record/1 round-trip" do
+    test "round-trips nested portable claims and exact-range integers unchanged" do
+      claims = %{
+        "nested" => %{
+          "minimum" => -9_007_199_254_740_991,
+          "maximum" => 9_007_199_254_740_991,
+          "values" => [nil, true, "text", %{"leaf" => 42}]
+        }
+      }
+
+      row =
+        base_record(%{claims: claims})
+        |> Authorization.from_record(now: @now)
+        |> Ecto.Changeset.apply_changes()
+
+      assert Authorization.to_record(row).data.claims == claims
+    end
+
     test "preserves the grant context for a DPoP-bound code" do
       original =
-        base_record(%{dpop_jkt: "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I", nonce: "nn"})
+        base_record(%{
+          dpop_jkt: "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I",
+          claims: %{"acr" => "phr", "nonce" => "nn"}
+        })
 
       row =
         original
@@ -253,7 +470,6 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       assert record.data.code_challenge == original.data.code_challenge
       assert record.data.dpop_jkt == original.data.dpop_jkt
       assert record.data.family_id == Map.get(original.data, :family_id)
-      assert record.data.nonce == original.data.nonce
       assert record.data.claims == original.data.claims
     end
   end
@@ -265,4 +481,7 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
       end)
     end)
   end
+
+  defp nested_claims(0), do: %{}
+  defp nested_claims(depth), do: %{"nested" => nested_claims(depth - 1)}
 end

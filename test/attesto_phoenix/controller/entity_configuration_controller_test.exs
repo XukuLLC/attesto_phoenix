@@ -3,8 +3,14 @@ defmodule AttestoPhoenix.EntityConfigurationTestRouter do
   use Phoenix.Router
   use AttestoPhoenix.Router
 
+  alias AttestoPhoenix.Plug.PutConfig
+
+  pipeline :attesto_phoenix_config do
+    plug PutConfig, otp_app: :attesto_phoenix
+  end
+
   scope "/" do
-    attesto_routes(prefix: "/auth", federation: true)
+    attesto_routes(pipeline: :attesto_phoenix_config, prefix: "/auth", federation: true)
   end
 end
 
@@ -49,6 +55,7 @@ defmodule AttestoPhoenix.Controller.EntityConfigurationControllerTest do
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
+      principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")],
       federation_authority_hints: @authority_hints,
       federation_entity_metadata: @entity_metadata
     )

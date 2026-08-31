@@ -21,7 +21,10 @@ defmodule AttestoPhoenix.Plug.PutConfig do
   reads `config :attesto_phoenix, otp_app: :my_app` at request time. Existing
   correctly typed private values are preserved, which lets a host install a
   request-specific configuration earlier in the pipeline. A value of the wrong
-  type fails closed instead of being silently replaced.
+  type fails closed instead of being silently replaced. Library controllers and
+  `AttestoPhoenix.Plug.Authenticate` bind the private configuration only while
+  their bounded work executes; this plug does not retain tenant state in the
+  process dictionary between pipeline and action dispatch.
   """
 
   @behaviour Plug
@@ -83,10 +86,10 @@ defmodule AttestoPhoenix.Plug.PutConfig do
       {:ok, %Config{} = config} ->
         config
 
-      {:ok, other} ->
+      {:ok, _other} ->
         raise ArgumentError,
               "#{inspect(__MODULE__)} expected conn.private[#{inspect(@host_config_key)}] " <>
-                "to contain %AttestoPhoenix.Config{}; got #{inspect(other)}"
+                "to contain %AttestoPhoenix.Config{}"
 
       :error ->
         configured_otp_app
@@ -100,10 +103,10 @@ defmodule AttestoPhoenix.Plug.PutConfig do
       {:ok, %Attesto.Config{} = config} ->
         config
 
-      {:ok, other} ->
+      {:ok, _other} ->
         raise ArgumentError,
               "#{inspect(__MODULE__)} expected conn.private[#{inspect(@protocol_config_key)}] " <>
-                "to contain %Attesto.Config{}; got #{inspect(other)}"
+                "to contain %Attesto.Config{}"
 
       :error ->
         Config.to_attesto_config(host_config)

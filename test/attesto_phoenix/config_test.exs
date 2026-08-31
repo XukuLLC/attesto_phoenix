@@ -1,9 +1,14 @@
 defmodule AttestoPhoenix.ConfigTest do
   use ExUnit.Case, async: false
 
+  import Plug.Conn, only: [put_private: 3]
+  import Plug.Test, only: [conn: 2]
+
+  alias Attesto.DPoP.NonceStore.ETS
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Store.EctoRefreshStore
 
   defmodule Keystore do
     @behaviour Attesto.Keystore
@@ -131,12 +136,37 @@ defmodule AttestoPhoenix.ConfigTest do
     def wrong_arity, do: nil
   end
 
+  defmodule FlatCallbackModule do
+    @moduledoc false
+
+    def client_id(client, suffix), do: client <> suffix
+  end
+
   defmodule ReplayCallbacks do
     @moduledoc false
 
     def check(_key, _ttl), do: :ok
     def check_with_partition(_key, _ttl, _partition), do: :ok
     def wrong_arity(_key), do: :ok
+  end
+
+  defmodule ConfigAwareNonceStore do
+    def issue(_config, _ttl_seconds), do: "nonce"
+    def valid?(_config, _nonce), do: true
+  end
+
+  defmodule IncompleteNonceStore do
+    def issue(_ttl_seconds), do: "nonce"
+  end
+
+  defmodule FetchOnlyPARStore do
+    @behaviour AttestoPhoenix.PARStore
+
+    @impl true
+    def put(_request_uri, _params, _ttl_seconds), do: :ok
+
+    @impl true
+    def fetch(_request_uri), do: :error
   end
 
   # The minimal required-key set. Required callbacks stay flat (this phase keeps
@@ -186,6 +216,346 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.keystore(cfg) == Keystore
       assert Config.vc_keystore(cfg) == VcKeystore
       assert Config.vc_signing_pem(cfg) == "vc-pem"
+    end
+  end
+
+  describe "refresh rotation configuration" do
+    setup do
+      original = Application.get_env(:attesto_phoenix, :refresh_successor_secret)
+
+      on_exit(fn ->
+        if is_nil(original) do
+          Application.delete_env(:attesto_phoenix, :refresh_successor_secret)
+        else
+          Application.put_env(:attesto_phoenix, :refresh_successor_secret, original)
+        end
+      end)
+
+      :ok
+    end
+
+    test "rejects invalid grace values" do
+      for value <- [-1, 1.5, "60", nil] do
+        assert_raise ArgumentError, ~r/:refresh_token_rotation_grace_seconds.*non-negative integer/, fn ->
+          config(refresh_token_rotation_grace_seconds: value)
+        end
+      end
+    end
+
+    test "requires a positive refresh lifetime and bounds grace by it" do
+      for value <- [0, -1, 1.5, "1200", nil] do
+        assert_raise ArgumentError, ~r/:refresh_token_ttl must be a positive integer/, fn ->
+          config(refresh_token_ttl: value)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:refresh_token_ttl must not exceed 2147483647 seconds/, fn ->
+        config(refresh_token_ttl: 2_147_483_648)
+      end
+
+      assert_raise ArgumentError, ~r/grace_seconds must not exceed.*refresh_token_ttl/s, fn ->
+        config(refresh_token_ttl: 59, refresh_token_rotation_grace_seconds: 60)
+      end
+
+      assert %Config{} = config(refresh_token_ttl: 60, refresh_token_rotation_grace_seconds: 60)
+    end
+
+    test "validates the sweep interval and requires it for Ecto retry-state cleanup" do
+      for value <- [0, -1, 1.5, "60000", false] do
+        assert_raise ArgumentError, ~r/:sweep_interval_ms must be a positive integer or nil/, fn ->
+          config(sweep_interval_ms: value)
+        end
+      end
+
+      Application.put_env(
+        :attesto_phoenix,
+        :refresh_successor_secret,
+        String.duplicate("stable-secret-", 3)
+      )
+
+      assert_raise ArgumentError, ~r/requires a positive :sweep_interval_ms/, fn ->
+        config(refresh_store: EctoRefreshStore, sweep_interval_ms: nil)
+      end
+
+      assert %Config{} = config(refresh_store: EctoRefreshStore, sweep_interval_ms: 60_000)
+    end
+
+    test "requires a valid stable secret for Ecto retry recovery" do
+      Application.delete_env(:attesto_phoenix, :refresh_successor_secret)
+
+      assert_raise ArgumentError, ~r/:refresh_successor_secret.*at least 32 bytes/, fn ->
+        config(refresh_store: EctoRefreshStore)
+      end
+
+      Application.put_env(:attesto_phoenix, :refresh_successor_secret, "too-short")
+
+      assert_raise ArgumentError, ~r/:refresh_successor_secret.*at least 32 bytes/, fn ->
+        config(refresh_store: EctoRefreshStore)
+      end
+
+      Application.put_env(
+        :attesto_phoenix,
+        :refresh_successor_secret,
+        String.duplicate("stable-secret-", 3)
+      )
+
+      assert %Config{} = config(refresh_store: EctoRefreshStore, sweep_interval_ms: 60_000)
+    end
+
+    test "revalidates prebuilt configs loaded from application environment" do
+      previous = Application.get_env(:attesto_phoenix, Config, :missing)
+      secret = String.duplicate("stable-secret-", 3)
+      Application.put_env(:attesto_phoenix, :refresh_successor_secret, secret)
+
+      valid = config(refresh_store: EctoRefreshStore, sweep_interval_ms: 60_000)
+      Application.put_env(:attesto_phoenix, Config, valid)
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(:attesto_phoenix, Config)
+          value -> Application.put_env(:attesto_phoenix, Config, value)
+        end
+      end)
+
+      assert Config.from_otp_app(:attesto_phoenix) === valid
+
+      Application.delete_env(:attesto_phoenix, :refresh_successor_secret)
+
+      assert_raise ArgumentError, ~r/:refresh_successor_secret.*at least 32 bytes/, fn ->
+        Config.from_otp_app(:attesto_phoenix)
+      end
+    end
+
+    test "strict zero grace and custom stores do not depend on a usable Ecto cipher secret" do
+      Application.delete_env(:attesto_phoenix, :refresh_successor_secret)
+
+      assert %Config{} =
+               config(
+                 refresh_store: EctoRefreshStore,
+                 refresh_token_rotation_grace_seconds: 0
+               )
+
+      assert %Config{} =
+               config(
+                 refresh_store: EmptyModule,
+                 refresh_token_rotation_grace_seconds: 60
+               )
+
+      Application.put_env(:attesto_phoenix, :refresh_successor_secret, "short")
+
+      assert %Config{} =
+               config(
+                 refresh_store: EctoRefreshStore,
+                 refresh_token_rotation_grace_seconds: 0
+               )
+
+      assert %Config{} =
+               config(
+                 refresh_store: EmptyModule,
+                 refresh_token_rotation_grace_seconds: 60
+               )
+    end
+  end
+
+  describe "DPoP nonce configuration" do
+    test "required nonce enforcement needs DPoP and a capable store" do
+      assert_raise ArgumentError, ~r/:nonce_store must select a capable module/, fn ->
+        config(dpop_nonce_required: true, nonce_store: nil)
+      end
+
+      assert_raise ArgumentError, ~r/is not a loadable nonce store/, fn ->
+        config(dpop_nonce_required: true, nonce_store: IncompleteNonceStore)
+      end
+
+      assert_raise ArgumentError, ~r/cannot be true when :dpop_enabled is false/, fn ->
+        config(dpop_enabled: false, dpop_nonce_required: true, nonce_store: ConfigAwareNonceStore)
+      end
+    end
+
+    test "accepts behaviour and config-aware nonce stores" do
+      assert %Config{} =
+               config(dpop_nonce_required: true, nonce_store: ETS)
+
+      assert %Config{} =
+               config(dpop_nonce_required: true, nonce_store: ConfigAwareNonceStore)
+    end
+  end
+
+  describe "top-level boolean policy configuration" do
+    test "rejects non-booleans for every direct boolean field" do
+      keys = [
+        :claims_parameter_supported,
+        :require_nonce,
+        :require_pkce,
+        :require_pushed_authorization_requests,
+        :authorization_response_iss,
+        :require_https,
+        :dpop_enabled,
+        :dpop_nonce_required,
+        :mtls_enabled,
+        :registration_enabled
+      ]
+
+      for key <- keys, value <- ["true", 1, nil] do
+        assert_raise ArgumentError, ~r/#{key} must be true or false/, fn ->
+          config([{key, value}])
+        end
+      end
+    end
+  end
+
+  describe "required PAR configuration" do
+    test "requires an atomic take callback only when PAR is required" do
+      assert %Config{par_store: FetchOnlyPARStore} = config(par_store: FetchOnlyPARStore)
+
+      assert_raise ArgumentError, ~r/:par_store must be.*atomic take\/1/, fn ->
+        config(
+          require_pushed_authorization_requests: true,
+          par_store: FetchOnlyPARStore
+        )
+      end
+    end
+
+    test "the default store remains valid and is unchanged when PAR is required" do
+      assert %Config{par_store: nil, require_pushed_authorization_requests: false} = config()
+
+      assert %Config{par_store: nil, require_pushed_authorization_requests: true} =
+               config(require_pushed_authorization_requests: true)
+    end
+  end
+
+  describe "nested boolean policy configuration" do
+    test "rejects malformed feature flags instead of silently changing security policy" do
+      cases = [
+        {:client_id_metadata, :enabled},
+        {:client_id_metadata, :allow_loopback},
+        {:client_id_metadata, :require_same_origin_redirect_uri},
+        {:jwt_bearer, :enabled},
+        {:device_authorization, :enabled},
+        {:ciba, :enabled},
+        {:ciba, :require_signed_request},
+        {:ciba, :require_binding_message},
+        {:ciba, :user_code_parameter_supported},
+        {:ciba, :enforce_fapi_alg_policy},
+        {:logout, :enabled},
+        {:session_management, :enabled}
+      ]
+
+      for {group, key} <- cases, value <- ["false", 0, nil] do
+        assert_raise ArgumentError, ~r/#{group}.*#{key}.*must be true or false/, fn ->
+          config([{group, [{key, value}]}])
+        end
+      end
+    end
+  end
+
+  describe "advertised and enforced protocol catalogs" do
+    test "an explicit empty catalog stays empty instead of widening to defaults" do
+      cfg =
+        config(
+          grant_types_supported: [],
+          token_endpoint_auth_methods_supported: []
+        )
+
+      assert Config.grant_types_supported(cfg) == []
+      assert Config.token_endpoint_auth_methods_supported(cfg) == []
+    end
+
+    test "explicit grant catalogs stay authoritative when optional grants are enabled" do
+      feature_configs = [
+        device_code: [
+          device_authorization: [enabled: true],
+          device_code_store: EmptyModule
+        ],
+        ciba: [
+          ciba: [enabled: true, require_signed_request: false],
+          ciba_store: EmptyModule,
+          authenticate_ciba_user: fn _request -> {:error, :not_found} end
+        ],
+        jwt_bearer: [
+          jwt_bearer: [
+            enabled: true,
+            issuers: %{"https://assertions.example" => [jwks: %{"keys" => []}]}
+          ],
+          resolve_jwt_bearer_subject: fn _claims -> {:error, :not_found} end
+        ],
+        pre_authorized_code: [pre_authorized_code_store: EmptyModule]
+      ]
+
+      for {feature, feature_opts} <- feature_configs do
+        empty = config(Keyword.put(feature_opts, :grant_types_supported, []))
+        narrowed = config(Keyword.put(feature_opts, :grant_types_supported, ["authorization_code"]))
+
+        assert Config.grant_types_supported(empty) == [],
+               "#{feature} widened an explicit empty grant catalog"
+
+        assert Config.grant_types_supported(narrowed) == ["authorization_code"],
+               "#{feature} widened an explicit narrowed grant catalog"
+      end
+    end
+
+    test "token authentication defaults match discovery and endpoint enforcement" do
+      cfg = config([])
+
+      assert Config.token_endpoint_auth_methods_supported(cfg) == [
+               "client_secret_basic",
+               "client_secret_post",
+               "private_key_jwt",
+               "none"
+             ]
+
+      with_wallet_keys =
+        config(trusted_wallet_provider_jwks: %{"keys" => [%{"kty" => "EC"}]})
+
+      assert Config.token_endpoint_auth_methods_supported(with_wallet_keys) == [
+               "client_secret_basic",
+               "client_secret_post",
+               "private_key_jwt",
+               "none",
+               "attest_jwt_client_auth"
+             ]
+    end
+
+    test "rejects malformed catalog values during configuration construction" do
+      for {key, value} <- [
+            {:grant_types_supported, "authorization_code"},
+            {:grant_types_supported, ["authorization_code", ""]},
+            {:grant_types_supported, ["authorization_code", :refresh_token]},
+            {:token_endpoint_auth_methods_supported, "client_secret_basic"},
+            {:token_endpoint_auth_methods_supported, ["client_secret_basic", ""]},
+            {:token_endpoint_auth_methods_supported, ["client_secret_basic", :none]}
+          ] do
+        assert_raise ArgumentError, ~r/#{key}.*nil or a list of non-empty strings/, fn ->
+          config([{key, value}])
+        end
+      end
+    end
+  end
+
+  describe "OID4VCI key-attestation configuration" do
+    test "required key attestation needs at least one usable trusted key" do
+      for jwks <- [nil, [], %{"keys" => []}, %{"keys" => [%{"kty" => "EC"}]}, "invalid"] do
+        assert_raise ArgumentError, ~r/:key_attestation_trusted_jwks.*usable trusted public key/, fn ->
+          config(require_key_attestation: true, key_attestation_trusted_jwks: jwks)
+        end
+      end
+    end
+
+    test "accepts a usable trusted key when key attestation is required" do
+      key = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_meta, public_jwk} = JOSE.JWK.to_public_map(key)
+
+      assert %Config{} =
+               config(
+                 require_key_attestation: true,
+                 key_attestation_trusted_jwks: %{"keys" => [public_jwk]}
+               )
+    end
+
+    test "rejects a non-boolean requirement instead of silently disabling it" do
+      assert_raise ArgumentError, ~r/:require_key_attestation must be true, false, or nil/, fn ->
+        config(require_key_attestation: "true")
+      end
     end
   end
 
@@ -241,8 +611,19 @@ defmodule AttestoPhoenix.ConfigTest do
   describe "ecto_repo!/0" do
     setup do
       previous = Application.get_env(:attesto_phoenix, :repo)
+      previous_otp_app = Application.fetch_env(:attesto_phoenix, :otp_app)
+
+      # This describe exercises the package-level compatibility lookup. Keep a
+      # host application's otp_app pointer from redirecting it to unrelated
+      # request configuration left by an earlier case.
+      Application.delete_env(:attesto_phoenix, :otp_app)
 
       on_exit(fn ->
+        case previous_otp_app do
+          {:ok, otp_app} -> Application.put_env(:attesto_phoenix, :otp_app, otp_app)
+          :error -> Application.delete_env(:attesto_phoenix, :otp_app)
+        end
+
         case previous do
           nil -> Application.delete_env(:attesto_phoenix, :repo)
           repo -> Application.put_env(:attesto_phoenix, :repo, repo)
@@ -459,6 +840,32 @@ defmodule AttestoPhoenix.ConfigTest do
       assert_raise ArgumentError, ~r/:load_client capability is required but unresolved/, fn ->
         behaviour_only_config([])
       end
+    end
+  end
+
+  describe "new/1 flat callback arity validation" do
+    test "rejects an anonymous callback with the wrong call arity" do
+      assert_raise ArgumentError, ~r/:client_id must be a one-argument callback/, fn ->
+        config(client_id: fn -> "client" end)
+      end
+    end
+
+    test "rejects an unloadable MFA without including its value in the error" do
+      missing_module = Module.concat(__MODULE__, "MissingClientCallback")
+
+      error =
+        assert_raise ArgumentError, fn ->
+          config(client_id: {missing_module, :client_id, ["secret-marker"]})
+        end
+
+      assert error.message =~ ":client_id callback module cannot be loaded"
+      refute error.message =~ "secret-marker"
+    end
+
+    test "accepts an MFA with extra arguments when its effective arity matches" do
+      cfg = config(client_id: {FlatCallbackModule, :client_id, ["-suffix"]})
+
+      assert Config.client_identifier(cfg, "client") == "client-suffix"
     end
   end
 
@@ -827,6 +1234,27 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe "CIBA algorithm policy" do
+    test "client registration callback accepts only a map or nil" do
+      assert Config.client_ciba_registration(
+               config(client_ciba_registration: fn _client -> %{token_delivery_mode: :poll} end),
+               %{}
+             ) == %{token_delivery_mode: :poll}
+
+      assert Config.client_ciba_registration(
+               config(client_ciba_registration: fn _client -> nil end),
+               %{}
+             ) == %{}
+
+      assert_raise ArgumentError,
+                   ~r/:client_ciba_registration callback must return a map or nil/,
+                   fn ->
+                     Config.client_ciba_registration(
+                       config(client_ciba_registration: fn _client -> {:error, :unavailable} end),
+                       %{}
+                     )
+                   end
+    end
+
     test "the default FAPI-CIBA allowlist retains the FAPI key gate" do
       opts = Config.ciba(config())
 
@@ -845,14 +1273,14 @@ defmodule AttestoPhoenix.ConfigTest do
     end
 
     test "rejects a non-boolean CIBA enforcement value at boot" do
-      assert_raise ArgumentError, ~r/ciba: \[:enforce_fapi_alg_policy\] must be a boolean/, fn ->
+      assert_raise ArgumentError, ~r/:ciba :enforce_fapi_alg_policy must be true or false/, fn ->
         config(ciba: [enforce_fapi_alg_policy: :yes])
       end
     end
 
     test "rejects a non-boolean signed-request policy at boot" do
       for invalid <- [nil, "true", :yes, 1] do
-        assert_raise ArgumentError, ~r/ciba: \[:require_signed_request\] must be a boolean/, fn ->
+        assert_raise ArgumentError, ~r/:ciba :require_signed_request must be true or false/, fn ->
           config(ciba: [require_signed_request: invalid])
         end
       end
@@ -896,6 +1324,28 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert_raise ArgumentError, ~r/request_object_policy.enforce_fapi_alg_policy must be nil or a boolean/, fn ->
         config(request_object_policy: policy)
+      end
+    end
+
+    test "rejects non-boolean request-object requirement fields at boot" do
+      for key <- [:require_request_object, :require_nbf, :require_exp],
+          invalid <- [nil, "true", :yes, 1] do
+        policy = struct!(Policy, [{key, invalid}])
+
+        assert_raise ArgumentError, ~r/request_object_policy\.#{key} must be a boolean/, fn ->
+          config(request_object_policy: policy)
+        end
+      end
+    end
+
+    test "rejects invalid request-object lifetime limits at boot" do
+      for key <- [:max_nbf_age_seconds, :max_lifetime_seconds],
+          invalid <- [0, -1, 1.5, "60"] do
+        policy = struct!(Policy, [{key, invalid}])
+
+        assert_raise ArgumentError, ~r/request_object_policy\.#{key} must be a positive integer or nil/, fn ->
+          config(request_object_policy: policy)
+        end
       end
     end
 
@@ -1535,4 +1985,46 @@ defmodule AttestoPhoenix.ConfigTest do
                "https://issuer.example/oauth/check_session"
     end
   end
+
+  describe "request-scoped resolution" do
+    test "resolves the validated config from conn.private instead of application config" do
+      request_config = config(issuer: "https://request.example")
+      global_config = config(issuer: "https://global.example")
+      previous_otp_app = Application.get_env(:attesto_phoenix, :otp_app, :missing)
+      previous_config = Application.get_env(:attesto_phoenix, Config, :missing)
+
+      Application.put_env(:attesto_phoenix, :otp_app, :attesto_phoenix)
+      Application.put_env(:attesto_phoenix, Config, global_config)
+
+      on_exit(fn ->
+        restore_env(:otp_app, previous_otp_app)
+        restore_env(Config, previous_config)
+      end)
+
+      assert Config.resolve!(put_private(conn(:get, "/"), :attesto_phoenix_config, request_config)) ===
+               request_config
+    end
+
+    test "fails closed when conn.private has no validated config" do
+      assert_raise ArgumentError, ~r/expected conn\.private\[:attesto_phoenix_config\]/, fn ->
+        Config.resolve!(conn(:get, "/"))
+      end
+    end
+
+    test "fails closed when conn.private has a malformed config" do
+      malformed = %{issuer: "https://bad.example", client_secret: "sensitive-value"}
+      conn = put_private(conn(:get, "/"), :attesto_phoenix_config, malformed)
+
+      error =
+        assert_raise ArgumentError, ~r/expected conn\.private\[:attesto_phoenix_config\]/, fn ->
+          Config.resolve!(conn)
+        end
+
+      refute error.message =~ "bad.example"
+      refute error.message =~ "sensitive-value"
+    end
+  end
+
+  defp restore_env(key, :missing), do: Application.delete_env(:attesto_phoenix, key)
+  defp restore_env(key, value), do: Application.put_env(:attesto_phoenix, key, value)
 end

@@ -83,6 +83,27 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
       assert RequestPolicy.require_pkce?(config(require_pkce: false), @native_public)
       assert RequestPolicy.require_pkce?(config(require_pkce: false), @native_confidential)
     end
+
+    test "malformed public/native policy results raise instead of silently dropping PKCE" do
+      for invalid <- [nil, :unknown, {:error, :unavailable}] do
+        public_config = config(require_pkce: false, client_public?: fn _client -> invalid end)
+
+        assert_raise ArgumentError, ~r/:client_public\? callback must return true or false/, fn ->
+          RequestPolicy.require_pkce?(public_config, @confidential)
+        end
+
+        native_config =
+          config(
+            require_pkce: false,
+            client_public?: fn _client -> false end,
+            client_native?: fn _client -> invalid end
+          )
+
+        assert_raise ArgumentError, ~r/:client_native\? callback must return true or false/, fn ->
+          RequestPolicy.require_pkce?(native_config, @confidential)
+        end
+      end
+    end
   end
 
   describe "client_native?/2 (RFC 8252)" do

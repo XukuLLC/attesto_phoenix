@@ -61,7 +61,7 @@ if Code.ensure_loaded?(Req) do
     """
     @spec screen(String.t(), keyword()) :: {:ok, screened()} | {:error, term()}
     def screen(url, opts \\ []) when is_binary(url) and is_list(opts) do
-      allow_loopback = Keyword.get(opts, :allow_loopback, false)
+      allow_loopback = allow_loopback!(opts)
 
       with {:ok, uri} <- validate(url, allow_loopback),
            {:ok, ips} <- resolve(uri.host, opts),
@@ -72,6 +72,16 @@ if Code.ensure_loaded?(Req) do
            host: uri.host,
            authority: authority(uri)
          }}
+      end
+    end
+
+    defp allow_loopback!(opts) do
+      case Keyword.get(opts, :allow_loopback, false) do
+        value when is_boolean(value) ->
+          value
+
+        _unexpected ->
+          raise ArgumentError, ":allow_loopback must be true or false"
       end
     end
 

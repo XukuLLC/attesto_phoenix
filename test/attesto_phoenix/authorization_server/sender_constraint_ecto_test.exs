@@ -92,7 +92,11 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintEctoTest do
       assert TestRepo.aggregate(DPoPReplay, :count) == 0
 
       # The MFA store runs when the grant path commits the claim.
-      assert :ok = SenderConstraint.commit_replay_claim(config, pending)
+      assert :ok =
+               Config.with_request_config(config, fn ->
+                 SenderConstraint.commit_replay_claim(config, pending)
+               end)
+
       assert TestRepo.aggregate(DPoPReplay, :count) == 1
     end
 
@@ -101,12 +105,18 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintEctoTest do
       config = config()
 
       assert {:ok, {:dpop, _jkt}, "DPoP", first} = SenderConstraint.resolve(config, input(proof), @plain)
-      assert :ok = SenderConstraint.commit_replay_claim(config, first)
+
+      assert :ok =
+               Config.with_request_config(config, fn ->
+                 SenderConstraint.commit_replay_claim(config, first)
+               end)
 
       assert {:ok, {:dpop, _jkt}, "DPoP", second} = SenderConstraint.resolve(config, input(proof), @plain)
 
       assert {:error, %OAuthError{error: :invalid_dpop_proof}} =
-               SenderConstraint.commit_replay_claim(config, second)
+               Config.with_request_config(config, fn ->
+                 SenderConstraint.commit_replay_claim(config, second)
+               end)
     end
   end
 

@@ -40,14 +40,14 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   authorization action must not cross a plain-HTTP hop).
   """
 
-  use Phoenix.Controller, formats: [:html, :json]
+  use AttestoPhoenix.Controller, formats: [:html, :json]
 
   alias Attesto.DeviceCode
   alias AttestoPhoenix.{Callback, Config, RequestContext}
 
   @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def verify(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     with :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
@@ -82,25 +82,31 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   end
 
   defp approve(conn, config, store, subject, user_code) do
-    approval = %{
-      subject: Map.get(subject, :subject) || Map.get(subject, :sub),
-      # The granted scope is the subject's narrowed scope when the host
-      # login/consent layer supplied one, otherwise the originally requested
-      # scope bound to the device code — never broader than what was requested.
-      scope: Map.get(subject, :scope) || pending_scope(store, user_code),
-      claims: Map.get(subject, :claims, %{})
-    }
+    case pending_scope(config, store, user_code) do
+      {:ok, pending_scope} ->
+        approval = %{
+          subject: Map.get(subject, :subject) || Map.get(subject, :sub),
+          # The granted scope is the subject's narrowed scope when the host
+          # login/consent layer supplied one, otherwise the originally requested
+          # scope bound to the device code — never broader than what was requested.
+          scope: Map.get(subject, :scope) || pending_scope,
+          claims: Map.get(subject, :claims, %{})
+        }
 
-    case DeviceCode.approve(store, user_code, approval) do
-      :ok -> render_stage(conn, config, :approved, user_code, nil)
-      _error -> render_stage(conn, config, :invalid, user_code, nil)
+        case approve_device_code(config, store, user_code, approval) do
+          :ok -> render_stage(conn, config, :approved, user_code, nil)
+          {:error, _domain_reason} -> render_stage(conn, config, :invalid, user_code, nil)
+        end
+
+      {:error, _domain_reason} ->
+        render_stage(conn, config, :invalid, user_code, nil)
     end
   end
 
   defp deny(conn, config, store, user_code) do
-    case DeviceCode.deny(store, user_code) do
+    case deny_device_code(config, store, user_code) do
       :ok -> render_stage(conn, config, :denied, user_code, nil)
-      _error -> render_stage(conn, config, :invalid, user_code, nil)
+      {:error, _domain_reason} -> render_stage(conn, config, :invalid, user_code, nil)
     end
   end
 
@@ -109,18 +115,131 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   defp prompt(conn, config, _store, nil), do: render_stage(conn, config, :prompt, nil, nil)
 
   defp prompt(conn, config, store, user_code) do
-    case DeviceCode.lookup(store, user_code) do
+    case lookup_device_code(config, store, user_code) do
       {:ok, %{status: :pending} = view} -> render_stage(conn, config, :prompt, user_code, view)
       {:ok, _decided} -> render_stage(conn, config, :invalid, user_code, nil)
-      _ -> render_stage(conn, config, :invalid, user_code, nil)
+      :error -> render_stage(conn, config, :invalid, user_code, nil)
+      {:error, :invalid_user_code} -> render_stage(conn, config, :invalid, user_code, nil)
     end
   end
 
-  defp pending_scope(store, user_code) do
-    case DeviceCode.lookup(store, user_code) do
-      {:ok, %{scope: scope}} -> scope
-      _ -> []
+  defp pending_scope(_config, _store, nil), do: {:error, :invalid_user_code}
+
+  defp pending_scope(config, store, user_code) do
+    case lookup_device_code(config, store, user_code) do
+      {:ok, %{status: :pending, scope: scope}} when is_list(scope) -> {:ok, scope}
+      {:ok, %{status: status}} when status in [:approved, :denied, :consumed] -> {:error, :not_pending}
+      :error -> {:error, :not_found}
+      {:error, :invalid_user_code} = error -> error
+      {:ok, _malformed_pending_view} -> device_code_contract_error!(:lookup)
     end
+  end
+
+  defp lookup_device_code(config, store, user_code) do
+    result =
+      invoke_device_code!(:lookup, fn ->
+        DeviceCode.lookup(store, user_code, device_code_opts(config))
+      end)
+
+    case result do
+      {:ok, view} ->
+        if valid_pending_view?(view), do: {:ok, view}, else: device_code_contract_error!(:lookup)
+
+      :error ->
+        :error
+
+      {:error, :invalid_user_code} = error ->
+        error
+
+      _unexpected ->
+        device_code_contract_error!(:lookup)
+    end
+  end
+
+  defp valid_pending_view?(%{
+         user_code: user_code,
+         client_id: client_id,
+         scope: scope,
+         resource: resource,
+         status: status,
+         expires_at: expires_at
+       }) do
+    valid_device_identity?(user_code, client_id) and valid_string_list?(scope) and
+      valid_string_list?(resource) and valid_device_status?(status) and valid_expiry?(expires_at)
+  end
+
+  defp valid_pending_view?(_view), do: false
+
+  defp valid_device_identity?(user_code, client_id) do
+    is_binary(user_code) and user_code != "" and
+      (is_nil(client_id) or (is_binary(client_id) and client_id != ""))
+  end
+
+  defp valid_string_list?(value), do: is_list(value) and Enum.all?(value, &is_binary/1)
+  defp valid_device_status?(status), do: status in [:pending, :approved, :denied, :consumed]
+  defp valid_expiry?(expires_at), do: is_integer(expires_at) and expires_at >= 0
+
+  defp approve_device_code(config, store, user_code, approval) do
+    result =
+      invoke_device_code!(:approve, fn ->
+        DeviceCode.approve(store, user_code, approval, device_code_opts(config))
+      end)
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} = error
+      when reason in [:not_found, :already_decided, :expired, :invalid_user_code, :invalid_subject] ->
+        error
+
+      _unexpected ->
+        device_code_contract_error!(:approve)
+    end
+  end
+
+  defp deny_device_code(_config, _store, nil), do: {:error, :invalid_user_code}
+
+  defp deny_device_code(config, store, user_code) do
+    result =
+      invoke_device_code!(:deny, fn ->
+        DeviceCode.deny(store, user_code, device_code_opts(config))
+      end)
+
+    case result do
+      :ok ->
+        :ok
+
+      {:error, reason} = error
+      when reason in [:not_found, :already_decided, :expired, :invalid_user_code] ->
+        error
+
+      _unexpected ->
+        device_code_contract_error!(:deny)
+    end
+  end
+
+  defp device_code_opts(config) do
+    [user_code_length: Keyword.fetch!(Config.device_authorization(config), :user_code_length)]
+  end
+
+  defp invoke_device_code!(operation, callback) do
+    callback.()
+  rescue
+    _exception -> device_code_contract_error!(operation)
+  catch
+    _kind, _reason -> device_code_contract_error!(operation)
+  end
+
+  defp device_code_contract_error!(operation) do
+    call =
+      case operation do
+        :lookup -> "lookup/2"
+        :approve -> "approve/3"
+        :deny -> "deny/2"
+      end
+
+    raise RuntimeError, "Attesto.DeviceCode.#{call} violated its return contract"
   end
 
   defp authenticate(conn, config) do

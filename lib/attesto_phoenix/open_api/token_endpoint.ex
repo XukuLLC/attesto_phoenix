@@ -185,7 +185,7 @@ if Code.ensure_loaded?(OpenApiSpex) do
           "grant_type" => "client_credentials",
           "scope" => "read",
           "client_id" => "client-123",
-          "client_secret" => "secret"
+          "client_secret" => "REDACTED_CLIENT_SECRET"
         }
       }
     end

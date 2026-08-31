@@ -20,16 +20,31 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     def get(token_hash), do: Process.get({:record, token_hash}, :error)
 
     @impl true
-    def consume(_token_hash, _opts), do: :error
-
-    @impl true
-    def remember_successor(_token_hash, _successor, _opts), do: :ok
+    def rotate(_parent_hash, _child, _successor, _opts), do: :error
 
     @impl true
     def revoke_family(family_id) do
       send(self(), {:revoked, family_id})
       :ok
     end
+  end
+
+  defmodule StubEventSink do
+    @behaviour AttestoPhoenix.EventSink
+
+    @impl true
+    def on_event(event) do
+      send(self(), {:event_sink, event})
+      :ok
+    end
+  end
+
+  defmodule RoutedRouter do
+    @moduledoc false
+
+    use Phoenix.Router
+
+    post "/oauth/revoke", RevocationController, :create
   end
 
   @client_id "client-123"
@@ -66,6 +81,12 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   defp put_record(token, record) do
+    record =
+      Map.merge(
+        %{token_hash: Attesto.Secret.hash(token), consumed: false},
+        record
+      )
+
     Process.put({:record, Attesto.Secret.hash(token)}, {:ok, record})
   end
 
@@ -98,6 +119,42 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   describe "successful revocation (RFC 7009 §2.1)" do
+    test "router dispatch invokes the revoke operation and event exactly once" do
+      put_record(@live_token, %{
+        family_id: @live_family,
+        data: %{client_id: @client_id},
+        expires_at: System.system_time(:second) + 1_000
+      })
+
+      test_pid = self()
+
+      config =
+        build_config(
+          on_event: fn event ->
+            send(test_pid, {:event, event})
+            :ok
+          end
+        )
+
+      params = %{
+        "token" => @live_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      conn =
+        params
+        |> build_conn(config: config)
+        |> RoutedRouter.call(RoutedRouter.init([]))
+
+      assert conn.status == 200
+      assert conn.resp_body == ""
+      assert_received {:revoked, @live_family}
+      refute_received {:revoked, _family}
+      assert_received {:event, %AttestoPhoenix.Event{name: :token_revoked}}
+      refute_received {:event, _event}
+    end
+
     test "pins the revocation endpoint's accepted and rejected auth methods" do
       for {method, expected_status} <- [
             {:client_secret_basic, 200},
@@ -238,7 +295,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       refute_received {:revoked, _family}
     end
 
-    test "returns 200 for an expired token without an error or family revoke" do
+    test "returns 200 for an expired token and revokes its family" do
       put_record(@live_token, %{
         family_id: @live_family,
         data: %{client_id: @client_id},
@@ -254,7 +311,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       conn = RevocationController.create(build_conn(params, []), params)
 
       assert conn.status == 200
-      refute_received {:revoked, _family}
+      assert_received {:revoked, @live_family}
     end
   end
 
@@ -394,6 +451,25 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       refute event.subject
     end
 
+    test "resolves :token_revoked through a configured event-sink module" do
+      cfg = build_config(event_sink: StubEventSink)
+
+      params = %{
+        "token" => @unknown_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret,
+        "token_type_hint" => "refresh_token"
+      }
+
+      conn = RevocationController.create(build_conn(params, config: cfg), params)
+
+      assert conn.status == 200
+      assert_received {:event_sink, event}
+      assert event.name == :token_revoked
+      assert event.client_id == @client_id
+      assert event.metadata.token_type_hint == "refresh_token"
+    end
+
     test "does not emit an event when client authentication fails" do
       test_pid = self()
 
@@ -476,7 +552,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
     bare = conn(:post, "/oauth/revoke", params)
 
-    assert_raise ArgumentError, ~r/no %AttestoPhoenix.Config\{\}/, fn ->
+    assert_raise ArgumentError, ~r/expected conn\.private\[:attesto_phoenix_config\]/, fn ->
       RevocationController.create(bare, params)
     end
   end

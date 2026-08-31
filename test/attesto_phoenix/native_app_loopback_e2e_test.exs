@@ -26,6 +26,8 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
 
   use ExUnit.Case, async: false
 
+  alias AttestoPhoenix.Plug.PutConfig
+
   @moduletag :e2e
 
   @js_dir Path.expand("../support/js", __DIR__)
@@ -98,6 +100,7 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
 
     plug :fetch_query
     plug Plug.Parsers, parsers: [:urlencoded, :json], pass: ["*/*"], json_decoder: JSON
+    plug PutConfig
     plug Router
 
     def fetch_query(conn, _opts), do: Plug.Conn.fetch_query_params(conn)

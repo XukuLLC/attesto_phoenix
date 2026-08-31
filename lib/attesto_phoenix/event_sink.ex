@@ -11,9 +11,11 @@ defmodule AttestoPhoenix.EventSink do
   """
 
   @doc """
-  Handle an authorization-server event. The return value is ignored; the host
-  owns persistence, metrics, and logging. The callback must not raise on the
-  request path (a failing audit sink should degrade, not break token issuance).
+  Handle an authorization-server event. The return value does not alter the
+  request path; an explicit `{:error, reason}` emits a fixed warning that does
+  not include the reason or event payload. The host owns persistence, metrics,
+  and logging. The callback must not raise on the request path (a failing audit
+  sink should degrade, not break token issuance).
   """
   @callback on_event(event :: AttestoPhoenix.Event.t()) :: any()
 end

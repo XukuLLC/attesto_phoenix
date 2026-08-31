@@ -19,7 +19,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
   all when disabled).
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
@@ -30,7 +30,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_enabled(config),

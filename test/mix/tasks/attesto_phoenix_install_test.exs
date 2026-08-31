@@ -13,12 +13,13 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   source so the test does not depend on the exact unified-diff rendering.
   """
 
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import Igniter.Test
 
   alias Attesto.PrincipalKind
   alias AttestoPhoenix.Config, as: PhoenixConfig
+  alias AttestoPhoenix.Store.Sweeper
   alias Test.AuthZ.PrincipalStore
 
   @task "attesto_phoenix.install"
@@ -33,7 +34,23 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   @registration_store_path "lib/test/auth_z/registration_store.ex"
   @event_sink_path "lib/test/auth_z/event_sink.ex"
   @router_path "lib/test_web/router.ex"
+  @application_path "lib/test/application.ex"
   @config_path "config/config.exs"
+  @runtime_config_path "config/runtime.exs"
+
+  @mix_fixture """
+  defmodule Test.MixProject do
+    use Mix.Project
+
+    def project do
+      [app: :test, version: "0.1.0", elixir: "~> 1.17", deps: []]
+    end
+
+    def application do
+      [extra_applications: [:logger], mod: {Test.Application, []}]
+    end
+  end
+  """
 
   # A minimal `Phoenix.Router` the installer can find and mount into. Seeded as a
   # fixture so the test never shells out to the phx_new generator.
@@ -47,6 +64,18 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   end
   """
 
+  @application_fixture """
+  defmodule Test.Application do
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [Test.Repo]
+      Supervisor.start_link(children, strategy: :one_for_one, name: Test.Supervisor)
+    end
+  end
+  """
+
   defmodule Keystore do
     @behaviour Attesto.Keystore
 
@@ -55,6 +84,16 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
 
     @impl true
     def verification_pems, do: ["test-only"]
+  end
+
+  defmodule GeneratedRepo do
+    @moduledoc false
+    use GenServer
+
+    def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok)
+
+    @impl true
+    def init(:ok), do: {:ok, :ok}
   end
 
   @old_installer_router_fixture """
@@ -80,6 +119,98 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
     load_principal: {Test.AuthZ.PrincipalStore, :load_principal}
   """
 
+  @legacy_table_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example",
+    keystore: Test.AuthZ.Keystore,
+    repo: Test.Repo,
+    table_prefix: "oauth"
+  """
+
+  @existing_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_auth"
+  """
+
+  @default_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: nil
+  """
+
+  @production_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_prod"
+  """
+
+  @same_file_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: nil
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_prod"
+  """
+
+  @duplicate_keyword_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: nil,
+    schema_prefix: "tenant_prod"
+  """
+
+  @invalid_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: 42
+  """
+
+  @string_schema_prefix_map_config_fixture ~S"""
+  import Config
+
+  config :test, AttestoPhoenix.Config, %{"schema_prefix" => "tenant_auth"}
+  """
+
+  @existing_runtime_secret_fixture """
+  import Config
+
+  config :attesto_phoenix, refresh_successor_secret: "host-supplied-development-value"
+  """
+
+  @existing_config_secret_fixture """
+  import Config
+
+  config :attesto_phoenix, refresh_successor_secret: "host-supplied-config-value"
+  """
+
+  @existing_prod_secret_fixture """
+  import Config
+
+  config :attesto_phoenix, refresh_successor_secret: "host-supplied-prod-value"
+  """
+
+  @existing_imported_config_fixture """
+  import Config
+
+  import_config "nested/attesto.exs"
+  """
+
+  @existing_nested_secret_fixture """
+  import Config
+
+  config :attesto_phoenix, refresh_successor_secret: "host-supplied-imported-value"
+  """
+
   @old_principal_store_fixture """
   defmodule Test.AuthZ.PrincipalStore do
     @behaviour AttestoPhoenix.PrincipalStore
@@ -93,7 +224,13 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   """
 
   defp project do
-    test_project(files: %{@router_path => @router_fixture})
+    test_project(
+      files: %{
+        "mix.exs" => @mix_fixture,
+        @router_path => @router_fixture,
+        @application_path => @application_fixture
+      }
+    )
   end
 
   describe "first run" do
@@ -120,8 +257,23 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert config =~ "audience:"
       assert config =~ "principal_kinds: {Test.AuthZ.PrincipalStore, :principal_kinds}"
       assert config =~ "oauth_path_prefix: \"/oauth\""
+      assert config =~ "schema_prefix:"
       assert config =~ "code_store: AttestoPhoenix.Store.EctoCodeStore"
       assert config =~ "load_client: {Test.AuthZ.ClientStore, :load_client}"
+
+      runtime_config = source_content(applied, @runtime_config_path)
+      assert runtime_config =~ "ATTESTO_REFRESH_SUCCESSOR_SECRET"
+      assert runtime_config =~ "config_env() in [:dev, :test]"
+      refute runtime_config =~ "development-only"
+
+      application = source_content(applied, @application_path)
+      assert application =~ "AttestoPhoenix.Store.Sweeper"
+      assert application =~ "AttestoPhoenix.Config.from_otp_app(:test)"
+      assert application =~ "if_configured: true"
+
+      {repo_position, _} = :binary.match(application, "Test.Repo")
+      {sweeper_position, _} = :binary.match(application, "AttestoPhoenix.Store.Sweeper")
+      assert repo_position < sweeper_position
 
       # The router gains the server scope mounting attesto_routes/1 and the use.
       router = source_content(applied, @router_path)
@@ -150,6 +302,13 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       host_options = evaluated |> Keyword.fetch!(:test) |> Keyword.fetch!(PhoenixConfig)
       library_options = Keyword.fetch!(evaluated, :attesto_phoenix)
 
+      # The installer writes callback modules and config in one source rewrite;
+      # the modules are not loaded until the host's normal compilation step.
+      # Config.new/1 intentionally rejects unloadable MFAs, so compile the
+      # generated callback sources here before exercising the post-install
+      # validation path.
+      compile_generated_callbacks(applied)
+
       assert library_options[:otp_app] == :test
       assert library_options[:repo] == Test.Repo
 
@@ -168,6 +327,51 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert %Attesto.Config{keystore: Keystore} = PhoenixConfig.to_attesto_config(host_config)
     end
 
+    test "generated runtime config defers the conditional secret requirement to Config" do
+      original = System.get_env("ATTESTO_REFRESH_SUCCESSOR_SECRET")
+      System.delete_env("ATTESTO_REFRESH_SUCCESSOR_SECRET")
+
+      on_exit(fn ->
+        if is_nil(original) do
+          System.delete_env("ATTESTO_REFRESH_SUCCESSOR_SECRET")
+        else
+          System.put_env("ATTESTO_REFRESH_SUCCESSOR_SECRET", original)
+        end
+      end)
+
+      applied =
+        project()
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      runtime = source_content(applied, @runtime_config_path)
+      refute runtime =~ "System.fetch_env!(\"ATTESTO_REFRESH_SUCCESSOR_SECRET\")"
+
+      test_config = Config.Reader.eval!(@runtime_config_path, runtime, env: :test)
+
+      test_secret = test_config[:attesto_phoenix][:refresh_successor_secret]
+      assert is_binary(test_secret)
+      assert {:ok, decoded_secret} = Base.url_decode64(test_secret, padding: false)
+      assert byte_size(decoded_secret) >= 32
+
+      prod_config = Config.Reader.eval!(@runtime_config_path, runtime, env: :prod)
+      assert is_nil(prod_config[:attesto_phoenix][:refresh_successor_secret])
+
+      staging_config = Config.Reader.eval!(@runtime_config_path, runtime, env: :staging)
+      assert is_nil(staging_config[:attesto_phoenix][:refresh_successor_secret])
+
+      System.put_env("ATTESTO_REFRESH_SUCCESSOR_SECRET", "short")
+
+      short_config = Config.Reader.eval!(@runtime_config_path, runtime, env: :prod)
+      assert short_config[:attesto_phoenix][:refresh_successor_secret] == "short"
+
+      secret = String.duplicate("production-secret-", 2)
+      System.put_env("ATTESTO_REFRESH_SUCCESSOR_SECRET", secret)
+
+      prod_config = Config.Reader.eval!(@runtime_config_path, runtime, env: :prod)
+      assert prod_config[:attesto_phoenix][:refresh_successor_secret] == secret
+    end
+
     test "honors a relocated --oauth-path-prefix" do
       applied =
         project()
@@ -180,9 +384,163 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                "attesto_routes(prefix: \"/mcp\", pipeline: :attesto_phoenix_config)"
     end
 
+    test "writes an explicit PostgreSQL schema prefix" do
+      composed =
+        project()
+        |> Igniter.compose_task(@task, ["--schema-prefix", "tenant_auth"])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "--schema-prefix tenant_auth" and
+                 notice =~ "PostgreSQL schema `tenant_auth`" and
+                 notice =~ "{repo, schema_prefix}"
+             end)
+
+      applied =
+        composed
+        |> apply_igniter!()
+
+      assert source_content(applied, @config_path) =~ "schema_prefix: \"tenant_auth\""
+    end
+
+    test "rerun reads an existing configured schema when the flag is omitted" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @existing_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "--schema-prefix tenant_auth" and
+                 notice =~ "PostgreSQL schema `tenant_auth`"
+             end)
+
+      applied = apply_igniter!(composed)
+      assert source_content(applied, @config_path) =~ "schema_prefix: \"tenant_auth\""
+    end
+
+    test "requires an explicit schema prefix when config sources disagree" do
+      assert_raise Mix.Error, ~r/multiple literal values.*--schema-prefix explicitly/, fn ->
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @default_schema_prefix_config_fixture,
+            "config/prod.exs" => @production_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+      end
+    end
+
+    test "requires an explicit schema prefix when one config source disagrees internally" do
+      assert_raise Mix.Error, ~r/multiple literal values.*--schema-prefix explicitly/, fn ->
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @same_file_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+      end
+    end
+
+    test "requires an explicit schema prefix when one config call repeats the key" do
+      assert_raise Mix.Error, ~r/multiple literal values.*--schema-prefix explicitly/, fn ->
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @duplicate_keyword_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+      end
+    end
+
+    test "rejects PostgreSQL system schemas" do
+      for prefix <- ["pg_catalog", "information_schema"] do
+        assert_raise Mix.Error, ~r/reserved PostgreSQL system schema/, fn ->
+          Igniter.compose_task(project(), @task, ["--schema-prefix", prefix])
+        end
+      end
+    end
+
+    test "rejects a malformed existing schema prefix instead of announcing public" do
+      assert_raise Mix.Error, ~r/invalid configured :schema_prefix/, fn ->
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @invalid_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+      end
+    end
+
+    test "rejects a string-key schema prefix map instead of announcing public" do
+      assert_raise Mix.Error, ~r/string key "schema_prefix"/, fn ->
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @string_schema_prefix_map_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+      end
+    end
+
+    test "rejects the removed 2.x table-prefix option" do
+      assert_raise Mix.Error, ~r/--table-prefix was removed.*--schema-prefix/, fn ->
+        Igniter.compose_task(project(), @task, ["--table-prefix", "tenant_auth"])
+      end
+    end
+
+    test "notices and preserves a legacy table-prefix config on rerun" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @legacy_table_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "Legacy `:table_prefix` configuration was found" and
+                 notice =~ "will fail closed"
+             end)
+
+      applied =
+        composed
+        |> apply_igniter!()
+
+      assert source_content(applied, @config_path) =~ "table_prefix: \"oauth\""
+    end
+
     test "repairs router output from installers that predate the config pipeline" do
       applied =
-        test_project(files: %{@router_path => @old_installer_router_fixture})
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @old_installer_router_fixture,
+            @application_path => @application_fixture
+          }
+        )
         |> Igniter.compose_task(@task, [])
         |> apply_igniter!()
 
@@ -196,7 +554,9 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       applied =
         test_project(
           files: %{
+            "mix.exs" => @mix_fixture,
             @router_path => @old_installer_router_fixture,
+            @application_path => @application_fixture,
             @config_path => @old_installer_config_fixture,
             @principal_store_path => @old_principal_store_fixture
           }
@@ -215,9 +575,14 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert evaluated[:attesto_phoenix][:otp_app] == :test
       assert evaluated[:attesto_phoenix][:repo] == Test.Repo
 
+      runtime = source_content(applied, @runtime_config_path)
+      assert runtime =~ "refresh_successor_secret:"
+
       principal_store = source_content(applied, @principal_store_path)
       assert principal_store =~ "def principal_kinds do"
       assert principal_store =~ "def load_principal(_subject_id)"
+
+      assert_generated_upgrade_application_starts(applied)
 
       applied
       |> Igniter.compose_task(@task, [])
@@ -239,11 +604,180 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       |> Igniter.compose_task(@task, [])
       |> assert_unchanged()
     end
+
+    test "preserves an existing project refresh secret" do
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @runtime_config_path => @existing_runtime_secret_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      runtime = source_content(applied, @runtime_config_path)
+      evaluated = Config.Reader.eval!(@runtime_config_path, runtime, env: :dev)
+
+      assert evaluated[:attesto_phoenix][:refresh_successor_secret] ==
+               "host-supplied-development-value"
+
+      applied
+      |> Igniter.compose_task(@task, [])
+      |> assert_unchanged()
+    end
+
+    test "preserves a secret configured in config.exs" do
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @existing_config_secret_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      config = Config.Reader.eval!(@config_path, source_content(applied, @config_path))
+
+      assert config[:attesto_phoenix][:refresh_successor_secret] ==
+               "host-supplied-config-value"
+
+      refute Igniter.exists?(applied, @runtime_config_path)
+    end
+
+    test "preserves a secret configured in prod.exs" do
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            "config/prod.exs" => @existing_prod_secret_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      prod = Config.Reader.eval!("config/prod.exs", source_content(applied, "config/prod.exs"))
+
+      assert prod[:attesto_phoenix][:refresh_successor_secret] ==
+               "host-supplied-prod-value"
+
+      refute Igniter.exists?(applied, @runtime_config_path)
+    end
+
+    test "preserves a secret configured in an imported config file" do
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @existing_imported_config_fixture,
+            "config/nested/attesto.exs" => @existing_nested_secret_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      imported =
+        Config.Reader.eval!(
+          "config/nested/attesto.exs",
+          source_content(applied, "config/nested/attesto.exs")
+        )
+
+      assert imported[:attesto_phoenix][:refresh_successor_secret] ==
+               "host-supplied-imported-value"
+
+      refute Igniter.exists?(applied, @runtime_config_path)
+    end
   end
 
   defp source_content(igniter, path) do
     igniter.rewrite
     |> Rewrite.source!(path)
     |> Rewrite.Source.get(:content)
+  end
+
+  defp compile_generated_callbacks(applied) do
+    for path <- [
+          @client_store_path,
+          @principal_store_path,
+          @scope_policy_path,
+          @consent_policy_path,
+          @registration_store_path,
+          @event_sink_path
+        ] do
+      Code.compile_string(source_content(applied, path), path)
+    end
+  end
+
+  defp assert_generated_upgrade_application_starts(applied) do
+    application_module = Module.concat(__MODULE__, GeneratedApplication)
+    supervisor_name = Module.concat(__MODULE__, GeneratedSupervisor)
+
+    source =
+      applied
+      |> source_content(@application_path)
+      |> String.replace("Test.Application", inspect(application_module))
+      |> String.replace("Test.Repo", inspect(GeneratedRepo))
+      |> String.replace("Test.Supervisor", inspect(supervisor_name))
+
+    previous = Application.get_env(:test, PhoenixConfig)
+
+    Application.put_env(:test, PhoenixConfig,
+      issuer: "https://issuer.example",
+      audience: "https://api.example",
+      keystore: Keystore,
+      repo: GeneratedRepo,
+      load_client: fn _ -> {:error, :not_found} end,
+      verify_client_secret: fn _, _ -> false end,
+      load_principal: fn _ -> {:error, :not_found} end
+    )
+
+    on_exit(fn ->
+      if is_nil(previous) do
+        Application.delete_env(:test, PhoenixConfig)
+      else
+        Application.put_env(:test, PhoenixConfig, previous)
+      end
+
+      :code.purge(application_module)
+      :code.delete(application_module)
+    end)
+
+    assert [{^application_module, _bytecode}] = Code.compile_string(source, @application_path)
+    # The generated application module is known only at runtime in this reusable
+    # installer fixture, so a direct module call is not available here.
+    # credo:disable-for-next-line Credo.Check.Refactor.Apply
+    assert {:ok, supervisor} = apply(application_module, :start, [:normal, []])
+    Process.unlink(supervisor)
+
+    on_exit(fn ->
+      try do
+        if Process.alive?(supervisor) do
+          Supervisor.stop(supervisor)
+        end
+      catch
+        :exit, {:noproc, _} -> :ok
+      end
+    end)
+
+    children = Supervisor.which_children(supervisor)
+
+    assert {GeneratedRepo, repo_pid, :worker, [GeneratedRepo]} =
+             List.keyfind(children, GeneratedRepo, 0)
+
+    assert {sweeper_id, :undefined, :worker, [Sweeper]} =
+             Enum.find(children, fn {_id, _pid, _type, modules} -> modules == [Sweeper] end)
+
+    assert sweeper_id == {Sweeper, GeneratedRepo, nil}
+
+    assert Process.alive?(repo_pid)
   end
 end

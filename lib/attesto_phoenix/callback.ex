@@ -34,6 +34,31 @@ defmodule AttestoPhoenix.Callback do
   def invoke(callback, args, _default), do: invoke(callback, args)
 
   @doc """
+  Invoke a configured boolean policy callback with an explicit absent-callback
+  default.
+
+  A configured callback must return exactly `true` or `false`. Any other value
+  is an integration or storage fault and raises without including that value in
+  the exception message.
+  """
+  @spec invoke_boolean(callback() | nil, [any()], boolean(), atom()) :: boolean()
+  def invoke_boolean(nil, _args, default, _name) when is_boolean(default), do: default
+
+  def invoke_boolean(callback, args, _default, name) when is_list(args) and is_atom(name) do
+    case invoke(callback, args) do
+      true ->
+        true
+
+      false ->
+        false
+
+      _unexpected ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: #{inspect(name)} callback must return true or false"
+    end
+  end
+
+  @doc """
   Adapt a configured `callback` (any accepted form) into a plain 2-arity
   function.
 

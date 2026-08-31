@@ -3,6 +3,7 @@ name: Elixir CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -43,6 +44,7 @@ jobs:
 
     env:
       MIX_ENV: test
+      ATTESTO_SOURCE_PATH: ${{ github.workspace }}/attesto
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_HOST: localhost
@@ -51,6 +53,17 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Checkout Attesto core
+        uses: actions/checkout@v4
+        with:
+          repository: XukuLLC/attesto
+          ref: e83e879fe84cdaaa878013ea60b5e92689b720fe
+          path: attesto
+
+      - name: Verify Attesto core revision
+        working-directory: attesto
+        run: test "$(git rev-parse HEAD)" = "e83e879fe84cdaaa878013ea60b5e92689b720fe"
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1
@@ -62,17 +75,17 @@ jobs:
         uses: actions/cache@v4
         with:
           path: deps
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-mix-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-mix-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-mix-
 
       - name: Restore build cache
         uses: actions/cache@v4
         with:
           path: _build
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-build-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-e83e879fe84cdaaa878013ea60b5e92689b720fe-${{ hashFiles('attesto/**') }}-build-
 
       - name: Install dependencies
         run: |
@@ -114,6 +127,8 @@ jobs:
         run: mix docs
 
       - name: Compile minimum consumer without optional Req
+        # Before Attesto 2.0.0 is published, this exercises the exact source
+        # checkout above across the minimum-dependency fixture.
         if: ${{ matrix.lint }}
         working-directory: integration/consumer_without_req
         env:
@@ -126,6 +141,43 @@ jobs:
           mix deps.compile attesto_phoenix --force 2>&1 | tee "$compile_log"
           if grep -F "warning:" "$compile_log"; then
             echo "AttestoPhoenix emitted a compiler warning against the minimum dependency set" >&2
+            exit 1
+          fi
+          mix run --no-start verify.exs
+
+
+  released-consumer:
+    name: Released Attesto 2.0 minimum consumer
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      MIX_ENV: prod
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Elixir
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.20.1"
+          otp-version: "29.0.2"
+
+      - name: Compile minimum consumer against released Attesto 2.0.0
+        # Attesto 2.0.0 is published before the Phoenix release tag is created.
+        # This fresh job has no source opt-in or source-built artifacts.
+        working-directory: integration/consumer_without_req
+        run: |
+          set -o pipefail
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+          mix deps.compile
+          compile_log="${RUNNER_TEMP}/attesto_phoenix_released_minimum_compile.log"
+          mix deps.compile attesto_phoenix --force 2>&1 | tee "$compile_log"
+          if grep -F "warning:" "$compile_log"; then
+            echo "AttestoPhoenix emitted a compiler warning against released Attesto 2.0.0" >&2
             exit 1
           fi
           mix run --no-start verify.exs

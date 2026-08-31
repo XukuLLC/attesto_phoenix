@@ -6,7 +6,7 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
   the signed authorization request object created by `AttestoPhoenix.Verifier`.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn, only: [put_resp_header: 3, send_resp: 3]
 
@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
   @doc "Serve a pending presentation session's signed request object."
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),

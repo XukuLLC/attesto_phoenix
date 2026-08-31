@@ -15,9 +15,16 @@ defmodule AttestoPhoenix.ConsumerWithoutReq.MixProject do
   defp deps do
     [
       {:attesto_phoenix, path: "../.."},
-      {:attesto, "== 1.15.0", override: true},
+      attesto_dep(),
       {:phoenix, "== 1.7.24", override: true},
       {:plug, "== 1.16.6", override: true}
     ]
+  end
+
+  defp attesto_dep do
+    case System.get_env("ATTESTO_SOURCE_PATH") do
+      path when is_binary(path) and path != "" -> {:attesto, path: Path.expand(path), override: true}
+      _unset -> {:attesto, "== 2.0.0", override: true}
+    end
   end
 end

@@ -15,10 +15,21 @@ defmodule AttestoPhoenix.Store.SweeperTest do
     @moduledoc false
 
     def start(deleted_per_table) do
-      Agent.start_link(fn -> %{calls: [], deleted: deleted_per_table} end, name: __MODULE__)
+      Agent.start_link(fn -> %{calls: [], updates: [], deleted: deleted_per_table} end, name: __MODULE__)
     end
 
     def calls, do: Agent.get(__MODULE__, & &1.calls)
+    def updates, do: Agent.get(__MODULE__, & &1.updates)
+
+    def update_all(%Ecto.Query{} = query, [], opts) do
+      table = query_source(query)
+
+      Agent.update(__MODULE__, fn state ->
+        %{state | updates: state.updates ++ [%{table: table, prefix: opts[:prefix]}]}
+      end)
+
+      {0, nil}
+    end
 
     def delete_all(%Ecto.Query{} = query, opts) do
       table = query_source(query)
@@ -117,11 +128,25 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       end
     end
 
+    test "returns :ignore for an unset interval when explicitly conditional" do
+      config = valid_config([])
+
+      assert :ignore = Sweeper.start_link(config: config, if_configured: true)
+    end
+
     test "raises when :sweep_interval_ms is non-positive" do
-      config = valid_config(sweep_interval_ms: 0)
+      config = %{valid_config(sweep_interval_ms: 1) | sweep_interval_ms: 0}
 
       assert_raise ArgumentError, ~r/must be a positive integer/, fn ->
-        Sweeper.start_link(config: config)
+        Sweeper.start_link(config: config, if_configured: true)
+      end
+    end
+
+    test "rejects a non-boolean :if_configured option" do
+      config = valid_config([])
+
+      assert_raise ArgumentError, ~r/:if_configured must be true or false/, fn ->
+        Sweeper.start_link(config: config, if_configured: "true")
       end
     end
   end
@@ -173,20 +198,26 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       swept = RecordingRepo.calls() |> Enum.map(& &1.table) |> Enum.sort()
       assert swept == Enum.sort(@swept_tables)
+
+      assert RecordingRepo.updates() == [
+               %{table: "attesto_refresh_tokens", prefix: nil},
+               %{table: "attesto_refresh_tokens", prefix: nil}
+             ]
     end
 
-    test "forwards :table_prefix to every delete" do
+    test "forwards :schema_prefix to every delete" do
       start_recorder(%{})
-      config = valid_config(sweep_interval_ms: 60_000, table_prefix: "auth")
+      config = valid_config(sweep_interval_ms: 60_000, schema_prefix: "auth")
       pid = start_sweeper(config)
 
       Sweeper.sweep_now(pid)
 
       prefixes = RecordingRepo.calls() |> Enum.map(& &1.prefix) |> Enum.uniq()
       assert prefixes == ["auth"]
+      assert Enum.all?(RecordingRepo.updates(), &(&1.prefix == "auth"))
     end
 
-    test "defaults :table_prefix to nil when unset" do
+    test "defaults :schema_prefix to nil when unset" do
       start_recorder(%{})
       config = valid_config(sweep_interval_ms: 60_000)
       pid = start_sweeper(config)
@@ -232,6 +263,17 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       assert Enum.count(tables, &(&1 == "dpop_replays")) == 2
 
       assert Process.alive?(pid)
+    end
+  end
+
+  describe "child identity" do
+    test "is stable for one repo and schema and differs for another schema" do
+      first = valid_config(schema_prefix: "oauth_a", sweep_interval_ms: 60_000)
+      same = valid_config(schema_prefix: "oauth_a", sweep_interval_ms: 60_000)
+      other = valid_config(schema_prefix: "oauth_b", sweep_interval_ms: 60_000)
+
+      assert Sweeper.child_spec(config: first).id == Sweeper.child_spec(config: same).id
+      refute Sweeper.child_spec(config: first).id == Sweeper.child_spec(config: other).id
     end
   end
 end

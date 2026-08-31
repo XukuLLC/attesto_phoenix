@@ -3,6 +3,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
   # Installs config into the application env, so not async-safe.
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
@@ -45,9 +46,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     @impl true
     def insert(_entry), do: :ok
     @impl true
-    def consume(_hash, _opts), do: :error
-    @impl true
-    def remember_successor(_hash, _data, _opts), do: :ok
+    def rotate(_hash, _child, _successor, _opts), do: :error
     @impl true
     def revoke_family(_family_id), do: :ok
   end
@@ -104,7 +103,10 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
   end
 
   defp call(params, headers \\ []) do
-    base = put_req_header(conn(:post, "/oauth/introspect", params), "authorization", basic_auth())
+    base =
+      conn(:post, "/oauth/introspect", params)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+      |> put_req_header("authorization", basic_auth())
 
     headers
     |> Enum.reduce(base, fn {k, v}, c -> put_req_header(c, k, v) end)
@@ -264,6 +266,33 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       assert JSON.decode!(conn.resp_body) == %{"active" => false}
     end
 
+    test "a dynamic-audience client lookup fault is observable but remains inactive", %{config: config} do
+      resource = "https://resource.example/dynamic-only"
+
+      opts =
+        config_opts()
+        |> Keyword.put(:load_client, fn
+          @client_id -> {:ok, %{id: @client_id}}
+          @token_client_id -> {:error, :store_unavailable}
+          _other -> {:error, :not_found}
+        end)
+        |> Keyword.put(:resource_indicators, allowed_resources_for: fn _client -> [resource] end)
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      log =
+        capture_log(fn ->
+          conn = call(%{"token" => access_token(config, audience: resource)})
+
+          assert conn.status == 200
+          assert JSON.decode!(conn.resp_body) == %{"active" => false}
+        end)
+
+      assert log =~ "AttestoPhoenix dynamic audience resolver failed; token treated as untrusted"
+      refute log =~ "store_unavailable"
+      refute log =~ @token_client_id
+    end
+
     test "a missing token is invalid_request (400)", %{config: _config} do
       conn = call(%{})
 
@@ -278,6 +307,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
 
       conn =
         conn(:post, "/oauth/introspect", params)
+        |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
         |> put_req_header("authorization", "Basic " <> Base.encode64("#{@client_id}:wrong"))
         |> IntrospectionController.create(params)
 
@@ -301,6 +331,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       conn =
         :post
         |> conn("/oauth/introspect", params)
+        |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
         |> IntrospectionController.create(params)
 
       assert conn.status == 400
@@ -317,10 +348,41 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
 
       Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
 
-      conn = call(%{"token" => access_token(config)})
+      log =
+        capture_log(fn ->
+          conn = call(%{"token" => access_token(config)})
 
-      assert conn.status == 200
-      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+          assert conn.status == 200
+          assert JSON.decode!(conn.resp_body) == %{"active" => false}
+        end)
+
+      refute log =~ "introspection authorization callback failed"
+    end
+
+    test "callback faults remain inactive but emit a sanitized operator warning", %{config: config} do
+      callbacks = [
+        fn _caller, _response -> {:error, :policy_secret} end,
+        fn _caller, _response -> raise "policy_exception_secret" end
+      ]
+
+      for callback <- callbacks do
+        opts = Keyword.put(config_opts(), :introspection_authorize, callback)
+        Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+        log =
+          capture_log(fn ->
+            conn = call(%{"token" => access_token(config)})
+
+            assert conn.status == 200
+            assert JSON.decode!(conn.resp_body) == %{"active" => false}
+          end)
+
+        assert log =~
+                 "AttestoPhoenix introspection authorization callback failed; token treated as inactive"
+
+        refute log =~ "policy_secret"
+        refute log =~ "policy_exception_secret"
+      end
     end
 
     test "the callback receives the authenticated caller and the response", %{config: config} do

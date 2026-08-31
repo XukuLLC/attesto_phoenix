@@ -66,6 +66,10 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   """
   @spec request(Config.t(), Request.t()) :: {:ok, response()} | {:error, OAuthError.t()}
   def request(%Config{} = config, %Request{} = request) do
+    Config.with_request_config(config, fn -> do_request(config, request) end)
+  end
+
+  defp do_request(%Config{} = config, %Request{} = request) do
     with {:ok, store} <- require_store(config),
          {:ok, client_map} <- build_client_map(config, request),
          :ok <- require_registered_delivery_mode(config, client_map),
@@ -91,7 +95,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   # (`:client_jwks` callback, for a signed request), and the CIBA metadata map
   # (`:client_ciba_registration`).
   defp build_client_map(config, %Request{client: client, request_client_id: presented}) do
-    case Callback.invoke(Config.client_id_fun(config), [client], nil) || presented do
+    case Config.client_identifier(config, client, presented) do
       client_id when is_binary(client_id) and client_id != "" ->
         registration = Config.client_ciba_registration(config, client)
 
@@ -153,8 +157,11 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
     ]
 
     case CIBA.Request.validate(client_map, params, validate_opts) do
-      {:ok, request} -> {:ok, request}
-      {:error, reason} -> {:error, error(reason, "the backchannel authentication request is invalid")}
+      {:ok, request} ->
+        {:ok, request}
+
+      {:error, reason} ->
+        {:error, error(reason, "the backchannel authentication request is invalid")}
     end
   end
 
@@ -186,10 +193,10 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
       {:error, :replay} ->
         {:error, error(:invalid_request, "the signed authentication request was replayed")}
 
-      other ->
+      _other ->
         raise ArgumentError,
               "#{inspect(__MODULE__)}: :replay_check must return :ok or " <>
-                "{:error, :replay}; got #{inspect(other)}"
+                "{:error, :replay}"
     end
   end
 
@@ -215,11 +222,17 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
         {:ok, subject}
 
       {:error, reason}
-      when reason in [:unknown_user_id, :expired_login_hint_token, :missing_user_code, :invalid_user_code] ->
+      when reason in [
+             :unknown_user_id,
+             :expired_login_hint_token,
+             :missing_user_code,
+             :invalid_user_code
+           ] ->
         {:error, error(reason, "the end-user could not be authenticated for the request")}
 
-      _other ->
-        {:error, error(:unknown_user_id, "the request's hint did not resolve to a user")}
+      _unexpected ->
+        raise RuntimeError,
+              "AttestoPhoenix.Config :authenticate_ciba_user callback violated its return contract"
     end
   end
 
@@ -231,8 +244,11 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
            max_expires_in: Keyword.get(opts, :max_expires_in_seconds, 600),
            interval: Keyword.get(opts, :interval_seconds, 5)
          ) do
-      {:ok, issued} -> {:ok, issued}
-      {:error, _reason} -> {:error, error(:invalid_request, "could not issue the authentication request")}
+      {:ok, issued} ->
+        {:ok, issued}
+
+      {:error, _reason} ->
+        {:error, error(:invalid_request, "could not issue the authentication request")}
     end
   end
 
@@ -240,22 +256,52 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   # authentication device (push, in-app prompt, ...). Fire-and-forget so the
   # §7.3 acknowledgement is not delayed by it; a callback fault is logged and
   # swallowed (the client can still poll / be pinged once the user decides).
+  # The callback's only successful return is :ok; every other value is an
+  # integration fault and must not disappear as an apparent success.
   defp notify(config, auth_req_id, %CIBA.Request{} = request, subject) do
     case config.notify_ciba_user do
       nil ->
         :ok
 
       callback ->
-        Task.start(fn ->
-          try do
-            Callback.invoke(callback, [auth_req_id, request, subject])
-          rescue
-            e -> Logger.warning("notify_ciba_user failed: #{inspect(e)}")
-          end
-        end)
+        start_notify_task(config, callback, auth_req_id, request, subject)
 
         :ok
     end
+  end
+
+  defp start_notify_task(config, callback, auth_req_id, request, subject) do
+    Task.start(fn ->
+      invoke_notify_callback_in_config(config, callback, auth_req_id, request, subject)
+    end)
+  end
+
+  defp invoke_notify_callback_in_config(config, callback, auth_req_id, request, subject) do
+    Config.with_request_config(config, fn ->
+      invoke_notify_callback(callback, auth_req_id, request, subject)
+    end)
+  end
+
+  defp invoke_notify_callback(callback, auth_req_id, request, subject) do
+    notify_callback_result(callback, auth_req_id, request, subject)
+  rescue
+    _exception -> notify_ciba_user_fault()
+  catch
+    _kind, _reason -> notify_ciba_user_fault()
+  end
+
+  defp notify_callback_result(callback, auth_req_id, request, subject) do
+    case Callback.invoke(callback, [auth_req_id, request, subject]) do
+      :ok -> :ok
+      {:error, _reason} -> notify_ciba_user_fault()
+      _unexpected -> notify_ciba_user_fault()
+    end
+  end
+
+  defp notify_ciba_user_fault do
+    Logger.warning("AttestoPhoenix notify_ciba_user callback failed; authentication request remains pending")
+
+    :ok
   end
 
   defp acknowledgement(%{auth_req_id: auth_req_id, expires_in: expires_in, interval: interval}) do

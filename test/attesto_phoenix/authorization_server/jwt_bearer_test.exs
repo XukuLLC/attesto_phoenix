@@ -6,6 +6,8 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.AuthorizationServer.JwtBearer, as: JwtBearerGrant
   alias AttestoPhoenix.AuthorizationServer.JwtBearerTest
@@ -407,6 +409,17 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert {:error, :replay} = JwtBearerGrant.authorize(config, @cid, params)
     end
 
+    test "unexpected replay callback results fail loudly instead of impersonating a replay" do
+      for invalid <- [nil, :unexpected, {:error, :storage_unavailable}] do
+        config = config(replay_check: fn _key, _ttl -> invalid end)
+        params = %{"assertion" => assertion()}
+
+        assert_raise ArgumentError,
+                     ~r/:replay_check must return :ok or \{:error, :replay\}/,
+                     fn -> JwtBearerGrant.authorize(config, @cid, params) end
+      end
+    end
+
     test "the same jti from two trusted issuers does not collide" do
       second_idp = "https://second-idp.example"
 
@@ -613,18 +626,139 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       end
     end
 
+    defmodule FailingFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      @impl true
+      def fetch(_url, _opts), do: {:error, {:transport, "private_fetch_reason"}}
+    end
+
+    defmodule FaultCache do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Cache
+
+      def script(get_result, put_result \\ :ok) do
+        Process.put({__MODULE__, :get}, get_result)
+        Process.put({__MODULE__, :put}, put_result)
+      end
+
+      @impl true
+      def get(_url), do: respond(Process.get({__MODULE__, :get}, :miss))
+
+      @impl true
+      def put(_url, _metadata, _expires_at), do: respond(Process.get({__MODULE__, :put}, :ok))
+
+      defp respond({:raise, message}), do: raise(message)
+      defp respond(result), do: result
+    end
+
+    defp remote_jwks_config(cache, fetcher \\ __MODULE__.StubFetcher, uri \\ "https://idp.example/jwks.json") do
+      config(
+        jwt_bearer: [
+          issuers: %{@idp => [jwks_uri: uri, allowed_algs: ["RS256"]]},
+          jwks_fetcher: fetcher,
+          jwks_cache: cache
+        ]
+      )
+    end
+
     test "fetches and verifies against the issuer's jwks_uri" do
-      config =
-        config(
-          jwt_bearer: [
-            issuers: %{@idp => [jwks_uri: "https://idp.example/jwks.json", allowed_algs: ["RS256"]]},
-            jwks_fetcher: __MODULE__.StubFetcher,
-            jwks_cache: nil
-          ]
-        )
+      config = remote_jwks_config(nil)
 
       assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
       assert is_binary(response.access_token)
+    end
+
+    test "a fetch failure warning excludes the URI and callback reason" do
+      uri = "https://idp.example/jwks.json?api_key=private_uri_secret"
+      config = remote_jwks_config(nil, __MODULE__.FailingFetcher, uri)
+
+      log =
+        capture_log(fn ->
+          assert {:error, %OAuthError{error: :invalid_grant}, _} =
+                   issue(config, %{"assertion" => assertion()})
+        end)
+
+      assert log =~ "AttestoPhoenix JWT-bearer JWKS fetch failed; keys unavailable"
+      refute log =~ uri
+      refute log =~ "private_uri_secret"
+      refute log =~ "private_fetch_reason"
+    end
+
+    test "a cache read error is visible and falls back to freshly fetched keys" do
+      FaultCache.script({:error, :private_backend_detail})
+      config = remote_jwks_config(FaultCache)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+          assert is_binary(response.access_token)
+        end)
+
+      assert log =~ "AttestoPhoenix JWT-bearer JWKS cache failed; fetching fresh keys"
+      refute log =~ "private_backend_detail"
+      refute log =~ "https://idp.example/jwks.json"
+    end
+
+    test "a malformed cache hit is visible and cannot supply verification keys" do
+      FaultCache.script({:ok, [:private_unvalidated_value]})
+      config = remote_jwks_config(FaultCache)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+          assert is_binary(response.access_token)
+        end)
+
+      assert log =~ "AttestoPhoenix JWT-bearer JWKS cache failed; fetching fresh keys"
+      refute log =~ "private_unvalidated_value"
+    end
+
+    test "a cached map without a keys list is visible and cannot supply verification keys" do
+      FaultCache.script({:ok, %{"private" => "unvalidated"}})
+      config = remote_jwks_config(FaultCache)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+          assert is_binary(response.access_token)
+        end)
+
+      assert log =~ "AttestoPhoenix JWT-bearer JWKS cache failed; fetching fresh keys"
+      refute log =~ "private"
+      refute log =~ "unvalidated"
+    end
+
+    test "a cache write error is visible without rejecting freshly verified keys" do
+      FaultCache.script(:miss, {:error, :private_backend_detail})
+      config = remote_jwks_config(FaultCache)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+          assert is_binary(response.access_token)
+        end)
+
+      assert log =~ "AttestoPhoenix JWT-bearer JWKS cache failed; fresh keys were not cached"
+      refute log =~ "private_backend_detail"
+      refute log =~ "https://idp.example/jwks.json"
+    end
+
+    test "a cache exception is visible and degrades to an uncached fresh fetch" do
+      FaultCache.script({:raise, "private backend exception"}, {:raise, "private write exception"})
+      config = remote_jwks_config(FaultCache)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+          assert is_binary(response.access_token)
+        end)
+
+      assert log =~ "AttestoPhoenix JWT-bearer JWKS cache failed; fetching fresh keys"
+      assert log =~ "AttestoPhoenix JWT-bearer JWKS cache failed; fresh keys were not cached"
+      refute log =~ "private backend exception"
+      refute log =~ "private write exception"
     end
   end
 
@@ -640,9 +774,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     @impl true
     def get(_hash), do: :error
     @impl true
-    def consume(_hash, _opts), do: :error
-    @impl true
-    def remember_successor(_hash, _successor, _opts), do: :ok
+    def rotate(_hash, _child, _successor, _opts), do: :error
     @impl true
     def revoke_family(_family_id), do: :ok
   end

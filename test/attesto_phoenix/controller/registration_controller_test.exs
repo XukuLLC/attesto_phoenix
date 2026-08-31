@@ -733,6 +733,19 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert invalid.status == 401
       assert body(invalid)["error"] == "invalid_token"
     end
+
+    test "an unexpected client-store result is a sanitized integration failure" do
+      config =
+        config(
+          load_client: fn "client-123" -> {:error, :store_unavailable} end,
+          client_registration_access_token_hash: fn _client -> flunk("no client may be trusted") end,
+          unregister_client: fn _client -> flunk("no client may be deleted") end
+        )
+
+      assert_raise RuntimeError, ":load_client callback violated its return contract", fn ->
+        delete_register(config, "client-123", "registration-token")
+      end
+    end
   end
 
   describe "event emission (RFC 7591)" do
@@ -805,17 +818,107 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert body(conn)["error"] == "invalid_client_metadata"
     end
 
-    test "rejects a token_endpoint_auth_method outside the supported set" do
-      # The default supported methods are client_secret_basic and none;
-      # client_secret_post is not offered.
+    test "an explicitly empty grant catalog does not widen to the default catalog" do
+      conn =
+        post_register(
+          config(grant_types_supported: []),
+          %{"grant_types" => ["client_credentials"]}
+        )
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
+
+    test "default catalogs match discovery and accept implemented grants and authentication" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["urn:ietf:params:oauth:grant-type:token-exchange"],
+          "token_endpoint_auth_method" => "client_secret_post"
+        })
+
+      assert conn.status == 201
+      assert body(conn)["grant_types"] == ["urn:ietf:params:oauth:grant-type:token-exchange"]
+      assert body(conn)["token_endpoint_auth_method"] == "client_secret_post"
+    end
+
+    test "an explicitly empty auth-method catalog does not restore default methods" do
+      conn =
+        post_register(
+          config(token_endpoint_auth_methods_supported: []),
+          %{
+            "grant_types" => ["client_credentials"],
+            "token_endpoint_auth_method" => "client_secret_basic"
+          }
+        )
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
+
+    test "absent authentication method is rejected when its RFC default is not supported" do
+      conn =
+        post_register(
+          config(token_endpoint_auth_methods_supported: ["private_key_jwt"]),
+          %{"grant_types" => ["client_credentials"]}
+        )
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+      assert body(conn)["error_description"] =~ "default token_endpoint_auth_method"
+    end
+
+    test "explicit null authentication method is malformed rather than absent" do
       conn =
         post_register(config([]), %{
           "grant_types" => ["client_credentials"],
-          "token_endpoint_auth_method" => "client_secret_post"
+          "token_endpoint_auth_method" => nil
         })
 
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client_metadata"
+    end
+  end
+
+  describe "request-scoped configuration" do
+    test "uses the validated config installed on the request" do
+      test_pid = self()
+
+      request_config =
+        config(
+          register_client: fn attrs ->
+            send(test_pid, :request_config_used)
+            {:ok, attrs}
+          end
+        )
+
+      conn = post_register(request_config, %{"grant_types" => ["client_credentials"]})
+
+      assert conn.status == 201
+      assert_receive :request_config_used
+    end
+
+    test "fails closed when the request config is absent" do
+      conn =
+        :post
+        |> conn(@endpoint_path, %{})
+        |> Map.put(:scheme, :https)
+        |> put_req_header("content-type", "application/json")
+
+      assert_raise ArgumentError, ~r/conn\.private\[:attesto_phoenix_config\]/, fn ->
+        RegistrationController.create(conn, %{})
+      end
+    end
+
+    test "fails closed when the request config is malformed" do
+      conn =
+        :post
+        |> conn(@endpoint_path, %{})
+        |> Map.put(:scheme, :https)
+        |> put_private(:attesto_phoenix_config, :malformed)
+
+      assert_raise ArgumentError, ~r/conn\.private\[:attesto_phoenix_config\]/, fn ->
+        RegistrationController.create(conn, %{})
+      end
     end
   end
 end

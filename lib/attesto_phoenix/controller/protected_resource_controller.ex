@@ -62,16 +62,12 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
   reject.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn, only: [put_resp_header: 3]
 
   alias Attesto.ProtectedResourceMetadata
   alias AttestoPhoenix.Config
-
-  # The router pipeline installs the AttestoPhoenix.Config here - the same
-  # private key the discovery, token, and revocation endpoints read.
-  @config_key :attesto_phoenix_config
 
   # The derived Attesto.Config (the protocol configuration the core metadata
   # builder reads) is installed here, the same key DiscoveryController reads.
@@ -85,13 +81,13 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
   @doc """
   Render the RFC 9728 protected-resource metadata document as JSON.
 
-  Fails closed with `RuntimeError` when either required configuration value is
+  Fails closed with `ArgumentError` when either required configuration value is
   absent from `conn.private`, since serving a document that omits required
   members would misdirect clients.
   """
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = fetch_config!(conn)
+    config = Config.resolve!(conn)
     protocol_config = fetch_protocol_config!(conn)
 
     metadata = ProtectedResourceMetadata.metadata(protocol_config, metadata_opts(config))
@@ -160,18 +156,6 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
   # Fail closed: a missing config is a wiring error, not a runtime condition to
   # paper over. Raising surfaces the misconfiguration instead of emitting a
   # document that omits required members.
-  @spec fetch_config!(Plug.Conn.t()) :: Config.t()
-  defp fetch_config!(conn) do
-    case conn.private do
-      %{@config_key => %Config{} = config} ->
-        config
-
-      _ ->
-        raise "#{inspect(__MODULE__)}: no %AttestoPhoenix.Config{} found in " <>
-                "conn.private[#{inspect(@config_key)}]; wire the host pipeline that assigns it"
-    end
-  end
-
   @spec fetch_protocol_config!(Plug.Conn.t()) :: Attesto.Config.t()
   defp fetch_protocol_config!(conn) do
     case conn.private do

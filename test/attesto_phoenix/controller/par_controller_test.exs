@@ -1,10 +1,12 @@
 defmodule AttestoPhoenix.Controller.PARControllerTest do
   use ExUnit.Case, async: false
 
-  import Plug.Test
+  import Plug.Conn, only: [put_private: 3]
+  import Plug.Test, only: []
 
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.ClientIdMetadata.Cache.ETS, as: CimdCache
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.PARController
   alias AttestoPhoenix.Store.PAR.ETS
 
@@ -787,6 +789,11 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
   defp https_post(params) do
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
     %{base | scheme: :https, host: "issuer.example", port: 443}
+  end
+
+  defp conn(method, path, params) do
+    Plug.Test.conn(method, path, params)
+    |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
   end
 
   defp dpop_proof do

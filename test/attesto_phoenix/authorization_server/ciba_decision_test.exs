@@ -6,7 +6,10 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecisionTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Attesto.CIBA
+  alias Attesto.CIBAStore.ETS
   alias Attesto.CIBAStore.ETS, as: Store
   alias AttestoPhoenix.AuthorizationServer.CIBADecision
   alias AttestoPhoenix.CIBAPing
@@ -31,6 +34,88 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecisionTest do
     def post(endpoint, token, auth_req_id) do
       send(Application.fetch_env!(:attesto_phoenix, :test_ping_pid), {:ping, endpoint, token, auth_req_id})
       :ok
+    end
+  end
+
+  defmodule ConfigPing do
+    @moduledoc false
+    @behaviour AttestoPhoenix.CIBAPing
+
+    @impl true
+    def post(_endpoint, _token, auth_req_id) do
+      pid = Application.fetch_env!(:attesto_phoenix, :test_ping_pid)
+      send(pid, {:ping_config, auth_req_id, AttestoPhoenix.Config.request_config()})
+      :ok
+    end
+  end
+
+  defmodule FailingPing do
+    @moduledoc false
+    @behaviour AttestoPhoenix.CIBAPing
+
+    @impl true
+    def post(_endpoint, _token, auth_req_id) do
+      pid = Application.fetch_env!(:attesto_phoenix, :test_ping_pid)
+      send(pid, {:ping_failed, self(), auth_req_id})
+
+      receive do
+        :continue -> {:error, {:transport, "CIBA-PING-REASON-SENTINEL"}}
+      end
+    end
+  end
+
+  defmodule FaultyPing do
+    @moduledoc false
+    @behaviour AttestoPhoenix.CIBAPing
+
+    @impl true
+    def post(_endpoint, token, auth_req_id) do
+      pid = Application.fetch_env!(:attesto_phoenix, :test_ping_pid)
+      send(pid, {:ping_fault_ready, self(), auth_req_id})
+
+      receive do
+        {:fault, :raise} -> raise RuntimeError, "CIBA-PING-EXCEPTION-#{token}-#{auth_req_id}"
+        {:fault, :throw} -> throw({:ciba_ping_throw, token, auth_req_id})
+        {:fault, :exit} -> exit({:ciba_ping_exit, token, auth_req_id})
+        {:fault, :malformed} -> {:ciba_ping_malformed, token, auth_req_id}
+      end
+    end
+  end
+
+  defmodule ConfigAwareStore do
+    @moduledoc false
+    @behaviour Attesto.CIBAStore
+
+    @impl true
+    defdelegate put(record), to: ETS
+
+    @impl true
+    defdelegate lookup(hash), to: ETS
+
+    @impl true
+    defdelegate poll(hash, opts), to: ETS
+
+    @impl true
+    defdelegate consume(hash, opts), to: ETS
+
+    @impl true
+    def approve(hash, approval, opts) do
+      send(
+        Application.fetch_env!(:attesto_phoenix, :test_ping_pid),
+        {:decision_config, :approve, AttestoPhoenix.Config.request_config()}
+      )
+
+      ETS.approve(hash, approval, opts)
+    end
+
+    @impl true
+    def deny(hash, opts) do
+      send(
+        Application.fetch_env!(:attesto_phoenix, :test_ping_pid),
+        {:decision_config, :deny, AttestoPhoenix.Config.request_config()}
+      )
+
+      ETS.deny(hash, opts)
     end
   end
 
@@ -89,6 +174,178 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecisionTest do
     assert {:ok, _decision} = CIBADecision.deny(config(), auth_req_id)
 
     assert_receive {:ping, @endpoint, _token, ^auth_req_id}, 1_000
+  end
+
+  test "async ping delivery receives the request-scoped config" do
+    auth_req_id = issue(:ping, "cnt-abcdefghijklmnopqrstuv")
+    config = config(schema_prefix: "tenant_ping", ciba_ping_http_client: ConfigPing)
+
+    assert {:ok, _decision} = CIBADecision.approve(config, auth_req_id, %{subject: "user:alice"})
+    assert_receive {:ping_config, ^auth_req_id, ^config}, 1_000
+  end
+
+  test "an unbound process uses the passed config for approval and restores it" do
+    parent = self()
+    auth_req_id = issue(:poll, nil)
+    config = config(ciba_store: ConfigAwareStore)
+
+    task =
+      Task.async(fn ->
+        result = CIBADecision.approve(config, auth_req_id, %{subject: "user:alice"})
+        send(parent, {:decision_config_restored, Config.request_config()})
+        result
+      end)
+
+    assert {:ok, _decision} = Task.await(task)
+    assert_receive {:decision_config, :approve, ^config}, 1_000
+    assert_receive {:decision_config_restored, nil}, 1_000
+  end
+
+  test "an unbound process uses the passed config for denial and restores it" do
+    parent = self()
+    auth_req_id = issue(:poll, nil)
+    config = config(ciba_store: ConfigAwareStore)
+
+    task =
+      Task.async(fn ->
+        result = CIBADecision.deny(config, auth_req_id)
+        send(parent, {:decision_config_restored, Config.request_config()})
+        result
+      end)
+
+    assert {:ok, _decision} = Task.await(task)
+    assert_receive {:decision_config, :deny, ^config}, 1_000
+    assert_receive {:decision_config_restored, nil}, 1_000
+  end
+
+  test "an unbound process resolves a ping endpoint under the passed config" do
+    parent = self()
+    auth_req_id = issue(:ping, "cnt-abcdefghijklmnopqrstuv")
+
+    config =
+      config(
+        load_client: fn "cli-1" ->
+          send(parent, {:lookup_config, Config.request_config()})
+          {:ok, %{id: "cli-1", ciba: %{client_notification_endpoint: @endpoint}}}
+        end
+      )
+
+    task = Task.async(fn -> CIBADecision.approve(config, auth_req_id, %{subject: "user:alice"}) end)
+
+    assert {:ok, _decision} = Task.await(task)
+    assert_receive {:lookup_config, ^config}, 1_000
+    assert_receive {:ping, @endpoint, "cnt-abcdefghijklmnopqrstuv", ^auth_req_id}, 1_000
+  end
+
+  test "a client-store fault is logged without changing the committed decision or sending a ping" do
+    notification_token = "cnt-abcdefghijklmnopqrstuv"
+    auth_req_id = issue(:ping, notification_token)
+    config = config(load_client: fn _client_id -> {:error, :store_unavailable} end)
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{delivery_mode: :ping, client_id: "cli-1"}} =
+                 CIBADecision.approve(config, auth_req_id, %{subject: "user:alice"})
+      end)
+
+    assert log =~ "CIBA ping: client lookup failed; notification skipped"
+    refute log =~ "store_unavailable"
+    refute log =~ notification_token
+    refute_receive {:ping, _endpoint, _token, ^auth_req_id}, 200
+
+    assert {:ok, %{status: :approved}} = CIBA.lookup(Store, auth_req_id)
+  end
+
+  test "ping delivery warnings never include the arbitrary transport reason" do
+    auth_req_id = issue(:ping, "cnt-abcdefghijklmnopqrstuv")
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{client_id: "cli-1"}} =
+                 CIBADecision.approve(
+                   config(ciba_ping_http_client: FailingPing),
+                   auth_req_id,
+                   %{subject: "user:alice"}
+                 )
+
+        assert_receive {:ping_failed, pid, ^auth_req_id}, 1_000
+        monitor = Process.monitor(pid)
+        send(pid, :continue)
+        assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 1_000
+      end)
+
+    assert log =~ "CIBA ping delivery failed; notification skipped"
+    refute log =~ "CIBA-PING-REASON-SENTINEL"
+  end
+
+  for fault <- [:raise, :throw, :exit, :malformed] do
+    test "ping #{fault} is reduced to one fixed warning without leaking values" do
+      token = "CIBA-PING-TOKEN-SENTINEL-#{unquote(fault)}"
+      auth_req_id = issue(:ping, token)
+
+      log =
+        capture_log(fn ->
+          assert {:ok, %{client_id: "cli-1"}} =
+                   CIBADecision.approve(
+                     config(ciba_ping_http_client: FaultyPing),
+                     auth_req_id,
+                     %{subject: "user:alice"}
+                   )
+
+          assert_receive {:ping_fault_ready, pid, ^auth_req_id}, 1_000
+          monitor = Process.monitor(pid)
+          send(pid, {:fault, unquote(fault)})
+          assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 1_000
+        end)
+
+      assert log =~ "CIBA ping delivery failed; notification skipped"
+      refute log =~ token
+      refute log =~ auth_req_id
+      assert {:ok, %{status: :approved}} = CIBA.lookup(Store, auth_req_id)
+    end
+  end
+
+  test "registration callback exceptions do not change the committed approval" do
+    registration_secret = "CIBA-REGISTRATION-EXCEPTION-SENTINEL"
+    auth_req_id = issue(:ping, "cnt-registration-exception")
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{client_id: "cli-1"}} =
+                 CIBADecision.approve(
+                   config(
+                     client_ciba_registration: fn _client ->
+                       raise RuntimeError, registration_secret
+                     end
+                   ),
+                   auth_req_id,
+                   %{subject: "user:alice"}
+                 )
+      end)
+
+    assert log =~ "CIBA ping registration failed; notification skipped"
+    refute log =~ registration_secret
+    refute_receive {:ping, _endpoint, _token, ^auth_req_id}, 200
+    assert {:ok, %{status: :approved}} = CIBA.lookup(Store, auth_req_id)
+  end
+
+  test "malformed registration callback results do not change the committed denial" do
+    registration_secret = "CIBA-REGISTRATION-MALFORMED-SENTINEL"
+    auth_req_id = issue(:ping, "cnt-registration-malformed")
+
+    log =
+      capture_log(fn ->
+        assert {:ok, %{client_id: "cli-1"}} =
+                 CIBADecision.deny(
+                   config(client_ciba_registration: fn _client -> {:malformed, registration_secret} end),
+                   auth_req_id
+                 )
+      end)
+
+    assert log =~ "CIBA ping registration failed; notification skipped"
+    refute log =~ registration_secret
+    refute_receive {:ping, _endpoint, _token, ^auth_req_id}, 200
+    assert {:ok, %{status: :denied}} = CIBA.lookup(Store, auth_req_id)
   end
 
   test "approve on a poll request sends no notification" do

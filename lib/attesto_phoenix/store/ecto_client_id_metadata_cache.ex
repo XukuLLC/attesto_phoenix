@@ -59,6 +59,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec get(String.t()) :: {:ok, map()} | :miss
   def get(url) when is_binary(url) do
+    prefix = Config.table_prefix()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -66,7 +67,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
         where: c.url == ^url and c.expires_at > ^now,
         select: c.metadata
 
-    case repo().one(query) do
+    case repo().one(query, prefix: prefix) do
       nil -> :miss
       metadata -> {:ok, metadata}
     end
@@ -84,16 +85,18 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec put(String.t(), map(), DateTime.t()) :: :ok
   def put(url, metadata, %DateTime{} = expires_at) when is_binary(url) and is_map(metadata) do
+    prefix = Config.table_prefix()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.truncate(expires_at, :second)
 
     entry = %{url: url, metadata: metadata, expires_at: expires_at, inserted_at: now}
 
     %ClientIdMetadata{}
-    |> ClientIdMetadata.put_changeset(entry)
+    |> ClientIdMetadata.put_changeset(entry, prefix: prefix)
     |> repo().insert!(
       on_conflict: [set: [metadata: metadata, expires_at: expires_at]],
-      conflict_target: :url
+      conflict_target: :url,
+      prefix: prefix
     )
 
     :ok
@@ -111,7 +114,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete(String.t()) :: :ok
   def delete(url) when is_binary(url) do
-    repo().delete_all(from(c in ClientIdMetadata, where: c.url == ^url))
+    repo().delete_all(from(c in ClientIdMetadata, where: c.url == ^url), prefix: Config.table_prefix())
     :ok
   end
 
@@ -121,7 +124,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete_all() :: :ok
   def delete_all do
-    repo().delete_all(ClientIdMetadata)
+    repo().delete_all(ClientIdMetadata, prefix: Config.table_prefix())
     :ok
   end
 

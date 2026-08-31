@@ -322,6 +322,35 @@ defmodule AttestoPhoenix.RouterTest do
     end
   end
 
+  defmodule CredentialLoggingRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(
+        credential_issuance: true,
+        presentation: true,
+        status_list: true,
+        federation: true
+      )
+    end
+  end
+
+  defmodule ClassedCredentialLoggingRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    scope "/" do
+      attesto_routes(
+        route_pipelines: [metadata: [], interactive: [], protocol: []],
+        credential_issuance: true,
+        presentation: true,
+        status_list: true,
+        federation: true
+      )
+    end
+  end
+
   defmodule PrefixedPresentationRouter do
     use Phoenix.Router
     use AttestoPhoenix.Router
@@ -737,64 +766,73 @@ defmodule AttestoPhoenix.RouterTest do
              end)
     end
 
-    test "complete default route table and pipeline data remain unchanged" do
-      metadata = %{log: :debug}
+    test "complete default route table keeps public metadata logging and suppresses credential parameters" do
+      public_metadata = %{log: :debug}
+      protected_metadata = %{log: false}
 
       assert route_signature(DefaultRouter) == [
-               {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery", metadata, []},
+               {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery",
+                public_metadata, []},
                {:get, "/.well-known/openid-configuration", OpenIDConfigurationController, :show,
-                "open_id_configuration", metadata, []},
-               {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", metadata, []},
+                "open_id_configuration", public_metadata, []},
+               {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", public_metadata, []},
                {:get, "/.well-known/oauth-protected-resource", ProtectedResourceController, :show, "protected_resource",
-                metadata, []},
-               {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, []},
-               {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, []},
-               {:post, "/oauth/token", TokenController, :create, "token", metadata, []},
-               {:post, "/oauth/par", PARController, :create, "par", metadata, []},
-               {:post, "/oauth/revoke", RevocationController, :create, "revocation", metadata, []},
-               {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", metadata, []},
-               {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, []},
-               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, []}
+                public_metadata, []},
+               {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata, []},
+               {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata, []},
+               {:post, "/oauth/token", TokenController, :create, "token", protected_metadata, []},
+               {:post, "/oauth/par", PARController, :create, "par", protected_metadata, []},
+               {:post, "/oauth/revoke", RevocationController, :create, "revocation", protected_metadata, []},
+               {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", protected_metadata, []},
+               {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata, []},
+               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata, []}
              ]
     end
 
-    test "complete legacy all-feature route table remains unchanged" do
-      metadata = %{log: :debug}
+    test "complete legacy all-feature route table suppresses credential parameters" do
+      public_metadata = %{log: :debug}
+      protected_metadata = %{log: false}
 
       assert route_signature(LegacyAllFeaturesRouter) == [
-               {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery", metadata,
-                [:oauth_server]},
+               {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery",
+                public_metadata, [:oauth_server]},
                {:get, "/.well-known/openid-configuration", OpenIDConfigurationController, :show,
-                "open_id_configuration", metadata, [:oauth_server]},
-               {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", metadata, [:oauth_server]},
+                "open_id_configuration", public_metadata, [:oauth_server]},
+               {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", public_metadata, [:oauth_server]},
                {:get, "/.well-known/oauth-protected-resource", ProtectedResourceController, :show, "protected_resource",
-                metadata, [:oauth_server]},
-               {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, [:oauth_server]},
-               {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", metadata, [:oauth_server]},
-               {:post, "/oauth/token", TokenController, :create, "token", metadata, [:oauth_server]},
-               {:post, "/oauth/par", PARController, :create, "par", metadata, [:oauth_server]},
-               {:post, "/oauth/revoke", RevocationController, :create, "revocation", metadata, [:oauth_server]},
-               {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", metadata,
+                public_metadata, [:oauth_server]},
+               {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata,
                 [:oauth_server]},
-               {:post, "/oauth/register", RegistrationController, :create, "registration", metadata, [:oauth_server]},
-               {:delete, "/oauth/register/:client_id", RegistrationController, :delete, "registration", metadata,
+               {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata,
                 [:oauth_server]},
+               {:post, "/oauth/token", TokenController, :create, "token", protected_metadata, [:oauth_server]},
+               {:post, "/oauth/par", PARController, :create, "par", protected_metadata, [:oauth_server]},
+               {:post, "/oauth/revoke", RevocationController, :create, "revocation", protected_metadata,
+                [:oauth_server]},
+               {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", protected_metadata,
+                [:oauth_server]},
+               {:post, "/oauth/register", RegistrationController, :create, "registration", protected_metadata,
+                [:oauth_server]},
+               {:delete, "/oauth/register/:client_id", RegistrationController, :delete, "registration",
+                protected_metadata, [:oauth_server]},
                {:post, "/oauth/device_authorization", DeviceAuthorizationController, :create, "device_authorization",
-                metadata, [:oauth_server]},
+                protected_metadata, [:oauth_server]},
                {:get, "/oauth/device_verification", DeviceVerificationController, :verify, "device_verification",
-                metadata, [:oauth_server]},
+                protected_metadata, [:oauth_server]},
                {:post, "/oauth/device_verification", DeviceVerificationController, :verify, "device_verification",
-                metadata, [:oauth_server]},
+                protected_metadata, [:oauth_server]},
                {:post, "/oauth/bc-authorize", BackchannelAuthenticationController, :create,
-                "backchannel_authentication", metadata, [:oauth_server]},
-               {:get, "/oauth/end_session", EndSessionController, :end_session, "end_session", metadata,
+                "backchannel_authentication", protected_metadata, [:oauth_server]},
+               {:get, "/oauth/end_session", EndSessionController, :end_session, "end_session", protected_metadata,
                 [:oauth_server]},
-               {:post, "/oauth/end_session", EndSessionController, :end_session, "end_session", metadata,
+               {:post, "/oauth/end_session", EndSessionController, :end_session, "end_session", protected_metadata,
                 [:oauth_server]},
-               {:get, "/oauth/check_session", CheckSessionController, :show, "check_session", metadata,
+               {:get, "/oauth/check_session", CheckSessionController, :show, "check_session", protected_metadata,
                 [:oauth_server]},
-               {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, [:oauth_server]},
-               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", metadata, [:oauth_server]}
+               {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata,
+                [:oauth_server]},
+               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata,
+                [:oauth_server]}
              ]
     end
 
@@ -863,6 +901,33 @@ defmodule AttestoPhoenix.RouterTest do
       classed = Enum.map(route_signature(ClassPipelineRouter), &Tuple.delete_at(&1, 6))
 
       assert classed == legacy
+    end
+
+    test "credential and presentation routes suppress Phoenix parameter logging in both expansion modes" do
+      sensitive_routes = [
+        {:post, "/oauth/credential"},
+        {:get, "/oauth/credential_offer/:id"},
+        {:post, "/oauth/deferred_credential"},
+        {:get, "/oauth/presentation_request/:id"},
+        {:post, "/oauth/presentation_response"},
+        {:get, "/oauth/statuslist/:id"}
+      ]
+
+      for router <- [CredentialLoggingRouter, ClassedCredentialLoggingRouter],
+          {method, path} <- sensitive_routes do
+        route = find_route(router, method, path)
+        assert route.metadata.log == false
+      end
+
+      for router <- [CredentialLoggingRouter, ClassedCredentialLoggingRouter],
+          path <- [
+            "/.well-known/openid-credential-issuer",
+            "/.well-known/jwt-vc-issuer",
+            "/.well-known/openid-federation"
+          ] do
+        route = find_route(router, :get, path)
+        assert route.metadata.log == :debug
+      end
     end
 
     test "prefix and protected-resource root options keep working with overrides" do

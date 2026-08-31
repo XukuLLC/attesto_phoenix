@@ -40,7 +40,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   alias Attesto.Plug.Authenticate, as: CoreAuthenticate
   alias Attesto.Plug.OAuthError
-  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, Event, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, Event, ProtectedResource, RequestContext}
 
   @claims_key :attesto_claims
   @principal_key :attesto_principal
@@ -69,7 +69,12 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   @impl Plug
   def call(conn, opts) do
-    config = resolve_config(opts)
+    config = resolve_config(conn, opts)
+
+    Config.with_request_config(config, fn -> authenticate_request(conn, opts, config) end)
+  end
+
+  defp authenticate_request(conn, opts, config) do
     claims_key = Keyword.get(opts, :claims_key, @claims_key)
     resource_metadata = Config.resource_metadata_url(config, conn, opts)
 
@@ -98,10 +103,18 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     end
   end
 
+  defp resolve_config(conn, opts) do
+    if Map.has_key?(conn.private, :attesto_phoenix_config) do
+      Config.resolve!(conn)
+    else
+      resolve_config_without_request(conn, opts)
+    end
+  end
+
   defp reject_revoked_or_assign_principal(conn, config, claims_key, opts, resource_metadata) do
     claims = conn.assigns[claims_key]
 
-    if access_token_revoked?(config, claims) do
+    if ProtectedResource.access_token_revoked?(config, claims) do
       emit_denied(config, conn, :invalid_token)
 
       OAuthError.unauthorized(
@@ -114,12 +127,6 @@ defmodule AttestoPhoenix.Plug.Authenticate do
       assign_principal(conn, config, claims_key, opts, resource_metadata)
     end
   end
-
-  defp access_token_revoked?(%Config{code_store: store}, %{"jti" => jti}) when is_atom(store) and is_binary(jti) do
-    function_exported?(store, :access_token_revoked?, 1) and store.access_token_revoked?(jti)
-  end
-
-  defp access_token_revoked?(_config, _claims), do: false
 
   defp assign_principal(conn, config, claims_key, opts, resource_metadata) do
     claims = conn.assigns[claims_key]
@@ -135,7 +142,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
         |> assign(context_key, context(claims, principal))
         |> tap(fn _conn -> emit_succeeded(config, claims) end)
 
-      {:error, _reason} ->
+      {:error, :not_found} ->
         emit_denied(config, conn, :invalid_token)
 
         OAuthError.unauthorized(
@@ -144,6 +151,9 @@ defmodule AttestoPhoenix.Plug.Authenticate do
           "invalid_token",
           error_opts(config, opts, resource_metadata, [])
         )
+
+      _invalid ->
+        raise RuntimeError, ":load_principal callback violated its return contract"
     end
   end
 
@@ -215,7 +225,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     }
   end
 
-  defp resolve_config(opts) do
+  defp resolve_config_without_request(_conn, opts) do
     case Keyword.get(opts, :config) do
       %Config{} = config ->
         config

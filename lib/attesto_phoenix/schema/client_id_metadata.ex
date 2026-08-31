@@ -68,9 +68,10 @@ defmodule AttestoPhoenix.Schema.ClientIdMetadata do
   `:expires_at` is a hard validation error rather than a silently unlimited
   cache entry.
   """
-  @spec put_changeset(t() | %__MODULE__{}, map()) :: Ecto.Changeset.t()
-  def put_changeset(entry \\ %__MODULE__{}, attrs) do
+  @spec put_changeset(t() | %__MODULE__{}, map(), keyword()) :: Ecto.Changeset.t()
+  def put_changeset(entry \\ %__MODULE__{}, attrs, opts \\ []) when is_list(opts) do
     entry
+    |> Ecto.put_meta(prefix: Keyword.get(opts, :prefix))
     |> cast(attrs, @insert_fields)
     |> validate_required(@insert_fields)
   end

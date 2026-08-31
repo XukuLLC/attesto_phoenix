@@ -17,14 +17,14 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   A device code travels on a pollable channel with no PKCE backstop and no
   redirect to bind, so a public (`:none`) client's resulting token would be a
   freely-replayable bearer token. Mirroring the public-client refresh-token rule
-  (RFC 9449 §8), a public client MUST present a DPoP proof at this endpoint; the
+  (RFC 9449 §5), a public client MUST present a DPoP proof at this endpoint; the
   proof's key is pre-bound to the device code and the token endpoint requires the
   matching proof at redemption. Confidential clients may opt out.
   """
 
   alias Attesto.{DeviceCode, ResourceIndicator, Scope}
   alias Attesto.DPoP
-  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, OAuthError}
+  alias AttestoPhoenix.{Config, DPoP.Adapter, OAuthError}
 
   @error_invalid_request :invalid_request
   @error_invalid_scope :invalid_scope
@@ -57,6 +57,10 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   """
   @spec request(Config.t(), Request.t()) :: {:ok, response()} | {:error, OAuthError.t()}
   def request(%Config{} = config, %Request{} = request) do
+    Config.with_request_config(config, fn -> do_request(config, request) end)
+  end
+
+  defp do_request(%Config{} = config, %Request{} = request) do
     %{client: client, params: params} = request
 
     with {:ok, store} <- require_store(config),
@@ -74,7 +78,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   # to the client id the request authenticated with (so a host that does not wire
   # a `:client_id` callback still works). Absent both, the request is malformed.
   defp resolve_client_id(config, %Request{client: client, request_client_id: presented}) do
-    case Callback.invoke(Config.client_id_fun(config), [client], nil) || presented do
+    case Config.client_identifier(config, client, presented) do
       id when is_binary(id) and id != "" -> {:ok, id}
       _ -> {:error, error(@error_invalid_client, "the client could not be identified")}
     end

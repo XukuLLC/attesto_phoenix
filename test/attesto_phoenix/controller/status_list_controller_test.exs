@@ -2,11 +2,13 @@ defmodule AttestoPhoenix.Controller.StatusListControllerTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
+  import Plug.Conn, only: [put_private: 3]
   import Plug.Test
 
   alias Attesto.{Key, StatusList, StatusListStore}
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.StatusListController
+  alias AttestoPhoenix.Plug.PutConfig
 
   @issuer "https://issuer.example"
   @oauth_prefix "/oauth"
@@ -36,8 +38,12 @@ defmodule AttestoPhoenix.Controller.StatusListControllerTest do
     use Phoenix.Router
     use AttestoPhoenix.Router
 
+    pipeline :attesto_phoenix_config do
+      plug PutConfig, otp_app: :attesto_phoenix
+    end
+
     scope "/" do
-      attesto_routes(status_list: true)
+      attesto_routes(pipeline: :attesto_phoenix_config, status_list: true)
     end
   end
 
@@ -55,6 +61,7 @@ defmodule AttestoPhoenix.Controller.StatusListControllerTest do
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
+      principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")],
       require_https: false,
       status_list_store: StatusListStore.ETS
     )
@@ -113,7 +120,10 @@ defmodule AttestoPhoenix.Controller.StatusListControllerTest do
     uri = @issuer <> "/wallet/oauth/statuslist/" <> @list_id
     {:ok, 0} = StatusListStore.ETS.allocate(uri)
 
-    response = StatusListController.show(conn(:get, "/wallet/oauth/statuslist/" <> @list_id), %{"id" => @list_id})
+    response =
+      conn(:get, "/wallet/oauth/statuslist/" <> @list_id)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+      |> StatusListController.show(%{"id" => @list_id})
 
     assert response.status == 200
 

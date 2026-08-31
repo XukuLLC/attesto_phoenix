@@ -9,7 +9,9 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStoreTest do
   which `AttestoPhoenix.DataCase` points at the sandboxed test repo.
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
+
+  import ExUnit.CaptureLog
 
   alias AttestoPhoenix.ConsentGrant
   alias AttestoPhoenix.Schema.ConsentGrant, as: Grant
@@ -187,6 +189,46 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStoreTest do
       |> TestRepo.insert!()
 
       assert {:error, :binding_mismatch} = Store.consume(token, cg_binding(client_id: "client-2"))
+    end
+  end
+
+  describe "secret-query observability" do
+    test "successful mint and consume do not log or emit a query for the token" do
+      log =
+        capture_log([level: :debug], fn ->
+          {:ok, token} = Store.mint(cg_binding(), @ttl)
+          Process.put({__MODULE__, :captured_token}, token)
+          assert :ok = Store.consume(token, cg_binding())
+        end)
+
+      token = Process.delete({__MODULE__, :captured_token})
+      refute log =~ token
+    end
+
+    test "a failed consume disambiguation does not log or emit the token" do
+      {:ok, token} = Store.mint(cg_binding(), @ttl)
+
+      log =
+        capture_log([level: :debug], fn ->
+          assert {:error, :binding_mismatch} =
+                   Store.consume(token, cg_binding(client_id: "different-client"))
+        end)
+
+      refute log =~ token
+    end
+
+    test "query telemetry remains enabled for safe work but is absent for token operations" do
+      capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+      on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+      {_id, ref} = capture
+
+      assert is_integer(TestRepo.aggregate(Grant, :count, :token))
+      assert AttestoPhoenix.TestTelemetryCapture.collect(ref) != []
+
+      {:ok, token} = Store.mint(cg_binding(), @ttl)
+      assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+      assert {:error, :binding_mismatch} = Store.consume(token, cg_binding(client_id: "different-client"))
+      assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
     end
   end
 end

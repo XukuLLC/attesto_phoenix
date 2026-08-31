@@ -66,9 +66,10 @@ defmodule AttestoPhoenix.Schema.ConsentGrant do
   `unique_constraint/3` on the primary key surfaces a duplicate `token` as a
   changeset error rather than a raised exception.
   """
-  @spec changeset(t() | %__MODULE__{}, map()) :: Ecto.Changeset.t()
-  def changeset(grant \\ %__MODULE__{}, attrs) do
+  @spec changeset(t() | %__MODULE__{}, map(), keyword()) :: Ecto.Changeset.t()
+  def changeset(grant \\ %__MODULE__{}, attrs, opts \\ []) when is_list(opts) do
     grant
+    |> Ecto.put_meta(prefix: Keyword.get(opts, :prefix))
     |> cast(attrs, @insert_fields)
     |> validate_required(@required_fields)
     |> unique_constraint(:token, name: :attesto_consent_grants_pkey)

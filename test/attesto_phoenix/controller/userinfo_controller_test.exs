@@ -15,9 +15,10 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
   use ExUnit.Case, async: false
 
   import Plug.Conn
-  import Plug.Test
+  import Plug.Test, only: []
 
   alias Attesto.Token
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.UserinfoController
 
   @endpoint_path "/oauth/userinfo"
@@ -498,6 +499,13 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     |> conn(@endpoint_path)
     |> maybe_authorization(token)
     |> UserinfoController.userinfo(%{})
+  end
+
+  defp conn(method, path), do: conn(method, path, %{})
+
+  defp conn(method, path, params) do
+    Plug.Test.conn(method, path, params)
+    |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
   end
 
   defp peek_claims(token) do

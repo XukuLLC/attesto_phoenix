@@ -2,9 +2,11 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationControllerTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
+  import Plug.Conn, only: [put_private: 3]
   import Plug.Test
 
   alias Attesto.DeviceCodeStore.ETS
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
 
   @client_id "device-client"
@@ -56,6 +58,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationControllerTest do
     conn =
       :post
       |> conn("/oauth/device_authorization", params)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
       |> DeviceAuthorizationController.create(params)
 
     assert conn.status == 400

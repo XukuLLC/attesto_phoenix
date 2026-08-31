@@ -10,7 +10,7 @@ defmodule AttestoPhoenix.Controller.StatusListController do
   store currently reports.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn, only: [put_resp_header: 3, send_resp: 3]
 
@@ -26,7 +26,7 @@ defmodule AttestoPhoenix.Controller.StatusListController do
   @doc "Serve the signed Status List Token for the status list `:id`."
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"id" => id}) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     uri = Config.status_list_endpoint_url(config) <> "/" <> id
 
     with :ok <- check_https(conn, config),

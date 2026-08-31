@@ -17,8 +17,17 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
 
       * adds an `AttestoPhoenix.Config` config skeleton (issuer, audience,
         keystore, repo, principal kinds, the Ecto-backed token stores, a chosen
-        `:oauth_path_prefix`, and neutral defaults) to the host config, and
+        `:oauth_path_prefix`, optional `:schema_prefix`, and neutral defaults)
+        to the host config, and
         points the library's global resolver and stores at that OTP app/repo,
+      * adds runtime refresh-successor encryption configuration: production
+        reads `ATTESTO_REFRESH_SUCCESSOR_SECRET`; the bundled Ecto store fails
+        config validation when positive retry grace needs it but custom stores
+        and strict zero-grace deployments do not; development and test use a
+        per-project fallback generated when this task runs,
+      * supervises `AttestoPhoenix.Store.Sweeper` after the host repo so expired
+        Ecto rows are reclaimed and refresh-successor ciphertext is redacted
+        promptly after its short retry window,
       * mounts the server routes (`attesto_routes/1`) at the chosen prefix into
         the host router behind a generated config-loading pipeline,
       * scaffolds host callback modules implementing the recommended production
@@ -26,7 +35,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         `ScopePolicy`, `ConsentPolicy`, `RegistrationStore`, `EventSink`) with
         documented stub callbacks the host fills in,
       * points the host at `mix attesto_phoenix.gen.migration` for the Ecto
-        tables the bundled stores read.
+        tables the bundled stores read, including the durable refresh-family
+        revocation tombstones. Existing installations upgrading to a release
+        that adds this table must apply its forward migration before boot.
 
     Every step is idempotent: re-running the task does not duplicate the config,
     the route, or the scaffolded modules. The task never decides authorization
@@ -50,6 +61,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         `--oauth-path-prefix /mcp/oauth`. The well-known documents (RFC 8615)
         and the JWKS document stay anchored at the host root and are NOT
         relocated by this prefix.
+      * `--schema-prefix` - the PostgreSQL schema selected by Ecto's `prefix:`
+        option for every generated table and index. The migration generator
+        uses the same value. The legacy 2.x `--table-prefix` option is rejected
+        because it meant literal table-name prefixing.
       * `--callbacks-module` - the base module the scaffolded callback modules
         are generated under. Defaults to `<App>.AuthZ`, yielding
         `<App>.AuthZ.ClientStore` and friends.
@@ -76,11 +91,13 @@ if Code.ensure_loaded?(Igniter) do
     # dependency of the library's own `AttestoPhoenix.Config` and the Ecto stores
     # that pattern-match `%AttestoPhoenix.Config{}`, forming a module cycle in the
     # single compile pass.
+    alias AttestoPhoenix.Store.Sweeper
     alias Igniter.Code.Common
     alias Igniter.Code.Function
     alias Igniter.Code.Keyword, as: CodeKeyword
     alias Igniter.Libs.Phoenix
     alias Igniter.Mix.Task.Info
+    alias Igniter.Project.Application, as: ProjectApplication
     alias Igniter.Project.Config, as: ProjectConfig
     alias Igniter.Project.Module, as: ProjectModule
     alias Mix.Tasks.AttestoPhoenix.Install.Docs
@@ -90,6 +107,7 @@ if Code.ensure_loaded?(Igniter) do
     # relocate it with `--oauth-path-prefix`.
     @default_oauth_path_prefix "/oauth"
     @config_pipeline :attesto_phoenix_config
+    @refresh_successor_secret_bytes 32
 
     # The recommended production behaviours and the callbacks each scaffolded
     # module implements. Each tuple is `{submodule, behaviour, [{function,
@@ -118,6 +136,7 @@ if Code.ensure_loaded?(Igniter) do
         example: Docs.example(),
         schema: [
           oauth_path_prefix: :string,
+          schema_prefix: :string,
           callbacks_module: :string
         ]
       }
@@ -125,19 +144,45 @@ if Code.ensure_loaded?(Igniter) do
 
     @impl Igniter.Mix.Task
     def igniter(igniter) do
+      reject_legacy_table_prefix_args!(igniter.args.argv)
+      igniter = notice_legacy_table_prefix_config(igniter)
+
       app = Igniter.Project.Application.app_name(igniter)
       app_module = ProjectModule.module_name_prefix(igniter)
       repo = Module.concat(app_module, Repo)
       options = igniter.args.options
 
       oauth_path_prefix = options[:oauth_path_prefix] || @default_oauth_path_prefix
+      schema_prefix = schema_prefix(options, igniter, app)
       callbacks_module = callbacks_module(options, app_module)
+      refresh_successor_secret = generate_refresh_successor_secret()
 
       igniter
       |> scaffold_callback_modules(callbacks_module)
-      |> configure_attesto_phoenix(app, oauth_path_prefix, callbacks_module, repo)
+      |> configure_attesto_phoenix(
+        app,
+        oauth_path_prefix,
+        schema_prefix,
+        callbacks_module,
+        repo,
+        refresh_successor_secret
+      )
+      |> supervise_store_sweeper(app, repo)
       |> mount_routes(app, oauth_path_prefix)
-      |> add_next_step_notices(app, oauth_path_prefix, callbacks_module, repo)
+      |> add_next_step_notices(app, oauth_path_prefix, schema_prefix, callbacks_module, repo)
+    end
+
+    defp supervise_store_sweeper(igniter, app, repo) do
+      options =
+        quote do
+          [config: AttestoPhoenix.Config.from_otp_app(unquote(app)), if_configured: true]
+        end
+
+      ProjectApplication.add_new_child(
+        igniter,
+        {Sweeper, {:code, options}},
+        after: [repo]
+      )
     end
 
     # The base module the scaffolded callbacks live under. `--callbacks-module`
@@ -161,8 +206,16 @@ if Code.ensure_loaded?(Igniter) do
     # installs the Ecto-backed stores with neutral defaults. The actual
     # authorization policy stays in the scaffolded host modules; this is only the
     # wiring `AttestoPhoenix.Config.from_otp_app/2` reads at boot.
-    defp configure_attesto_phoenix(igniter, app, oauth_path_prefix, callbacks_module, repo) do
-      config = config_skeleton(oauth_path_prefix, callbacks_module, repo)
+    defp configure_attesto_phoenix(
+           igniter,
+           app,
+           oauth_path_prefix,
+           schema_prefix,
+           callbacks_module,
+           repo,
+           refresh_successor_secret
+         ) do
+      config = config_skeleton(oauth_path_prefix, schema_prefix, callbacks_module, repo)
       principal_store = Module.concat(callbacks_module, PrincipalStore)
 
       igniter
@@ -191,9 +244,63 @@ if Code.ensure_loaded?(Igniter) do
         [:repo],
         {:code, quote(do: unquote(repo))}
       )
+      |> configure_refresh_successor_secret(refresh_successor_secret)
     end
 
-    defp config_skeleton(oauth_path_prefix, callbacks_module, repo) do
+    # Runtime configuration is evaluated after the regular config files, so an
+    # unconditional runtime entry would silently override a host value from
+    # config.exs, dev.exs, prod.exs, or another imported config file. Include
+    # every config source before checking the key and add the generated fallback
+    # only when the project has not configured the secret anywhere.
+    defp configure_refresh_successor_secret(igniter, refresh_successor_secret) do
+      if refresh_successor_secret_configured?(igniter) do
+        igniter
+      else
+        ProjectConfig.configure_new(
+          igniter,
+          "runtime.exs",
+          :attesto_phoenix,
+          [:refresh_successor_secret],
+          {:code, refresh_successor_secret_runtime_default(refresh_successor_secret)}
+        )
+      end
+    end
+
+    defp refresh_successor_secret_configured?(igniter) do
+      config_path = ProjectApplication.config_path(igniter)
+      config_dir = config_path |> Path.dirname() |> Path.expand()
+      config_glob = Path.join(config_dir, "**/*.exs")
+      igniter = Igniter.include_glob(igniter, config_glob)
+      config_dir_parts = Path.split(config_dir)
+
+      igniter.rewrite
+      |> Rewrite.sources()
+      |> Enum.any?(&refresh_successor_secret_configured_in?(&1, igniter, config_dir, config_dir_parts))
+    end
+
+    defp refresh_successor_secret_configured_in?(source, igniter, config_dir, config_dir_parts) do
+      source_path = Path.expand(source.path)
+
+      cond do
+        Path.extname(source.path) != ".exs" ->
+          false
+
+        Enum.take(Path.split(source_path), length(config_dir_parts)) != config_dir_parts ->
+          false
+
+        true ->
+          relative_path = Path.relative_to(source_path, config_dir)
+
+          ProjectConfig.configures_key?(
+            igniter,
+            relative_path,
+            :attesto_phoenix,
+            :refresh_successor_secret
+          )
+      end
+    end
+
+    defp config_skeleton(oauth_path_prefix, schema_prefix, callbacks_module, repo) do
       keystore = Module.concat(callbacks_module, Keystore)
       client_store = Module.concat(callbacks_module, ClientStore)
       principal_store = Module.concat(callbacks_module, PrincipalStore)
@@ -217,6 +324,9 @@ if Code.ensure_loaded?(Igniter) do
           # and the JWKS verification keys). Scaffold or wire your own.
           keystore: unquote(keystore),
           repo: unquote(repo),
+          # PostgreSQL schema selected by Ecto for every generated table and
+          # index. Leave nil for the public schema.
+          schema_prefix: unquote(schema_prefix),
           # Required host callbacks, wired at the scaffolded modules. Fill in the
           # stub callbacks the installer generated.
           load_client: {unquote(client_store), :load_client},
@@ -237,7 +347,8 @@ if Code.ensure_loaded?(Igniter) do
           # Provider; the rest are examples to replace.
           scopes_supported: ["profile", "email", "offline_access"],
           # Ecto-backed stores. Run `mix attesto_phoenix.gen.migration` to create
-          # the backing tables.
+          # the backing tables, including durable refresh-family revocation
+          # tombstones.
           code_store: AttestoPhoenix.Store.EctoCodeStore,
           refresh_store: AttestoPhoenix.Store.EctoRefreshStore,
           nonce_store: AttestoPhoenix.Store.EctoNonceStore,
@@ -264,10 +375,321 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp schema_prefix(options, igniter, app) do
+      case options[:schema_prefix] do
+        nil ->
+          configured_schema_prefix(igniter, app)
+          |> validate_schema_prefix!()
+
+        prefix when is_binary(prefix) ->
+          validate_schema_prefix!(prefix)
+
+        other ->
+          raise Mix.Error,
+            message: "invalid --schema-prefix: expected a PostgreSQL schema identifier, got #{inspect(other)}"
+      end
+    end
+
+    # An installer rerun must keep notices and generated migration commands
+    # aligned with an already-configured host schema. Read literal values from
+    # the host config AST without evaluating arbitrary config code; dynamic
+    # expressions remain host-owned and are left for runtime resolution.
+    defp configured_schema_prefix(igniter, app) do
+      config_path = ProjectApplication.config_path(igniter)
+      config_dir = config_path |> Path.dirname() |> Path.expand()
+      config_glob = Path.join(config_dir, "**/*.exs")
+      igniter = Igniter.include_glob(igniter, config_glob)
+      config_dir_parts = Path.split(config_dir)
+
+      results =
+        igniter.rewrite
+        |> Rewrite.sources()
+        |> Enum.flat_map(&configured_schema_prefix_source(&1, app, config_dir_parts))
+
+      configured_schema_prefix_results(results)
+    end
+
+    defp configured_schema_prefix_source(source, app, config_dir_parts) do
+      case config_source?(source.path, config_dir_parts) do
+        true ->
+          source.content
+          |> configured_schema_prefix_in_source(app)
+          |> Enum.map(&configured_schema_prefix_source_result/1)
+
+        false ->
+          []
+      end
+    end
+
+    defp configured_schema_prefix_source_result({:ok, prefix}), do: {:found, prefix}
+    defp configured_schema_prefix_source_result({:invalid, value}), do: {:invalid, value}
+    defp configured_schema_prefix_source_result({:dynamic, expression}), do: {:dynamic, expression}
+
+    defp config_source?(path, config_dir_parts) do
+      source_path = Path.expand(path)
+
+      Path.extname(path) == ".exs" and
+        Enum.take(Path.split(source_path), length(config_dir_parts)) == config_dir_parts
+    end
+
+    defp configured_schema_prefix_results(results) do
+      case Enum.find(results, &schema_prefix_error_result?/1) do
+        {:invalid, value} -> raise_invalid_schema_prefix(value)
+        {:dynamic, expression} -> raise_dynamic_schema_prefix(expression)
+        nil -> configured_schema_prefix_literals(results)
+      end
+    end
+
+    defp configured_schema_prefix_literals(results) do
+      prefixes = for {:found, prefix} <- results, do: prefix
+
+      case Enum.uniq(prefixes) do
+        [] -> nil
+        [prefix] -> prefix
+        prefixes -> raise_ambiguous_schema_prefix(prefixes)
+      end
+    end
+
+    defp schema_prefix_error_result?({:invalid, _value}), do: true
+    defp schema_prefix_error_result?({:dynamic, _expression}), do: true
+    defp schema_prefix_error_result?(_result), do: false
+
+    defp raise_invalid_schema_prefix(value) do
+      raise Mix.Error,
+        message:
+          "invalid configured :schema_prefix in the host config: expected nil or a " <>
+            "lowercase PostgreSQL schema identifier, got #{value}"
+    end
+
+    defp raise_dynamic_schema_prefix(expression) do
+      raise Mix.Error,
+        message:
+          "could not determine configured :schema_prefix expression #{expression}; " <>
+            "pass --schema-prefix explicitly so the migration and installer cannot " <>
+            "silently target public"
+    end
+
+    defp raise_ambiguous_schema_prefix(prefixes) do
+      raise Mix.Error,
+        message:
+          "could not determine a single configured :schema_prefix in the host config; " <>
+            "found multiple literal values #{inspect(prefixes)}; pass --schema-prefix " <>
+            "explicitly so the migration and installer cannot silently target public"
+    end
+
+    defp configured_schema_prefix_in_source(content, app) when is_binary(content) do
+      case Code.string_to_quoted(content, emit_warnings: false) do
+        {:ok, ast} ->
+          ast
+          |> configured_schema_prefix_ast_results(app)
+          |> Enum.map(&format_configured_schema_prefix_result/1)
+
+        _error ->
+          []
+      end
+    end
+
+    defp configured_schema_prefix_ast_results(ast, app) do
+      {_ast, results} = Macro.prewalk(ast, [], &configured_schema_prefix_ast_node(&1, &2, app))
+      Enum.reverse(results)
+    end
+
+    defp configured_schema_prefix_ast_node(node, results, app) do
+      node_result = configured_schema_prefix_node(node, app)
+
+      case node_result do
+        {^node, :not_found} -> {node, results}
+        {^node, node_results} -> {node, node_results ++ results}
+      end
+    end
+
+    defp configured_schema_prefix_node({:config, _meta, [configured_app, config_module, config_opts]} = node, app) do
+      if configured_app == app and attesto_config_module_ast?(config_module) do
+        configured_schema_prefix_config(node, config_opts)
+      else
+        {node, :not_found}
+      end
+    end
+
+    defp configured_schema_prefix_node(node, _app), do: {node, :not_found}
+
+    defp configured_schema_prefix_config(node, opts) when is_list(opts) do
+      configured_schema_prefix_option(node, opts)
+    end
+
+    defp configured_schema_prefix_config(node, {:%{}, _meta, pairs}) when is_list(pairs) do
+      configured_schema_prefix_map_option(node, pairs)
+    end
+
+    defp configured_schema_prefix_config(node, _opts), do: {node, :not_found}
+
+    defp configured_schema_prefix_map_option(node, pairs) do
+      case Enum.flat_map(pairs, &schema_prefix_map_option_result/1) do
+        [] -> {node, :not_found}
+        results -> {node, results}
+      end
+    end
+
+    defp schema_prefix_map_option_result({:schema_prefix, value}), do: [{:found, configured_schema_prefix_value(value)}]
+
+    defp schema_prefix_map_option_result({key, value}) when key in ["schema_prefix", :table_prefix, "table_prefix"],
+      do: [{:found, {:string_key, key, value}}]
+
+    defp schema_prefix_map_option_result(_other), do: []
+
+    defp format_configured_schema_prefix_result(result) do
+      case result do
+        {:found, {:dynamic, expression}} ->
+          {:dynamic, expression}
+
+        {:found, {:string_key, key, value}} ->
+          {:invalid, "string key #{inspect(key)} (value #{Macro.to_string(value)})"}
+
+        {:found, prefix} when is_binary(prefix) or is_nil(prefix) ->
+          {:ok, prefix}
+
+        {:found, invalid} ->
+          {:invalid, Macro.to_string(invalid)}
+
+        :not_found ->
+          :not_found
+      end
+    end
+
+    defp configured_schema_prefix_option(node, opts) do
+      case Enum.flat_map(opts, &schema_prefix_option_result/1) do
+        [] -> {node, :not_found}
+        results -> {node, results}
+      end
+    end
+
+    defp schema_prefix_option_result({:schema_prefix, value}), do: [{:found, configured_schema_prefix_value(value)}]
+
+    defp schema_prefix_option_result({"schema_prefix", value}), do: [{:found, {:string_key, "schema_prefix", value}}]
+
+    defp schema_prefix_option_result({"table_prefix", value}), do: [{:found, {:string_key, "table_prefix", value}}]
+
+    defp schema_prefix_option_result(_other), do: []
+
+    defp configured_schema_prefix_value(value) when is_binary(value) or is_nil(value), do: value
+
+    defp configured_schema_prefix_value(value) when is_atom(value) or is_number(value) or is_list(value), do: value
+
+    defp configured_schema_prefix_value(value), do: {:dynamic, Macro.to_string(value)}
+
+    defp attesto_config_module_ast?(AttestoPhoenix.Config), do: true
+
+    defp attesto_config_module_ast?({:__aliases__, _meta, [:AttestoPhoenix, :Config]}), do: true
+
+    defp attesto_config_module_ast?(_other), do: false
+
+    defp validate_schema_prefix!(prefix) do
+      cond do
+        is_nil(prefix) ->
+          nil
+
+        prefix == "" ->
+          raise Mix.Error,
+            message: "invalid --schema-prefix: expected a non-empty lowercase PostgreSQL schema identifier"
+
+        byte_size(prefix) > 63 ->
+          raise Mix.Error,
+            message: "invalid --schema-prefix: expected at most 63 bytes"
+
+        prefix == "information_schema" or String.starts_with?(prefix, "pg_") ->
+          raise Mix.Error,
+            message:
+              "invalid --schema-prefix: #{inspect(prefix)} is a reserved PostgreSQL system schema; choose an application-owned schema"
+
+        Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, prefix) ->
+          prefix
+
+        true ->
+          raise Mix.Error,
+            message: "invalid --schema-prefix: expected a lowercase PostgreSQL schema identifier"
+      end
+    end
+
+    defp reject_legacy_table_prefix_args!(argv) do
+      if Enum.any?(argv, &legacy_table_prefix_arg?/1) do
+        raise Mix.Error,
+          message:
+            "--table-prefix was removed in 3.0 because 2.x prefixed literal table names. Use --schema-prefix for a PostgreSQL schema and migrate existing tables before deploying."
+      end
+    end
+
+    # The installer can repair its own generated AST, but it cannot safely
+    # infer whether a host-owned `:table_prefix` was the old literal table-name
+    # convention or an unrelated application key. Leave the source untouched
+    # and emit a fail-closed notice: Config rejects the key at boot, so a rerun
+    # cannot silently route an existing non-empty-prefix database to `public`.
+    defp notice_legacy_table_prefix_config(igniter) do
+      config_path = ProjectApplication.config_path(igniter)
+      config_dir = config_path |> Path.dirname() |> Path.expand()
+      config_glob = Path.join(config_dir, "**/*.exs")
+      igniter = Igniter.include_glob(igniter, config_glob)
+
+      if Rewrite.sources(igniter.rewrite)
+         |> Enum.any?(&legacy_table_prefix_config_source?/1) do
+        Igniter.add_notice(igniter, """
+        Legacy `:table_prefix` configuration was found in the host config. The
+        installer leaves that host-owned AST untouched because it cannot safely
+        infer the old literal table-name intent. Remove every legacy
+        `:table_prefix` entry, set `:schema_prefix` to the PostgreSQL schema
+        containing the migrated canonical tables, and complete the 2.x -> 3.0
+        stopped cutover before boot. `AttestoPhoenix.Config` will fail closed
+        while the legacy key remains; it will not reinterpret it as a schema.
+        See `guides/upgrade_3_0_schema_prefix.md` for inventory and migration
+        checks.
+        """)
+      else
+        igniter
+      end
+    end
+
+    defp legacy_table_prefix_config_source?(%{path: path, content: content})
+         when is_binary(path) and is_binary(content) do
+      Path.extname(path) == ".exs" and
+        (String.contains?(content, "table_prefix:") or
+           String.contains?(content, ":table_prefix") or
+           String.contains?(content, "\"table_prefix\""))
+    end
+
+    defp legacy_table_prefix_config_source?(_source), do: false
+
+    defp legacy_table_prefix_arg?("--table-prefix"), do: true
+    defp legacy_table_prefix_arg?(arg) when is_binary(arg), do: String.starts_with?(arg, "--table-prefix=")
+    defp legacy_table_prefix_arg?(_arg), do: false
+
     defp audience_default do
       quote do
         System.get_env("ATTESTO_AUDIENCE") || System.get_env("ATTESTO_ISSUER") ||
           "https://localhost"
+      end
+    end
+
+    # Generate the development/test fallback once per installer invocation. The
+    # value is persisted in the generated host's runtime config by
+    # `configure_new/5`, which leaves an existing project value untouched on a
+    # later run. URL-safe Base64 keeps the literal easy to paste into an
+    # environment variable while retaining all 256 bits from the CSPRNG.
+    defp generate_refresh_successor_secret do
+      @refresh_successor_secret_bytes
+      |> :crypto.strong_rand_bytes()
+      |> Base.url_encode64(padding: false)
+    end
+
+    defp refresh_successor_secret_runtime_default(secret) do
+      quote do
+        case System.get_env("ATTESTO_REFRESH_SUCCESSOR_SECRET") do
+          nil ->
+            if config_env() in [:dev, :test] do
+              unquote(secret)
+            end
+
+          secret ->
+            secret
+        end
       end
     end
 
@@ -545,7 +967,15 @@ if Code.ensure_loaded?(Igniter) do
     # Notices
     # ------------------------------------------------------------------
 
-    defp add_next_step_notices(igniter, app, oauth_path_prefix, callbacks_module, repo) do
+    defp add_next_step_notices(igniter, app, oauth_path_prefix, schema_prefix, callbacks_module, repo) do
+      migration_command =
+        case schema_prefix do
+          nil -> "mix attesto_phoenix.gen.migration --repo #{inspect(repo)}"
+          prefix -> "mix attesto_phoenix.gen.migration --repo #{inspect(repo)} --schema-prefix #{prefix}"
+        end
+
+      selected_schema = schema_prefix || "public (Ecto default)"
+
       Igniter.add_notice(igniter, """
       attesto_phoenix is installed. Remaining app-owned steps:
 
@@ -564,11 +994,35 @@ if Code.ensure_loaded?(Igniter) do
            https issuer URL, and set :audience to the protected resource URL
            (prefer config/runtime.exs per deployment).
 
-        3. Create the Ecto tables the bundled stores read:
+           When the bundled Ecto refresh store uses positive rotation grace,
+           provision `ATTESTO_REFRESH_SUCCESSOR_SECRET` as one stable secret of
+           at least 32 bytes in production. Every node and deployment serving
+           the same refresh-token families must use the same value. Config
+           validation refuses startup when that combination lacks a valid
+           secret; custom stores and strict zero-grace deployments do not need
+           this Ecto-specific key.
 
-               mix attesto_phoenix.gen.migration --repo #{inspect(repo)}
+        3. Create the Ecto tables the bundled stores read (including the
+           durable refresh-family revocation tombstone table):
+
+               #{migration_command}
 
            then `mix ecto.migrate`.
+
+           The generated stores and sweeper use PostgreSQL schema `#{selected_schema}`.
+           Keep one `AttestoPhoenix.Store.Sweeper` instance per independent
+           `{repo, schema_prefix}` pair; do not run multiple sweepers against
+           one pair or share one sweeper across independent profiles.
+
+           If this is an upgrade of an existing database, add the tombstone
+           table with a forward migration and backfill it from revoked rows
+           before deploying the new code. Do not rerun the create-table
+           migration against tables that already exist.
+
+           Stop and drain every 2.x token writer before this migration and
+           before starting 3.0, including deployments using the public schema.
+           Mixed 2.x/3.0 writers are unsupported because 2.x does not read or
+           write durable refresh-family revocation tombstones.
 
         4. The OAuth endpoints are mounted under "#{oauth_path_prefix}". The
            well-known discovery and JWKS documents stay at the host root

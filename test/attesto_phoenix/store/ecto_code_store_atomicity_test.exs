@@ -38,10 +38,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreAtomicityTest do
           client_id: "client-1",
           subject: "subject-1",
           scope: ["openid"],
+          resource: [],
           redirect_uri: "https://rp.example/cb",
           code_challenge: @challenge,
-          code_challenge_method: Authorization.code_challenge_method(),
-          family_id: "fam-1"
+          dpop_jkt: nil,
+          family_id: "fam-1",
+          claims: %{}
         },
         overrides
       )
@@ -90,7 +92,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreAtomicityTest do
     assert :ok = AuthorizationCode.finalize(EctoCodeStore, code, grant)
     assert row(code).consumed_success
 
-    assert {:error, {:reuse, %{family_id: "fam-1", subject: "subject-1"}}} =
+    assert {:error, {:reuse, %{family_id: nil, subject: "subject-1"}}} =
              AuthorizationCode.redeem(EctoCodeStore, code, redeem_params())
   end
 end

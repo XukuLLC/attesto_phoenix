@@ -18,9 +18,17 @@ defmodule AttestoPhoenix.Schema.DeviceCode do
 
   import Ecto.Changeset
 
+  alias Attesto.Scope
+  alias Attesto.Thumbprint
+
   @type t :: %__MODULE__{}
 
   @statuses [:pending, :approved, :denied, :consumed]
+  @user_code_alphabet ~c"BCDFGHJKLMNPQRSTVWXZ"
+  @min_user_code_length 8
+  @max_user_code_length 64
+  @canonical_data_keys [:client_id, :dpop_jkt, :resource, :scope]
+  @canonical_data_error "device code has invalid canonical data"
 
   @primary_key {:id, :binary_id, autogenerate: true}
   schema "attesto_device_codes" do
@@ -49,21 +57,30 @@ defmodule AttestoPhoenix.Schema.DeviceCode do
 
   @doc """
   Build the insert changeset for a new `pending` device code from the core
-  store record. Fail-closed: a missing required field is rejected, not defaulted.
+  store record. The issue-time `:data` map must contain exactly the four atom
+  keys emitted by `Attesto.DeviceCode.issue/3`; missing or extra keys raise a
+  fixed, value-free `ArgumentError` before any field is projected into the row.
+  The write envelope must also be pending with a valid expiry, and undecided:
+  status must be explicit, while decision fields and `last_polled_at` must be
+  nil or absent. Other missing required record fields remain changeset
+  validation errors.
   """
   @spec from_record(Attesto.DeviceCodeStore.entry(), keyword()) :: Ecto.Changeset.t()
   def from_record(record, opts \\ []) when is_map(record) and is_list(opts) do
     prefix = Keyword.get(opts, :prefix)
-    data = Map.get(record, :data, %{})
+    data = canonical_data!(record)
 
     attrs = %{
       device_code_hash: Map.get(record, :device_code_hash),
       user_code: Map.get(record, :user_code),
-      client_id: Map.get(data, :client_id),
-      scope: Map.get(data, :scope, []),
-      resource: Map.get(data, :resource, []),
-      dpop_jkt: Map.get(data, :dpop_jkt),
-      status: Map.get(record, :status, :pending),
+      client_id: data.client_id,
+      scope: data.scope,
+      resource: data.resource,
+      dpop_jkt: data.dpop_jkt,
+      status: Map.get(record, :status),
+      subject: Map.get(record, :subject),
+      granted_scope: Map.get(record, :granted_scope),
+      granted_claims: Map.get(record, :granted_claims),
       expires_at: unix_to_datetime(Map.get(record, :expires_at)),
       last_polled_at: unix_to_datetime(Map.get(record, :last_polled_at))
     }
@@ -86,8 +103,8 @@ defmodule AttestoPhoenix.Schema.DeviceCode do
       user_code: row.user_code,
       data: %{
         client_id: row.client_id,
-        scope: row.scope || [],
-        resource: row.resource || [],
+        scope: row.scope,
+        resource: row.resource,
         dpop_jkt: row.dpop_jkt
       },
       status: row.status,
@@ -108,12 +125,57 @@ defmodule AttestoPhoenix.Schema.DeviceCode do
     %{
       user_code: row.user_code,
       client_id: row.client_id,
-      scope: row.scope || [],
-      resource: row.resource || [],
+      scope: row.scope,
+      resource: row.resource,
       status: row.status,
       expires_at: datetime_to_unix(row.expires_at)
     }
   end
+
+  defp canonical_data!(record) do
+    data = Map.get(record, :data)
+
+    if is_map(data) and
+         map_size(data) == length(@canonical_data_keys) and
+         Enum.all?(@canonical_data_keys, &Map.has_key?(data, &1)) and
+         valid_canonical_data?(data) and valid_record_envelope?(record) do
+      data
+    else
+      raise ArgumentError, @canonical_data_error
+    end
+  end
+
+  defp valid_canonical_data?(data) do
+    non_empty_binary?(Map.get(data, :client_id)) and
+      Scope.valid_list?(Map.get(data, :scope)) and
+      valid_string_list?(Map.get(data, :resource)) and
+      valid_optional_jkt?(Map.get(data, :dpop_jkt))
+  end
+
+  defp valid_record_envelope?(record) do
+    non_empty_binary?(Map.get(record, :device_code_hash)) and
+      valid_user_code?(Map.get(record, :user_code)) and
+      Map.get(record, :status) == :pending and
+      is_integer(Map.get(record, :expires_at)) and Map.get(record, :expires_at) >= 0 and
+      is_nil(Map.get(record, :subject)) and
+      is_nil(Map.get(record, :granted_scope)) and
+      is_nil(Map.get(record, :granted_claims)) and
+      is_nil(Map.get(record, :last_polled_at))
+  end
+
+  defp valid_user_code?(user_code) when is_binary(user_code) do
+    byte_size(user_code) in @min_user_code_length..@max_user_code_length and
+      Enum.all?(:binary.bin_to_list(user_code), &(&1 in @user_code_alphabet))
+  end
+
+  defp valid_user_code?(_user_code), do: false
+
+  defp valid_optional_jkt?(nil), do: true
+  defp valid_optional_jkt?(value), do: Thumbprint.valid?(value)
+
+  defp valid_string_list?(value), do: is_list(value) and Enum.all?(value, &non_empty_binary?/1)
+
+  defp non_empty_binary?(value), do: is_binary(value) and value != ""
 
   defp unix_to_datetime(nil), do: nil
   defp unix_to_datetime(unix) when is_integer(unix), do: DateTime.from_unix!(unix) |> DateTime.truncate(:second)

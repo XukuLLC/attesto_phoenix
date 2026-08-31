@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   # take/1 does not gate on expiry; a future value keeps fixtures realistic.
   @future_seconds System.system_time(:second) + 600
 
-  # The grant context the protocol layer round-trips. The schema spreads
+  # The canonical grant context the protocol layer round-trips. The schema spreads
   # these across columns, so the required authorization-request fields must
   # be present (RFC 6749 §4.1.3, RFC 7636 §4.3).
   defp grant_data(overrides \\ %{}) do
@@ -31,12 +31,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
         client_id: "client-abc",
         subject: "subject-1",
         scope: ["openid", "profile"],
+        resource: [],
         redirect_uri: "https://rp.example/cb",
         code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-        code_challenge_method: Authorization.code_challenge_method(),
+        dpop_jkt: nil,
         family_id: "fam-1",
-        nonce: "request-nonce",
-        claims: %{"acr" => "urn:mace:incommon:iap:silver"}
+        claims: %{"acr" => "urn:mace:incommon:iap:silver", "nonce" => "request-nonce"}
       },
       overrides
     )
@@ -45,6 +45,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   defp entry(code_hash, data \\ grant_data(), expires_at \\ @future_seconds) do
     %{code_hash: code_hash, data: data, expires_at: expires_at}
   end
+
+  defp nested_objects(1), do: %{"value" => 1}
+  defp nested_objects(depth), do: %{"nested" => nested_objects(depth - 1)}
+
+  defp nested_object_arrays(1), do: %{"value" => 1}
+  defp nested_object_arrays(depth), do: %{"nested" => [nested_object_arrays(depth - 1)]}
 
   describe "put/1" do
     test "persists a record retrievable by its code_hash" do
@@ -62,6 +68,49 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert data.redirect_uri == "https://rp.example/cb"
       assert data.code_challenge == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
       assert data.family_id == "fam-1"
+      assert data.claims["nonce"] == "request-nonce"
+
+      assert Map.keys(data) |> Enum.sort() ==
+               [
+                 :claims,
+                 :client_id,
+                 :code_challenge,
+                 :dpop_jkt,
+                 :family_id,
+                 :redirect_uri,
+                 :resource,
+                 :scope,
+                 :subject
+               ]
+    end
+
+    test "round-trips portable nested claims through Postgres JSONB" do
+      claims = %{
+        "nested" => %{
+          "minimum" => -9_007_199_254_740_991,
+          "maximum" => 9_007_199_254_740_991,
+          "values" => [nil, false, true, "text", %{"leaf" => 42}]
+        }
+      }
+
+      assert :ok = EctoCodeStore.put(entry("hash-jsonb-claims", grant_data(%{claims: claims})))
+      assert {:ok, %{data: %{claims: ^claims}}} = EctoCodeStore.take("hash-jsonb-claims")
+    end
+
+    test "accepts the portable depth-64 boundary and alternating object/array boundary" do
+      assert %Ecto.Changeset{valid?: true} =
+               Authorization.from_record(entry("hash-depth-64", grant_data(%{claims: nested_objects(64)})))
+
+      assert %Ecto.Changeset{valid?: true} =
+               Authorization.from_record(entry("hash-alternating-32", grant_data(%{claims: nested_object_arrays(32)})))
+
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
+        Authorization.from_record(entry("hash-depth-65", grant_data(%{claims: nested_objects(65)})))
+      end
+
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
+        Authorization.from_record(entry("hash-alternating-33", grant_data(%{claims: nested_object_arrays(33)})))
+      end
     end
 
     test "preserves expires_at as absolute unix seconds across storage" do
@@ -83,11 +132,20 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert {:ok, %{data: %{subject: "first"}}} = EctoCodeStore.take("hash-dup")
     end
 
-    test "fails closed when a required grant field is missing" do
-      # The schema validates required fields; an incomplete grant must not be
-      # stored as a half-formed, unredeemable code.
+    test "fails closed when a required canonical grant key is missing" do
+      # The bridge rejects an incomplete canonical map before projection, so it
+      # cannot be stored as a half-formed, unredeemable code.
       bad = entry("hash-bad", Map.delete(grant_data(), :redirect_uri))
-      assert_raise Ecto.InvalidChangesetError, fn -> EctoCodeStore.put(bad) end
+
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
+        EctoCodeStore.put(bad)
+      end
+    end
+
+    test "rejects an extra canonical data key before database projection" do
+      assert_raise ArgumentError, "authorization code record has invalid canonical data", fn ->
+        EctoCodeStore.put(entry("hash-extra", grant_data(%{adapter_metadata: "not protocol data"})))
+      end
     end
   end
 
@@ -102,18 +160,81 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert :error = EctoCodeStore.take("hash-once")
     end
 
-    test "returns consumed metadata only after successful redemption is marked" do
+    test "clears authorization provenance when no refresh family is finalized" do
       assert :ok = EctoCodeStore.put(entry("hash-consumed", grant_data(%{family_id: "fam-ok"})))
 
       assert {:ok, %{code_hash: "hash-consumed"}} = EctoCodeStore.take("hash-consumed")
       assert :ok = EctoCodeStore.mark_consumed("hash-consumed", %{})
 
-      assert {:error, :consumed, %{family_id: "fam-ok", subject: "subject-1"}} =
+      assert {:error, :consumed, %{family_id: nil, subject: "subject-1"}} =
                EctoCodeStore.take("hash-consumed")
+    end
+
+    test "an explicit nil family clears authorization provenance" do
+      assert :ok = EctoCodeStore.put(entry("hash-consumed-nil", grant_data(%{family_id: "fam-ok"})))
+
+      assert {:ok, %{code_hash: "hash-consumed-nil"}} = EctoCodeStore.take("hash-consumed-nil")
+      assert :ok = EctoCodeStore.mark_consumed("hash-consumed-nil", %{family_id: nil})
+
+      assert {:error, :consumed, %{family_id: nil, subject: "subject-1"}} =
+               EctoCodeStore.take("hash-consumed-nil")
+    end
+
+    test "binds a finalized refresh family to the consumed authorization row" do
+      assert :ok = EctoCodeStore.put(entry("hash-finalized", grant_data(%{family_id: "fam-origin"})))
+
+      assert {:ok, %{code_hash: "hash-finalized"}} = EctoCodeStore.take("hash-finalized")
+      assert :ok = EctoCodeStore.mark_consumed("hash-finalized", %{family_id: "fam-issued"})
+
+      assert {:error, :consumed, %{family_id: "fam-issued", subject: "subject-1"}} =
+               EctoCodeStore.take("hash-finalized")
+    end
+
+    test "records an access token by code hash before family rebinding" do
+      expires_at = System.system_time(:second) + 600
+
+      assert :ok = EctoCodeStore.put(entry("hash-access-code", grant_data(%{family_id: nil})))
+      assert {:ok, %{code_hash: "hash-access-code"}} = EctoCodeStore.take("hash-access-code")
+
+      assert :ok =
+               EctoCodeStore.record_access_token_for_code(
+                 "hash-access-code",
+                 "jti-code",
+                 expires_at
+               )
+
+      assert %Authorization{access_token_jti: "jti-code"} =
+               TestRepo.get_by!(Authorization, code_hash: "hash-access-code")
     end
 
     test "returns :error for an absent code_hash" do
       assert :error = EctoCodeStore.take("hash-missing")
+    end
+
+    test "legacy consumed rows without an access-token JTI are a replay no-op" do
+      # 2.14.x could leave a successful consumed marker without either a
+      # refresh-family ID or access-token linkage. Reuse containment must still
+      # return :ok for that row instead of raising on a zero-row UPDATE.
+      assert :ok = EctoCodeStore.put(entry("hash-legacy", grant_data(%{family_id: nil})))
+      assert {:ok, %{code_hash: "hash-legacy"}} = EctoCodeStore.take("hash-legacy")
+      assert :ok = EctoCodeStore.mark_consumed("hash-legacy", %{family_id: nil})
+
+      assert :ok = EctoCodeStore.revoke_access_token_for_code("hash-legacy")
+
+      row = TestRepo.get_by!(Authorization, code_hash: "hash-legacy")
+      assert is_nil(row.family_id)
+      assert is_nil(row.access_token_jti)
+      assert is_nil(row.access_token_revoked_at)
+    end
+
+    test "replay revocation is idempotent when the authorization row is gone" do
+      assert :ok = EctoCodeStore.revoke_access_token_for_code("hash-missing")
+    end
+
+    test "mark_consumed fails loudly when no authorization row exists" do
+      assert_raise RuntimeError, ~r/mark_consumed failed to update exactly one authorization record/, fn ->
+        EctoCodeStore.mark_consumed("hash-missing", %{})
+      end
     end
 
     test "consumes the row regardless of expiry" do
@@ -176,6 +297,14 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert :ok = EctoCodeStore.revoke_family_access_tokens("fam-exp")
 
       refute EctoCodeStore.access_token_revoked?("jti-expired")
+    end
+
+    test "record_access_token fails loudly when the family row is absent" do
+      expires_at = System.system_time(:second) + 600
+
+      assert_raise RuntimeError, ~r/record_access_token failed to update exactly one authorization record/, fn ->
+        EctoCodeStore.record_access_token("fam-missing", "jti-missing", expires_at)
+      end
     end
   end
 end

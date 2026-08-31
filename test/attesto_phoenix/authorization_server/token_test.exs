@@ -44,6 +44,114 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     @moduledoc false
   end
 
+  defmodule OneShotLookupFailureCodeStore do
+    @moduledoc false
+    @behaviour Attesto.CodeStore
+
+    def fail_next_lookup, do: Process.put({__MODULE__, :fail_next_lookup}, true)
+
+    @impl true
+    def put(record), do: ETS.put(record)
+
+    @impl true
+    def get(code_hash) do
+      if Process.delete({__MODULE__, :fail_next_lookup}) do
+        {:error, :store_unavailable}
+      else
+        ETS.get(code_hash)
+      end
+    end
+
+    @impl true
+    def take(code_hash) do
+      send(self(), {__MODULE__, :take_called})
+      ETS.take(code_hash)
+    end
+  end
+
+  defmodule OneShotLookupFailureRefreshStore do
+    @moduledoc false
+    @behaviour Attesto.RefreshStore
+
+    alias Attesto.RefreshStore.ETS
+
+    def fail_next_lookup, do: Process.put({__MODULE__, :fail_next_lookup}, true)
+
+    @impl true
+    def insert(record), do: ETS.insert(record)
+
+    @impl true
+    def get(token_hash) do
+      if Process.delete({__MODULE__, :fail_next_lookup}) do
+        {:error, :store_unavailable}
+      else
+        ETS.get(token_hash)
+      end
+    end
+
+    @impl true
+    def rotate(parent_hash, child, successor, opts), do: ETS.rotate(parent_hash, child, successor, opts)
+
+    @impl true
+    def revoke_family(family_id), do: ETS.revoke_family(family_id)
+  end
+
+  # The local Attesto 2.x path reports this operational result when the store
+  # can prove its rotation transaction rolled back. The legacy Hex dependency
+  # predates that result, so the regression below is guarded by the atomic
+  # refresh-store callback's presence.
+  defmodule TemporarilyUnavailableRefreshStore do
+    @moduledoc false
+    @behaviour Attesto.RefreshStore
+
+    @token "refresh-token-for-temporary-failure"
+
+    def token, do: @token
+
+    @impl true
+    def insert(_record), do: :ok
+
+    @impl true
+    def get(token_hash) do
+      if token_hash == Attesto.Secret.hash(@token) do
+        {:ok,
+         %{
+           token_hash: token_hash,
+           family_id: "family-temporary-failure",
+           generation: 0,
+           data: %{
+             subject: "oc_user-1",
+             scope: ["read"],
+             resource: [],
+             client_id: "client-1",
+             dpop_jkt: nil,
+             acr: nil,
+             auth_time: nil,
+             claims: %{}
+           },
+           expires_at: System.system_time(:second) + 600,
+           consumed: false,
+           consumed_at: nil,
+           successor: nil
+         }}
+      else
+        :error
+      end
+    end
+
+    def consume(_token_hash, _opts), do: :error
+
+    def remember_successor(_token_hash, _successor, _opts), do: :error
+
+    @impl true
+    def revoke_family(_family_id), do: :ok
+
+    # Attesto 2.x's atomic rotation callback deliberately returns this only
+    # after rolling back the proposed parent/child transition.
+    @impl true
+    def rotate(_parent_hash, _child, _successor, _opts), do: {:error, :invalid_rotation}
+  end
+
   # One principal kind so `Attesto.Token.mint/3` has a kind to issue under.
   @client_kind Attesto.PrincipalKind.new("client", "oc_", required_claims: [{"client_id", :non_empty_string}])
 
@@ -406,7 +514,100 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     end
   end
 
+  if function_exported?(Attesto.RefreshStore.ETS, :rotate, 4) do
+    describe "temporarily unavailable refresh rotation" do
+      test "returns HTTP-neutral OAuth 503 data and the matching denial event" do
+        config = config(refresh_store: TemporarilyUnavailableRefreshStore)
+
+        request =
+          request(config,
+            grant_type: "refresh_token",
+            params: %{"refresh_token" => TemporarilyUnavailableRefreshStore.token()}
+          )
+
+        assert {:error, %OAuthError{error: :temporarily_unavailable, status: 503}, [event]} =
+                 Token.issue(config, request)
+
+        assert %Event{
+                 name: :token_denied,
+                 result: "temporarily_unavailable",
+                 metadata: %{error: "temporarily_unavailable", http_status: 503}
+               } = event
+
+        assert {:ok, %{consumed: false}} =
+                 TemporarilyUnavailableRefreshStore.get(Attesto.Secret.hash(TemporarilyUnavailableRefreshStore.token()))
+      end
+
+      test "logs only the fixed operational diagnostic" do
+        config = config(refresh_store: TemporarilyUnavailableRefreshStore)
+
+        request =
+          request(config,
+            grant_type: "refresh_token",
+            params: %{"refresh_token" => TemporarilyUnavailableRefreshStore.token()}
+          )
+
+        log =
+          ExUnit.CaptureLog.capture_log(fn ->
+            assert {:error, %OAuthError{error: :temporarily_unavailable, status: 503}, _events} =
+                     Token.issue(config, request)
+          end)
+
+        assert log =~ "refresh token rotation temporarily unavailable; retry the request"
+        refute log =~ "invalid_rotation"
+        refute log =~ TemporarilyUnavailableRefreshStore.token()
+      end
+    end
+  end
+
   describe "authorization_code grant (RFC 6749 §4.1)" do
+    test "a deferred DPoP lookup fault cannot bypass replay claiming and consume a code" do
+      start_code_store("oc_user-1", ["read"])
+      OneShotLookupFailureCodeStore.fail_next_lookup()
+      test_pid = self()
+
+      config =
+        config(
+          code_store: OneShotLookupFailureCodeStore,
+          dpop_enabled: true,
+          replay_check: fn _key, _ttl ->
+            send(test_pid, :dpop_replay_claimed)
+            :ok
+          end
+        )
+
+      {proof, _jkt} = dpop_proof_and_jkt()
+      public_client = Map.put(@client, :public?, true)
+
+      request =
+        request(config,
+          client: public_client,
+          client_auth_method: :none,
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          },
+          sender_constraint_input: %{
+            dpop_proof: proof,
+            mtls_cert_der: nil,
+            http_uri: "https://issuer.example/oauth/token",
+            http_method: "POST"
+          }
+        )
+
+      assert_raise RuntimeError, ~r/get\/1 violated its grant-store return contract/, fn ->
+        Token.issue(config, request)
+      end
+
+      refute_received {OneShotLookupFailureCodeStore, :take_called}
+      refute_received :dpop_replay_claimed
+
+      assert {:ok, _entry} =
+               ETS.get(Attesto.Secret.hash(Process.get(:auth_code)))
+    end
+
     test "one authenticated client_id snapshot binds code, ID Token, refresh family, and rotation" do
       code_store = start_code_store("oc_user-1", ["openid", "offline_access"])
       refresh_store = start_refresh_store()
@@ -441,7 +642,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
           params: %{"refresh_token" => response.refresh_token}
         )
 
-      assert {:ok, refreshed, [%Event{name: :refresh_rotated, client_id: "client-1"}]} =
+      assert {:ok, refreshed, [%Event{name: :refresh_rotated, client_id: "client-1", subject: "oc_user-1"}]} =
                Token.issue(config, refresh_request)
 
       assert claim!(refreshed.access_token, "client_id") == "client-1"
@@ -494,7 +695,11 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert [
                %Event{name: :token_issued},
-               %Event{name: :refresh_issued, grant_type: "authorization_code"} = event
+               %Event{
+                 name: :refresh_issued,
+                 grant_type: "authorization_code",
+                 subject: "oc_user-1"
+               } = event
              ] = events
 
       assert event.metadata == %{
@@ -571,6 +776,41 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                Token.issue(config, grant_id_refresh_request(config, initial.refresh_token))
 
       assert claim!(refreshed.access_token, claim) == "fam-1"
+    end
+
+    test "a 2.14.2 authorization-code refresh marker preserves the legacy family claim" do
+      claim = "https://api.example.com/claims/oauth_grant_id"
+      refresh_store = start_refresh_store()
+      refresh_token = "legacy-refresh-token"
+      now = System.system_time(:second)
+
+      assert :ok =
+               Attesto.RefreshStore.ETS.insert(%{
+                 token_hash: Attesto.Secret.hash(refresh_token),
+                 family_id: "legacy-family",
+                 generation: 0,
+                 data: %{
+                   subject: "oc_user-1",
+                   scope: ["read"],
+                   resource: [],
+                   client_id: "client-1",
+                   dpop_jkt: nil,
+                   acr: nil,
+                   auth_time: nil,
+                   claims: %{"attesto_phoenix.authorization_grant_type" => "authorization_code"}
+                 },
+                 expires_at: now + 600,
+                 consumed: false,
+                 consumed_at: nil,
+                 successor: nil
+               })
+
+      config = config(refresh_store: refresh_store, authorization_grant_id_claim: claim)
+
+      assert {:ok, refreshed, _events} =
+               Token.issue(config, grant_id_refresh_request(config, refresh_token))
+
+      assert claim!(refreshed.access_token, claim) == "legacy-family"
     end
 
     test "a family started while the feature was disabled stays ineligible once it is enabled" do
@@ -658,6 +898,56 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "refresh_token grant (RFC 6749 §6)" do
+    test "a deferred DPoP lookup fault cannot bypass replay claiming and rotate a refresh token" do
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1"
+        })
+
+      OneShotLookupFailureRefreshStore.fail_next_lookup()
+      test_pid = self()
+
+      config =
+        config(
+          refresh_store: OneShotLookupFailureRefreshStore,
+          dpop_enabled: true,
+          replay_check: fn _key, _ttl ->
+            send(test_pid, :dpop_replay_claimed)
+            :ok
+          end
+        )
+
+      {proof, _jkt} = dpop_proof_and_jkt()
+      public_client = Map.put(@client, :public?, true)
+
+      request =
+        request(config,
+          client: public_client,
+          client_auth_method: :none,
+          grant_type: "refresh_token",
+          params: %{"refresh_token" => refresh_token},
+          sender_constraint_input: %{
+            dpop_proof: proof,
+            mtls_cert_der: nil,
+            http_uri: "https://issuer.example/oauth/token",
+            http_method: "POST"
+          }
+        )
+
+      assert_raise RuntimeError, ~r/get\/1 violated its grant-store return contract/, fn ->
+        Token.issue(config, request)
+      end
+
+      refute_received :dpop_replay_claimed
+
+      assert {:ok, %{consumed: false}} =
+               Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+    end
+
     test "a DPoP refresh_rotated event carries the token type and jkt" do
       {proof, jkt} = dpop_proof_and_jkt()
       refresh_store = start_refresh_store()
@@ -693,7 +983,9 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
           }
         )
 
-      assert {:ok, response, [%Event{name: :refresh_rotated} = event]} = Token.issue(config, request)
+      assert {:ok, response, [%Event{name: :refresh_rotated, subject: "oc_user-1"} = event]} =
+               Token.issue(config, request)
+
       assert response.token_type == "DPoP"
       assert is_binary(response.refresh_token)
 
@@ -703,6 +995,40 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                sender_constraint: :dpop,
                cnf: %{"jkt" => jkt}
              }
+    end
+
+    test "an actual refresh-token reuse returns the advertised reuse event before the denial event" do
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1"
+        })
+
+      config =
+        config(
+          refresh_store: refresh_store,
+          refresh_token_rotation_grace_seconds: 0
+        )
+
+      request = request(config, grant_type: "refresh_token", params: %{"refresh_token" => refresh_token})
+
+      assert {:ok, _response, [%Event{name: :refresh_rotated, subject: "oc_user-1"}]} =
+               Token.issue(config, request)
+
+      assert {:error, %OAuthError{error: :invalid_grant},
+              [
+                %Event{
+                  name: :refresh_reuse_detected,
+                  client_id: "client-1",
+                  grant_type: "refresh_token",
+                  result: :reuse_detected,
+                  metadata: %{client_ip: "203.0.113.7", reason: :reuse_detected}
+                },
+                %Event{name: :token_denied, result: "invalid_grant"}
+              ]} = Token.issue(config, request)
     end
 
     test "RFC 9470: a refresh preserves the ORIGINAL auth_time (never re-stamped)" do
@@ -948,7 +1274,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert {:error, %OAuthError{error: :invalid_grant}, _events} =
                Token.issue(config, pre_authorized_request(config, "unknown"))
 
-      expired = issue_pre_authorized_code(ttl: 0)
+      expired = issue_pre_authorized_code(ttl: 1, now: System.system_time(:second) - 10)
 
       assert {:error, %OAuthError{error: :invalid_grant}, _events} =
                Token.issue(config, pre_authorized_request(config, expired))
@@ -1477,6 +1803,21 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert event.metadata.cnf == nil
     end
 
+    test "an unexpected scope-policy failure is not converted to a client error" do
+      config = config(authorize_scope: fn _client, _requested -> {:error, :store_unavailable} end)
+      request = request(config, params: %{"scope" => "read"})
+
+      error =
+        assert_raise RuntimeError, fn ->
+          Token.issue(config, request)
+        end
+
+      assert Exception.message(error) ==
+               "AttestoPhoenix.Config :authorize_scope callback violated its return contract"
+
+      refute Exception.message(error) =~ "store_unavailable"
+    end
+
     test "the request-derived client_id is the denial fallback when no :client_id callback" do
       config = config(client_id: nil)
 
@@ -1510,6 +1851,35 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                Token.issue(config, request)
 
       assert is_binary(token)
+    end
+
+    test "nil is the only callback result that leaves the per-client catalog unrestricted" do
+      config = config(client_grant_types: fn _client -> nil end)
+      request = request(config, params: %{"scope" => "read"})
+
+      assert {:ok, %{access_token: token}, [%Event{name: :token_issued}]} =
+               Token.issue(config, request)
+
+      assert is_binary(token)
+    end
+
+    test "an explicit empty per-client catalog denies every grant" do
+      config = config(client_grant_types: fn _client -> [] end)
+      request = request(config, grant_type: "client_credentials")
+
+      assert {:error, %OAuthError{error: :unsupported_grant_type}, [%Event{name: :token_denied}]} =
+               Token.issue(config, request)
+    end
+
+    test "malformed per-client catalog results fail loudly instead of widening access" do
+      for invalid <- [:error, {:error, :store_down}, "client_credentials", ["client_credentials", ""]] do
+        config = config(client_grant_types: fn _client -> invalid end)
+        request = request(config, grant_type: "client_credentials")
+
+        assert_raise ArgumentError, ~r/:client_grant_types callback must return nil or a list/, fn ->
+          Token.issue(config, request)
+        end
+      end
     end
   end
 

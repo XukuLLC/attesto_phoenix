@@ -14,7 +14,7 @@ defmodule AttestoPhoenix.Controller.PARController do
   credential-stripping, and DPoP-binding decision lives in that conn-free core.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
@@ -25,7 +25,7 @@ defmodule AttestoPhoenix.Controller.PARController do
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- RequestContext.check_https(conn, config),

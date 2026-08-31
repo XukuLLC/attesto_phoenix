@@ -16,7 +16,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   `invalid_request` (the route should not be mounted at all when disabled).
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
@@ -30,7 +30,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
 
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_enabled(config),

@@ -7,6 +7,12 @@ defmodule AttestoPhoenix.Config do
   `otp_app`/config key), validates the required keys, applies neutral defaults,
   and derives the `Attesto.Config` the protocol layer needs.
 
+  Controller actions resolve the already validated request configuration with
+  `resolve!/1`, which reads `%AttestoPhoenix.Config{}` from
+  `conn.private[:attesto_phoenix_config]`. The zero-argument `resolve!/0`
+  remains available for non-request code that intentionally reads the global
+  application configuration.
+
   Build one with `new/1` (from a keyword list or map) or `from_otp_app/2` (to
   read `Application.get_env/2`). Validation raises `ArgumentError` on a missing
   required key so misconfiguration fails fast at boot.
@@ -318,6 +324,13 @@ defmodule AttestoPhoenix.Config do
       `{:denied, reason}` to refuse (reported to the client as `access_denied`,
       RFC 6749 §4.1.2.1). When unset, consent is implicitly granted for the
       authenticated subject.
+    * `:notify_ciba_user` - `(auth_req_id, request, subject -> :ok | {:error,
+      reason})`. Starts the out-of-band user-authentication step for a CIBA
+      request. It runs asynchronously after the request is persisted, so the
+      §7.3 acknowledgement never waits for the notification. Only `:ok` is a
+      successful dispatch; an `{:error, reason}`, exception, or any other
+      return is logged as a failure and the authentication request remains
+      pending.
     * `:client_public?` - `(client -> boolean())`. Returns whether a client
       may authenticate without a secret and rely on PKCE.
     * `:client_native?` - `(client -> boolean())`. Returns whether a client is
@@ -340,6 +353,10 @@ defmodule AttestoPhoenix.Config do
       `:refresh_store` is configured.
     * `:code_store` - module implementing `Attesto.CodeStore`.
     * `:refresh_store` - module implementing `Attesto.RefreshStore`.
+      `AttestoPhoenix.Store.EctoRefreshStore` with a non-zero rotation grace
+      also requires `config :attesto_phoenix, :refresh_successor_secret` to be
+      a stable secret of at least 32 bytes. The config builder rejects that
+      combination when the secret is missing or invalid.
     * `:par_store` - module implementing `AttestoPhoenix.PARStore`. Defaults to
       the single-node `AttestoPhoenix.Store.PAR.ETS`; use
       `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
@@ -486,14 +503,20 @@ defmodule AttestoPhoenix.Config do
     * `:trusted_proxies` - list of trusted proxy CIDRs/IPs controlling whether
       `X-Forwarded-*` headers are honored. Default `[]` (no forwarded trust).
     * `:access_token_ttl` - access-token lifetime, seconds. Default `900`.
-    * `:refresh_token_ttl` - refresh-token lifetime, seconds. Default `1_209_600`.
+    * `:refresh_token_ttl` - refresh-token lifetime, seconds. Must be a positive
+      integer no greater than `2_147_483_647`. Default `1_209_600`.
     * `:refresh_token_rotation_grace_seconds` - idempotency window, in
       seconds, during which a just-rotated refresh token can be retried and
       receive the same successor refresh token instead of being treated as a
-      reuse attack. Default `60`; set `0` for strict immediate reuse
+      reuse attack. Must be a non-negative integer no greater than
+      `:refresh_token_ttl`. Default `60`; set `0` for strict immediate reuse
       revocation. A non-zero window is important for clients that lose the
       first rotation response and retry the previous token (OAuth 2.0 Security
-      BCP §4.13; FAPI 2.0 Security Profile §5.3.2.1).
+      BCP §4.14.2; FAPI 2.0 Security Profile §5.3.2.1). With the bundled Ecto
+      refresh store, a non-zero value requires the application-wide
+      `:refresh_successor_secret` described under `:refresh_store`, a positive
+      `:sweep_interval_ms`, and supervision of the packaged sweeper or an
+      equivalent cleanup process.
     * `:authorization_code_ttl` - authorization-code lifetime, seconds. Default `60`.
     * `:dpop_enabled` - enable DPoP sender-constraint support. Default `true`.
     * `:dpop_nonce_required` - require server-issued DPoP nonces. Default `false`.
@@ -555,8 +578,11 @@ defmodule AttestoPhoenix.Config do
       that require signed authentication requests must set this explicitly so
       request-JWT replay protection cannot be omitted or left unsupervised. An
       optional signed request is rejected at runtime when this callback is nil.
-    * `:nonce_store` - `Attesto.DPoP.NonceStore` implementation. Defaults to
-      the single-node ETS nonce store.
+    * `:nonce_store` - `Attesto.DPoP.NonceStore` implementation. No store is
+      selected by default. A capable store is required when
+      `:dpop_nonce_required` is `true`; use
+      `Attesto.DPoP.NonceStore.ETS` on one node or
+      `AttestoPhoenix.Store.EctoNonceStore` across nodes.
     * `:presentation_session_store` - module implementing
       `Attesto.PresentationSessionStore` for verifier-side OID4VP request state.
       Required when the host mounts the `presentation: true` routes or calls
@@ -577,10 +603,18 @@ defmodule AttestoPhoenix.Config do
       Defaults to `"direct_post"`; set to `"direct_post.jwt"` to require an
       encrypted authorization response. That mode also requires a usable
       `:verifier_encryption_keystore` when a presentation request is created.
-    * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`. The
-      sweeper is not started if unset.
-    * `:table_prefix` - optional Ecto schema/table prefix for the generated
-      tables.
+    * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`.
+      `start_link/1` rejects an unset or non-positive value. The installer adds
+      the supervised process automatically; manual Ecto configurations must
+      add it after the repo when positive refresh retry grace is enabled.
+      Configuration validates the interval but cannot prove that the host has
+      actually supervised the process.
+    * `:schema_prefix` - optional PostgreSQL schema selected by Ecto's
+      `prefix:` option for every generated table and index. It must be `nil` or
+      a non-empty, lowercase ASCII PostgreSQL schema identifier containing only
+      letters, digits, and underscores, beginning with a letter or underscore
+      and no longer than 63 bytes. The 2.x `:table_prefix` option is rejected;
+      it meant literal table-name prefixing and cannot be reinterpreted safely.
 
   ### Endpoint paths advertised in metadata
 
@@ -661,6 +695,8 @@ defmodule AttestoPhoenix.Config do
   alias Attesto.ResourceIndicator
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
+  alias AttestoPhoenix.Store.EctoRefreshStore
+  alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.URLComparison
 
   # Only the plain required *values* are enforced by `struct!/2`. The required
@@ -669,6 +705,12 @@ defmodule AttestoPhoenix.Config do
   # behaviour module (`:client_store` / `:principal_store`) instead of a flat
   # callback. They are validated by resolution in `validate!/1` so the
   # behaviour-module install path actually works.
+  @max_refresh_token_ttl_seconds 2_147_483_647
+  # PostgreSQL truncates unquoted identifiers at NAMEDATALEN - 1 bytes. Keep
+  # this setting deliberately narrower than the quoted-identifier grammar so
+  # it is safe to use as an Ecto schema prefix in every generated query.
+  @max_schema_prefix_bytes 63
+  @request_config_process_key {__MODULE__, :request_config}
   @enforce_keys [
     :issuer,
     :keystore,
@@ -750,7 +792,7 @@ defmodule AttestoPhoenix.Config do
     :replay_check,
     :nonce_store,
     :sweep_interval_ms,
-    :table_prefix,
+    :schema_prefix,
     :authorize_path,
     :token_path,
     :par_path,
@@ -901,7 +943,7 @@ defmodule AttestoPhoenix.Config do
           replay_check: callback() | nil,
           nonce_store: module() | nil,
           sweep_interval_ms: pos_integer() | nil,
-          table_prefix: String.t() | nil,
+          schema_prefix: String.t() | nil,
           oauth_path_prefix: String.t(),
           authorize_path: String.t() | nil,
           token_path: String.t() | nil,
@@ -957,6 +999,14 @@ defmodule AttestoPhoenix.Config do
           ciba_ping_http_client: module(),
           ciba: keyword(),
           backchannel_authentication_path: String.t() | nil,
+          terminate_session: callback() | nil,
+          render_logged_out: callback() | nil,
+          client_post_logout_redirect_uris: callback() | nil,
+          client_backchannel_logout_uri: callback() | nil,
+          client_backchannel_logout_session_required: callback() | nil,
+          client_frontchannel_logout_uri: callback() | nil,
+          client_frontchannel_logout_session_required: callback() | nil,
+          check_session_path: String.t() | nil,
           logout: keyword(),
           session_management: keyword()
         }
@@ -976,9 +1026,21 @@ defmodule AttestoPhoenix.Config do
   `:registration_enabled`, or `:cert_der` when `:mtls_enabled`).
   """
   @spec new(keyword() | map()) :: t()
-  def new(opts) when is_list(opts), do: opts |> Map.new() |> new()
+  def new(opts) when is_list(opts) do
+    reject_malformed_prefix_keys!(opts)
+    opts |> Map.new() |> new()
+  end
 
   def new(opts) when is_map(opts) do
+    reject_legacy_global_table_prefix!()
+    reject_malformed_prefix_keys!(opts)
+    reject_legacy_table_prefix!(opts)
+
+    # Validate this raw input before struct construction so malformed prefixes
+    # are still rejected even though the validated `t()` field is typed as
+    # `String.t() | nil`.
+    validate_schema_prefix!(Map.get(opts, :schema_prefix))
+
     __MODULE__
     |> struct!(opts)
     |> apply_defaults()
@@ -1144,6 +1206,7 @@ defmodule AttestoPhoenix.Config do
   ]
 
   defp normalize_device_authorization(nil), do: @device_authorization_defaults
+
   defp normalize_device_authorization(opts) when is_list(opts), do: Keyword.merge(@device_authorization_defaults, opts)
 
   # OpenID Connect CIBA Core 1.0. `enabled: true` adds
@@ -1180,7 +1243,11 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_ciba(opts) when is_list(opts) do
     enforce_fapi_alg_policy =
-      Keyword.get(opts, :enforce_fapi_alg_policy, not Keyword.has_key?(opts, :request_signing_algs))
+      Keyword.get(
+        opts,
+        :enforce_fapi_alg_policy,
+        not Keyword.has_key?(opts, :request_signing_algs)
+      )
 
     @ciba_defaults
     |> Keyword.merge(opts)
@@ -1234,9 +1301,47 @@ defmodule AttestoPhoenix.Config do
   """
   @spec from_otp_app(atom(), atom()) :: t()
   def from_otp_app(otp_app, key \\ __MODULE__) when is_atom(otp_app) do
-    otp_app
-    |> Application.get_env(key, [])
-    |> new()
+    reject_legacy_global_table_prefix!()
+
+    case Application.get_env(otp_app, key, []) do
+      %__MODULE__{} = config -> validate_existing_config!(config)
+      opts -> new(opts)
+    end
+  end
+
+  # A struct placed directly in the application environment skips `new/1`'s
+  # constructor path. Run the same full validation on it so a stale or manually
+  # assembled struct cannot bypass security-critical checks (in particular the
+  # Ecto successor secret and required PAR atomic-claim checks). Request-local
+  # configs are intentionally not re-resolved here: they were already built by
+  # the host and remain isolated through `resolve!/1`/`with_request_config/2`.
+  defp validate_existing_config!(%__MODULE__{} = config) do
+    validate_request_config!(config)
+    validate!(config)
+  end
+
+  # Request-local configs are often assembled from a profile's partial options
+  # and may intentionally omit unrelated defaults. Validate the prefix and
+  # legacy sentinels before storing or resolving them without imposing the
+  # global application's full callback contract on a request profile.
+  defp validate_request_config!(%__MODULE__{} = config) do
+    reject_legacy_global_table_prefix!()
+    reject_malformed_prefix_keys!(config)
+    reject_legacy_table_prefix!(config)
+    validate_request_repo!(config.repo)
+    validate_schema_prefix!(config.schema_prefix)
+    config
+  end
+
+  # Request-local configs bypass the full application validation because they
+  # are deliberately allowed to carry only the fields needed by that request.
+  # The Ecto repository is different: allowing it to be absent or non-module
+  # would make a store silently fall back to another tenant's repository.
+  defp validate_request_repo!(repo) when is_atom(repo) and not is_nil(repo), do: :ok
+
+  defp validate_request_repo!(_repo) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: request config must contain a valid Ecto.Repo module"
   end
 
   @doc """
@@ -1249,8 +1354,122 @@ defmodule AttestoPhoenix.Config do
   """
   @spec resolve!() :: t()
   def resolve! do
+    reject_legacy_global_table_prefix!()
     otp_app = Application.get_env(:attesto_phoenix, :otp_app)
     from_otp_app(otp_app, __MODULE__)
+  end
+
+  @doc "Return the bounded operation's request config, or `nil` outside one."
+  @spec request_config() :: t() | nil
+  def request_config do
+    case Process.get(@request_config_process_key) do
+      %__MODULE__{} = config -> config
+      _ -> nil
+    end
+  end
+
+  @doc """
+  Run a conn-free callback with `config` as the request-local configuration.
+
+  The previous process-local value is restored even if `fun` raises. This is
+  useful to hosts that invoke a store outside the normal Plug request path.
+  """
+  @spec with_request_config(t(), (-> result)) :: result when result: var
+  def with_request_config(%__MODULE__{} = config, fun) when is_function(fun, 0) do
+    previous = Process.get(@request_config_process_key, :__attesto_missing_request_config__)
+    install_request_config(config)
+
+    try do
+      fun.()
+    after
+      restore_request_config(previous)
+    end
+  end
+
+  defp install_request_config(%__MODULE__{} = config) do
+    config = validate_request_config!(config)
+    Process.put(@request_config_process_key, config)
+    config
+  end
+
+  @doc """
+  Resolve the Ecto schema prefix for the current operation.
+
+  A request-local config installed by `with_request_config/2` wins. Without
+  one, the fallback is the validated host `AttestoPhoenix.Config` read under
+  the configured `:otp_app`; this function deliberately does not consult a
+  separate `config :attesto_phoenix, :table_prefix` key. In 3.0 the public
+  option is `:schema_prefix`; `:table_prefix` is reserved for the internal
+  accessor retained for store compatibility.
+  """
+  @spec table_prefix() :: String.t() | nil
+  def table_prefix do
+    reject_legacy_global_table_prefix!()
+
+    case request_config() do
+      %__MODULE__{} = config ->
+        validate_request_config!(config).schema_prefix
+
+      nil ->
+        case Application.get_env(:attesto_phoenix, :otp_app) do
+          nil ->
+            nil
+
+          otp_app when is_atom(otp_app) ->
+            resolve!().schema_prefix
+
+          _other ->
+            raise ArgumentError,
+                  "#{inspect(__MODULE__)} expected config :attesto_phoenix, :otp_app to be an atom"
+        end
+    end
+  end
+
+  @doc "Resolve the prefix from an explicit config or connection."
+  @spec table_prefix(t() | Plug.Conn.t()) :: String.t() | nil
+  def table_prefix(%__MODULE__{} = config) do
+    validate_request_config!(config).schema_prefix
+  end
+
+  def table_prefix(%Plug.Conn{} = conn), do: conn |> resolve!() |> table_prefix()
+
+  @doc "Resolve the public PostgreSQL schema prefix from a validated config."
+  @spec schema_prefix() :: String.t() | nil
+  def schema_prefix, do: table_prefix()
+
+  @spec schema_prefix(t() | Plug.Conn.t()) :: String.t() | nil
+  def schema_prefix(%__MODULE__{} = config), do: table_prefix(config)
+
+  def schema_prefix(%Plug.Conn{} = conn), do: conn |> resolve!() |> schema_prefix()
+
+  defp restore_request_config(:__attesto_missing_request_config__), do: Process.delete(@request_config_process_key)
+
+  defp restore_request_config(previous), do: Process.put(@request_config_process_key, previous)
+
+  @doc """
+  Resolves the validated config installed on a request connection.
+
+  Controllers must use this request-scoped value so a host can select a
+  validated configuration per request. A missing or malformed private value is
+  a pipeline wiring error and fails closed with `ArgumentError`; this function
+  never falls back to application configuration.
+  """
+  @spec resolve!(Plug.Conn.t()) :: t()
+  def resolve!(%Plug.Conn{} = conn) do
+    case conn.private do
+      %{attesto_phoenix_config: %__MODULE__{} = config} ->
+        validate_request_config!(config)
+
+      %{attesto_phoenix_config: _other} ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)} expected conn.private[:attesto_phoenix_config] " <>
+                "to contain a validated %AttestoPhoenix.Config{}"
+
+      _ ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)} expected conn.private[:attesto_phoenix_config] " <>
+                "to contain %AttestoPhoenix.Config{}; wire the host pipeline that assigns it"
+    end
   end
 
   @doc "The configured keystore used for ID-token and authorization-server signing."
@@ -1287,6 +1506,11 @@ defmodule AttestoPhoenix.Config do
   @doc """
   Returns the configured Ecto repository, raising when it is unset.
 
+  A validated request-local config always wins. Without a request config, the
+  host config under the configured `:otp_app` is used. A package-level `:repo`
+  is retained only for legacy deployments that have no `:otp_app` pointer; it
+  is never used to rescue a missing or malformed request/host config.
+
   `missing_message` is available for adapters that have a more specific
   existing error message; the lookup and default failure stay shared.
   """
@@ -1295,11 +1519,56 @@ defmodule AttestoPhoenix.Config do
 
   @spec ecto_repo!(String.t()) :: module()
   def ecto_repo!(missing_message) when is_binary(missing_message) do
-    case Application.get_env(:attesto_phoenix, :repo) do
-      nil -> raise ArgumentError, missing_message
-      repo -> repo
+    case request_config() do
+      %__MODULE__{} = config ->
+        request_repo!(validate_request_config!(config), missing_message)
+
+      nil ->
+        configured_repo!(missing_message)
     end
   end
+
+  defp configured_repo!(missing_message) do
+    case Application.get_env(:attesto_phoenix, :otp_app) do
+      nil ->
+        legacy_repo!(missing_message)
+
+      otp_app when is_atom(otp_app) ->
+        configured_otp_repo!(otp_app, missing_message)
+
+      _other ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config expected config :attesto_phoenix, :otp_app to be an atom"
+    end
+  end
+
+  defp legacy_repo!(missing_message) do
+    # This is the intentionally narrow compatibility path for 2.x-style
+    # package configuration. Once an otp_app pointer exists, an absent or
+    # malformed host config must fail closed rather than crossing tenants.
+    case Application.get_env(:attesto_phoenix, :repo) do
+      repo when is_atom(repo) and not is_nil(repo) -> repo
+      _other -> raise ArgumentError, missing_message
+    end
+  end
+
+  defp configured_otp_repo!(otp_app, missing_message) do
+    case Application.get_env(otp_app, __MODULE__, :__attesto_missing_config__) do
+      :__attesto_missing_config__ ->
+        raise ArgumentError, missing_message
+
+      %__MODULE__{} = config ->
+        request_repo!(validate_existing_config!(config), missing_message)
+
+      _opts ->
+        config = from_otp_app(otp_app, __MODULE__)
+        request_repo!(config, missing_message)
+    end
+  end
+
+  defp request_repo!(%__MODULE__{repo: repo}, _missing_message) when is_atom(repo) and not is_nil(repo), do: repo
+
+  defp request_repo!(_config, missing_message), do: raise(ArgumentError, missing_message)
 
   @doc """
   Returns the merged, defaulted Client ID Metadata Document (CIMD) options.
@@ -1612,7 +1881,12 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp normalize_ciba_registration(map) when is_map(map), do: map
-  defp normalize_ciba_registration(_other), do: %{}
+  defp normalize_ciba_registration(nil), do: %{}
+
+  defp normalize_ciba_registration(_other) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :client_ciba_registration callback must return a map or nil"
+  end
 
   @doc "The merged, defaulted OpenID Connect logout (RP-Initiated + Back-Channel) options."
   @spec logout(t()) :: keyword()
@@ -1719,10 +1993,10 @@ defmodule AttestoPhoenix.Config do
   defp blocked_logout_host?(host) do
     down = String.downcase(host)
 
-    cond do
-      down in ~w(localhost) -> true
-      String.ends_with?(down, ".localhost") -> true
-      true -> blocked_literal_ip?(host)
+    if Enum.any?([down == "localhost", String.ends_with?(down, ".localhost")]) do
+      true
+    else
+      blocked_literal_ip?(host)
     end
   end
 
@@ -1758,10 +2032,9 @@ defmodule AttestoPhoenix.Config do
   """
   @spec client_backchannel_logout_session_required(t(), term()) :: boolean()
   def client_backchannel_logout_session_required(%__MODULE__{} = config, client) do
-    case resolve_callback(config, :client_backchannel_logout_session_required) do
-      nil -> false
-      cb -> Callback.invoke(cb, [client], false) == true
-    end
+    config
+    |> resolve_callback(:client_backchannel_logout_session_required)
+    |> Callback.invoke_boolean([client], false, :client_backchannel_logout_session_required)
   end
 
   @doc """
@@ -1812,8 +2085,12 @@ defmodule AttestoPhoenix.Config do
   # POST target.
   defp safe_frontchannel_uri?(uri) do
     case URI.new(uri) do
-      {:ok, %URI{scheme: "https", host: host, userinfo: nil}} when is_binary(host) and host != "" -> true
-      _ -> false
+      {:ok, %URI{scheme: "https", host: host, userinfo: nil}}
+      when is_binary(host) and host != "" ->
+        true
+
+      _ ->
+        false
     end
   end
 
@@ -1824,10 +2101,9 @@ defmodule AttestoPhoenix.Config do
   """
   @spec client_frontchannel_logout_session_required(t(), term()) :: boolean()
   def client_frontchannel_logout_session_required(%__MODULE__{} = config, client) do
-    case resolve_callback(config, :client_frontchannel_logout_session_required) do
-      nil -> false
-      cb -> Callback.invoke(cb, [client], false) == true
-    end
+    config
+    |> resolve_callback(:client_frontchannel_logout_session_required)
+    |> Callback.invoke_boolean([client], false, :client_frontchannel_logout_session_required)
   end
 
   @doc "The merged, defaulted OpenID Connect Session Management 1.0 options."
@@ -1855,7 +2131,9 @@ defmodule AttestoPhoenix.Config do
   """
   @spec browser_state_cookie(t()) :: String.t()
   def browser_state_cookie(%__MODULE__{} = config) do
-    config |> session_management() |> Keyword.get(:browser_state_cookie, "__Host-attesto_op_browser_state")
+    config
+    |> session_management()
+    |> Keyword.get(:browser_state_cookie, "__Host-attesto_op_browser_state")
   end
 
   @doc "The OP browser-state cookie lifetime, in seconds."
@@ -2355,22 +2633,61 @@ defmodule AttestoPhoenix.Config do
   @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
   @grant_ciba "urn:openid:params:grant-type:ciba"
 
-  @spec grant_types_supported(t()) :: [String.t()]
-  def grant_types_supported(%__MODULE__{grant_types_supported: list} = config) when is_list(list) and list != [],
-    do:
-      list
-      |> maybe_add_jwt_bearer(config)
-      |> maybe_add_device_code(config)
-      |> maybe_add_pre_authorized_code(config)
-      |> maybe_add_ciba(config)
+  @default_token_endpoint_auth_methods_supported [
+    "client_secret_basic",
+    "client_secret_post",
+    "private_key_jwt",
+    "none"
+  ]
+  @wallet_attestation_auth_method "attest_jwt_client_auth"
 
-  def grant_types_supported(%__MODULE__{} = config),
+  @spec grant_types_supported(t()) :: [String.t()]
+  # A non-nil list is an explicit operator policy, including `[]`; feature
+  # switches must not widen it after validation. Only the nil/default branch
+  # derives optional grants from enabled features.
+  def grant_types_supported(%__MODULE__{grant_types_supported: list} = _config) when is_list(list), do: list
+
+  def grant_types_supported(%__MODULE__{grant_types_supported: nil} = config),
     do:
       @default_grant_types_supported
       |> maybe_add_jwt_bearer(config)
       |> maybe_add_device_code(config)
       |> maybe_add_pre_authorized_code(config)
       |> maybe_add_ciba(config)
+
+  def grant_types_supported(%__MODULE__{}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :grant_types_supported must be nil or a list of non-empty strings"
+  end
+
+  @doc """
+  The client-authentication methods accepted at the token endpoint.
+
+  This is the single catalog used by endpoint enforcement, discovery, and
+  dynamic registration. When no explicit catalog is configured, wallet
+  attestation is added only when trusted Wallet Provider keys are available.
+  An explicitly configured catalog is never widened, and wallet attestation is
+  removed when its verification keys are absent.
+  """
+  @spec token_endpoint_auth_methods_supported(t()) :: [String.t()]
+  def token_endpoint_auth_methods_supported(%__MODULE__{token_endpoint_auth_methods_supported: methods} = config)
+      when is_list(methods), do: maybe_enable_wallet_attestation(methods, config, false)
+
+  def token_endpoint_auth_methods_supported(%__MODULE__{token_endpoint_auth_methods_supported: nil} = config),
+    do: maybe_enable_wallet_attestation(@default_token_endpoint_auth_methods_supported, config, true)
+
+  def token_endpoint_auth_methods_supported(%__MODULE__{}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :token_endpoint_auth_methods_supported must be nil or a list of non-empty strings"
+  end
+
+  defp maybe_enable_wallet_attestation(methods, config, add_when_configured?) do
+    case trusted_wallet_provider_jwks(config) do
+      nil -> Enum.reject(methods, &(&1 == @wallet_attestation_auth_method))
+      _jwks when add_when_configured? -> methods ++ [@wallet_attestation_auth_method]
+      _jwks -> methods
+    end
+  end
 
   defp maybe_add_jwt_bearer(list, %__MODULE__{} = config) do
     if jwt_bearer_enabled?(config) and @grant_jwt_bearer not in list,
@@ -2530,6 +2847,165 @@ defmodule AttestoPhoenix.Config do
     build_id_token_claims: {:claims_provider, :build_id_token_claims, 4}
   }
 
+  # Flat callbacks that are not provided by one of the behaviour-module
+  # resolution entries above. The value is the number of request arguments
+  # passed to `Callback.invoke/2`; a `{module, function, extra_args}` callback
+  # must export this arity plus the number of extra arguments.
+  @flat_callback_arities %{
+    send_error: 3,
+    no_store: 1,
+    www_authenticate: 2,
+    resource_metadata_resolver: 1,
+    htu: 1,
+    cert_der: 1,
+    forwarded_cert_der: 1,
+    client_certificate_chain_validated?: 2,
+    introspection_authorize: 2,
+    build_credential: 3,
+    build_deferred_credential: 2,
+    authenticate_device_user: 1,
+    render_device_verification: 2,
+    authenticate_ciba_user: 1,
+    notify_ciba_user: 3,
+    issue_refresh_token?: 2,
+    replay_check: 2,
+    terminate_session: 2,
+    render_logged_out: 2
+  }
+
+  @max_callback_arity 255
+
+  defp callback_contract(callback, arity) when is_function(callback) do
+    if is_function(callback, arity), do: :ok, else: :wrong_arity
+  end
+
+  defp callback_contract({module, fun}, arity) when is_atom(module) and is_atom(fun) do
+    callback_mfa_contract(module, fun, arity)
+  end
+
+  defp callback_contract({module, fun, extra}, arity) when is_atom(module) and is_atom(fun) and is_list(extra) do
+    case callback_extra_arity(extra, arity) do
+      {:ok, effective_arity} -> callback_mfa_contract(module, fun, effective_arity)
+      :too_many -> :wrong_arity
+    end
+  end
+
+  defp callback_contract(_callback, _arity), do: :invalid
+
+  defp callback_mfa_contract(module, fun, arity) do
+    case Code.ensure_loaded(module) do
+      {:module, ^module} ->
+        if function_exported?(module, fun, arity), do: :ok, else: :wrong_arity
+
+      {:error, _reason} ->
+        :unloadable
+    end
+  end
+
+  # Do not walk an arbitrarily large host-provided extra-argument list. Erlang
+  # function arities are capped at 255, so anything beyond the effective limit
+  # is invalid regardless of how many elements follow it.
+  defp callback_extra_arity(extra, call_arity) do
+    max_extra = @max_callback_arity - call_arity
+
+    Enum.reduce_while(extra, 0, fn _arg, count ->
+      if count < max_extra do
+        {:cont, count + 1}
+      else
+        {:halt, :too_many}
+      end
+    end)
+    |> case do
+      :too_many -> :too_many
+      extra_count -> {:ok, call_arity + extra_count}
+    end
+  end
+
+  defp callback_label(key) when is_atom(key), do: inspect(key)
+  defp callback_label(label) when is_binary(label), do: label
+
+  defp callback_arity_description(0), do: "zero-argument"
+  defp callback_arity_description(1), do: "one-argument"
+  defp callback_arity_description(2), do: "two-argument"
+  defp callback_arity_description(3), do: "three-argument"
+  defp callback_arity_description(4), do: "four-argument"
+  defp callback_arity_description(arity), do: "#{arity}-argument"
+
+  defp validate_configured_callback!(_key, nil, _arity), do: :ok
+
+  defp validate_configured_callback!(key, callback, arity) do
+    case callback_contract(callback, arity) do
+      :ok ->
+        :ok
+
+      :unloadable ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{callback_label(key)} must be a " <>
+                "#{callback_arity_description(arity)} callback in a supported form; " <>
+                "#{callback_label(key)} callback module cannot be loaded."
+
+      _invalid ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{callback_label(key)} must be a " <>
+                "#{callback_arity_description(arity)} callback in a supported form."
+    end
+  end
+
+  defp validate_function_callback!(_key, nil, _arity), do: :ok
+
+  defp validate_function_callback!(key, callback, arity) when is_function(callback) do
+    if is_function(callback, arity) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: #{callback_label(key)} must be a " <>
+              "#{callback_arity_description(arity)} function."
+    end
+  end
+
+  defp validate_function_callback!(key, _callback, arity) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: #{callback_label(key)} must be a " <>
+            "#{callback_arity_description(arity)} function."
+  end
+
+  defp validate_flat_callbacks!(%__MODULE__{} = config) do
+    Enum.each(@resolution, fn {key, {_store_key, _fun, arity}} ->
+      validate_configured_callback!(key, Map.get(config, key), arity)
+    end)
+
+    Enum.each(@flat_callback_arities, fn {key, arity} ->
+      validate_configured_callback!(key, Map.get(config, key), arity)
+    end)
+
+    # These two options intentionally have narrower contracts than the general
+    # callback type: audiences is invoked with `fun.(config)`, while a list of
+    # principal kinds is also a valid static value.
+    validate_function_callback!(:client_assertion_audiences, config.client_assertion_audiences, 1)
+
+    case config.principal_kinds do
+      nil -> :ok
+      kinds when is_list(kinds) -> :ok
+      callback -> validate_configured_callback!(:principal_kinds, callback, 0)
+    end
+
+    resource_indicators = resource_indicators(config)
+
+    validate_configured_callback!(
+      ":resource_indicators :allowed_resources_for",
+      Keyword.get(resource_indicators, :allowed_resources_for),
+      1
+    )
+
+    jwt_bearer = jwt_bearer(config)
+
+    validate_configured_callback!(
+      ":jwt_bearer :jwks_resolver",
+      Keyword.get(jwt_bearer, :jwks_resolver),
+      2
+    )
+  end
+
   # The behaviour-module Config keys, each paired with the behaviour module it
   # is expected to implement. Used for boot-time conformance validation.
   @behaviour_modules %{
@@ -2571,7 +3047,10 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp callback_exported?(module, fun, arity) do
-    Code.ensure_loaded?(module) and function_exported?(module, fun, arity)
+    case Code.ensure_loaded(module) do
+      {:module, ^module} -> function_exported?(module, fun, arity)
+      {:error, _reason} -> false
+    end
   end
 
   # One resolver fun per flat callback key. Each is a thin alias over
@@ -2595,8 +3074,41 @@ defmodule AttestoPhoenix.Config do
   A required callback (`:load_client` / `AttestoPhoenix.ClientStore`); this
   helper invokes the resolved callback so consumers do not re-derive it.
   """
-  @spec client_store_load(t(), String.t()) :: term()
-  def client_store_load(%__MODULE__{} = config, client_id), do: Callback.invoke(load_client_fun(config), [client_id])
+  @spec client_store_load(t(), String.t()) ::
+          {:ok, term()} | {:error, :not_found | :revoked}
+  def client_store_load(%__MODULE__{} = config, client_id) do
+    case Callback.invoke(load_client_fun(config), [client_id]) do
+      {:ok, _client} = found -> found
+      {:error, reason} = absent when reason in [:not_found, :revoked] -> absent
+      _invalid -> raise RuntimeError, ":load_client callback violated its return contract"
+    end
+  end
+
+  @doc """
+  Resolve the host identifier for an opaque client.
+
+  `absent_default` is used only when no `:client_id` callback is configured.
+  Once configured, the callback must honor its non-empty-string contract;
+  invalid results are integration faults and never fall through to a
+  credential-carried identifier.
+  """
+  @spec client_identifier(t(), term(), term()) :: String.t() | term()
+  def client_identifier(%__MODULE__{} = config, client, absent_default \\ nil) do
+    case client_id_fun(config) do
+      nil ->
+        absent_default
+
+      callback ->
+        case Callback.invoke(callback, [client]) do
+          client_id when is_binary(client_id) and client_id != "" ->
+            client_id
+
+          _invalid ->
+            raise RuntimeError,
+                  "AttestoPhoenix.Config :client_id callback violated its return contract"
+        end
+    end
+  end
 
   @doc """
   Resolve and run the host's constant-time client-secret verification
@@ -2604,7 +3116,13 @@ defmodule AttestoPhoenix.Config do
   """
   @spec client_store_verify_secret(t(), term(), String.t()) :: boolean()
   def client_store_verify_secret(%__MODULE__{} = config, client, presented_secret),
-    do: Callback.invoke(verify_client_secret_fun(config), [client, presented_secret]) == true
+    do:
+      Callback.invoke_boolean(
+        verify_client_secret_fun(config),
+        [client, presented_secret],
+        false,
+        :verify_client_secret
+      )
 
   @doc """
   Invokes the host's `:build_userinfo_claims` callback for the authenticated
@@ -2653,7 +3171,8 @@ defmodule AttestoPhoenix.Config do
           optional(:valid_until) => integer()
         }
 
-  @type credential_result :: sd_jwt_credential_result() | jwt_vc_credential_result() | mdoc_credential_result()
+  @type credential_result ::
+          sd_jwt_credential_result() | jwt_vc_credential_result() | mdoc_credential_result()
 
   @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
   @spec build_credential_fun(t()) :: callback() | nil
@@ -2691,8 +3210,12 @@ defmodule AttestoPhoenix.Config do
   Raises `ArgumentError` when the callback is not configured, so a Deferred
   Credential endpoint request cannot silently issue an empty credential.
   """
+  # Callback results are deliberately broad here: the host function is invoked
+  # dynamically, so the controller must retain its runtime result-contract
+  # check for malformed values even though the documented success form is a
+  # `credential_result()` map.
   @spec build_deferred_credential(t(), String.t(), String.t()) ::
-          {:ok, credential_result()} | {:error, :issuance_pending} | {:error, term()}
+          term()
   def build_deferred_credential(%__MODULE__{} = config, subject, transaction_id) do
     case build_deferred_credential_fun(config) do
       nil ->
@@ -2715,12 +3238,22 @@ defmodule AttestoPhoenix.Config do
   # `:terminate_session` callback could report "logged out" without clearing the
   # session. Refuse to build such a config.
   defp validate_logout!(%__MODULE__{} = config) do
-    if logout_enabled?(config) and is_nil(config.terminate_session) do
-      raise ArgumentError,
-            "AttestoPhoenix.Config: :terminate_session is required when logout is enabled " <>
-              "(logout: [enabled: true]). Add a `terminate_session: &MyApp.AuthZ.terminate_session/2` " <>
-              "callback that clears the host's browser session — the library must not serve an " <>
-              "end-session endpoint that cannot actually log the user out. Or disable logout."
+    case Keyword.get(config.logout, :enabled, false) do
+      true ->
+        case config.terminate_session do
+          nil ->
+            raise ArgumentError,
+                  "AttestoPhoenix.Config: :terminate_session is required when logout is enabled " <>
+                    "(logout: [enabled: true]). Add a `terminate_session: &MyApp.AuthZ.terminate_session/2` " <>
+                    "callback that clears the host's browser session — the library must not serve an " <>
+                    "end-session endpoint that cannot actually log the user out. Or disable logout."
+
+          _callback ->
+            :ok
+        end
+
+      _disabled ->
+        :ok
     end
   end
 
@@ -2818,7 +3351,8 @@ defmodule AttestoPhoenix.Config do
       opts = jwt_bearer(config)
       issuers = Keyword.get(opts, :issuers, %{})
 
-      if (not is_map(issuers) or map_size(issuers) == 0) and is_nil(Keyword.get(opts, :jwks_resolver)) do
+      if (not is_map(issuers) or map_size(issuers) == 0) and
+           is_nil(Keyword.get(opts, :jwks_resolver)) do
         raise ArgumentError,
               "AttestoPhoenix.Config: jwt_bearer requires a non-empty :issuers map " <>
                 "(issuer => [jwks: ... | jwks_uri: ...]) or a :jwks_resolver function " <>
@@ -2908,18 +3442,28 @@ defmodule AttestoPhoenix.Config do
               "AttestoPhoenix.Config: #{config_path} must select a module implementing " <>
                 "#{fun}/#{arity}; got #{inspect(selected)}."
 
-      not Code.ensure_loaded?(selected) ->
-        raise ArgumentError,
-              "AttestoPhoenix.Config: #{config_path} selects #{inspect(selected)}, which cannot " <>
-                "be loaded. Configure a module implementing #{fun}/#{arity}."
+      true ->
+        case Code.ensure_loaded(selected) do
+          {:error, _reason} ->
+            raise ArgumentError,
+                  "AttestoPhoenix.Config: #{config_path} selects #{inspect(selected)}, which cannot " <>
+                    "be loaded. Configure a module implementing #{fun}/#{arity}."
 
-      not function_exported?(selected, fun, arity) ->
+          {:module, ^selected} ->
+            validate_outbound_adapter_export!(selected, fun, arity, config_path)
+        end
+    end
+  end
+
+  defp validate_outbound_adapter_export!(selected, fun, arity, config_path) do
+    case function_exported?(selected, fun, arity) do
+      true ->
+        :ok
+
+      false ->
         raise ArgumentError,
               "AttestoPhoenix.Config: #{config_path} module #{inspect(selected)} does not export " <>
                 "#{fun}/#{arity}."
-
-      true ->
-        :ok
     end
   end
 
@@ -2962,6 +3506,8 @@ defmodule AttestoPhoenix.Config do
       end
     end)
 
+    validate_flat_callbacks!(config)
+
     # Required capabilities are validated by RESOLUTION, not flat-key presence,
     # so installing a behaviour module (`:client_store`/`:principal_store`)
     # satisfies them just as a flat callback does.
@@ -2995,9 +3541,14 @@ defmodule AttestoPhoenix.Config do
     validate_issuer!(config)
     validate_resource_indicators!(config)
     validate_resource_metadata!(config)
-    validate_resource_metadata_resolver!(config)
-    validate_replay_check!(config)
+    validate_boolean_flags!(config)
+    validate_nested_boolean_flags!(config)
+    validate_required_par_store!(config)
+    validate_refresh_rotation!(config)
+    validate_dpop_nonce!(config)
+    validate_key_attestation!(config)
     validate_authorization_grant_id_claim!(config)
+    validate_supported_value_lists!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
@@ -3038,14 +3589,18 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:userinfo_path, config.userinfo_path)
     validate_optional_path!(:device_authorization_path, config.device_authorization_path)
     validate_optional_path!(:device_verification_path, config.device_verification_path)
-    validate_optional_path!(:backchannel_authentication_path, config.backchannel_authentication_path)
+
+    validate_optional_path!(
+      :backchannel_authentication_path,
+      config.backchannel_authentication_path
+    )
+
     validate_optional_path!(:end_session_path, config.end_session_path)
     validate_optional_path!(:check_session_path, config.check_session_path)
 
     validate_discovery_endpoints!(config)
     validate_advertised_paths_consistent!(config)
     validate_native_apps!(config)
-
     config
   end
 
@@ -3087,6 +3642,27 @@ defmodule AttestoPhoenix.Config do
           "AttestoPhoenix.Config: :authorization_grant_id_claim must be nil or a non-empty " <>
             "string; got #{inspect(claim)}"
   end
+
+  defp validate_supported_value_lists!(%__MODULE__{} = config) do
+    Enum.each(
+      [
+        grant_types_supported: config.grant_types_supported,
+        token_endpoint_auth_methods_supported: config.token_endpoint_auth_methods_supported
+      ],
+      fn {key, value} ->
+        if not valid_optional_string_list?(value) do
+          raise ArgumentError,
+                "AttestoPhoenix.Config: #{inspect(key)} must be nil or a list of non-empty strings"
+        end
+      end
+    )
+  end
+
+  defp valid_optional_string_list?(nil), do: true
+
+  defp valid_optional_string_list?(values) when is_list(values), do: Enum.all?(values, &(is_binary(&1) and &1 != ""))
+
+  defp valid_optional_string_list?(_value), do: false
 
   defp validate_mtls_client_auth!(%__MODULE__{} = config) do
     methods = List.wrap(config.token_endpoint_auth_methods_supported)
@@ -3198,20 +3774,6 @@ defmodule AttestoPhoenix.Config do
               "AttestoPhoenix.Config: every :resource_indicators :allowed_resources entry " <>
                 "must be a non-empty absolute URI with no fragment; got #{inspect(invalid)}."
     end
-
-    case Keyword.get(opts, :allowed_resources_for) do
-      nil ->
-        :ok
-
-      callback ->
-        if callback_with_call_arity?(callback, 1) do
-          :ok
-        else
-          raise ArgumentError,
-                "AttestoPhoenix.Config: :resource_indicators :allowed_resources_for must " <>
-                  "be a one-argument callback in a supported form or nil; got #{inspect(callback)}."
-        end
-    end
   end
 
   # RFC 9728 §5.1: when set, :resource_metadata is rendered as a quoted
@@ -3232,42 +3794,356 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  defp validate_resource_metadata_resolver!(%{resource_metadata_resolver: nil}), do: :ok
+  defp validate_refresh_rotation!(%__MODULE__{} = config) do
+    grace = config.refresh_token_rotation_grace_seconds
+    ttl = config.refresh_token_ttl
+    sweep_interval_ms = config.sweep_interval_ms
 
-  defp validate_resource_metadata_resolver!(%{resource_metadata_resolver: resolver}) do
-    if callback_with_call_arity?(resolver, 1) do
-      :ok
-    else
+    validate_refresh_token_ttl!(ttl)
+    validate_refresh_grace!(grace, ttl)
+    validate_sweep_interval!(sweep_interval_ms)
+    validate_refresh_successor_secret!(config, grace)
+    validate_refresh_sweeper!(config, grace, sweep_interval_ms)
+
+    :ok
+  end
+
+  defp validate_refresh_token_ttl!(ttl) when is_integer(ttl) and ttl > 0 do
+    if ttl > @max_refresh_token_ttl_seconds do
       raise ArgumentError,
-            "AttestoPhoenix.Config: :resource_metadata_resolver must be a one-argument " <>
-              "callback in a supported form or nil; got #{inspect(resolver)}."
+            "AttestoPhoenix.Config: :refresh_token_ttl must not exceed " <>
+              "#{@max_refresh_token_ttl_seconds} seconds."
     end
   end
 
-  defp validate_replay_check!(%__MODULE__{replay_check: nil}), do: :ok
+  defp validate_refresh_token_ttl!(ttl) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :refresh_token_ttl must be a positive integer; got #{inspect(ttl)}."
+  end
 
-  defp validate_replay_check!(%__MODULE__{replay_check: replay_check}) do
-    if callback_with_call_arity?(replay_check, 2) do
-      :ok
-    else
+  defp validate_refresh_grace!(grace, ttl) when is_integer(grace) and grace >= 0 do
+    if grace > ttl do
       raise ArgumentError,
-            "AttestoPhoenix.Config: :replay_check must be a two-argument callback " <>
-              "in a supported function or MFA form; got #{inspect(replay_check)}."
+            "AttestoPhoenix.Config: :refresh_token_rotation_grace_seconds must not exceed " <>
+              ":refresh_token_ttl."
     end
   end
 
-  defp callback_with_call_arity?(callback, arity) when is_function(callback), do: is_function(callback, arity)
-
-  defp callback_with_call_arity?({module, fun}, arity) when is_atom(module) and is_atom(fun) do
-    Code.ensure_loaded?(module) and function_exported?(module, fun, arity)
+  defp validate_refresh_grace!(grace, _ttl) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :refresh_token_rotation_grace_seconds must be a " <>
+            "non-negative integer; got #{inspect(grace)}."
   end
 
-  defp callback_with_call_arity?({module, fun, extra}, arity)
-       when is_atom(module) and is_atom(fun) and is_list(extra) do
-    Code.ensure_loaded?(module) and function_exported?(module, fun, arity + length(extra))
+  defp validate_sweep_interval!(nil), do: :ok
+  defp validate_sweep_interval!(interval) when is_integer(interval) and interval > 0, do: :ok
+
+  defp validate_sweep_interval!(interval) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :sweep_interval_ms must be a positive integer or nil; got " <>
+            "#{inspect(interval)}."
   end
 
-  defp callback_with_call_arity?(_callback, _arity), do: false
+  # PostgreSQL's unquoted schema identifiers are ASCII-ish, begin with a
+  # letter or underscore, and are limited to NAMEDATALEN - 1 (63) bytes. Keep
+  # this setting conservative: Ecto interpolates it as a schema prefix for all
+  # generated stores, so accepting punctuation, whitespace, or quoted names
+  # would make migrations and runtime queries disagree.
+  @spec validate_schema_prefix!(term()) :: :ok | no_return()
+  defp validate_schema_prefix!(nil), do: :ok
+
+  defp validate_schema_prefix!(prefix) when is_binary(prefix) do
+    cond do
+      prefix == "" ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :schema_prefix must be nil or a non-empty " <>
+                "PostgreSQL schema identifier (lowercase ASCII letters, digits, and " <>
+                "underscores; maximum #{@max_schema_prefix_bytes} bytes)."
+
+      byte_size(prefix) > @max_schema_prefix_bytes ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :schema_prefix must be at most " <>
+                "#{@max_schema_prefix_bytes} bytes (PostgreSQL identifier limit); " <>
+                "received #{byte_size(prefix)} bytes."
+
+      prefix == "information_schema" or String.starts_with?(prefix, "pg_") ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :schema_prefix #{inspect(prefix)} is a reserved " <>
+                "PostgreSQL system schema; choose an application-owned schema."
+
+      not Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, prefix) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :schema_prefix must be a conservative PostgreSQL " <>
+                "schema identifier (lowercase ASCII letters, digits, and underscores; " <>
+                "must begin with a letter or underscore)."
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_schema_prefix!(_prefix) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :schema_prefix must be nil or a conservative PostgreSQL " <>
+            "schema identifier (lowercase ASCII letters, digits, and underscores; maximum " <>
+            "#{@max_schema_prefix_bytes} bytes); received an invalid value."
+  end
+
+  defp reject_legacy_table_prefix!(opts) when is_map(opts) do
+    if Map.has_key?(opts, :table_prefix) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :table_prefix was removed in 3.0. " <>
+              "It was the 2.x literal table-name prefix and cannot be reinterpreted " <>
+              "as a PostgreSQL schema. Rename it to :schema_prefix and apply the " <>
+              "3.0 migration to the canonical table names before booting."
+    end
+  end
+
+  defp reject_malformed_prefix_keys!(opts) when is_map(opts) do
+    cond do
+      Map.has_key?(opts, "schema_prefix") ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: string key \"schema_prefix\" is not supported; " <>
+                "use the atom key :schema_prefix in a keyword list or map."
+
+      Map.has_key?(opts, "table_prefix") ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: string key \"table_prefix\" is a legacy 2.x " <>
+                "setting; remove it and use the atom key :schema_prefix after the 3.0 cutover."
+
+      true ->
+        :ok
+    end
+  end
+
+  defp reject_malformed_prefix_keys!(opts) when is_list(opts) do
+    cond do
+      Enum.any?(opts, fn
+        {"schema_prefix", _value} -> true
+        _other -> false
+      end) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: string key \"schema_prefix\" is not supported; " <>
+                "use the atom key :schema_prefix in a keyword list or map."
+
+      Enum.any?(opts, fn
+        {"table_prefix", _value} -> true
+        _other -> false
+      end) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: string key \"table_prefix\" is a legacy 2.x " <>
+                "setting; remove it and use the atom key :schema_prefix after the 3.0 cutover."
+
+      true ->
+        :ok
+    end
+  end
+
+  # AttestoPhoenix 2.x Ecto stores also accepted a package-level
+  # `config :attesto_phoenix, :table_prefix` setting. Presence is the signal,
+  # including an explicitly configured nil: silently treating that key as the
+  # public schema would make a mixed 2.x/3.0 deployment ambiguous.
+  defp reject_legacy_global_table_prefix! do
+    if Keyword.has_key?(Application.get_all_env(:attesto_phoenix), :table_prefix) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: config :attesto_phoenix, :table_prefix was " <>
+              "removed in 3.0. It was the 2.x literal table-name prefix and " <>
+              "cannot be reinterpreted as a PostgreSQL schema. Remove the key, " <>
+              "configure :schema_prefix under the host AttestoPhoenix.Config, " <>
+              "and complete the 3.0 table cutover before booting."
+    end
+  end
+
+  defp validate_refresh_successor_secret!(%{refresh_store: EctoRefreshStore}, grace) when grace > 0 do
+    if not AttestoPhoenix.RefreshSuccessorCipher.configured?() do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: AttestoPhoenix.Store.EctoRefreshStore with a non-zero " <>
+              ":refresh_token_rotation_grace_seconds requires " <>
+              "config :attesto_phoenix, :refresh_successor_secret to be at least 32 bytes. " <>
+              "Load one stable value in config/runtime.exs and keep it identical across " <>
+              "nodes and deployments, or set :refresh_token_rotation_grace_seconds to 0 " <>
+              "for strict immediate reuse handling."
+    end
+  end
+
+  defp validate_refresh_successor_secret!(_config, _grace), do: :ok
+
+  defp validate_refresh_sweeper!(%{refresh_store: EctoRefreshStore}, grace, nil) when grace > 0 do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: AttestoPhoenix.Store.EctoRefreshStore with a non-zero " <>
+            ":refresh_token_rotation_grace_seconds requires a positive :sweep_interval_ms " <>
+            "and supervision of AttestoPhoenix.Store.Sweeper (or an equivalent cleanup job)."
+  end
+
+  defp validate_refresh_sweeper!(_config, _grace, _sweep_interval_ms), do: :ok
+
+  @strict_boolean_keys [
+    :claims_parameter_supported,
+    :require_nonce,
+    :require_pkce,
+    :require_pushed_authorization_requests,
+    :authorization_response_iss,
+    :require_https,
+    :dpop_enabled,
+    :dpop_nonce_required,
+    :mtls_enabled,
+    :registration_enabled
+  ]
+
+  @strict_nested_boolean_keys [
+    client_id_metadata: [:enabled, :allow_loopback, :require_same_origin_redirect_uri],
+    jwt_bearer: [:enabled],
+    device_authorization: [:enabled],
+    ciba: [
+      :enabled,
+      :require_signed_request,
+      :require_binding_message,
+      :user_code_parameter_supported,
+      :enforce_fapi_alg_policy
+    ],
+    logout: [:enabled],
+    session_management: [:enabled]
+  ]
+
+  defp validate_boolean_flags!(%__MODULE__{} = config) do
+    Enum.each(@strict_boolean_keys, fn key ->
+      value = Map.fetch!(config, key)
+
+      if not is_boolean(value) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{inspect(key)} must be true or false; got " <>
+                "#{inspect(value)}."
+      end
+    end)
+
+    :ok
+  end
+
+  defp validate_nested_boolean_flags!(%__MODULE__{} = config) do
+    Enum.each(@strict_nested_boolean_keys, fn {group, keys} ->
+      options = Map.fetch!(config, group)
+      Enum.each(keys, &validate_nested_boolean!(group, options, &1))
+    end)
+
+    :ok
+  end
+
+  defp validate_nested_boolean!(group, options, key) do
+    value = Keyword.fetch!(options, key)
+
+    if not is_boolean(value) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: #{inspect(group)} #{inspect(key)} must be true or false; " <>
+              "got #{inspect(value)}."
+    end
+  end
+
+  defp validate_dpop_nonce!(%__MODULE__{} = config) do
+    if config.dpop_nonce_required and not config.dpop_enabled do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :dpop_nonce_required cannot be true when " <>
+              ":dpop_enabled is false."
+    end
+
+    if config.dpop_nonce_required do
+      validate_dpop_nonce_store!(config.nonce_store)
+    end
+
+    :ok
+  end
+
+  # A required PAR policy must have a one-step atomic claim primitive. A
+  # fetch-only store can support the optional login/consent flow, but allowing
+  # it when PAR is mandatory turns a replayable request_uri into a successful
+  # authorization more than once. Keep the neutral optional-PAR behavior
+  # unchanged, including the default ETS store.
+  defp validate_required_par_store!(%__MODULE__{require_pushed_authorization_requests: true} = config) do
+    store = config.par_store || ETS
+
+    if valid_required_par_store?(store), do: :ok, else: invalid_required_par_store!(store)
+  end
+
+  defp validate_required_par_store!(_config), do: :ok
+
+  defp valid_required_par_store?(module) when is_atom(module) do
+    case Code.ensure_loaded(module) do
+      {:module, ^module} ->
+        Enum.all?(
+          [{:put, 3}, {:fetch, 1}, {:take, 1}],
+          &function_exported?(module, elem(&1, 0), elem(&1, 1))
+        )
+
+      _ ->
+        false
+    end
+  end
+
+  defp invalid_required_par_store!(store) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :require_pushed_authorization_requests is true, so " <>
+            ":par_store must be a loadable module exporting put/3, fetch/1, and atomic take/1; " <>
+            "got #{inspect(store)}."
+  end
+
+  defp validate_dpop_nonce_store!(store) when is_atom(store) and not is_nil(store) do
+    case Code.ensure_loaded(store) do
+      {:error, _reason} ->
+        invalid_dpop_nonce_store!(store)
+
+      {:module, ^store} ->
+        issue? = function_exported?(store, :issue, 2) or function_exported?(store, :issue, 1)
+        valid? = function_exported?(store, :valid?, 2) or function_exported?(store, :valid?, 1)
+
+        if issue? and valid? do
+          :ok
+        else
+          invalid_dpop_nonce_store!(store)
+        end
+    end
+  end
+
+  defp validate_dpop_nonce_store!(store) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :dpop_nonce_required is true, so :nonce_store must " <>
+            "select a capable module; got #{inspect(store)}."
+  end
+
+  defp invalid_dpop_nonce_store!(store) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :dpop_nonce_required is true, but :nonce_store " <>
+            "#{inspect(store)} is not a loadable nonce store. Configure a module exporting " <>
+            "issue/1 and valid?/1, or the config-aware issue/2 and valid?/2 callbacks."
+  end
+
+  defp validate_key_attestation!(%__MODULE__{} = config) do
+    required = config.require_key_attestation
+
+    if required not in [nil, false, true] do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :require_key_attestation must be true, false, or nil; " <>
+              "got #{inspect(required)}."
+    end
+
+    if required == true and not usable_key_attestation_jwks?(config.key_attestation_trusted_jwks) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :require_key_attestation is true, but " <>
+              ":key_attestation_trusted_jwks does not contain a usable trusted public key. " <>
+              "Configure a non-empty RFC 7517 JWK Set, public JWK map, or list of public " <>
+              "JWK maps accepted by the key-attestation verifier."
+    end
+
+    :ok
+  end
+
+  defp usable_key_attestation_jwks?(jwks) do
+    jwks
+    |> Attesto.JWS.verification_candidates(
+      accepted_algs: Attesto.SigningAlg.fapi_algs(),
+      fapi?: true,
+      malformed_key: :reject_set
+    )
+    |> Enum.any?()
+  end
 
   # RFC 6750 §2.1/§2.2: the access-token presentation methods
   # `AttestoPhoenix.Plug.Authenticate` actually accepts. The §2.3 URI query
@@ -3306,7 +4182,8 @@ defmodule AttestoPhoenix.Config do
   defp absolute_resource_url?(url) when is_binary(url) do
     if String.valid?(url) do
       case URI.new(url) do
-        {:ok, %URI{scheme: "https", host: host, fragment: nil}} when is_binary(host) and host != "" ->
+        {:ok, %URI{scheme: "https", host: host, fragment: nil}}
+        when is_binary(host) and host != "" ->
           not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, url)
 
         _ ->
@@ -3325,23 +4202,32 @@ defmodule AttestoPhoenix.Config do
   # route-mount API because Config can also support host-mounted routes.
   defp validate_issuer!(%__MODULE__{issuer: issuer}) do
     valid? =
-      if is_binary(issuer) and String.valid?(issuer) do
-        case URI.new(issuer) do
-          {:ok, %URI{scheme: "https", host: host, query: nil, fragment: nil}}
-          when is_binary(host) and host != "" ->
-            not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, issuer)
-
-          _ ->
-            false
-        end
-      else
-        false
+      try do
+        valid_issuer?(issuer)
+      rescue
+        FunctionClauseError -> false
       end
 
-    if not valid? do
+    if !valid? do
       raise ArgumentError,
             "AttestoPhoenix.Config: :issuer must be an absolute URL using the https scheme, with a host " <>
               "and no query or fragment; got #{inspect(issuer)}."
+    end
+  end
+
+  @spec valid_issuer?(binary()) :: boolean()
+  defp valid_issuer?(issuer) when is_binary(issuer) do
+    if String.valid?(issuer) do
+      case URI.new(issuer) do
+        {:ok, %URI{scheme: "https", host: host, query: nil, fragment: nil}}
+        when is_binary(host) and host != "" ->
+          not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, issuer)
+
+        _ ->
+          false
+      end
+    else
+      false
     end
   end
 
@@ -3632,46 +4518,11 @@ defmodule AttestoPhoenix.Config do
   # PAR or /authorize request is verified. `apply_defaults/1` has already
   # replaced a `nil` with `%Attesto.RequestObject.Policy{}`.
   defp validate_request_object_policy!(%__MODULE__{request_object_policy: %Policy{} = policy} = config) do
-    enforcement = policy.enforce_fapi_alg_policy
-
-    if enforcement not in [nil, true, false] do
-      raise ArgumentError,
-            "AttestoPhoenix.Config: :request_object_policy.enforce_fapi_alg_policy must be nil " <>
-              "or a boolean; got #{inspect(enforcement)}."
-    end
-
-    if !is_nil(policy.accepted_algs) do
-      validate_signing_algorithm_list!(
-        ":request_object_policy.accepted_algs",
-        policy.accepted_algs
-      )
-
-      if enforcement == true do
-        validate_fapi_algorithm_list!(
-          ":request_object_policy.accepted_algs",
-          policy.accepted_algs
-        )
-      end
-    end
-
-    # A policy that REQUIRES a signed request object (FAPI 2.0 Message Signing
-    # §5.3.1) is unsatisfiable without a way to resolve the client's trusted
-    # JWKS: every authorization request would be rejected (one carrying no
-    # request object fails the policy; one carrying a request object fails
-    # verification for want of keys). Fail fast at boot rather than deploy an OP
-    # that rejects every request - and that would otherwise advertise the
-    # incoherent pair `request_parameter_supported: false` +
-    # `require_signed_request_object: true`.
-    if Policy.require_request_object?(policy) and
-         is_nil(client_jwks_fun(config)) do
-      raise ArgumentError,
-            "AttestoPhoenix.Config: a :request_object_policy that requires a signed " <>
-              "request object (e.g. Attesto.RequestObject.Policy.fapi_message_signing/0) " <>
-              "needs a way to resolve a client's trusted JWKS to verify it. Add a " <>
-              "`client_jwks: &MyApp.AuthZ.client_jwks/1` callback (or install a " <>
-              ":client_store module implementing AttestoPhoenix.ClientStore.client_jwks/1), " <>
-              "or relax the policy (Attesto.RequestObject.Policy.generic/0)."
-    end
+    validate_request_object_booleans!(policy)
+    validate_request_object_lifetimes!(policy)
+    validate_request_object_enforcement!(policy.enforce_fapi_alg_policy)
+    validate_request_object_algs!(policy)
+    validate_request_object_jwks!(config, policy)
 
     :ok
   end
@@ -3681,6 +4532,62 @@ defmodule AttestoPhoenix.Config do
           "AttestoPhoenix.Config: :request_object_policy must be an " <>
             "%Attesto.RequestObject.Policy{} (e.g. " <>
             "Attesto.RequestObject.Policy.fapi_message_signing/0); got #{inspect(other)}."
+  end
+
+  defp validate_request_object_booleans!(policy) do
+    Enum.each([:require_request_object, :require_nbf, :require_exp], fn key ->
+      if !is_boolean(Map.fetch!(policy, key)) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :request_object_policy.#{key} must be a boolean."
+      end
+    end)
+  end
+
+  defp validate_request_object_lifetimes!(policy) do
+    Enum.each([:max_nbf_age_seconds, :max_lifetime_seconds], fn key ->
+      case Map.fetch!(policy, key) do
+        nil -> :ok
+        value when is_integer(value) and value > 0 -> :ok
+        _value -> request_object_lifetime_error!(key)
+      end
+    end)
+  end
+
+  defp request_object_lifetime_error!(key) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :request_object_policy.#{key} must be a positive integer or nil."
+  end
+
+  defp validate_request_object_enforcement!(enforcement) when enforcement in [nil, true, false], do: :ok
+
+  defp validate_request_object_enforcement!(enforcement) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :request_object_policy.enforce_fapi_alg_policy must be nil " <>
+            "or a boolean; got #{inspect(enforcement)}."
+  end
+
+  defp validate_request_object_algs!(%Policy{accepted_algs: nil}), do: :ok
+
+  defp validate_request_object_algs!(%Policy{} = policy) do
+    validate_signing_algorithm_list!(":request_object_policy.accepted_algs", policy.accepted_algs)
+
+    if policy.enforce_fapi_alg_policy == true do
+      validate_fapi_algorithm_list!(":request_object_policy.accepted_algs", policy.accepted_algs)
+    end
+  end
+
+  # A required signed request object is unsatisfiable without trusted client
+  # keys, so reject that configuration at boot.
+  defp validate_request_object_jwks!(config, policy) do
+    if Policy.require_request_object?(policy) and is_nil(client_jwks_fun(config)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: a :request_object_policy that requires a signed " <>
+              "request object (e.g. Attesto.RequestObject.Policy.fapi_message_signing/0) " <>
+              "needs a way to resolve a client's trusted JWKS to verify it. Add a " <>
+              "`client_jwks: &MyApp.AuthZ.client_jwks/1` callback (or install a " <>
+              ":client_store module implementing AttestoPhoenix.ClientStore.client_jwks/1), " <>
+              "or relax the policy (Attesto.RequestObject.Policy.generic/0)."
+    end
   end
 
   defp validate_behaviour_modules!(%__MODULE__{} = config) do
@@ -3693,26 +4600,36 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp validate_behaviour_module!(store_key, behaviour, module, _config) when is_atom(module) do
-    if !Code.ensure_loaded?(module) do
-      raise ArgumentError,
-            "AttestoPhoenix.Config: #{inspect(store_key)} is set to #{inspect(module)}, " <>
-              "which cannot be loaded. Set it to a module implementing " <>
-              "#{inspect(behaviour)}."
-    end
-
-    Enum.each(Map.fetch!(@behaviour_required, store_key), fn {fun, arity} ->
-      if !function_exported?(module, fun, arity) do
+    case Code.ensure_loaded(module) do
+      {:error, _reason} ->
         raise ArgumentError,
-              "AttestoPhoenix.Config: #{inspect(store_key)} module #{inspect(module)} " <>
-                "does not export #{fun}/#{arity}, required by #{inspect(behaviour)}."
-      end
-    end)
+              "AttestoPhoenix.Config: #{inspect(store_key)} is set to #{inspect(module)}, " <>
+                "which cannot be loaded. Set it to a module implementing " <>
+                "#{inspect(behaviour)}."
+
+      {:module, ^module} ->
+        Enum.each(Map.fetch!(@behaviour_required, store_key), fn callback ->
+          validate_behaviour_callback!(store_key, behaviour, module, callback)
+        end)
+    end
   end
 
   defp validate_behaviour_module!(store_key, behaviour, module, _config) do
     raise ArgumentError,
           "AttestoPhoenix.Config: #{inspect(store_key)} must be a module implementing " <>
             "#{inspect(behaviour)}; got #{inspect(module)}."
+  end
+
+  defp validate_behaviour_callback!(store_key, behaviour, module, {fun, arity}) do
+    case function_exported?(module, fun, arity) do
+      true ->
+        :ok
+
+      false ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{inspect(store_key)} module #{inspect(module)} " <>
+                "does not export #{fun}/#{arity}, required by #{inspect(behaviour)}."
+    end
   end
 
   # The store/callback each required key installs, so a missing-key error tells
@@ -3755,6 +4672,7 @@ defmodule AttestoPhoenix.Config do
   defp validate_optional_path!(key, value), do: validate_path!(key, value)
 
   defp validate_verifier_client_id!(nil), do: :ok
+
   defp validate_verifier_client_id!(client_id) when is_binary(client_id) and client_id != "", do: :ok
 
   defp validate_verifier_client_id!(client_id) do

@@ -50,6 +50,7 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   @impl AttestoPhoenix.ConsentGrantStore
   @spec mint(ConsentGrant.binding(), pos_integer()) :: {:ok, String.t()} | {:error, Ecto.Changeset.t()}
   def mint(%{} = binding, ttl_seconds) when is_integer(ttl_seconds) and ttl_seconds > 0 do
+    prefix = Config.table_prefix()
     token = :crypto.strong_rand_bytes(@token_bytes) |> Base.url_encode64(padding: false)
     now = DateTime.utc_now()
 
@@ -60,9 +61,8 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
       expires_at: DateTime.add(now, ttl_seconds, :second)
     }
 
-    attrs
-    |> Grant.changeset()
-    |> repo().insert()
+    Grant.changeset(%Grant{}, attrs, prefix: prefix)
+    |> repo().insert(prefix: prefix, log: false, telemetry_event: nil)
     |> case do
       {:ok, _grant} -> {:ok, token}
       {:error, changeset} -> {:error, changeset}
@@ -82,6 +82,7 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   @spec consume(String.t() | nil, ConsentGrant.binding()) ::
           :ok | {:error, AttestoPhoenix.ConsentGrantStore.consume_error()}
   def consume(token, %{} = binding) when is_binary(token) and token != "" do
+    prefix = Config.table_prefix()
     now = DateTime.utc_now()
     hash = ConsentGrant.binding_hash(binding)
 
@@ -91,9 +92,13 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
           g.token == ^token and g.binding_hash == ^hash and is_nil(g.consumed_at) and
             g.expires_at > ^now
 
-    case repo().update_all(query, set: [consumed_at: now]) do
+    case repo().update_all(query, [set: [consumed_at: now]],
+           prefix: prefix,
+           log: false,
+           telemetry_event: nil
+         ) do
       {1, _} -> :ok
-      {0, _} -> disambiguate(token, hash, now)
+      {0, _} -> disambiguate(token, hash, now, prefix)
     end
   end
 
@@ -103,8 +108,8 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   # a precise reason (fail closed: any reason still refuses consent). The order
   # of clauses matters: an already-consumed grant is reported `:consumed` even
   # when it is also expired, so a replay is never miscategorised as a stale TTL.
-  defp disambiguate(token, hash, now) do
-    case repo().get(Grant, token) do
+  defp disambiguate(token, hash, now, prefix) do
+    case repo().get(Grant, token, prefix: prefix, log: false, telemetry_event: nil) do
       nil ->
         {:error, :not_found}
 

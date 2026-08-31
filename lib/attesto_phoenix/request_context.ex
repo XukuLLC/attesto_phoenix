@@ -430,8 +430,16 @@ defmodule AttestoPhoenix.RequestContext do
   defp certificate_context(conn, config, der, source) do
     chain_validated =
       case config.client_certificate_chain_validated? do
-        nil -> false
-        callback -> Callback.invoke(callback, [conn, der]) == true
+        nil ->
+          false
+
+        callback ->
+          Callback.invoke_boolean(
+            callback,
+            [conn, der],
+            false,
+            :client_certificate_chain_validated?
+          )
       end
 
     %{

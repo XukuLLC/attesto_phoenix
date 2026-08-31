@@ -9,8 +9,10 @@ defmodule AttestoPhoenix.Controller.CheckSessionControllerTest do
 
   use ExUnit.Case, async: false
 
+  import Plug.Conn, only: [put_private: 3]
   import Plug.Test
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.CheckSessionController, as: Controller
 
   @config_key AttestoPhoenix.Config
@@ -50,6 +52,7 @@ defmodule AttestoPhoenix.Controller.CheckSessionControllerTest do
   defp call do
     :get
     |> conn("/oauth/check_session")
+    |> put_private(:attesto_phoenix_config, Config.from_otp_app(:attesto_phoenix))
     |> Controller.show(%{})
   end
 
@@ -101,5 +104,45 @@ defmodule AttestoPhoenix.Controller.CheckSessionControllerTest do
 
     conn = call()
     assert conn.status == 404
+  end
+
+  test "uses the request-private config when application config differs", %{base: base} do
+    Application.put_env(
+      :attesto_phoenix,
+      @config_key,
+      Keyword.put(base, :session_management, enabled: false)
+    )
+
+    request_config =
+      base
+      |> Keyword.put(:session_management,
+        enabled: true,
+        browser_state_cookie: "request_opbs",
+        browser_state_secret: :crypto.strong_rand_bytes(32)
+      )
+      |> Config.new()
+
+    response =
+      :get
+      |> conn("/oauth/check_session")
+      |> put_private(:attesto_phoenix_config, request_config)
+      |> Controller.show(%{})
+
+    assert response.status == 200
+    assert response.resp_body =~ ~s("request_opbs")
+  end
+
+  test "fails closed when request-private config is absent" do
+    assert_raise ArgumentError, ~r/conn\.private\[:attesto_phoenix_config\]/, fn ->
+      Controller.show(conn(:get, "/oauth/check_session"), %{})
+    end
+  end
+
+  test "fails closed when request-private config is malformed" do
+    conn = put_private(conn(:get, "/oauth/check_session"), :attesto_phoenix_config, :malformed)
+
+    assert_raise ArgumentError, ~r/conn\.private\[:attesto_phoenix_config\]/, fn ->
+      Controller.show(conn, %{})
+    end
   end
 end

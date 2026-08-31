@@ -121,7 +121,7 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceControllerTest do
     end
 
     test "fails closed when the AttestoPhoenix.Config is absent (wiring error)" do
-      assert_raise RuntimeError, ~r/attesto_phoenix_config/, fn ->
+      assert_raise ArgumentError, ~r/attesto_phoenix_config/, fn ->
         conn(:get, "/.well-known/oauth-protected-resource")
         |> put_private(:attesto_protocol_config, protocol_config())
         |> ProtectedResourceController.show(%{})

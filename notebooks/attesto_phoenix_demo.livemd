@@ -19,7 +19,7 @@ mix ecto.migrate
 
 ```elixir
 Mix.install([
-  {:attesto_phoenix, "~> 2.6"},
+  {:attesto_phoenix, "~> 3.0"},
   {:req, "~> 0.5"},
   {:req_dpop, "~> 0.5"},
   {:bandit, "~> 1.0"},
@@ -128,63 +128,30 @@ end
 
 :persistent_term.put({DemoRouter, :attesto_phoenix_config}, attesto_phoenix_config)
 
-demo_cert = """
------BEGIN CERTIFICATE-----
-MIIDJTCCAg2gAwIBAgIUFLbDT772+NFb8cCLTfCDZl9JpakwDQYJKoZIhvcNAQEL
-BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDYwMTE1MzU1NVoXDTM2MDUy
-OTE1MzU1NVowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEArlmQZs4lSmc9nR4bXY66eHhGJAauXg0KIJdHuELgEljh
-FXiOL/sq1LlYOC2H/BbySRBM/T/eIkV0g0akbI1VMQjvPcLhW61+fpLi+ZgaqNuF
-5lD0UMBXmYhmK0jgbPt7z9d08afLosoMtwaTxHjIsge/8or4g3jZFmj4Rr423NXC
-iBTz1Gqz3i2Jy/40PdXLXV5gajj+zjVmSQa/U8j3IfCrogV66cySH4uexqX08Mko
-K5NuPkVLcTAQMSAGJt6S4Tcfj6MnemT7Bh1X9m7EJY8ByfnNMA4hnBhvVRNo2VHL
-R+DgW0aS9ehPxex05c7UERB5SiAYcn8I2w/E+2/BswIDAQABo28wbTAdBgNVHQ4E
-FgQUzXf4IUctWzPAZr0a9yFocESuOoowHwYDVR0jBBgwFoAUzXf4IUctWzPAZr0a
-9yFocESuOoowDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
-BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAHIX+wh1tvoOhcvLfqIJsuBD5kaaNLxh
-xR75kL/F9wjHvOklDTjWoCXeiUXLdGh4CWWP4Rif+eOgyFyZ9cHS1w89nItuUX4X
-F9NV2ehIEIZkeA2vRfYH/kevbGEesSKUSrz+XnhsG703eqyz3RjBHqy+QLyccWw7
-qspfhvgMT1sLa5VId8rKvlr+79WYuE2A8T+l7Fs0TaYdAaFUyqwQJQ63yuGjYtIb
-gTOAFk4wzvcrTMRv+OgcFmzgiqsVOTuQArF4RBWiqViINQy9nM9hWgze6cNrH5Ol
-wmwxLJX31heatRpl0vgcaH+ScHrhwop4VmyBPYu1KrCkYYHpgshPEqU=
------END CERTIFICATE-----
-"""
+today = Date.utc_today()
+validity = {Date.add(today, -1) |> Date.to_erl(), Date.add(today, 3_650) |> Date.to_erl()}
 
-demo_key = """
------BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCuWZBmziVKZz2d
-Hhtdjrp4eEYkBq5eDQogl0e4QuASWOEVeI4v+yrUuVg4LYf8FvJJEEz9P94iRXSD
-RqRsjVUxCO89wuFbrX5+kuL5mBqo24XmUPRQwFeZiGYrSOBs+3vP13Txp8uiygy3
-BpPEeMiyB7/yiviDeNkWaPhGvjbc1cKIFPPUarPeLYnL/jQ91ctdXmBqOP7ONWZJ
-Br9TyPch8KuiBXrpzJIfi57GpfTwySgrk24+RUtxMBAxIAYm3pLhNx+Poyd6ZPsG
-HVf2bsQljwHJ+c0wDiGcGG9VE2jZUctH4OBbRpL16E/F7HTlztQREHlKIBhyfwjb
-D8T7b8GzAgMBAAECggEACPu/n2YK/dgIw+O21tpxbGumEY0jYHoDhfjFgg6c3qHw
-8Kff8hD0lmlf/+UFfYCHk13Hpo535gQpVx14s2Jee8K3sQYtkaLq3AXtgNBmVagz
-ltGgOD9XRCeHCPJRJGYA0/Pu225US8FlZ+wEb4cmfPKkehBqPzvzoF5gP75+5sbD
-1ck2Rf0DBFbvoFR4ct3HSXv8YreTwQVg22IM5rX+3qW7+i4qiRUTVcbc+BuOsyHT
-e8HRdS9wHfb1tn75rP8YP/wNmowVicp198ZBbGrmCCn4cir44lBVlSDga/v/OazI
-ouP14xWmCJeE6GqXsDSxAm/qO94WGAoDWngxDs08YQKBgQDhEcjxuzz8Z1JEne2+
-JfRu9KhNeNr04GsTcimlRCZZNpl8SpzrGunww73RfEWZcU/9AF9GYyFdklyW3YCD
-aYe+g0bC64LiFE32vjL7hbvOQagco+36A8QOHZkI4Y2rLm6rAH598UjcGkXE7NaE
-5TiTaNP8ihVDlE7Dgo73Cn9NFwKBgQDGT2bukb4bT8WPeFom0IJnMycK+Y7LmMuy
-i+xsqwqSKk8pho1h1RnZm1GgfPp/Iz8r9V6zLpYX6kxPu3Z/tZQNJMjRzNCh3ize
-Y0BU1qA3V1Eqs+NSj1u7n7qY96UoCmiupaYCihwTTKC7Ah9Uh0KGeEDdI1x/nbXd
-x/M5fN1pxQKBgQCctENSe2lE27Nd7w+eutJrhpDAEAtzP+WNjokMdly09Nz8uv5y
-ezSy27aH6pyS72Af6Whsm4yZl9Q7flGCLbHDpadZA50HR9fYmijpEv3l57Ti7Ag/
-cOvKYDUzB8gZjaSkDx4DFkICbZByQexCb05q5Cvkw0d23AXS/k4IFxj3VQKBgC+0
-KAmZi4acYOTLSbxuif/zQSAVujDlt5JisGPPnUJd5R8TG+19yrMa9r7JcaSlwOt9
-IeOugDKOjP7dFHtSHaQvxhMZ1tIpVNfGPlJqMq49VewUy8kvbRysJsHnSJZiMp5Y
-gJ+5w1ktJLj3oLu/sdQRF2FawUR9lqMcFzkr/UMVAoGAXJQJD3hZ1EKuNKChkNDf
-py0Yr+uhbOs4GzTD2jqVp50Bg2qjvF1IAf8oBA8UaFAVCTtY+MFpYQAMQEWurU8/
-7jgK/vrU3vGF53FucsKSf9UdkODlFXM9KTee42OenSQNsaDyXn/SbHdPN8uZeis5
-0fJLvmUodnzxuv1r7N1RDaU=
------END PRIVATE KEY-----
-"""
+demo_tls =
+  :public_key.pkix_test_root_cert(~c"localhost",
+    key: {:rsa, 2048, 65_537},
+    digest: :sha256,
+    validity: validity
+  )
 
-certfile = Path.join(System.tmp_dir!(), "attesto_phoenix_demo_cert.pem")
-keyfile = Path.join(System.tmp_dir!(), "attesto_phoenix_demo_key.pem")
+demo_cert = :public_key.pem_encode([{:Certificate, demo_tls.cert, :not_encrypted}])
+
+demo_key =
+  :public_key.pem_encode([
+    :public_key.pem_entry_encode(:RSAPrivateKey, demo_tls.key)
+  ])
+demo_tls_dir = Path.join(System.tmp_dir!(), "attesto_phoenix_demo_#{System.unique_integer([:positive])}")
+:ok = File.mkdir_p(demo_tls_dir)
+File.chmod!(demo_tls_dir, 0o700)
+certfile = Path.join(demo_tls_dir, "cert.pem")
+keyfile = Path.join(demo_tls_dir, "key.pem")
 File.write!(certfile, demo_cert)
 File.write!(keyfile, demo_key)
+File.chmod!(keyfile, 0o600)
 
 {:ok, _server} =
   Bandit.start_link(

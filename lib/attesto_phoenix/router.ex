@@ -70,6 +70,15 @@ defmodule AttestoPhoenix.Router do
   binding is offered, whether registration is open) is owned by the host
   through `AttestoPhoenix.Config`, which the controllers read at request time.
 
+  Phoenix route-dispatch parameter logging is disabled for the non-metadata
+  routes. OAuth, OIDC, and credential requests carry redeemable codes, proofs,
+  assertions, signed request objects, and encrypted responses whose parameter
+  names are not all covered by Phoenix's default filters. Method, path, status,
+  and duration remain available through the endpoint log. Hosts that add
+  another request logger must likewise exclude credentials and the
+  `authorization`, `dpop`, `oauth-client-attestation`, and
+  `oauth-client-attestation-pop` headers.
+
   ## Placement and pipelines
 
   The discovery, optional OpenID configuration, and JWKS documents are
@@ -118,8 +127,13 @@ defmodule AttestoPhoenix.Router do
       end
 
   The config-loading plug is required unless an enclosing scope or another host
-  pipeline has already put both validated configs in `conn.private`. A
-  route-class override is the complete ordered pipeline list for that class;
+  pipeline has already put both validated configs in `conn.private`. Library
+  controller dispatch validates that private configuration and binds it only
+  for the action, so exceptions, halted responses, and unsent connections do
+  not retain tenant state. A custom pipeline that calls library stores outside a
+  controller action must use `AttestoPhoenix.Config.with_request_config/2`
+  around that work.
+  A route-class override is the complete ordered pipeline list for that class;
   Attesto does not append or prepend the `:pipeline` default. The host remains
   responsible for the policy inside those pipelines. In particular, externally
   submitted OAuth POST requests must not accidentally inherit a generic browser
@@ -703,14 +717,14 @@ defmodule AttestoPhoenix.Router do
             unquote_splicing(protected_resource_path_routes)
           end
 
-          scope "/" do
+          scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :interactive))
 
             get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
             post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
           end
 
-          scope "/" do
+          scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
 
             post(unquote(prefix <> token_path), unquote(token_controller), :create)
@@ -728,23 +742,23 @@ defmodule AttestoPhoenix.Router do
             unquote(presentation_response_route)
           end
 
-          scope "/" do
+          scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :interactive))
             unquote(device_verification_route)
           end
 
-          scope "/" do
+          scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
             unquote(ciba_route)
           end
 
-          scope "/" do
+          scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :interactive))
             unquote(logout_route)
             unquote(session_management_route)
           end
 
-          scope "/" do
+          scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
 
             unquote(userinfo_route)
@@ -779,46 +793,52 @@ defmodule AttestoPhoenix.Router do
           unquote(protected_resource_root_route)
           unquote_splicing(protected_resource_path_routes)
 
-          # RFC 6749 §3.1 / OpenID Connect Core 1.0 §3.1.2: the authorization
-          # endpoint accepts both GET and POST under the host-chosen prefix. It
-          # carries no client-authentication pipeline (RFC 6749 §3.1: the client
-          # is not authenticated here; the resource owner authenticates through
-          # the host's login/consent callbacks).
-          get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
-          post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+          # These routes accept credentials, proofs, signed request objects,
+          # encrypted responses, or session handles. Suppress Phoenix's
+          # controller-parameter log for the entire block; endpoint logs still
+          # retain method, path, status, and duration.
+          scope "/", log: false do
+            # RFC 6749 §3.1 / OpenID Connect Core 1.0 §3.1.2: the authorization
+            # endpoint accepts both GET and POST under the host-chosen prefix. It
+            # carries no client-authentication pipeline (RFC 6749 §3.1: the client
+            # is not authenticated here; the resource owner authenticates through
+            # the host's login/consent callbacks).
+            get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+            post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
 
-          # RFC 6749 §3.2 / RFC 7009 §2: token issuance and revocation are POST
-          # endpoints under the host-chosen prefix. They authenticate the client
-          # from the request itself (RFC 6749 §2.3, RFC 7009 §2).
-          post(unquote(prefix <> token_path), unquote(token_controller), :create)
-          post(unquote(prefix <> par_path), unquote(par_controller), :create)
-          post(unquote(prefix <> revoke_path), unquote(revocation_controller), :create)
+            # RFC 6749 §3.2 / RFC 7009 §2: token issuance and revocation are POST
+            # endpoints under the host-chosen prefix. They authenticate the client
+            # from the request itself (RFC 6749 §2.3, RFC 7009 §2).
+            post(unquote(prefix <> token_path), unquote(token_controller), :create)
+            post(unquote(prefix <> par_path), unquote(par_controller), :create)
+            post(unquote(prefix <> revoke_path), unquote(revocation_controller), :create)
 
-          # RFC 7662 §2: token introspection is a POST endpoint that authenticates
-          # the client from the request (RFC 7662 §2.1); RFC 9701 adds the signed
-          # JWT response negotiated by the Accept header.
-          post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
+            # RFC 7662 §2: token introspection is a POST endpoint that authenticates
+            # the client from the request (RFC 7662 §2.1); RFC 9701 adds the signed
+            # JWT response negotiated by the Accept header.
+            post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
 
-          unquote(registration_route)
-          unquote(device_route)
-          unquote(nonce_route)
-          unquote(credential_route)
-          unquote(credential_offer_route)
-          unquote(deferred_credential_route)
-          unquote(status_list_route)
-          unquote(presentation_request_route)
-          unquote(presentation_response_route)
-          unquote(ciba_route)
-          unquote(logout_route)
-          unquote(session_management_route)
+            unquote(registration_route)
+            unquote(device_route)
+            unquote(nonce_route)
+            unquote(credential_route)
+            unquote(credential_offer_route)
+            unquote(deferred_credential_route)
+            unquote(status_list_route)
+            unquote(presentation_request_route)
+            unquote(presentation_response_route)
+            unquote(ciba_route)
+            unquote(logout_route)
+            unquote(session_management_route)
 
-          # OpenID Connect Core 1.0 §5.3.1: the UserInfo endpoint accepts both
-          # GET and POST, and is a bearer-authenticated protected resource
-          # (RFC 6750 §2.1/§2.2). The controller verifies the presented access
-          # token from its configured standard credential channels before
-          # returning any claim, so the endpoint authenticates from the request
-          # itself rather than from a caller session.
-          unquote(userinfo_route)
+            # OpenID Connect Core 1.0 §5.3.1: the UserInfo endpoint accepts both
+            # GET and POST, and is a bearer-authenticated protected resource
+            # (RFC 6750 §2.1/§2.2). The controller verifies the presented access
+            # token from its configured standard credential channels before
+            # returning any claim, so the endpoint authenticates from the request
+            # itself rather than from a caller session.
+            unquote(userinfo_route)
+          end
         end
       end
     end

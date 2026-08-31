@@ -213,6 +213,39 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
     Config.new(opts)
   end
 
+  defp private_key_jwt_token_config(client_id, persisted, test_pid) do
+    client = %{id: client_id, public?: false, jwks: persisted["jwks"]}
+
+    Config.new(
+      issuer: "https://issuer.example",
+      audience: "https://issuer.example",
+      keystore: __MODULE__.Keystore,
+      repo: StubRepo,
+      require_https: false,
+      load_client: fn id ->
+        send(test_pid, {:private_key_jwt_client_lookup, id})
+
+        if id == client_id do
+          {:ok, client}
+        else
+          {:error, :not_found}
+        end
+      end,
+      verify_client_secret: fn _client, _given -> false end,
+      client_public?: fn _client -> false end,
+      client_id: fn loaded -> loaded.id end,
+      client_jwks: fn loaded ->
+        send(test_pid, {:private_key_jwt_jwks_resolved, loaded.jwks})
+        loaded.jwks
+      end,
+      load_principal: fn _ -> {:error, :not_found} end,
+      replay_check: fn _key, _ttl -> :ok end,
+      token_endpoint_auth_methods_supported: ["private_key_jwt"],
+      client_auth_signing_algs: ["RS256"],
+      client_auth_enforce_fapi_alg_policy: false
+    )
+  end
+
   defp request(config, client_id, overrides) do
     fields =
       [
@@ -302,6 +335,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
         |> conn("/oauth/token", %{"grant_type" => "client_credentials"})
         |> put_req_header("content-type", "application/x-www-form-urlencoded")
         |> put_req_header("authorization", "Basic " <> Base.encode64("#{client_id}:#{secret}"))
+        |> put_private(:attesto_phoenix_config, config)
         |> TokenController.create(%{"grant_type" => "client_credentials"})
 
       assert conn.status == 200
@@ -322,13 +356,14 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       {client_id, _secret} = register_confidential_client()
       # Installs the server config in application env (the token endpoint resolves
       # it there); the returned struct is unused on this rejection path.
-      _config = controller_token_config(client_id, "the-real-secret", prefixing_build_principal(client_id))
+      config = controller_token_config(client_id, "the-real-secret", prefixing_build_principal(client_id))
 
       conn =
         :post
         |> conn("/oauth/token", %{"grant_type" => "client_credentials"})
         |> put_req_header("content-type", "application/x-www-form-urlencoded")
         |> put_req_header("authorization", "Basic " <> Base.encode64("#{client_id}:wrong-secret"))
+        |> put_private(:attesto_phoenix_config, config)
         |> TokenController.create(%{"grant_type" => "client_credentials"})
 
       # RFC 6749 §5.2: header-auth invalid_client is 401 with a challenge.
@@ -336,5 +371,84 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       assert get_resp_header(conn, "www-authenticate") == [~s(Basic realm="OAuth")]
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
     end
+
+    test "a DCR-persisted inline JWKS authenticates an RS256 private_key_jwt client" do
+      client_key = JOSE.JWK.generate_key({:rsa, 2048})
+      client_jwk = public_jwk(client_key)
+      client_jwks = %{"keys" => [client_jwk]}
+      test_pid = self()
+
+      registration_config = %{
+        registration_config()
+        | register_client: fn attrs ->
+            send(test_pid, {:persisted_private_key_jwt_client, attrs})
+            {:ok, attrs}
+          end
+      }
+
+      registration_conn =
+        post_register(registration_config, %{
+          "grant_types" => ["client_credentials"],
+          "token_endpoint_auth_method" => "private_key_jwt",
+          "jwks" => client_jwks
+        })
+
+      assert registration_conn.status == 201
+      payload = JSON.decode!(registration_conn.resp_body)
+      assert payload["jwks"] == client_jwks
+      assert_receive {:persisted_private_key_jwt_client, persisted}
+      assert persisted["client_id"] == payload["client_id"]
+      assert persisted["jwks"] == client_jwks
+
+      client_id = persisted["client_id"]
+      config = private_key_jwt_token_config(client_id, persisted, test_pid)
+
+      params = %{
+        "grant_type" => "unsupported",
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, client_id)
+      }
+
+      conn =
+        :post
+        |> conn("/oauth/token", params)
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> put_private(:attesto_phoenix_config, config)
+        |> TokenController.create(params)
+
+      # The assertion authenticated successfully; only the intentionally
+      # unsupported grant is rejected downstream.
+      body = JSON.decode!(conn.resp_body)
+      assert body["error"] == "unsupported_grant_type"
+      assert_receive {:private_key_jwt_client_lookup, ^client_id}
+      assert_receive {:private_key_jwt_jwks_resolved, ^client_jwks}
+    end
+  end
+
+  defp client_assertion(jwk, client_id) do
+    now = System.system_time(:second)
+
+    claims = %{
+      "iss" => client_id,
+      "sub" => client_id,
+      "aud" => "https://issuer.example",
+      "iat" => now,
+      "exp" => now + 60,
+      "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+    }
+
+    header = %{"alg" => "RS256", "kid" => JOSE.JWK.thumbprint(jwk)}
+    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    compact
+  end
+
+  defp public_jwk(jwk) do
+    {_kty, public} = JOSE.JWK.to_public_map(jwk)
+
+    Map.merge(public, %{
+      "kid" => JOSE.JWK.thumbprint(jwk),
+      "alg" => "RS256",
+      "use" => "sig"
+    })
   end
 end

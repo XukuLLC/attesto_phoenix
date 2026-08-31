@@ -28,6 +28,17 @@ defmodule AttestoPhoenix.DPoP.AdapterTest do
     def valid?(%Config{issuer: issuer}, nonce), do: nonce == "live:#{issuer}"
   end
 
+  defmodule InvalidNonceCallbacks do
+    @moduledoc false
+    @behaviour Attesto.DPoP.NonceStore
+
+    @impl true
+    def issue(_ttl), do: {:error, :unavailable}
+
+    @impl true
+    def valid?(_nonce), do: {:error, :unavailable}
+  end
+
   defmodule CertificateCallbacks do
     @moduledoc false
 
@@ -109,6 +120,20 @@ defmodule AttestoPhoenix.DPoP.AdapterTest do
     assert opts[:nonce_issue].() == "issued:https://issuer.example:300"
     assert opts[:cert_der].(conn) == "from-mfa/reports"
     assert opts[:htu].(conn) == "https://configured.example/reports"
+  end
+
+  test "required nonce storage faults fail loudly instead of accepting a proof or emitting a malformed nonce" do
+    opts =
+      config(dpop_nonce_required: true, nonce_store: InvalidNonceCallbacks)
+      |> Adapter.protected_resource_opts()
+
+    assert_raise ArgumentError, ~r/nonce validity callback must return true or false/, fn ->
+      opts[:nonce_check].("presented")
+    end
+
+    assert_raise ArgumentError, ~r/nonce issue callback must return a non-empty string/, fn ->
+      opts[:nonce_issue].()
+    end
   end
 
   test "legacy certificate extraction cannot constrain a token from an untrusted socket peer" do

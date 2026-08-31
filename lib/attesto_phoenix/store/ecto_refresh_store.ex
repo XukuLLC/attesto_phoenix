@@ -1,46 +1,22 @@
 defmodule AttestoPhoenix.Store.EctoRefreshStore do
   @moduledoc """
-  Ecto implementation of the `Attesto.RefreshStore` behaviour.
+  PostgreSQL implementation of `Attesto.RefreshStore`.
 
-  The protocol core (`Attesto.RefreshToken`) owns all rotation logic and reuse
-  detection; this module is purely the storage seam. It persists refresh-token
-  records over `AttestoPhoenix.Schema.RefreshToken` and provides the atomic
-  single-use claim on which reuse detection depends (RFC 6749 §10.4, OAuth 2.0
-  Security BCP §4.13).
+  Rotation is one family-serialized transaction. The transaction locks the
+  family with a transaction-scoped advisory lock, locks the parent row, marks
+  the parent consumed with its authenticated retry state, and inserts the
+  successor before it commits. A blocked caller therefore sees either the
+  complete committed winner or a complete reuse record; it can never observe
+  a consumed parent before its successor exists.
 
-  ## Why the claim must be atomic
-
-  Rotation requires detecting when an already-rotated (consumed) token is
-  presented again: that is the captured-token signal, and the whole family
-  must then be revoked. Reliable detection needs a compare-and-set that, in
-  one indivisible step, checks the token is unconsumed and marks it consumed.
-  Here that is a single conditional `UPDATE ... RETURNING`:
-
-      UPDATE attesto_refresh_tokens
-         SET consumed = true, consumed_at = now()
-       WHERE token_hash = $1 AND consumed = false
-      RETURNING ...
-
-  Zero rows updated *with a row still present* means the token was already
-  consumed: reuse. A non-atomic read-then-write would let two concurrent
-  rotations both observe "unconsumed" and both succeed, defeating detection.
-  This holds across all nodes sharing the database, which the single-node ETS
-  store cannot offer. `consume/1` returns `{:ok, entry}` to the single winner,
-  `{:reuse, entry}` on a replay, and `:error` for an unknown token.
-
-  ## Sticky revocation
-
-  `revoke_family/1` marks every row in the family revoked (it does not delete
-  them) so the revocation persists. A subsequent `insert/1` checks the family
-  before writing and refuses with `{:error, :family_revoked}`, so a successor
-  whose claim won before the revocation landed cannot be added to a revoked
-  family. Revocation therefore rejects later inserts, not only the rows present
-  when it ran. The check and the insert run in one transaction so no concurrent
-  revocation can interleave between them.
-
-  The repo is resolved from the application environment (`:repo` under the
-  `:attesto_phoenix` app) so the host owns the connection; nothing here
-  hardcodes an OTP app's repo, and a missing repo fails closed.
+  Positive retry state is authenticated-encrypted before the transaction. The
+  encryption key must be stable across every node that can serve the family.
+  Strict rotation stores only `%{retry_until: now, recoverable: false}` and
+  needs no encryption secret. Expired retry state is redacted by the sweeper,
+  while a consumed parent is retained until that deadline or its own expiry,
+  whichever comes first. Family revocation
+  is also recorded in the separate `RefreshFamilyRevocation` table, whose
+  tombstones are never swept.
   """
 
   @behaviour Attesto.RefreshStore
@@ -49,202 +25,839 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.RefreshSuccessorCipher
+  alias AttestoPhoenix.Schema.RefreshFamilyRevocation
   alias AttestoPhoenix.Schema.RefreshToken
 
   @app :attesto_phoenix
-
-  # Namespace (first key of Postgres' two-argument advisory-lock form) for the
-  # per-family rotation/revocation serialization locks, so they cannot collide
-  # with advisory locks any other subsystem takes. Arbitrary but stable.
   @advisory_lock_namespace 0x4154_5246
+  @valid_deadline_sql "jsonb_typeof(?->'retry_until') = 'number' AND " <>
+                        "(?->>'retry_until') ~ '^-{0,1}(0|[1-9][0-9]*)$' AND " <>
+                        "(?->'retry_until') >= to_jsonb(0::numeric) AND " <>
+                        "(?->'retry_until') <= to_jsonb(9223372036854775807::numeric)"
+  @fallback_deadline_sql "CASE WHEN ? IS NOT NULL AND ? IS NOT NULL THEN " <>
+                           "LEAST(" <>
+                           "GREATEST(LEAST(floor(extract(epoch from ?)) + ?, 9223372036854775807::numeric), 0::numeric), " <>
+                           "GREATEST(LEAST(floor(extract(epoch from ?)) - 1, 9223372036854775807::numeric), 0::numeric)) " <>
+                           "ELSE GREATEST(?::numeric, 0::numeric) END"
+  @parent_deadline_sql "GREATEST(LEAST(floor(extract(epoch from ?)) - 1, 9223372036854775807::numeric), 0::numeric)"
+  # JSONB maps are untrusted persisted state. A v1 wrapper is recognized only
+  # when its version, ciphertext type, and exact two-key set all match. The
+  # caller wraps this predicate in COALESCE because JSON operators return NULL
+  # for missing/null members, and malformed state must never disappear from a
+  # three-valued SQL predicate.
+  @legacy_wrapper_sql "jsonb_typeof(?) = 'object' AND " <>
+                        "(? - 'v' - 'ciphertext') = '{}'::jsonb AND " <>
+                        "jsonb_typeof(?->'v') = 'number' AND " <>
+                        "?->>'v' = '1' AND " <>
+                        "jsonb_typeof(?->'ciphertext') = 'string'"
+  # Current wrappers carry an authenticated deadline and child binding. Keep
+  # retention logic limited to this exact v2 envelope and its expected JSON
+  # types; unknown keys or versions use the conservative malformed path.
+  @modern_wrapper_sql "jsonb_typeof(?) = 'object' AND " <>
+                        "(? - 'v' - 'ciphertext' - 'retry_until' - 'child_hash') = '{}'::jsonb AND " <>
+                        "jsonb_typeof(?->'v') = 'number' AND " <>
+                        "?->>'v' = '2' AND " <>
+                        "jsonb_typeof(?->'ciphertext') = 'string' AND " <>
+                        "jsonb_typeof(?->'retry_until') = 'number' AND " <>
+                        "jsonb_typeof(?->'child_hash') = 'string'"
+  @modern_valid_wrapper_sql "COALESCE((" <>
+                              @modern_wrapper_sql <>
+                              " AND (" <> @valid_deadline_sql <> ")), false)"
+  @malformed_wrapper_sql "NOT COALESCE((" <>
+                           @modern_wrapper_sql <> " AND (" <> @valid_deadline_sql <> ")), false)"
+  @legacy_retention_sql "NOT COALESCE((" <>
+                          @legacy_wrapper_sql <>
+                          "), false) OR " <>
+                          "? IS NULL OR ? IS NULL OR (" <>
+                          @fallback_deadline_sql <> ") < ?::numeric"
+  @tombstone_wrapper_sql "jsonb_typeof(?) = 'object' AND " <>
+                           "(? - 'v' - 'retry_until' - 'recoverable') = '{}'::jsonb AND " <>
+                           "jsonb_typeof(?->'v') = 'number' AND " <>
+                           "?->>'v' = '1' AND " <>
+                           "jsonb_typeof(?->'retry_until') = 'number' AND " <>
+                           "jsonb_typeof(?->'recoverable') = 'boolean' AND " <>
+                           "?->>'recoverable' = 'false' AND (" <> @valid_deadline_sql <> ")"
+  @valid_tombstone_sql "NOT COALESCE((" <> @tombstone_wrapper_sql <> "), false)"
+  @modern_redaction_sql "jsonb_build_object('v', 1, 'retry_until', CASE WHEN ?->'retry_until' < to_jsonb(" <>
+                          @parent_deadline_sql <>
+                          ") THEN ?->'retry_until' ELSE to_jsonb(" <>
+                          @parent_deadline_sql <>
+                          ") END, 'recoverable', false)"
+  @redaction_sql "jsonb_build_object('v', 1, 'retry_until', " <>
+                   @fallback_deadline_sql <> ", 'recoverable', false)"
+
+  @type rotation_error ::
+          :family_revoked
+          | :retry_state_unavailable
+          | :token_conflict
+          | :family_integrity_error
+          | :invalid_rotation
+          | :expired
 
   @doc """
-  Persists a new (unconsumed) refresh-token record.
+  Persists a new unconsumed refresh token.
 
-  Returns `{:error, :family_revoked}` when the record's `:family_id` has
-  already been revoked, and the row is NOT written. The revocation check and
-  the insert run in one transaction holding a per-family advisory lock (shared
-  with `revoke_family/1`), so a concurrent revocation cannot interleave and
-  leave a live successor in a revoked family (sticky revocation, RFC 6749
-  §10.4). A plain `FOR UPDATE` on the existing rows would not suffice: under
-  `READ COMMITTED` a revoking `UPDATE` that began before this insert committed
-  would not see the just-inserted successor (a phantom), leaving it live. The
-  advisory lock serializes the two operations outright, so a revocation that
-  loses the race still runs its `UPDATE` on a fresh snapshot that includes the
-  new row. The opaque store record is flattened onto the schema columns by
-  `AttestoPhoenix.Schema.RefreshToken.from_store_record/2`.
+  Family revocation and `(family_id, generation)`/token uniqueness are checked
+  while holding the same family lock used by rotation and revocation.
   """
   @impl Attesto.RefreshStore
-  @spec insert(Attesto.RefreshStore.entry()) :: :ok | {:error, :family_revoked}
-  def insert(%{token_hash: token_hash, family_id: family_id} = record)
-      when is_binary(token_hash) and is_binary(family_id) do
+  @spec insert(Attesto.RefreshStore.entry()) :: :ok | {:error, :family_revoked | :conflict}
+  def insert(%{} = record) do
+    validate_new_record!(record)
+    prefix = table_prefix()
+    family_id = record.family_id
+
     result =
-      repo().transaction(fn ->
-        lock_family!(family_id)
+      repo().transaction(
+        fn ->
+          lock_family!(family_id)
+          insert_locked(record, family_id, prefix)
+        end,
+        log: false,
+        telemetry_event: nil
+      )
 
-        if family_revoked?(family_id) do
-          # Sticky revocation: refuse a successor whose claim won before the
-          # revocation landed (RFC 6749 §10.4 family revocation).
-          repo().rollback(:family_revoked)
-        else
-          %RefreshToken{}
-          |> RefreshToken.insert_changeset(RefreshToken.from_store_record(record))
-          |> repo().insert!()
-
-          :ok
-        end
-      end)
-
-    case result do
-      {:ok, :ok} -> :ok
-      {:error, :family_revoked} -> {:error, :family_revoked}
-    end
+    normalize_insert_result(result)
   end
 
-  @doc """
-  Non-consuming read of the record for `token_hash`, or `:error` if absent or
-  family-revoked.
+  def insert(_record), do: invalid_record!()
 
-  Returns the record in the `Attesto.RefreshStore` contract shape (opaque
-  `:data` context, `:expires_at` as absolute unix seconds). Used by
-  `Attesto.RefreshToken` to validate a rotation (expiry, client and DPoP
-  binding) and to detect an already-consumed replay before the atomic claim,
-  so a recoverable validation failure does not burn the token.
+  @doc """
+  Strong primary read of a refresh record.
+
+  Revoked families are intentionally hidden from the protocol layer. The
+  query is always executed through the configured primary repo and carries the
+  configured Ecto prefix explicitly.
   """
   @impl Attesto.RefreshStore
   @spec get(Attesto.RefreshStore.token_hash()) :: {:ok, Attesto.RefreshStore.entry()} | :error
   def get(token_hash) when is_binary(token_hash) do
-    case repo().get_by(RefreshToken, token_hash: token_hash, family_revoked: false) do
-      %RefreshToken{} = row -> {:ok, RefreshToken.to_store_record(row)}
-      nil -> :error
-    end
-  end
-
-  @doc """
-  Atomically marks the token consumed if it was not already.
-
-  Returns `{:ok, entry}` to the single caller that wins the claim (the record
-  is reported as it stood, unconsumed, since the successor is minted from it),
-  `{:reuse, entry}` when the token was already consumed (the caller MUST then
-  `revoke_family/1`; the entry carries the `:family_id`), or `:error` for an
-  unknown token. The conditional `UPDATE ... WHERE consumed = false RETURNING`
-  is one indivisible statement, so concurrent rotations cannot both win.
-  """
-  @impl Attesto.RefreshStore
-  @spec consume(Attesto.RefreshStore.token_hash(), keyword()) ::
-          {:ok, Attesto.RefreshStore.entry()} | {:reuse, Attesto.RefreshStore.entry()} | :error
-  def consume(token_hash, opts \\ []) when is_binary(token_hash) and is_list(opts) do
-    consumed_at = opts |> Keyword.get(:now, System.system_time(:second)) |> to_datetime()
-
-    # The atomic claim: only a row that is still unconsumed flips to consumed,
-    # and the affected-row count disambiguates the winner from every concurrent
-    # loser. RETURNING hands back the claimed row.
     query =
-      from r in RefreshToken,
-        where: r.token_hash == ^token_hash and r.consumed == false and r.family_revoked == false,
+      from(r in RefreshToken,
+        left_join: revocation in RefreshFamilyRevocation,
+        on: revocation.family_id == r.family_id,
+        where: r.token_hash == ^token_hash and r.family_revoked == false,
+        where: is_nil(revocation.family_id),
         select: r
+      )
 
-    case repo().update_all(query, set: [consumed: true, consumed_at: consumed_at]) do
-      {1, [row]} ->
-        # Won the claim. Report the record as it stood (unconsumed): the next
-        # token in the family is minted from it.
-        {:ok, RefreshToken.to_store_record(%{row | consumed: false, consumed_at: nil})}
+    case repo().one(query, prefix: table_prefix(), log: false, telemetry_event: nil) do
+      %RefreshToken{} = row ->
+        record = to_store_record(row)
 
-      {0, _} ->
-        classify_consume_miss(token_hash)
+        if valid_recovered_successor?(row, record.successor, table_prefix()) do
+          {:ok, record}
+        else
+          {:ok, %{record | successor: nil}}
+        end
+
+      nil ->
+        :error
     end
   end
 
   @doc """
-  Records the successor minted by a consumed parent token.
+  Atomically rotates `parent_hash` into `child`.
 
-  The core uses this for refresh-rotation idempotency: an immediate retry of a
-  just-rotated token by the same client can receive the same successor rather
-  than revoking the family. Only consumed parents accept a successor marker.
-  The marker is encrypted before it is written to the database; if no
-  `:refresh_successor_secret` is configured, the store fails closed by returning
-  `:error`.
+  The successor is protected before any database work. A positive successor
+  requires the stable refresh-successor secret; failure to protect it returns
+  `:retry_state_unavailable` without touching the database. Strict mode uses
+  an exact non-secret tombstone and remains usable without that secret.
   """
   @impl Attesto.RefreshStore
-  @spec remember_successor(Attesto.RefreshStore.token_hash(), map(), keyword()) :: :ok | :error
-  def remember_successor(token_hash, successor, opts \\ [])
-      when is_binary(token_hash) and is_map(successor) and is_list(opts) do
-    with {:ok, protected} <- protect_successor(successor) do
-      query =
-        from r in RefreshToken,
-          where: r.token_hash == ^token_hash and r.consumed == true and r.family_revoked == false
+  @spec rotate(
+          Attesto.RefreshStore.token_hash(),
+          Attesto.RefreshStore.entry(),
+          map(),
+          keyword()
+        ) ::
+          {:ok, Attesto.RefreshStore.entry(), Attesto.RefreshStore.entry()}
+          | {:reuse, Attesto.RefreshStore.entry()}
+          | {:error, rotation_error()}
+          | :error
+  def rotate(parent_hash, child, successor, opts \\ [])
+      when is_binary(parent_hash) and is_map(child) and is_map(successor) and is_list(opts) do
+    now = Keyword.get(opts, :now)
 
-      case repo().update_all(query, set: [successor: protected]) do
-        {1, _} -> :ok
-        {0, _} -> :error
-      end
+    with {:ok, now} <- valid_now(now),
+         {:ok, protected} <- protect_successor(parent_hash, child, successor, now) do
+      result = rotate_transaction(parent_hash, child, successor, protected, now)
+      result
+    else
+      {:error, :retry_state_unavailable} -> {:error, :retry_state_unavailable}
+      {:error, :invalid_rotation} -> {:error, :invalid_rotation}
     end
   end
 
   @doc """
-  Revokes a token family: marks every token in `family_id` revoked.
-
-  The rows are kept (their `:family_revoked` flag is set) rather than deleted,
-  so the revocation is sticky: a successor `insert/1` serialized after this call
-  is refused (see `insert/1`). The revocation runs in a transaction holding the
-  same per-family advisory lock as `insert/1`, so a concurrent successor insert
-  cannot slip a live row past it: a revocation that wins the lock is seen by the
-  later insert (refused); one that loses runs its `UPDATE` after the insert has
-  committed, on a fresh snapshot that includes the new row. Idempotent:
-  re-revoking is a no-op re-set, and revoking an unknown family updates nothing
-  and returns `:ok`.
+  Serializes family revocation with inserts and rotations, durably records the
+  tombstone, and removes every row in the family.
   """
   @impl Attesto.RefreshStore
   @spec revoke_family(Attesto.RefreshStore.family_id()) :: :ok
   def revoke_family(family_id) when is_binary(family_id) do
-    repo().transaction(fn ->
-      lock_family!(family_id)
-      query = from r in RefreshToken, where: r.family_id == ^family_id
-      repo().update_all(query, set: [family_revoked: true])
-    end)
+    prefix = table_prefix()
+
+    case repo().transaction(
+           fn ->
+             lock_family!(family_id)
+
+             revoke_rows!(family_id, prefix)
+
+             :ok
+           end,
+           log: false,
+           telemetry_event: nil
+         ) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, _reason} ->
+        raise RuntimeError, "#{inspect(__MODULE__)} revoke_family/1 transaction failed"
+
+      _invalid_return ->
+        raise RuntimeError,
+              "#{inspect(__MODULE__)} revoke_family/1 violated the repo transaction contract"
+    end
+  end
+
+  @doc false
+  @spec redact_expired_successors(module(), DateTime.t(), keyword()) :: non_neg_integer()
+  def redact_expired_successors(repo, %DateTime{} = now, opts \\ []) when is_atom(repo) and is_list(opts) do
+    prefix = Keyword.get(opts, :prefix)
+    grace = Keyword.get(opts, :legacy_grace_seconds, 0)
+
+    if not (is_integer(grace) and grace >= 0) do
+      raise ArgumentError, ":legacy_grace_seconds must be a non-negative integer"
+    end
+
+    now_unix = DateTime.to_unix(now, :second)
+
+    # JSONB numbers are arbitrary precision and may be decimal or exponent
+    # notation. Never cast a value read from JSONB to bigint: an adversarial
+    # value can overflow before a predicate has a chance to reject it. The
+    # text check admits only canonical integer syntax, while the JSONB numeric
+    # comparisons enforce the range needed by the store contract.
+    modern =
+      from(r in RefreshToken,
+        where: not is_nil(r.successor),
+        where:
+          fragment(
+            @modern_valid_wrapper_sql,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor
+          ),
+        where:
+          fragment("(?->'retry_until') < to_jsonb(?::numeric)", r.successor, ^now_unix) or
+            r.expires_at <= ^now,
+        update: [
+          set: [
+            successor:
+              fragment(
+                @modern_redaction_sql,
+                r.successor,
+                r.expires_at,
+                r.successor,
+                r.expires_at
+              )
+          ]
+        ]
+      )
+
+    # Every other wrapper is malformed or legacy-undated. Redact it as well,
+    # so bad state cannot retain credential-equivalent ciphertext forever.
+    # Where timestamps are usable, preserve the v1 stopped-cutover deadline
+    # calculation; otherwise use the already safe sweep instant.
+    malformed =
+      from(r in RefreshToken,
+        where: not is_nil(r.successor),
+        where:
+          fragment(
+            @malformed_wrapper_sql,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor
+          ),
+        where:
+          fragment(
+            @valid_tombstone_sql,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor
+          ),
+        where:
+          fragment(
+            @legacy_retention_sql,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.successor,
+            r.consumed_at,
+            r.expires_at,
+            r.consumed_at,
+            r.expires_at,
+            r.consumed_at,
+            ^grace,
+            r.expires_at,
+            ^now_unix,
+            ^now_unix
+          ),
+        update: [
+          set: [
+            successor:
+              fragment(
+                @redaction_sql,
+                r.consumed_at,
+                r.expires_at,
+                r.consumed_at,
+                ^grace,
+                r.expires_at,
+                ^now_unix
+              )
+          ]
+        ]
+      )
+
+    {modern_count, _} =
+      repo.update_all(modern, [], prefix: prefix, log: false, telemetry_event: nil)
+
+    {legacy_count, _} =
+      repo.update_all(malformed, [], prefix: prefix, log: false, telemetry_event: nil)
+
+    modern_count + legacy_count
+  end
+
+  defp rotate_transaction(parent_hash, child, successor, protected, now) do
+    prefix = table_prefix()
+
+    repo().transaction(
+      fn ->
+        parent_query =
+          from(r in RefreshToken,
+            where: r.token_hash == ^parent_hash,
+            select: r
+          )
+
+        case repo().one(parent_query, prefix: prefix, log: false, telemetry_event: nil) do
+          nil ->
+            repo().rollback(:not_found)
+
+          %RefreshToken{family_id: family_id} ->
+            # Discover the family from persisted state before taking the family
+            # lock. Locking a caller-provided child family first lets malformed
+            # input create lock-order inversions with a concurrent rotation or
+            # revocation of the real parent family.
+            lock_family!(family_id)
+
+            locked_parent_query =
+              from(r in RefreshToken,
+                where: r.token_hash == ^parent_hash,
+                lock: "FOR UPDATE",
+                select: r
+              )
+
+            rotate_loaded_parent_or_revoke(
+              repo().one(locked_parent_query, prefix: prefix, log: false, telemetry_event: nil),
+              family_id,
+              parent_hash,
+              child,
+              successor,
+              protected,
+              now,
+              prefix
+            )
+        end
+      end,
+      log: false,
+      telemetry_event: nil
+    )
+    |> unwrap_transaction()
+  end
+
+  defp rotate_loaded_parent_or_revoke(nil, family_id, parent_hash, child, successor, protected, now, prefix) do
+    if family_revoked?(family_id, prefix) do
+      repo().rollback(:family_revoked)
+    else
+      rotate_loaded_parent(nil, parent_hash, child, successor, protected, now, prefix)
+    end
+  end
+
+  defp rotate_loaded_parent_or_revoke(
+         %RefreshToken{} = row,
+         _family_id,
+         parent_hash,
+         child,
+         successor,
+         protected,
+         now,
+         prefix
+       ) do
+    if family_revoked?(row.family_id, prefix) do
+      repo().rollback(:family_revoked)
+    else
+      rotate_loaded_parent(row, parent_hash, child, successor, protected, now, prefix)
+    end
+  end
+
+  defp rotate_loaded_parent(nil, _parent_hash, _child, _successor, _protected, _now, _prefix) do
+    repo().rollback(:not_found)
+  end
+
+  defp rotate_loaded_parent(
+         %RefreshToken{family_revoked: true},
+         _parent_hash,
+         _child,
+         _successor,
+         _protected,
+         _now,
+         _prefix
+       ) do
+    repo().rollback(:family_revoked)
+  end
+
+  defp rotate_loaded_parent(
+         %RefreshToken{consumed: true} = row,
+         _parent_hash,
+         _child,
+         _successor,
+         _protected,
+         _now,
+         _prefix
+       ) do
+    {:reuse, to_store_record(row)}
+  end
+
+  defp rotate_loaded_parent(%RefreshToken{} = row, parent_hash, child, successor, protected, now, prefix) do
+    case validate_rotation(row, parent_hash, child, successor, now, prefix) do
+      :ok ->
+        commit_rotation(row, child, protected, now, prefix)
+
+      {:error, :family_integrity_error} ->
+        revoke_rows!(row.family_id, prefix)
+        {:error, :family_integrity_error}
+
+      {:error, reason} ->
+        repo().rollback(reason)
+    end
+  end
+
+  defp insert_locked(record, family_id, prefix) do
+    cond do
+      family_revoked?(family_id, prefix) ->
+        repo().rollback(:family_revoked)
+
+      generation_taken?(family_id, Map.get(record, :generation, 0), prefix) ->
+        repo().rollback(:conflict)
+
+      true ->
+        insert_record(record, prefix)
+    end
+  end
+
+  defp validate_new_record!(record) do
+    if RefreshToken.valid_store_record?(record) and
+         Map.get(record, :consumed) == false and
+         is_nil(Map.get(record, :consumed_at)) and
+         is_nil(Map.get(record, :successor)) do
+      :ok
+    else
+      invalid_record!()
+    end
+  end
+
+  defp invalid_record!, do: raise(ArgumentError, "refresh token record violates the canonical store contract")
+
+  defp insert_record(record, prefix) do
+    changeset =
+      %RefreshToken{}
+      |> RefreshToken.insert_changeset(RefreshToken.from_store_record(record, prefix: prefix))
+
+    case repo().insert(changeset, prefix: prefix, log: false, telemetry_event: nil) do
+      {:ok, _row} -> :ok
+      {:error, changeset} -> repo().rollback(insert_error(changeset))
+    end
+  end
+
+  defp normalize_insert_result({:ok, :ok}), do: :ok
+  defp normalize_insert_result({:error, :family_revoked}), do: {:error, :family_revoked}
+  defp normalize_insert_result({:error, :conflict}), do: {:error, :conflict}
+  defp normalize_insert_result({:error, _reason}), do: {:error, :conflict}
+
+  defp commit_rotation(row, child, protected, now, prefix) do
+    parent_changeset =
+      row
+      |> RefreshToken.claim_changeset(DateTime.from_unix!(now, :second))
+      |> Ecto.Changeset.change(successor: protected)
+
+    # The successor wrapper contains credential-equivalent encrypted state.
+    # Ecto logs bound parameters at debug level unless told otherwise, so this
+    # write must never enter the host's query log.
+    with {:ok, committed_parent} <-
+           repo().update(parent_changeset, prefix: prefix, log: false, telemetry_event: nil),
+         {:ok, committed_child} <- insert_child(child, row.token_hash, prefix) do
+      {:ok, to_store_record(committed_parent), to_store_record(committed_child)}
+    else
+      {:error, changeset} -> repo().rollback(insert_error(changeset))
+    end
+  end
+
+  defp insert_child(child, parent_hash, prefix) do
+    changeset =
+      %RefreshToken{}
+      |> RefreshToken.insert_changeset(RefreshToken.from_store_record(child, parent_hash: parent_hash))
+
+    repo().insert(changeset, prefix: prefix, log: false, telemetry_event: nil)
+  end
+
+  defp validate_rotation(row, parent_hash, child, successor, now, prefix) do
+    with :ok <- validate_parent(row, parent_hash),
+         :ok <- validate_child_record(child),
+         :ok <- validate_child(row, child, parent_hash),
+         :ok <- validate_expiry(row, child, now),
+         :ok <- validate_generation(row, child, prefix),
+         :ok <- validate_token_hash(child, prefix) do
+      validate_successor(successor, child, now)
+    end
+  end
+
+  defp validate_child_record(child) do
+    if RefreshToken.valid_store_record?(child) and
+         Map.get(child, :consumed) == false and
+         is_nil(Map.get(child, :consumed_at)) and
+         is_nil(Map.get(child, :successor)) do
+      :ok
+    else
+      {:error, :invalid_rotation}
+    end
+  end
+
+  defp validate_parent(%RefreshToken{token_hash: token_hash}, token_hash), do: :ok
+  defp validate_parent(_row, _parent_hash), do: {:error, :invalid_rotation}
+
+  defp validate_child(row, child, parent_hash) do
+    token_hash = Map.get(child, :token_hash)
+    family_id = Map.get(child, :family_id)
+    generation = Map.get(child, :generation)
+    consumed = Map.get(child, :consumed)
+    consumed_at = Map.get(child, :consumed_at)
+
+    cond do
+      not is_binary(token_hash) or token_hash == parent_hash -> {:error, :invalid_rotation}
+      family_id != row.family_id -> {:error, :invalid_rotation}
+      generation != row.generation + 1 -> {:error, :invalid_rotation}
+      consumed != false or not is_nil(consumed_at) -> {:error, :invalid_rotation}
+      true -> :ok
+    end
+  end
+
+  defp validate_expiry(row, child, now) do
+    child_expires_at = Map.get(child, :expires_at)
+
+    cond do
+      not is_integer(child_expires_at) or child_expires_at <= now -> {:error, :invalid_rotation}
+      DateTime.to_unix(row.expires_at, :second) <= now -> {:error, :expired}
+      true -> :ok
+    end
+  end
+
+  defp validate_generation(row, child, prefix) do
+    if generation_taken?(row.family_id, Map.get(child, :generation), prefix),
+      do: {:error, :family_integrity_error},
+      else: :ok
+  end
+
+  defp validate_token_hash(child, prefix) do
+    if token_hash_taken?(Map.get(child, :token_hash), prefix),
+      do: {:error, :token_conflict},
+      else: :ok
+  end
+
+  defp validate_successor(successor, child, now) do
+    if valid_positive_successor?(successor, child, now) or valid_strict_successor?(successor, now),
+      do: :ok,
+      else: {:error, :invalid_rotation}
+  end
+
+  defp valid_positive_successor?(
+         %{token: token, generation: generation, context: context, retry_until: retry_until} = successor,
+         child,
+         now
+       )
+       when is_binary(token) and token != "" and is_integer(generation) and
+              (is_map(context) and is_integer(retry_until)) do
+    child_family_id = Map.get(child, :family_id)
+    child_generation = Map.get(child, :generation)
+    child_expires_at = Map.get(child, :expires_at)
+
+    valid_successor_contexts?(child, context) and
+      valid_child_identity?(child, token, child_family_id, child_generation, child_expires_at) and
+      valid_successor_payload?(child, token, generation, context) and
+      valid_successor_deadline?(retry_until, child_expires_at, now) and
+      exact_positive_successor_keys?(successor)
+  end
+
+  defp valid_positive_successor?(_successor, _child, _now), do: false
+
+  defp valid_child_identity?(child, token, family_id, generation, expires_at) do
+    is_binary(family_id) and is_integer(generation) and is_integer(expires_at) and
+      token_hash(token) == Map.get(child, :token_hash)
+  end
+
+  defp valid_successor_contexts?(child, context) do
+    RefreshToken.valid_context?(Map.get(child, :data)) and RefreshToken.valid_context?(context)
+  end
+
+  defp valid_successor_payload?(child, token, generation, context) do
+    generation == Map.get(child, :generation) and context == Map.get(child, :data) and token != ""
+  end
+
+  defp valid_successor_deadline?(retry_until, expires_at, now) do
+    retry_until >= now and retry_until < expires_at
+  end
+
+  defp exact_positive_successor_keys?(successor) do
+    Map.keys(successor) |> Enum.sort() == [:context, :generation, :retry_until, :token]
+  end
+
+  defp valid_strict_successor?(%{retry_until: retry_until, recoverable: false} = successor, now)
+       when is_integer(retry_until), do: retry_until == now and map_size(successor) == 2
+
+  defp valid_strict_successor?(_successor, _now), do: false
+
+  defp protect_successor(parent_hash, child, successor, now) do
+    cond do
+      valid_strict_successor?(successor, now) ->
+        {:ok, %{"v" => 1, "retry_until" => now, "recoverable" => false}}
+
+      valid_positive_successor?(successor, child, now) ->
+        aad =
+          RefreshSuccessorCipher.binding_aad(
+            parent_hash,
+            child.family_id,
+            child.generation - 1,
+            child.token_hash,
+            successor.retry_until
+          )
+
+        case RefreshSuccessorCipher.encrypt(successor, aad) do
+          {:ok, ciphertext} ->
+            {:ok,
+             %{
+               "v" => 2,
+               "ciphertext" => ciphertext,
+               "retry_until" => successor.retry_until,
+               "child_hash" => child.token_hash
+             }}
+
+          :error ->
+            {:error, :retry_state_unavailable}
+        end
+
+      true ->
+        {:error, :invalid_rotation}
+    end
+  end
+
+  defp unwrap_transaction({:ok, result}), do: result
+  defp unwrap_transaction({:error, :not_found}), do: :error
+
+  defp unwrap_transaction({:error, reason})
+       when reason in [
+              :family_revoked,
+              :retry_state_unavailable,
+              :token_conflict,
+              :family_integrity_error,
+              :invalid_rotation,
+              :expired
+            ], do: {:error, reason}
+
+  defp valid_now(now) when is_integer(now) and now >= 0, do: {:ok, now}
+  defp valid_now(_), do: {:error, :invalid_rotation}
+
+  defp family_revoked?(family_id, prefix) do
+    repo().exists?(
+      from(r in RefreshFamilyRevocation, where: r.family_id == ^family_id),
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
+    ) or
+      repo().exists?(
+        from(r in RefreshToken, where: r.family_id == ^family_id and r.family_revoked == true),
+        prefix: prefix,
+        log: false,
+        telemetry_event: nil
+      )
+  end
+
+  defp generation_taken?(family_id, generation, prefix) when is_binary(family_id) and is_integer(generation) do
+    repo().exists?(
+      from(r in RefreshToken, where: r.family_id == ^family_id and r.generation == ^generation),
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
+    )
+  end
+
+  defp generation_taken?(_family_id, _generation, _prefix), do: true
+
+  defp token_hash_taken?(hash, prefix) do
+    repo().exists?(
+      from(r in RefreshToken, where: r.token_hash == ^hash),
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
+    )
+  end
+
+  defp revoke_rows!(family_id, prefix) do
+    mark_family_revoked!(family_id, prefix)
+
+    repo().delete_all(
+      from(r in RefreshToken, where: r.family_id == ^family_id),
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
+    )
 
     :ok
   end
 
-  # RFC 6749 §10.4 sticky revocation depends on `insert/1` and `revoke_family/1`
-  # never interleaving for one family. A Postgres advisory transaction lock keyed
-  # on the family id serializes them (held until the surrounding transaction
-  # ends). `hashtext/1` maps the family id to the int4 key the two-argument
-  # advisory-lock form takes; the constant first key namespaces these locks to
-  # this store so they cannot collide with another subsystem's advisory locks.
+  defp mark_family_revoked!(family_id, prefix) do
+    revoked_at = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    case repo().insert(
+           %RefreshFamilyRevocation{family_id: family_id, revoked_at: revoked_at},
+           on_conflict: :nothing,
+           conflict_target: [:family_id],
+           prefix: prefix,
+           log: false,
+           telemetry_event: nil
+         ) do
+      {:ok, _row} ->
+        :ok
+
+      {:error, _changeset} ->
+        raise RuntimeError, "#{inspect(__MODULE__)} could not persist refresh-family revocation"
+    end
+  end
+
+  defp insert_error(%Ecto.Changeset{} = changeset) do
+    if Enum.any?(changeset.errors, fn {field, {_message, opts}} ->
+         field in [:token_hash, :family_id, :generation] and opts[:constraint] == :unique
+       end) do
+      :token_conflict
+    else
+      :invalid_rotation
+    end
+  end
+
+  defp insert_error(_), do: :invalid_rotation
+
   defp lock_family!(family_id) do
-    repo().query!("SELECT pg_advisory_xact_lock($1::int4, hashtext($2))", [@advisory_lock_namespace, family_id])
+    repo().query!(
+      "SELECT pg_advisory_xact_lock($1::int4, hashtext($2))",
+      [@advisory_lock_namespace, family_id],
+      log: false,
+      telemetry_event: nil
+    )
   end
 
-  # No row was claimable: either the token is unknown, or it was already
-  # consumed. A non-consuming read distinguishes them, so an unknown token
-  # never trips reuse detection (there is no family to revoke). No silent
-  # reject: each outcome maps to a distinct, explicit return value.
-  defp classify_consume_miss(token_hash) do
-    case repo().get_by(RefreshToken, token_hash: token_hash) do
-      %RefreshToken{family_revoked: true} -> :error
-      %RefreshToken{consumed: true} = row -> {:reuse, RefreshToken.to_store_record(row)}
-      %RefreshToken{} -> :error
-      nil -> :error
+  defp token_hash(token), do: Attesto.Secret.hash(token)
+
+  # A v1 successor wrapper did not persist its retry deadline. Resolve the
+  # configured grace once per read and let the schema derive a deadline from
+  # the row's consumed_at/expiry timestamps. Request-local config wins so
+  # tenant-specific settings cannot bleed into another request.
+  defp to_store_record(%RefreshToken{} = row) do
+    RefreshToken.to_store_record(row, legacy_grace_seconds: refresh_rotation_grace_seconds())
+  end
+
+  # v2 carries the child hash in its authenticated wrapper. Legacy v1
+  # ciphertext predates that binding, so establish the missing parent/family
+  # relation from durable lineage before exposing its decrypted token. This
+  # also makes a copied v1 ciphertext fail closed: the candidate child must be
+  # the row minted by this parent in this family.
+  defp valid_recovered_successor?(_row, nil, _prefix), do: true
+
+  defp valid_recovered_successor?(_row, %{recoverable: false}, _prefix), do: true
+
+  defp valid_recovered_successor?(
+         %RefreshToken{token_hash: parent_hash, family_id: family_id},
+         %{token: token, generation: generation, context: context},
+         prefix
+       )
+       when is_binary(token) and is_integer(generation) and is_map(context) do
+    child_hash = token_hash(token)
+
+    child_query =
+      from(child in RefreshToken,
+        where:
+          child.token_hash == ^child_hash and child.family_id == ^family_id and
+            child.generation == ^generation and child.parent_hash == ^parent_hash,
+        select: child
+      )
+
+    case repo().one(child_query, prefix: prefix, log: false, telemetry_event: nil) do
+      %RefreshToken{} = child ->
+        recovered_child_matches?(child, generation, context)
+
+      nil ->
+        false
     end
   end
 
-  defp family_revoked?(family_id) do
-    query =
-      from r in RefreshToken,
-        where: r.family_id == ^family_id and r.family_revoked == true
+  defp valid_recovered_successor?(_row, _successor, _prefix), do: false
 
-    repo().exists?(query)
+  defp recovered_child_matches?(%RefreshToken{} = child, generation, context) do
+    child_record = to_store_record(child)
+    child_record.generation == generation and child_record.data == context
+  rescue
+    ArgumentError -> false
   end
 
-  defp to_datetime(%DateTime{} = dt), do: dt
-  defp to_datetime(seconds) when is_integer(seconds), do: DateTime.from_unix!(seconds, :second)
+  defp refresh_rotation_grace_seconds do
+    case Config.request_config() do
+      %Config{refresh_token_rotation_grace_seconds: grace} ->
+        grace
 
-  defp protect_successor(successor) do
-    with {:ok, ciphertext} <- RefreshSuccessorCipher.encrypt(successor) do
-      {:ok, %{"v" => 1, "ciphertext" => ciphertext}}
+      nil ->
+        case Application.get_env(@app, :otp_app) do
+          otp_app when is_atom(otp_app) ->
+            Config.from_otp_app(otp_app).refresh_token_rotation_grace_seconds
+
+          _other ->
+            0
+        end
     end
   end
+
+  defp table_prefix, do: Config.table_prefix()
 
   defp repo do
     Config.ecto_repo!(

@@ -57,9 +57,10 @@ defmodule AttestoPhoenix.Schema.DPoPNonce do
   error rather than a raised exception, so a caller can treat a collision as a
   generation retry.
   """
-  @spec issue_changeset(t() | %__MODULE__{}, map()) :: Ecto.Changeset.t()
-  def issue_changeset(nonce \\ %__MODULE__{}, attrs) do
+  @spec issue_changeset(t() | %__MODULE__{}, map(), keyword()) :: Ecto.Changeset.t()
+  def issue_changeset(nonce \\ %__MODULE__{}, attrs, opts \\ []) when is_list(opts) do
     nonce
+    |> Ecto.put_meta(prefix: Keyword.get(opts, :prefix))
     |> cast(attrs, @insert_fields)
     |> validate_required(@insert_fields)
     |> unique_constraint(:nonce)

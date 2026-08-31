@@ -3,6 +3,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
 
   import ExUnit.CaptureIO
 
+  alias AttestoPhoenix.Config
   alias Mix.Tasks.AttestoPhoenix.Gen.Migration
 
   @moduletag :tmp_dir
@@ -33,7 +34,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
   end
 
   describe "run/1" do
-    test "generates a migration creating all seven stores", %{tmp_dir: tmp_dir} do
+    test "generates a migration creating all bundled tables", %{tmp_dir: tmp_dir} do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
@@ -41,6 +42,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       # by-the-docs deploy installs tables the stores cannot use:
       #   * AttestoPhoenix.Schema.Authorization               -> attesto_authorization_codes
       #   * AttestoPhoenix.Schema.RefreshToken                -> attesto_refresh_tokens
+      #   * AttestoPhoenix.Schema.RefreshFamilyRevocation    -> attesto_refresh_family_revocations
+      #   * AttestoPhoenix.Schema.DeviceCode                  -> attesto_device_codes
+      #   * AttestoPhoenix.Schema.CIBARequest                 -> attesto_ciba_requests
+      #   * AttestoPhoenix.Schema.LogoutSession               -> attesto_logout_sessions
       #   * AttestoPhoenix.Schema.DPoPNonce                   -> dpop_nonces
       #   * AttestoPhoenix.Schema.DPoPReplay                  -> dpop_replays
       #   * AttestoPhoenix.Schema.PushedAuthorizationRequest  -> attesto_pushed_authorization_requests
@@ -49,6 +54,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|use Ecto.Migration|
       assert source =~ ~s|create table(:attesto_authorization_codes|
       assert source =~ ~s|create table(:attesto_refresh_tokens|
+      assert source =~ ~s|create table(:attesto_refresh_family_revocations|
+      assert source =~ ~s|create table(:attesto_device_codes|
+      assert source =~ ~s|create table(:attesto_ciba_requests|
+      assert source =~ ~s|create table(:attesto_logout_sessions|
       assert source =~ ~s|create table(:dpop_nonces|
       assert source =~ ~s|create table(:dpop_replays|
       assert source =~ ~s|create table(:attesto_pushed_authorization_requests|
@@ -64,10 +73,14 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       # PRIMARY KEY; metadata is jsonb (:map); expires_at is indexed for sweeps.
       assert source =~ ~s|add :url, :string, size: 255, primary_key: true, null: false|
       assert source =~ ~s|add :metadata, :map, null: false|
-      assert source =~ ~s|create index(:attesto_client_id_metadata, [:expires_at])|
+
+      assert source =~
+               ~s|create index(:attesto_client_id_metadata, [:expires_at], prefix: prefix)|
     end
 
-    test "pushed_authorization_requests keys on request_uri as PK with a jsonb params column", %{tmp_dir: tmp_dir} do
+    test "pushed_authorization_requests keys on request_uri as PK with a jsonb params column", %{
+      tmp_dir: tmp_dir
+    } do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
@@ -76,7 +89,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       # indexed for sweeps.
       assert source =~ ~s|add :request_uri, :string, size: 255, primary_key: true, null: false|
       assert source =~ ~s|add :params, :map, null: false|
-      assert source =~ ~s|create index(:attesto_pushed_authorization_requests, [:expires_at])|
+
+      assert source =~
+               ~s|create index(:attesto_pushed_authorization_requests, [:expires_at], prefix: prefix)|
     end
 
     test "creates the unique constraints the schemas name", %{tmp_dir: tmp_dir} do
@@ -88,9 +103,16 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       #   * Authorization: attesto_authorization_codes_code_hash_index
       #   * RefreshToken:  attesto_refresh_tokens_token_hash_index
       #   * DPoPNonce:     dpop_nonces_nonce_index (Ecto default)
-      assert source =~ ~s|create unique_index(:attesto_authorization_codes, [:code_hash])|
-      assert source =~ ~s|create unique_index(:attesto_refresh_tokens, [:token_hash])|
-      assert source =~ ~s|create unique_index(:dpop_nonces, [:nonce])|
+      assert source =~
+               ~s|create unique_index(:attesto_authorization_codes, [:code_hash], prefix: prefix)|
+
+      assert source =~
+               ~s|create unique_index(:attesto_refresh_tokens, [:token_hash], prefix: prefix)|
+
+      assert source =~ ~s|create unique_index(:dpop_nonces, [:nonce], prefix: prefix)|
+
+      assert source =~
+               "name: :attesto_refresh_tokens_family_id_generation_index"
     end
 
     test "keys dpop_replays on jti so the conflict is dpop_replays_pkey", %{tmp_dir: tmp_dir} do
@@ -123,7 +145,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|add :consumed_at, :utc_datetime|
       # The schema is @primary_key false, keyed on code_hash: the table is
       # created primary_key: false and there is no surrogate id column in it.
-      assert source =~ ~s|create table(:attesto_authorization_codes, primary_key: false) do|
+      assert source =~
+               ~s|create table(:attesto_authorization_codes, primary_key: false, prefix: prefix) do|
     end
 
     test "refresh_tokens carries the rotation/reuse columns", %{tmp_dir: tmp_dir} do
@@ -138,7 +161,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|add :successor, :map|
       assert source =~ ~s|add :family_revoked, :boolean, null: false, default: false|
       assert source =~ ~s|add :parent_hash, :string, size: 88|
-      assert source =~ ~s|create index(:attesto_refresh_tokens, [:family_id])|
+      assert source =~ ~s|create index(:attesto_refresh_tokens, [:family_id], prefix: prefix)|
     end
 
     test "dpop_nonces carries issued_at/used_at", %{tmp_dir: tmp_dir} do
@@ -153,9 +176,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
-      assert source =~ ~s|create index(:attesto_authorization_codes, [:expires_at])|
-      assert source =~ ~s|create index(:attesto_refresh_tokens, [:expires_at])|
-      assert source =~ ~s|create index(:dpop_replays, [:expires_at])|
+      assert source =~
+               ~s|create index(:attesto_authorization_codes, [:expires_at], prefix: prefix)|
+
+      assert source =~ ~s|create index(:attesto_refresh_tokens, [:expires_at], prefix: prefix)|
+      assert source =~ ~s|create index(:dpop_replays, [:expires_at], prefix: prefix)|
     end
 
     test "is reversible", %{tmp_dir: tmp_dir} do
@@ -166,28 +191,234 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|def down do|
       # down drops every table the up created.
       for table <-
-            ~w(attesto_authorization_codes attesto_refresh_tokens dpop_nonces dpop_replays attesto_pushed_authorization_requests attesto_client_id_metadata attesto_consent_grants) do
-        assert source =~ ~s|drop table(:#{table})|
+            ~w(
+              attesto_authorization_codes
+              attesto_refresh_tokens
+              attesto_refresh_family_revocations
+              attesto_device_codes
+              attesto_ciba_requests
+              attesto_logout_sessions
+              dpop_nonces
+              dpop_replays
+              attesto_pushed_authorization_requests
+              attesto_client_id_metadata
+              attesto_consent_grants
+            ) do
+        assert source =~ ~s|drop table(:#{table}, prefix: prefix)|
       end
     end
 
-    test "applies an explicit --table-prefix to every table", %{tmp_dir: tmp_dir} do
-      run!(["--table-prefix", "oauth_"], tmp_dir)
+    test "applies an explicit --schema-prefix to every table", %{tmp_dir: tmp_dir} do
+      run!(["--schema-prefix", "oauth_"], tmp_dir)
       source = generated_migration(tmp_dir)
 
-      assert source =~ ~s|create table(:oauth_attesto_authorization_codes|
-      assert source =~ ~s|create table(:oauth_attesto_refresh_tokens|
-      assert source =~ ~s|create table(:oauth_dpop_nonces|
-      assert source =~ ~s|create table(:oauth_dpop_replays|
-      assert source =~ ~s|create unique_index(:oauth_attesto_authorization_codes, [:code_hash])|
+      assert source =~ ~s|prefix = "oauth_"|
+
+      assert source =~
+               ~s|create table(:attesto_authorization_codes, primary_key: false, prefix: prefix)|
+
+      assert source =~
+               ~s|create table(:attesto_refresh_tokens, primary_key: false, prefix: prefix)|
+
+      assert source =~ ~s|create table(:dpop_nonces, primary_key: false, prefix: prefix)|
+      assert source =~ ~s|create table(:dpop_replays, primary_key: false, prefix: prefix)|
+
+      assert source =~
+               ~s|create unique_index(:attesto_authorization_codes, [:code_hash], prefix: prefix)|
+
+      assert source =~ "name: :attesto_refresh_tokens_family_id_generation_index"
+      assert source =~ "prefix: prefix"
+
+      refute source =~ "oauth_attesto_authorization_codes"
     end
 
-    test "rejects an invalid table prefix (fail closed)", %{tmp_dir: tmp_dir} do
-      assert_raise Mix.Error, ~r/invalid --table-prefix/, fn ->
-        run!(["--table-prefix", "bad-prefix;"], tmp_dir)
+    test "reads a prebuilt Config struct from the selected otp_app", %{tmp_dir: tmp_dir} do
+      host_app = :attesto_phoenix_generator_config_test
+      previous = Application.get_env(host_app, Config, :missing)
+      Application.put_env(host_app, Config, struct(Config, schema_prefix: "tenant_schema"))
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(host_app, Config)
+          value -> Application.put_env(host_app, Config, value)
+        end
+      end)
+
+      run!(["--otp-app", Atom.to_string(host_app)], tmp_dir)
+      source = generated_migration(tmp_dir)
+
+      assert source =~ ~s|prefix = "tenant_schema"|
+
+      assert source =~
+               ~s|create table(:attesto_authorization_codes, primary_key: false, prefix: prefix)|
+    end
+
+    test "reads the configured otp_app when --otp-app is omitted", %{tmp_dir: tmp_dir} do
+      host_app = :attesto_phoenix_generator_no_flag_config_test
+      previous_pointer = Application.get_env(:attesto_phoenix, :otp_app, :missing)
+      previous_config = Application.get_env(host_app, Config, :missing)
+
+      Application.put_env(:attesto_phoenix, :otp_app, host_app)
+      Application.put_env(host_app, Config, schema_prefix: "tenant_schema")
+
+      on_exit(fn ->
+        case previous_pointer do
+          :missing -> Application.delete_env(:attesto_phoenix, :otp_app)
+          value -> Application.put_env(:attesto_phoenix, :otp_app, value)
+        end
+
+        case previous_config do
+          :missing -> Application.delete_env(host_app, Config)
+          value -> Application.put_env(host_app, Config, value)
+        end
+      end)
+
+      run!([], tmp_dir)
+      source = generated_migration(tmp_dir)
+
+      assert source =~ ~s|prefix = "tenant_schema"|
+    end
+
+    test "rejects an empty explicit schema prefix", %{tmp_dir: tmp_dir} do
+      assert_raise Mix.Error, ~r/invalid --schema-prefix.*non-empty/, fn ->
+        run!(["--schema-prefix", ""], tmp_dir)
       end
 
       assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects an empty configured schema prefix", %{tmp_dir: tmp_dir} do
+      host_app = :attesto_phoenix_generator_empty_prefix_test
+      previous = Application.get_env(host_app, Config, :missing)
+      Application.put_env(host_app, Config, schema_prefix: "")
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(host_app, Config)
+          value -> Application.put_env(host_app, Config, value)
+        end
+      end)
+
+      assert_raise Mix.Error, ~r/invalid --schema-prefix.*non-empty/, fn ->
+        run!(["--otp-app", Atom.to_string(host_app)], tmp_dir)
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects a schema prefix over PostgreSQL's 63-byte bound", %{tmp_dir: tmp_dir} do
+      assert_raise Mix.Error, ~r/at most 63 bytes/, fn ->
+        run!(["--schema-prefix", String.duplicate("a", 64)], tmp_dir)
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects an invalid schema prefix (fail closed)", %{tmp_dir: tmp_dir} do
+      assert_raise Mix.Error, ~r/invalid --schema-prefix/, fn ->
+        run!(["--schema-prefix", "bad-prefix;"], tmp_dir)
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects PostgreSQL system schemas", %{tmp_dir: tmp_dir} do
+      for prefix <- ["pg_catalog", "information_schema"] do
+        assert_raise Mix.Error, ~r/reserved PostgreSQL system schema/, fn ->
+          run!(["--schema-prefix", prefix], tmp_dir)
+        end
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects string-key configured prefix maps", %{tmp_dir: tmp_dir} do
+      host_app = :attesto_phoenix_generator_string_prefix_test
+      previous = Application.get_env(host_app, Config, :missing)
+      Application.put_env(host_app, Config, %{"schema_prefix" => "tenant_schema"})
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(host_app, Config)
+          value -> Application.put_env(host_app, Config, value)
+        end
+      end)
+
+      assert_raise Mix.Error, ~r/string key "schema_prefix".*atom key :schema_prefix/, fn ->
+        run!(["--otp-app", Atom.to_string(host_app)], tmp_dir)
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects the removed 2.x table-prefix flag", %{tmp_dir: tmp_dir} do
+      assert_raise Mix.Error, ~r/--table-prefix was removed.*--schema-prefix/, fn ->
+        run!(["--table-prefix", "oauth_"], tmp_dir)
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects a legacy configured table prefix", %{tmp_dir: tmp_dir} do
+      host_app = :attesto_phoenix_generator_legacy_prefix_test
+      previous = Application.get_env(host_app, Config, :missing)
+      Application.put_env(host_app, Config, table_prefix: "oauth_")
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(host_app, Config)
+          value -> Application.put_env(host_app, Config, value)
+        end
+      end)
+
+      assert_raise Mix.Error, ~r/legacy :table_prefix configuration detected.*:schema_prefix/, fn ->
+        run!(["--otp-app", Atom.to_string(host_app)], tmp_dir)
+      end
+    end
+
+    test "rejects a stale package-level table prefix", %{tmp_dir: tmp_dir} do
+      previous = Application.get_env(:attesto_phoenix, :table_prefix, :missing)
+      Application.put_env(:attesto_phoenix, :table_prefix, nil)
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(:attesto_phoenix, :table_prefix)
+          value -> Application.put_env(:attesto_phoenix, :table_prefix, value)
+        end
+      end)
+
+      assert_raise Mix.Error, ~r/legacy config :attesto_phoenix, :table_prefix detected.*:schema_prefix/, fn ->
+        run!(["--schema-prefix", "oauth"], tmp_dir)
+      end
+    end
+
+    test "rejects malformed configured schema prefixes instead of using public", %{tmp_dir: tmp_dir} do
+      host_app = :attesto_phoenix_generator_malformed_prefix_test
+      previous = Application.get_env(host_app, Config, :missing)
+      Application.put_env(host_app, Config, schema_prefix: 42)
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(host_app, Config)
+          value -> Application.put_env(host_app, Config, value)
+        end
+      end)
+
+      assert_raise Mix.Error, ~r/invalid configured :schema_prefix/, fn ->
+        run!(["--otp-app", Atom.to_string(host_app)], tmp_dir)
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
+    end
+
+    test "rejects unknown options and positional arguments", %{tmp_dir: tmp_dir} do
+      assert_raise Mix.Error, ~r/invalid migration-generator arguments/, fn ->
+        run!(["--schema-prefix", "oauth", "--bogus"], tmp_dir)
+      end
+
+      assert_raise Mix.Error, ~r/invalid migration-generator arguments/, fn ->
+        run!(["unexpected"], tmp_dir)
+      end
     end
 
     test "refuses to regenerate over an existing migration", %{tmp_dir: tmp_dir} do

@@ -9,11 +9,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Phoenix.ConnTest
   import Plug.Conn
 
   alias Attesto.AuthorizationCode
   alias Attesto.RequestObject.Policy
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
@@ -34,6 +36,20 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
     @impl true
     def take(_request_uri), do: :error
+  end
+
+  defmodule TakeFaultsPARStore do
+    @moduledoc false
+    @behaviour AttestoPhoenix.PARStore
+
+    @impl true
+    defdelegate put(request_uri, params, ttl_seconds), to: ETS
+
+    @impl true
+    defdelegate fetch(request_uri), to: ETS
+
+    @impl true
+    def take(_request_uri), do: {:error, :store_unavailable}
   end
 
   # A fixed S256 PKCE pair (RFC 7636 §4.2): the challenge is the
@@ -156,7 +172,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   defp call(params, opts \\ []) do
-    conn = Map.put(build_conn(), :scheme, :https)
+    conn = build_conn() |> Map.put(:scheme, :https) |> with_config()
 
     conn =
       case Keyword.get(opts, :user_agent) do
@@ -165,6 +181,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       end
 
     AuthorizeController.authorize(conn, params)
+  end
+
+  defp with_config(conn) do
+    put_private(
+      conn,
+      :attesto_phoenix_config,
+      Config.new(Application.fetch_env!(:attesto_phoenix, Config))
+    )
   end
 
   defp location(conn) do
@@ -369,7 +393,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
     setup do
       {:ok, _} =
-        start_supervised(%{id: StubFetcher, start: {Agent, :start_link, [fn -> %{} end, [name: StubFetcher]]}})
+        start_supervised(%{
+          id: StubFetcher,
+          start: {Agent, :start_link, [fn -> %{} end, [name: StubFetcher]]}
+        })
 
       :ok
     end
@@ -427,9 +454,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       put_config(client_id_metadata: cimd_config())
 
       # Everything at its default: same-origin required, loopback allowance on.
-      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://127.0.0.1:51353/callback"}))
+      conn =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "http://127.0.0.1:51353/callback"
+          })
+        )
 
-      assert conn.status == 302, "expected the native CIMD client to be served, got: #{conn.resp_body}"
+      assert conn.status == 302,
+             "expected the native CIMD client to be served, got: #{conn.resp_body}"
+
       assert location(conn) =~ "http://127.0.0.1:51353/callback"
       assert is_binary(location_query(conn)["code"])
     end
@@ -442,7 +477,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       script_doc(client_id, cimd_doc(%{"redirect_uris" => ["https://elsewhere.example/cb"]}))
       put_config(client_id_metadata: cimd_config())
 
-      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"}))
+      conn =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "https://elsewhere.example/cb"
+          })
+        )
 
       assert conn.status == 400
       assert location(conn) == nil
@@ -464,7 +505,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => ambiguous}))
 
       assert conn.status == 400
-      assert location(conn) == nil, "an ambiguous redirect URI must never become a redirect target"
+
+      assert location(conn) == nil,
+             "an ambiguous redirect URI must never become a redirect target"
     end
 
     # The same-origin requirement gates the redirect URI itself, so it has to be
@@ -477,12 +520,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       put_config(client_id_metadata: cimd_config())
 
       conn =
-        valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"})
+        valid_params(%{
+          "client_id" => client_id,
+          "redirect_uri" => "https://elsewhere.example/cb"
+        })
         |> Map.drop(["code_challenge", "code_challenge_method"])
         |> call()
 
       assert conn.status == 400
-      assert location(conn) == nil, "an error must not be redirected to a URI the origin check refuses"
+
+      assert location(conn) == nil,
+             "an error must not be redirected to a URI the origin check refuses"
     end
 
     # The converse: when the origin check passes, an ordinary validation failure
@@ -512,7 +560,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       script_doc(client_id, cimd_doc(%{"redirect_uris" => ["http://localhost/callback"]}))
       put_config(client_id_metadata: cimd_config())
 
-      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost:51353/callback"}))
+      conn =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "http://localhost:51353/callback"
+          })
+        )
 
       assert conn.status == 400
       assert location(conn) == nil
@@ -536,9 +590,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         native_apps: [loopback_include_localhost: true]
       )
 
-      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost:3118/callback"}))
+      conn =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "http://localhost:3118/callback"
+          })
+        )
 
-      assert conn.status == 302, "expected the localhost loopback flow to be served, got: #{conn.resp_body}"
+      assert conn.status == 302,
+             "expected the localhost loopback flow to be served, got: #{conn.resp_body}"
+
       assert location(conn) =~ "http://localhost:3118/callback"
       assert is_binary(location_query(conn)["code"])
     end
@@ -552,7 +614,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         native_apps: [loopback_include_localhost: true]
       )
 
-      conn = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost:51353/callback"}))
+      conn =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "http://localhost:51353/callback"
+          })
+        )
 
       assert conn.status == 302
       assert location(conn) =~ "http://localhost:51353/callback"
@@ -599,7 +667,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       script_doc(
         client_id,
-        cimd_doc(%{"redirect_uris" => ["https://elsewhere.example/cb", "http://localhost.evil.example/callback"]})
+        cimd_doc(%{
+          "redirect_uris" => [
+            "https://elsewhere.example/cb",
+            "http://localhost.evil.example/callback"
+          ]
+        })
       )
 
       put_config(
@@ -607,11 +680,23 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         native_apps: [loopback_include_localhost: true]
       )
 
-      cross_origin = call(valid_params(%{"client_id" => client_id, "redirect_uri" => "https://elsewhere.example/cb"}))
+      cross_origin =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "https://elsewhere.example/cb"
+          })
+        )
+
       assert cross_origin.status == 400
 
       lookalike =
-        call(valid_params(%{"client_id" => client_id, "redirect_uri" => "http://localhost.evil.example:3118/callback"}))
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => "http://localhost.evil.example:3118/callback"
+          })
+        )
 
       assert lookalike.status == 400
     end
@@ -781,6 +866,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       query = location_query(conn)
       refute Map.has_key?(query, "code")
       assert query["error"] == "invalid_request_uri"
+    end
+
+    test "an unexpected single-use claim result is a sanitized integration failure" do
+      request_uri = "urn:ietf:params:oauth:request_uri:store-fault"
+
+      put_config(require_pushed_authorization_requests: true, par_store: TakeFaultsPARStore)
+      :ok = TakeFaultsPARStore.put(request_uri, valid_params(), 60)
+
+      assert_raise RuntimeError, ~r/take\/1 violated its PAR-store return contract/, fn ->
+        call(%{"client_id" => @client_id, "request_uri" => request_uri})
+      end
+
+      assert {:ok, _params} = TakeFaultsPARStore.fetch(request_uri)
     end
 
     test "ignores front-channel state outside a resolved PAR request" do
@@ -989,6 +1087,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn =
         build_conn()
         |> Map.put(:scheme, :https)
+        |> with_config()
         |> put_req_header("accept", "text/html")
         |> AuthorizeController.authorize(%{
           "client_id" => @client_id,
@@ -1013,6 +1112,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert %{"error" => "invalid_request"} = json_response(conn, 400)
     end
 
+    test "an unexpected client-store result is a sanitized integration failure" do
+      put_config(load_client: fn _client_id -> {:error, :store_unavailable} end)
+
+      assert_raise RuntimeError, ":load_client callback violated its return contract", fn ->
+        call(valid_params())
+      end
+    end
+
     test "missing client_id renders a direct 400" do
       conn = valid_params(%{}) |> Map.delete("client_id") |> call()
 
@@ -1031,6 +1138,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn =
         build_conn()
         |> Map.put(:scheme, :https)
+        |> with_config()
         |> put_req_header("accept", "text/html")
         |> AuthorizeController.authorize(valid_params(%{"redirect_uri" => "https://evil.example.com/cb"}))
 
@@ -1052,6 +1160,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn =
         build_conn()
         |> Map.put(:scheme, :http)
+        |> with_config()
         |> AuthorizeController.authorize(valid_params())
 
       assert conn.status == 400
@@ -1214,6 +1323,44 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert conn.status == 302
       assert is_binary(location_query(conn)["code"])
+    end
+
+    test "an invalid authenticate_resource_owner result is logged without callback data" do
+      put_config(
+        authenticate_resource_owner: fn _conn, _request, _opts ->
+          {:invalid_callback_result, %{private_value: "authorize-login-private-sentinel"}}
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          conn = call(valid_params())
+
+          assert conn.status == 302
+          assert location_query(conn)["error"] == "server_error"
+        end)
+
+      assert log =~ "authenticate_resource_owner callback returned an invalid result"
+      refute log =~ "authorize-login-private-sentinel"
+    end
+
+    test "an invalid consent result is logged without callback data" do
+      put_config(
+        consent: fn _conn, _request, _subject ->
+          {:invalid_callback_result, %{private_value: "authorize-consent-private-sentinel"}}
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          conn = call(valid_params())
+
+          assert conn.status == 302
+          assert location_query(conn)["error"] == "server_error"
+        end)
+
+      assert log =~ "consent callback returned an invalid result"
+      refute log =~ "authorize-consent-private-sentinel"
     end
   end
 
@@ -1414,7 +1561,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert Map.get(cookie, :domain) == nil
 
       # The value is OP-owned: it verifies under the OP secret for this login.
-      assert Attesto.SessionState.browser_state_valid?(@browser_state_secret, opbs, @established_binding)
+      assert Attesto.SessionState.browser_state_valid?(
+               @browser_state_secret,
+               opbs,
+               @established_binding
+             )
 
       # And it verifies against the §3.2 recipe over the redirect_uri origin.
       [_hash, salt] = String.split(session_state, ".", parts: 2)
@@ -1433,6 +1584,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn =
         build_conn()
         |> Map.put(:scheme, :https)
+        |> with_config()
         |> put_req_header("cookie", "#{@browser_state_cookie}=#{opbs}")
         |> AuthorizeController.authorize(valid_params())
 
@@ -1458,13 +1610,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn =
         build_conn()
         |> Map.put(:scheme, :https)
+        |> with_config()
         |> put_req_header("cookie", "#{@browser_state_cookie}=#{opbs}")
         |> AuthorizeController.authorize(valid_params(%{"max_age" => "0"}))
 
       fresh = conn.resp_cookies[@browser_state_cookie]
       assert is_binary(fresh.value)
       refute fresh.value == opbs
-      assert Attesto.SessionState.browser_state_valid?(@browser_state_secret, fresh.value, @reauth_binding)
+
+      assert Attesto.SessionState.browser_state_valid?(
+               @browser_state_secret,
+               fresh.value,
+               @reauth_binding
+             )
 
       # The RP that earlier held a session_state over the OLD value now
       # recomputes `changed`: the response's session_state is over the fresh
@@ -1473,7 +1631,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       [_hash, salt] = String.split(session_state, ".", parts: 2)
 
       assert session_state ==
-               Attesto.SessionState.compute(@client_id, "https://client.example.com", fresh.value, salt)
+               Attesto.SessionState.compute(
+                 @client_id,
+                 "https://client.example.com",
+                 fresh.value,
+                 salt
+               )
 
       refute session_state ==
                Attesto.SessionState.compute(@client_id, "https://client.example.com", opbs, salt)
@@ -1487,13 +1650,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn =
         build_conn()
         |> Map.put(:scheme, :https)
+        |> with_config()
         |> put_req_header("cookie", "#{@browser_state_cookie}=attacker-known-value")
         |> AuthorizeController.authorize(valid_params())
 
       fresh = conn.resp_cookies[@browser_state_cookie]
       assert is_binary(fresh.value)
       refute fresh.value == "attacker-known-value"
-      assert Attesto.SessionState.browser_state_valid?(@browser_state_secret, fresh.value, @established_binding)
+
+      assert Attesto.SessionState.browser_state_valid?(
+               @browser_state_secret,
+               fresh.value,
+               @established_binding
+             )
 
       # The injected value can no longer forge `unchanged`: the response's
       # session_state is over the OP-minted value, not the attacker's.
@@ -1501,7 +1670,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       [_hash, salt] = String.split(session_state, ".", parts: 2)
 
       refute session_state ==
-               Attesto.SessionState.compute(@client_id, "https://client.example.com", "attacker-known-value", salt)
+               Attesto.SessionState.compute(
+                 @client_id,
+                 "https://client.example.com",
+                 "attacker-known-value",
+                 salt
+               )
     end
 
     test "disabled session management adds no session_state and no cookie" do
@@ -1571,7 +1745,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       details =
         authorization_details_json([
-          %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+          %{
+            "type" => "openid_credential",
+            "credential_configuration_id" => "UniversityDegreeCredential"
+          }
         ])
 
       conn = call(valid_params(%{"authorization_details" => details}))
@@ -1586,7 +1763,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       details =
         authorization_details_json([
-          %{"type" => "openid_credential", "credential_configuration_id" => "SomeUnofferedCredential"}
+          %{
+            "type" => "openid_credential",
+            "credential_configuration_id" => "SomeUnofferedCredential"
+          }
         ])
 
       conn = call(valid_params(%{"authorization_details" => details}))
@@ -1600,7 +1780,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       # base_config/1 configures no :credential_configurations_supported.
       details =
         authorization_details_json([
-          %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegreeCredential"}
+          %{
+            "type" => "openid_credential",
+            "credential_configuration_id" => "UniversityDegreeCredential"
+          }
         ])
 
       conn = call(valid_params(%{"authorization_details" => details}))
@@ -1625,7 +1808,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       details =
         authorization_details_json([
-          %{"type" => "payment_initiation", "credential_configuration_id" => "UniversityDegreeCredential"}
+          %{
+            "type" => "payment_initiation",
+            "credential_configuration_id" => "UniversityDegreeCredential"
+          }
         ])
 
       conn = call(valid_params(%{"authorization_details" => details}))
@@ -1731,7 +1917,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     test "a native client without code_challenge is rejected" do
       no_pkce_config()
 
-      conn = call(Map.drop(native_params(@native_loopback_uri), ["code_challenge", "code_challenge_method"]))
+      conn =
+        call(
+          Map.drop(native_params(@native_loopback_uri), [
+            "code_challenge",
+            "code_challenge_method"
+          ])
+        )
 
       assert conn.status == 302
       query = location_query(conn)
@@ -1797,7 +1989,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     test "the refusal happens before the client is resolved" do
       put_config(native_apps: [reject_embedded_user_agents: true])
 
-      conn = call(valid_params(%{"client_id" => "no-such-client"}), user_agent: @webview_user_agent)
+      conn =
+        call(valid_params(%{"client_id" => "no-such-client"}), user_agent: @webview_user_agent)
 
       assert conn.status == 400
       assert conn.resp_body =~ "embedded user agent"
@@ -1828,7 +2021,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   def load_client(@client_id), do: {:ok, %{id: @client_id}}
+
   def load_client(@native_client_id), do: {:ok, %{id: @native_client_id, native?: true, public?: true}}
+
   def load_client(_), do: {:error, :not_found}
 
   def verify_secret(_, _), do: false
@@ -1838,7 +2033,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   def client_id(%{id: id}), do: id
 
   def client_redirect_uris(%{id: @client_id}), do: [@redirect_uri]
+
   def client_redirect_uris(%{id: @native_client_id}), do: [@native_loopback_uri, @native_loopback_uri_v6]
+
   def client_redirect_uris(_), do: []
 
   def client_native?(client), do: Map.get(client, :native?, false)

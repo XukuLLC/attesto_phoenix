@@ -16,12 +16,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   @response_types_supported ["code"]
   @response_modes_supported AuthorizationRequest.supported_response_modes()
 
-  @token_endpoint_auth_methods_supported [
-    "client_secret_basic",
-    "client_secret_post",
-    "private_key_jwt",
-    "none"
-  ]
   @wallet_attestation_auth_method "attest_jwt_client_auth"
 
   @doc """
@@ -45,7 +39,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       "response_types_supported" => @response_types_supported,
       "response_modes_supported" => @response_modes_supported,
       "grant_types_supported" => Config.grant_types_supported(config),
-      "token_endpoint_auth_methods_supported" => token_endpoint_auth_methods_supported(config),
+      "token_endpoint_auth_methods_supported" => Config.token_endpoint_auth_methods_supported(config),
       "token_endpoint_auth_signing_alg_values_supported" => config.client_auth_signing_algs,
       "introspection_endpoint" => Config.introspection_endpoint_url(config),
       "introspection_endpoint_auth_methods_supported" => introspection_auth_methods(config),
@@ -121,26 +115,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   defp put_if_present(metadata, _key, nil), do: metadata
   defp put_if_present(metadata, key, value), do: Map.put(metadata, key, value)
 
-  defp token_endpoint_auth_methods_supported(%Config{token_endpoint_auth_methods_supported: methods} = config)
-       when is_list(methods) and methods != [] do
-    maybe_enable_wallet_attestation(methods, config, false)
-  end
-
-  defp token_endpoint_auth_methods_supported(%Config{} = config) do
-    maybe_enable_wallet_attestation(@token_endpoint_auth_methods_supported, config, true)
-  end
-
-  defp maybe_enable_wallet_attestation(methods, config, add_when_configured?) do
-    case Config.trusted_wallet_provider_jwks(config) do
-      nil -> Enum.reject(methods, &(&1 == @wallet_attestation_auth_method))
-      _jwks when add_when_configured? -> methods ++ [@wallet_attestation_auth_method]
-      _jwks -> methods
-    end
-  end
-
   defp introspection_auth_methods(config) do
     Enum.reject(
-      token_endpoint_auth_methods_supported(config),
+      Config.token_endpoint_auth_methods_supported(config),
       &(&1 in ["none", @wallet_attestation_auth_method])
     )
   end
@@ -203,8 +180,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   # is advertised, the AS MUST publish the attestation and PoP signing algorithm
   # values it accepts. These mirror the client-authentication signing algs.
   defp client_attestation_alg_values_supported(%Config{} = config) do
-    # token_endpoint_auth_methods_supported/1 always returns a list.
-    if "attest_jwt_client_auth" in token_endpoint_auth_methods_supported(config) do
+    # Config.token_endpoint_auth_methods_supported/1 always returns a list.
+    if "attest_jwt_client_auth" in Config.token_endpoint_auth_methods_supported(config) do
       config.client_auth_signing_algs
     end
   end

@@ -7,7 +7,7 @@ defmodule AttestoPhoenix.Controller.NonceController do
   wallet presents later in its credential proof.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   alias AttestoPhoenix.{Callback, Config}
   alias AttestoPhoenix.OAuthError
@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Controller.NonceController do
   @doc "Issue a fresh c_nonce for a wallet credential proof."
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),
@@ -45,15 +45,35 @@ defmodule AttestoPhoenix.Controller.NonceController do
   end
 
   defp issue_nonce(store) do
-    cond do
-      function_exported?(store, :issue, 0) ->
-        {:ok, store.issue()}
+    case invoke_nonce_store(store) do
+      {:returned, result} -> validate_issued_nonce(result)
+      :failed -> raise RuntimeError, "c_nonce_store issue callback failed"
+    end
+  end
 
-      function_exported?(store, :issue, 1) ->
-        {:ok, store.issue(@default_nonce_ttl_seconds)}
+  defp invoke_nonce_store(store) do
+    result =
+      cond do
+        function_exported?(store, :issue, 0) ->
+          store.issue()
 
-      true ->
-        {:error, OAuthError.new(:invalid_request, "c_nonce_store does not support issuing nonces", status: 400)}
+        function_exported?(store, :issue, 1) ->
+          store.issue(@default_nonce_ttl_seconds)
+
+        true ->
+          {:error, OAuthError.new(:invalid_request, "c_nonce_store does not support issuing nonces", status: 400)}
+      end
+
+    {:returned, result}
+  catch
+    _kind, _reason -> :failed
+  end
+
+  defp validate_issued_nonce(result) do
+    case result do
+      nonce when is_binary(nonce) and nonce != "" -> {:ok, nonce}
+      {:error, %OAuthError{}} = error -> error
+      _unexpected -> raise RuntimeError, "c_nonce_store issue callback must return a non-empty binary"
     end
   end
 end

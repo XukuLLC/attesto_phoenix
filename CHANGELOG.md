@@ -4,7 +4,205 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.0.0] - 2026-08-31
+
+### Breaking
+
+- Replace the public 2.x host `:table_prefix` and package-level
+  `config :attesto_phoenix, :table_prefix` settings, plus the
+  `--table-prefix` migration-generator option, with `:schema_prefix` and
+  `--schema-prefix`. Version 2.x prefixed literal table names; 3.0 keeps the
+  canonical table names and selects one PostgreSQL schema through Ecto's
+  `prefix:` option. Legacy keys and flags now fail closed with an upgrade
+  message instead of being silently reinterpreted.
+- Require Attesto 2.0 and its atomic refresh-store rotation contract. Custom
+  refresh stores must replace the former multi-step consume/insert/successor
+  callbacks with one family-serialized `rotate/4` transaction.
+- Update the bundled Ecto device-code store to Attesto 2.0's full-entry lookup
+  and atomic, time-aware decision callbacks. Custom device-code stores must
+  adopt the corresponding Attesto 2.0 behavior contract.
+- The default dynamic-registration grant catalog now includes the implemented
+  OAuth token-exchange grant. Hosts that do not want to register clients for it
+  must explicitly narrow `:grant_types_supported`.
+
+### Security
+
+- Suppress both Ecto Logger output and repository query telemetry for
+  credential-bearing and privacy-sensitive values, including consent tokens,
+  DPoP nonces, device user codes, PAR request URIs, CIBA notification tokens,
+  refresh rows, and logout-session identifiers and targets.
+- Bind controller actions and the standalone authentication plug to the
+  validated request configuration only for bounded work, selecting its Ecto
+  repository and schema prefix together and restoring state on success, halt,
+  or failure.
+- Enforce a lossless portable JSON boundary for persisted claim maps, including
+  nested values, nulls, booleans, and I-JSON-safe integers (±9_007_199_254_740_991); incompatible
+  pre-3.0 persisted maps fail closed when read.
+- Recognize only exact v1/v2 encrypted refresh-successor wrappers and redact
+  malformed, unknown, or tampered state conservatively no later than the parent
+  token expiry.
+
+- Fail configuration construction when the bundled Ecto refresh store uses a
+  non-zero rotation retry grace without a usable
+  `:refresh_successor_secret`. The Igniter installer now adds an idempotent
+  runtime setting that requires a stable secret of at least 32 bytes in
+  production and provides only an explicit development/test fallback.
+- Reject invalid refresh-rotation grace values, non-boolean top-level policy
+  switches, and required DPoP nonce enforcement when DPoP is disabled or no
+  capable nonce store is configured, instead of silently omitting requested
+  security behavior.
+- Reject required OID4VCI key attestation when no usable trusted verification
+  key is configured, instead of silently omitting the requirement from proof
+  verification.
+- Require exact boolean results from security-policy callbacks and exact
+  booleans for nested feature and request-object policy fields. Malformed
+  public/native-client classification, sender-constraint policy, request-object
+  requirements, loopback exceptions, and confirmation controls now fail loudly
+  instead of being treated as enabled or disabled by truthiness.
+- Enforce documented callback and store result contracts across client and
+  principal lookup, grant presence, scope policy, replay and nonce handling,
+  PAR, device approval, CIBA, credential issuance, introspection, and dynamic
+  audience resolution. Unexpected results fail loudly with fixed, value-free
+  diagnostics; post-commit notification and audit-delivery failures emit fixed
+  warnings. Ordinary protocol denials retain their existing wire responses.
+- Preserve the authenticated fixed retry deadline in Ecto successor records,
+  reject a mismatched housekeeping deadline, and redact encrypted successor
+  credentials after that deadline while retaining a deadline-only tombstone.
+  The installer now supervises `AttestoPhoenix.Store.Sweeper` after the host
+  repo so this cleanup actually runs.
+- Preserve bounded retry compatibility for v1 encrypted successors at a
+  stopped 2.14.2-to-3.0 cutover by deriving their deadline from persisted
+  `consumed_at` and the configured grace, capped before token expiry. A retry
+  after that window remains reuse and revokes the family.
+- Require an atomic PAR `take/1` implementation when
+  `require_pushed_authorization_requests: true`; fetch-only stores remain valid
+  for optional PAR. Refresh-family revocation now surfaces transaction
+  rollback instead of returning false success, and prebuilt application
+  config structs are fully revalidated before use.
+- Persist refresh-family revocation tombstones in
+  `attesto_refresh_family_revocations`, separate from expirable token rows, so
+  the sweeper cannot erase the decision and permit a later family resurrection.
+- Bind authorization-code replay markers to the refresh family actually issued
+  by the core composition API, and retain the access-token JTI linkage by code
+  hash until that family is finalized. Refresh issuance is refused for
+  reuse-tracking code stores that expose only the legacy family callback, rather
+  than recording a token under the wrong refresh family.
+- Keep asynchronous CIBA user-notification callbacks and ping delivery inside
+  the validated request-local configuration, so concurrently mounted profiles
+  retain their own policies and Ecto schema prefixes.
+- Disable Phoenix route-dispatch parameter logging on protocol and interactive
+  routes. These requests can contain redeemable codes, assertions, proofs,
+  signed request objects, and encrypted responses that Phoenix's default
+  substring filters do not comprehensively cover. Endpoint method/path/status
+  logging remains available; hosts must apply the same rule to custom request
+  and header loggers.
+- Emit the documented `:refresh_reuse_detected` host event when core refresh
+  reuse detection revokes a family, alongside the ordinary token-denial event.
+  Refresh issuance and rotation events now include the resource-owner subject.
+- Enforce Attesto 2's exact canonical authorization-code, CIBA, device-code,
+  refresh-token, and refresh-successor contexts at the bundled Ecto write
+  boundaries. Missing, extra, or malformed members are rejected before column
+  projection, and malformed persisted confirmation data remains invalid rather
+  than being interpreted as an unbound credential.
+
+### Fixed
+
+- Resolve every protocol controller from the validated request-scoped
+  configuration installed by `AttestoPhoenix.Plug.PutConfig`, with no global
+  fallback when the reserved request value is absent or malformed. This keeps
+  concurrently mounted policy profiles isolated and fails closed when a host
+  omits the required pipeline. Thanks to
+  [@MuNeNiCK](https://github.com/MuNeNiCK) for reporting the request-scoping gap
+  and independently proposing a fix in
+  [#24](https://github.com/XukuLLC/attesto_phoenix/pull/24).
+- Preserve explicitly empty grant-type and client-authentication catalogs in
+  discovery, endpoint enforcement, and dynamic registration instead of
+  widening them to package defaults. Malformed catalogs and per-client grant
+  lists are rejected rather than treated as unrestricted.
+- Require bundled Ecto code-store transitions and access-token linkage to
+  update exactly one authorization record, and make logout-session persistence
+  refusal visible instead of reporting silent success.
+- Clear the refresh-family marker when an Ecto authorization code is finalized
+  without issuing a refresh token. A later replay is rejected and revokes only
+  the code-linked access-token JTI, never a refresh family.
+- Route revocation events through the fully resolved event callback, including
+  behavior-module `:event_sink` configuration, and warn without payload data
+  when an event sink explicitly reports delivery failure.
+- Let the installer-added sweeper child return `:ignore` when an upgraded host
+  has no sweep interval, while manual supervision and invalid configured
+  intervals continue to fail at startup.
+- Treat replay of a legacy consumed authorization-code row with no access-token
+  JTI as an idempotent no-op, so the generic `invalid_grant` path cannot become
+  a 500 while still enforcing exact-one revocation for linked tokens.
+- Map Attesto refresh rotation's `:temporarily_unavailable` result to OAuth
+  `temporarily_unavailable` with HTTP 503. The parent token remains valid for a
+  retry; logs and the denial event carry only the fixed operational code, never
+  the store's internal reason.
+- Run synchronous CIBA approve/deny transitions and ping endpoint resolution
+  inside the passed request configuration, including for conn-free callers.
+- Round-trip authorization codes through the exact nine-key Attesto 2 grant
+  context: the database-only PKCE method is no longer returned as a sibling
+  member, and a legacy nonce column is promoted into `:claims`. Refresh-token
+  persistence now preserves duplicate scope members instead of silently
+  deduplicating them.
+
+### Upgrade notes
+
+- Every 2.x-to-3.0 deployment, including one using the default `public`
+  schema, requires a stopped cutover for all token writers. Drain 2.x nodes
+  and workers, apply the refresh-generation index migration, create and
+  backfill the 3.0 refresh-family tombstone table, then start 3.0 and re-enable
+  traffic. Mixed 2.x/3.0 writers are unsupported because 2.x does not read or
+  write the tombstones.
+- Non-empty 2.x table prefixes require a stopped cutover before any 3.0 node
+  starts: inventory the literal-prefix tables, move and rename them into one
+  PostgreSQL schema, align indexes/constraints, and verify row counts. Never
+  run mixed 2.x/3.0 nodes, workers, or migration commands during this cutover;
+  see `guides/upgrade_3_0_schema_prefix.md` for the inventory and verification
+  procedure. Remove every legacy `:table_prefix` setting, then configure
+  `:schema_prefix` and use `--schema-prefix` for future generated migrations.
+- Before upgrading an existing Ecto database, apply a forward migration that
+  adds the unique `(family_id, generation)` index on `attesto_refresh_tokens` if
+  it is not already present. The exact operation is:
+
+  ```elixir
+  prefix = nil # Replace with your configured PostgreSQL schema name when non-default.
+
+  create unique_index(
+    :attesto_refresh_tokens,
+    [:family_id, :generation],
+    name: :attesto_refresh_tokens_family_id_generation_index,
+    prefix: prefix
+  )
+  ```
+
+  Use the runtime Ecto `prefix` (`nil` for `public`, or the configured schema).
+  If creation fails because duplicate family/generation rows exist, stop,
+  reconcile and revoke the affected families, then retry; never blindly delete
+  duplicate rows. Do not rerun the create-table migration.
+- Before deploying this release to an existing Ecto database, create the
+  `attesto_refresh_family_revocations` table with the same runtime prefix and
+  backfill it from every existing refresh row with `family_revoked = true`.
+  This preserves already-revoked families after the sweeper removes their
+  expired token rows. Qualify both source and destination tables with that
+  prefix when it is non-default; do not backfill `public` accidentally. New
+  installations receive the table from `mix attesto_phoenix.gen.migration`.
+- Dynamic-registration clients inherit the 3.0 default grant catalog, which
+  includes token exchange. Set an explicit `grant_types_supported` catalog
+  before deployment when token exchange must remain unavailable. Explicit empty
+  grant/auth-method catalogs remain empty rather than widening to defaults.
+- Existing installations using `AttestoPhoenix.Store.EctoRefreshStore` with
+  positive refresh retry grace must configure one stable
+  `:refresh_successor_secret` of at least 32 bytes across every node and
+  deployment. Configuration now fails at startup if it is absent or too short.
+- At a stopped 2.14.2-to-3.0 cutover, an authorization-code refresh can
+  preserve the configured `:authorization_grant_id_claim` using its bounded
+  legacy lineage marker. Other grant types and families started while that
+  feature was disabled remain excluded from the claim.
+- Manual Ecto installations must supervise `AttestoPhoenix.Store.Sweeper` with
+  a positive `:sweep_interval_ms`; rerunning `mix attesto_phoenix.install` adds
+  the child idempotently. A custom cleanup job must explicitly redact expired
+  refresh-successor ciphertext in addition to deleting expired rows.
 
 ## [2.14.2] - 2026-08-28
 
@@ -17,7 +215,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   remains disabled by default without requiring a migration. An authorization
   code issued without a `family_id` is permanently ineligible for the claim:
   such a grant still starts an internal refresh family, but neither its initial
-  nor any refreshed access token carries the claim.
+  nor any refreshed access token carries the claim. Thanks to
+  [@oliver-kriska](https://github.com/oliver-kriska) for the contribution in
+  [#23](https://github.com/XukuLLC/attesto_phoenix/pull/23).
 
 ### Changed
 
@@ -172,6 +372,11 @@ equivalent on this side.
   current core hardening baseline.
 - Refresh the test-only Postgrex lock past its stream-comment SQL-injection
   advisory; the driver does not enter this package's runtime closure.
+- Correct `AttestoPhoenix.Store.EctoCodeStore.take/1`'s return specification
+  to include consumed-code metadata and update its documentation to describe
+  the atomic consume operation accurately. Thanks to
+  [@h8](https://github.com/h8) for the contribution in
+  [#22](https://github.com/XukuLLC/attesto_phoenix/pull/22).
 
 ### Added
 
@@ -323,6 +528,10 @@ the matching HTTP-surface guidance.
   the anchoring lives in `Attesto.RedirectURI` and is exercised end-to-end in
   the authorize-controller tests. Requires `attesto` 1.9.0 or later, the first
   release carrying the `:exact_allow_loopback_port_including_localhost` mode.
+
+  Thanks to [@jtippett](https://github.com/jtippett) for the contribution in
+  [#20](https://github.com/XukuLLC/attesto_phoenix/pull/20).
+
 ## [2.7.0] - 2026-08-03
 
 ### Added

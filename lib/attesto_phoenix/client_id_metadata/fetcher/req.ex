@@ -133,10 +133,19 @@ if Code.ensure_loaded?(Req) do
     @spec fetch(String.t(), keyword()) ::
             {:ok, Fetcher.result()} | {:error, term()}
     def fetch(url, opts \\ []) when is_binary(url) and is_list(opts) do
+      allow_loopback = allow_loopback!(opts)
+
       with {:ok, uri} <- revalidate(url),
            {:ok, ips} <- resolve(uri.host, opts),
-           {:ok, pinned} <- screen(ips, opts) do
+           {:ok, pinned} <- screen(ips, allow_loopback) do
         request(uri, pinned, opts)
+      end
+    end
+
+    defp allow_loopback!(opts) do
+      case Keyword.get(opts, :allow_loopback, false) do
+        value when is_boolean(value) -> value
+        _invalid -> raise ArgumentError, ":allow_loopback must be true or false"
       end
     end
 
@@ -179,9 +188,7 @@ if Code.ensure_loaded?(Req) do
     # first address (the connect in step 4 targets exactly this checked IP). The
     # whole resolved set is screened so a mixed A/AAAA answer cannot smuggle an
     # internal address past the guard via the unused family.
-    defp screen(ips, opts) do
-      allow_loopback = Keyword.get(opts, :allow_loopback, false)
-
+    defp screen(ips, allow_loopback) do
       case Enum.find(ips, &blocked?(&1, allow_loopback)) do
         nil -> {:ok, hd(ips)}
         blocked -> {:error, {:blocked_ip, blocked}}

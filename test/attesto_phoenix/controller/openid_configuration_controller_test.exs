@@ -793,7 +793,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
         conn(:get, "/.well-known/openid-configuration")
         |> put_private(:attesto_protocol_config, protocol_config())
 
-      assert_raise RuntimeError, fn -> OpenIDConfigurationController.show(conn, %{}) end
+      assert_raise ArgumentError, fn -> OpenIDConfigurationController.show(conn, %{}) end
     end
 
     test "fails closed when the protocol config is not installed on the conn" do

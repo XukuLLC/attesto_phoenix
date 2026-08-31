@@ -172,6 +172,24 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
                Fetcher.fetch("http://app.example/cb", resolver: resolver([{93, 184, 216, 34}]))
     end
 
+    test "rejects non-boolean loopback policy instead of treating it as enabled" do
+      for invalid <- ["false", 1, {:error, :unavailable}] do
+        test_pid = self()
+
+        assert_raise ArgumentError, ~r/:allow_loopback must be true or false/, fn ->
+          Fetcher.fetch(@url,
+            resolver: fn _host, _family ->
+              send(test_pid, :resolver_called)
+              {:ok, [{127, 0, 0, 1}]}
+            end,
+            allow_loopback: invalid
+          )
+        end
+
+        refute_received :resolver_called
+      end
+    end
+
     test "allow_loopback: true permits loopback only" do
       # loopback now allowed...
       server = AttestoPhoenix.TestHTTPServer.open()

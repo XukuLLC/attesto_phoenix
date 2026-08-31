@@ -20,10 +20,12 @@ defmodule AttestoPhoenix.ResourceAudiencePolicy do
 
   alias AttestoPhoenix.{ClientAuthentication, Config}
 
+  require Logger
+
   @doc "Returns a verifier callback bound to the given authorization-server configuration."
   @spec resolver(Config.t()) :: (map() -> [String.t()])
   def resolver(%Config{} = config) do
-    fn claims -> trusted_audiences(config, claims) end
+    fn claims -> resolve_trusted_audiences(config, claims) end
   end
 
   @doc "Resolves the static and, when needed, original-client resource allowlist."
@@ -47,6 +49,23 @@ defmodule AttestoPhoenix.ResourceAudiencePolicy do
   end
 
   defp original_client_audiences(_config, _claims, static), do: static
+
+  # Attesto's verifier deliberately converts resolver failures to
+  # `:invalid_audience` so no host fault crosses the token boundary. Report the
+  # integration failure here, before re-raising into that privacy-preserving
+  # boundary, without logging the callback value, client identifier, or token
+  # claims.
+  defp resolve_trusted_audiences(config, claims) do
+    trusted_audiences(config, claims)
+  rescue
+    exception ->
+      Logger.warning("AttestoPhoenix dynamic audience resolver failed; token treated as untrusted")
+      reraise exception, __STACKTRACE__
+  catch
+    kind, reason ->
+      Logger.warning("AttestoPhoenix dynamic audience resolver failed; token treated as untrusted")
+      :erlang.raise(kind, reason, __STACKTRACE__)
+  end
 
   defp audience_covered?(audience, static) when is_binary(audience), do: audience in static
 

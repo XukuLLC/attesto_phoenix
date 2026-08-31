@@ -16,6 +16,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError}
   alias AttestoPhoenix.ClientAuthentication.{Policy, Result}
 
@@ -187,29 +189,45 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
       config = %{
         config
-        | load_client: fn "pki-mtls-1" -> client end,
+        | load_client: fn "pki-mtls-1" -> {:ok, client} end,
           client_mtls_metadata: fn ^client -> {:error, :db_timeout} end
       }
 
-      assert_generic_invalid_client(
-        authenticate(
-          mtls_headers(mtls_certificate_der()),
-          %{"client_id" => @pki_mtls.id},
-          config,
-          allow_public: true
-        )
-      )
+      log =
+        capture_log(fn ->
+          assert_generic_invalid_client(
+            authenticate(
+              mtls_headers(mtls_certificate_der()),
+              %{"client_id" => @pki_mtls.id},
+              config,
+              allow_public: true
+            )
+          )
+        end)
+
+      assert log =~
+               "AttestoPhoenix client mTLS metadata callback reported an error; client authentication denied"
+
+      refute log =~ "db_timeout"
 
       config = %{config | client_mtls_metadata: fn ^client -> :malformed end}
 
-      assert_generic_invalid_client(
-        authenticate(
-          mtls_headers(mtls_certificate_der()),
-          %{"client_id" => @pki_mtls.id},
-          config,
-          allow_public: true
-        )
-      )
+      malformed_log =
+        capture_log(fn ->
+          assert_generic_invalid_client(
+            authenticate(
+              mtls_headers(mtls_certificate_der()),
+              %{"client_id" => @pki_mtls.id},
+              config,
+              allow_public: true
+            )
+          )
+        end)
+
+      assert malformed_log =~
+               "AttestoPhoenix client mTLS metadata callback reported an error; client authentication denied"
+
+      refute malformed_log =~ "malformed"
     end
 
     test "a certificate cannot make a public client eligible when the endpoint forbids public clients", %{
@@ -422,6 +440,19 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                authenticate([], params, config, allow_public: true)
     end
 
+    test "an unexpected client-store result is a sanitized integration failure", %{config: config} do
+      config = %{config | load_client: fn _id -> {:error, :store_unavailable} end}
+      params = %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"}
+
+      assert_raise RuntimeError, ":load_client callback violated its return contract", fn ->
+        authenticate([], params, config, allow_public: true)
+      end
+
+      assert_raise RuntimeError, ":load_client callback violated its return contract", fn ->
+        ClientAuthentication.resolve_client(config, "public-1")
+      end
+    end
+
     test "Basic credentials reject a conflicting host client_id", %{config: config} do
       config = %{config | client_id: fn _client -> "different-client" end}
 
@@ -465,6 +496,37 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                 method: :client_secret_basic
               }} = authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: true)
     end
+
+    test "a configured client_id callback cannot fall through on an invalid result", %{config: config} do
+      for invalid <- [nil, "", 123, {:error, :store_unavailable}] do
+        configured = %{config | client_id: fn _client -> invalid end}
+
+        error =
+          assert_raise RuntimeError, fn ->
+            authenticate(basic("confidential-1", "s3cr3t"), %{}, configured, allow_public: true)
+          end
+
+        assert Exception.message(error) ==
+                 "AttestoPhoenix.Config :client_id callback violated its return contract"
+
+        refute Exception.message(error) =~ "store_unavailable"
+      end
+    end
+  end
+
+  describe "configured authentication-method catalog" do
+    test "an explicit empty catalog refuses a valid client credential", %{config: config} do
+      config = %{config | token_endpoint_auth_methods_supported: []}
+
+      assert_generic_invalid_client(authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: true))
+    end
+
+    test "only nil leaves the catalog unrestricted", %{config: config} do
+      config = %{config | token_endpoint_auth_methods_supported: nil}
+
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: true)
+    end
   end
 
   describe "private_key_jwt identity agreement" do
@@ -489,6 +551,47 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
       assert_generic_invalid_client(authenticate([], params, config, allow_public: true))
       refute_received :jti_consumed
+    end
+
+    test "unexpected replay callback results fail loudly instead of impersonating assertion replay", %{
+      config: config
+    } do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+      params = assertion_params(client_key, "ES256")
+
+      for invalid <- [nil, :unexpected, {:error, :storage_unavailable}] do
+        configured = %{
+          config
+          | client_jwks: fn @confidential -> client_jwks end,
+            replay_check: fn _key, _ttl -> invalid end
+        }
+
+        assert_raise ArgumentError,
+                     ~r/:replay_check must return :ok or \{:error, :replay\}/,
+                     fn -> authenticate([], params, configured, allow_public: false) end
+      end
+    end
+
+    test "only the exact replay result is classified as assertion replay", %{config: config} do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+      test_process = self()
+
+      configured = %{
+        config
+        | client_jwks: fn @confidential -> client_jwks end,
+          replay_check: fn _key, _ttl ->
+            send(test_process, :assertion_replay_checked)
+            {:error, :replay}
+          end
+      }
+
+      assert_generic_invalid_client(
+        authenticate([], assertion_params(client_key, "ES256"), configured, allow_public: false)
+      )
+
+      assert_received :assertion_replay_checked
     end
   end
 
@@ -878,6 +981,50 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
       assert {:ok, %Result{method: :client_secret_basic}} =
                authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: false)
+    end
+
+    test "unexpected replay callback results fail loudly instead of impersonating attestation replay", %{
+      config: config
+    } do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      headers = wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1")
+
+      for invalid <- [nil, :unexpected, {:error, :storage_unavailable}] do
+        configured = %{
+          trust_wallet_provider(config, wallet_provider_key)
+          | replay_check: fn _key, _ttl -> invalid end
+        }
+
+        assert_raise ArgumentError,
+                     ~r/:replay_check must return :ok or \{:error, :replay\}/,
+                     fn -> authenticate(headers, %{}, configured, allow_public: false) end
+      end
+    end
+
+    test "only the exact replay result is classified as attestation replay", %{config: config} do
+      wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      test_process = self()
+
+      configured = %{
+        trust_wallet_provider(config, wallet_provider_key)
+        | replay_check: fn _key, _ttl ->
+            send(test_process, :attestation_replay_checked)
+            {:error, :replay}
+          end
+      }
+
+      assert_generic_invalid_client(
+        authenticate(
+          wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1"),
+          %{},
+          configured,
+          allow_public: false
+        )
+      )
+
+      assert_received :attestation_replay_checked
     end
   end
 

@@ -1,6 +1,8 @@
 defmodule AttestoPhoenix.EventTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Event
 
@@ -120,15 +122,21 @@ defmodule AttestoPhoenix.EventTest do
       assert_receive {:event, %Event{name: :client_registered, client_id: "abc"}}
     end
 
-    test "returns :ok regardless of the callback's return value" do
+    test "returns :ok and emits a sanitized warning for an explicit callback error" do
       cfg = config({Sink, :record_self, []})
 
-      assert Event.emit(cfg, :refresh_reuse_detected,
-               result: :reuse_detected,
-               metadata: %{"pid" => self()}
-             ) == :ok
+      log =
+        capture_log(fn ->
+          assert Event.emit(cfg, :refresh_reuse_detected,
+                   result: :reuse_detected,
+                   metadata: %{"pid" => self()}
+                 ) == :ok
+        end)
 
       assert_receive {:event, %Event{name: :refresh_reuse_detected, result: :reuse_detected}}
+      assert log =~ "AttestoPhoenix event callback reported an error; event delivery may be incomplete"
+      refute log =~ "ignored_return"
+      refute log =~ "refresh_reuse_detected"
     end
   end
 

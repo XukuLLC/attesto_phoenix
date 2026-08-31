@@ -39,17 +39,19 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   `:refresh_store` (consulted for opaque refresh tokens).
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
   alias Attesto.Introspection
   alias Attesto.SignedIntrospection
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext, ResourceAudiencePolicy}
-  # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
-  # introspection response as a signed JWT, and the type of that response.
   alias AttestoPhoenix.Store.EctoRefreshStore
 
+  require Logger
+
+  # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
+  # introspection response as a signed JWT, and the type of that response.
   @signed_media_type "application/token-introspection+jwt"
 
   # The Attesto.RefreshStore consulted for opaque refresh tokens, defaulting to
@@ -68,7 +70,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) when is_map(params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),
@@ -165,13 +167,31 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   # from the host's optional `:introspection_authorize` callback, capturing the
   # authenticated caller's client_id. When the host configures none, no
   # predicate is passed and every authenticated caller may introspect any token
-  # (the single-trust-domain default). The core treats a non-`true` return or a
-  # raise as unauthorized (fail closed) and downgrades the response to inactive.
+  # (the single-trust-domain default). A deliberate `false` is an ordinary
+  # authorization denial. Exceptions and non-boolean returns also downgrade the
+  # response to inactive, but emit one fixed warning so a policy integration
+  # fault is not mistaken for a deliberate denial.
   defp caller_authorize(%Config{} = config, client_id) do
     case Callback.config_callback(config, :introspection_authorize) do
       nil -> nil
-      callback -> fn response -> Callback.invoke(callback, [client_id, response]) end
+      callback -> fn response -> introspection_authorized?(callback, client_id, response) end
     end
+  end
+
+  defp introspection_authorized?(callback, client_id, response) do
+    case Callback.invoke(callback, [client_id, response]) do
+      result when is_boolean(result) -> result
+      _unexpected -> introspection_policy_fault()
+    end
+  rescue
+    _exception -> introspection_policy_fault()
+  catch
+    _kind, _reason -> introspection_policy_fault()
+  end
+
+  defp introspection_policy_fault do
+    Logger.warning("AttestoPhoenix introspection authorization callback failed; token treated as inactive")
+    false
   end
 
   defp check_https(conn, config) do

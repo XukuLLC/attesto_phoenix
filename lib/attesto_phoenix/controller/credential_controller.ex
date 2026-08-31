@@ -11,7 +11,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   signing, format-specific issuance, and response framing.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import AttestoPhoenix.Controller.OID4VCIHelpers,
     only: [body_params: 2, invalid_request: 4, maybe_put_option: 3]
@@ -23,9 +23,15 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
+  require Logger
+
   @credential_configuration_ids_claim "credential_configuration_ids"
   @mdoc_signing_key_error "mso_mdoc issuance requires an EC P-256 (ES256) VC signing key."
   @sd_jwt_vc_formats ~w(vc+sd-jwt dc+sd-jwt)
+  @invalid_builder_result_warning "AttestoPhoenix credential builder returned an invalid result; credential issuance denied"
+  @builder_failure "AttestoPhoenix credential builder callback failed"
+  @nonce_consume_failure "c_nonce_store consume/1 must return :ok or {:error, reason}"
+  @nonce_validity_failure "c_nonce_store valid?/1 must return true or false"
 
   @doc """
   Issue the credential(s) requested by an authenticated wallet.
@@ -40,7 +46,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     resource_metadata = Config.resource_metadata_url(config, conn)
 
     case ProtectedResource.authenticate(conn, config, resource_metadata) do
@@ -200,11 +206,23 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp consume_each(store, nonces) do
     Enum.reduce_while(nonces, :ok, fn nonce, :ok ->
-      case store.consume(nonce) do
+      case consume_nonce!(store, nonce) do
         :ok -> {:cont, :ok}
         {:error, _reason} -> {:halt, {:error, :invalid_nonce}}
       end
     end)
+  end
+
+  defp consume_nonce!(store, nonce) do
+    case store.consume(nonce) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      _unexpected -> raise RuntimeError, @nonce_consume_failure
+    end
+  rescue
+    _error -> raise RuntimeError, @nonce_consume_failure
+  catch
+    _kind, _reason -> raise RuntimeError, @nonce_consume_failure
   end
 
   defp verify_proof(config, claims, {"jwt", jwt}) do
@@ -242,11 +260,27 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   defp nonce_valid?(config, nonce) do
     case Callback.config_callback(config, :c_nonce_store) do
       store when is_atom(store) ->
-        function_exported?(store, :valid?, 1) and store.valid?(nonce)
+        if function_exported?(store, :valid?, 1) do
+          nonce_valid_from_store!(store, nonce)
+        else
+          false
+        end
 
       _ ->
         false
     end
+  end
+
+  defp nonce_valid_from_store!(store, nonce) do
+    case store.valid?(nonce) do
+      true -> true
+      false -> false
+      _unexpected -> raise RuntimeError, @nonce_validity_failure
+    end
+  rescue
+    _error -> raise RuntimeError, @nonce_validity_failure
+  catch
+    _kind, _reason -> raise RuntimeError, @nonce_validity_failure
   end
 
   defp proof_opts(config, claims, nonce) do
@@ -348,7 +382,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     do: {:error, :unsupported_credential_format}
 
   defp build_credential(config, subject, credential_configuration_id, holder_jwk, format) do
-    case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
+    case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
       {:ok, %{vct: vct, claims: claims} = result}
       when is_binary(vct) and is_map(claims) ->
         {:ok, issue_credential(config, result, holder_jwk, format)}
@@ -377,7 +411,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   end
 
   defp build_jwt_vc_credential(config, subject, credential_configuration_id, holder_jwk) do
-    case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
+    case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
       {:ok, %{credential_type: credential_type, claims: claims} = result}
       when is_binary(credential_type) and is_map(claims) ->
         {:ok, issue_jwt_vc_credential(config, subject, result, holder_jwk)}
@@ -405,7 +439,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   end
 
   defp build_mdoc_credential(config, subject, credential_configuration_id, holder_jwk, credential_configuration) do
-    case Config.build_credential(config, subject, credential_configuration_id, holder_jwk) do
+    case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
       {:ok, %{namespaces: namespaces} = result} when is_map(namespaces) ->
         issue_mdoc_credential(config, result, holder_jwk, credential_configuration)
 
@@ -414,8 +448,20 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     end
   end
 
+  defp invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
+    Config.build_credential(config, subject, credential_configuration_id, holder_jwk)
+  rescue
+    _error -> raise RuntimeError, @builder_failure
+  catch
+    _kind, _reason -> raise RuntimeError, @builder_failure
+  end
+
   defp normalize_build_result({:error, reason}), do: {:error, reason}
-  defp normalize_build_result(_other), do: {:error, :invalid_credential}
+
+  defp normalize_build_result(_other) do
+    Logger.warning(@invalid_builder_result_warning)
+    {:error, :invalid_credential}
+  end
 
   defp issue_mdoc_credential(config, result, holder_jwk, credential_configuration) do
     now = System.system_time(:second)

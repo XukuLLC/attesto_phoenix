@@ -39,6 +39,9 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   require Logger
 
   @jti_namespace "idjag:"
+  @cache_read_warning "AttestoPhoenix JWT-bearer JWKS cache failed; fetching fresh keys"
+  @cache_write_warning "AttestoPhoenix JWT-bearer JWKS cache failed; fresh keys were not cached"
+  @fetch_warning "AttestoPhoenix JWT-bearer JWKS fetch failed; keys unavailable"
 
   @typedoc """
   The resolved local subject, the assertion's scope ceiling (`nil` when the
@@ -79,6 +82,10 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   """
   @spec authorize(Config.t(), String.t() | nil, map()) :: {:ok, result()} | {:error, error()}
   def authorize(%Config{} = config, client_id, params) when is_map(params) do
+    Config.with_request_config(config, fn -> do_authorize(config, client_id, params) end)
+  end
+
+  defp do_authorize(%Config{} = config, client_id, params) do
     with {:ok, prepared} <- prepare(config, client_id, params),
          {:ok, subject} <- resolve_subject(config, prepared.claims),
          :ok <- commit_replay_claim(config, prepared.replay_claim) do
@@ -100,6 +107,10 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   @spec prepare(Config.t(), String.t() | nil, map()) ::
           {:ok, prepared_result()} | {:error, error()}
   def prepare(%Config{} = config, client_id, params) when is_map(params) do
+    Config.with_request_config(config, fn -> do_prepare(config, client_id, params) end)
+  end
+
+  defp do_prepare(%Config{} = config, client_id, params) do
     opts = Config.jwt_bearer(config)
 
     with {:ok, assertion} <- require_assertion(params),
@@ -133,12 +144,29 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     end
   end
 
-  @doc "Atomically claim a replay identity returned by `prepare/3` before minting."
+  @doc """
+  Atomically claim a replay identity returned by `prepare/3` before minting.
+
+  The configured replay callback must return exactly `:ok` or
+  `{:error, :replay}`. Any other result raises as an integration or storage
+  fault rather than being mislabeled as a replay.
+  """
   @spec commit_replay_claim(Config.t(), pending_claim()) :: :ok | {:error, :replay}
   def commit_replay_claim(%Config{} = config, {key, ttl}) when is_binary(key) and is_integer(ttl) do
+    Config.with_request_config(config, fn -> do_commit_replay_claim(config, key, ttl) end)
+  end
+
+  defp do_commit_replay_claim(config, key, ttl) do
     case Callback.invoke(Adapter.replay_check(config), [key, ttl]) do
-      :ok -> :ok
-      _other -> {:error, :replay}
+      :ok ->
+        :ok
+
+      {:error, :replay} ->
+        {:error, :replay}
+
+      _other ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}"
     end
   end
 
@@ -206,9 +234,14 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
 
   defp cache_get(cache, uri) do
     case cache.get(uri) do
-      {:ok, jwks} when is_map(jwks) -> {:ok, jwks}
-      _ -> :miss
+      {:ok, %{"keys" => keys} = jwks} when is_list(keys) -> {:ok, jwks}
+      :miss -> :miss
+      _fault -> warn_cache_read_fault()
     end
+  rescue
+    _exception -> warn_cache_read_fault()
+  catch
+    _kind, _reason -> warn_cache_read_fault()
   end
 
   defp fetch_and_cache(opts, cache, uri) do
@@ -228,8 +261,8 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
             {:error, :jwks_unavailable}
         end
 
-      {:error, reason} ->
-        Logger.warning("jwt_bearer: JWKS fetch failed for #{uri}: #{inspect(reason)}")
+      {:error, _reason} ->
+        Logger.warning(@fetch_warning)
         {:error, :jwks_unavailable}
     end
   end
@@ -240,9 +273,29 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     bounds = Keyword.get(opts, :jwks_cache_ttl_bounds, {300, 86_400})
 
     case ttl_seconds(cache_control, bounds) do
-      ttl when ttl > 0 -> cache.put(uri, jwks, DateTime.add(DateTime.utc_now(), ttl, :second))
-      _ -> :ok
+      ttl when ttl > 0 ->
+        case cache.put(uri, jwks, DateTime.add(DateTime.utc_now(), ttl, :second)) do
+          :ok -> :ok
+          _fault -> warn_cache_write_fault()
+        end
+
+      _ ->
+        :ok
     end
+  rescue
+    _exception -> warn_cache_write_fault()
+  catch
+    _kind, _reason -> warn_cache_write_fault()
+  end
+
+  defp warn_cache_read_fault do
+    Logger.warning(@cache_read_warning)
+    :miss
+  end
+
+  defp warn_cache_write_fault do
+    Logger.warning(@cache_write_warning)
+    :ok
   end
 
   # RFC 9111 freshness: honor `no-store`/`no-cache` (do not cache), clamp a

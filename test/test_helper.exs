@@ -10,6 +10,15 @@ alias AttestoPhoenix.TestRepo
 
 ExUnit.configure(exclude: [:ecto])
 
+# The default Config uses a non-zero refresh-rotation retry window. Keep one
+# stable test-only secret available for every test that selects the bundled
+# Ecto refresh store; focused fail-fast tests temporarily remove or replace it.
+Application.put_env(
+  :attesto_phoenix,
+  :refresh_successor_secret,
+  String.duplicate("test-refresh-successor-", 4)
+)
+
 ecto_included? =
   ExUnit.configuration()
   |> Keyword.get(:include, [])
@@ -36,12 +45,6 @@ if ecto_included? do
   # (rather than from an explicit `AttestoPhoenix.Config`) find it. Set here
   # rather than per test so concurrent `async: true` tests never race on it.
   Application.put_env(:attesto_phoenix, :repo, TestRepo)
-
-  Application.put_env(
-    :attesto_phoenix,
-    :refresh_successor_secret,
-    String.duplicate("test-refresh-successor-", 4)
-  )
 
   migrations_dir = Path.join(__DIR__, "support/migrations")
 

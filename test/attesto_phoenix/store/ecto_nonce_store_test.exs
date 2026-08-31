@@ -10,6 +10,8 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
 
   use AttestoPhoenix.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DPoPNonce
   alias AttestoPhoenix.Store.EctoNonceStore
@@ -39,9 +41,16 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
   end
 
   describe "issue/2" do
-    test "issue/0 resolves the application-wide configured repo", %{config: config} do
-      Application.put_env(:attesto_phoenix, :config, config)
-      on_exit(fn -> Application.delete_env(:attesto_phoenix, :config) end)
+    test "issue/0 resolves the configured host config", %{config: config} do
+      previous_otp_app = Application.get_env(:attesto_phoenix, :otp_app, :missing)
+      previous_config = Application.get_env(__MODULE__, Config, :missing)
+      Application.put_env(:attesto_phoenix, :otp_app, __MODULE__)
+      Application.put_env(__MODULE__, Config, config)
+
+      on_exit(fn ->
+        restore_env(:otp_app, previous_otp_app)
+        restore_env(:config, previous_config)
+      end)
 
       nonce = EctoNonceStore.issue()
 
@@ -73,6 +82,11 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
       assert_raise FunctionClauseError, fn -> EctoNonceStore.issue(config, 0) end
     end
   end
+
+  defp restore_env(:otp_app, :missing), do: Application.delete_env(:attesto_phoenix, :otp_app)
+  defp restore_env(:otp_app, value), do: Application.put_env(:attesto_phoenix, :otp_app, value)
+  defp restore_env(:config, :missing), do: Application.delete_env(__MODULE__, Config)
+  defp restore_env(:config, value), do: Application.put_env(__MODULE__, Config, value)
 
   describe "valid?/2" do
     test "is true for a freshly issued, unconsumed nonce", %{config: config} do
@@ -159,6 +173,46 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
 
       # The conditional UPDATE serialises on the row: one winner, one loser.
       assert Enum.sort(results) == Enum.sort([:ok, {:error, :used}])
+    end
+
+    test "successful issue, valid lookup, and accept do not log the nonce", %{config: config} do
+      log =
+        capture_log([level: :debug], fn ->
+          nonce = EctoNonceStore.issue(config, @ttl)
+          Process.put({__MODULE__, :captured_nonce}, nonce)
+          assert EctoNonceStore.valid?(config, nonce)
+          assert :ok = EctoNonceStore.accept(config, nonce, @ttl)
+        end)
+
+      nonce = Process.delete({__MODULE__, :captured_nonce})
+      refute log =~ nonce
+    end
+
+    test "a failed accept disambiguation does not log the nonce", %{config: config} do
+      nonce = EctoNonceStore.issue(config, @ttl)
+      assert :ok = EctoNonceStore.accept(config, nonce, @ttl)
+
+      log =
+        capture_log([level: :debug], fn ->
+          assert {:error, :used} = EctoNonceStore.accept(config, nonce, @ttl)
+        end)
+
+      refute log =~ nonce
+    end
+
+    test "query telemetry remains enabled for safe work but is absent for nonce operations", %{config: config} do
+      capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+      on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+      {_id, ref} = capture
+
+      assert is_integer(TestRepo.aggregate(DPoPNonce, :count, :nonce))
+      assert AttestoPhoenix.TestTelemetryCapture.collect(ref) != []
+
+      nonce = EctoNonceStore.issue(config, @ttl)
+      assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+      assert EctoNonceStore.valid?(config, nonce)
+      assert EctoNonceStore.accept(config, nonce, @ttl) == :ok
+      assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
     end
   end
 

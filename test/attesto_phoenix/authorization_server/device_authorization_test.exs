@@ -67,6 +67,21 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorizationTest do
              DeviceCode.redeem(Store, response.device_code, %{client_id: "cli-1"}, interval: 0)
   end
 
+  test "a configured client_id callback cannot fall through to the presented identifier" do
+    config = config(client_id: fn _client -> nil end)
+    request = request(%{id: "cli-1"}, %{"scope" => "read"}, request_client_id: "cli-1")
+
+    error =
+      assert_raise RuntimeError, fn ->
+        DeviceAuthorization.request(config, request)
+      end
+
+    assert Exception.message(error) ==
+             "AttestoPhoenix.Config :client_id callback violated its return contract"
+
+    assert :ets.info(Store, :size) == 0
+  end
+
   test "binds the requested scope (visible on the verification view)" do
     config = config()
     assert {:ok, response} = DeviceAuthorization.request(config, request(%{id: "cli-1"}, %{"scope" => "read write"}))

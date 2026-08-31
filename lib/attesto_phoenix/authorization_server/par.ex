@@ -56,6 +56,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Store.PAR.ETS
 
+  require Logger
+
   @typedoc """
   The conn-free DPoP facts the controller lifts off the PAR request
   (RFC 9449 §4.1 / §4.2 / §4.3).
@@ -111,6 +113,10 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   end
 
   def store(%Config{} = config, %Request{} = request) do
+    Config.with_request_config(config, fn -> do_store(config, request) end)
+  end
+
+  defp do_store(%Config{} = config, %Request{} = request) do
     %{client: client, client_id: authenticated_client_id, params: params, dpop_input: dpop_input} = request
     ttl = config_field(config, :par_ttl, @default_par_ttl)
     request_uri = @request_uri_prefix <> random()
@@ -134,7 +140,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
         :ok ->
           {:ok, %{request_uri: request_uri, expires_in: ttl}}
 
-        _ ->
+        _error ->
+          Logger.warning("AttestoPhoenix PAR store reported an error; pushed request was not stored")
           {:error, error(@error_invalid_request, "could not store pushed authorization request")}
       end
     end
@@ -250,9 +257,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # host's `:client_id` callback.
   defp client_id(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.client_id(metadata)
 
-  defp client_id(config, client) do
-    Callback.invoke(Config.client_id_fun(config), [client], nil)
-  end
+  defp client_id(config, client), do: Config.client_identifier(config, client)
 
   # RFC 9126 §2.1: the pushed request carries a `client_id`, and it must be the
   # client that actually authenticated. A disagreement is not a correctable

@@ -7,6 +7,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.CredentialIssuerMetadataController
+  alias AttestoPhoenix.Plug.PutConfig
 
   @issuer "https://issuer.example"
   @metadata_path "/.well-known/openid-credential-issuer"
@@ -20,6 +21,9 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
 
   defmodule StubKeystore do
     @moduledoc false
+
+    def signing_pem, do: "test-only"
+    def verification_pems, do: ["test-only"]
   end
 
   defmodule CredentialRouter do
@@ -27,8 +31,12 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
     use Phoenix.Router
     use AttestoPhoenix.Router
 
+    pipeline :attesto_phoenix_config do
+      plug PutConfig, otp_app: :attesto_phoenix
+    end
+
     scope "/" do
-      attesto_routes(credential_issuance: true)
+      attesto_routes(pipeline: :attesto_phoenix_config, credential_issuance: true)
     end
   end
 
@@ -41,6 +49,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
+      principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")],
       credential_configurations_supported: @credential_configurations
     )
 
@@ -83,7 +92,11 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
 
     put_config(config)
 
-    response = CredentialIssuerMetadataController.show(conn(:get, @metadata_path), %{})
+    response =
+      conn(:get, @metadata_path)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+      |> CredentialIssuerMetadataController.show(%{})
+
     body = JSON.decode!(response.resp_body)
 
     assert body["credential_endpoint"] == @issuer <> "/wallet/oauth/credential"

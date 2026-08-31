@@ -62,9 +62,10 @@ defmodule AttestoPhoenix.Schema.PushedAuthorizationRequest do
   a changeset error (which `EctoPARStore.put/3` maps to `{:error, _}`) rather
   than a raised exception.
   """
-  @spec put_changeset(t() | %__MODULE__{}, map()) :: Ecto.Changeset.t()
-  def put_changeset(request \\ %__MODULE__{}, attrs) do
+  @spec put_changeset(t() | %__MODULE__{}, map(), keyword()) :: Ecto.Changeset.t()
+  def put_changeset(request \\ %__MODULE__{}, attrs, opts \\ []) when is_list(opts) do
     request
+    |> Ecto.put_meta(prefix: Keyword.get(opts, :prefix))
     |> cast(attrs, @insert_fields)
     |> validate_required(@insert_fields)
     |> unique_constraint(:request_uri, name: :attesto_pushed_authorization_requests_pkey)

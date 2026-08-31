@@ -37,10 +37,12 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecision do
   @spec approve(Config.t(), String.t(), map(), keyword()) ::
           {:ok, CIBA.decision()} | {:error, term()}
   def approve(%Config{} = config, auth_req_id, approval, opts \\ []) do
-    with {:ok, decision} <- CIBA.approve(ciba_store(config), auth_req_id, approval, opts) do
-      deliver_ping(config, auth_req_id, decision)
-      {:ok, decision}
-    end
+    Config.with_request_config(config, fn ->
+      with {:ok, decision} <- CIBA.approve(ciba_store(config), auth_req_id, approval, opts) do
+        deliver_ping(config, auth_req_id, decision)
+        {:ok, decision}
+      end
+    end)
   end
 
   @doc """
@@ -50,10 +52,12 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecision do
   """
   @spec deny(Config.t(), String.t(), keyword()) :: {:ok, CIBA.decision()} | {:error, term()}
   def deny(%Config{} = config, auth_req_id, opts \\ []) do
-    with {:ok, decision} <- CIBA.deny(ciba_store(config), auth_req_id, opts) do
-      deliver_ping(config, auth_req_id, decision)
-      {:ok, decision}
-    end
+    Config.with_request_config(config, fn ->
+      with {:ok, decision} <- CIBA.deny(ciba_store(config), auth_req_id, opts) do
+        deliver_ping(config, auth_req_id, decision)
+        {:ok, decision}
+      end
+    end)
   end
 
   # §10.2: only ping-mode requests are notified, and only when the client has a
@@ -64,45 +68,95 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecision do
     client_id = Callback.map_value(decision, :client_id)
 
     case notification_endpoint(config, client_id) do
-      endpoint when is_binary(endpoint) and endpoint != "" ->
-        post_async(Config.ciba_ping_http_client(config), endpoint, token, auth_req_id)
+      {:ok, endpoint} ->
+        post_async(config, Config.ciba_ping_http_client(config), endpoint, token, auth_req_id)
 
-      _ ->
-        Logger.warning("CIBA ping: no notification endpoint registered for client #{inspect(client_id)}")
+      {:error, :client_lookup_failed} ->
+        Logger.warning("CIBA ping: client lookup failed; notification skipped")
+        :ok
+
+      {:error, :registration_failed} ->
+        Logger.warning("CIBA ping registration failed; notification skipped")
+        :ok
+
+      :error ->
+        Logger.warning("CIBA ping: no notification endpoint registered; notification skipped")
         :ok
     end
   end
 
   defp deliver_ping(_config, _auth_req_id, _decision), do: :ok
 
-  defp post_async(http, endpoint, token, auth_req_id) do
+  defp post_async(config, http, endpoint, token, auth_req_id) do
     Task.start(fn ->
-      case http.post(endpoint, token, auth_req_id) do
-        :ok -> :ok
-        {:error, reason} -> Logger.warning("CIBA ping delivery failed: #{inspect(reason)}")
+      try do
+        Config.with_request_config(config, fn ->
+          post_ping(http, endpoint, token, auth_req_id)
+        end)
+      rescue
+        _exception -> ping_delivery_failed()
+      catch
+        _kind, _value -> ping_delivery_failed()
       end
     end)
 
     :ok
   end
 
+  defp post_ping(http, endpoint, token, auth_req_id) do
+    case http.post(endpoint, token, auth_req_id) do
+      :ok -> :ok
+      {:error, _reason} -> ping_delivery_failed()
+      _unexpected -> ping_delivery_failed()
+    end
+  end
+
+  defp ping_delivery_failed do
+    Logger.warning("CIBA ping delivery failed; notification skipped")
+  end
+
   # The client's registered `backchannel_client_notification_endpoint`, resolved
   # by loading the client and reading its CIBA registration. The core decision
   # carries only the `client_id`, so the host client is re-loaded here.
   defp notification_endpoint(config, client_id) when is_binary(client_id) do
-    case Callback.invoke(Config.load_client_fun(config), [client_id], nil) do
-      {:ok, client} ->
-        config |> Config.client_ciba_registration(client) |> Map.get(:client_notification_endpoint)
-
-      client when not is_nil(client) ->
-        config |> Config.client_ciba_registration(client) |> Map.get(:client_notification_endpoint)
-
-      _ ->
-        nil
+    with {:ok, client} <- load_client_for_ping(config, client_id),
+         {:ok, registration} <- registration_for_ping(config, client) do
+      endpoint_from_registration(registration)
+    else
+      {:error, reason} when reason in [:not_found, :revoked] -> :error
+      error -> error
     end
   end
 
-  defp notification_endpoint(_config, _client_id), do: nil
+  defp notification_endpoint(_config, _client_id), do: :error
+
+  defp endpoint_from_registration(registration) do
+    case Map.get(registration, :client_notification_endpoint) do
+      endpoint when is_binary(endpoint) and endpoint != "" -> {:ok, endpoint}
+      nil -> :error
+      _malformed -> {:error, :registration_failed}
+    end
+  end
+
+  defp registration_for_ping(config, client) do
+    {:ok, Config.client_ciba_registration(config, client)}
+  rescue
+    _exception -> {:error, :registration_failed}
+  catch
+    _kind, _value -> {:error, :registration_failed}
+  end
+
+  # The CIBA decision is already durable before ping delivery begins. A host
+  # client-store fault must therefore remain observable without changing that
+  # committed decision into a misleading failure response. Keep the diagnostic
+  # bounded: callback returns/exceptions may contain storage or credential data.
+  defp load_client_for_ping(config, client_id) do
+    Config.client_store_load(config, client_id)
+  rescue
+    _exception -> {:error, :client_lookup_failed}
+  catch
+    _kind, _value -> {:error, :client_lookup_failed}
+  end
 
   defp ciba_store(config) do
     case Config.ciba_store(config) do

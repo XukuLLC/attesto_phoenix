@@ -19,9 +19,10 @@ defmodule AttestoPhoenix.Event do
        a no-op: the library emits, the host stores.
 
   The dispatcher never raises on a missing callback (emission is optional),
-  never inspects or persists the event itself, and discards the callback's
-  return value so a storage decision can never alter the authorization-server
-  control flow that emitted the event.
+  never persists the event itself, and does not let a callback's return value
+  alter the authorization-server control flow that emitted the event. An
+  explicit `{:error, reason}` return emits a fixed warning without logging the
+  reason or event payload, so audit-delivery failures are operator-visible.
 
   ## Configuration
 
@@ -42,6 +43,8 @@ defmodule AttestoPhoenix.Event do
   """
 
   alias AttestoPhoenix.Config
+
+  require Logger
 
   @typedoc """
   The closed set of authorization-server lifecycle events.
@@ -66,11 +69,15 @@ defmodule AttestoPhoenix.Event do
   * `:refresh_issued` - an initial refresh token was issued alongside an
     access token at the token endpoint (RFC 6749 §5.1, §6). Distinct from
     `:refresh_rotated`: no predecessor was consumed, this is the first token
-    in a new rotation family.
+    in a new rotation family. Carries the resource-owner `:subject`.
   * `:refresh_rotated` - a refresh token was exchanged and a new refresh token
     issued, invalidating the presented one (RFC 6749 §6, RFC 6819 §5.2.2.3).
+    Carries the resource-owner `:subject`.
   * `:refresh_reuse_detected` - an already-rotated refresh token was presented
-    again, indicating possible theft (RFC 6819 §5.2.2.3).
+    again outside the recoverable retry case (RFC 6819 §5.2.2.3). Emitted
+    alongside the ordinary `:token_denied` event. Detailed family and subject
+    correlation remains on core telemetry at
+    `[:attesto, :refresh_token, :reuse_detected]`.
   * `:auth_succeeded` - a presented access token authenticated a protected
     resource request (RFC 6750 §2.1).
   * `:auth_denied` - a protected resource request was rejected (RFC 6750 §3.1).
@@ -192,9 +199,10 @@ defmodule AttestoPhoenix.Event do
   unrecognized name raises). When `:on_event` is unset this is a no-op that
   returns `:ok`.
 
-  Emission is observational: the callback's return value is discarded and `:ok`
-  is always returned, so a host's storage decision can never alter the
-  authorization-server control flow that emitted the event.
+  Emission is observational: `:ok` is always returned, so a host's storage
+  decision can never alter the authorization-server control flow that emitted
+  the event. An explicit `{:error, reason}` return emits a fixed warning without
+  logging the reason or event payload.
   """
   @spec emit(Config.t(), name(), map() | keyword()) :: :ok
   def emit(%Config{} = config, name, fields \\ %{}) when is_atom(name) do
@@ -212,20 +220,24 @@ defmodule AttestoPhoenix.Event do
   def dispatch(nil, %__MODULE__{}), do: :ok
 
   def dispatch(callback, %__MODULE__{} = event) when is_function(callback, 1) do
-    _ = callback.(event)
-    :ok
+    callback.(event) |> observe_dispatch_result()
   end
 
   def dispatch({module, function}, %__MODULE__{} = event) when is_atom(module) and is_atom(function) do
-    _ = apply(module, function, [event])
-    :ok
+    apply(module, function, [event]) |> observe_dispatch_result()
   end
 
   def dispatch({module, function, args}, %__MODULE__{} = event)
       when is_atom(module) and is_atom(function) and is_list(args) do
-    _ = apply(module, function, [event | args])
+    apply(module, function, [event | args]) |> observe_dispatch_result()
+  end
+
+  defp observe_dispatch_result({:error, _reason}) do
+    Logger.warning("AttestoPhoenix event callback reported an error; event delivery may be incomplete")
     :ok
   end
+
+  defp observe_dispatch_result(_result), do: :ok
 
   @doc """
   Returns the closed set of recognized event names.

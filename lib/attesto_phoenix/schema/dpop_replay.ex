@@ -87,9 +87,10 @@ defmodule AttestoPhoenix.Schema.DPoPReplay do
   directly; this changeset is the validated entry point for callers that
   prefer the changeset API.
   """
-  @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(replay, attrs) do
+  @spec changeset(t(), map(), keyword()) :: Ecto.Changeset.t()
+  def changeset(replay, attrs, opts \\ []) when is_list(opts) do
     replay
+    |> Ecto.put_meta(prefix: Keyword.get(opts, :prefix))
     |> cast(attrs, @required_fields)
     |> validate_required(@required_fields)
     |> unique_constraint(:jti, name: :dpop_replays_pkey)

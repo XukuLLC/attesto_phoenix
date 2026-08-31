@@ -46,17 +46,13 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   exist.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn, only: [put_resp_header: 3]
 
   alias Attesto.Discovery
   alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.Config
-
-  # The router pipeline installs the AttestoPhoenix.Config here. This is the
-  # same private key the token and revocation endpoints read.
-  @config_key :attesto_phoenix_config
 
   # The router pipeline installs the derived Attesto.Config (the protocol
   # configuration the core metadata builder reads) here.
@@ -70,13 +66,13 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   @doc """
   Render the RFC 8414 metadata document as JSON.
 
-  Fails closed with `RuntimeError` when either required configuration value
+  Fails closed with `ArgumentError` when either required configuration value
   is absent from `conn.private`, since serving a document that omits
   required members would misdirect clients.
   """
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = fetch_config!(conn)
+    config = Config.resolve!(conn)
     protocol_config = fetch_protocol_config!(conn)
 
     metadata =
@@ -92,18 +88,6 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   # Fail closed: a missing config is a wiring error, not a runtime
   # condition to paper over. Raising surfaces the misconfiguration instead
   # of emitting a document that omits required members.
-  @spec fetch_config!(Plug.Conn.t()) :: Config.t()
-  defp fetch_config!(conn) do
-    case conn.private do
-      %{@config_key => %Config{} = config} ->
-        config
-
-      _ ->
-        raise "#{inspect(__MODULE__)}: no %AttestoPhoenix.Config{} found in " <>
-                "conn.private[#{inspect(@config_key)}]; wire the host pipeline that assigns it"
-    end
-  end
-
   @spec fetch_protocol_config!(Plug.Conn.t()) :: Attesto.Config.t()
   defp fetch_protocol_config!(conn) do
     case conn.private do

@@ -7,7 +7,7 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
   alias Attesto.DPoP.ReplayCache
   alias Attesto.Token
-  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.Plug.Authenticate
   alias ReqDPoP.Key, as: DPoPKey
 
@@ -51,7 +51,23 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
   defmodule RevokedTokenStore do
     @moduledoc false
 
-    def access_token_revoked?(jti), do: jti == Process.get(:attesto_phoenix_revoked_jti)
+    def access_token_revoked?(jti) do
+      case Process.get({__MODULE__, :result}, :__not_configured__) do
+        :__not_configured__ -> jti == Process.get(:attesto_phoenix_revoked_jti)
+        result -> result
+      end
+    end
+  end
+
+  defmodule ConfigObservingRevokedTokenStore do
+    @moduledoc false
+
+    alias AttestoPhoenix.Config
+
+    def access_token_revoked?(_jti) do
+      send(self(), {:protected_resource_config, Config.request_config()})
+      false
+    end
   end
 
   @user_kind Attesto.PrincipalKind.new("user", "ou_", required_claims: [{"client_id", :non_empty_string}])
@@ -102,6 +118,50 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
            }
 
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
+  end
+
+  test "request-private config is authoritative over static plug config", %{config: config} do
+    request_config = %{config | audience: "https://request-resource.example"}
+    token = mint(request_config, scope: "openid")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_private(:attesto_phoenix_config, request_config)
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    refute conn.halted
+    assert conn.assigns.attesto_claims["aud"] == "https://request-resource.example"
+    assert Config.request_config() == nil
+  end
+
+  test "direct protected-resource authentication binds its explicit config", %{config: config} do
+    config = %{config | code_store: __MODULE__.ConfigObservingRevokedTokenStore, schema_prefix: "resource_tenant"}
+    token = mint(config, scope: "openid")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+
+    assert {:ok, _conn, claims} = ProtectedResource.authenticate(conn, config, nil)
+    assert claims["sub"] == @subject
+    assert_received {:protected_resource_config, ^config}
+    assert Config.request_config() == nil
+  end
+
+  test "malformed request-private config fails closed instead of using static config", %{config: config} do
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_private(:attesto_phoenix_config, %{repo: config.repo})
+
+    assert_raise ArgumentError, ~r/expected conn\.private\[:attesto_phoenix_config\]/, fn ->
+      Authenticate.call(conn, Authenticate.init(config: config))
+    end
+
+    assert Config.request_config() == nil
   end
 
   test "resolves principal kinds once per request and preserves the resolved value", %{
@@ -206,6 +266,22 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_denied, result: :invalid_token}}
   end
 
+  test "an unexpected principal-store result is a sanitized integration failure", %{
+    config: config
+  } do
+    config = %{config | load_principal: fn _subject -> {:error, :store_unavailable} end}
+    token = mint(config, scope: "openid")
+
+    assert_raise RuntimeError, ":load_principal callback violated its return contract", fn ->
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+    end
+
+    refute_received {:event, %AttestoPhoenix.Event{name: :auth_denied}}
+  end
+
   test "rejects an access token revoked after authorization-code reuse", %{config: config} do
     token = mint(config, scope: "openid")
     Process.put(:attesto_phoenix_revoked_jti, peek_claims(config, token)["jti"])
@@ -222,6 +298,33 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert JSON.decode!(conn.resp_body) == %{"error" => "invalid_token"}
     assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_denied, result: :invalid_token}}
+  end
+
+  test "rejects malformed revocation-store results at both public boundaries", %{config: config} do
+    token = mint(config, scope: "openid")
+    claims = peek_claims(config, token)
+    config = %{config | code_store: __MODULE__.RevokedTokenStore}
+
+    for invalid <- [:error, {:error, :backend_unavailable}, "sensitive-result-sentinel"] do
+      Process.put({RevokedTokenStore, :result}, invalid)
+
+      error =
+        assert_raise RuntimeError, "code_store access_token_revoked?/1 must return true or false", fn ->
+          ProtectedResource.access_token_revoked?(config, claims)
+        end
+
+      refute Exception.message(error) =~ "sensitive-result-sentinel"
+
+      error =
+        assert_raise RuntimeError, "code_store access_token_revoked?/1 must return true or false", fn ->
+          :get
+          |> conn("/reports")
+          |> put_req_header("authorization", "Bearer " <> token)
+          |> Authenticate.call(Authenticate.init(config: config))
+        end
+
+      refute Exception.message(error) =~ "sensitive-result-sentinel"
+    end
   end
 
   test "supports custom assign keys", %{config: config} do

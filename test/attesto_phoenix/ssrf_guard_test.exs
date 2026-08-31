@@ -94,4 +94,15 @@ defmodule AttestoPhoenix.SSRFGuardTest do
     assert {:error, {:blocked_ip, {169, 254, 169, 254}}} =
              SSRFGuard.screen(@url, resolver: resolver([{169, 254, 169, 254}]), allow_loopback: true)
   end
+
+  test "a truthy non-boolean cannot enable the loopback exception" do
+    for invalid <- ["false", 1, {:error, :unavailable}] do
+      assert_raise ArgumentError, ~r/:allow_loopback must be true or false/, fn ->
+        SSRFGuard.screen("http://local.test/cb",
+          resolver: resolver([{127, 0, 0, 1}]),
+          allow_loopback: invalid
+        )
+      end
+    end
+  end
 end

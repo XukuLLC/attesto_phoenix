@@ -29,10 +29,27 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
 
   use Ecto.Schema
 
+  alias Attesto.Scope
+  alias Attesto.Thumbprint
+
   @type t :: %__MODULE__{}
 
   @statuses [:pending, :approved, :denied, :consumed]
   @delivery_modes [:poll, :ping, :push]
+  @canonical_data_keys [
+    :acr_values,
+    :binding_message,
+    :client_id,
+    :client_notification_token,
+    :delivery_mode,
+    :dpop_jkt,
+    :resource,
+    :scope,
+    :subject
+  ]
+  @canonical_data_error "CIBA request has invalid canonical data"
+  @notification_token_pattern ~r/\A[A-Za-z0-9\-._~+\/]+=*\z/
+  @notification_token_max_length 1024
 
   @primary_key {:id, :binary_id, autogenerate: true}
   schema "attesto_ciba_requests" do
@@ -70,26 +87,36 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
 
   @doc """
   Build the insert map for a new `pending` authentication request from the core
-  store record. Returns `{schema_struct, prefix}` ready for `Repo.insert/2`.
+  store record. The issue-time `:data` map must contain exactly the nine atom
+  keys emitted by `Attesto.CIBA.issue/4`; missing or extra keys raise a fixed,
+  value-free `ArgumentError` before any field is projected into the row. The
+  write envelope must also be pending with a valid expiry and interval, and
+  undecided: status and interval are explicit, while decision fields and
+  `last_polled_at` must be nil or absent.
   """
   @spec from_record(Attesto.CIBAStore.entry(), keyword()) :: t()
   def from_record(record, opts \\ []) when is_map(record) and is_list(opts) do
     prefix = Keyword.get(opts, :prefix)
-    data = Map.get(record, :data, %{})
+    data = canonical_data!(record)
 
     %__MODULE__{
       auth_req_id_hash: Map.get(record, :auth_req_id_hash),
-      client_id: Map.get(data, :client_id),
-      delivery_mode: Map.get(data, :delivery_mode),
-      scope: Map.get(data, :scope, []),
-      acr_values: Map.get(data, :acr_values, []),
-      binding_message: Map.get(data, :binding_message),
-      client_notification_token: Map.get(data, :client_notification_token),
-      hint_subject: Map.get(data, :subject),
-      resource: Map.get(data, :resource, []),
-      dpop_jkt: Map.get(data, :dpop_jkt),
-      status: Map.get(record, :status, :pending),
-      interval: Map.get(record, :interval, 0),
+      client_id: data.client_id,
+      delivery_mode: data.delivery_mode,
+      scope: data.scope,
+      acr_values: data.acr_values,
+      binding_message: data.binding_message,
+      client_notification_token: data.client_notification_token,
+      hint_subject: data.subject,
+      resource: data.resource,
+      dpop_jkt: data.dpop_jkt,
+      status: Map.get(record, :status),
+      subject: Map.get(record, :subject),
+      acr: Map.get(record, :acr),
+      auth_time: unix_to_datetime(Map.get(record, :auth_time)),
+      granted_scope: Map.get(record, :granted_scope),
+      granted_claims: Map.get(record, :granted_claims),
+      interval: Map.get(record, :interval),
       expires_at: unix_to_datetime(Map.get(record, :expires_at)),
       last_polled_at: unix_to_datetime(Map.get(record, :last_polled_at))
     }
@@ -104,14 +131,14 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
     %{
       auth_req_id_hash: row.auth_req_id_hash,
       data: %{
-        acr_values: row.acr_values || [],
+        acr_values: row.acr_values,
         binding_message: row.binding_message,
         client_id: row.client_id,
         client_notification_token: row.client_notification_token,
         delivery_mode: row.delivery_mode,
         dpop_jkt: row.dpop_jkt,
-        resource: row.resource || [],
-        scope: row.scope || [],
+        resource: row.resource,
+        scope: row.scope,
         subject: row.hint_subject
       },
       status: row.status,
@@ -120,11 +147,81 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
       auth_time: datetime_to_unix(row.auth_time),
       granted_scope: row.granted_scope,
       granted_claims: row.granted_claims,
-      interval: row.interval || 0,
+      interval: row.interval,
       expires_at: datetime_to_unix(row.expires_at),
       last_polled_at: datetime_to_unix(row.last_polled_at)
     }
   end
+
+  defp canonical_data!(record) do
+    data = Map.get(record, :data)
+
+    if is_map(data) and
+         map_size(data) == length(@canonical_data_keys) and
+         Enum.all?(@canonical_data_keys, &Map.has_key?(data, &1)) and
+         valid_canonical_data?(data) and valid_record_envelope?(record) do
+      data
+    else
+      raise ArgumentError, @canonical_data_error
+    end
+  end
+
+  defp valid_canonical_data?(data) do
+    valid_string_list?(Map.get(data, :acr_values)) and
+      valid_optional_display_text?(Map.get(data, :binding_message)) and
+      non_empty_binary?(Map.get(data, :client_id)) and
+      valid_notification_binding?(Map.get(data, :delivery_mode), Map.get(data, :client_notification_token)) and
+      valid_delivery_mode?(Map.get(data, :delivery_mode)) and
+      valid_optional_jkt?(Map.get(data, :dpop_jkt)) and
+      valid_string_list?(Map.get(data, :resource)) and
+      Scope.valid_list?(Map.get(data, :scope)) and
+      non_empty_binary?(Map.get(data, :subject))
+  end
+
+  defp valid_record_envelope?(record) do
+    valid_required_record_envelope?(record) and valid_optional_record_envelope?(record)
+  end
+
+  defp valid_required_record_envelope?(record) do
+    non_empty_binary?(Map.get(record, :auth_req_id_hash)) and
+      Map.get(record, :status) == :pending and
+      is_integer(Map.get(record, :interval)) and Map.get(record, :interval) >= 0 and
+      is_integer(Map.get(record, :expires_at)) and Map.get(record, :expires_at) >= 0
+  end
+
+  defp valid_optional_record_envelope?(record) do
+    is_nil(Map.get(record, :subject)) and
+      is_nil(Map.get(record, :acr)) and
+      is_nil(Map.get(record, :auth_time)) and
+      is_nil(Map.get(record, :granted_scope)) and
+      is_nil(Map.get(record, :granted_claims)) and
+      is_nil(Map.get(record, :last_polled_at))
+  end
+
+  defp valid_delivery_mode?(mode), do: mode in @delivery_modes
+
+  defp valid_notification_binding?(:poll, nil), do: true
+
+  defp valid_notification_binding?(mode, token) when mode in [:ping, :push],
+    do:
+      is_binary(token) and token != "" and byte_size(token) <= @notification_token_max_length and
+        Regex.match?(@notification_token_pattern, token)
+
+  defp valid_notification_binding?(_mode, _token), do: false
+
+  defp valid_optional_display_text?(nil), do: true
+
+  defp valid_optional_display_text?(value) when is_binary(value) and value != "",
+    do: String.valid?(value) and not Regex.match?(~r/[\x00-\x1F\x7F]/u, value)
+
+  defp valid_optional_display_text?(_value), do: false
+
+  defp valid_optional_jkt?(nil), do: true
+  defp valid_optional_jkt?(value), do: Thumbprint.valid?(value)
+
+  defp valid_string_list?(value), do: is_list(value) and Enum.all?(value, &non_empty_binary?/1)
+
+  defp non_empty_binary?(value), do: is_binary(value) and value != ""
 
   defp unix_to_datetime(nil), do: nil
   defp unix_to_datetime(unix) when is_integer(unix), do: unix |> DateTime.from_unix!() |> DateTime.truncate(:second)

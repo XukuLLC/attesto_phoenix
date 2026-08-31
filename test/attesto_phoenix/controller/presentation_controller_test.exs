@@ -3,7 +3,11 @@ defmodule AttestoPhoenix.PresentationTestRouter do
   use Phoenix.Router
   use AttestoPhoenix.Router
 
+  alias AttestoPhoenix.Plug.PutConfig
+
   pipeline :wallet_protocol do
+    plug PutConfig, otp_app: :attesto_phoenix
+
     plug Plug.Parsers,
       parsers: [:urlencoded, :json],
       pass: ["application/json", "application/x-www-form-urlencoded"],
@@ -80,6 +84,7 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
+      principal_kinds: [Attesto.PrincipalKind.new("user", "ou_")],
       require_https: false,
       presentation_session_store: Store,
       verifier_encryption_keystore: EncryptionKeystore,

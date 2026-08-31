@@ -30,13 +30,23 @@ defmodule AttestoPhoenix.Store.NonceStore do
   """
   @spec issue(Config.t(), module()) :: String.t()
   def issue(%Config{} = config, store) when is_atom(store) do
-    if function_exported?(store, :issue, 2) do
-      store.issue(config, @default_ttl_seconds)
-    else
-      # The `Attesto.DPoP.NonceStore` behaviour guarantees only `issue/1`
-      # (`ttl_seconds`); call it with an explicit TTL rather than relying on an
-      # arity-0 default a spec-exact store need not expose.
-      store.issue(@default_ttl_seconds)
+    result =
+      if function_exported?(store, :issue, 2) do
+        store.issue(config, @default_ttl_seconds)
+      else
+        # The `Attesto.DPoP.NonceStore` behaviour guarantees only `issue/1`
+        # (`ttl_seconds`); call it with an explicit TTL rather than relying on an
+        # arity-0 default a spec-exact store need not expose.
+        store.issue(@default_ttl_seconds)
+      end
+
+    case result do
+      nonce when is_binary(nonce) and nonce != "" ->
+        nonce
+
+      _unexpected ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: nonce issue callback must return a non-empty string"
     end
   end
 
@@ -46,10 +56,23 @@ defmodule AttestoPhoenix.Store.NonceStore do
   """
   @spec valid?(Config.t(), module(), String.t()) :: boolean()
   def valid?(%Config{} = config, store, nonce) when is_atom(store) do
-    if function_exported?(store, :valid?, 2) do
-      store.valid?(config, nonce)
-    else
-      store.valid?(nonce)
+    result =
+      if function_exported?(store, :valid?, 2) do
+        store.valid?(config, nonce)
+      else
+        store.valid?(nonce)
+      end
+
+    case result do
+      true ->
+        true
+
+      false ->
+        false
+
+      _unexpected ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: nonce validity callback must return true or false"
     end
   end
 end

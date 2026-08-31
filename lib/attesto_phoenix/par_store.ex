@@ -11,7 +11,9 @@ defmodule AttestoPhoenix.PARStore do
   applications commonly establish login or consent and then re-enter the
   authorization endpoint with the same `request_uri`. Stores should expire
   entries by TTL; they should not consume them simply because the front channel
-  was resolved.
+  was resolved. When `:require_pushed_authorization_requests` is enabled, the
+  configured store must also implement atomic `take/1`; otherwise completion
+  fails closed instead of issuing a code without a single-use claim.
   """
 
   @callback put(String.t(), map(), pos_integer()) :: :ok | {:error, term()}

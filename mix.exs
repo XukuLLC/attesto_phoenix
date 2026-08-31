@@ -22,9 +22,11 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "2.14.2"
+  @version "3.0.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
+  @attesto_requirement ">= 2.0.0 and < 3.0.0"
+  @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
     [
@@ -64,55 +66,48 @@ defmodule AttestoPhoenix.MixProject do
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
-  # Co-develop against the sibling attesto checkout, but ONLY when explicitly
-  # opted in via ATTESTO_PATH=1 (and the checkout exists). This is deliberately
-  # NOT keyed on Mix.env alone: `mix hex.build` / `mix hex.publish` run in :dev,
-  # and a path dep cannot be packaged ("only Hex packages can be dependencies"),
-  # so a Mix.env-based switch would break publishing from a dev checkout. The
-  # default - including every publish - resolves the published version
-  # constraint; local development sets ATTESTO_PATH=1 to use the sibling.
+  # Co-develop against an Attesto source checkout only when explicitly opted in.
+  # `ATTESTO_SOURCE_PATH` is the CI-friendly form; ATTESTO_PATH=1 retains the
+  # local sibling-checkout shorthand. Both are validated before becoming path
+  # dependencies, so a typo cannot silently exercise a released core instead.
   #
-  # The 1.15.0 floor is load-bearing, not housekeeping. 1.9.0 carried
-  # `Attesto.RedirectURI`'s
-  # `:exact_allow_loopback_port_including_localhost` mode, which the native-app
-  # policy selects when the host enables `:loopback_include_localhost`. An
-  # older core would compile this package but raise when that mode reaches
-  # `Attesto.RedirectURI.registered?/3`. It also carries
-  # `Attesto.DPoP.verify_proof/2`'s `replay_ttl`, which this package's deferred
-  # token-endpoint replay claim reads to size the entry it records - against an
-  # older core that key is absent and `commit_replay_claim/2` cannot make the
-  # claim the endpoint owes RFC 9449 §11.1. It also carries `Attesto.Telemetry`,
-  # emitted from the same path, and `Attesto.RedirectURI.unambiguous?/1` with
-  # the CIMD document validation that rejects a parser-ambiguous redirect URI -
-  # without which this package's origin-phrased same-origin check would compile
-  # and then approve a redirect URI a browser resolves to a different host. An
-  # older core would additionally omit the key-bound FAPI algorithm enforcement
-  # and RFC 9864 Edwards identifiers that client authentication, request
-  # objects, and CIBA rely on. 1.10.0 raised the floor for the OID4VC security
-  # hardening this package's HTTP surface documents and relies on: the
-  # library-generated credential-offer id
-  # (`Attesto.CredentialOffer.store_by_reference/3`), the single-use
-  # presentation result (`AttestoPhoenix.Verifier.presentation_result/2`
-  # consuming through the store's now-required `take/1`), and the bounded
-  # Credential Request `proofs`. 1.11.0 adds the required `Attesto.CNonceStore`
-  # `consume/1` callback, which the credential endpoint now calls to single-use
-  # the c_nonce - an older core lacks it and the endpoint fails closed.
-  # 1.13.0 supplies the ID-JAG assertion-claim validation the token endpoint's
-  # JWT-bearer enforcement builds on. Most of it is defence in depth (this
-  # package re-validates the signed `resource` and matches `cnf.jkt` itself),
-  # but the `authorization_details` rejection lives ONLY in core: on an older
-  # release an assertion carrying RFC 9396 constraints is accepted and treated
-  # as broader scope-only authority, which is exactly the widening 2.12.0
-  # closes. 1.15.0 supplies the RFC 8705 §2 certificate-identity matcher and
-  # non-extractable `Attesto.Signer` path now invoked by this package; resolving
-  # an older core would leave advertised mTLS authentication and JWS credential
-  # issuance pointing at missing runtime functions. The floor is therefore
-  # load-bearing, not cosmetic.
+  # `mix hex.build` / `mix hex.publish` run in :dev, and a path dep cannot be
+  # packaged ("only Hex packages can be dependencies"). Keep those tasks on the
+  # Hex requirement even when a developer's shell exports a path opt-in. This
+  # also makes the generated package metadata the release contract every time.
+  #
+  # The 2.0 floor is load-bearing: this package implements the atomic refresh
+  # rotation transaction and device-code decision contracts introduced by that
+  # major. Resolving an older core would leave the Ecto adapters and grant
+  # orchestration on incompatible public callbacks.
   defp attesto_dep do
-    if System.get_env("ATTESTO_PATH") in ~w(1 true) and File.dir?("../attesto") do
-      {:attesto, path: "../attesto"}
+    source_path = System.get_env("ATTESTO_SOURCE_PATH")
+
+    cond do
+      hex_package_task?() -> {:attesto, @attesto_requirement}
+      is_binary(source_path) and source_path != "" -> attesto_source_dep!(source_path)
+      System.get_env("ATTESTO_PATH") in ~w(1 true) -> attesto_source_dep!("../attesto")
+      true -> {:attesto, @attesto_requirement}
+    end
+  end
+
+  defp hex_package_task? do
+    Enum.any?(System.argv(), &(&1 in @hex_package_tasks))
+  end
+
+  defp attesto_source_dep!(path) do
+    expanded_path = Path.expand(path)
+
+    if File.dir?(expanded_path) and
+         File.regular?(Path.join(expanded_path, "mix.exs")) and
+         (File.dir?(Path.join(expanded_path, ".git")) or
+            File.regular?(Path.join(expanded_path, ".git"))) do
+      {:attesto, path: expanded_path}
     else
-      {:attesto, ">= 1.15.0 and < 2.0.0"}
+      Mix.raise(
+        "Attesto source dependency path #{inspect(path)} must point to a Git checkout " <>
+          "containing mix.exs (resolved to #{inspect(expanded_path)})"
+      )
     end
   end
 
@@ -191,6 +186,7 @@ defmodule AttestoPhoenix.MixProject do
       source_url: @url,
       extras: [
         "README.md",
+        "guides/upgrade_3_0_schema_prefix.md",
         "guides/examples.md",
         "guides/local_https.md",
         "guides/consumer_migration.md",
@@ -200,12 +196,14 @@ defmodule AttestoPhoenix.MixProject do
         "guides/identity_assertion_grant.md",
         "notebooks/attesto_phoenix_demo.livemd",
         "CHANGELOG.md",
+        "CONTRIBUTING.md",
         "LICENSE"
       ],
       groups_for_extras: [
         Guides: ~r/guides\/.*/,
         Notebooks: ~r/notebooks\/.*/,
         Changelog: ~r/CHANGELOG\.md/,
+        Contributing: ~r/CONTRIBUTING\.md/,
         License: ~r/LICENSE/
       ],
       groups_for_modules: [
@@ -268,7 +266,7 @@ defmodule AttestoPhoenix.MixProject do
         "Changelog" => "https://hexdocs.pm/attesto_phoenix/changelog.html",
         "GitHub" => @url
       },
-      files: ~w(lib guides notebooks LICENSE mix.exs README.md CHANGELOG.md)
+      files: ~w(lib guides notebooks LICENSE mix.exs README.md CHANGELOG.md CONTRIBUTING.md)
     ]
   end
 end

@@ -106,12 +106,13 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
   @spec check_and_record(String.t(), pos_integer()) :: :ok | {:error, :replay}
   def check_and_record(jti, ttl_seconds \\ @default_ttl_seconds)
       when is_binary(jti) and is_integer(ttl_seconds) and ttl_seconds > 0 do
+    prefix = Config.table_prefix()
     expires_at = DateTime.add(DateTime.utc_now(), ttl_seconds, :second)
 
     changeset =
-      DPoPReplay.changeset(%DPoPReplay{}, %{jti: jti, expires_at: expires_at})
+      DPoPReplay.changeset(%DPoPReplay{}, %{jti: jti, expires_at: expires_at}, prefix: prefix)
 
-    case repo().insert(changeset) do
+    case repo().insert(changeset, prefix: prefix) do
       {:ok, _record} ->
         :ok
 
@@ -142,10 +143,11 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
   """
   @spec sweep() :: non_neg_integer()
   def sweep do
+    prefix = Config.table_prefix()
     now = DateTime.utc_now()
 
     {deleted, _} =
-      repo().delete_all(from(r in DPoPReplay, where: r.expires_at < ^now))
+      repo().delete_all(from(r in DPoPReplay, where: r.expires_at < ^now), prefix: prefix)
 
     deleted
   end

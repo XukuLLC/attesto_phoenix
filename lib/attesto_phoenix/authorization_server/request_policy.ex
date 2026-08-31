@@ -191,7 +191,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   def client_native?(_config, %CIMDClient{metadata: _metadata}), do: false
 
   def client_native?(config, client) do
-    Callback.invoke(Config.client_native_fun(config), [client], false) == true
+    Callback.invoke_boolean(Config.client_native_fun(config), [client], false, :client_native?)
   end
 
   @doc """
@@ -207,10 +207,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   def client_public?(_config, %CIMDClient{metadata: _metadata}), do: true
 
   def client_public?(config, client) do
-    case Config.client_public_fun(config) do
-      nil -> true
-      callback -> Callback.invoke(callback, [client]) == true
-    end
+    Callback.invoke_boolean(Config.client_public_fun(config), [client], true, :client_public?)
   end
 
   @doc """

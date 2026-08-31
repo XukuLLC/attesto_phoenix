@@ -5,7 +5,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   Generates an Ecto migration that creates the persistence backing the
   Ecto-based stores ship with `attesto_phoenix`.
 
-  The migration creates ten tables, named to match the runtime schemas
+  The migration creates eleven tables, named to match the runtime schemas
   exactly so a by-the-docs deploy installs tables the Ecto-backed stores can
   use without modification:
 
@@ -26,6 +26,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       `claims`, and the diagnostic `parent_hash`, so that reuse of a rotated
       token can be detected and the whole family revoked (RFC 6819, section
       5.2.2.3 - refresh token rotation / replay detection).
+
+    * `attesto_refresh_family_revocations` - durable refresh-family revocation
+      tombstones. Refresh-token rows are eligible for expiry cleanup, so this
+      separate table preserves a revocation after every row in the family has
+      been swept. Existing installations upgrading to a release that uses
+      this table must apply a forward migration before starting the new code;
+      see the upgrade notes in the README and CHANGELOG.
 
     * `attesto_device_codes` - the device authorization grant store
       (`AttestoPhoenix.Schema.DeviceCode`, RFC 8628). One row per device code,
@@ -101,27 +108,31 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       configured for the host application are used (the same resolution
       `mix ecto.gen.migration` performs).
 
-    * `--table-prefix` - an optional prefix applied to every generated table
-      name (for example `--table-prefix oauth_` yields
-      `oauth_attesto_authorization_codes`).
-      Defaults to no prefix. When omitted, the prefix configured for the host
-      (`:table_prefix` on the `AttestoPhoenix.Config` keyword the host puts in
-      its application environment) is used so the generated tables match the
-      prefix the Ecto stores read at runtime; the task never invents a prefix.
+    * `--schema-prefix` - an optional PostgreSQL schema selected by Ecto's
+      `prefix:` option for every generated table and index (for example
+      `--schema-prefix oauth` creates `attesto_authorization_codes` in schema
+      `oauth`). Runtime Ecto queries use the same `prefix:` option; the table
+      names themselves remain canonical. Defaults to no prefix. When omitted,
+      the prefix configured for the host (`:schema_prefix` on the
+      `AttestoPhoenix.Config` the host puts in its application environment) is
+      used so the generated schema matches the prefix the Ecto stores read at
+      runtime; the task never invents a prefix. The 2.x `--table-prefix` option
+      is rejected because it meant literal table-name prefixing.
 
     * `--migrations-path` - directory the migration file is written to. Defaults
       to the repo's `priv/<repo>/migrations` directory, the same location
       `mix ecto.gen.migration` uses.
 
     * `--otp-app` - the host application whose environment holds the
-      `AttestoPhoenix.Config` keyword to read `:table_prefix` from when
-      `--table-prefix` is omitted. Optional; without it the default (no prefix)
-      is used.
+      `AttestoPhoenix.Config` keyword or struct to read `:schema_prefix` from
+      when `--schema-prefix` is omitted. Optional; when omitted, the task first uses
+      `config :attesto_phoenix, otp_app: ...` and then the current Mix
+      project's `:app`. If neither application has a configured prefix, the
+      default is no prefix.
 
     * `--config-key` - the application environment key the host stores its
       `AttestoPhoenix.Config` keyword under. Defaults to `AttestoPhoenix.Config`,
-      matching `AttestoPhoenix.Config.from_otp_app/2`. Only consulted together
-      with `--otp-app`.
+      matching `AttestoPhoenix.Config.from_otp_app/2`.
 
   The generated migration is reversible: `up` creates the tables and indexes and
   `down` drops them.
@@ -142,10 +153,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   @jti_column_size 255
   @nonce_column_size 255
   @identifier_column_size 255
+  @max_schema_prefix_bytes 63
 
   @switches [
     repo: [:keep],
-    table_prefix: :string,
+    schema_prefix: :string,
     migrations_path: :string,
     otp_app: :string,
     config_key: :string
@@ -157,14 +169,18 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
   @impl Mix.Task
   def run(args) do
-    # Reading any host configuration (table prefix, the repo set) goes through
+    reject_legacy_table_prefix_arg!(args)
+    reject_legacy_global_table_prefix!()
+
+    # Reading any host configuration (schema prefix, the repo set) goes through
     # AttestoPhoenix.Config rather than being hardcoded here: the task is policy
     # free and only renders what the host has declared.
+    {opts, positional, invalid} = OptionParser.parse(args, strict: @switches)
+    reject_invalid_args!(positional, invalid)
+
     repos = parse_repo(args)
 
-    {opts, _, _} = OptionParser.parse(args, switches: @switches)
-
-    prefix = table_prefix(opts)
+    prefix = schema_prefix(opts)
     validate_prefix!(prefix)
 
     repos
@@ -186,61 +202,227 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
   defp resolve_repos!(repos), do: repos
 
-  defp table_prefix(opts) do
-    # An explicit --table-prefix always wins; otherwise defer to the prefix the
+  defp schema_prefix(opts) do
+    # An explicit --schema-prefix always wins; otherwise defer to the prefix the
     # host configured for the runtime stores so the schema and the migration
-    # agree. The neutral identity default (no host config, no flag) is the empty
-    # string: no prefix. The task never invents a prefix of its own.
-    case Keyword.fetch(opts, :table_prefix) do
+    # agree. The neutral identity default (no host config, no flag) is nil: no
+    # prefix. The task never invents a prefix of its own.
+    case Keyword.fetch(opts, :schema_prefix) do
       {:ok, prefix} -> prefix
-      :error -> configured_table_prefix(opts)
+      :error -> configured_schema_prefix(opts)
     end
   end
 
-  # Reads :table_prefix from the host's AttestoPhoenix.Config keyword in the
-  # application environment, without building (and thus validating) the full
-  # config: the generator must run before the host's other required keys (issuer,
-  # keystore, ...) are necessarily present. Returns "" (no prefix) when no host
-  # app is identified or no prefix is configured.
-  defp configured_table_prefix(opts) do
+  # Reads :schema_prefix from the host's AttestoPhoenix.Config keyword or
+  # already-built struct in the application environment, without requiring the
+  # host's other required keys (issuer, keystore, ...) to be present.
+  defp configured_schema_prefix(opts) do
+    key = opts |> Keyword.get(:config_key) |> config_key()
+
+    case configured_otp_app(opts) do
+      nil -> nil
+      otp_app -> otp_configured_schema_prefix(otp_app, key)
+    end
+  end
+
+  # Keep the no-flag command useful from a host application's project root.
+  # The explicit library pointer wins because it is the same source used by
+  # runtime config resolution; the Mix project app is the safe fallback for a
+  # host that stores its config directly under its own application.
+  defp configured_otp_app(opts) do
     case Keyword.fetch(opts, :otp_app) do
       {:ok, otp_app} ->
-        key = opts |> Keyword.get(:config_key) |> config_key()
-
-        otp_app
-        |> String.to_atom()
-        |> Application.get_env(key, [])
-        |> Keyword.get(:table_prefix)
-        |> normalize_configured_prefix()
+        normalize_otp_app!(otp_app)
 
       :error ->
-        ""
+        case Application.get_env(:attesto_phoenix, :otp_app) do
+          nil ->
+            Mix.Project.config()[:app]
+
+          otp_app when is_atom(otp_app) ->
+            otp_app
+
+          other ->
+            Mix.raise("invalid config :attesto_phoenix, :otp_app: expected an application atom, got #{inspect(other)}")
+        end
     end
   end
 
-  defp config_key(nil), do: @default_config_key
-  defp config_key(key) when is_binary(key), do: Module.concat([key])
+  defp normalize_otp_app!(otp_app) when is_binary(otp_app) and otp_app != "" do
+    String.to_existing_atom(otp_app)
+  rescue
+    ArgumentError ->
+      Mix.raise("invalid --otp-app: application #{inspect(otp_app)} is not loaded")
+  end
 
-  defp normalize_configured_prefix(nil), do: ""
-  defp normalize_configured_prefix(prefix) when is_binary(prefix), do: prefix
+  defp normalize_otp_app!(otp_app) when is_atom(otp_app), do: otp_app
 
-  # Table names are emitted into the migration source verbatim, so a prefix that
-  # is not a bare identifier fragment would either break the generated module or
-  # allow injection. Fail closed (no silent normalization) per a strict
-  # identifier grammar: letters, digits and underscores only.
-  defp validate_prefix!(prefix) when is_binary(prefix) do
-    if prefix == "" or Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, prefix) do
-      :ok
-    else
+  defp normalize_otp_app!(other) do
+    Mix.raise("invalid --otp-app: expected an application name, got #{inspect(other)}")
+  end
+
+  defp otp_configured_schema_prefix(otp_app, key) do
+    case Application.get_env(otp_app, key, []) do
+      %AttestoPhoenix.Config{schema_prefix: prefix} = config ->
+        reject_malformed_prefix_keys!(config)
+        reject_legacy_table_prefix_config!(config)
+        normalize_configured_prefix(prefix)
+
+      opts when is_list(opts) ->
+        reject_legacy_table_prefix_config!(opts)
+        opts |> Keyword.get(:schema_prefix) |> normalize_configured_prefix()
+
+      opts when is_map(opts) ->
+        reject_malformed_prefix_keys!(opts)
+        reject_legacy_table_prefix_config!(opts)
+        opts |> Map.get(:schema_prefix) |> normalize_configured_prefix()
+
+      other ->
+        Mix.raise(
+          "invalid config #{inspect(key)} for #{inspect(otp_app)}: expected " <>
+            "a keyword list, map, or AttestoPhoenix.Config struct; got #{inspect(other)}"
+        )
+    end
+  end
+
+  defp reject_legacy_table_prefix_config!(opts) when is_map(opts) do
+    if Map.has_key?(opts, :table_prefix) do
       Mix.raise(
-        "invalid --table-prefix #{inspect(prefix)}: " <>
-          "expected an empty string or a lowercase identifier matching /[a-z_][a-z0-9_]*/"
+        "legacy :table_prefix configuration detected. Version 3.0 uses " <>
+          ":schema_prefix for a PostgreSQL schema; 2.x literal table-name " <>
+          "prefixes are incompatible. Rename the key and run the 3.0 migration " <>
+          "after inventorying and migrating the existing tables."
       )
     end
   end
 
-  defp validate_prefix!(other) do
-    Mix.raise("invalid table prefix #{inspect(other)}: expected a string")
+  defp reject_legacy_table_prefix_config!(opts) when is_list(opts) do
+    reject_malformed_prefix_keys!(opts)
+
+    if Keyword.has_key?(opts, :table_prefix) do
+      reject_legacy_table_prefix_config!(Map.new(opts))
+    end
+  end
+
+  defp reject_malformed_prefix_keys!(opts) when is_map(opts) do
+    cond do
+      Map.has_key?(opts, "schema_prefix") ->
+        Mix.raise(
+          "invalid config: string key \"schema_prefix\" is not supported; use " <>
+            "the atom key :schema_prefix in the host keyword list or map"
+        )
+
+      Map.has_key?(opts, "table_prefix") ->
+        Mix.raise(
+          "legacy config: string key \"table_prefix\" was removed in 3.0; " <>
+            "remove it and use the atom key :schema_prefix after the table cutover"
+        )
+
+      true ->
+        :ok
+    end
+  end
+
+  defp reject_malformed_prefix_keys!(opts) when is_list(opts) do
+    cond do
+      Enum.any?(opts, fn
+        {"schema_prefix", _value} -> true
+        _other -> false
+      end) ->
+        reject_malformed_prefix_keys!(Map.new(opts))
+
+      Enum.any?(opts, fn
+        {"table_prefix", _value} -> true
+        _other -> false
+      end) ->
+        reject_malformed_prefix_keys!(Map.new(opts))
+
+      true ->
+        :ok
+    end
+  end
+
+  defp reject_legacy_table_prefix_arg!(args) do
+    if Enum.any?(args, &legacy_table_prefix_arg?/1) do
+      Mix.raise(
+        "--table-prefix was removed in 3.0 because 2.x prefixed literal table " <>
+          "names. Use --schema-prefix for a PostgreSQL schema and migrate existing " <>
+          "tables before deploying."
+      )
+    end
+  end
+
+  defp reject_legacy_global_table_prefix! do
+    if Keyword.has_key?(Application.get_all_env(:attesto_phoenix), :table_prefix) do
+      Mix.raise(
+        "legacy config :attesto_phoenix, :table_prefix detected. Version 3.0 " <>
+          "uses :schema_prefix for a PostgreSQL schema; remove the old key and " <>
+          "complete the 3.0 table cutover before generating a migration."
+      )
+    end
+  end
+
+  defp legacy_table_prefix_arg?("--table-prefix"), do: true
+  defp legacy_table_prefix_arg?(arg) when is_binary(arg), do: String.starts_with?(arg, "--table-prefix=")
+  defp legacy_table_prefix_arg?(_arg), do: false
+
+  defp config_key(nil), do: @default_config_key
+  defp config_key(key) when is_binary(key), do: Module.concat([key])
+
+  defp normalize_configured_prefix(nil), do: nil
+  # Preserve an explicitly configured empty value so `validate_prefix!/1` can
+  # reject it just like `AttestoPhoenix.Config.new/1`; it is not equivalent to
+  # the neutral `nil` prefix.
+  defp normalize_configured_prefix(""), do: ""
+  defp normalize_configured_prefix(prefix) when is_binary(prefix), do: prefix
+
+  defp normalize_configured_prefix(other) do
+    Mix.raise(
+      "invalid configured :schema_prefix: expected nil or a lowercase PostgreSQL " <>
+        "schema identifier, got #{inspect(other)}"
+    )
+  end
+
+  defp reject_invalid_args!([], []), do: :ok
+
+  defp reject_invalid_args!(positional, invalid) do
+    Mix.raise(
+      "invalid migration-generator arguments; use --schema-prefix for a " <>
+        "PostgreSQL schema and --repo RepoModule. " <>
+        "Unexpected positional arguments: #{inspect(positional)}; invalid options: #{inspect(invalid)}"
+    )
+  end
+
+  # Prefixes are emitted into the migration source as Ecto schema options, so
+  # validate the same conservative
+  # PostgreSQL identifier accepted by AttestoPhoenix.Config. Fail closed (no
+  # silent normalization).
+  defp validate_prefix!(nil), do: :ok
+
+  defp validate_prefix!(prefix) when is_binary(prefix) do
+    cond do
+      prefix == "" ->
+        Mix.raise("invalid --schema-prefix: expected a non-empty lowercase PostgreSQL schema identifier")
+
+      byte_size(prefix) > @max_schema_prefix_bytes ->
+        Mix.raise("invalid --schema-prefix: expected at most 63 bytes")
+
+      prefix == "information_schema" or String.starts_with?(prefix, "pg_") ->
+        Mix.raise(
+          "invalid --schema-prefix: #{inspect(prefix)} is a reserved PostgreSQL " <>
+            "system schema; choose an application-owned schema"
+        )
+
+      Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, prefix) ->
+        :ok
+
+      true ->
+        Mix.raise("invalid --schema-prefix: expected a lowercase PostgreSQL schema identifier")
+    end
+  end
+
+  defp validate_prefix!(_other) do
+    Mix.raise("invalid --schema-prefix: expected nil or a lowercase PostgreSQL schema identifier")
   end
 
   defp generate_for_repo(repo, opts, prefix) do
@@ -270,21 +452,22 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     #   * AttestoPhoenix.Schema.ClientIdMetadata            -> "attesto_client_id_metadata"
     #   * AttestoPhoenix.Schema.ConsentGrant                -> "attesto_consent_grants"
     #
-    # The optional --table-prefix is the only thing the host may vary; the base
+    # The optional --schema-prefix is the only thing the host may vary; the base
     # names are not host-configurable because the schemas hardcode them.
     assigns = [
       module: migration_module(repo, base_name),
-      prefix: prefix,
-      authorization_codes: table_name(prefix, "attesto_authorization_codes"),
-      refresh_tokens: table_name(prefix, "attesto_refresh_tokens"),
-      device_codes: table_name(prefix, "attesto_device_codes"),
-      ciba_requests: table_name(prefix, "attesto_ciba_requests"),
-      logout_sessions: table_name(prefix, "attesto_logout_sessions"),
-      dpop_nonces: table_name(prefix, "dpop_nonces"),
-      dpop_replays: table_name(prefix, "dpop_replays"),
-      pushed_authorization_requests: table_name(prefix, "attesto_pushed_authorization_requests"),
-      client_id_metadata: table_name(prefix, "attesto_client_id_metadata"),
-      consent_grants: table_name(prefix, "attesto_consent_grants"),
+      prefix: normalize_configured_prefix(prefix),
+      authorization_codes: "attesto_authorization_codes",
+      refresh_tokens: "attesto_refresh_tokens",
+      refresh_family_revocations: "attesto_refresh_family_revocations",
+      device_codes: "attesto_device_codes",
+      ciba_requests: "attesto_ciba_requests",
+      logout_sessions: "attesto_logout_sessions",
+      dpop_nonces: "dpop_nonces",
+      dpop_replays: "dpop_replays",
+      pushed_authorization_requests: "attesto_pushed_authorization_requests",
+      client_id_metadata: "attesto_client_id_metadata",
+      consent_grants: "attesto_consent_grants",
       hash_size: @hash_column_size,
       jti_size: @jti_column_size,
       nonce_size: @nonce_column_size,
@@ -316,8 +499,6 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     Module.concat([repo, Migrations, Macro.camelize(base_name)])
   end
 
-  defp table_name(prefix, name), do: prefix <> name
-
   # UTC timestamp identifier, matching the format mix ecto.gen.migration uses so
   # the generated file sorts correctly against hand-written migrations.
   defp timestamp do
@@ -342,13 +523,22 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     use Ecto.Migration
 
     def up do
+      prefix = <%= inspect @prefix %>
+
+      # A non-default runtime prefix is a PostgreSQL schema, not a table-name
+      # fragment. Create it if needed, but leave it in place on rollback: it
+      # may be shared by other application tables or migrations.
+      <%= if @prefix do %>
+      execute(~s|CREATE SCHEMA IF NOT EXISTS "\#{prefix}"|)
+      <% end %>
+
       # Authorization code grant store (RFC 6749, section 4.1), backing
       # AttestoPhoenix.Schema.Authorization / AttestoPhoenix.Store.EctoCodeStore.
       # One row per issued code. Only the hash of the code is stored (RFC 6749,
       # section 10.3); the unique index on it is the single-use lookup key
       # (EctoCodeStore.take/1 deletes by code_hash). The schema declares
       # `@primary_key false` and keys on :code_hash, so there is no surrogate id.
-      create table(:<%= @authorization_codes %>, primary_key: false) do
+      create table(:<%= @authorization_codes %>, primary_key: false, prefix: prefix) do
         add :code_hash, :string, size: <%= @hash_size %>, null: false
         add :client_id, :string, size: <%= @identifier_size %>, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
@@ -389,11 +579,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Single-use redemption is enforced at the database: the code hash is
       # globally unique. The default index name attesto_authorization_codes_code_hash_index
       # matches the schema's unique_constraint(:code_hash, name: ...).
-      create unique_index(:<%= @authorization_codes %>, [:code_hash])
+      create unique_index(:<%= @authorization_codes %>, [:code_hash], prefix: prefix)
       # Expiry sweeps scan by expiry (AttestoPhoenix.Store.Sweeper).
-      create index(:<%= @authorization_codes %>, [:expires_at])
-      create index(:<%= @authorization_codes %>, [:family_id])
-      create index(:<%= @authorization_codes %>, [:access_token_jti])
+      create index(:<%= @authorization_codes %>, [:expires_at], prefix: prefix)
+      create index(:<%= @authorization_codes %>, [:family_id], prefix: prefix)
+      create index(:<%= @authorization_codes %>, [:access_token_jti], prefix: prefix)
 
       # Refresh token store (RFC 6749, section 6), backing
       # AttestoPhoenix.Schema.RefreshToken / AttestoPhoenix.Store.EctoRefreshStore.
@@ -401,7 +591,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # issues a new row in the same family; presenting a consumed token revokes
       # the family. consumed/family_revoked are the booleans the atomic claim and
       # sticky revocation flip.
-      create table(:<%= @refresh_tokens %>, primary_key: false) do
+      create table(:<%= @refresh_tokens %>, primary_key: false, prefix: prefix) do
         add :id, :binary_id, primary_key: true
         add :token_hash, :string, size: <%= @hash_size %>, null: false
         add :family_id, :string, size: <%= @identifier_size %>, null: false
@@ -442,10 +632,28 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Token presentation looks up by hash; it must be unique to keep lookup and
       # rotation atomic. The default index name attesto_refresh_tokens_token_hash_index
       # matches the schema's unique_constraint(:token_hash, name: ...).
-      create unique_index(:<%= @refresh_tokens %>, [:token_hash])
+      create unique_index(:<%= @refresh_tokens %>, [:token_hash], prefix: prefix)
+      # One generation per family prevents a concurrent or corrupted rotation
+      # from creating two sibling successors.
+      # Keep this name aligned with Schema.RefreshToken's unique_constraint/3.
+      create unique_index(
+        :<%= @refresh_tokens %>,
+        [:family_id, :generation],
+        name: :attesto_refresh_tokens_family_id_generation_index,
+        prefix: prefix
+      )
       # Family-wide revocation scans by family_id.
-      create index(:<%= @refresh_tokens %>, [:family_id])
-      create index(:<%= @refresh_tokens %>, [:expires_at])
+      create index(:<%= @refresh_tokens %>, [:family_id], prefix: prefix)
+      create index(:<%= @refresh_tokens %>, [:expires_at], prefix: prefix)
+
+      # Durable family revocation tombstones. This table is deliberately
+      # separate from refresh-token rows because the sweeper may delete every
+      # expired row in a family. The primary key makes revoke idempotent and
+      # keeps marker lookups/insert checks cheap.
+      create table(:<%= @refresh_family_revocations %>, primary_key: false, prefix: prefix) do
+        add :family_id, :string, size: <%= @identifier_size %>, primary_key: true, null: false
+        add :revoked_at, :utc_datetime, null: false
+      end
 
       # Device authorization grant (RFC 8628), backing
       # AttestoPhoenix.Schema.DeviceCode / AttestoPhoenix.Store.EctoDeviceCodeStore.
@@ -453,7 +661,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # consumed; each transition is one guarded atomic UPDATE in the store. Only
       # the device_code hash is stored; user_code is the normalized verification
       # key. last_polled_at enforces the section 3.5 minimum poll interval.
-      create table(:<%= @device_codes %>, primary_key: false) do
+      create table(:<%= @device_codes %>, primary_key: false, prefix: prefix) do
         add :id, :binary_id, primary_key: true
         add :device_code_hash, :string, size: <%= @hash_size %>, null: false
         add :user_code, :string, size: <%= @identifier_size %>, null: false
@@ -479,9 +687,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
       # The device polls by device_code_hash and the verification page resolves by
       # user_code; both are unique single-use lookup keys.
-      create unique_index(:<%= @device_codes %>, [:device_code_hash])
-      create unique_index(:<%= @device_codes %>, [:user_code])
-      create index(:<%= @device_codes %>, [:expires_at])
+      create unique_index(:<%= @device_codes %>, [:device_code_hash], prefix: prefix)
+      create unique_index(:<%= @device_codes %>, [:user_code], prefix: prefix)
+      create index(:<%= @device_codes %>, [:expires_at], prefix: prefix)
 
       # OpenID Connect CIBA authentication requests (CIBA Core 1.0), backing
       # AttestoPhoenix.Schema.CIBARequest / AttestoPhoenix.Store.EctoCIBAStore. A
@@ -489,7 +697,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # consumed; each transition is one guarded atomic UPDATE in the store. Only
       # the auth_req_id hash is stored. The §7.3 poll interval is frozen into the
       # `interval` column at issue (it is the value the client was told).
-      create table(:<%= @ciba_requests %>, primary_key: false) do
+      create table(:<%= @ciba_requests %>, primary_key: false, prefix: prefix) do
         add :id, :binary_id, primary_key: true
         add :auth_req_id_hash, :string, size: <%= @hash_size %>, null: false
         add :client_id, :string, size: <%= @identifier_size %>, null: false
@@ -527,8 +735,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       end
 
       # The token endpoint redeems by auth_req_id_hash (the single-use poll key).
-      create unique_index(:<%= @ciba_requests %>, [:auth_req_id_hash])
-      create index(:<%= @ciba_requests %>, [:expires_at])
+      create unique_index(:<%= @ciba_requests %>, [:auth_req_id_hash], prefix: prefix)
+      create index(:<%= @ciba_requests %>, [:expires_at], prefix: prefix)
 
       # Logout session store (OpenID Connect Back-Channel Logout 1.0 +
       # Front-Channel Logout 1.0), backing AttestoPhoenix.Schema.LogoutSession /
@@ -538,7 +746,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # frontchannel_logout_uri in an iframe (front-channel); at least one of the
       # two URIs is present. Upserted on (sid, client_id); read by sid
       # (session-scoped logout) or subject (all the subject's sessions).
-      create table(:<%= @logout_sessions %>, primary_key: false) do
+      create table(:<%= @logout_sessions %>, primary_key: false, prefix: prefix) do
         add :id, :binary_id, primary_key: true
         add :sid, :string, size: <%= @identifier_size %>, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
@@ -560,16 +768,16 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # refreshes the row rather than duplicating it. The default index name
       # attesto_logout_sessions_sid_client_id_index matches the schema's
       # unique_constraint([:sid, :client_id], name: ...).
-      create unique_index(:<%= @logout_sessions %>, [:sid, :client_id])
+      create unique_index(:<%= @logout_sessions %>, [:sid, :client_id], prefix: prefix)
       # Fan-out reads by sid or subject; sweeps scan by expires_at.
-      create index(:<%= @logout_sessions %>, [:subject])
-      create index(:<%= @logout_sessions %>, [:expires_at])
+      create index(:<%= @logout_sessions %>, [:subject], prefix: prefix)
+      create index(:<%= @logout_sessions %>, [:expires_at], prefix: prefix)
 
       # Server-issued DPoP nonces (RFC 9449, section 8), backing
       # AttestoPhoenix.Schema.DPoPNonce / AttestoPhoenix.Store.EctoNonceStore.
       # Each nonce is single-use: issued_at + the consume cutoff bound freshness,
       # and used_at (NULL while unused) is stamped exactly once.
-      create table(:<%= @dpop_nonces %>, primary_key: false) do
+      create table(:<%= @dpop_nonces %>, primary_key: false, prefix: prefix) do
         add :id, :binary_id, primary_key: true
         add :nonce, :string, size: <%= @nonce_size %>, null: false
         add :issued_at, :utc_datetime, null: false
@@ -579,11 +787,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
       # The default index name dpop_nonces_nonce_index matches the schema's
       # unique_constraint(:nonce) (which uses Ecto's default name).
-      create unique_index(:<%= @dpop_nonces %>, [:nonce])
+      create unique_index(:<%= @dpop_nonces %>, [:nonce], prefix: prefix)
       # Partial index over still-unused rows keeps the conditional consume fast.
       create index(:<%= @dpop_nonces %>, [:used_at],
                where: "used_at IS NULL",
-               name: :<%= @dpop_nonces %>_unused_index
+               name: :<%= @dpop_nonces %>_unused_index,
+               prefix: prefix
              )
 
       # DPoP proof replay cache (RFC 9449, section 11.1), backing
@@ -592,14 +801,14 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # PRIMARY KEY, so the atomic record-and-check is INSERT ... ON CONFLICT DO
       # NOTHING and the conflicting constraint is the primary key dpop_replays_pkey
       # the schema's unique_constraint(:jti, name: :dpop_replays_pkey) names.
-      create table(:<%= @dpop_replays %>, primary_key: false) do
+      create table(:<%= @dpop_replays %>, primary_key: false, prefix: prefix) do
         add :jti, :string, size: <%= @jti_size %>, primary_key: true, null: false
         add :expires_at, :utc_datetime_usec, null: false
         add :inserted_at, :utc_datetime_usec, null: false
       end
 
       # Expiry sweeps scan by expires_at; replay decisions hit the primary key.
-      create index(:<%= @dpop_replays %>, [:expires_at])
+      create index(:<%= @dpop_replays %>, [:expires_at], prefix: prefix)
 
       # Pushed Authorization Request store (RFC 9126), backing
       # AttestoPhoenix.Schema.PushedAuthorizationRequest /
@@ -608,7 +817,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # take/1 = DELETE ... RETURNING) hits the primary key. The stored, validated
       # request params live in a jsonb column; expires_at bounds the reference's
       # life (RFC 9126 section 2.2) and is re-checked on read.
-      create table(:<%= @pushed_authorization_requests %>, primary_key: false) do
+      create table(:<%= @pushed_authorization_requests %>, primary_key: false, prefix: prefix) do
         add :request_uri, :string, size: <%= @identifier_size %>, primary_key: true, null: false
         add :params, :map, null: false
         add :expires_at, :utc_datetime, null: false
@@ -616,7 +825,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       end
 
       # Expiry sweeps scan by expires_at; resolution hits the primary key.
-      create index(:<%= @pushed_authorization_requests %>, [:expires_at])
+      create index(:<%= @pushed_authorization_requests %>, [:expires_at], prefix: prefix)
 
       # Client ID Metadata Document cache
       # (draft-ietf-oauth-client-id-metadata-document-01), backing
@@ -627,7 +836,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # metadata column; expires_at is the freshness derived from the response's
       # Cache-Control/Expires (RFC 9111), re-checked on read and indexed for
       # sweeps. Only validated documents are ever written here.
-      create table(:<%= @client_id_metadata %>, primary_key: false) do
+      create table(:<%= @client_id_metadata %>, primary_key: false, prefix: prefix) do
         add :url, :string, size: <%= @identifier_size %>, primary_key: true, null: false
         add :metadata, :map, null: false
         add :expires_at, :utc_datetime, null: false
@@ -635,7 +844,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       end
 
       # Expiry sweeps scan by expires_at; lookups hit the primary key.
-      create index(:<%= @client_id_metadata %>, [:expires_at])
+      create index(:<%= @client_id_metadata %>, [:expires_at], prefix: prefix)
 
       # Single-use, request-bound consent grants (RFC 6749 section 4.1.1),
       # backing AttestoPhoenix.Schema.ConsentGrant /
@@ -646,7 +855,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # use; expires_at bounds the short consent window and is re-checked on
       # consume. The default index name attesto_consent_grants_pkey matches the
       # schema's unique_constraint(:token, name: :attesto_consent_grants_pkey).
-      create table(:<%= @consent_grants %>, primary_key: false) do
+      create table(:<%= @consent_grants %>, primary_key: false, prefix: prefix) do
         add :token, :string, size: <%= @identifier_size %>, primary_key: true, null: false
         add :binding_hash, :string, size: <%= @hash_size %>, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
@@ -657,20 +866,22 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       end
 
       # Expiry sweeps scan by expires_at; consume hits the primary key.
-      create index(:<%= @consent_grants %>, [:expires_at])
+      create index(:<%= @consent_grants %>, [:expires_at], prefix: prefix)
     end
 
     def down do
-      drop table(:<%= @consent_grants %>)
-      drop table(:<%= @client_id_metadata %>)
-      drop table(:<%= @pushed_authorization_requests %>)
-      drop table(:<%= @dpop_replays %>)
-      drop table(:<%= @dpop_nonces %>)
-      drop table(:<%= @logout_sessions %>)
-      drop table(:<%= @ciba_requests %>)
-      drop table(:<%= @device_codes %>)
-      drop table(:<%= @refresh_tokens %>)
-      drop table(:<%= @authorization_codes %>)
+      prefix = <%= inspect @prefix %>
+      drop table(:<%= @consent_grants %>, prefix: prefix)
+      drop table(:<%= @client_id_metadata %>, prefix: prefix)
+      drop table(:<%= @pushed_authorization_requests %>, prefix: prefix)
+      drop table(:<%= @dpop_replays %>, prefix: prefix)
+      drop table(:<%= @dpop_nonces %>, prefix: prefix)
+      drop table(:<%= @logout_sessions %>, prefix: prefix)
+      drop table(:<%= @ciba_requests %>, prefix: prefix)
+      drop table(:<%= @device_codes %>, prefix: prefix)
+      drop table(:<%= @refresh_family_revocations %>, prefix: prefix)
+      drop table(:<%= @refresh_tokens %>, prefix: prefix)
+      drop table(:<%= @authorization_codes %>, prefix: prefix)
     end
   end
   """)

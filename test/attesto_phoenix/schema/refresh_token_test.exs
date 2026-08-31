@@ -4,6 +4,7 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
   alias AttestoPhoenix.Schema.RefreshToken
 
   @cnf_jkt "jkt"
+  @dpop_jkt Attesto.Secret.hash("thumb-xyz")
 
   defp base_attrs(overrides \\ %{}) do
     Map.merge(
@@ -43,14 +44,41 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
       assert Ecto.Changeset.get_field(changeset, :claims) == %{}
     end
 
-    test "deduplicates scope" do
+    test "preserves duplicate scope members" do
       changeset =
         RefreshToken.insert_changeset(
           %RefreshToken{},
           base_attrs(%{scope: ["read", "read", "write"]})
         )
 
-      assert Ecto.Changeset.get_change(changeset, :scope) == ["read", "write"]
+      assert Ecto.Changeset.get_change(changeset, :scope) == ["read", "read", "write"]
+    end
+
+    test "rejects claims that are not recursively JSONB-round-trippable" do
+      for claims <- [
+            %{"nested" => %{atom_key: "rejected"}},
+            %{"nested" => [%{1 => "rejected"}]},
+            %{"decimal" => Decimal.new("1.25")},
+            %{"tuple" => {:rejected, 1}}
+          ] do
+        changeset = RefreshToken.insert_changeset(%RefreshToken{}, base_attrs(%{claims: claims}))
+        refute changeset.valid?
+        assert %{claims: [_]} = errors_on(changeset)
+      end
+    end
+
+    test "preserves nested portable JSON claims exactly" do
+      claims = %{
+        "nested" => %{
+          "values" => [nil, true, 42, %{"leaf" => "value"}]
+        }
+      }
+
+      changeset = RefreshToken.insert_changeset(%RefreshToken{}, base_attrs(%{claims: claims}))
+      assert changeset.valid?
+
+      row = Ecto.Changeset.apply_changes(changeset)
+      assert RefreshToken.to_store_record(row).data.claims == claims
     end
 
     test "refuses a record that starts consumed (RFC 6749 §6)" do
@@ -86,6 +114,9 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
         data: %{
           subject: "subject-1",
           scope: ["read"],
+          resource: [],
+          acr: nil,
+          auth_time: nil,
           client_id: "client-1",
           dpop_jkt: nil,
           claims: %{"k" => "v"}
@@ -116,13 +147,22 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
         token_hash: "hash-abc",
         family_id: "fam-1",
         generation: 0,
-        data: %{subject: "subject-1", scope: [], dpop_jkt: "thumb-xyz", claims: %{}},
+        data: %{
+          subject: "subject-1",
+          scope: [],
+          resource: [],
+          acr: nil,
+          auth_time: nil,
+          client_id: nil,
+          dpop_jkt: @dpop_jkt,
+          claims: %{}
+        },
         expires_at: 1_900_000_000,
         consumed: false
       }
 
       attrs = RefreshToken.from_store_record(record)
-      assert attrs.cnf == %{@cnf_jkt => "thumb-xyz"}
+      assert attrs.cnf == %{@cnf_jkt => @dpop_jkt}
     end
 
     test "carries parent_hash from opts" do
@@ -130,7 +170,16 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
         token_hash: "hash-child",
         family_id: "fam-1",
         generation: 1,
-        data: %{subject: "subject-1", scope: [], claims: %{}},
+        data: %{
+          subject: "subject-1",
+          scope: [],
+          resource: [],
+          acr: nil,
+          auth_time: nil,
+          client_id: nil,
+          dpop_jkt: nil,
+          claims: %{}
+        },
         expires_at: 1_900_000_000,
         consumed: false
       }
@@ -185,17 +234,17 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
         family_id: "fam-1",
         subject: "subject-1",
         scope: [],
-        cnf: %{@cnf_jkt => "thumb-xyz"},
+        cnf: %{@cnf_jkt => @dpop_jkt},
         claims: %{},
         consumed: false,
         expires_at: ~U[2030-01-01 00:00:00Z]
       }
 
       record = RefreshToken.to_store_record(row)
-      assert record.data.dpop_jkt == "thumb-xyz"
+      assert record.data.dpop_jkt == @dpop_jkt
     end
 
-    test "normalizes persisted successor keys back to the core contract shape" do
+    test "never recovers a persisted plaintext successor map" do
       row = %RefreshToken{
         token_hash: "hash-parent",
         family_id: "fam-1",
@@ -211,8 +260,11 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
           "context" => %{
             "subject" => "subject-1",
             "scope" => ["read"],
+            "resource" => [],
+            "acr" => nil,
+            "auth_time" => nil,
             "client_id" => "client-1",
-            "dpop_jkt" => "thumb-xyz",
+            "dpop_jkt" => @dpop_jkt,
             "claims" => %{"tenant" => "t1"}
           }
         },
@@ -223,20 +275,24 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
 
       assert record.consumed_at == DateTime.to_unix(~U[2030-01-01 00:00:00Z], :second)
 
-      assert record.successor == %{
-               token: "successor-plaintext",
-               generation: 1,
-               context: %{
-                 subject: "subject-1",
-                 scope: ["read"],
-                 resource: [],
-                 acr: nil,
-                 auth_time: nil,
-                 client_id: "client-1",
-                 dpop_jkt: "thumb-xyz",
-                 claims: %{"tenant" => "t1"}
-               }
-             }
+      assert record.successor == nil
+
+      atom_keyed = %{
+        token: "successor-plaintext",
+        generation: 1,
+        context: %{
+          subject: "subject-1",
+          scope: ["read"],
+          resource: [],
+          acr: nil,
+          auth_time: nil,
+          client_id: "client-1",
+          dpop_jkt: @dpop_jkt,
+          claims: %{"tenant" => "t1"}
+        }
+      }
+
+      assert RefreshToken.to_store_record(%{row | successor: atom_keyed}).successor == nil
     end
   end
 
@@ -253,7 +309,7 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
           acr: "phr",
           auth_time: 1_700_000_000,
           client_id: "client-1",
-          dpop_jkt: "thumb-xyz",
+          dpop_jkt: @dpop_jkt,
           claims: %{"tenant" => "t1"}
         },
         expires_at: 1_900_000_000,
@@ -280,6 +336,162 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
       assert rebuilt.expires_at == original.expires_at
       assert rebuilt.data == original.data
     end
+  end
+
+  describe "canonical bridge hardening" do
+    test "rejects missing and extra context members before projection" do
+      record = canonical_record()
+
+      for key <- Map.keys(record.data) do
+        assert_raise ArgumentError, "refresh token record violates the canonical store contract", fn ->
+          RefreshToken.from_store_record(%{record | data: Map.delete(record.data, key)})
+        end
+      end
+
+      assert_raise ArgumentError, "refresh token record violates the canonical store contract", fn ->
+        RefreshToken.from_store_record(%{record | data: Map.put(record.data, :unexpected, "redacted")})
+      end
+    end
+
+    test "rejects malformed present values without embedding them in diagnostics" do
+      invalid_values = [
+        {:subject, ""},
+        {:scope, nil},
+        {:scope, ["read", :not_a_scope]},
+        {:resource, nil},
+        {:resource, [""]},
+        {:client_id, ""},
+        {:dpop_jkt, "not-a-thumbprint"},
+        {:acr, ""},
+        {:auth_time, -1},
+        {:claims, nil}
+      ]
+
+      for {key, value} <- invalid_values do
+        record = %{canonical_record() | data: Map.put(canonical_record().data, key, value)}
+
+        error =
+          assert_raise ArgumentError, "refresh token record violates the canonical store contract", fn ->
+            RefreshToken.from_store_record(record)
+          end
+
+        refute Exception.message(error) =~ "not_a_scope"
+      end
+    end
+
+    test "does not turn malformed persisted cnf into an unbound token" do
+      row = %RefreshToken{
+        token_hash: "hash-cnf",
+        family_id: "fam-cnf",
+        generation: 0,
+        subject: "subject-1",
+        scope: [],
+        resource: [],
+        claims: %{},
+        consumed: false,
+        expires_at: ~U[2030-01-01 00:00:00Z]
+      }
+
+      for cnf <- [
+            %{"jkt" => "not-a-thumbprint"},
+            %{"jkt" => @dpop_jkt, "x5t#S256" => "unsupported"},
+            %{"x5t#S256" => @dpop_jkt},
+            %{jkt: "not-a-thumbprint"},
+            "malformed-cnf"
+          ] do
+        record = RefreshToken.to_store_record(%{row | cnf: cnf})
+        refute is_nil(record.data.dpop_jkt)
+        refute RefreshToken.valid_context?(record.data)
+      end
+    end
+
+    test "does not default malformed persisted canonical columns" do
+      row = %{base_row() | generation: nil, scope: nil, resource: nil, claims: nil}
+
+      record = RefreshToken.to_store_record(row)
+
+      assert record.generation == nil
+      assert record.data.scope == nil
+      assert record.data.resource == nil
+      assert record.data.claims == nil
+      refute RefreshToken.valid_context?(record.data)
+    end
+
+    test "accepts both JSON and atom keyed jkt confirmations only when canonical" do
+      for cnf <- [%{"jkt" => @dpop_jkt}, %{jkt: @dpop_jkt}] do
+        row = %RefreshToken{
+          token_hash: "hash-cnf-compat",
+          family_id: "fam-cnf-compat",
+          generation: 0,
+          subject: "subject-1",
+          scope: [],
+          resource: [],
+          cnf: cnf,
+          claims: %{},
+          consumed: false,
+          expires_at: ~U[2030-01-01 00:00:00Z]
+        }
+
+        assert RefreshToken.to_store_record(row).data.dpop_jkt == @dpop_jkt
+      end
+    end
+
+    test "rejects successor contexts with missing or extra members instead of defaulting them" do
+      base = canonical_record()
+
+      successor = %{
+        "token" => "successor-plaintext",
+        "generation" => 1,
+        "context" => base.data
+      }
+
+      for context <- [
+            Map.delete(base.data, :resource),
+            Map.put(base.data, :unexpected, "redacted")
+          ] do
+        row = Map.put(base_row(), :successor, %{successor | "context" => stringify(context)})
+        assert RefreshToken.to_store_record(row).successor == nil
+      end
+    end
+  end
+
+  defp canonical_record do
+    %{
+      token_hash: "hash-canonical",
+      family_id: "fam-canonical",
+      generation: 0,
+      data: %{
+        subject: "subject-1",
+        scope: ["read", "read"],
+        resource: [],
+        acr: nil,
+        auth_time: nil,
+        client_id: nil,
+        dpop_jkt: nil,
+        claims: %{}
+      },
+      expires_at: 1_900_000_000,
+      consumed: false
+    }
+  end
+
+  defp base_row do
+    %RefreshToken{
+      token_hash: "hash-parent",
+      family_id: "fam-canonical",
+      generation: 0,
+      subject: "subject-1",
+      scope: ["read", "read"],
+      resource: [],
+      claims: %{},
+      consumed: true,
+      consumed_at: ~U[2030-01-01 00:00:00Z],
+      expires_at: ~U[2030-01-01 00:00:00Z]
+    }
+  end
+
+  defp stringify(map) do
+    Map.new(map, fn {key, value} -> {Atom.to_string(key), value} end)
   end
 
   defp errors_on(changeset) do

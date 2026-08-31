@@ -9,7 +9,9 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
   which `AttestoPhoenix.DataCase` points at the sandboxed test repo.
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
+
+  import ExUnit.CaptureLog
 
   alias AttestoPhoenix.Schema.PushedAuthorizationRequest
   alias AttestoPhoenix.Store.EctoPARStore
@@ -23,7 +25,7 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
     "response_type" => "code",
     "scope" => "openid profile",
     "redirect_uri" => "https://rp.example/cb",
-    "dpop_jkt" => "thumbprint-xyz"
+    "dpop_jkt" => "request-parameter-secret"
   }
 
   test "put then fetch round-trips the params verbatim (string-keyed jsonb)" do
@@ -85,5 +87,27 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
     assert {:error, _changeset} = EctoPARStore.put(@request_uri, %{"client_id" => "other"}, 90)
     # The original reference is intact.
     assert {:ok, %{"client_id" => "client-1"}} = EctoPARStore.fetch(@request_uri)
+  end
+
+  test "query telemetry is suppressed for request_uri writes, reads, and deletes" do
+    capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+    on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+    {_id, ref} = capture
+
+    assert is_integer(TestRepo.aggregate(PushedAuthorizationRequest, :count, :request_uri))
+    assert AttestoPhoenix.TestTelemetryCapture.collect(ref) != []
+
+    log =
+      capture_log([level: :debug], fn ->
+        assert :ok = EctoPARStore.put(@request_uri, @params, 90)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, _} = EctoPARStore.fetch(@request_uri)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, _} = EctoPARStore.take(@request_uri)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+      end)
+
+    refute log =~ @request_uri
+    refute log =~ @params["dpop_jkt"]
   end
 end

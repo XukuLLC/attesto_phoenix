@@ -20,8 +20,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   The plaintext code is never persisted; the primary key is the
   `Attesto.Secret.hash/1` digest of the code. The column layout and the
-  record bridge live in `AttestoPhoenix.Schema.Authorization`; this module
-  only owns the two atomic database operations.
+  record bridge live in `AttestoPhoenix.Schema.Authorization`; the bridge
+  emits core's canonical authorization-code data map, with `S256` implicit and
+  the OIDC `nonce` inside `claims`. This module owns the atomic code operations
+  and the optional access-token linkage used
+  by replay containment. Refresh-flow linkage is selected by code hash before
+  the core binds the row to its newly issued refresh family.
 
   The repository module is supplied by the host application (`:repo` under
   the `:attesto_phoenix` app) and is read at call time. A store with no
@@ -43,7 +47,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   the opaque grant `:data`, and an integer `:expires_at` in unix seconds.
   `AttestoPhoenix.Schema.Authorization.from_record/1` spreads it across the
   row's columns and validates it fail-closed (missing required field or a
-  non-`S256` PKCE method is rejected, not defaulted).
+  non-`S256` PKCE method is rejected, not defaulted). The record returned by
+  `take/1` contains core's canonical data keys only; database compatibility
+  columns for the PKCE method and legacy top-level nonce are not emitted.
 
   The hash is the primary key, so a duplicate insert is a caller bug:
   `Attesto.AuthorizationCode` derives the hash from freshly generated random
@@ -56,9 +62,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec put(Attesto.CodeStore.entry()) :: :ok
   def put(%{code_hash: code_hash, data: data, expires_at: expires_at} = record)
       when is_binary(code_hash) and is_map(data) and is_integer(expires_at) do
+    prefix = Config.table_prefix()
+
     record
-    |> Authorization.from_record()
-    |> repo().insert!()
+    |> Authorization.from_record(prefix: prefix)
+    |> repo().insert!(prefix: prefix)
 
     :ok
   end
@@ -73,7 +81,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   so the single-use contract of `Attesto.CodeStore` holds against concurrent
   redemptions.
 
-  The loaded row is folded back into the `:code_hash` / `:data` /
+  The loaded row is folded back into the `:code_hash` / canonical `:data` /
   `:expires_at` (unix seconds) map via
   `AttestoPhoenix.Schema.Authorization.to_record/1`. Expiry is not checked
   here: `Attesto.AuthorizationCode` re-checks `:expires_at` after `take/1`,
@@ -84,6 +92,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec take(Attesto.CodeStore.code_hash()) ::
           {:ok, Attesto.CodeStore.entry()} | :error | {:error, :consumed, Attesto.CodeStore.consumed_meta()}
   def take(code_hash) when is_binary(code_hash) do
+    prefix = Config.table_prefix()
     consumed_at = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -91,9 +100,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().update_all(query, set: [consumed_at: consumed_at]) do
+    case repo().update_all(query, [set: [consumed_at: consumed_at]], prefix: prefix) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
-      {0, _} -> consumed_or_missing(code_hash)
+      {0, _} -> consumed_or_missing(code_hash, prefix)
     end
   end
 
@@ -108,12 +117,14 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @impl Attesto.CodeStore
   @spec get(Attesto.CodeStore.code_hash()) :: {:ok, Attesto.CodeStore.entry()} | :error
   def get(code_hash) when is_binary(code_hash) do
+    prefix = Config.table_prefix()
+
     query =
       from a in Authorization,
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().one(query) do
+    case repo().one(query, prefix: prefix) do
       nil -> :error
       row -> {:ok, Authorization.to_record(row)}
     end
@@ -125,47 +136,153 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   `Attesto.AuthorizationCode.redeem/4` calls this after every validation step
   has passed. A later `take/1` for the same hash can then surface
   `{:error, :consumed, meta}` instead of treating the replay as an unknown code.
+  When the core's `issue_refresh_and_finalize/6` composition supplies the
+  family actually issued, this update binds that family to the consumed
+  authorization row atomically with the success marker. That lets access-token
+  revocation index the minted token under the same family used by replay
+  containment without accepting a caller-supplied family identifier.
   """
   @impl Attesto.CodeStore
   @spec mark_consumed(Attesto.CodeStore.code_hash(), Attesto.CodeStore.consumed_meta()) :: :ok
-  def mark_consumed(code_hash, _meta) when is_binary(code_hash) do
+  def mark_consumed(code_hash, %{family_id: family_id})
+      when is_binary(code_hash) and is_binary(family_id) and family_id != "" do
+    mark_consumed_row(code_hash, family_id: family_id)
+  end
+
+  def mark_consumed(code_hash, %{family_id: nil}) when is_binary(code_hash) do
+    # `nil` is an explicit no-refresh marker. Clear any authorization-code
+    # provenance family so replay containment cannot mistake it for a refresh
+    # family during a later redemption.
+    mark_consumed_row(code_hash, family_id: nil)
+  end
+
+  def mark_consumed(code_hash, %{}) when is_binary(code_hash) do
+    mark_consumed_row(code_hash, family_id: nil)
+  end
+
+  def mark_consumed(_code_hash, _invalid_meta) do
+    raise ArgumentError, "#{inspect(__MODULE__)}.mark_consumed/2 received invalid consumed metadata"
+  end
+
+  defp mark_consumed_row(code_hash, family_updates) when is_binary(code_hash) and is_list(family_updates) do
+    prefix = Config.table_prefix()
     query = from a in Authorization, where: a.code_hash == ^code_hash
-    repo().update_all(query, set: [consumed_success: true])
-    :ok
+    updates = [consumed_success: true] ++ family_updates
+
+    query
+    |> repo().update_all([set: updates], prefix: prefix)
+    |> expect_one_updated!(:mark_consumed)
   end
 
   @doc false
   @spec record_access_token(String.t(), String.t(), integer()) :: :ok
   def record_access_token(family_id, jti, expires_at)
       when is_binary(family_id) and is_binary(jti) and is_integer(expires_at) do
+    prefix = Config.table_prefix()
     query = from a in Authorization, where: a.family_id == ^family_id
 
-    repo().update_all(query,
-      set: [
-        access_token_jti: jti,
-        access_token_expires_at: DateTime.from_unix!(expires_at)
-      ]
-    )
+    record_access_token_row(query, jti, expires_at, prefix)
+  end
 
-    :ok
+  # Records a minted access token against the authorization row for `code_hash`.
+  # This form is used before initial refresh issuance finalizes the code, when
+  # the family returned by RefreshToken.issue/3 is not known yet. The code hash
+  # selects the exact consumed row; finalization then binds its family ID.
+  @doc false
+  @spec record_access_token_for_code(String.t(), String.t(), integer()) :: :ok
+  def record_access_token_for_code(code_hash, jti, expires_at)
+      when is_binary(code_hash) and code_hash != "" and is_binary(jti) and is_integer(expires_at) do
+    prefix = Config.table_prefix()
+    query = from a in Authorization, where: a.code_hash == ^code_hash
+
+    record_access_token_row(query, jti, expires_at, prefix)
+  end
+
+  defp record_access_token_row(query, jti, expires_at, prefix) do
+    expect_one_updated!(
+      repo().update_all(
+        query,
+        [
+          set: [
+            access_token_jti: jti,
+            access_token_expires_at: DateTime.from_unix!(expires_at)
+          ]
+        ],
+        prefix: prefix
+      ),
+      :record_access_token
+    )
   end
 
   @doc false
   @spec revoke_family_access_tokens(String.t()) :: :ok
   def revoke_family_access_tokens(family_id) when is_binary(family_id) do
+    prefix = Config.table_prefix()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
       from a in Authorization,
         where: a.family_id == ^family_id and not is_nil(a.access_token_jti)
 
-    repo().update_all(query, set: [access_token_revoked_at: now])
+    repo().update_all(query, [set: [access_token_revoked_at: now]], prefix: prefix)
     :ok
+  end
+
+  @doc false
+  @spec revoke_access_token_for_code(String.t()) :: :ok
+  def revoke_access_token_for_code(code_hash) when is_binary(code_hash) and code_hash != "" do
+    prefix = Config.table_prefix()
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    # 2.14.x consumed-code rows can predate access-token linkage. Replay
+    # containment is deliberately idempotent for those rows: there is no token
+    # to revoke, and requiring an UPDATE count of one would turn an ordinary
+    # invalid_grant into a 500. Update first so a concurrent sweeper cannot
+    # delete a row between a read and the security-critical revocation.
+    query =
+      from a in Authorization,
+        where:
+          a.code_hash == ^code_hash and not is_nil(a.access_token_jti) and
+            a.access_token_jti != ^""
+
+    case repo().update_all(query, [set: [access_token_revoked_at: now]], prefix: prefix) do
+      {1, _rows} ->
+        :ok
+
+      {0, _rows} ->
+        # A zero count is safe only for an absent row or the legacy nil-JTI
+        # record. If a linked row remains, fail closed instead of claiming that
+        # its access token was revoked.
+        legacy_or_missing_revoke(code_hash, prefix)
+
+      _unexpected_count ->
+        raise RuntimeError,
+              "#{inspect(__MODULE__)}.revoke_access_token_for_code failed to update exactly one authorization record"
+    end
+  end
+
+  defp legacy_or_missing_revoke(code_hash, prefix) do
+    case repo().get_by(Authorization, [code_hash: code_hash], prefix: prefix) do
+      nil ->
+        :ok
+
+      %Authorization{access_token_jti: nil} ->
+        :ok
+
+      %Authorization{access_token_jti: jti} when is_binary(jti) and jti != "" ->
+        raise RuntimeError,
+              "#{inspect(__MODULE__)}.revoke_access_token_for_code failed to update exactly one authorization record"
+
+      _malformed_row ->
+        raise RuntimeError,
+              "#{inspect(__MODULE__)}.revoke_access_token_for_code found invalid access-token linkage"
+    end
   end
 
   @doc false
   @spec access_token_revoked?(String.t()) :: boolean()
   def access_token_revoked?(jti) when is_binary(jti) do
+    prefix = Config.table_prefix()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -174,17 +291,24 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
           a.access_token_jti == ^jti and not is_nil(a.access_token_revoked_at) and
             a.access_token_expires_at > ^now
 
-    repo().exists?(query)
+    repo().exists?(query, prefix: prefix)
   end
 
-  defp consumed_or_missing(code_hash) do
-    case repo().get_by(Authorization, code_hash: code_hash) do
+  defp consumed_or_missing(code_hash, prefix) do
+    case repo().get_by(Authorization, [code_hash: code_hash], prefix: prefix) do
       %Authorization{consumed_success: true} = row ->
         {:error, :consumed, Authorization.consumed_meta(row)}
 
       _ ->
         :error
     end
+  end
+
+  defp expect_one_updated!({1, _rows}, _operation), do: :ok
+
+  defp expect_one_updated!({_unexpected_count, _rows}, operation) do
+    raise RuntimeError,
+          "#{inspect(__MODULE__)}.#{operation} failed to update exactly one authorization record"
   end
 
   defp repo, do: Config.ecto_repo!()

@@ -292,6 +292,25 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       refute "urn:ietf:params:oauth:grant-type:token-exchange" in body["grant_types_supported"]
     end
 
+    test "advertises an explicitly empty grant catalog without restoring defaults" do
+      body = call_show(host_config(grant_types_supported: []), protocol_config()) |> decode_body()
+
+      assert body["grant_types_supported"] == []
+    end
+
+    test "keeps an explicitly empty grant catalog when device authorization is enabled" do
+      host =
+        host_config(
+          grant_types_supported: [],
+          device_authorization: [enabled: true],
+          device_code_store: StubKeystore
+        )
+
+      body = call_show(host, protocol_config()) |> decode_body()
+
+      assert body["grant_types_supported"] == []
+    end
+
     test "advertises only the client-auth methods the token endpoint accepts (RFC 8414)" do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 
@@ -309,6 +328,14 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       body = call_show(host, protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+    end
+
+    test "advertises an explicitly empty auth-method catalog without restoring defaults" do
+      body =
+        call_show(host_config(token_endpoint_auth_methods_supported: []), protocol_config())
+        |> decode_body()
+
+      assert body["token_endpoint_auth_methods_supported"] == []
     end
 
     test "advertises both RFC 8705 methods, certificate-bound tokens, and mTLS endpoint aliases" do
@@ -493,7 +520,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         conn(:get, "/.well-known/oauth-authorization-server")
         |> put_private(:attesto_protocol_config, protocol_config())
 
-      assert_raise RuntimeError, fn -> DiscoveryController.show(conn, %{}) end
+      assert_raise ArgumentError, fn -> DiscoveryController.show(conn, %{}) end
     end
 
     test "fails closed when the protocol config is not installed on the conn" do

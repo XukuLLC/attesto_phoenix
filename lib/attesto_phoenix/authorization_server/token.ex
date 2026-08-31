@@ -87,6 +87,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # refresh token's opaque claims map so it survives store round-trips without
   # becoming an access-token claim or requiring store/schema changes.
   @refresh_grant_type_claim "attesto_phoenix.authorization_grant_type"
+  @refresh_grant_family_claim "attesto_phoenix.authorization_grant_family_id"
 
   # RFC 8628 §3.5: the polling errors that MUST be rendered with their own error
   # codes (NOT collapsed to invalid_grant) — clients depend on distinguishing
@@ -134,7 +135,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   """
   @spec issue(Config.t(), Request.t()) ::
           {:ok, response(), [Event.t()]} | {:error, OAuthError.t(), [Event.t()]}
-  def issue(%Config{} = _config, %Request{} = request) do
+  def issue(%Config{} = config, %Request{} = request) do
+    request = %{request | config: config}
+    Config.with_request_config(config, fn -> do_issue(request) end)
+  end
+
+  defp do_issue(%Request{} = request) do
     # The controller supplies the exact identifier authenticated at the edge.
     # Preserve compatibility for direct callers that predate that field's
     # authoritative semantics by resolving the host callback once, up front.
@@ -145,6 +151,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case run(request) do
       {:ok, response, events} ->
         {:ok, response, events}
+
+      {:error, %OAuthError{} = err, events} when is_list(events) ->
+        {:error, err, events ++ [denied_event(request, err)]}
 
       {:error, %OAuthError{} = err} ->
         {:error, err, [denied_event(request, err)]}
@@ -196,14 +205,29 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     case Callback.invoke(Config.client_grant_types_fun(config), [host_client(client)], nil) do
       grant_types when is_list(grant_types) ->
+        require_valid_client_grant_types!(grant_types)
+
         if grant_type in grant_types do
           :ok
         else
           {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
         end
 
-      _not_configured ->
+      nil ->
         :ok
+
+      _invalid ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :client_grant_types callback must return nil or a list of strings"
+    end
+  end
+
+  defp require_valid_client_grant_types!(grant_types) do
+    if Enum.all?(grant_types, &(is_binary(&1) and &1 != "")) do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :client_grant_types callback must return nil or a list of non-empty strings"
     end
   end
 
@@ -259,29 +283,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # response. Omitted entirely for a plain authorization_code grant that
       # carried none — this leaves every non-OID4VCI flow byte-identical.
       response = maybe_echo_credential_authorization_details(response, grant)
-      :ok = record_code_access_token(config, grant, response)
       issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
 
-      # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
-      # client can refresh without re-running the authorization flow. The
-      # initial token is minted into the code's `family_id` (OAuth 2.0 Security
-      # BCP §4.13) so a later replay of the same code, surfaced as
-      # `{:error, {:reuse, meta}}` by `Attesto.AuthorizationCode.redeem/4`,
-      # carries the `family_id` needed to revoke this exact descendant family.
-      #
-      # Only on full success do we finalize the code (record the reuse marker).
-      # `redeem/4` claimed and validated the code but deferred that marker, so a
-      # failure ANYWHERE above (mint, refresh persistence, a host-callback fault)
-      # leaves the code spent-but-unfinalized: the client's retry is a clean
-      # `invalid_grant`, never a false reuse that would revoke the family.
-      case maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued]) do
-        {:ok, response, events} ->
-          :ok = AuthorizationCode.finalize(grant_store(config, :code_store), code, grant)
-          {:ok, response, events}
-
-        {:error, %OAuthError{}} = error ->
-          error
-      end
+      issue_authorization_code_response(
+        request,
+        code,
+        grant,
+        scope,
+        audience,
+        {token_type, binding},
+        response,
+        [issued]
+      )
     end
   end
 
@@ -300,7 +313,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              presented,
              requested,
              resource,
-             SenderConstraint.refresh_binding_jkt(config, client, binding)
+             SenderConstraint.binding_jkt(binding)
            ),
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
          {:ok, response} <-
@@ -317,7 +330,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              audience_opts(rotated.context.resource) ++ context_auth_context_opts(rotated.context)
            ) do
       response = Map.put(response, :refresh_token, rotated.token)
-      {:ok, response, [refresh_rotated_event(request, scope, "refresh_token", token_type, binding)]}
+
+      {:ok, response,
+       [refresh_rotated_event(request, rotated.context.subject, scope, "refresh_token", token_type, binding)]}
     end
   end
 
@@ -520,6 +535,43 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §5.2.
   defp dispatch(%Request{grant_type: grant_type}) do
     {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
+  end
+
+  # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
+  # client can refresh without re-running the authorization flow. The core
+  # composition API owns issuance and binds the returned family ID inside the
+  # same success path; callers never pass a family identifier back to
+  # authorization-code finalization.
+  defp issue_authorization_code_response(request, code, grant, scope, resource, sender, response, events) do
+    %{config: config, client: client} = request
+
+    if grant_store(config, :refresh_store) && issue_refresh_token?(config, client, scope) do
+      case issue_authorization_code_refresh_token(
+             request,
+             code,
+             grant,
+             scope,
+             resource,
+             sender,
+             response,
+             events
+           ) do
+        {:ok, response, events} -> {:ok, response, events}
+        {:error, %OAuthError{}} = error -> error
+      end
+    else
+      # No refresh token is issued, so the original grant provenance remains
+      # the only family metadata and the legacy finalize/3 API is correct.
+      case record_code_access_token(config, grant, response, code) do
+        :ok ->
+          :ok = AuthorizationCode.finalize(grant_store(config, :code_store), code, grant)
+          {:ok, response, events}
+
+        {:error, :access_token_reuse_binding_unavailable} ->
+          Logger.error("authorization-code issuance requires code-hash access-token linkage")
+          {:error, error(@error_invalid_request, "unable to issue token")}
+      end
+    end
   end
 
   # Validate the ID-JAG and map the handler's reasons to RFC 6749 §5.2 errors: a
@@ -767,11 +819,24 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp grant_present?(config, :code, code) do
-    match?({:ok, _}, grant_store(config, :code_store).get(Attesto.Secret.hash(code)))
+    grant_present_in_store?(grant_store(config, :code_store), Attesto.Secret.hash(code))
   end
 
   defp grant_present?(config, :refresh, token) do
-    match?({:ok, _}, grant_store(config, :refresh_store).get(Attesto.Secret.hash(token)))
+    grant_present_in_store?(grant_store(config, :refresh_store), Attesto.Secret.hash(token))
+  end
+
+  defp grant_present_in_store?(store, grant_hash) do
+    case store.get(grant_hash) do
+      {:ok, _record} ->
+        true
+
+      :error ->
+        false
+
+      _invalid ->
+        raise RuntimeError, "#{inspect(store)}.get/1 violated its grant-store return contract"
+    end
   end
 
   defp redeem_code(%Request{config: config} = request, code, verifier, redirect_uri, jkt) do
@@ -788,14 +853,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         {:ok, grant}
 
       # OAuth 2.0 Security BCP §4.13 / RFC 6749 §4.1.2: a re-presented,
-      # already-redeemed code is the reuse attack signal. Revoke the
-      # descendant refresh-token family recorded at the first redemption
-      # (`meta.family_id`) before answering - the captured code and any tokens
-      # it spawned are now compromised - then fail closed with the generic
-      # `invalid_grant` so the replay learns nothing on the wire.
+      # already-redeemed code is the reuse attack signal. Revoke access tokens
+      # and the refresh family linked to the first redemption before answering
+      # - the captured code and any tokens it spawned are now compromised -
+      # then fail closed with the generic `invalid_grant` so the replay learns
+      # nothing on the wire.
       {:error, {:reuse, meta}} ->
         revoke_reused_family(config, meta)
-        revoke_reused_access_tokens(config, meta)
+        revoke_reused_access_tokens(config, meta, code)
         {:error, grant_error(:invalid_grant)}
 
       {:error, reason} ->
@@ -1005,29 +1070,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # Revoke the refresh-token family linked to a replayed code (OAuth 2.0
-  # Security BCP §4.13.2) through the configured `:refresh_store`. The reuse
-  # `meta` carries a `family_id` (not a token), so the family-level
-  # `c:Attesto.RefreshStore.revoke_family/1` is the right seam -
-  # `Attesto.Revocation` is the per-token entry point and would need a token
-  # to look the family up. Reuse detection only fires when a `:code_store`
-  # tracks consumption; a deployment that wired no `:refresh_store` has no
-  # family to revoke (the grant never minted one), so this is a no-op there,
-  # as is an absent/empty `family_id`.
-  defp revoke_reused_family(config, meta) do
-    if refresh_store = grant_store(config, :refresh_store) do
-      case reuse_family_id(meta) do
-        family_id when is_binary(family_id) and family_id != "" ->
-          :ok = refresh_store.revoke_family(family_id)
-
-        _ ->
-          :ok
-      end
-    end
-
-    :ok
-  end
-
   # The replayed code's first-redemption context is the
   # `Attesto.CodeStore.consumed_meta()` map (always a map per that callback's
   # spec). Read the `:family_id` under both atom and string keys so a store
@@ -1037,20 +1079,44 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     Map.get(meta, :family_id) || Map.get(meta, "family_id")
   end
 
-  defp revoke_reused_access_tokens(config, meta) do
+  defp revoke_reused_family(config, meta) do
+    store = grant_store(config, :refresh_store)
+
+    case reuse_family_id(meta) do
+      family_id when is_binary(family_id) and family_id != "" ->
+        if store && function_exported?(store, :revoke_family, 1) do
+          :ok = store.revoke_family(family_id)
+
+          :ok
+        else
+          raise RuntimeError, "refresh store does not support family revocation"
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp revoke_reused_access_tokens(config, meta, code) do
     store = grant_store(config, :code_store)
 
-    if store && function_exported?(store, :revoke_family_access_tokens, 1) do
-      case reuse_family_id(meta) do
-        family_id when is_binary(family_id) and family_id != "" ->
+    case reuse_family_id(meta) do
+      family_id when is_binary(family_id) and family_id != "" ->
+        if store && function_exported?(store, :revoke_family_access_tokens, 1) do
           :ok = store.revoke_family_access_tokens(family_id)
 
-        _ ->
           :ok
-      end
-    end
+        else
+          raise RuntimeError, "code store does not support family access-token revocation"
+        end
 
-    :ok
+      _ ->
+        if store && function_exported?(store, :revoke_access_token_for_code, 1) do
+          :ok = store.revoke_access_token_for_code(Attesto.Secret.hash(code))
+        end
+
+        :ok
+    end
   end
 
   # The request-time `resource` on a refresh narrows the bound set (the core
@@ -1078,12 +1144,35 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # (`nil`) keeps the full granted set so the refreshed token stays audienced
       # to the resources the original grant authorized.
       |> put_optional_kw(:resource, resource)
-      |> put_optional_kw(:dpop_jkt, jkt)
+      # RFC 9449 §5: only public clients need their refresh token bound to the
+      # DPoP proof key. A confidential client still presents and verifies a
+      # proof (so its newly minted access token is sender-constrained), but its
+      # authenticated client credentials protect the refresh token. Passing
+      # that proof JKT into Attesto.RefreshToken for an unbound confidential
+      # token would make rotation reject the proof as unexpected and prevent a
+      # legitimate key rotation.
+      |> put_optional_kw(:dpop_jkt, refresh_rotation_dpop_jkt(request, presented, jkt))
       |> Keyword.put(:rotation_grace_seconds, config.refresh_token_rotation_grace_seconds)
 
     case RefreshToken.rotate(grant_store(config, :refresh_store), presented, opts) do
-      {:ok, rotated} -> {:ok, rotated}
-      {:error, reason} -> {:error, grant_error(reason)}
+      {:ok, rotated} ->
+        {:ok, rotated}
+
+      {:error, :reuse_detected} ->
+        {:error, grant_error(:reuse_detected), [refresh_reuse_detected_event(request)]}
+
+      # Attesto.RefreshToken uses this result only when its refresh-store
+      # transition is known to have rolled back. The parent remains valid, so
+      # expose a retryable OAuth response rather than collapsing it into
+      # invalid_grant (which would tell a client to discard a usable token).
+      # Keep the diagnostic fixed and secret-free: the store's internal reason
+      # must never reach either logs or the wire.
+      {:error, :temporarily_unavailable} ->
+        Logger.error("refresh token rotation temporarily unavailable; retry the request")
+        {:error, temporarily_unavailable_error()}
+
+      {:error, reason} ->
+        {:error, grant_error(reason)}
     end
   end
 
@@ -1101,24 +1190,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   #     `offline_access` scope (OIDC Core §11), the standard signal that the
   #     client asked for offline access.
   #
-  # RFC 9449 §8 requires DPoP-bound refresh tokens for public clients. For
-  # confidential clients, the refresh token remains bound to the authenticated
-  # client_id (RFC 6749 §6 / §10.4) rather than to one DPoP proof key; this
-  # lets a confidential client rotate or recover its DPoP key while each newly
-  # minted access token is still sender-constrained to the proof presented on
-  # that token request. An mTLS-bound request issues no DPoP binding on the
-  # refresh token. The plaintext token is added to the RFC 6749 §5.1 body;
-  # only its hash is persisted (see `Attesto.RefreshToken`).
-  defp maybe_issue_refresh_token(
-         request,
-         grant,
-         scope,
-         token_type,
-         binding,
-         response,
-         events,
-         grant_type \\ "authorization_code"
-       ) do
+  # RFC 9449 §5 requires DPoP binding for refresh tokens issued to public
+  # clients. Confidential clients authenticate at the token endpoint, so their
+  # refresh token is bound to the authenticated client_id rather than to one
+  # DPoP proof key. Their token request proof is still verified and binds the
+  # newly minted access token, allowing the client to rotate its proof key.
+  # An mTLS-bound or proof-free request issues no DPoP binding on the refresh
+  # token.
+  # The plaintext token is added to the RFC 6749 §5.1 body; only its hash is
+  # persisted (see `Attesto.RefreshToken`).
+  defp maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, events, grant_type) do
     %{config: config, client: client} = request
 
     if refresh_store = grant_store(config, :refresh_store) do
@@ -1141,43 +1222,102 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp issue_initial_refresh_token(request, grant, scope, sender, refresh_store, response, events, grant_type) do
-    %{config: config, client: client} = request
-    {token_type, binding} = sender
+  defp issue_authorization_code_refresh_token(
+         request,
+         code,
+         grant,
+         scope,
+         resource,
+         {token_type, binding} = sender,
+         response,
+         events
+       ) do
+    %{config: config} = request
+    refresh_store = grant_store(config, :refresh_store)
+    code_store = grant_store(config, :code_store)
 
+    context = initial_refresh_context(request, grant, scope, resource, sender, "authorization_code")
+
+    # The composition API finalizes the code as part of successful issuance.
+    # Record the minted access JTI first, by code hash, so a row with no
+    # authorization provenance family is still fully contained on replay. A
+    # store that opts into code-reuse markers but cannot bind this JTI by code
+    # hash is refused here: its legacy family callback would index the token
+    # under the code's provenance family, not the family the composition API
+    # will generate.
+    case record_code_access_token_by_code(config, response, Attesto.Secret.hash(code)) do
+      :ok ->
+        case AuthorizationCode.issue_refresh_and_finalize(
+               code_store,
+               code,
+               grant,
+               refresh_store,
+               context,
+               ttl: config.refresh_token_ttl
+             ) do
+          {:ok, %{token: token, family_id: _family_id}} ->
+            response = Map.put(response, :refresh_token, token)
+            issued = refresh_issued_event(request, grant.subject, scope, "authorization_code", token_type, binding)
+            {:ok, response, events ++ [issued]}
+
+          {:error, reason} ->
+            # Issuance is a server/config fault, not a client error; do not leak
+            # detail, and do not hand back an access token whose advertised
+            # offline access we then failed to provide.
+            Logger.error("refresh token issuance failed: #{inspect(reason)}")
+            {:error, error(@error_invalid_request, "unable to issue token")}
+        end
+
+      {:error, :access_token_reuse_binding_unavailable} ->
+        Logger.error("authorization-code refresh issuance requires code-hash access-token linkage")
+        {:error, error(@error_invalid_request, "unable to issue token")}
+    end
+  end
+
+  defp initial_refresh_context(request, grant, scope, resource, sender, grant_type) do
+    %{config: config} = request
+    {_token_type, binding} = sender
+
+    %{subject: grant.subject, scope: scope, resource: resource}
+    |> put_optional(:client_id, token_client_id(request))
+    |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
+    |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
+    |> put_optional(:dpop_jkt, refresh_context_dpop_jkt(request, grant, binding))
+    |> put_refresh_grant_provenance(config, grant_type, Map.get(grant, :family_id))
+  end
+
+  # The request's authenticated method is the authoritative public/confidential
+  # discriminator at this stage. Do not infer it from the client identifier or
+  # the opaque host client value: a confidential client may use private_key_jwt
+  # and may legitimately rotate the DPoP key between refresh requests.
+  defp refresh_context_dpop_jkt(%Request{client_auth_method: :none}, _grant, binding),
+    do: SenderConstraint.binding_jkt(binding)
+
+  defp refresh_context_dpop_jkt(%Request{}, _grant, _binding), do: nil
+
+  defp refresh_rotation_dpop_jkt(%Request{client_auth_method: :none}, _presented, jkt), do: jkt
+
+  # Confidential refresh tokens are client-bound rather than proof-key-bound.
+  # The proof was still verified above and is used to bind the new access token.
+  defp refresh_rotation_dpop_jkt(%Request{}, _presented, _jkt), do: nil
+
+  defp issue_initial_refresh_token(request, grant, scope, sender, refresh_store, response, events, grant_type) do
     # RFC 8707: carry the code's bound resource set onto the initial refresh
     # token so a refreshed access token stays audienced to the same resources.
     # RFC 9470: seed the original acr/auth_time (from the code's claims) onto the
     # refresh family so refreshes preserve the real authentication event.
-    context =
-      %{subject: grant.subject, scope: scope, resource: grant.resource}
-      |> put_optional(:client_id, token_client_id(request))
-      |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
-      |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
-      |> put_optional(:dpop_jkt, SenderConstraint.refresh_binding_jkt(config, client, binding))
-      |> put_refresh_grant_provenance(config, grant_type, Map.get(grant, :family_id))
+    %{config: config} = request
+    context = initial_refresh_context(request, grant, scope, grant.resource, sender, grant_type)
+    {token_type, binding} = sender
 
-    # OAuth 2.0 Security BCP §4.13: mint the initial token into the code's
-    # `family_id` so the spent code and its descendant tokens share one
-    # family. `Attesto.RefreshToken.issue/3` takes `:family_id` as an option
-    # (not in the context map) and starts a fresh family only when it is
-    # absent; threading the grant's `family_id` here is what lets a later
-    # code-reuse `{:reuse, meta}` revoke this exact family (see
-    # `revoke_reused_family/2`). When the code carried no `family_id`,
-    # `put_optional_kw/3` drops the option, a fresh family is generated, and
-    # reuse detection simply has no family to revoke.
-    # `Map.get/2` (not `grant.family_id`) so this path is shared with grants
-    # whose struct has no `family_id` (the RFC 8628 device grant): a single-use
-    # device code has no code-reuse family to link, so the absent id yields a
-    # fresh family — exactly the intended behavior.
-    issue_opts =
-      [ttl: config.refresh_token_ttl]
-      |> put_optional_kw(:family_id, Map.get(grant, :family_id))
-
-    case RefreshToken.issue(refresh_store, context, issue_opts) do
-      {:ok, %{token: token}} ->
+    # `Attesto.RefreshToken.issue/3` owns the initial family identifier. The
+    # authorization code's family remains in the opaque context only as the
+    # provenance value used by the optional public grant-ID claim.
+    case RefreshToken.issue(refresh_store, context, ttl: config.refresh_token_ttl) do
+      {:ok, %{token: token, family_id: family_id}}
+      when is_binary(token) and token != "" and is_binary(family_id) and family_id != "" ->
         response = Map.put(response, :refresh_token, token)
-        issued = refresh_issued_event(request, scope, grant_type, token_type, binding)
+        issued = refresh_issued_event(request, grant.subject, scope, grant_type, token_type, binding)
         {:ok, response, events ++ [issued]}
 
       {:error, reason} ->
@@ -1185,6 +1325,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         # detail, and do not hand back an access token whose advertised
         # offline access we then failed to provide.
         Logger.error("refresh token issuance failed: #{inspect(reason)}")
+        {:error, error(@error_invalid_request, "unable to issue token")}
+
+      {:ok, _invalid_result} ->
+        Logger.error("refresh token issuance returned an invalid result")
         {:error, error(@error_invalid_request, "unable to issue token")}
     end
   end
@@ -1196,7 +1340,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp issue_refresh_token?(config, client, scope) do
     case Callback.config_callback(config, :issue_refresh_token?) do
       nil -> @offline_access_scope in scope
-      callback -> invoke(callback, [host_client(client), scope]) == true
+      callback -> Callback.invoke_boolean(callback, [host_client(client), scope], false, :issue_refresh_token?)
     end
   end
 
@@ -1259,32 +1403,38 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          sid when is_binary(sid) and sid != "" <- id_token_claim(grant.claims, "sid") do
       bc_uri = Config.client_backchannel_logout_uri(config, host_client(client))
       fc_uri = Config.client_frontchannel_logout_uri(config, host_client(client))
-
-      if is_binary(bc_uri) or is_binary(fc_uri) do
-        now = System.system_time(:second)
-
-        store.record(%{
-          sid: sid,
-          subject: grant.subject,
-          client_id: client_id,
-          backchannel_logout_uri: bc_uri,
-          session_required: Config.client_backchannel_logout_session_required(config, host_client(client)),
-          frontchannel_logout_uri: fc_uri,
-          frontchannel_session_required:
-            Config.client_frontchannel_logout_session_required(config, host_client(client)),
-          expires_at: now + Config.logout_session_ttl_seconds(config)
-        })
-      else
-        :ok
-      end
+      maybe_store_logout_session(config, store, client, grant, client_id, sid, bc_uri, fc_uri)
     else
       _ -> :ok
     end
   rescue
-    e ->
-      Logger.warning("logout session record failed: #{inspect(e)}")
+    _exception ->
+      Logger.warning("logout session record failed")
       :ok
   end
+
+  defp maybe_store_logout_session(config, store, client, grant, client_id, sid, bc_uri, fc_uri)
+       when is_binary(bc_uri) or is_binary(fc_uri) do
+    now = System.system_time(:second)
+
+    record = %{
+      sid: sid,
+      subject: grant.subject,
+      client_id: client_id,
+      backchannel_logout_uri: bc_uri,
+      session_required: Config.client_backchannel_logout_session_required(config, host_client(client)),
+      frontchannel_logout_uri: fc_uri,
+      frontchannel_session_required: Config.client_frontchannel_logout_session_required(config, host_client(client)),
+      expires_at: now + Config.logout_session_ttl_seconds(config)
+    }
+
+    case store.record(record) do
+      :ok -> :ok
+      _invalid -> Logger.warning("logout session record failed: store violated its return contract")
+    end
+  end
+
+  defp maybe_store_logout_session(_config, _store, _client, _grant, _client_id, _sid, _bc_uri, _fc_uri), do: :ok
 
   # OIDC Core §3.1.3.6 / §3.3.2.11: bind the ID Token to the artifacts of this
   # exchange. The `nonce` from the Authentication Request (OIDC Core §3.1.3.7
@@ -1442,9 +1592,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     requested = if is_binary(requested), do: String.split(requested, " ", trim: true), else: requested
 
     case invoke(Config.authorize_scope_fun(config), [host_client(client), requested]) do
-      {:ok, scope} when is_list(scope) -> {:ok, scope}
-      {:error, _reason} -> {:error, error(@error_invalid_scope, "scope not permitted")}
-      _ -> {:error, error(@error_invalid_request, "scope policy unavailable")}
+      {:ok, scope} when is_list(scope) ->
+        {:ok, scope}
+
+      {:error, :invalid_scope} ->
+        {:error, error(@error_invalid_scope, "scope not permitted")}
+
+      _unexpected ->
+        raise RuntimeError,
+              "AttestoPhoenix.Config :authorize_scope callback violated its return contract"
     end
   end
 
@@ -1487,21 +1643,84 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp record_code_access_token(config, grant, response) do
+  defp record_code_access_token_by_code(config, response, code_hash) do
     store = grant_store(config, :code_store)
 
-    if store && function_exported?(store, :record_access_token, 3) do
-      with family_id when is_binary(family_id) and family_id != "" <- grant.family_id,
-           {:ok, %{"jti" => jti, "exp" => exp}} <-
-             decode_access_token_claims(response.access_token),
-           true <- is_binary(jti) and is_integer(exp) do
-        :ok = store.record_access_token(family_id, jti, exp)
-      else
-        _ -> :ok
-      end
-    end
+    cond do
+      store && function_exported?(store, :mark_consumed, 2) &&
+        function_exported?(store, :record_access_token_for_code, 3) &&
+          function_exported?(store, :revoke_family_access_tokens, 1) ->
+        record_minted_access_token_for_code!(store, response.access_token, code_hash)
+        :ok
 
-    :ok
+      store && function_exported?(store, :mark_consumed, 2) ->
+        # A legacy family-based callback cannot safely index this token yet:
+        # the authorization provenance family is not the refresh family that
+        # replay containment will revoke. Refuse issuance rather than record
+        # it under the wrong family or claim that replay revokes the access
+        # token.
+        {:error, :access_token_reuse_binding_unavailable}
+
+      true ->
+        # Stores without reuse markers have no access-token replay path to
+        # protect, so preserve their existing refresh issuance behavior.
+        :ok
+    end
+  end
+
+  defp record_code_access_token(config, grant, response, code) do
+    store = grant_store(config, :code_store)
+
+    cond do
+      store && function_exported?(store, :mark_consumed, 2) ->
+        record_reuse_access_token(store, response, code)
+
+      store && function_exported?(store, :record_access_token, 3) ->
+        record_family_access_token(store, grant, response)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp record_reuse_access_token(store, response, code) do
+    if function_exported?(store, :record_access_token_for_code, 3) and
+         function_exported?(store, :revoke_access_token_for_code, 1) do
+      record_minted_access_token_for_code!(store, response.access_token, Attesto.Secret.hash(code))
+      :ok
+    else
+      {:error, :access_token_reuse_binding_unavailable}
+    end
+  end
+
+  defp record_family_access_token(store, grant, response) do
+    case grant.family_id do
+      family_id when is_binary(family_id) and family_id != "" ->
+        record_minted_access_token!(store, family_id, response.access_token)
+
+      _without_family ->
+        :ok
+    end
+  end
+
+  defp record_minted_access_token!(store, family_id, access_token) do
+    with {:ok, %{"jti" => jti, "exp" => exp}} <- decode_access_token_claims(access_token),
+         true <- is_binary(jti) and jti != "" and is_integer(exp) do
+      :ok = store.record_access_token(family_id, jti, exp)
+    else
+      _invalid_minted_token ->
+        raise RuntimeError, "minted access token lacks the claims required for code-reuse revocation"
+    end
+  end
+
+  defp record_minted_access_token_for_code!(store, access_token, code_hash) do
+    with {:ok, %{"jti" => jti, "exp" => exp}} <- decode_access_token_claims(access_token),
+         true <- is_binary(jti) and jti != "" and is_integer(exp) do
+      :ok = store.record_access_token_for_code(code_hash, jti, exp)
+    else
+      _invalid_minted_token ->
+        raise RuntimeError, "minted access token lacks the claims required for code-reuse revocation"
+    end
   end
 
   defp decode_access_token_claims(token) when is_binary(token) do
@@ -1702,10 +1921,25 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp refresh_authorization_grant_id_claims(config, %{
-         family_id: family_id,
+         context: %{
+           claims: %{@refresh_grant_type_claim => "authorization_code", @refresh_grant_family_claim => origin_family_id}
+         }
+       }) do
+    authorization_grant_id_claims(config, origin_family_id)
+  end
+
+  # Attesto Phoenix 2.14.2 persisted the authorization-code marker but did not
+  # yet copy the origin family into the refresh context. That marker is the
+  # only safe lineage discriminator: device/CIBA refresh contexts never carry
+  # it. For that bounded rolling-upgrade case, the old implementation reused
+  # the refresh family's `family_id`, which was the authorization-code family.
+  # Never apply this fallback to an unmarked refresh token, and never use it for
+  # newly issued tokens (which carry the explicit origin-family marker above).
+  defp refresh_authorization_grant_id_claims(config, %{
+         family_id: legacy_family_id,
          context: %{claims: %{@refresh_grant_type_claim => "authorization_code"}}
        }) do
-    authorization_grant_id_claims(config, family_id)
+    authorization_grant_id_claims(config, legacy_family_id)
   end
 
   defp refresh_authorization_grant_id_claims(_config, _rotated), do: %{}
@@ -1771,9 +2005,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # relabel state, tokens, ID Tokens, or audit events.
   defp client_id(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.client_id(metadata)
 
-  defp client_id(config, client) do
-    Callback.invoke(Config.client_id_fun(config), [client], nil)
-  end
+  defp client_id(config, client), do: Config.client_identifier(config, client)
 
   defp snapshot_client_id(%Request{request_client_id: client_id} = request)
        when is_binary(client_id) and client_id != "", do: request
@@ -1828,22 +2060,36 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     issued_like_event(request, :token_issued, scope, grant_type, token_type, binding)
   end
 
-  defp refresh_rotated_event(request, scope, grant_type, token_type, binding) do
-    issued_like_event(request, :refresh_rotated, scope, grant_type, token_type, binding)
+  defp refresh_rotated_event(request, subject, scope, grant_type, token_type, binding) do
+    issued_like_event(request, :refresh_rotated, subject, scope, grant_type, token_type, binding)
   end
 
-  defp refresh_issued_event(request, scope, grant_type, token_type, binding) do
-    issued_like_event(request, :refresh_issued, scope, grant_type, token_type, binding)
+  defp refresh_issued_event(request, subject, scope, grant_type, token_type, binding) do
+    issued_like_event(request, :refresh_issued, subject, scope, grant_type, token_type, binding)
   end
 
   defp issued_like_event(request, name, scope, grant_type, token_type, binding) do
+    issued_like_event(request, name, nil, scope, grant_type, token_type, binding)
+  end
+
+  defp issued_like_event(request, name, subject, scope, grant_type, token_type, binding) do
     Event.new(name, %{
+      subject: subject,
       client_id: token_client_id(request),
       scope: Enum.join(List.wrap(scope), " "),
       grant_type: grant_type,
       metadata:
         %{client_ip: request.client_ip}
         |> Map.merge(sender_constraint_metadata(token_type, binding))
+    })
+  end
+
+  defp refresh_reuse_detected_event(request) do
+    Event.new(:refresh_reuse_detected, %{
+      client_id: token_client_id(request),
+      grant_type: "refresh_token",
+      result: :reuse_detected,
+      metadata: %{client_ip: request.client_ip, reason: :reuse_detected}
     })
   end
 
@@ -1923,17 +2169,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # If the feature is disabled when the family starts, omit the marker so later
   # configuration cannot introduce a family claim that the initial token lacked.
   #
-  # `family_id` is the ORIGINAL code's family, not the refresh family: a code
-  # that carried none still gets a core-generated internal refresh family.
-  # Refresh rotation continues normally, and refresh reuse detection revokes
-  # that family. Code replay cannot reach it, since the code holds no ID linking
-  # it to that family. Such a grant must stay permanently ineligible for the
-  # public claim.
-  # Gating the marker on the origin family is what stops the generated one from
-  # being mistaken for eligibility on the first rotation.
+  # `family_id` is the ORIGINAL code's family, not the refresh family. The
+  # refresh family is generated by Attesto.RefreshToken.issue/3 and is internal
+  # rotation state. Gating the provenance marker on the origin family prevents
+  # the generated identifier from becoming a public claim by accident.
   defp put_refresh_grant_provenance(context, config, grant_type, family_id) do
     if Config.authorization_grant_id_claim(config) && eligible_grant_family_id?(family_id) do
-      Map.put(context, :claims, %{@refresh_grant_type_claim => grant_type})
+      Map.put(context, :claims, %{
+        @refresh_grant_type_claim => grant_type,
+        @refresh_grant_family_claim => family_id
+      })
     else
       context
     end
@@ -1971,4 +2216,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp grant_error(:invalid_target), do: error(@error_invalid_target, "the requested resource is not within the grant")
 
   defp grant_error(_reason), do: error(@error_invalid_grant, "authorization grant is invalid or expired")
+
+  defp temporarily_unavailable_error do
+    OAuthError.new(:temporarily_unavailable, "temporarily unavailable", status: 503)
+  end
 end

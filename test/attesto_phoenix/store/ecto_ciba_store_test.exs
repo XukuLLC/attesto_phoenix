@@ -7,8 +7,14 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
   interval.
   """
 
-  use AttestoPhoenix.DataCase, async: true
+  use AttestoPhoenix.DataCase, async: false
 
+  import ExUnit.CaptureLog
+
+  alias Attesto.CIBA
+  alias Attesto.CIBA.Grant
+  alias Attesto.CIBA.Request
+  alias AttestoPhoenix.Schema.CIBARequest
   alias AttestoPhoenix.Store.EctoCIBAStore, as: Store
 
   @moduletag :ecto
@@ -43,6 +49,9 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
     record
   end
 
+  defp nested_claims(0), do: %{}
+  defp nested_claims(depth), do: %{"nested" => nested_claims(depth - 1)}
+
   test "put + lookup returns the pending entry with the frozen data" do
     r = put(%{data: put_data(scope: ["openid", "profile"], delivery_mode: :ping, client_notification_token: "cnt")})
 
@@ -53,6 +62,32 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
     assert entry.data.delivery_mode == :ping
     assert entry.data.client_notification_token == "cnt"
     assert entry.data.subject == "user:alice"
+  end
+
+  test "core issue, approve, and redeem round-trip through the Ecto read bridge" do
+    now = System.system_time(:second)
+
+    request = %Request{
+      client_id: "cli-1",
+      delivery_mode: :poll,
+      hint: {:login_hint, "user:alice"},
+      scope: ["openid"]
+    }
+
+    assert {:ok, %{auth_req_id: auth_req_id}} =
+             CIBA.issue(Store, request, %{subject: "user:alice"}, now: now, interval: 1)
+
+    assert {:ok, _decision} = CIBA.approve(Store, auth_req_id, %{subject: "user:alice"}, now: now)
+
+    assert {:ok, %Grant{client_id: "cli-1", subject: "user:alice", scope: ["openid"]}} =
+             CIBA.redeem(Store, auth_req_id, %{client_id: "cli-1"}, now: now)
+  end
+
+  test "put rejects an extra canonical data key before database projection" do
+    assert_raise ArgumentError, "CIBA request has invalid canonical data", fn ->
+      record = put_record()
+      Store.put(Map.put(record, :data, Map.put(Map.fetch!(record, :data), :adapter_metadata, "not protocol data")))
+    end
   end
 
   test "lookup of an unknown hash is :error" do
@@ -84,6 +119,64 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
 
     assert {:error, :already_decided} = Store.approve(r.auth_req_id_hash, %{subject: "user:alice"}, %{})
     assert {:error, :already_decided} = Store.deny(r.auth_req_id_hash, %{})
+  end
+
+  test "approve preserves portable nested claims at the JSON boundary" do
+    r = put()
+
+    claims = %{
+      "nested" => %{
+        "minimum" => -9_007_199_254_740_991,
+        "maximum" => 9_007_199_254_740_991,
+        "values" => [nil, false, "text", %{"leaf" => 42}]
+      }
+    }
+
+    assert {:ok, approved} =
+             Store.approve(
+               r.auth_req_id_hash,
+               %{
+                 subject: "user:alice",
+                 acr: "silver",
+                 auth_time: System.system_time(:second),
+                 granted_scope: ["openid"],
+                 granted_claims: claims
+               },
+               %{now: System.system_time(:second)}
+             )
+
+    assert approved.status == :approved
+    assert approved.granted_claims == claims
+    assert {:ok, loaded} = Store.lookup(r.auth_req_id_hash)
+    assert loaded.granted_claims == claims
+  end
+
+  test "approve rejects non-portable claims before updating the pending row" do
+    invalid_claims = [
+      %{atom_key: "value"},
+      %{"nested" => %{atom_key: "value"}},
+      %{"float" => 1.5},
+      %{"nul" => "a\0b"},
+      %{"large" => 9_007_199_254_740_992},
+      nested_claims(64)
+    ]
+
+    Enum.each(invalid_claims, fn claims ->
+      r = put()
+
+      assert_raise ArgumentError, "CIBA approval has invalid granted claims", fn ->
+        Store.approve(
+          r.auth_req_id_hash,
+          %{subject: "user:alice", granted_claims: claims},
+          %{now: System.system_time(:second)}
+        )
+      end
+
+      assert {:ok, entry} = Store.lookup(r.auth_req_id_hash)
+      assert entry.status == :pending
+      assert entry.subject == nil
+      assert entry.granted_claims == nil
+    end)
   end
 
   test "deny transitions pending->denied" do
@@ -138,6 +231,44 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
     assert {:ok, _} = Store.poll(r.auth_req_id_hash, %{now: now})
   end
 
+  test "query telemetry is suppressed for notification-token writes and full-row transitions" do
+    capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
+    on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
+    {_id, ref} = capture
+
+    assert is_integer(TestRepo.aggregate(CIBARequest, :count, :auth_req_id_hash))
+    assert AttestoPhoenix.TestTelemetryCapture.collect(ref) != []
+
+    now = System.system_time(:second)
+
+    r = %{
+      auth_req_id_hash: "telemetry-ciba-#{System.unique_integer([:positive])}",
+      data: put_data(delivery_mode: :ping, client_notification_token: "notification-token-secret"),
+      status: :pending,
+      interval: 0,
+      expires_at: now + 120,
+      last_polled_at: nil
+    }
+
+    log =
+      capture_log([level: :debug], fn ->
+        assert :ok = Store.put(r)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, _} = Store.lookup(r.auth_req_id_hash)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, _} = Store.poll(r.auth_req_id_hash, %{now: now})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, _} = Store.approve(r.auth_req_id_hash, %{subject: "user:alice"}, %{now: now})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:error, :already_decided} = Store.deny(r.auth_req_id_hash, %{now: now})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, _} = Store.consume(r.auth_req_id_hash, %{now: now})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+      end)
+
+    refute log =~ "notification-token-secret"
+  end
+
   defp put_data(overrides) do
     Map.merge(
       %{
@@ -153,5 +284,16 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
       },
       Map.new(overrides)
     )
+  end
+
+  defp put_record do
+    %{
+      auth_req_id_hash: "arh-#{System.unique_integer([:positive])}",
+      data: put_data(%{}),
+      status: :pending,
+      interval: 0,
+      expires_at: System.system_time(:second) + 120,
+      last_polled_at: nil
+    }
   end
 end

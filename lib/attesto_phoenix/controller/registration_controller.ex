@@ -69,7 +69,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   secret is never placed on the event.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
@@ -101,11 +101,6 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # is REQUIRED in the client information response; `0` denotes a secret that
   # does not expire. This server issues non-expiring secrets.
   @client_secret_non_expiring 0
-
-  # RFC 6749 §1.3 / §4: the grant types this server understands, against which a
-  # requested `grant_types` member is checked when the host has not narrowed the
-  # set via `:grant_types_supported`.
-  @default_grant_types_supported ~w(authorization_code refresh_token client_credentials)
 
   # RFC 7591 §2: a grant type that issues an authorization code (and thus
   # redirects the resource owner back to the client) requires at least one
@@ -157,7 +152,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   """
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, _params) do
-    config = config(conn)
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
     metadata = registration_metadata(conn)
 
@@ -186,28 +181,23 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   """
   @spec delete(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def delete(conn, %{"client_id" => client_id}) when is_binary(client_id) do
-    config = config(conn)
+    config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- check_https(conn, config),
          {:ok, token} <- registration_bearer_token(conn),
-         {:ok, client} <- Callback.invoke(Config.load_client_fun(config), [client_id]),
+         {:ok, client} <- Config.client_store_load(config, client_id),
          :ok <- verify_registration_access_token(config, client, token),
          :ok <- unregister_client(config, client) do
       send_resp(conn, :no_content, "")
     else
-      {:error, %{} = error} -> render_error(conn, error)
-      _ -> render_error(conn, invalid_registration_token_error())
+      {:error, %{} = error} ->
+        render_error(conn, error)
+
+      {:error, reason} when reason in [:not_found, :revoked] ->
+        render_error(conn, invalid_registration_token_error())
     end
   end
-
-  # ── Configuration ────────────────────────────────────────────────────────
-
-  # The per-request config is placed on the conn by the host pipeline (the same
-  # mechanism the other authorization-server controllers rely on). It is a
-  # validated `AttestoPhoenix.Config` struct read by field; this controller
-  # holds no policy of its own.
-  defp config(%Plug.Conn{private: %{attesto_phoenix_config: %Config{} = config}}), do: config
 
   # ── Request parsing ──────────────────────────────────────────────────────
 
@@ -410,13 +400,21 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   end
 
   defp validate_auth_method(metadata, config) do
-    supported = token_endpoint_auth_methods_supported(config)
+    supported = Config.token_endpoint_auth_methods_supported(config)
 
-    case Map.get(metadata, "token_endpoint_auth_method") do
-      nil ->
-        {:ok, @default_auth_method}
+    case Map.fetch(metadata, "token_endpoint_auth_method") do
+      :error ->
+        if @default_auth_method in supported do
+          {:ok, @default_auth_method}
+        else
+          {:error,
+           error(
+             @error_invalid_client_metadata,
+             "the default token_endpoint_auth_method client_secret_basic is not supported"
+           )}
+        end
 
-      method when is_binary(method) ->
+      {:ok, method} when is_binary(method) ->
         if method in supported do
           {:ok, method}
         else
@@ -427,7 +425,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
            )}
         end
 
-      _ ->
+      {:ok, _other} ->
         {:error, error(@error_invalid_client_metadata, "token_endpoint_auth_method must be a string")}
     end
   end
@@ -436,7 +434,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # (RFC 6749 §1.3). Absent, the client is registered with no grant types; the
   # host store decides whether that is acceptable.
   defp validate_grant_types(metadata, config) do
-    supported = grant_types_supported(config)
+    supported = Config.grant_types_supported(config)
 
     case Map.get(metadata, "grant_types") do
       nil ->
@@ -715,27 +713,6 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     Event.emit(config, :client_registered, %{client_id: Map.get(issued, "client_id")})
   end
 
-  # ── Policy inputs ────────────────────────────────────────────────────────
-
-  defp grant_types_supported(config) do
-    case config_field(config, :grant_types_supported) do
-      list when is_list(list) and list != [] -> list
-      _ -> @default_grant_types_supported
-    end
-  end
-
-  defp token_endpoint_auth_methods_supported(config) do
-    case config_field(config, :token_endpoint_auth_methods_supported) do
-      list when is_list(list) and list != [] -> list
-      _ -> [@default_auth_method, @auth_method_none]
-    end
-  end
-
-  # These two policy inputs are optional registration extensions to the core
-  # config; read them defensively so a config struct without the field falls
-  # back to the RFC defaults rather than crashing.
-  defp config_field(config, key), do: Map.get(config, key)
-
   # ── Helpers ──────────────────────────────────────────────────────────────
 
   defp registration_bearer_token(conn) do
@@ -792,7 +769,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   end
 
   defp render_error(conn, %OAuthError{} = err) do
-    OAuthError.render(conn, err, auth_scheme: :none, config: config(conn))
+    OAuthError.render(conn, err, auth_scheme: :none, config: Config.resolve!(conn))
   end
 
   defp error(code, description), do: OAuthError.new(code, description, status: 400)

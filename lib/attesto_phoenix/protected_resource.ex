@@ -27,6 +27,10 @@ defmodule AttestoPhoenix.ProtectedResource do
   """
   @spec authenticate(Plug.Conn.t(), Config.t(), String.t() | nil) :: result()
   def authenticate(%Plug.Conn{} = conn, %Config{} = config, resource_metadata) do
+    Config.with_request_config(config, fn -> do_authenticate(conn, config, resource_metadata) end)
+  end
+
+  defp do_authenticate(%Plug.Conn{} = conn, %Config{} = config, resource_metadata) do
     case RequestContext.check_https(conn, config) do
       :ok ->
         conn = Authenticate.call(conn, authenticate_opts(config, resource_metadata))
@@ -87,7 +91,15 @@ defmodule AttestoPhoenix.ProtectedResource do
   @doc "Return whether the access token identified by the claims is revoked."
   @spec access_token_revoked?(Config.t(), map()) :: boolean()
   def access_token_revoked?(%Config{code_store: store}, %{"jti" => jti}) when is_atom(store) and is_binary(jti) do
-    function_exported?(store, :access_token_revoked?, 1) and store.access_token_revoked?(jti)
+    if function_exported?(store, :access_token_revoked?, 1) do
+      case store.access_token_revoked?(jti) do
+        true -> true
+        false -> false
+        _unexpected -> raise RuntimeError, "code_store access_token_revoked?/1 must return true or false"
+      end
+    else
+      false
+    end
   end
 
   def access_token_revoked?(_config, _claims), do: false

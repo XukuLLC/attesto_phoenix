@@ -7,7 +7,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   convention-derived credential and nonce endpoint paths.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn,
     only: [get_req_header: 2, put_resp_content_type: 2, put_resp_header: 3, send_resp: 3]
@@ -27,7 +27,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   """
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
 
     metadata =
       CredentialIssuerMetadata.build(

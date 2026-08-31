@@ -10,10 +10,17 @@
 An opinionated Phoenix/Ecto OAuth 2.0 / OIDC authorization server on top of
 [attesto](https://hex.pm/packages/attesto).
 
-For a batteries-included authenticated MCP server integration, use
-[`attesto_mcp_server`](https://hex.pm/packages/attesto_mcp_server). It reuses
-AttestoPhoenix issuer, verification, revocation, principal, DPoP, and mTLS
-policy.
+The Attesto family also includes:
+
+- [`attesto`](https://hex.pm/packages/attesto) — the transport-neutral OAuth,
+  OIDC, FAPI, DPoP, and mTLS engine beneath this package.
+- [`attesto_client`](https://hex.pm/packages/attesto_client) — OAuth, OIDC, and
+  FAPI client flows and verification.
+- [`attesto_mcp`](https://hex.pm/packages/attesto_mcp) — the reusable
+  Attesto-backed authorization boundary for custom MCP integrations.
+- [`attesto_mcp_server`](https://hex.pm/packages/attesto_mcp_server) — the
+  batteries-included authenticated MCP server. It reuses this package's issuer,
+  verification, revocation, principal, DPoP, and mTLS policy.
 
 <a href="https://openid.net/certification/certified-openid-connect-implementations/"><img src="https://openid.net/wordpress-content/uploads/2016/04/oid-l-certification-mark-l-rgb-150dpi-90mm.png" alt="OpenID Certified" width="180" align="right"></a>
 
@@ -110,6 +117,8 @@ authorization server, use `attesto_phoenix`.
 ## Contents
 
 - [Installation](#installation)
+- [Upgrading from 2.x](#upgrading-from-2x)
+- [3.0 schema-prefix cutover guide](guides/upgrade_3_0_schema_prefix.md)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Mounting the routes](#mounting-the-routes)
@@ -127,7 +136,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 2.0"}
+    {:attesto_phoenix, "~> 3.0"}
   ]
 end
 ```
@@ -138,11 +147,111 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 2.0"},
+    {:attesto_phoenix, "~> 3.0"},
     {:igniter, "~> 0.5", only: [:dev], runtime: false}
   ]
 end
 ```
+
+## Upgrading from 2.x
+
+Version 3.0 requires `attesto` 2.x. Upgrade both packages together, then
+review any custom store modules against the new core contracts:
+
+Drain every 2.x token writer before starting 3.0, even when the old deployment
+used the default `public` schema. Version 3.0 adds durable refresh-family
+revocation tombstones that 2.x nodes do not read or write, so mixed 2.x/3.0
+writers are unsupported. Apply the generation-index migration and create/backfill
+the tombstone table, then start 3.0 and re-enable traffic. For a non-empty 2.x
+literal table prefix, also complete the table move and rename procedure in the
+[3.0 schema-prefix upgrade guide](guides/upgrade_3_0_schema_prefix.md).
+
+- A custom `Attesto.RefreshStore` must provide one atomic, family-serialized
+  `rotate/4` transaction. It replaces the old multi-step consume/insert/
+  successor flow and must commit the parent, child, retry state, and family
+  revocation checks together.
+- A custom `Attesto.DeviceCodeStore` must return the full entry from
+  `lookup_user_code/1` and `get/1`, and implement atomic, time-aware
+  `approve/3`, `deny/2`, `poll/2`, and `consume/2` transitions. Pass the
+  `:now`/`:interval` values supplied in the callback options through the
+  store's guards; do not reintroduce read-then-write decisions.
+- Dynamic client registration uses the widened 3.0 default grant catalog,
+  including OAuth token exchange. An explicit empty `grant_types_supported: []`
+  or `token_endpoint_auth_methods_supported: []` remains empty; it does not
+  fall back to the package defaults. Set an explicit narrowed catalog before
+  deployment when token exchange must remain unavailable.
+
+Before deploying, apply a forward Ecto migration for the unique
+`(family_id, generation)` index on `attesto_refresh_tokens` if your existing
+2.x database does not already have it. The exact Ecto operation is:
+
+```elixir
+def up do
+  prefix = nil # Replace with your configured PostgreSQL schema name when non-default.
+
+  create unique_index(
+    :attesto_refresh_tokens,
+    [:family_id, :generation],
+    name: :attesto_refresh_tokens_family_id_generation_index,
+    prefix: prefix
+  )
+end
+```
+
+Use the same `prefix` value as the runtime Ecto stores (`nil` for `public`, or
+the configured PostgreSQL schema name). The index name is intentionally bound
+to `attesto_refresh_tokens_family_id_generation_index`, including when a
+non-default prefix is used. If creation fails because duplicate
+family/generation rows already exist, stop the migration, reconcile the
+affected families, and revoke those families before retrying. Do not blindly
+delete duplicate rows: first determine which token lineage is authoritative
+and preserve the security audit trail. New installations can generate the
+complete migration with `mix attesto_phoenix.gen.migration --repo MyApp.Repo`;
+do not rerun that create-table migration against an existing database.
+
+The generated migration also creates
+`attesto_refresh_family_revocations`, a durable tombstone table used by the
+bundled refresh store. If an existing database is upgrading to this release,
+apply a forward migration for that table before deploying the new code and
+backfill it from every existing `attesto_refresh_tokens` row where
+`family_revoked = true` (using the same `schema_prefix` as the refresh table):
+
+```elixir
+def up do
+  prefix = "oauth" # Use nil for public; use one validated schema everywhere.
+  schema = prefix || "public"
+
+  create table(:attesto_refresh_family_revocations, primary_key: false, prefix: prefix) do
+    add :family_id, :string, primary_key: true, null: false
+    add :revoked_at, :utc_datetime, null: false
+  end
+
+  execute("""
+  INSERT INTO "#{schema}".attesto_refresh_family_revocations (family_id, revoked_at)
+  SELECT DISTINCT family_id, CURRENT_TIMESTAMP
+  FROM "#{schema}".attesto_refresh_tokens
+  WHERE family_revoked = true
+  ON CONFLICT (family_id) DO NOTHING
+  """)
+end
+```
+
+The example qualifies both tables from the reviewed `schema` value; validate
+that value and keep it identical to `schema_prefix`. Do not rerun the complete
+create-table migration against an existing database.
+
+Keep `AttestoPhoenix.Store.Sweeper` supervised after the host repo and set a
+positive `:sweep_interval_ms`. The sweeper removes expired rows and clears
+expired refresh-successor ciphertext; a custom cleanup job must provide both
+operations. The installer adds the child idempotently when rerun.
+
+If the bundled `AttestoPhoenix.Store.EctoRefreshStore` retains the default
+positive retry grace, set one stable `ATTESTO_REFRESH_SUCCESSOR_SECRET` of at
+least 32 bytes in runtime configuration on every node before boot. Production
+configuration leaves this absent or short value for `AttestoPhoenix.Config.new/1` to reject
+only when that bundled store and positive grace are selected. A custom refresh
+store or `refresh_token_rotation_grace_seconds: 0` remains valid without a
+usable Ecto successor secret.
 
 ## Quick start
 
@@ -157,11 +266,26 @@ mix attesto_phoenix.gen.migration --repo MyApp.Repo
 mix ecto.migrate
 ```
 
+When the generated configuration keeps the bundled Ecto refresh store and its
+positive retry grace, provision one stable `ATTESTO_REFRESH_SUCCESSOR_SECRET`
+of at least 32 bytes before the first non-development boot. Config validation
+rejects that combination when the secret is absent or too short; custom refresh
+stores and strict zero-grace deployments do not need this Ecto-specific key.
+Every node serving the same refresh-token families must use the same value.
+
 Use `--oauth-path-prefix` when the OAuth endpoints should not live under
 `/oauth`:
 
 ```bash
 mix attesto_phoenix.install --oauth-path-prefix /mcp/oauth
+```
+
+For a fresh installation in a non-default PostgreSQL schema, pass the same
+validated schema to the installer and migration generator:
+
+```bash
+mix attesto_phoenix.install --schema-prefix oauth
+mix attesto_phoenix.gen.migration --repo MyApp.Repo --schema-prefix oauth
 ```
 
 After the installer runs, fill in the generated callback modules and configure a
@@ -175,6 +299,7 @@ inherently application policy is a neutral callback rather than a baked-in
 assumption.
 
 ```elixir
+# config/config.exs
 # Points controllers and Ecto-backed stores at the host application.
 config :attesto_phoenix,
   otp_app: :my_app,
@@ -211,6 +336,9 @@ config :my_app, AttestoPhoenix.Config,
   trusted_proxies: ["10.0.0.0/8"],     # honor X-Forwarded-* only from these
   access_token_ttl: 900,
   refresh_token_ttl: 1_209_600,
+  refresh_token_rotation_grace_seconds: 60,
+  schema_prefix: nil,                   # PostgreSQL schema; nil means `public`
+  sweep_interval_ms: 60_000,
   authorization_code_ttl: 60,
   authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id",
   dpop_enabled: true,
@@ -233,6 +361,58 @@ config :my_app, AttestoPhoenix.Config,
     allowed_resources_for: {MyApp.OAuth, :resources_for}  # optional per-client (client -> [uri])
   ]
 ```
+
+The bundled Ecto refresh store encrypts the retry record used by a non-zero
+refresh-rotation grace period. Load its key from runtime configuration:
+
+```elixir
+# config/runtime.exs
+config :attesto_phoenix,
+  refresh_successor_secret:
+    System.fetch_env!("ATTESTO_REFRESH_SUCCESSOR_SECRET")
+```
+
+Use at least 32 bytes and keep the value identical across every node and
+deployment that serves the same refresh-token families. Changing or losing it
+prevents recovery of an in-flight rotation retry. `AttestoPhoenix.Config`
+refuses the bundled Ecto store with a non-zero grace period when this setting
+is missing or too short. Set `refresh_token_rotation_grace_seconds: 0` only
+when you intentionally prefer strict immediate reuse handling and do not need
+retry recovery. The installer writes an idempotent runtime entry with this
+production fail-fast behavior and an explicitly development/test-only fallback.
+
+Successor retry state written by this release uses an authenticated v2 envelope
+bound to the parent hash, family, parent generation, child hash, and fixed
+retry deadline. After a stopped cutover from 2.x to 3.0, the store also
+accepts the v1 envelope (the package-wide authenticated-data value used by
+older releases). Mixed 2.x/3.0 deployments are unsupported. That v1
+compatibility path has a deliberately reduced binding: the
+ciphertext is authenticated but is not cryptographically tied to its parent or
+family, so the store additionally requires durable child lineage before it can
+expose a recovered successor. Plaintext successor maps are never accepted from
+the database. Complete the upgrade and allow the sweeper to redact v1 state;
+new writes are always v2-bound.
+
+When wiring the Ecto stores by hand, supervise the sweeper after your repo. It
+removes expired rows and irreversibly redacts the encrypted successor on the
+first scheduled sweep after its short retry window has passed:
+
+```elixir
+# lib/my_app/application.ex
+children = [
+  MyApp.Repo,
+  {AttestoPhoenix.Store.Sweeper,
+   config: AttestoPhoenix.Config.from_otp_app(:my_app)}
+]
+```
+
+`mix attesto_phoenix.install` adds this child and the 60-second sweep interval
+for you. A manual Ecto configuration with positive refresh retry grace must do
+both; ordinary expired-row pruning alone does not promptly remove successor
+ciphertext from a still-live refresh-token row.
+Supervise one sweeper per independent `{repo, schema_prefix}` pair when the host
+serves multiple request-scoped profiles; never share one sweeper across schemas
+or start duplicate sweepers for the same pair.
 
 Build the validated struct wherever you need it:
 
@@ -260,8 +440,10 @@ config :my_app, AttestoPhoenix.Config,
 The feature is disabled by default. When configured, Attesto Phoenix generates
 a 128-bit authorization family ID (22 unpadded Base64URL characters), stores it
 as the authorization code's `family_id`, and signs that exact value into the
-initial and refreshed access tokens. Refresh rotation and lost-response retry
-preserve the family ID while every access token receives a fresh `jti`.
+initial and refreshed access tokens. The refresh token itself has an independent
+internal family ID owned by Attesto 2.0; refresh rotation and lost-response
+retry preserve the authorization claim while every access token receives a
+fresh `jti`.
 
 Within access tokens the library owns the value: host principal/code claims
 cannot replace it, and other grant types strip the configured claim instead of
@@ -277,12 +459,11 @@ itself rather than through the authorization endpoint — is permanently
 ineligible. Neither its initial nor any refreshed access token carries the
 claim, so claim presence never changes within one family. Redemption may still
 create an internal refresh family. Refresh-token rotation continues normally,
-and refresh-token reuse detection continues to revoke that family.
-Authorization-code replay, however, cannot revoke it: the code carries no
-`family_id` linking it to the descendant family, so there is nothing for reuse
-detection to match on. The
-claim is a
-correlation handle, not proof that a refresh family exists or remains active.
+and refresh-token reuse detection continues to revoke that family. When the
+configured code store supports reuse tracking, authorization-code replay also
+binds to the actual refresh family issued for that redemption, independently of
+whether the configured authorization claim exists. The claim is a correlation
+handle, not proof that a refresh family exists or remains active.
 No migration is required because issuance reuses the existing `family_id`
 fields. Use a private claim name under a namespace you control; do not use OIDC
 `sid`, which identifies an OP browser session with a different lifecycle.
@@ -929,14 +1110,35 @@ behaviours: `attesto_authorization_codes`, `attesto_refresh_tokens`,
 `dpop_nonces`, `dpop_replays`, and `attesto_pushed_authorization_requests`, plus
 two feature tables — `attesto_client_id_metadata` (the CIMD client-metadata
 cache) and `attesto_consent_grants` (the single-use, request-bound consent-grant
-primitive). It does **not** own a clients table (that is yours, behind
-`:load_client`).
+primitive) — and the `attesto_refresh_family_revocations` table that retains
+refresh-family revocation tombstones after token-row cleanup. It does **not**
+own a clients table (that is yours, behind `:load_client`).
 
 Generate the migration into your app:
 
 ```bash
 mix attesto_phoenix.gen.migration --repo MyApp.Repo
 ```
+
+When the host configures a non-default `schema_prefix`, the generator picks it
+up automatically from `config :attesto_phoenix, otp_app: ...` (or the current
+Mix project's app), so the command above remains aligned with runtime Ecto
+queries. Pass `--schema-prefix` to override it explicitly. This option selects
+one PostgreSQL schema through Ecto's `prefix:` option; it does not alter the
+canonical table names.
+
+The 2.x host `:table_prefix` key, separate package-level
+`config :attesto_phoenix, :table_prefix` setting, and `--table-prefix` generator
+flag are rejected in 3.0. They meant literal table-name prefixing, which is a
+different database layout and cannot be silently translated. Remove every old
+setting, rename the public host key to `:schema_prefix`, inventory the old
+tables, and follow the [3.0 schema-prefix upgrade guide](guides/upgrade_3_0_schema_prefix.md)
+before deploying.
+
+The generated migration passes that prefix to both the table and every index;
+it does not prepend the prefix to the table or index name. In particular, its
+refresh-generation constraint is the named index
+`attesto_refresh_tokens_family_id_generation_index` shown above.
 
 Then run it:
 
@@ -952,7 +1154,12 @@ across machines mid-flow. Access tokens are stateless signed JWTs (any node
 validates any token against the shared keystore); everything else lives in
 Postgres with atomic single-use enforcement (`DELETE … RETURNING` for codes and
 PAR references, conditional `UPDATE` for nonces, `INSERT … ON CONFLICT` for the
-replay cache, transactional refresh rotation/family revocation).
+replay cache, and a family-serialized refresh transaction). Refresh rotation
+locks the family and parent, consumes the parent, inserts exactly one child,
+and persists the authenticated-encrypted retry state in one database
+transaction. Matching concurrent retries therefore receive the committed
+successor, while reuse and revocation remain serialized against new family
+members; no partially rotated family is observable.
 
 To be fully clusterable, wire the Ecto stores (the `mix attesto_phoenix.install`
 config block does this by default):
@@ -965,6 +1172,11 @@ replay_check:  {AttestoPhoenix.Store.EctoReplayCheck, :check_and_record},
 par_store:     AttestoPhoenix.Store.EctoPARStore
 ```
 
+The Ecto refresh store also needs the stable
+`ATTESTO_REFRESH_SUCCESSOR_SECRET` runtime setting shown in
+[Configuration](#configuration) whenever
+`refresh_token_rotation_grace_seconds` is greater than zero (the default).
+
 Single-node deployments may instead use the in-memory ETS implementations for
 nonces, replay, and PAR; the Ecto variants exist for clustered correctness.
 Signed CIBA still requires an explicit `:replay_check`, so a single-node host
@@ -974,6 +1186,8 @@ using ETS must supervise `Attesto.DPoP.ReplayCache` and point the callback at
 *requires* PAR, so a clustered FAPI deployment must set
 `par_store: AttestoPhoenix.Store.EctoPARStore` or a pushed `request_uri` will not
 resolve on the node that later handles `/authorize`.
+When `require_pushed_authorization_requests: true`, any custom PAR store must
+also implement atomic `take/1`; configuration rejects fetch-only stores.
 
 ## Local HTTPS for development
 
@@ -1006,6 +1220,8 @@ full walkthrough and the tunnel-vs-mkcert tradeoff.
 
 - [Example configurations](guides/examples.md) - confidential and public-client
   configuration sketches.
+- [3.0 schema-prefix cutover](guides/upgrade_3_0_schema_prefix.md) - inventory,
+  migrate, verify, and cut over from the 2.x literal table-name layout.
 - [Local HTTPS for development](guides/local_https.md) - serve a locally-trusted
   mkcert certificate so the OAuth / MCP flow runs over `https://localhost` with no
   tunnel and no downgrade.

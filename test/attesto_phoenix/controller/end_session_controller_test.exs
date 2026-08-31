@@ -11,6 +11,7 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
 
   use AttestoPhoenix.DataCase, async: false
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
@@ -38,6 +39,20 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       send(pid, {:bc_post, uri, logout_token})
       :ok
     end
+  end
+
+  defmodule ErrorHTTP do
+    @moduledoc false
+    @behaviour AttestoPhoenix.BackChannelLogout
+
+    @impl true
+    def post(_uri, _logout_token), do: {:error, {:transport, "logout-http-private-sentinel"}}
+  end
+
+  defmodule ErrorStore do
+    @moduledoc false
+
+    def take_targets(_criteria), do: raise("logout-store-private-sentinel")
   end
 
   setup do
@@ -99,17 +114,36 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
   defp call(method, params) do
     method
     |> conn("/oauth/end_session", params)
+    |> put_private(
+      :attesto_phoenix_config,
+      Config.new(Application.fetch_env!(:attesto_phoenix, @config_key))
+    )
     |> Controller.end_session(params)
   end
 
   defp call_html(method, params) do
     method
     |> conn("/oauth/end_session", params)
+    |> put_private(
+      :attesto_phoenix_config,
+      Config.new(Application.fetch_env!(:attesto_phoenix, @config_key))
+    )
     |> put_req_header("accept", "text/html,application/xhtml+xml")
     |> Controller.end_session(params)
   end
 
   defp body(conn), do: JSON.decode!(conn.resp_body)
+
+  defp with_app_config(overrides, fun) do
+    original = Application.fetch_env!(:attesto_phoenix, @config_key)
+    Application.put_env(:attesto_phoenix, @config_key, Keyword.merge(original, overrides))
+
+    try do
+      fun.()
+    after
+      Application.put_env(:attesto_phoenix, @config_key, original)
+    end
+  end
 
   defp logout_payload(jwt) do
     [_h, p | _] = String.split(jwt, ".")
@@ -118,7 +152,9 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
   end
 
   describe "RP-initiated redirect" do
-    test "valid hint + registered uri redirects with state and terminates the session", %{hint: hint} do
+    test "valid hint + registered uri redirects with state and terminates the session", %{
+      hint: hint
+    } do
       conn =
         call(:get, %{
           "id_token_hint" => hint,
@@ -153,7 +189,10 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
 
     test "a browser (Accept: text/html) gets an HTML error page, not JSON", %{hint: hint} do
       conn =
-        call_html(:get, %{"id_token_hint" => hint, "post_logout_redirect_uri" => "https://evil.example/steal"})
+        call_html(:get, %{
+          "id_token_hint" => hint,
+          "post_logout_redirect_uri" => "https://evil.example/steal"
+        })
 
       assert conn.status == 400
       assert conn |> get_resp_header("content-type") |> List.first() =~ "text/html"
@@ -216,7 +255,47 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       assert [] = Store.targets(%{sid: @sid})
     end
 
-    test "logout enabled without :terminate_session fails config validation (no fail-open)", %{config: _config} do
+    test "a logout-session store exception is logged without exception data", %{hint: hint} do
+      log =
+        with_app_config([logout_session_store: ErrorStore], fn ->
+          capture_log(fn ->
+            conn = call(:get, %{"id_token_hint" => hint})
+            assert conn.status == 200
+          end)
+        end)
+
+      assert log =~ "logout session store failed; back-channel targets were not loaded"
+      refute log =~ "logout-store-private-sentinel"
+    end
+
+    test "a back-channel delivery error is logged without error data", %{hint: hint} do
+      now = System.system_time(:second)
+
+      :ok =
+        Store.record(%{
+          sid: @sid,
+          subject: @subject,
+          client_id: "rp-error",
+          backchannel_logout_uri: "https://rp-error.example/bc",
+          session_required: true,
+          expires_at: now + 3600
+        })
+
+      log =
+        with_app_config([logout: [enabled: true, http_client: ErrorHTTP]], fn ->
+          capture_log(fn ->
+            conn = call(:get, %{"id_token_hint" => hint})
+            assert conn.status == 200
+          end)
+        end)
+
+      assert log =~ "back-channel logout delivery failed"
+      refute log =~ "logout-http-private-sentinel"
+    end
+
+    test "logout enabled without :terminate_session fails config validation (no fail-open)", %{
+      config: _config
+    } do
       base = Application.get_env(:attesto_phoenix, @config_key)
       no_terminate = Keyword.delete(base, :terminate_session)
 
@@ -266,8 +345,12 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
 
       # Front-Channel Logout 1.0 §2: iss and sid ride together as query params.
       encoded_iss = URI.encode_www_form(@issuer)
-      assert conn.resp_body =~ ~s(<iframe src="https://rp-fc-1.example/fc?iss=#{encoded_iss}&amp;sid=#{@sid}")
-      assert conn.resp_body =~ ~s(<iframe src="https://rp-fc-2.example/fc?x=1&amp;iss=#{encoded_iss}&amp;sid=#{@sid}")
+
+      assert conn.resp_body =~
+               ~s(<iframe src="https://rp-fc-1.example/fc?iss=#{encoded_iss}&amp;sid=#{@sid}")
+
+      assert conn.resp_body =~
+               ~s(<iframe src="https://rp-fc-2.example/fc?x=1&amp;iss=#{encoded_iss}&amp;sid=#{@sid}")
 
       # the rows are consumed by the render
       assert [] = Store.targets(%{sid: @sid})
@@ -306,7 +389,9 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       refute conn.resp_body =~ "http-equiv=\"refresh\""
     end
 
-    test "a non-browser caller cannot run iframes: plain completion, targets skipped", %{hint: hint} do
+    test "a non-browser caller cannot run iframes: plain completion, targets skipped", %{
+      hint: hint
+    } do
       record_front_channel("rp-fc", "https://rp-fc.example/fc")
 
       conn =
@@ -317,10 +402,14 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
         })
 
       assert conn.status in 302..303
-      assert conn |> get_resp_header("location") |> List.first() == "https://rp.example/after?state=xyz"
+
+      assert conn |> get_resp_header("location") |> List.first() ==
+               "https://rp.example/after?state=xyz"
     end
 
-    test "a session with both channels POSTs the logout_token AND renders the iframe", %{hint: hint} do
+    test "a session with both channels POSTs the logout_token AND renders the iframe", %{
+      hint: hint
+    } do
       record_front_channel("rp-both", "https://rp-both.example/fc",
         extra: [backchannel_logout_uri: "https://rp-both.example/bc", session_required: true]
       )
@@ -343,12 +432,16 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
         })
 
       assert conn.status in 302..303
-      assert conn |> get_resp_header("location") |> List.first() == "https://rp.example/after?state=xyz"
+
+      assert conn |> get_resp_header("location") |> List.first() ==
+               "https://rp.example/after?state=xyz"
     end
   end
 
   describe "session management browser state (Session Management 1.0 §3.2)" do
-    test "logout expires the OP browser-state cookie when session management is enabled", %{hint: hint} do
+    test "logout expires the OP browser-state cookie when session management is enabled", %{
+      hint: hint
+    } do
       base = Application.get_env(:attesto_phoenix, @config_key)
 
       Application.put_env(

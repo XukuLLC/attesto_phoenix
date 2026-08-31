@@ -19,12 +19,15 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   import ExUnit.CaptureLog
   import Plug.Conn
-  import Plug.Test
+  import Plug.Test, only: []
 
   alias Attesto.CodeStore.ETS
   alias Attesto.DPoP.ReplayCache
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.TokenController
+  alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Schema.RefreshToken
+  alias AttestoPhoenix.Store.EctoCodeStore
   alias AttestoPhoenix.Store.EctoRefreshStore
   alias Ecto.Adapters.SQL.Sandbox
   alias Plug.Conn.Unfetched
@@ -88,6 +91,76 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     def take_targets(_criteria), do: []
   end
 
+  defmodule RefusingLogoutStore do
+    @moduledoc false
+    @behaviour Attesto.LogoutSessionStore
+
+    @impl true
+    def record(_entry), do: :error
+
+    @impl true
+    def targets(_criteria), do: []
+
+    @impl true
+    def delete(_criteria), do: :ok
+
+    @impl true
+    def take_targets(_criteria), do: []
+  end
+
+  # Attesto 2.x returns :temporarily_unavailable only when the atomic refresh
+  # transaction is known to have rolled back. This fake keeps the parent
+  # readable and forces that operational result for the controller regression.
+  defmodule TemporarilyUnavailableRefreshStore do
+    @moduledoc false
+    @behaviour Attesto.RefreshStore
+
+    @token "controller-refresh-token-for-temporary-failure"
+
+    def token, do: @token
+
+    @impl true
+    def insert(_record), do: :ok
+
+    @impl true
+    def get(token_hash) do
+      if token_hash == Attesto.Secret.hash(@token) do
+        {:ok,
+         %{
+           token_hash: token_hash,
+           family_id: "controller-temporary-failure-family",
+           generation: 0,
+           data: %{
+             subject: "oc_sub-1",
+             scope: ["read"],
+             resource: [],
+             client_id: "confidential-1",
+             dpop_jkt: nil,
+             acr: nil,
+             auth_time: nil,
+             claims: %{}
+           },
+           expires_at: System.system_time(:second) + 600,
+           consumed: false,
+           consumed_at: nil,
+           successor: nil
+         }}
+      else
+        :error
+      end
+    end
+
+    def consume(_token_hash, _opts), do: :error
+
+    def remember_successor(_token_hash, _successor, _opts), do: :error
+
+    @impl true
+    def revoke_family(_family_id), do: :ok
+
+    @impl true
+    def rotate(_parent_hash, _child, _successor, _opts), do: {:error, :invalid_rotation}
+  end
+
   # A reuse-tracking `Attesto.CodeStore` (OAuth 2.0 Security BCP §4.13). Unlike
   # the bundled `Attesto.CodeStore.ETS`, it implements the OPTIONAL
   # reuse-tracking pair: `take/1` returns `{:error, :consumed, meta}` for a code
@@ -140,7 +213,24 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     @impl true
     def mark_consumed(code_hash, meta) do
       true = :ets.insert(@consumed, {code_hash, meta})
+
+      case {Map.get(meta, :family_id), :ets.lookup(@access_tokens, {:code_token, code_hash})} do
+        {family_id, [{{:code_token, ^code_hash}, jti}]}
+        when is_binary(family_id) and family_id != "" ->
+          true = :ets.insert(@access_tokens, {{:token, family_id}, jti})
+
+        _ ->
+          :ok
+      end
+
       :ok
+    end
+
+    def consumed_meta(code_hash) do
+      case :ets.lookup(@consumed, code_hash) do
+        [{^code_hash, meta}] -> {:ok, meta}
+        [] -> :error
+      end
     end
 
     def record_access_token(family_id, jti, _expires_at) do
@@ -158,6 +248,51 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     def access_token_revoked?(jti) do
       :ets.lookup(@access_tokens, {:revoked, jti}) != []
+    end
+
+    def access_token_recorded_for_family?(family_id) do
+      :ets.lookup(@access_tokens, {:token, family_id}) != []
+    end
+
+    def record_access_token_for_code(code_hash, jti, _expires_at) do
+      true = :ets.insert(@access_tokens, {{:code_token, code_hash}, jti})
+      :ok
+    end
+
+    def revoke_access_token_for_code(code_hash) do
+      for {{:code_token, ^code_hash}, jti} <- :ets.tab2list(@access_tokens) do
+        true = :ets.insert(@access_tokens, {{:revoked, jti}, true})
+      end
+
+      :ok
+    end
+  end
+
+  # Legacy reuse-tracking store deliberately lacks the code-hash JTI callback.
+  # The token endpoint must refuse an authorization-code refresh rather than
+  # call its family callback with the code's provenance family, which is not
+  # the family the core creates for the refresh token.
+  defmodule LegacyReuseCodeStore do
+    @moduledoc false
+    @behaviour Attesto.CodeStore
+
+    defdelegate put(record), to: ReuseCodeStore
+    defdelegate take(code_hash), to: ReuseCodeStore
+    defdelegate mark_consumed(code_hash, meta), to: ReuseCodeStore
+    defdelegate record_access_token(family_id, jti, expires_at), to: ReuseCodeStore
+    defdelegate revoke_family_access_tokens(family_id), to: ReuseCodeStore
+    defdelegate access_token_revoked?(jti), to: ReuseCodeStore
+  end
+
+  # A refresh store probe for no-refresh replay tests. If the consumed
+  # authorization row accidentally retains its provenance family, the replay
+  # path would call this callback with the wrong identifier.
+  defmodule RecordingRevokeStore do
+    @moduledoc false
+
+    def revoke_family(family_id) do
+      send(Application.fetch_env!(:attesto_phoenix, :test_revoke_family_pid), {:revoke_family, family_id})
+      :ok
     end
   end
 
@@ -188,13 +323,18 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     clients =
       Map.new([@public_client, @confidential_client], &{&1.id, &1})
 
+    # The Ecto cases use the shared sandbox repo. Keep the non-Ecto cases on
+    # this module's package-repo fixture so the default suite remains free of
+    # a database dependency.
+    repo = if context[:ecto], do: AttestoPhoenix.TestRepo, else: __MODULE__.Repo
+
     base = [
       issuer: "https://issuer.example",
       # Derived into the protocol `Attesto.Config` by the minting paths; the
       # core requires a non-empty audience, so the token-minting tests need it.
       audience: "https://issuer.example",
       keystore: __MODULE__.Keystore,
-      repo: __MODULE__.Repo,
+      repo: repo,
       # RFC 6749 §2.3: lookup carries existence and the revocation gate. A
       # `revoked-1` lookup reports `{:error, :revoked}`.
       load_client: fn
@@ -235,6 +375,50 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert log =~ "token endpoint denied"
       assert log =~ "invalid_client"
+    end
+  end
+
+  if function_exported?(Attesto.RefreshStore.ETS, :rotate, 4) do
+    describe "temporarily unavailable refresh rotation" do
+      test "renders OAuth 503, emits the matching denial, and logs no store reason" do
+        capture_events()
+
+        put_config(
+          refresh_store: TemporarilyUnavailableRefreshStore,
+          refresh_token_rotation_grace_seconds: 0
+        )
+
+        log =
+          capture_log(fn ->
+            conn =
+              post_token(%{
+                "grant_type" => "refresh_token",
+                "client_id" => "confidential-1",
+                "client_secret" => "s3cr3t",
+                "refresh_token" => TemporarilyUnavailableRefreshStore.token()
+              })
+
+            assert conn.status == 503
+            assert body(conn)["error"] == "temporarily_unavailable"
+            assert body(conn)["error_description"] == "temporarily unavailable"
+            assert get_resp_header(conn, "cache-control") == ["no-store"]
+            assert get_resp_header(conn, "pragma") == ["no-cache"]
+          end)
+
+        assert_receive {:event,
+                        %AttestoPhoenix.Event{
+                          name: :token_denied,
+                          result: "temporarily_unavailable",
+                          metadata: %{error: "temporarily_unavailable", http_status: 503}
+                        }}
+
+        assert log =~ "refresh token rotation temporarily unavailable; retry the request"
+        refute log =~ "invalid_rotation"
+        refute log =~ TemporarilyUnavailableRefreshStore.token()
+
+        assert {:ok, %{consumed: false}} =
+                 TemporarilyUnavailableRefreshStore.get(Attesto.Secret.hash(TemporarilyUnavailableRefreshStore.token()))
+      end
     end
   end
 
@@ -417,6 +601,47 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       # Authentication succeeded; only the grant type is rejected downstream.
       assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
+    test "accepts a 2048-bit RSA RS256 assertion under an explicit non-FAPI policy" do
+      client_key = JOSE.JWK.generate_key({:rsa, 2048})
+      client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "RS256"})]}
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+        client_auth_signing_algs: ["RS256"],
+        client_auth_enforce_fapi_alg_policy: false
+      )
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => client_assertion(client_key, "confidential-1", %{}, "RS256")
+        })
+
+      # Authentication succeeded; only the intentionally unsupported grant is
+      # rejected downstream.
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
+    test "the default FAPI-tight policy rejects a 2048-bit RSA RS256 assertion" do
+      client_key = JOSE.JWK.generate_key({:rsa, 2048})
+      client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "RS256"})]}
+
+      # Leaving both policy keys unset exercises Config.new/1's FAPI-tight
+      # defaults: RS256 is not in the accepted FAPI signing set.
+      put_config(client_jwks: fn %{id: "confidential-1"} -> client_jwks end)
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => client_assertion(client_key, "confidential-1", %{}, "RS256")
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
     end
 
     test "accepts Client Attestation JWT + PoP headers as attest_jwt_client_auth" do
@@ -981,6 +1206,59 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   end
 
   describe "denial events" do
+    test "delivers refresh reuse before the ordinary denial without credential material" do
+      capture_events()
+      enable_minting()
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_sub-1",
+          scope: ["read"],
+          client_id: "public-1"
+        })
+
+      put_config(
+        refresh_store: refresh_store,
+        refresh_token_rotation_grace_seconds: 0
+      )
+
+      params = %{
+        "grant_type" => "refresh_token",
+        "client_id" => "public-1",
+        "refresh_token" => refresh_token
+      }
+
+      assert post_token(params).status == 200
+
+      assert_receive {:event,
+                      %AttestoPhoenix.Event{
+                        name: :refresh_rotated,
+                        client_id: "public-1",
+                        subject: "oc_sub-1"
+                      }}
+
+      assert post_token(params).status == 400
+
+      assert_receive {:event,
+                      %AttestoPhoenix.Event{
+                        name: :refresh_reuse_detected,
+                        client_id: "public-1",
+                        grant_type: "refresh_token",
+                        result: :reuse_detected
+                      } = reuse_event}
+
+      assert_receive {:event,
+                      %AttestoPhoenix.Event{
+                        name: :token_denied,
+                        client_id: "public-1",
+                        grant_type: "refresh_token",
+                        result: "invalid_grant"
+                      } = denial_event}
+
+      refute inspect([reuse_event, denial_event]) =~ refresh_token
+    end
+
     test "emits token_denied for invalid client authentication" do
       capture_events()
 
@@ -1702,7 +1980,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   describe "authorization-grant ID claim" do
     @tag :ecto
-    test "matches the authorization and refresh family through rotation and retry" do
+    test "preserves authorization provenance through refresh rotation and retry" do
       enable_minting()
       family_id = "AAAAAAAAAAAAAAAAAAAAAA"
 
@@ -1718,6 +1996,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       put_config(
         refresh_store: EctoRefreshStore,
+        sweep_interval_ms: 1_000,
         code_store: code_store,
         authorization_grant_id_claim: @authorization_grant_id_claim,
         build_principal: fn _client, subject, scope ->
@@ -1739,7 +2018,10 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert {:ok, initial_refresh} =
                EctoRefreshStore.get(Attesto.Secret.hash(initial_body["refresh_token"]))
 
-      assert initial_refresh.family_id == family_id
+      # Attesto 2.0 owns refresh-family identifiers. The authorization code's
+      # family is provenance for the configured public claim, not public
+      # refresh-token rotation state.
+      refute initial_refresh.family_id == family_id
 
       refresh_params = %{
         "grant_type" => "refresh_token",
@@ -1759,7 +2041,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
           token_hash: Attesto.Secret.hash(initial_body["refresh_token"])
         )
 
-      assert %{"v" => 1, "ciphertext" => ciphertext} = parent.successor
+      assert %{"v" => 2, "ciphertext" => ciphertext} = parent.successor
       assert is_binary(ciphertext)
       refute inspect(parent.successor) =~ rotated_body["refresh_token"]
 
@@ -1786,6 +2068,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       put_config(
         refresh_store: EctoRefreshStore,
+        sweep_interval_ms: 1_000,
         code_store: code_store,
         authorization_grant_id_claim: @authorization_grant_id_claim
       )
@@ -1935,6 +2218,70 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert is_binary(body(conn)["refresh_token"])
     end
 
+    test "a confidential authorization-code DPoP proof does not pin the refresh token" do
+      enable_minting()
+      refresh_store = start_refresh_store()
+
+      code_store =
+        start_unbound_confidential_code_store("oc_sub-1", ["openid", "offline_access"],
+          code_challenge: @code_challenge,
+          code_challenge_method: "S256"
+        )
+
+      initial_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
+
+      put_config(
+        refresh_store: refresh_store,
+        code_store: code_store,
+        dpop_enabled: true,
+        require_pkce: false
+      )
+
+      initial = post_dpop_confidential_auth_code(initial_proof)
+      assert initial.status == 200
+      refresh_token = body(initial)["refresh_token"]
+      assert is_binary(refresh_token)
+
+      assert {:ok, stored} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+      assert stored.data.dpop_jkt == nil
+
+      {wrong_proof, wrong_jkt} = dpop_proof_and_jkt([])
+      wrong_key = post_dpop_confidential_refresh(refresh_token, wrong_proof)
+      assert wrong_key.status == 200
+      assert wrong_jkt != initial_jkt
+      assert peek_claims(body(wrong_key)["access_token"])["cnf"]["jkt"] == wrong_jkt
+    end
+
+    test "authorization-code refresh context carries a narrowed resource" do
+      enable_minting()
+      start_refresh_store()
+
+      code_store =
+        start_code_store("oc_sub-1", ["read", "offline_access"],
+          resource: ["https://api.example/a", "https://api.example/b"]
+        )
+
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: code_store
+      )
+
+      conn =
+        post_token(%{
+          "grant_type" => "authorization_code",
+          "client_id" => "public-1",
+          "code" => Process.get(:auth_code),
+          "code_verifier" => @code_verifier,
+          "redirect_uri" => @redirect_uri,
+          "resource" => "https://api.example/a"
+        })
+
+      assert conn.status == 200
+      assert {:ok, refresh} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(body(conn)["refresh_token"]))
+      assert refresh.data.resource == ["https://api.example/a"]
+    end
+
     test "no refresh token when offline_access is absent and no host gate is set" do
       enable_minting()
       start_refresh_store()
@@ -1968,10 +2315,49 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert is_binary(body(conn)["refresh_token"])
     end
 
-    test "confidential DPoP refresh rotation may use a fresh proof key" do
+    test "confidential private_key_jwt DPoP refresh accepts a newly rotated proof key" do
       enable_minting()
       start_refresh_store()
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+      initial_code_store =
+        start_unbound_confidential_code_store("oc_sub-1", ["openid", "offline_access"],
+          code_challenge: @code_challenge,
+          code_challenge_method: "S256"
+        )
+
       {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: initial_code_store,
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+        dpop_enabled: true,
+        require_pkce: false
+      )
+
+      initial = post_dpop_private_key_jwt_auth_code(initial_proof, client_key)
+
+      assert initial.status == 200
+      refresh_token = body(initial)["refresh_token"]
+      assert is_binary(refresh_token)
+      assert {:ok, stored} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+      assert stored.data.dpop_jkt == nil
+
+      {rotated_proof, rotated_jkt} = dpop_proof_and_jkt([])
+      rotated = post_dpop_private_key_jwt_refresh(refresh_token, rotated_proof, client_key)
+
+      assert rotated.status == 200
+      assert rotated_jkt != initial_jkt
+      assert peek_claims(body(rotated)["access_token"])["cnf"]["jkt"] == rotated_jkt
+    end
+
+    test "a confidential DPoP-bound authorization code issues an unbound refresh token" do
+      enable_minting()
+      start_refresh_store()
+      initial_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
 
       code_store =
         start_dpop_confidential_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
@@ -1988,22 +2374,30 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert initial.status == 200
       refresh_token = body(initial)["refresh_token"]
       assert is_binary(refresh_token)
+      assert {:ok, stored} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+      assert stored.data.dpop_jkt == nil
 
-      {refresh_proof, refresh_jkt} = dpop_proof_and_jkt([])
-      rotated = post_dpop_confidential_refresh(refresh_token, refresh_proof)
+      {rotated_proof, rotated_jkt} = dpop_proof_and_jkt([])
+      rotated = post_dpop_confidential_refresh(refresh_token, rotated_proof)
 
       assert rotated.status == 200
-      assert is_binary(body(rotated)["refresh_token"])
-      assert peek_claims(body(rotated)["access_token"])["cnf"]["jkt"] == refresh_jkt
+      assert rotated_jkt != initial_jkt
+      assert peek_claims(body(rotated)["access_token"])["cnf"]["jkt"] == rotated_jkt
     end
 
     test "confidential DPoP refresh retry returns the same successor within configured grace" do
       enable_minting()
       start_refresh_store()
-      {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+      initial_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
 
       code_store =
-        start_dpop_confidential_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
+        start_unbound_confidential_code_store(
+          "oc_sub-1",
+          ["openid", "offline_access"],
+          code_challenge: @code_challenge,
+          code_challenge_method: "S256"
+        )
 
       put_config(
         refresh_store: Attesto.RefreshStore.ETS,
@@ -2019,25 +2413,30 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       old_refresh_token = body(initial)["refresh_token"]
       assert is_binary(old_refresh_token)
 
-      {first_proof, _first_jkt} = dpop_proof_and_jkt([])
+      {first_proof, _first_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
       first = post_dpop_confidential_refresh(old_refresh_token, first_proof)
 
       assert first.status == 200
       successor = body(first)["refresh_token"]
       assert is_binary(successor)
 
+      # Confidential refresh rotation is client-bound, not proof-key-bound;
+      # retrying the same parent with a newly rotated DPoP key remains the
+      # idempotent retry for the same successor.
       {retry_proof, retry_jkt} = dpop_proof_and_jkt([])
       retry = post_dpop_confidential_refresh(old_refresh_token, retry_proof)
 
       assert retry.status == 200
       assert body(retry)["refresh_token"] == successor
+      assert retry_jkt != initial_jkt
       assert peek_claims(body(retry)["access_token"])["cnf"]["jkt"] == retry_jkt
     end
 
     test "confidential DPoP refresh without proof returns standard OAuth invalid_request" do
       enable_minting()
       start_refresh_store()
-      {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+      initial_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
 
       code_store =
         start_dpop_confidential_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
@@ -2071,7 +2470,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     test "configured zero refresh rotation grace treats immediate retry as reuse" do
       enable_minting()
       start_refresh_store()
-      {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+      initial_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
 
       code_store =
         start_dpop_confidential_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
@@ -2090,12 +2490,12 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       old_refresh_token = body(initial)["refresh_token"]
       assert is_binary(old_refresh_token)
 
-      {first_proof, _first_jkt} = dpop_proof_and_jkt([])
+      {first_proof, _first_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
       first = post_dpop_confidential_refresh(old_refresh_token, first_proof)
 
       assert first.status == 200
 
-      {retry_proof, _retry_jkt} = dpop_proof_and_jkt([])
+      {retry_proof, _retry_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
       retry = post_dpop_confidential_refresh(old_refresh_token, retry_proof)
 
       assert retry.status == 400
@@ -2105,7 +2505,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     test "public DPoP refresh rotation still requires the original proof key" do
       enable_minting()
       start_refresh_store()
-      {initial_proof, initial_jkt} = dpop_proof_and_jkt([])
+      initial_jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {initial_proof, initial_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
       code_store = start_dpop_code_store("oc_sub-1", ["openid", "offline_access"], initial_jkt)
 
       put_config(
@@ -2134,19 +2535,28 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert rotated.status == 400
       assert body(rotated)["error"] == "invalid_grant"
+
+      {matching_proof, matching_jkt} = dpop_proof_and_jkt(jwk: initial_jwk)
+      matching = post_dpop_public_refresh(refresh_token, matching_proof)
+
+      assert matching.status == 200
+      assert matching_jkt == initial_jkt
+      assert peek_claims(body(matching)["access_token"])["cnf"]["jkt"] == initial_jkt
     end
   end
 
   # OAuth 2.0 Security BCP §4.13 / RFC 6749 §4.1.2: re-presenting an
   # already-redeemed authorization code is the reuse attack signal. The server
-  # MUST revoke the refresh-token family the first redemption spawned and
-  # answer invalid_grant (no oracle).
+  # MUST reject a replayed code with invalid_grant (no oracle). Attesto 2.0
+  # owns refresh-family identifiers independently from authorization-code
+  # provenance, so the code's family marker must never be passed as public
+  # refresh issuance state.
   describe "authorization-code reuse detection (OAuth 2.0 Security BCP §4.13)" do
     test "reusing a code revokes the descendant family and returns invalid_grant" do
       enable_minting()
       start_refresh_store()
-      # The code is linked to "fam-reuse"; the initial refresh token is minted
-      # into that family, and reuse detection later revokes it by that id.
+      # The code carries "fam-reuse" as its authorization provenance marker.
+      # Attesto.RefreshToken.issue/3 generates the independent internal family.
       code_store = start_family_code_store(["offline_access"], "fam-reuse")
 
       put_config(
@@ -2154,34 +2564,170 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         code_store: code_store
       )
 
-      # First redemption succeeds and hands back a refresh token in fam-reuse.
+      # First redemption succeeds and hands back a refresh token in a fresh
+      # Attesto-managed family.
       first = post_auth_code()
       assert first.status == 200
       refresh_token = body(first)["refresh_token"]
       assert is_binary(refresh_token)
 
-      # Sanity: the issued token is live in fam-reuse before the replay.
-      assert {:ok, %{family_id: "fam-reuse"}} =
+      # Sanity: the issued token is live in its generated family before replay.
+      assert {:ok, %{family_id: refresh_family}} =
                Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+
+      refute refresh_family == "fam-reuse"
+
+      access_token = body(first)["access_token"]
+      jti = peek_claims(access_token)["jti"]
+
+      # The replay marker must bind to the family returned by RefreshToken.issue/3,
+      # not the authorization provenance family carried by the code.
+      assert {:ok, %{family_id: ^refresh_family}} =
+               ReuseCodeStore.consumed_meta(Attesto.Secret.hash(Process.get(:auth_code)))
+
+      refute ReuseCodeStore.access_token_recorded_for_family?("fam-reuse")
 
       # Second redemption of the SAME code is reuse: invalid_grant on the wire.
       second = post_auth_code()
       assert second.status == 400
       assert body(second)["error"] == "invalid_grant"
 
-      # The whole family is revoked: its tokens are gone from the store, so the
-      # refresh token from the first redemption can no longer rotate.
-      assert Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token)) == :error
+      # The replay marker binds to the generated family, so the family itself
+      # and its indexed access descendants are revoked rather than the code's
+      # provenance ID.
+      assert :error = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+      assert code_store.access_token_revoked?(jti)
+    end
 
-      rotate =
-        post_token(%{
-          "grant_type" => "refresh_token",
-          "client_id" => "public-1",
-          "refresh_token" => refresh_token
-        })
+    test "refuses refresh issuance when a legacy store cannot bind access JTI by code" do
+      enable_minting()
+      start_refresh_store()
+      start_family_code_store(["offline_access"], "fam-reuse")
 
-      assert rotate.status == 400
-      assert body(rotate)["error"] == "invalid_grant"
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: LegacyReuseCodeStore
+      )
+
+      refused = post_auth_code()
+      assert refused.status == 400
+      assert body(refused)["error"] == "invalid_request"
+
+      # No legacy family callback was invoked with the authorization provenance
+      # ID, and no refresh family was minted before the fail-closed refusal.
+      refute ReuseCodeStore.access_token_recorded_for_family?("fam-reuse")
+
+      # The code was claimed by the failed attempt but never finalized, so a
+      # retry remains the ordinary single-use invalid_grant path, not a reuse
+      # marker that could revoke an unrelated family.
+      retry = post_auth_code()
+      assert retry.status == 400
+      assert body(retry)["error"] == "invalid_grant"
+    end
+
+    @tag :ecto
+    test "Ecto replay containment binds the issued family and revokes its access token" do
+      enable_minting()
+
+      code_store =
+        start_ecto_code_store("oc_sub-1", ["read", "offline_access"], family_id: "fam-provenance")
+
+      put_config(
+        refresh_store: EctoRefreshStore,
+        sweep_interval_ms: 1_000,
+        code_store: code_store
+      )
+
+      first = post_auth_code()
+      assert first.status == 200
+      first_body = body(first)
+      access_token = first_body["access_token"]
+      jti = peek_claims(access_token)["jti"]
+
+      assert {:ok, %{family_id: refresh_family}} =
+               EctoRefreshStore.get(Attesto.Secret.hash(first_body["refresh_token"]))
+
+      code_hash = Attesto.Secret.hash(Process.get(:auth_code))
+      row = AttestoPhoenix.TestRepo.get_by!(Authorization, code_hash: code_hash)
+      assert row.family_id == refresh_family
+      assert row.consumed_success
+      assert row.access_token_jti == jti
+      refute EctoCodeStore.access_token_revoked?(jti)
+
+      second = post_auth_code()
+      assert second.status == 400
+      assert body(second)["error"] == "invalid_grant"
+
+      assert :error = EctoRefreshStore.get(Attesto.Secret.hash(first_body["refresh_token"]))
+      assert EctoCodeStore.access_token_revoked?(jti)
+    end
+
+    @tag :ecto
+    test "Ecto no-refresh replay clears provenance and revokes only the code-linked access token" do
+      enable_minting()
+      Application.put_env(:attesto_phoenix, :test_revoke_family_pid, self())
+      on_exit(fn -> Application.delete_env(:attesto_phoenix, :test_revoke_family_pid) end)
+
+      code_store = start_ecto_code_store("oc_sub-1", ["read"], family_id: "fam-provenance")
+
+      put_config(
+        refresh_store: RecordingRevokeStore,
+        code_store: code_store,
+        issue_refresh_token?: fn _client, _scope -> false end
+      )
+
+      first = post_auth_code()
+      assert first.status == 200
+      first_body = body(first)
+      refute Map.has_key?(first_body, "refresh_token")
+      jti = peek_claims(first_body["access_token"])["jti"]
+
+      code_hash = Attesto.Secret.hash(Process.get(:auth_code))
+      row = AttestoPhoenix.TestRepo.get_by!(Authorization, code_hash: code_hash)
+      assert is_nil(row.family_id)
+      assert row.consumed_success
+      assert row.access_token_jti == jti
+
+      replay = post_auth_code()
+      assert replay.status == 400
+      assert body(replay)["error"] == "invalid_grant"
+      assert EctoCodeStore.access_token_revoked?(jti)
+      refute_receive {:revoke_family, _provenance_family}, 100
+    end
+
+    @tag :ecto
+    test "Ecto replay of a legacy no-JTI row stays invalid_grant without a 500 or family revoke" do
+      enable_minting()
+      Application.put_env(:attesto_phoenix, :test_revoke_family_pid, self())
+      on_exit(fn -> Application.delete_env(:attesto_phoenix, :test_revoke_family_pid) end)
+
+      code_store = start_ecto_code_store("oc_sub-1", ["read"], family_id: nil)
+      put_config(code_store: code_store, refresh_store: RecordingRevokeStore)
+
+      code = Process.get(:auth_code)
+      code_hash = Attesto.Secret.hash(code)
+
+      assert {:ok, _grant} =
+               Attesto.AuthorizationCode.redeem(
+                 code_store,
+                 code,
+                 %{client_id: "public-1", redirect_uri: @redirect_uri, code_verifier: @code_verifier}
+               )
+
+      # Model the successful 2.14.x consumed marker: no provenance family and
+      # no access-token JTI were persisted.
+      assert :ok = EctoCodeStore.mark_consumed(code_hash, %{family_id: nil})
+
+      replay = post_auth_code()
+
+      assert replay.status == 400
+      assert body(replay)["error"] == "invalid_grant"
+      refute_receive {:revoke_family, _family_id}, 100
+
+      row = AttestoPhoenix.TestRepo.get_by!(Authorization, code_hash: code_hash)
+      assert is_nil(row.family_id)
+      assert is_nil(row.access_token_jti)
+      assert is_nil(row.access_token_revoked_at)
     end
 
     test "reuse with no :refresh_store configured still fails closed with invalid_grant" do
@@ -2194,11 +2740,15 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       first = post_auth_code()
       assert first.status == 200
-      refute Map.has_key?(body(first), "refresh_token")
+      first_body = body(first)
+      refute Map.has_key?(first_body, "refresh_token")
+      jti = peek_claims(first_body["access_token"])["jti"]
+      refute code_store.access_token_revoked?(jti)
 
       second = post_auth_code()
       assert second.status == 400
       assert body(second)["error"] == "invalid_grant"
+      assert code_store.access_token_revoked?(jti)
     end
 
     test "reusing a code revokes the access token issued by the first redemption" do
@@ -2300,6 +2850,28 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert conn.status == 200
       refute_received {:logout_recorded, _entry}
+    end
+
+    test "logs a logout-store refusal while preserving successful token issuance" do
+      enable_minting()
+      openid_code_store = start_openid_code_store(["openid"], %{"nonce" => "n-1", "sid" => "sess-refused"})
+
+      put_config(
+        code_store: openid_code_store,
+        logout: [enabled: true],
+        terminate_session: fn conn, _ctx -> {:ok, conn} end,
+        logout_session_store: RefusingLogoutStore,
+        client_frontchannel_logout_uri: fn _client -> "https://rp.example/fc" end
+      )
+
+      log =
+        capture_log(fn ->
+          conn = post_auth_code()
+          assert conn.status == 200
+          assert is_binary(body(conn)["id_token"])
+        end)
+
+      assert log =~ "logout session record failed: store violated its return contract"
     end
 
     test "carries auth_time/acr/amr from the code's claims into the id_token" do
@@ -2659,6 +3231,25 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     store
   end
 
+  defp start_ecto_code_store(subject, scope, opts) do
+    attrs =
+      Map.merge(
+        %{
+          client_id: "public-1",
+          redirect_uri: @redirect_uri,
+          scope: scope,
+          subject: subject,
+          code_challenge: @code_challenge,
+          code_challenge_method: "S256"
+        },
+        Map.new(opts)
+      )
+
+    {:ok, code} = Attesto.AuthorizationCode.issue(EctoCodeStore, attrs)
+    Process.put(:auth_code, code)
+    EctoCodeStore
+  end
+
   # A code store whose stored grant is bound to the CIMD client_id URL, so the
   # exchange resolves the CIMD document (public, none + PKCE) and runs the host
   # policy callbacks against its metadata map.
@@ -2679,17 +3270,23 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     store
   end
 
-  defp start_unbound_confidential_code_store(subject, scope) do
+  defp start_unbound_confidential_code_store(subject, scope, opts \\ []) do
     store = ensure_started(ETS)
 
     {:ok, code} =
-      Attesto.AuthorizationCode.issue(store, %{
-        client_id: "confidential-1",
-        redirect_uri: @redirect_uri,
-        scope: scope,
-        subject: subject,
-        claims: %{"nonce" => "n-confidential"}
-      })
+      Attesto.AuthorizationCode.issue(
+        store,
+        Map.merge(
+          %{
+            client_id: "confidential-1",
+            redirect_uri: @redirect_uri,
+            scope: scope,
+            subject: subject,
+            claims: %{"nonce" => "n-confidential"}
+          },
+          Map.new(opts)
+        )
+      )
 
     Process.put(:auth_code, code)
     store
@@ -2757,9 +3354,10 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     store
   end
 
-  # A code store pre-seeded with a `family_id`-linked code (OAuth 2.0 Security
-  # BCP §4.13): the initial refresh token is minted into this family, so a
-  # later replay of the code carries the `family_id` reuse detection revokes.
+  # A code store pre-seeded with a `family_id`-linked authorization provenance
+  # marker (OAuth 2.0 Security BCP §4.13). RefreshToken.issue/3 owns a separate
+  # generated family; the core composition binds replay metadata to that actual
+  # family after issuance succeeds.
   # The reuse-tracking `ReuseCodeStore` implements the optional `take/1` +
   # `mark_consumed/2` pair, so a second redemption surfaces
   # `{:error, {:reuse, meta}}` from `Attesto.AuthorizationCode.redeem/4` to the
@@ -2824,7 +3422,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   defp dpop_proof_and_jkt(opts) do
     nonce = Keyword.get(opts, :nonce)
-    jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+    jwk = Keyword.get(opts, :jwk) || JOSE.JWK.generate_key({:ec, "P-256"})
     {_, pub_map} = JOSE.JWK.to_public_map(jwk)
 
     payload =
@@ -2891,6 +3489,24 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     |> TokenController.create(params)
   end
 
+  defp post_dpop_private_key_jwt_auth_code(proof, client_key) do
+    params = %{
+      "grant_type" => "authorization_code",
+      "code" => Process.get(:auth_code),
+      "redirect_uri" => @redirect_uri,
+      "code_verifier" => @code_verifier,
+      "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+      "client_assertion" => client_assertion(client_key, "confidential-1")
+    }
+
+    %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
+
+    %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
+    |> put_req_header("dpop", proof)
+    |> TokenController.create(params)
+  end
+
   defp post_dpop_confidential_refresh(refresh_token, proof) do
     params = %{
       "grant_type" => "refresh_token",
@@ -2903,6 +3519,22 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     %{base | scheme: :https, host: "issuer.example", port: 443}
     |> put_token_content_type()
     |> put_req_header("authorization", "Basic " <> Base.encode64("confidential-1:s3cr3t"))
+    |> put_req_header("dpop", proof)
+    |> TokenController.create(params)
+  end
+
+  defp post_dpop_private_key_jwt_refresh(refresh_token, proof, client_key) do
+    params = %{
+      "grant_type" => "refresh_token",
+      "refresh_token" => refresh_token,
+      "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+      "client_assertion" => client_assertion(client_key, "confidential-1")
+    }
+
+    %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
+
+    %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
     |> put_req_header("dpop", proof)
     |> TokenController.create(params)
   end
@@ -3120,6 +3752,11 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # whichever key the resolver uses; overrides are merged so a single test can
   # override one callback.
   @config_keys [AttestoPhoenix, AttestoPhoenix.Config]
+
+  defp conn(method, path, params) do
+    Plug.Test.conn(method, path, params)
+    |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+  end
 
   defp put_config(overrides) do
     prev_otp = Application.get_env(:attesto_phoenix, :otp_app)

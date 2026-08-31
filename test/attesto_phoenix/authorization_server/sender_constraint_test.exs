@@ -461,17 +461,12 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
   end
 
   describe "refresh_binding_jkt/3" do
-    test "public clients carry the DPoP thumbprint onto the refresh token (RFC 9449 §8)" do
+    test "only public clients carry the DPoP thumbprint onto the refresh token (RFC 9449 §5)" do
       config = base_config()
       public = %{id: "p", public?: true}
-
-      assert SenderConstraint.refresh_binding_jkt(config, public, {:dpop, "jkt-abc"}) == "jkt-abc"
-    end
-
-    test "confidential clients do not bind the refresh token to a DPoP key (RFC 6749 §6)" do
-      config = base_config()
       confidential = %{id: "c", public?: false}
 
+      assert SenderConstraint.refresh_binding_jkt(config, public, {:dpop, "jkt-abc"}) == "jkt-abc"
       assert SenderConstraint.refresh_binding_jkt(config, confidential, {:dpop, "jkt-abc"}) == nil
     end
 
@@ -481,10 +476,18 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
 
       assert SenderConstraint.refresh_binding_jkt(config, public, {:mtls, "x5t-abc"}) == nil
     end
+
+    test "malformed public-client classification is rejected" do
+      config = base_config(client_public?: fn _client -> :malformed end)
+
+      assert_raise ArgumentError, ~r/:client_public\? callback must return true or false/, fn ->
+        SenderConstraint.refresh_binding_jkt(config, %{id: "client"}, {:dpop, "jkt-abc"})
+      end
+    end
   end
 
   describe "client_requires_dpop?/2 and client_requires_mtls?/2" do
-    test "read the config callbacks, failing open when absent" do
+    test "read the config callbacks and default to not required only when absent" do
       config = base_config()
       bare = bare_config()
 
@@ -495,6 +498,22 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
       assert SenderConstraint.client_requires_mtls?(config, @mtls_required)
       refute SenderConstraint.client_requires_mtls?(config, @plain)
       refute SenderConstraint.client_requires_mtls?(bare, @mtls_required)
+    end
+
+    test "configured callbacks must return exact booleans before binding is resolved" do
+      for invalid <- [nil, :unknown, {:error, :unavailable}] do
+        dpop_config = base_config(client_requires_dpop?: fn _client -> invalid end)
+
+        assert_raise ArgumentError,
+                     ~r/:client_requires_dpop\? callback must return true or false/,
+                     fn -> SenderConstraint.resolve(dpop_config, input([]), @plain) end
+
+        mtls_config = base_config(client_requires_mtls?: fn _client -> invalid end)
+
+        assert_raise ArgumentError,
+                     ~r/:client_requires_mtls\? callback must return true or false/,
+                     fn -> SenderConstraint.resolve(mtls_config, input([]), @plain) end
+      end
     end
   end
 end

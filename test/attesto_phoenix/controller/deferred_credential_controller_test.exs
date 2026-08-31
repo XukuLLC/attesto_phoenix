@@ -2,12 +2,14 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
   @moduledoc false
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
 
   alias Attesto.{SdJwtVc, Token}
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.DeferredCredentialController
+  alias AttestoPhoenix.Plug.PutConfig
 
   @endpoint_path "/oauth/deferred_credential"
   @issuer "https://issuer.example"
@@ -51,8 +53,12 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
     use Phoenix.Router
     use AttestoPhoenix.Router
 
+    pipeline :attesto_phoenix_config do
+      plug PutConfig, otp_app: :attesto_phoenix
+    end
+
     scope "/" do
-      attesto_routes(credential_issuance: true)
+      attesto_routes(pipeline: :attesto_phoenix_config, credential_issuance: true)
     end
   end
 
@@ -145,16 +151,27 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
 
     test "maps a host credential-builder error to invalid_credential_request" do
       config = Application.fetch_env!(:attesto_phoenix, Config)
-      put_config(Keyword.put(config, :build_deferred_credential, fn _subject, _txn -> {:error, :not_found} end))
 
-      response = post_deferred(mint_token(), %{"transaction_id" => "txn-123"})
+      put_config(
+        Keyword.put(config, :build_deferred_credential, fn _subject, _txn ->
+          {:error, "sensitive-domain-error"}
+        end)
+      )
 
-      assert response.status == 400
+      log =
+        capture_log(fn ->
+          response = post_deferred(mint_token(), %{"transaction_id" => "txn-123"})
 
-      assert body(response) == %{
-               "error" => "invalid_credential_request",
-               "error_description" => "credential unavailable"
-             }
+          assert response.status == 400
+
+          assert body(response) == %{
+                   "error" => "invalid_credential_request",
+                   "error_description" => "credential unavailable"
+                 }
+        end)
+
+      refute log =~ "sensitive-domain-error"
+      refute log =~ "deferred credential builder returned an invalid result"
     end
 
     test "maps a non-SD-JWT host result to invalid_credential_request" do
@@ -174,6 +191,48 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
                "error" => "invalid_credential_request",
                "error_description" => "credential unavailable"
              }
+    end
+
+    test "reports a malformed deferred-builder result without logging its value" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      put_config(
+        Keyword.put(config, :build_deferred_credential, fn _subject, _txn ->
+          "sensitive-result-sentinel"
+        end)
+      )
+
+      log =
+        capture_log(fn ->
+          response = post_deferred(mint_token(), %{"transaction_id" => "txn-123"})
+
+          assert response.status == 400
+          assert body(response)["error"] == "invalid_credential_request"
+        end)
+
+      assert log =~
+               "AttestoPhoenix deferred credential builder returned an invalid result; credential issuance denied"
+
+      refute log =~ "sensitive-result-sentinel"
+    end
+
+    test "sanitizes a deferred-builder failure while leaving it loud" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      for failure <- [:raise, :throw, :exit] do
+        put_config(
+          Keyword.put(config, :build_deferred_credential, fn _subject, _txn ->
+            fail_builder(failure)
+          end)
+        )
+
+        error =
+          assert_raise RuntimeError, "AttestoPhoenix deferred credential builder callback failed", fn ->
+            post_deferred(mint_token(), %{"transaction_id" => "txn-123"})
+          end
+
+        refute Exception.message(error) =~ "sensitive-builder-failure"
+      end
     end
 
     test "rejects a missing transaction_id" do
@@ -230,6 +289,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
     conn =
       :post
       |> conn(@endpoint_path)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
       |> maybe_authorization(token)
 
     DeferredCredentialController.create(%{conn | body_params: request}, request)
@@ -237,6 +297,10 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
 
   defp maybe_authorization(conn, nil), do: conn
   defp maybe_authorization(conn, token), do: put_req_header(conn, "authorization", "Bearer " <> token)
+
+  defp fail_builder(:raise), do: raise("sensitive-builder-failure")
+  defp fail_builder(:throw), do: throw("sensitive-builder-failure")
+  defp fail_builder(:exit), do: exit("sensitive-builder-failure")
 
   defp put_config(opts) do
     Application.put_env(:attesto_phoenix, :otp_app, :attesto_phoenix)

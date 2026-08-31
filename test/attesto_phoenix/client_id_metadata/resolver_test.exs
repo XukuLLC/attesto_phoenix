@@ -19,6 +19,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
 
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias AttestoPhoenix.ClientIdMetadata.Cache.ETS
   alias AttestoPhoenix.ClientIdMetadata.Resolver
   alias AttestoPhoenix.Config
@@ -55,6 +57,31 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
         {entry.result, put_in(state, [url, :calls], entry.calls + 1)}
       end)
     end
+  end
+
+  defmodule FaultCache do
+    @moduledoc false
+    @behaviour AttestoPhoenix.ClientIdMetadata.Cache
+
+    def script(get_result, put_result \\ :ok) do
+      Process.put({__MODULE__, :get}, get_result)
+      Process.put({__MODULE__, :put}, put_result)
+      Process.put({__MODULE__, :put_calls}, 0)
+    end
+
+    @impl true
+    def get(_url), do: respond(Process.get({__MODULE__, :get}, :miss))
+
+    @impl true
+    def put(_url, _metadata, _expires_at) do
+      Process.put({__MODULE__, :put_calls}, Process.get({__MODULE__, :put_calls}, 0) + 1)
+      respond(Process.get({__MODULE__, :put}, :ok))
+    end
+
+    def put_calls, do: Process.get({__MODULE__, :put_calls}, 0)
+
+    defp respond({:raise, message}), do: raise(message)
+    defp respond(result), do: result
   end
 
   setup do
@@ -141,6 +168,115 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       assert {:ok, ^client} = Resolver.resolve(url, resolver_config())
 
       assert StubFetcher.calls(agent, url) == 1
+    end
+
+    test "Cache-Control no-store skips cache writes and refetches", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script(:miss, {:error, :cache_write_must_not_run})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: [no_store: true]}})
+      config = resolver_config(cache: FaultCache)
+
+      assert {:ok, _client} = Resolver.resolve(url, config)
+      assert {:ok, _client} = Resolver.resolve(url, config)
+
+      assert FaultCache.put_calls() == 0
+      assert StubFetcher.calls(agent, url) == 2
+    end
+
+    test "Cache-Control no-cache skips cache writes and refetches", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script(:miss, {:error, :cache_write_must_not_run})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: [no_cache: true]}})
+      config = resolver_config(cache: FaultCache)
+
+      assert {:ok, _client} = Resolver.resolve(url, config)
+      assert {:ok, _client} = Resolver.resolve(url, config)
+
+      assert FaultCache.put_calls() == 0
+      assert StubFetcher.calls(agent, url) == 2
+    end
+
+    test "a cache read error is visible and falls back to a fresh document", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script({:error, :private_backend_detail})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: []}})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, client} = Resolver.resolve(url, resolver_config(cache: FaultCache))
+          assert client["client_id"] == url
+        end)
+
+      assert StubFetcher.calls(agent, url) == 1
+      assert log =~ "AttestoPhoenix CIMD cache failed; fetching fresh client metadata"
+      refute log =~ "private_backend_detail"
+      refute log =~ url
+    end
+
+    test "a malformed cache hit is visible and cannot become client metadata", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script({:ok, [:private_unvalidated_value]})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: []}})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, client} = Resolver.resolve(url, resolver_config(cache: FaultCache))
+          assert client["client_id"] == url
+        end)
+
+      assert StubFetcher.calls(agent, url) == 1
+      assert log =~ "AttestoPhoenix CIMD cache failed; fetching fresh client metadata"
+      refute log =~ "private_unvalidated_value"
+    end
+
+    test "a cached map without validated metadata is visible and cannot become client metadata", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script({:ok, %{"private" => "unvalidated"}})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: []}})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, client} = Resolver.resolve(url, resolver_config(cache: FaultCache))
+          assert client["client_id"] == url
+        end)
+
+      assert StubFetcher.calls(agent, url) == 1
+      assert log =~ "AttestoPhoenix CIMD cache failed; fetching fresh client metadata"
+      refute log =~ "private"
+      refute log =~ "unvalidated"
+    end
+
+    test "a cache write error is visible without rejecting fresh validated metadata", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script(:miss, {:error, :private_backend_detail})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: []}})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, client} = Resolver.resolve(url, resolver_config(cache: FaultCache))
+          assert client["client_id"] == url
+        end)
+
+      assert log =~ "AttestoPhoenix CIMD cache failed; fresh client metadata was not cached"
+      refute log =~ "private_backend_detail"
+      refute log =~ url
+    end
+
+    test "cache exceptions are visible and degrade to an uncached fresh document", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script({:raise, "private backend exception"}, {:raise, "private write exception"})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: []}})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, client} = Resolver.resolve(url, resolver_config(cache: FaultCache))
+          assert client["client_id"] == url
+        end)
+
+      assert log =~ "AttestoPhoenix CIMD cache failed; fetching fresh client metadata"
+      assert log =~ "AttestoPhoenix CIMD cache failed; fresh client metadata was not cached"
+      refute log =~ "private backend exception"
+      refute log =~ "private write exception"
     end
 
     test "never caches an invalid document (refetches every time)", %{agent: agent} do

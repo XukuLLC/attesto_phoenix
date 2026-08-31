@@ -148,7 +148,7 @@ defmodule AttestoPhoenix.Controller.JWKSControllerTest do
     test "fails closed when no config is present in conn.private" do
       conn = conn(:get, "/.well-known/jwks.json")
 
-      assert_raise ArgumentError, ~r/no %AttestoPhoenix.Config\{\}/, fn ->
+      assert_raise ArgumentError, ~r/expected conn\.private\[:attesto_phoenix_config\]/, fn ->
         JWKSController.show(conn, %{})
       end
     end

@@ -26,15 +26,27 @@ defmodule AttestoPhoenix.DataCase do
     pid =
       Sandbox.start_owner!(AttestoPhoenix.TestRepo, shared: not tags[:async])
 
-    previous = Application.get_env(:attesto_phoenix, :repo)
+    previous_repo = Application.fetch_env(:attesto_phoenix, :repo)
+    previous_otp_app = Application.fetch_env(:attesto_phoenix, :otp_app)
+
+    # Store conformance tests exercise the package-level repo contract. A
+    # synthetic host application's otp_app pointer from another test must not
+    # redirect these bare-store calls to that host's (possibly nonexistent)
+    # repository.
+    Application.delete_env(:attesto_phoenix, :otp_app)
     Application.put_env(:attesto_phoenix, :repo, AttestoPhoenix.TestRepo)
 
     on_exit(fn ->
       Sandbox.stop_owner(pid)
 
-      case previous do
-        nil -> Application.delete_env(:attesto_phoenix, :repo)
-        value -> Application.put_env(:attesto_phoenix, :repo, value)
+      case previous_otp_app do
+        {:ok, value} -> Application.put_env(:attesto_phoenix, :otp_app, value)
+        :error -> Application.delete_env(:attesto_phoenix, :otp_app)
+      end
+
+      case previous_repo do
+        {:ok, value} -> Application.put_env(:attesto_phoenix, :repo, value)
+        :error -> Application.delete_env(:attesto_phoenix, :repo)
       end
     end)
 

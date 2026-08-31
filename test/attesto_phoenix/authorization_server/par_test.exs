@@ -14,6 +14,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
   """
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias AttestoPhoenix.AuthorizationServer.PAR
   alias AttestoPhoenix.AuthorizationServer.PAR.Request
   alias AttestoPhoenix.{Config, OAuthError}
@@ -320,8 +322,14 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
     test "a storage failure surfaces as invalid_request without leaking detail" do
       config = config(par_store: FailingStore)
 
-      assert {:error, %OAuthError{error: :invalid_request, status: 400}} =
-               PAR.store(config, request(params: base_params()))
+      log =
+        capture_log(fn ->
+          assert {:error, %OAuthError{error: :invalid_request, status: 400}} =
+                   PAR.store(config, request(params: base_params()))
+        end)
+
+      assert log =~ "AttestoPhoenix PAR store reported an error; pushed request was not stored"
+      refute log =~ "boom"
     end
 
     test "rejects a request_uri parameter at the PAR endpoint (RFC 9126 §2.1)" do

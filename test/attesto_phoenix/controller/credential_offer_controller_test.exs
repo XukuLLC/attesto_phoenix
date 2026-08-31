@@ -7,6 +7,7 @@ defmodule AttestoPhoenix.Controller.CredentialOfferControllerTest do
 
   alias Attesto.CredentialOfferStore.ETS, as: CredentialOfferStore
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Plug.PutConfig
 
   @issuer "https://issuer.example"
   @oauth_prefix "/oauth"
@@ -14,6 +15,9 @@ defmodule AttestoPhoenix.Controller.CredentialOfferControllerTest do
 
   defmodule StubKeystore do
     @moduledoc false
+
+    def signing_pem, do: "test-only"
+    def verification_pems, do: ["test-only"]
   end
 
   defmodule CredentialRouter do
@@ -21,8 +25,12 @@ defmodule AttestoPhoenix.Controller.CredentialOfferControllerTest do
     use Phoenix.Router
     use AttestoPhoenix.Router
 
+    pipeline :attesto_phoenix_config do
+      plug PutConfig, otp_app: :attesto_phoenix
+    end
+
     scope "/" do
-      attesto_routes(credential_issuance: true)
+      attesto_routes(pipeline: :attesto_phoenix_config, credential_issuance: true)
     end
   end
 
@@ -38,6 +46,7 @@ defmodule AttestoPhoenix.Controller.CredentialOfferControllerTest do
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
+      principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")],
       require_https: false,
       credential_offer_store: CredentialOfferStore
     )

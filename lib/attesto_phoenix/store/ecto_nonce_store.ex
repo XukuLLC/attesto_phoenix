@@ -45,7 +45,12 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   nonce whose `issued_at` is older than `now - ttl` is rejected with
   `{:error, :expired}` (RFC 9449 §8).
 
-  The repository is read from the supplied `AttestoPhoenix.Config`.
+  The repository and schema prefix are read as one pair from the supplied
+  `AttestoPhoenix.Config`. Behaviour-only calls use the shared
+  `AttestoPhoenix.Config.ecto_repo!/0` and
+  `AttestoPhoenix.Config.table_prefix/0` accessors, so request-local
+  routing and the configured host application follow the same rules as every
+  other Ecto store. The removed 2.x `:config` key is never consulted.
   """
 
   @behaviour Attesto.DPoP.NonceStore
@@ -75,19 +80,25 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   """
   @impl true
   @spec issue(pos_integer()) :: String.t()
-  def issue(ttl_seconds), do: issue(config!(), ttl_seconds)
+  def issue(ttl_seconds), do: issue_with(Config.ecto_repo!(), Config.table_prefix(), ttl_seconds)
 
   @doc "Like `issue/1`, using an explicit `AttestoPhoenix.Config`."
   @spec issue(Config.t(), pos_integer()) :: String.t()
   def issue(%Config{} = config, ttl_seconds) when is_integer(ttl_seconds) and ttl_seconds > 0 do
-    repo = repo!(config)
+    issue_with(config.repo, Config.table_prefix(config), ttl_seconds)
+  end
+
+  defp issue_with(repo, prefix, ttl_seconds) do
     nonce = :crypto.strong_rand_bytes(@nonce_bytes) |> Base.url_encode64(padding: false)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.add(now, ttl_seconds, :second)
 
-    %{nonce: nonce, issued_at: now, expires_at: expires_at}
-    |> DPoPNonce.issue_changeset()
-    |> repo.insert!()
+    DPoPNonce.issue_changeset(
+      %DPoPNonce{},
+      %{nonce: nonce, issued_at: now, expires_at: expires_at},
+      prefix: prefix
+    )
+    |> repo.insert!(prefix: prefix, log: false, telemetry_event: nil)
 
     nonce
   end
@@ -99,13 +110,18 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   """
   @impl true
   @spec valid?(String.t()) :: boolean()
-  def valid?(nonce) when is_binary(nonce), do: valid?(config!(), nonce)
+  def valid?(nonce) when is_binary(nonce), do: valid_with(Config.ecto_repo!(), Config.table_prefix(), nonce)
   def valid?(_), do: false
 
   @doc "Like `valid?/1`, using an explicit `AttestoPhoenix.Config`."
   @spec valid?(Config.t(), String.t()) :: boolean()
   def valid?(%Config{} = config, nonce) when is_binary(nonce) do
-    repo = repo!(config)
+    valid_with(config.repo, Config.table_prefix(config), nonce)
+  end
+
+  def valid?(%Config{}, _), do: false
+
+  defp valid_with(repo, prefix, nonce) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -114,10 +130,8 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
         select: true
       )
 
-    repo.one(query) == true
+    repo.one(query, prefix: prefix, log: false, telemetry_event: nil) == true
   end
-
-  def valid?(%Config{}, _), do: false
 
   @doc """
   Atomically consumes `nonce` under a freshness window of `ttl` seconds.
@@ -134,13 +148,16 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   configured `AttestoPhoenix.Config`.
   """
   @spec accept(String.t(), pos_integer()) :: :ok | {:error, :used | :expired | :unknown}
-  def accept(nonce, ttl), do: accept(config!(), nonce, ttl)
+  def accept(nonce, ttl), do: accept_with(Config.ecto_repo!(), Config.table_prefix(), nonce, ttl)
 
   @doc "Like `accept/2`, using an explicit `AttestoPhoenix.Config`."
   @spec accept(Config.t(), String.t(), pos_integer()) ::
           :ok | {:error, :used | :expired | :unknown}
   def accept(%Config{} = config, nonce, ttl) when is_binary(nonce) and is_integer(ttl) and ttl > 0 do
-    repo = repo!(config)
+    accept_with(config.repo, Config.table_prefix(config), nonce, ttl)
+  end
+
+  defp accept_with(repo, prefix, nonce, ttl) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     cutoff = DateTime.add(now, -ttl, :second)
 
@@ -152,20 +169,20 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
         where: n.nonce == ^nonce and is_nil(n.used_at) and n.issued_at >= ^cutoff,
         update: [set: [used_at: ^now]]
       )
-      |> repo.update_all([])
+      |> repo.update_all([], prefix: prefix, log: false, telemetry_event: nil)
 
     case count do
       1 -> :ok
-      0 -> disambiguate(repo, nonce, cutoff)
+      0 -> disambiguate(repo, nonce, cutoff, prefix)
     end
   end
 
   # The conditional update matched nothing. Read the row back to report the
   # precise reason rather than silently rejecting (fail-closed).
-  defp disambiguate(repo, nonce, cutoff) do
+  defp disambiguate(repo, nonce, cutoff, prefix) do
     query = from(n in DPoPNonce, where: n.nonce == ^nonce, select: {n.used_at, n.issued_at})
 
-    case repo.one(query) do
+    case repo.one(query, prefix: prefix, log: false, telemetry_event: nil) do
       nil ->
         {:error, :unknown}
 
@@ -182,13 +199,4 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
         end
     end
   end
-
-  defp config! do
-    case Application.get_env(:attesto_phoenix, :config) do
-      %Config{} = config -> config
-      nil -> Config.from_otp_app(:attesto_phoenix)
-    end
-  end
-
-  defp repo!(%Config{repo: repo}) when is_atom(repo) and not is_nil(repo), do: repo
 end

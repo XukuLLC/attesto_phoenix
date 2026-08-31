@@ -8,6 +8,8 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
 
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Attesto.CIBA
   alias Attesto.CIBAStore.ETS, as: Store
   alias AttestoPhoenix.AuthorizationServer.BackchannelAuthentication
@@ -73,7 +75,10 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       assert {:ok, ack} =
                BackchannelAuthentication.request(
                  config,
-                 request(poll_client(), %{"scope" => "openid profile", "login_hint" => "alice@example.test"})
+                 request(poll_client(), %{
+                   "scope" => "openid profile",
+                   "login_hint" => "alice@example.test"
+                 })
                )
 
       assert is_binary(ack.auth_req_id)
@@ -90,7 +95,12 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       client = poll_client(%{ciba: %{token_delivery_mode: :ping}})
 
       config =
-        config(notify_ciba_user: fn auth_req_id, _req, subject -> send(pid, {:notified, auth_req_id, subject}) end)
+        config(
+          notify_ciba_user: fn auth_req_id, _req, subject ->
+            send(pid, {:notified, auth_req_id, subject})
+            :ok
+          end
+        )
 
       params = %{
         "scope" => "openid",
@@ -104,12 +114,114 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       assert_receive {:notified, auth_req_id, "user:alice"}, 1_000
       assert auth_req_id == ack.auth_req_id
     end
+
+    test "async notify callback receives the request-scoped config" do
+      test_pid = self()
+
+      config =
+        config(
+          schema_prefix: "tenant_notify",
+          notify_ciba_user: fn _auth_req_id, _request, _subject ->
+            send(test_pid, {:notify_config, Config.request_config()})
+            :ok
+          end
+        )
+
+      params = %{"scope" => "openid", "login_hint" => "alice@example.test"}
+
+      assert {:ok, _ack} =
+               BackchannelAuthentication.request(config, request(poll_client(), params))
+
+      assert_receive {:notify_config, ^config}, 1_000
+    end
+
+    test "an explicit notification error is observable while the request remains pending" do
+      test_pid = self()
+
+      notify = fn auth_req_id, _request, _subject ->
+        send(test_pid, {:notify_started, self(), auth_req_id})
+
+        receive do
+          :finish_notification -> {:error, :gateway_secret}
+        end
+      end
+
+      config = config(notify_ciba_user: notify)
+      params = %{"scope" => "openid", "login_hint" => "alice@example.test"}
+
+      log =
+        capture_log(fn ->
+          assert {:ok, ack} =
+                   BackchannelAuthentication.request(config, request(poll_client(), params))
+
+          Process.put(:failed_notify_auth_req_id, ack.auth_req_id)
+
+          assert_receive {:notify_started, task_pid, auth_req_id}, 1_000
+          assert auth_req_id == ack.auth_req_id
+
+          monitor = Process.monitor(task_pid)
+          send(task_pid, :finish_notification)
+          assert_receive {:DOWN, ^monitor, :process, ^task_pid, :normal}, 1_000
+          Logger.flush()
+        end)
+
+      auth_req_id = Process.delete(:failed_notify_auth_req_id)
+
+      assert log =~
+               "AttestoPhoenix notify_ciba_user callback failed; authentication request remains pending"
+
+      refute log =~ "gateway_secret"
+      refute log =~ auth_req_id
+
+      assert {:error, :authorization_pending} =
+               CIBA.redeem(Store, auth_req_id, %{client_id: "cli-1"}, [])
+    end
+
+    test "an unexpected notification result is observable while the request remains pending" do
+      test_pid = self()
+
+      notify = fn auth_req_id, _request, _subject ->
+        send(test_pid, {:notify_started, self(), auth_req_id})
+        :error
+      end
+
+      config = config(notify_ciba_user: notify)
+      params = %{"scope" => "openid", "login_hint" => "alice@example.test"}
+
+      log =
+        capture_log(fn ->
+          assert {:ok, ack} =
+                   BackchannelAuthentication.request(config, request(poll_client(), params))
+
+          Process.put(:unexpected_notify_auth_req_id, ack.auth_req_id)
+
+          assert_receive {:notify_started, task_pid, auth_req_id}, 1_000
+          assert auth_req_id == ack.auth_req_id
+
+          monitor = Process.monitor(task_pid)
+          assert_receive {:DOWN, ^monitor, :process, ^task_pid, :normal}, 1_000
+          Logger.flush()
+        end)
+
+      auth_req_id = Process.delete(:unexpected_notify_auth_req_id)
+
+      assert log =~
+               "AttestoPhoenix notify_ciba_user callback failed; authentication request remains pending"
+
+      refute log =~ auth_req_id
+
+      assert {:error, :authorization_pending} =
+               CIBA.redeem(Store, auth_req_id, %{client_id: "cli-1"}, [])
+    end
   end
 
   describe "request/2 request-shape errors (CIBA §13)" do
     test "a missing hint is invalid_request" do
       assert {:error, %OAuthError{error: :invalid_request}} =
-               BackchannelAuthentication.request(config(), request(poll_client(), %{"scope" => "openid"}))
+               BackchannelAuthentication.request(
+                 config(),
+                 request(poll_client(), %{"scope" => "openid"})
+               )
     end
 
     test "more than one hint is invalid_request" do
@@ -154,7 +266,10 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       assert {:error, %OAuthError{error: :unknown_user_id, status: 400}} =
                BackchannelAuthentication.request(
                  config,
-                 request(poll_client(), %{"scope" => "openid", "login_hint" => "ghost@example.test"})
+                 request(poll_client(), %{
+                   "scope" => "openid",
+                   "login_hint" => "ghost@example.test"
+                 })
                )
     end
 
@@ -164,8 +279,29 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       assert {:error, %OAuthError{error: :missing_user_code}} =
                BackchannelAuthentication.request(
                  config,
-                 request(poll_client(), %{"scope" => "openid", "login_hint" => "alice@example.test"})
+                 request(poll_client(), %{
+                   "scope" => "openid",
+                   "login_hint" => "alice@example.test"
+                 })
                )
+    end
+
+    test "an unexpected user-resolution failure is loud and stores no authentication request" do
+      config = config(authenticate_ciba_user: fn _ -> {:error, :store_unavailable} end)
+
+      error =
+        assert_raise RuntimeError, fn ->
+          BackchannelAuthentication.request(
+            config,
+            request(poll_client(), %{"scope" => "openid", "login_hint" => "alice@example.test"})
+          )
+        end
+
+      assert Exception.message(error) ==
+               "AttestoPhoenix.Config :authenticate_ciba_user callback violated its return contract"
+
+      refute Exception.message(error) =~ "store_unavailable"
+      assert :ets.info(Store, :size) == 0
     end
   end
 
@@ -189,7 +325,9 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
           "login_hint" => "alice@example.test"
         })
 
-      assert {:ok, ack} = BackchannelAuthentication.request(config, request(client, %{"request" => jwt}))
+      assert {:ok, ack} =
+               BackchannelAuthentication.request(config, request(client, %{"request" => jwt}))
+
       assert is_binary(ack.auth_req_id)
 
       # A plain (unsigned) request is rejected when signing is mandatory.

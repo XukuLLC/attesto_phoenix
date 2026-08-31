@@ -61,9 +61,11 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   RFC 9449 is the DPoP equivalent: a client configured for DPoP-bound issuance
   must present a proof at the token endpoint. The host's
   `:client_requires_mtls?` / `:client_requires_dpop?` callbacks gate this; both
-  are read defensively and fail open only to "not required" when the host has
-  not supplied the callback (the constraints are off by default per
-  `:dpop_enabled` / `:mtls_enabled`).
+  default to "not required" only when the host has not supplied the callback
+  (the constraints are off by default per `:dpop_enabled` / `:mtls_enabled`). A
+  configured callback must return exactly `true` or `false`; any other result is
+  a host integration fault and raises rather than silently allowing unbound
+  Bearer issuance.
 
   ## DPoP nonce challenge preserved
 
@@ -135,6 +137,10 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @spec resolve(Config.t(), input(), term()) ::
           {:ok, binding(), String.t(), pending_claim()} | {:error, OAuthError.t()}
   def resolve(%Config{} = config, input, client) do
+    Config.with_request_config(config, fn -> do_resolve(config, input, client) end)
+  end
+
+  defp do_resolve(%Config{} = config, input, client) do
     # Resolve the client's REQUIRED constraint first: a per-client policy must
     # be enforced on its own terms, so a client cannot satisfy its required
     # constraint by presenting a DIFFERENT (valid) one. Only a client that
@@ -215,6 +221,10 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   def commit_replay_claim(%Config{}, nil), do: :ok
 
   def commit_replay_claim(%Config{} = config, {replay_key, jti, ttl}) when is_binary(replay_key) do
+    Config.with_request_config(config, fn -> do_commit_replay_claim(config, replay_key, jti, ttl) end)
+  end
+
+  defp do_commit_replay_claim(config, replay_key, jti, ttl) do
     case Adapter.replay_check(config).(replay_key, ttl) do
       :ok ->
         :ok
@@ -225,9 +235,9 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
         Attesto.Telemetry.dpop_replay_detected(jti)
         {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: :replay")}
 
-      other ->
+      _other ->
         raise ArgumentError,
-              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}; got #{inspect(other)}"
+              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}"
     end
   end
 
@@ -280,7 +290,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   def binding_jkt(_binding), do: nil
 
   @doc """
-  The DPoP thumbprint to bind a refresh token to (RFC 9449 §8).
+  The DPoP thumbprint to bind a refresh token to (RFC 9449 §5).
 
   Public clients get DPoP-bound refresh tokens; for confidential clients the
   refresh token stays bound to the authenticated `client_id` (RFC 6749 §6 /
@@ -294,8 +304,9 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   @doc """
   Whether the client requires DPoP-bound token issuance (RFC 9449).
 
-  Read defensively; fails open to "not required" when the host supplies no
-  `:client_requires_dpop?` callback.
+  Returns `false` when the host supplies no `:client_requires_dpop?` callback.
+  A configured callback must return exactly `true` or `false`; any other value
+  raises as a host integration fault.
   """
   @spec client_requires_dpop?(Config.t(), term()) :: boolean()
   # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-01`) is governed
@@ -304,14 +315,15 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   def client_requires_dpop?(%Config{}, %CIMDClient{metadata: _metadata}), do: false
 
   def client_requires_dpop?(%Config{} = config, client) do
-    Callback.invoke(Config.client_requires_dpop_fun(config), [client], false) == true
+    client_requires?(Config.client_requires_dpop_fun(config), client, :client_requires_dpop?)
   end
 
   @doc """
   Whether the client requires certificate-bound token issuance (RFC 8705).
 
-  Read defensively; fails open to "not required" when the host supplies no
-  `:client_requires_mtls?` callback.
+  Returns `false` when the host supplies no `:client_requires_mtls?` callback.
+  A configured callback must return exactly `true` or `false`; any other value
+  raises as a host integration fault.
   """
   @spec client_requires_mtls?(Config.t(), term()) :: boolean()
   # A CIMD client is governed by its document, not the host's per-client policy,
@@ -319,10 +331,26 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   def client_requires_mtls?(%Config{}, %CIMDClient{metadata: _metadata}), do: false
 
   def client_requires_mtls?(%Config{} = config, client) do
-    Callback.invoke(Config.client_requires_mtls_fun(config), [client], false) == true
+    client_requires?(Config.client_requires_mtls_fun(config), client, :client_requires_mtls?)
   end
 
   # ----- internal -----
+
+  defp client_requires?(nil, _client, _callback_name), do: false
+
+  defp client_requires?(callback, client, callback_name) do
+    case Callback.invoke(callback, [client]) do
+      true ->
+        true
+
+      false ->
+        false
+
+      _other ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: #{inspect(callback_name)} callback must return true or false"
+    end
+  end
 
   defp dpop_present?(input), do: is_binary(dpop_proof(input))
 
@@ -406,13 +434,13 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
 
   defp issue_nonce(_config), do: ""
 
-  # A CIMD client holds no symmetric secret, so it is public by construction (it
-  # leans on PKCE / DPoP downstream); a registered client defers to the host's
-  # `:client_public?` discriminator.
+  # A CIMD client holds no symmetric secret, so it is public by construction
+  # (it leans on PKCE / DPoP downstream); a registered client defers to the
+  # host's `:client_public?` discriminator.
   defp client_public?(_config, %CIMDClient{metadata: _metadata}), do: true
 
   defp client_public?(config, client) do
-    Callback.invoke(Config.client_public_fun(config), [client], false) == true
+    Callback.invoke_boolean(Config.client_public_fun(config), [client], false, :client_public?)
   end
 
   defp dpop_proof(input), do: Map.get(input, :dpop_proof)

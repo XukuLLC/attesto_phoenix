@@ -42,6 +42,17 @@ defmodule AttestoPhoenix.Store.NonceStoreTest do
     def valid?(nonce), do: nonce == "free-live"
   end
 
+  defmodule InvalidResults do
+    @moduledoc false
+    @behaviour Attesto.DPoP.NonceStore
+
+    @impl true
+    def issue(_ttl), do: Process.get({__MODULE__, :issue_result})
+
+    @impl true
+    def valid?(_nonce), do: Process.get({__MODULE__, :valid_result})
+  end
+
   defp config do
     struct!(Config,
       issuer: "https://issuer.example",
@@ -62,6 +73,19 @@ defmodule AttestoPhoenix.Store.NonceStoreTest do
     test "uses the behaviour's config-free issue/0 for a store without issue/2" do
       assert NonceStore.issue(config(), ConfigFree) == "free-issued:300"
     end
+
+    test "rejects empty or malformed issued nonces without including the value" do
+      for invalid <- [nil, "", {:error, :unavailable}, {:private, "callback-value"}] do
+        Process.put({InvalidResults, :issue_result}, invalid)
+
+        error =
+          assert_raise ArgumentError, ~r/must return a non-empty string/, fn ->
+            NonceStore.issue(config(), InvalidResults)
+          end
+
+        refute error.message =~ inspect(invalid)
+      end
+    end
   end
 
   describe "valid?/3" do
@@ -73,6 +97,19 @@ defmodule AttestoPhoenix.Store.NonceStoreTest do
     test "uses the behaviour's config-free valid?/1 for a store without valid?/2" do
       assert NonceStore.valid?(config(), ConfigFree, "free-live")
       refute NonceStore.valid?(config(), ConfigFree, "nope")
+    end
+
+    test "rejects truthy and unavailable results instead of accepting the nonce" do
+      for invalid <- [nil, :unexpected, {:error, :unavailable}] do
+        Process.put({InvalidResults, :valid_result}, invalid)
+
+        error =
+          assert_raise ArgumentError, ~r/must return true or false/, fn ->
+            NonceStore.valid?(config(), InvalidResults, "presented")
+          end
+
+        refute error.message =~ inspect(invalid)
+      end
     end
   end
 end

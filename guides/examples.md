@@ -14,6 +14,22 @@ scope "/" do
 end
 ```
 
+Because these examples select the bundled Ecto refresh store and retain the
+default 60-second retry grace, they also load one stable encryption secret in
+runtime configuration:
+
+```elixir
+# config/runtime.exs
+config :attesto_phoenix,
+  refresh_successor_secret:
+    System.fetch_env!("ATTESTO_REFRESH_SUCCESSOR_SECRET")
+```
+
+The value must be at least 32 bytes and identical on every node and across
+deployments. A single-node development setup may instead use an explicit
+development-only value. Production should fail at startup when the environment
+variable is absent.
+
 ## Confidential client (server-side app, client secret)
 
 A confidential client authenticates with a secret at the token endpoint

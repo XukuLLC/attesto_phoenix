@@ -113,6 +113,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
     * Every client-authentication failure returns the single generic
       `invalid_client` "client authentication failed" message, so an attacker
       cannot tell an unknown client from a wrong secret.
+    * Assertion and wallet-attestation replay callbacks classify only the exact
+      `{:error, :replay}` result as a replay. Any other non-success result is an
+      integration or storage fault and raises instead of falsely attributing an
+      attack.
     * Presenting more than one authentication method is rejected with
       `invalid_request` (RFC 6749 §2.3).
   """
@@ -120,6 +124,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
   alias Attesto.{ClientAssertion, MTLS, WalletAttestation}
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
+
+  require Logger
 
   defmodule Policy do
     @moduledoc """
@@ -651,15 +657,9 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   defp require_configured_client_auth_method(config, method) do
-    case Map.get(config, :token_endpoint_auth_methods_supported) do
-      methods when is_list(methods) and methods != [] ->
-        if Atom.to_string(method) in methods,
-          do: :ok,
-          else: {:error, error(@error_invalid_client, @client_auth_failed)}
-
-      _ ->
-        :ok
-    end
+    if Atom.to_string(method) in Config.token_endpoint_auth_methods_supported(config),
+      do: :ok,
+      else: {:error, error(@error_invalid_client, @client_auth_failed)}
   end
 
   defp has_body_secret?(%{"client_secret" => secret}) when is_binary(secret) and secret != "", do: true
@@ -674,15 +674,15 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp verify_confidential_client(config, client_id, secret, method) do
     verify_client_secret = Config.verify_client_secret_fun(config)
 
-    case invoke(Config.load_client_fun(config), [client_id]) do
+    case Config.client_store_load(config, client_id) do
       {:ok, client} ->
-        if invoke(verify_client_secret, [client, secret]) == true do
+        if Callback.invoke_boolean(verify_client_secret, [client, secret], false, :verify_client_secret) do
           result(config, client, client_id, method)
         else
           {:error, error(@error_invalid_client, @client_auth_failed)}
         end
 
-      _other ->
+      {:error, reason} when reason in [:not_found, :revoked] ->
         # RFC 6749 §2.3 / OWASP: do not leak whether the client exists or is
         # revoked. Run a dummy verification so the lookup-failure path matches
         # the wrong-secret path in observable timing, and return one message.
@@ -741,9 +741,16 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp authenticate_certificate_client(config, policy, client, client_id, certificate) do
     case client_mtls_metadata(config, client) do
-      {:ok, metadata} -> authenticate_registered_mtls_client(config, policy, client, client_id, certificate, metadata)
-      :not_registered -> authenticate_certificate_bearing_public(config, policy, client, client_id)
-      {:error, _reason} -> {:error, error(@error_invalid_client, @client_auth_failed)}
+      {:ok, metadata} ->
+        authenticate_registered_mtls_client(config, policy, client, client_id, certificate, metadata)
+
+      :not_registered ->
+        authenticate_certificate_bearing_public(config, policy, client, client_id)
+
+      {:error, _reason} ->
+        Logger.warning("AttestoPhoenix client mTLS metadata callback reported an error; client authentication denied")
+
+        {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
 
@@ -832,12 +839,12 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp maybe_put_client_id(opts, _client_id), do: opts
 
   defp consume_wallet_attestation_replay(config, %{replay_key: replay_key, replay_ttl: replay_ttl}) do
-    replay_check = Adapter.replay_check(config)
-
-    case invoke(replay_check, ["client_attestation:" <> replay_key, replay_ttl]) do
-      :ok -> :ok
-      _other -> {:error, :attestation_replay}
-    end
+    consume_replay_claim(
+      config,
+      "client_attestation:" <> replay_key,
+      replay_ttl,
+      :attestation_replay
+    )
   end
 
   defp assertion_verify_opts(%Policy{} = policy) do
@@ -879,14 +886,28 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp consume_client_assertion_jti(config, policy, client_id, %{"jti" => jti}) when is_binary(jti) and jti != "" do
     key = client_assertion_replay_key(client_id, jti)
-
-    case invoke(Adapter.replay_check(config), [key, policy.assertion_max_lifetime]) do
-      :ok -> :ok
-      _other -> {:error, :assertion_replay}
-    end
+    consume_replay_claim(config, key, policy.assertion_max_lifetime, :assertion_replay)
   end
 
   defp consume_client_assertion_jti(_config, _policy, _client_id, _claims), do: {:error, :missing_jti}
+
+  # A replay decision is security data, while every other non-success result is
+  # an integration or storage fault. Do not turn an unavailable/malformed
+  # replay boundary into a false attack classification: callers render the
+  # exact replay result as generic invalid_client, while faults raise loudly.
+  defp consume_replay_claim(config, key, ttl, replay_error) do
+    case invoke(Adapter.replay_check(config), [key, ttl]) do
+      :ok ->
+        :ok
+
+      {:error, :replay} ->
+        {:error, replay_error}
+
+      _other ->
+        raise ArgumentError,
+              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}"
+    end
+  end
 
   defp client_assertion_replay_key(client_id, jti) do
     digest = :crypto.hash(:sha256, "#{client_id}\0#{jti}")
@@ -931,9 +952,9 @@ defmodule AttestoPhoenix.ClientAuthentication do
         {:error, _reason} -> {:error, :not_found}
       end
     else
-      case invoke(Config.load_client_fun(config), [client_id]) do
+      case Config.client_store_load(config, client_id) do
         {:ok, client} -> {:ok, client}
-        _other -> {:error, :not_found}
+        {:error, reason} when reason in [:not_found, :revoked] -> {:error, :not_found}
       end
     end
   end
@@ -972,7 +993,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp client_public?(config, client) do
     case Config.client_public_fun(config) do
       nil -> client_native?(config, client)
-      callback -> Callback.invoke(callback, [client]) == true
+      callback -> Callback.invoke_boolean(callback, [client], false, :client_public?)
     end
   end
 
@@ -1058,7 +1079,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp client_native?(_config, %CIMDClient{metadata: _metadata}), do: false
 
   defp client_native?(config, client) do
-    Callback.invoke(Config.client_native_fun(config), [client], false) == true
+    Callback.invoke_boolean(Config.client_native_fun(config), [client], false, :client_native?)
   end
 
   # A CIMD client's identifier is the URL its document is bound to; a registered
@@ -1066,9 +1087,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # identifier in `result/4` when absent).
   defp resolved_client_id(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.client_id(metadata)
 
-  defp resolved_client_id(config, client) do
-    Callback.invoke(Config.client_id_fun(config), [client], nil)
-  end
+  defp resolved_client_id(config, client), do: Config.client_identifier(config, client)
 
   # Callback invocation delegates to `AttestoPhoenix.Callback`, except that an
   # absent (`nil`) callback is the `:no_callback` sentinel its callers branch

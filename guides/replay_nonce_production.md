@@ -53,6 +53,11 @@ Wire a shared store that every node reads and writes:
 A Redis-backed store is equally valid as long as every node shares it; the
 contract is "one store, all nodes."
 
+Setting `dpop_nonce_required: true` without a capable `:nonce_store` is rejected
+when `AttestoPhoenix.Config` is built. A capable store exports `issue/1` and
+`valid?/1`, or the config-aware `issue/2` and `valid?/2` callbacks used by the
+bundled Ecto implementation.
+
 ## TTL and the sweeper
 
 A shared replay/nonce store accumulates rows that are only relevant for the
@@ -68,8 +73,13 @@ proof acceptance window. Two things keep it bounded:
 
         sweep_interval_ms: 60_000
 
-    If `:sweep_interval_ms` is unset the sweeper is not started, and expired
-    rows are retained until you prune them another way.
+    The Igniter installer adds this process after the host repo. A manual
+    configuration must supervise it explicitly. When the bundled Ecto refresh
+    store uses positive retry grace, a replacement cleanup job must provide
+    equivalent deadline-based irreversible redaction of refresh-successor
+    ciphertext; deleting only expired rows leaves encrypted successor
+    credentials on still-live parent rows. The packaged sweeper is the stable
+    public integration point; its internal cleanup callback is not a host API.
 
 ## Checklist
 
@@ -77,4 +87,5 @@ proof acceptance window. Two things keep it bounded:
   - [ ] `:nonce_store` points at a store shared by every node.
   - [ ] The store's tables are migrated (`mix attesto_phoenix.gen.migration`).
   - [ ] `AttestoPhoenix.Store.Sweeper` is supervised with `:sweep_interval_ms`
-        set, or another prune mechanism is in place.
+        set, or another cleanup mechanism performs both expiry deletion and
+        prompt refresh-successor redaction.

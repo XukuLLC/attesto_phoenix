@@ -52,6 +52,14 @@ defmodule AttestoPhoenix.Verifier do
         %{dcql_query: dcql_query, expected_query_ids: expected_query_ids, issuer_trust: issuer_trust} = attrs
       )
       when is_map(dcql_query) do
+    Config.with_request_config(config, fn ->
+      do_create_presentation_request(config, attrs, dcql_query, expected_query_ids, issuer_trust)
+    end)
+  end
+
+  def create_presentation_request(%Config{}, _attrs), do: {:error, :invalid_attrs}
+
+  defp do_create_presentation_request(config, attrs, dcql_query, expected_query_ids, issuer_trust) do
     response_mode = Map.get(attrs, :response_mode) || Config.presentation_response_mode(config)
     scheme = Map.get(attrs, :client_id_scheme) || Config.verifier_client_id_scheme(config)
 
@@ -73,8 +81,6 @@ defmodule AttestoPhoenix.Verifier do
     end
   end
 
-  def create_presentation_request(%Config{}, _attrs), do: {:error, :invalid_attrs}
-
   @doc """
   Read and consume the verified result of a completed presentation session.
 
@@ -85,13 +91,17 @@ defmodule AttestoPhoenix.Verifier do
   """
   @spec presentation_result(Config.t(), String.t()) :: {:ok, map()} | :error
   def presentation_result(%Config{} = config, id) when is_binary(id) do
+    Config.with_request_config(config, fn -> do_presentation_result(config, id) end)
+  end
+
+  def presentation_result(%Config{}, _id), do: :error
+
+  defp do_presentation_result(config, id) do
     case Config.presentation_session_store(config) do
       store when is_atom(store) and not is_nil(store) -> PresentationSession.result(store, id)
       _ -> :error
     end
   end
-
-  def presentation_result(%Config{}, _id), do: :error
 
   defp create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query) do
     PresentationSession.create(

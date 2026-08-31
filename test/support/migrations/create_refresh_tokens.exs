@@ -37,6 +37,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateRefreshTokens do
     end
 
     create(unique_index(:attesto_refresh_tokens, [:token_hash]))
+    create(unique_index(:attesto_refresh_tokens, [:family_id, :generation]))
     create(index(:attesto_refresh_tokens, [:family_id]))
   end
 end

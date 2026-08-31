@@ -30,15 +30,24 @@ defmodule AttestoPhoenix.Schema.Authorization do
     * `:redirect_uri` - the registered redirect URI, compared by exact
       string match at redemption (RFC 6749 §3.1.2 / §4.1.3).
     * `:code_challenge` / `:code_challenge_method` - the PKCE challenge and
-      its transform (RFC 7636). Only `S256` is a valid method.
+      its transform (RFC 7636). Only `S256` is a valid method. The method
+      column remains for database compatibility and auditability; the core
+      grant data treats `S256` as implicit and does not include this key.
     * `:cnf` - the optional confirmation/key-binding map (RFC 7800). When
-      present it holds a `jkt` (DPoP key thumbprint, RFC 9449 §6) and/or an
-      `x5t#S256` (mTLS certificate thumbprint, RFC 8705 §3.1); a bound code
-      MUST be redeemed presenting the same binding.
-    * `:nonce` - the OIDC request `nonce` (OpenID Connect Core §3.1.2.1),
-      round-tripped into the eventual ID Token.
-    * `:claims` - an opaque map of additional request context carried from
-      the authorization request to redemption.
+      present for an authorization-code row it is exactly `%{"jkt" => jkt}`
+      (or the legacy atom-key form `%{jkt: jkt}`), where `jkt` is a canonical
+      RFC 7638 SHA-256 thumbprint. `nil` means no binding. Other keys, mixed
+      key styles, malformed thumbprints, and an `x5t#S256`-only binding are
+      rejected; a bound code MUST be redeemed presenting the same DPoP key.
+    * `:nonce` - a legacy compatibility column for the OIDC request `nonce`
+      (OpenID Connect Core §3.1.2.1). Canonical grant data carries this value
+      under `:claims`.
+    * `:claims` - a portable, lossless JSON object of additional request
+      context carried from the authorization request to redemption. Keys are
+      strings at every level; values are JSON `null`, booleans, strings,
+      exact-range integers, arrays, or nested objects. Floats and other VM
+      terms are not persisted because the Ecto JSONB boundary must round-trip
+      the grant context unchanged.
 
   ## Lifecycle columns
 
@@ -64,8 +73,9 @@ defmodule AttestoPhoenix.Schema.Authorization do
   `Attesto.CodeStore` exchanges plain maps with a `:code_hash`, a
   `:data` map, and an integer `:expires_at` (unix seconds). `from_record/2`
   builds an Ecto changeset from such a map for insertion, and `to_record/1`
-  rebuilds the map from a loaded row so the protocol layer can hydrate the
-  authorization-code grant from `record.data`.
+  rebuilds the exact nine-key canonical data map that the protocol layer uses
+  to hydrate the authorization-code grant. The database-only PKCE-method and
+  legacy nonce columns are not returned as sibling data keys.
 
   ## Table name and prefix
 
@@ -80,12 +90,30 @@ defmodule AttestoPhoenix.Schema.Authorization do
 
   import Ecto.Changeset
 
+  alias Attesto.Claims
+  alias Attesto.PKCE
+  alias Attesto.Scope
+  alias Attesto.Thumbprint
+
   @default_table "attesto_authorization_codes"
 
   # RFC 7636 §4.3: the only code-challenge transform a compliant server
   # accepts. `plain` is forbidden so an intercepted authorization request
   # cannot downgrade PKCE.
   @code_challenge_method_s256 "S256"
+  @canonical_data_keys [
+    :client_id,
+    :code_challenge,
+    :claims,
+    :dpop_jkt,
+    :family_id,
+    :redirect_uri,
+    :resource,
+    :scope,
+    :subject
+  ]
+  @canonical_data_error "authorization code record has invalid canonical data"
+  @cnf_error "authorization code record has invalid confirmation binding"
 
   @typedoc "A persisted authorization-code row."
   @type t :: %__MODULE__{
@@ -112,7 +140,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
 
   @typedoc """
   The plain map exchanged with `Attesto.CodeStore`: the code hash, the
-  opaque grant `:data`, and the absolute expiry in unix seconds.
+  grant `:data`, and the absolute expiry in unix seconds.
   """
   @type store_record :: %{
           required(:code_hash) => String.t(),
@@ -190,12 +218,20 @@ defmodule AttestoPhoenix.Schema.Authorization do
   @doc """
   Builds an insertable changeset from a `Attesto.CodeStore` record map.
 
-  `record` is the map the protocol layer persists: a `:code_hash`, the
-  opaque grant `:data`, and an integer `:expires_at` in unix seconds. The
+  `record` is the map the protocol layer persists: a `:code_hash`, the grant
+  `:data`, and an integer `:expires_at` in unix seconds. The
   fields inside `:data` (client, subject, scope, redirect URI, PKCE
-  challenge, optional DPoP thumbprint, OIDC nonce, and request claims) are
-  spread across the row's columns so they can be queried and audited
-  individually while still round-tripping losslessly via `to_record/1`.
+  challenge, optional DPoP thumbprint, claims, and family) are spread across
+  the row's columns so they can be queried and audited individually. The
+  canonical core data map keeps the OIDC nonce inside `:claims`; the
+  database-only `:nonce` column remains readable for legacy rows. When
+  populated, it is promoted into a valid claims map as the authoritative
+  string-key nonce after removing any legacy atom- or string-key nonce entries.
+  When the column is NULL, a canonical string-key nonce already in `claims` is
+  preserved, while atom-key or mixed maps remain malformed for core validation.
+  A malformed NULL claims value is preserved, even when the legacy nonce is
+  populated; it is not repaired. A top-level `:nonce` in the core data map is
+  not canonical and is rejected.
 
   Options:
 
@@ -208,28 +244,29 @@ defmodule AttestoPhoenix.Schema.Authorization do
   subject, redirect URI, or expiry) is rejected rather than defaulted. PKCE
   is optional at persistence (a confidential client the host exempted from
   PKCE via `Attesto.AuthorizationRequest`'s `:require_pkce` issues a code with
-  no challenge); when a `code_challenge_method` is present it is constrained to
-  `S256` (RFC 7636 §4.3), and a challenge-less code stores a NULL method.
+  no challenge). A challenge implies `S256` (RFC 7636 §4.3), and a
+  challenge-less code stores a NULL database method; the database-only method
+  column is not accepted as a sibling in canonical core data.
   """
   @spec from_record(store_record(), keyword()) :: Ecto.Changeset.t()
   def from_record(record, opts \\ []) when is_map(record) and is_list(opts) do
     now = Keyword.get(opts, :now, DateTime.utc_now()) |> DateTime.truncate(:second)
     prefix = Keyword.get(opts, :prefix)
-    data = Map.get(record, :data, %{})
+    data = canonical_data!(record)
 
     attrs = %{
       code_hash: Map.get(record, :code_hash),
-      client_id: Map.get(data, :client_id),
-      subject: Map.get(data, :subject),
-      scope: Map.get(data, :scope, []),
-      resource: Map.get(data, :resource, []),
-      redirect_uri: Map.get(data, :redirect_uri),
-      code_challenge: Map.get(data, :code_challenge),
+      client_id: data.client_id,
+      subject: data.subject,
+      scope: data.scope,
+      resource: data.resource,
+      redirect_uri: data.redirect_uri,
+      code_challenge: data.code_challenge,
       code_challenge_method: code_challenge_method_for(data),
       cnf: cnf_from_data(data),
-      nonce: Map.get(data, :nonce),
-      claims: Map.get(data, :claims, %{}),
-      family_id: Map.get(data, :family_id),
+      nonce: nil,
+      claims: data.claims,
+      family_id: data.family_id,
       expires_at: unix_to_datetime(Map.get(record, :expires_at)),
       inserted_at: now
     }
@@ -245,11 +282,24 @@ defmodule AttestoPhoenix.Schema.Authorization do
   @doc """
   Rebuilds the `Attesto.CodeStore` record map from a loaded row.
 
-  The columns are folded back into the opaque grant `:data` map in exactly
-  the shape the protocol layer expects, and the
-  `:expires_at` `utc_datetime` is converted back to unix seconds. The
-  protocol layer re-checks expiry after taking the record, so a row that is
-  past `:expires_at` is still returned here and rejected downstream.
+  The columns are folded back into the exact nine-key canonical grant `:data`
+  map the protocol layer expects. `code_challenge_method` is implicit as
+  `S256` in that contract, and a non-NULL legacy `nonce` column is promoted
+  into `claims` as the authoritative string-key nonce, removing any atom-key
+  or conflicting string-key nonce. If the legacy column is NULL, a canonical
+  string-key nonce already present in `claims` is preserved; atom-key or mixed
+  nonce maps remain malformed so the core JSON-object validation rejects them.
+  A NULL `claims` value remains malformed even when the legacy nonce column is
+  populated; it is not repaired into a new map. The row's confirmation binding is accepted only when
+  it is `nil`, an exact string-key `jkt` map, or an exact legacy atom-key `jkt`
+  map containing a canonical thumbprint; malformed or unsupported bindings
+  raise a fixed, value-free `ArgumentError` rather than becoming `nil`. The
+  `:expires_at` `utc_datetime` is converted back to unix seconds. Database
+  non-NULL constraints keep scope, resource, and claims populated for normal
+  rows; malformed NULL values are preserved for the protocol layer to reject,
+  rather than defaulted into a valid-looking grant. The protocol layer
+  re-checks expiry after taking the record, so a row that is past `:expires_at`
+  is still returned here and rejected downstream.
   """
   @spec to_record(t()) :: store_record()
   def to_record(%__MODULE__{} = row) do
@@ -258,18 +308,35 @@ defmodule AttestoPhoenix.Schema.Authorization do
       data: %{
         client_id: row.client_id,
         subject: row.subject,
-        scope: row.scope || [],
-        resource: row.resource || [],
+        scope: row.scope,
+        resource: row.resource,
         redirect_uri: row.redirect_uri,
         code_challenge: row.code_challenge,
-        code_challenge_method: row.code_challenge_method,
-        dpop_jkt: dpop_jkt_from_cnf(row.cnf),
-        nonce: row.nonce,
-        claims: row.claims || %{},
+        dpop_jkt: dpop_jkt_from_cnf!(row.cnf),
+        claims: claims_from_row(row),
         family_id: row.family_id
       },
       expires_at: datetime_to_unix(row.expires_at)
     }
+  end
+
+  defp claims_from_row(%__MODULE__{claims: claims, nonce: nonce}) do
+    case claims do
+      claims when is_map(claims) ->
+        if is_nil(nonce) do
+          claims
+        else
+          claims
+          |> Map.drop(["nonce", :nonce])
+          |> Map.put("nonce", nonce)
+        end
+
+      nil ->
+        nil
+
+      invalid_claims ->
+        invalid_claims
+    end
   end
 
   @doc false
@@ -287,30 +354,84 @@ defmodule AttestoPhoenix.Schema.Authorization do
   # into a `cnf` map for column storage. A code with no binding stores no
   # `cnf` (NULL), never an empty map, so "unbound" and "bound to nothing"
   # cannot be confused.
+  defp canonical_data!(record) do
+    data = Map.get(record, :data)
+
+    if is_map(data) and
+         map_size(data) == length(@canonical_data_keys) and
+         Enum.all?(@canonical_data_keys, &Map.has_key?(data, &1)) and
+         valid_canonical_data?(data) do
+      data
+    else
+      raise ArgumentError, @canonical_data_error
+    end
+  end
+
+  defp valid_canonical_data?(data) do
+    non_empty_binary?(Map.get(data, :client_id)) and
+      non_empty_binary?(Map.get(data, :subject)) and
+      non_empty_binary?(Map.get(data, :redirect_uri)) and
+      valid_optional_challenge?(Map.get(data, :code_challenge)) and
+      Scope.valid_list?(Map.get(data, :scope)) and
+      valid_string_list?(Map.get(data, :resource)) and
+      valid_optional_jkt?(Map.get(data, :dpop_jkt)) and
+      valid_optional_non_empty_binary?(Map.get(data, :family_id)) and
+      Claims.portable_json_object?(Map.get(data, :claims))
+  end
+
   defp cnf_from_data(data) do
     case Map.get(data, :dpop_jkt) do
-      nil -> nil
-      jkt when is_binary(jkt) -> %{"jkt" => jkt}
+      nil ->
+        nil
+
+      jkt when is_binary(jkt) ->
+        if Thumbprint.valid?(jkt), do: %{"jkt" => jkt}, else: raise(ArgumentError, @cnf_error)
+
+      _invalid ->
+        raise ArgumentError, @cnf_error
     end
   end
 
   # RFC 7636 §4.3: the challenge method is meaningful only when a challenge is
   # present. A code issued without a challenge (PKCE relaxed for a confidential
   # client; see Attesto.AuthorizationRequest's :require_pkce) persists with a
-  # NULL method, not a spurious "S256"; a code with a challenge defaults the
-  # method to S256 when the grant did not carry one (S256 is the only method
-  # accepted at issuance).
-  defp code_challenge_method_for(data) do
-    case Map.get(data, :code_challenge) do
-      nil -> nil
-      _challenge -> Map.get(data, :code_challenge_method, @code_challenge_method_s256)
-    end
+  # NULL method, not a spurious "S256". The canonical core map has no method
+  # sibling: a present challenge always means S256.
+  defp code_challenge_method_for(%{code_challenge: nil}), do: nil
+  defp code_challenge_method_for(%{code_challenge: _challenge}), do: @code_challenge_method_s256
+
+  # Ecto/Postgres decodes JSON object keys as strings. The atom-key clause is a
+  # deliberately narrow compatibility path for rows built by older adapters;
+  # both forms must be an exact one-key map containing a canonical thumbprint.
+  # Every other form is rejected instead of being treated as an unbound code.
+  defp dpop_jkt_from_cnf!(nil), do: nil
+
+  defp dpop_jkt_from_cnf!(%{"jkt" => jkt} = cnf) when map_size(cnf) == 1 do
+    valid_cnf_jkt!(jkt)
   end
 
-  defp dpop_jkt_from_cnf(nil), do: nil
-  defp dpop_jkt_from_cnf(%{"jkt" => jkt}) when is_binary(jkt), do: jkt
-  defp dpop_jkt_from_cnf(%{jkt: jkt}) when is_binary(jkt), do: jkt
-  defp dpop_jkt_from_cnf(_cnf), do: nil
+  defp dpop_jkt_from_cnf!(%{jkt: jkt} = cnf) when map_size(cnf) == 1 do
+    valid_cnf_jkt!(jkt)
+  end
+
+  defp dpop_jkt_from_cnf!(_cnf), do: raise(ArgumentError, @cnf_error)
+
+  defp valid_cnf_jkt!(jkt) do
+    if Thumbprint.valid?(jkt), do: jkt, else: raise(ArgumentError, @cnf_error)
+  end
+
+  defp valid_optional_challenge?(nil), do: true
+  defp valid_optional_challenge?(value), do: PKCE.valid_challenge?(value)
+
+  defp valid_optional_jkt?(nil), do: true
+  defp valid_optional_jkt?(value), do: Thumbprint.valid?(value)
+
+  defp valid_optional_non_empty_binary?(nil), do: true
+  defp valid_optional_non_empty_binary?(value), do: non_empty_binary?(value)
+
+  defp valid_string_list?(value), do: is_list(value) and Enum.all?(value, &non_empty_binary?/1)
+
+  defp non_empty_binary?(value), do: is_binary(value) and value != ""
 
   defp unix_to_datetime(nil), do: nil
 

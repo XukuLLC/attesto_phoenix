@@ -31,7 +31,7 @@ defmodule AttestoPhoenix.Controller.JWKSController do
   pipeline.
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
@@ -46,10 +46,6 @@ defmodule AttestoPhoenix.Controller.JWKSController do
   # so a newly published key is picked up promptly.
   @cache_max_age_seconds 600
 
-  # The configured AttestoPhoenix.Config is threaded through the connection's
-  # private storage by the host pipeline.
-  @config_key :attesto_phoenix_config
-
   @doc """
   Handle `GET /.well-known/jwks.json` (RFC 7517 §5).
 
@@ -58,7 +54,7 @@ defmodule AttestoPhoenix.Controller.JWKSController do
   """
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
-    config = fetch_config!(conn)
+    config = Config.resolve!(conn)
 
     # Keep the published key metadata aligned with the token signing path:
     # `from_config/1` preserves the keystore's per-key `alg` metadata.
@@ -74,18 +70,6 @@ defmodule AttestoPhoenix.Controller.JWKSController do
   # be shared by intermediary caches for `max-age` seconds.
   defp put_public_cache(conn) do
     put_resp_header(conn, "cache-control", "public, max-age=#{@cache_max_age_seconds}")
-  end
-
-  defp fetch_config!(conn) do
-    case conn.private do
-      %{@config_key => %Config{} = config} ->
-        config
-
-      _missing ->
-        raise ArgumentError,
-              "AttestoPhoenix.Controller.JWKSController: no %AttestoPhoenix.Config{} " <>
-                "in conn.private[#{inspect(@config_key)}]; wire the host pipeline that assigns it"
-    end
   end
 
   defp attesto_config(config), do: Config.to_attesto_config(config)

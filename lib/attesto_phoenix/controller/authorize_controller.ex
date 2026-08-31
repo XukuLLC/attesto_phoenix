@@ -101,7 +101,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       `AttestoPhoenix.Event`).
   """
 
-  use Phoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn
 
@@ -153,7 +153,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   """
   @spec authorize(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def authorize(conn, params) do
-    config = Config.resolve!()
+    config = Config.resolve!(conn)
     # Capture the PAR reference before resolution rebinds `params` to the stored
     # set, so it can be consumed once (and only once) a code is issued.
     par_request_uri = params["request_uri"]
@@ -231,9 +231,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp load_registered_client(config, client_id) do
-    case Callback.invoke(Config.load_client_fun(config), [client_id]) do
-      {:ok, client} -> {:ok, client}
-      _other -> {:error, {:direct, :invalid_client_id}}
+    case Config.client_store_load(config, client_id) do
+      {:ok, client} ->
+        {:ok, client}
+
+      {:error, reason} when reason in [:not_found, :revoked] ->
+        {:error, {:direct, :invalid_client_id}}
     end
   end
 
@@ -304,7 +307,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       {:error, {:redirect, _error}} = redirectable ->
         # The URI this error would travel to is the request's own, which reached
         # a redirectable outcome only by exact-matching the document's set.
-        with :ok <- require_same_origin_redirect_uri(config, client, Map.get(params, "redirect_uri")) do
+        with :ok <-
+               require_same_origin_redirect_uri(config, client, Map.get(params, "redirect_uri")) do
           redirectable
         end
 
@@ -543,11 +547,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         emit_failure(conn, config, error_code)
         emit_error(conn, config, request, error_code)
 
-      other ->
+      _other ->
         # A callback that returns no known shape is a host/config fault, not a
         # client error. Fail closed with the §4.1.2.1 server_error rather than
         # crash, and do not issue a code.
-        Logger.error("authenticate_resource_owner returned #{inspect(other)}")
+        Logger.error("authenticate_resource_owner callback returned an invalid result")
         emit_error(conn, config, request, @error_server_error)
     end
   end
@@ -585,8 +589,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         error_code = if prompt_none?, do: @error_consent_required, else: @error_access_denied
         emit_error(conn, config, request, error_code)
 
-      other ->
-        Logger.error("consent returned #{inspect(other)}")
+      _other ->
+        Logger.error("consent callback returned an invalid result")
         emit_error(conn, config, request, @error_server_error)
     end
   end
@@ -696,6 +700,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   #     the effective post-merge params), so a signed request object's value is
   #     authoritative and an unsigned outer-query value is ignored.
   defp authorize_dpop_jkt(request, params, true), do: dpop_jkt_from_params(params) || request.dpop_jkt
+
   defp authorize_dpop_jkt(request, _params, false), do: request.dpop_jkt
 
   defp dpop_jkt_from_params(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
@@ -736,7 +741,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # onto the access token that the pre-authorized_code grant uses (see
     # `AttestoPhoenix.AuthorizationServer.Token`'s `@grant_pre_authorized_code`
     # dispatch clause).
-    |> put_optional("credential_configuration_ids", Map.get(conn.private, :attesto_credential_configuration_ids))
+    |> put_optional(
+      "credential_configuration_ids",
+      Map.get(conn.private, :attesto_credential_configuration_ids)
+    )
   end
 
   # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ───────
@@ -969,27 +977,41 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # single winner among any concurrent completions (on any node) gets `:ok` and
   # issues a code; the rest get `:error` and issue nothing.
   #
-  #   * `:ok` - won the claim, or not a PAR request (nothing to claim), or the
-  #     store does not implement the optional `take/1` (cannot enforce single
-  #     use; proceed best-effort, as before).
+  #   * `:ok` - won the claim, or not a PAR request (nothing to claim), or an
+  #     optional-PAR store does not implement `take/1`.
   #   * `:error` - lost the claim: the reference was already consumed by a
   #     concurrent completion, or expired during login/consent.
   defp claim_par_request_uri(conn, config) do
     case conn.private[:attesto_par_request_uri] do
-      uri when is_binary(uri) and uri != "" -> claim_reference(par_store(config), uri)
-      _ -> :ok
+      uri when is_binary(uri) and uri != "" ->
+        claim_reference(
+          par_store(config),
+          uri,
+          Callback.config_flag(config, :require_pushed_authorization_requests)
+        )
+
+      _ ->
+        :ok
     end
   end
 
   # Consume the reference via the store's atomic `take/1`. A store that does not
-  # implement the optional callback cannot enforce single use, so proceed
-  # best-effort (`:ok`); otherwise the `take` result IS the claim outcome
-  # (`{:ok, _}` won, `:error` lost).
-  defp claim_reference(store, uri) do
-    cond do
-      not function_exported?(store, :take, 1) -> :ok
-      match?({:ok, _}, store.take(uri)) -> :ok
-      true -> :error
+  # implement the optional callback can proceed best-effort only when PAR is
+  # optional; mandatory PAR fails closed because it cannot enforce single use.
+  defp claim_reference(store, uri, required?) do
+    if function_exported?(store, :take, 1) do
+      case store.take(uri) do
+        {:ok, _params} ->
+          :ok
+
+        :error ->
+          :error
+
+        _invalid ->
+          raise RuntimeError, "#{inspect(store)}.take/1 violated its PAR-store return contract"
+      end
+    else
+      if required?, do: :error, else: :ok
     end
   end
 
