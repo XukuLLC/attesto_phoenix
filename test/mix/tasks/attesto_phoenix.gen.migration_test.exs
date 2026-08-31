@@ -352,7 +352,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
     end
 
     test "rejects the removed 2.x table-prefix flag", %{tmp_dir: tmp_dir} do
-      assert_raise Mix.Error, ~r/--table-prefix was removed.*--schema-prefix/, fn ->
+      assert_raise Mix.Error, ~r/--table-prefix was removed.*one runtime layout.*--schema-prefix/, fn ->
         run!(["--table-prefix", "oauth_"], tmp_dir)
       end
 
@@ -371,7 +371,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
         end
       end)
 
-      assert_raise Mix.Error, ~r/legacy :table_prefix configuration detected.*:schema_prefix/, fn ->
+      assert_raise Mix.Error, ~r/legacy :table_prefix configuration detected.*:schema_prefix.*one runtime layout/, fn ->
         run!(["--otp-app", Atom.to_string(host_app)], tmp_dir)
       end
     end

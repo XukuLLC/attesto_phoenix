@@ -162,9 +162,13 @@ Drain every 2.x token writer before starting 3.0, even when the old deployment
 used the default `public` schema. Version 3.0 adds durable refresh-family
 revocation tombstones that 2.x nodes do not read or write, so mixed 2.x/3.0
 writers are unsupported. Apply the generation-index migration and create/backfill
-the tombstone table, then start 3.0 and re-enable traffic. For a non-empty 2.x
-literal table prefix, also complete the table move and rename procedure in the
-[3.0 schema-prefix upgrade guide](guides/upgrade_3_0_schema_prefix.md).
+the tombstone table, then start 3.0 and re-enable traffic. A non-empty 2.x
+`:table_prefix` value does not identify one runtime layout: the old migration
+generator could create literal-prefixed tables in `public`, most runtime stores
+used canonical public tables, and only the CIBA store and sweeper treated the
+value as an Ecto schema prefix. Inventory the actual source for every table and
+complete the stopped procedure in the [3.0 schema-prefix upgrade
+guide](guides/upgrade_3_0_schema_prefix.md); do not infer it from configuration.
 
 - A custom `Attesto.RefreshStore` must provide one atomic, family-serialized
   `rotate/4` transaction. It replaces the old multi-step consume/insert/
@@ -1011,8 +1015,16 @@ end
 
 `AttestoPhoenix.Plug.Authenticate` verifies the Bearer JWT, enforces DPoP and
 mTLS binding when enabled, resolves the subject via `:load_principal`, emits
-neutral `:auth_succeeded` / `:auth_denied` events through `:on_event`, and
-assigns:
+neutral `:auth_succeeded` / `:auth_denied` events through `:on_event`.
+
+When `conn.private[:attesto_phoenix_config]` is present, that validated request
+config is authoritative; plug `:config`/`:otp_app` options are used only when
+the request-private value is absent. A malformed request-private value fails
+closed rather than falling back to global application configuration. Mount
+`AttestoPhoenix.Plug.PutConfig` in the pipeline when the plug should use a
+request-specific profile.
+
+The plug assigns:
 
 - `conn.assigns.attesto_claims` - the verified JWT claims
 - `conn.assigns.attesto_principal` - the host principal returned by
@@ -1129,11 +1141,13 @@ canonical table names.
 
 The 2.x host `:table_prefix` key, separate package-level
 `config :attesto_phoenix, :table_prefix` setting, and `--table-prefix` generator
-flag are rejected in 3.0. They meant literal table-name prefixing, which is a
-different database layout and cannot be silently translated. Remove every old
-setting, rename the public host key to `:schema_prefix`, inventory the old
-tables, and follow the [3.0 schema-prefix upgrade guide](guides/upgrade_3_0_schema_prefix.md)
-before deploying.
+flag are rejected in 3.0. In v2.14.2 the generator could prepend a value to
+table names in `public`, while most runtime stores queried canonical public
+tables and only the CIBA store and sweeper used it as an Ecto schema prefix.
+The setting therefore cannot be silently translated into one 3.0 schema.
+Remove every old setting, inventory the actual source tables, and follow the
+[3.0 schema-prefix upgrade guide](guides/upgrade_3_0_schema_prefix.md) before
+deploying. Stop if more than one candidate for a logical table is non-empty.
 
 The generated migration passes that prefix to both the table and every index;
 it does not prepend the prefix to the table or index name. In particular, its
@@ -1220,8 +1234,9 @@ full walkthrough and the tunnel-vs-mkcert tradeoff.
 
 - [Example configurations](guides/examples.md) - confidential and public-client
   configuration sketches.
-- [3.0 schema-prefix cutover](guides/upgrade_3_0_schema_prefix.md) - inventory,
-  migrate, verify, and cut over from the 2.x literal table-name layout.
+- [3.0 schema-prefix cutover](guides/upgrade_3_0_schema_prefix.md) - inventory
+  the mixed 2.x candidates, move only verified sources, and cut over to one
+  canonical schema.
 - [Local HTTPS for development](guides/local_https.md) - serve a locally-trusted
   mkcert certificate so the OAuth / MCP flow runs over `https://localhost` with no
   tunnel and no downgrade.

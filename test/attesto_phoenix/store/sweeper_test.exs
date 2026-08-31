@@ -164,6 +164,19 @@ defmodule AttestoPhoenix.Store.SweeperTest do
   end
 
   describe "sweep behavior" do
+    test "sweep_now/0 targets the default registered sweeper" do
+      start_recorder(%{})
+      config = valid_config(sweep_interval_ms: 60_000)
+
+      Config.with_request_config(config, fn ->
+        {:ok, pid} = Sweeper.start_link(config: config)
+        on_exit(fn -> safe_stop(pid, &GenServer.stop/1) end)
+
+        assert is_map(Sweeper.sweep_now())
+        assert Process.alive?(pid)
+      end)
+    end
+
     test "deletes from every generated store table exactly once per sweep" do
       start_recorder(%{
         "attesto_authorization_codes" => 3,

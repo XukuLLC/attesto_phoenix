@@ -149,6 +149,13 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
       assert {:error, :expired} == EctoNonceStore.accept(config, nonce, @ttl)
     end
 
+    test "enforces persisted expiry even when the caller ttl is still fresh", %{config: config} do
+      nonce = insert_nonce(issued_seconds_ago: 1, expires_seconds_ago: 1)
+
+      assert {:error, :expired} == EctoNonceStore.accept(config, nonce, @ttl)
+      assert is_nil(TestRepo.get_by!(DPoPNonce, nonce: nonce).used_at)
+    end
+
     test "rejects a non-positive ttl via the guard", %{config: config} do
       nonce = EctoNonceStore.issue(config, @ttl)
       assert_raise FunctionClauseError, fn -> EctoNonceStore.accept(config, nonce, 0) end

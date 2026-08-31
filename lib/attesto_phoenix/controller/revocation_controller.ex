@@ -88,12 +88,10 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   @token_param "token"
   @token_type_hint_param "token_type_hint"
 
-  # The configured AttestoPhoenix.Config is threaded through the connection's
-  # private storage by the host pipeline.
-  # The Attesto.RefreshStore module revocation runs over. The package ships
-  # an Ecto-backed implementation (parameterized by the configured repo) as
-  # the default; the host pipeline may override it through conn.private to
-  # select a different Attesto.RefreshStore (e.g. the single-node ETS store).
+  # Config.refresh_store selects the Attesto.RefreshStore used for revocation.
+  # For compatibility with older host pipelines, conn.private may supply the
+  # store only when the validated request config leaves refresh_store unset.
+  # The package's Ecto-backed implementation remains the final default.
   @refresh_store_key :attesto_phoenix_refresh_store
   @default_refresh_store EctoRefreshStore
 
@@ -162,7 +160,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     # returns `:ok` for an unknown, expired, or already-revoked token
     # (no-existence oracle, RFC 7009 §2.2), and `{:error,
     # :unauthorized_client}` when the token is bound to a different client.
-    case Revocation.revoke(refresh_store(conn), token, client_id: client_id) do
+    case Revocation.revoke(refresh_store(config, conn), token, client_id: client_id) do
       :ok ->
         # The token was unknown to this client OR was revoked; either way the
         # response is an indistinguishable empty 200 (no-existence oracle).
@@ -233,7 +231,11 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     )
   end
 
-  defp refresh_store(conn) do
-    Map.get(conn.private, @refresh_store_key, @default_refresh_store)
-  end
+  # Compatibility for older host pipelines that staged a store in conn.private:
+  # an explicit validated Config.refresh_store always wins. The private seam is
+  # used only when the config leaves the store unset.
+  defp refresh_store(%Config{refresh_store: nil}, conn),
+    do: Map.get(conn.private, @refresh_store_key, @default_refresh_store)
+
+  defp refresh_store(%Config{refresh_store: store}, _conn), do: store
 end

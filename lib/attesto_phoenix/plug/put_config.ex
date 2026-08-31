@@ -20,8 +20,11 @@ defmodule AttestoPhoenix.Plug.PutConfig do
   The explicit `:otp_app` option is preferred. When it is omitted, the plug
   reads `config :attesto_phoenix, otp_app: :my_app` at request time. Existing
   correctly typed private values are preserved, which lets a host install a
-  request-specific configuration earlier in the pipeline. A value of the wrong
-  type fails closed instead of being silently replaced. Library controllers and
+  request-specific configuration earlier in the pipeline. A preinstalled
+  protocol config must exactly match the value derived from that request's host
+  config; otherwise the plug fails closed instead of advertising policy that
+  the token endpoints do not enforce. A value of the wrong type also fails
+  closed instead of being silently replaced. Library controllers and
   `AttestoPhoenix.Plug.Authenticate` bind the private configuration only while
   their bounded work executes; this plug does not retain tenant state in the
   process dictionary between pipeline and action dispatch.
@@ -99,9 +102,17 @@ defmodule AttestoPhoenix.Plug.PutConfig do
   end
 
   defp fetch_or_derive_protocol_config!(conn, host_config) do
+    derived = Config.to_attesto_config(host_config)
+
     case Map.fetch(conn.private, @protocol_config_key) do
       {:ok, %Attesto.Config{} = config} ->
-        config
+        if config === derived do
+          config
+        else
+          raise ArgumentError,
+                "#{inspect(__MODULE__)} expected conn.private[#{inspect(@protocol_config_key)}] " <>
+                  "to match the protocol config derived from conn.private[#{inspect(@host_config_key)}]"
+        end
 
       {:ok, _other} ->
         raise ArgumentError,
@@ -109,7 +120,7 @@ defmodule AttestoPhoenix.Plug.PutConfig do
                 "to contain %Attesto.Config{}"
 
       :error ->
-        Config.to_attesto_config(host_config)
+        derived
     end
   end
 end

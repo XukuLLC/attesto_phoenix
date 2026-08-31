@@ -392,7 +392,8 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert Enum.any?(composed.notices, fn notice ->
                notice =~ "--schema-prefix tenant_auth" and
                  notice =~ "PostgreSQL schema `tenant_auth`" and
-                 notice =~ "{repo, schema_prefix}"
+                 notice =~ "{repo, schema_prefix}" and
+                 notice =~ "attesto_refresh_tokens_family_id_generation_index"
              end)
 
       applied =
@@ -522,6 +523,7 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
 
       assert Enum.any?(composed.notices, fn notice ->
                notice =~ "Legacy `:table_prefix` configuration was found" and
+                 notice =~ "not identify one runtime layout" and
                  notice =~ "will fail closed"
              end)
 

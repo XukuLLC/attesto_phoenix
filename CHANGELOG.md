@@ -11,10 +11,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Replace the public 2.x host `:table_prefix` and package-level
   `config :attesto_phoenix, :table_prefix` settings, plus the
   `--table-prefix` migration-generator option, with `:schema_prefix` and
-  `--schema-prefix`. Version 2.x prefixed literal table names; 3.0 keeps the
-  canonical table names and selects one PostgreSQL schema through Ecto's
-  `prefix:` option. Legacy keys and flags now fail closed with an upgrade
-  message instead of being silently reinterpreted.
+  `--schema-prefix`. In v2.14.2, the generator could prepend the value
+  literally to table names in `public`, while most runtime stores queried
+  canonical public tables and only `EctoCIBAStore` and `Sweeper` passed it as an
+  Ecto schema prefix. The old value therefore did not identify one coherent
+  runtime layout. Version 3.0 keeps canonical table names and selects one
+  PostgreSQL schema through Ecto's `prefix:` option. Legacy keys and flags now
+  fail closed with an upgrade message instead of being silently reinterpreted.
+- Require protocol controllers to receive the validated request configuration
+  in `conn.private[:attesto_phoenix_config]`. A missing or malformed request
+  value no longer falls back to global application configuration; hosts must
+  mount `AttestoPhoenix.Plug.PutConfig` in the route pipeline. Thanks to
+  [@MuNeNiCK](https://github.com/MuNeNiCK) for reporting the request-scoping gap
+  and independently proposing a fix in
+  [#24](https://github.com/XukuLLC/attesto_phoenix/pull/24).
+- Require a protocol config preinstalled before `AttestoPhoenix.Plug.PutConfig`
+  to exactly match the protocol config derived from the same request's host
+  config. Divergent private values now fail closed instead of letting metadata
+  and endpoint policy disagree.
+- Register the bundled Ecto sweeper under a deterministic repository/schema
+  name so multiple policy profiles can coexist. `Sweeper.sweep_now/0` resolves
+  that configured default; callers using an explicit custom registration name
+  must continue to call `sweep_now/1`.
 - Require Attesto 2.0 and its atomic refresh-store rotation contract. Custom
   refresh stores must replace the former multi-step consume/insert/successor
   callbacks with one family-serialized `rotate/4` transaction.
@@ -41,7 +59,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Recognize only exact v1/v2 encrypted refresh-successor wrappers and redact
   malformed, unknown, or tampered state conservatively no later than the parent
   token expiry.
-
+- Enforce a DPoP nonce row's persisted expiry as well as the caller's freshness
+  window, so a nonce issued with a shorter lifetime cannot be accepted after
+  its stored deadline.
+- Honor the validated request's configured refresh store for RFC 7009
+  revocation, ahead of the compatibility-only `conn.private` override. Load a
+  configured code-store module before probing its optional access-token
+  revocation callback, fail closed when the module cannot load, and continue
+  to require an exact boolean when that callback exists.
 - Fail configuration construction when the bundled Ecto refresh store uses a
   non-zero rotation retry grace without a usable
   `:refresh_successor_secret`. The Igniter installer now adds an idempotent
@@ -107,14 +132,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Resolve every protocol controller from the validated request-scoped
-  configuration installed by `AttestoPhoenix.Plug.PutConfig`, with no global
-  fallback when the reserved request value is absent or malformed. This keeps
-  concurrently mounted policy profiles isolated and fails closed when a host
-  omits the required pipeline. Thanks to
-  [@MuNeNiCK](https://github.com/MuNeNiCK) for reporting the request-scoping gap
-  and independently proposing a fix in
-  [#24](https://github.com/XukuLLC/attesto_phoenix/pull/24).
 - Preserve explicitly empty grant-type and client-authentication catalogs in
   discovery, endpoint enforcement, and dynamic registration instead of
   widening them to package defaults. Malformed catalogs and per-client grant
@@ -154,13 +171,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   backfill the 3.0 refresh-family tombstone table, then start 3.0 and re-enable
   traffic. Mixed 2.x/3.0 writers are unsupported because 2.x does not read or
   write the tombstones.
-- Non-empty 2.x table prefixes require a stopped cutover before any 3.0 node
-  starts: inventory the literal-prefix tables, move and rename them into one
-  PostgreSQL schema, align indexes/constraints, and verify row counts. Never
-  run mixed 2.x/3.0 nodes, workers, or migration commands during this cutover;
-  see `guides/upgrade_3_0_schema_prefix.md` for the inventory and verification
-  procedure. Remove every legacy `:table_prefix` setting, then configure
-  `:schema_prefix` and use `--schema-prefix` for future generated migrations.
+- A non-empty 2.x `:table_prefix` value does not identify one runtime layout.
+  Before any 3.0 node starts, inventory public canonical, public
+  literal-prefixed, and schema/canonical candidates for every table using
+  counts, observed behavior, and backups. Stop if a logical table has split
+  non-empty data; move only a verified source relation into one PostgreSQL
+  schema. Never run mixed 2.x/3.0 nodes, workers, or migration commands during
+  this stopped cutover; see `guides/upgrade_3_0_schema_prefix.md`. Remove every
+  legacy `:table_prefix` setting, then configure `:schema_prefix` and use
+  `--schema-prefix` for future fresh migrations.
 - Before upgrading an existing Ecto database, apply a forward migration that
   adds the unique `(family_id, generation)` index on `attesto_refresh_tokens` if
   it is not already present. The exact operation is:

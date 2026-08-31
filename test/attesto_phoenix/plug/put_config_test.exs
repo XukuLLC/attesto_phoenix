@@ -108,6 +108,24 @@ defmodule AttestoPhoenix.Plug.PutConfigTest do
     assert result.private[:attesto_protocol_config] === protocol_config
   end
 
+  test "rejects a protocol config that drifts from the request host config" do
+    host_config = Config.new(host_options())
+    protocol_config = Config.to_attesto_config(host_config)
+    drifted = %{protocol_config | audience: "https://different-resource.example"}
+
+    input =
+      conn(:get, "/")
+      |> put_private(:attesto_phoenix_config, host_config)
+      |> put_private(:attesto_protocol_config, drifted)
+
+    error =
+      assert_raise ArgumentError, ~r/to match the protocol config derived/, fn ->
+        PutConfig.call(input, PutConfig.init([]))
+      end
+
+    refute error.message =~ "different-resource"
+  end
+
   test "fails closed when a reserved private key contains the wrong type" do
     input = put_private(conn(:get, "/"), :attesto_phoenix_config, :wrong)
 

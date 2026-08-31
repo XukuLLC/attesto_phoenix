@@ -64,7 +64,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
       * `--schema-prefix` - the PostgreSQL schema selected by Ecto's `prefix:`
         option for every generated table and index. The migration generator
         uses the same value. The legacy 2.x `--table-prefix` option is rejected
-        because it meant literal table-name prefixing.
+        because it controlled literal names in generated migrations, not one
+        coherent runtime layout: most stores queried canonical public tables,
+        while only the CIBA store and sweeper treated it as an Ecto schema
+        prefix.
       * `--callbacks-module` - the base module the scaffolded callback modules
         are generated under. Defaults to `<App>.AuthZ`, yielding
         `<App>.AuthZ.ClientStore` and friends.
@@ -614,15 +617,15 @@ if Code.ensure_loaded?(Igniter) do
       if Enum.any?(argv, &legacy_table_prefix_arg?/1) do
         raise Mix.Error,
           message:
-            "--table-prefix was removed in 3.0 because 2.x prefixed literal table names. Use --schema-prefix for a PostgreSQL schema and migrate existing tables before deploying."
+            "--table-prefix was removed in 3.0. In 2.x it controlled literal names in generated migrations but did not identify one runtime layout: most stores queried canonical public tables, while only the CIBA store and sweeper used it as an Ecto schema prefix. Use --schema-prefix for a fresh migration; inventory and migrate verified existing sources before deploying."
       end
     end
 
     # The installer can repair its own generated AST, but it cannot safely
-    # infer whether a host-owned `:table_prefix` was the old literal table-name
-    # convention or an unrelated application key. Leave the source untouched
-    # and emit a fail-closed notice: Config rejects the key at boot, so a rerun
-    # cannot silently route an existing non-empty-prefix database to `public`.
+    # infer which physical relations a host-owned `:table_prefix` deployment
+    # actually used. Leave the source untouched and emit a fail-closed notice:
+    # Config rejects the key at boot, so a rerun cannot silently route an
+    # existing database to `public`.
     defp notice_legacy_table_prefix_config(igniter) do
       config_path = ProjectApplication.config_path(igniter)
       config_dir = config_path |> Path.dirname() |> Path.expand()
@@ -633,13 +636,18 @@ if Code.ensure_loaded?(Igniter) do
          |> Enum.any?(&legacy_table_prefix_config_source?/1) do
         Igniter.add_notice(igniter, """
         Legacy `:table_prefix` configuration was found in the host config. The
-        installer leaves that host-owned AST untouched because it cannot safely
-        infer the old literal table-name intent. Remove every legacy
-        `:table_prefix` entry, set `:schema_prefix` to the PostgreSQL schema
-        containing the migrated canonical tables, and complete the 2.x -> 3.0
-        stopped cutover before boot. `AttestoPhoenix.Config` will fail closed
-        while the legacy key remains; it will not reinterpret it as a schema.
-        See `guides/upgrade_3_0_schema_prefix.md` for inventory and migration
+        installer leaves that host-owned AST untouched because the setting does
+        not identify one runtime layout. In v2.14.2 the migration generator
+        could create literal-prefixed tables in `public`, most stores queried
+        canonical public tables, and only the CIBA store and sweeper used the
+        value as an Ecto schema prefix. Inventory actual sources from counts,
+        observed behavior, and backups; stop if a logical table has split
+        non-empty candidates; move only verified sources. Then remove every
+        legacy `:table_prefix` entry, set `:schema_prefix` to the PostgreSQL
+        schema containing the migrated canonical tables, and complete the
+        stopped 2.x -> 3.0 cutover before boot. `AttestoPhoenix.Config` will fail closed while the legacy key
+        remains; it will not reinterpret it as a schema. See
+        `guides/upgrade_3_0_schema_prefix.md` for inventory and migration
         checks.
         """)
       else
@@ -1016,8 +1024,12 @@ if Code.ensure_loaded?(Igniter) do
 
            If this is an upgrade of an existing database, add the tombstone
            table with a forward migration and backfill it from revoked rows
-           before deploying the new code. Do not rerun the create-table
-           migration against tables that already exist.
+           before deploying the new code. Also add the unique
+           `(family_id, generation)` index named
+           `attesto_refresh_tokens_family_id_generation_index` to
+           `attesto_refresh_tokens`; stop and reconcile if duplicate rows make
+           that index fail. Do not rerun the create-table migration against
+           tables that already exist.
 
            Stop and drain every 2.x token writer before this migration and
            before starting 3.0, including deployments using the public schema.

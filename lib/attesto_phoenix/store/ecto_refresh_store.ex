@@ -799,40 +799,57 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   end
 
   # v2 carries the child hash in its authenticated wrapper. Legacy v1
-  # ciphertext predates that binding, so establish the missing parent/family
-  # relation from durable lineage before exposing its decrypted token. This
-  # also makes a copied v1 ciphertext fail closed: the candidate child must be
-  # the row minted by this parent in this family.
+  # ciphertext predates that binding, so establish the missing family,
+  # generation, token-hash, and context relation from durable lineage before
+  # exposing its decrypted token. A 2.x child has no parent_hash, so the
+  # legacy path accepts that exact child while still rejecting copied state
+  # from another family or a current child with a different lineage marker.
   defp valid_recovered_successor?(_row, nil, _prefix), do: true
 
   defp valid_recovered_successor?(_row, %{recoverable: false}, _prefix), do: true
 
   defp valid_recovered_successor?(
-         %RefreshToken{token_hash: parent_hash, family_id: family_id},
+         %RefreshToken{token_hash: parent_hash, family_id: family_id, generation: parent_generation} = row,
          %{token: token, generation: generation, context: context},
          prefix
        )
-       when is_binary(token) and is_integer(generation) and is_map(context) do
+       when is_binary(token) and is_integer(parent_generation) and is_integer(generation) and
+              generation == parent_generation + 1 and is_map(context) do
     child_hash = token_hash(token)
 
     child_query =
       from(child in RefreshToken,
         where:
           child.token_hash == ^child_hash and child.family_id == ^family_id and
-            child.generation == ^generation and child.parent_hash == ^parent_hash,
+            child.generation == ^generation,
         select: child
       )
 
-    case repo().one(child_query, prefix: prefix, log: false, telemetry_event: nil) do
-      %RefreshToken{} = child ->
-        recovered_child_matches?(child, generation, context)
-
-      nil ->
-        false
-    end
+    child = repo().one(child_query, prefix: prefix, log: false, telemetry_event: nil)
+    valid_recovered_child?(row, child, parent_hash, generation, context)
   end
 
   defp valid_recovered_successor?(_row, _successor, _prefix), do: false
+
+  defp valid_recovered_child?(_row, nil, _parent_hash, _generation, _context), do: false
+
+  defp valid_recovered_child?(row, %RefreshToken{} = child, parent_hash, generation, context) do
+    recovered_child_lineage_matches?(row, child, parent_hash) and
+      recovered_child_matches?(child, generation, context)
+  end
+
+  defp recovered_child_lineage_matches?(row, child, parent_hash) do
+    child.parent_hash == parent_hash or
+      (legacy_v1_wrapper?(row.successor) and is_nil(child.parent_hash))
+  end
+
+  defp legacy_v1_wrapper?(%{"v" => 1, "ciphertext" => ciphertext} = wrapper) when is_binary(ciphertext),
+    do: Map.keys(wrapper) |> Enum.sort() == ["ciphertext", "v"]
+
+  defp legacy_v1_wrapper?(%{v: 1, ciphertext: ciphertext} = wrapper) when is_binary(ciphertext),
+    do: Map.keys(wrapper) |> Enum.sort() == [:ciphertext, :v]
+
+  defp legacy_v1_wrapper?(_wrapper), do: false
 
   defp recovered_child_matches?(%RefreshToken{} = child, generation, context) do
     child_record = to_store_record(child)
@@ -848,7 +865,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
       nil ->
         case Application.get_env(@app, :otp_app) do
-          otp_app when is_atom(otp_app) ->
+          otp_app when is_atom(otp_app) and not is_nil(otp_app) ->
             Config.from_otp_app(otp_app).refresh_token_rotation_grace_seconds
 
           _other ->

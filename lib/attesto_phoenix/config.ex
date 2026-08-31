@@ -614,7 +614,10 @@ defmodule AttestoPhoenix.Config do
       a non-empty, lowercase ASCII PostgreSQL schema identifier containing only
       letters, digits, and underscores, beginning with a letter or underscore
       and no longer than 63 bytes. The 2.x `:table_prefix` option is rejected;
-      it meant literal table-name prefixing and cannot be reinterpreted safely.
+      it did not identify one runtime layout: generated migrations could use
+      literal names in `public`, while most stores queried canonical public
+      tables and only the CIBA store and sweeper used it as an Ecto schema
+      prefix. Inventory an existing database before selecting this value.
 
   ### Endpoint paths advertised in metadata
 
@@ -1296,8 +1299,8 @@ defmodule AttestoPhoenix.Config do
   defp normalize_session_management(opts) when is_list(opts), do: Keyword.merge(@session_management_defaults, opts)
 
   @doc """
-  Reads the config for `otp_app` under `key` (default `AttestoPhoenix`) from the
-  application environment and builds a validated config.
+  Reads the config for `otp_app` under `key` (default `AttestoPhoenix.Config`)
+  from the application environment and builds a validated config.
   """
   @spec from_otp_app(atom(), atom()) :: t()
   def from_otp_app(otp_app, key \\ __MODULE__) when is_atom(otp_app) do
@@ -3892,10 +3895,12 @@ defmodule AttestoPhoenix.Config do
   defp reject_legacy_table_prefix!(opts) when is_map(opts) do
     if Map.has_key?(opts, :table_prefix) do
       raise ArgumentError,
-            "AttestoPhoenix.Config: :table_prefix was removed in 3.0. " <>
-              "It was the 2.x literal table-name prefix and cannot be reinterpreted " <>
-              "as a PostgreSQL schema. Rename it to :schema_prefix and apply the " <>
-              "3.0 migration to the canonical table names before booting."
+            "AttestoPhoenix.Config: :table_prefix was removed in 3.0. In 2.x it " <>
+              "did not identify one runtime layout: generated migrations could " <>
+              "use literal names in public, while most stores queried canonical " <>
+              "public tables and only the CIBA store and sweeper used it as an " <>
+              "Ecto schema prefix. Rename it to :schema_prefix only after " <>
+              "inventorying and migrating verified sources before booting."
     end
   end
 
@@ -3947,10 +3952,13 @@ defmodule AttestoPhoenix.Config do
     if Keyword.has_key?(Application.get_all_env(:attesto_phoenix), :table_prefix) do
       raise ArgumentError,
             "AttestoPhoenix.Config: config :attesto_phoenix, :table_prefix was " <>
-              "removed in 3.0. It was the 2.x literal table-name prefix and " <>
-              "cannot be reinterpreted as a PostgreSQL schema. Remove the key, " <>
-              "configure :schema_prefix under the host AttestoPhoenix.Config, " <>
-              "and complete the 3.0 table cutover before booting."
+              "removed in 3.0. The 2.x value did not identify one runtime layout: " <>
+              "generated migrations could use literal names in public, while most " <>
+              "stores queried canonical public tables and only the CIBA store and " <>
+              "sweeper used it as an Ecto schema prefix. Remove the key, inventory " <>
+              "and migrate verified sources, configure :schema_prefix under the " <>
+              "host AttestoPhoenix.Config, and complete the 3.0 table cutover " <>
+              "before booting."
     end
   end
 

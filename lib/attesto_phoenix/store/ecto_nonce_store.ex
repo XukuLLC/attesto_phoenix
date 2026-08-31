@@ -166,33 +166,39 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
     # from every concurrent loser (RFC 9449 §8 single-use requirement).
     {count, _} =
       from(n in DPoPNonce,
-        where: n.nonce == ^nonce and is_nil(n.used_at) and n.issued_at >= ^cutoff,
+        where:
+          n.nonce == ^nonce and is_nil(n.used_at) and n.issued_at >= ^cutoff and
+            n.expires_at > ^now,
         update: [set: [used_at: ^now]]
       )
       |> repo.update_all([], prefix: prefix, log: false, telemetry_event: nil)
 
     case count do
       1 -> :ok
-      0 -> disambiguate(repo, nonce, cutoff, prefix)
+      0 -> disambiguate(repo, nonce, cutoff, prefix, now)
     end
   end
 
   # The conditional update matched nothing. Read the row back to report the
   # precise reason rather than silently rejecting (fail-closed).
-  defp disambiguate(repo, nonce, cutoff, prefix) do
-    query = from(n in DPoPNonce, where: n.nonce == ^nonce, select: {n.used_at, n.issued_at})
+  defp disambiguate(repo, nonce, cutoff, prefix, now) do
+    query =
+      from(n in DPoPNonce,
+        where: n.nonce == ^nonce,
+        select: {n.used_at, n.issued_at, n.expires_at}
+      )
 
     case repo.one(query, prefix: prefix, log: false, telemetry_event: nil) do
       nil ->
         {:error, :unknown}
 
-      {used_at, _issued_at} when not is_nil(used_at) ->
+      {used_at, _issued_at, _expires_at} when not is_nil(used_at) ->
         {:error, :used}
 
-      {_used_at, issued_at} ->
-        # used_at is nil but the conditional update still missed: the only
-        # remaining reason is the freshness window (RFC 9449 §8).
-        if DateTime.before?(issued_at, cutoff) do
+      {_used_at, issued_at, expires_at} ->
+        # used_at is nil but the conditional update still missed. Persisted
+        # expiry and the caller's freshness window are both authoritative.
+        if DateTime.compare(expires_at, now) != :gt or DateTime.before?(issued_at, cutoff) do
           {:error, :expired}
         else
           {:error, :unknown}

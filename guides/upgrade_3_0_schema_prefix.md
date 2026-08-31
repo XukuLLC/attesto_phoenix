@@ -1,433 +1,313 @@
 # 3.0 schema-prefix cutover
 
-Version 2.x used `:table_prefix` as a literal prefix on each table name. For
-example, a value of `oauth_` produced `public.oauth_attesto_refresh_tokens`.
-Version 3.0 uses the public `:schema_prefix` option instead: the table remains
-`attesto_refresh_tokens` and Ecto selects PostgreSQL schema `oauth` with
-`prefix: "oauth"`.
+This is a stopped-cutover procedure for an existing `attesto_phoenix` 2.x
+database. Read it before changing configuration or starting a 3.0 node.
 
-These are different database layouts. The 3.0 runtime deliberately rejects the
-host `:table_prefix` key, the separate package-level
-`config :attesto_phoenix, :table_prefix` setting, and `--table-prefix`; it never
-guesses whether a value was a literal table prefix or a schema name.
+## What the 2.x setting did (and did not) mean
 
-## Critical deployment warning
+The 2.x `:table_prefix` setting is not a reliable description of one runtime
+database layout. In v2.14.2:
 
-Do not run 2.x and 3.0 nodes together for any deployment. 2.x does not read or
-write the durable refresh-family revocation tombstones used by 3.0, so mixed
-writers can diverge even when both versions use the public schema. For a
-non-empty prefix, 2.x additionally reads `public.<literal-prefix><table>` while
-3.0 reads `<schema>.<table>`, splitting authorization codes, refresh families,
-PAR references, replay records, and revocations across two physical layouts.
-Drain all 2.x nodes and complete the cutover before starting any 3.0 node. The
-same rule applies to workers, scheduled jobs, and migration commands that use
-the old generator.
+* the migration generator could prepend the value literally to table names in
+  `public` (for example, `oauth_` produced
+  `public.oauth_attesto_refresh_tokens`);
+* most runtime stores ignored `:table_prefix` and queried the canonical table
+  names in `public` (for example, `public.attesto_refresh_tokens`); and
+* only `EctoCIBAStore` and `Sweeper` passed the value to Ecto as a schema
+  prefix, looking for canonical table names in a PostgreSQL schema with that
+  name.
 
-Version 3.0 also enforces a lossless portable-JSON boundary for persisted
-authorization-code, device-code, CIBA, and refresh claim maps. Any pre-3.0 row
-whose claim map uses atom keys, floats, unsupported VM terms, invalid strings,
-out-of-range integers, or nesting deeper than the portable limit is rejected
-when read; it is never coerced into a broader grant. Audit or retire such rows
-before cutover if they must remain redeemable.
+Consequently, a non-empty 2.x value does not identify the source of every
+table. A deployment may contain canonical public tables, literal-prefixed
+tables created by a migration, schema/canonical tables used by the CIBA store
+or sweeper, or more than one of these. Do not infer the live layout from the
+old setting, and do not assume that the generated migration's table names
+were the tables used by the runtime.
 
-The procedure below is for an existing non-empty 2.x prefix. Back up the
-database, rehearse it on a copy, and keep the application stopped while the
-cutover runs.
+Version 3.0 removes `:table_prefix` and `--table-prefix`. It keeps the
+canonical table names and uses `:schema_prefix` as an Ecto PostgreSQL schema
+prefix. For example, `schema_prefix: "oauth"` means
+`oauth.attesto_refresh_tokens`, not a table named
+`oauth_attesto_refresh_tokens`.
 
-## 1. Inventory the old layout
+## Stop first
 
-The generated 2.x migration owns these tables:
+Before inspecting or changing the database:
 
-```text
-attesto_authorization_codes
-attesto_refresh_tokens
-attesto_device_codes
-attesto_ciba_requests
-attesto_logout_sessions
-dpop_nonces
-dpop_replays
-attesto_pushed_authorization_requests
-attesto_client_id_metadata
-attesto_consent_grants
-```
+1. Stop every 2.x application node, worker, sweeper, scheduler, and other
+   process that can write or delete Attesto rows. Do not start a 3.0 writer
+   until this cutover is complete. Mixed 2.x/3.0 writers are unsupported: 2.x
+   does not read or write the durable refresh-family revocation tombstones that
+   3.0 uses.
+2. Take a database backup and rehearse the procedure against a restorable copy.
+   Keep the pre-cutover backup until the post-cutover checks and a controlled
+   production flow have succeeded.
+3. Record the exact 2.x package version, all config sources, the old generator
+   command, every configured `:table_prefix` value, and the repository/schema
+   used by each deployment. A value in one config file may not have been the
+   value used by every 2.x node.
 
-The `attesto_refresh_family_revocations` tombstone table is new in 3.0; it is
-not part of the 2.x inventory and is created and backfilled in step 2.
+If you cannot stop all writers, stop here. This guide does not support a live
+or mixed-version migration.
 
-Confirm which prefixed tables exist, their owners, and their row counts. This
-query is intentionally an inventory query; it does not rename or delete data:
+3.0 also reads persisted authorization-code, device-code, CIBA, and refresh
+claim maps through a lossless portable-JSON boundary. Rows containing unsupported
+terms, invalid strings, unsafe integers, or other non-portable values fail
+closed when read. Audit rows that must remain redeemable during the rehearsal;
+changing the table location does not repair an incompatible claim map.
 
-```sql
-SELECT n.nspname AS schema_name, c.relname AS table_name,
-       c.relowner::regrole AS table_owner,
-       c.reltuples::bigint AS estimated_rows
-FROM pg_class AS c
-JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE c.relkind = 'r'
-  AND n.nspname = 'public'
-  AND left(c.relname, length('oauth_')) = 'oauth_'
-ORDER BY c.relname;
-```
+## 1. Inventory every candidate relation
 
-Record exact counts for every expected old table. For a precise count, run
-`SELECT count(*) FROM public.<old_table>;` for each table. Also inspect indexes
-and constraints before moving anything:
+The bundled migration has these canonical table names. The refresh-family
+tombstone table is new in 3.0 and therefore has no 2.x source row set.
 
-```sql
-SELECT schemaname, tablename, indexname, indexdef
-FROM pg_indexes
-WHERE schemaname = 'public' AND left(tablename, length('oauth_')) = 'oauth_'
-ORDER BY tablename, indexname;
+| Logical table | Canonical name |
+| --- | --- |
+| authorization codes | `attesto_authorization_codes` |
+| refresh tokens | `attesto_refresh_tokens` |
+| device codes | `attesto_device_codes` |
+| CIBA requests | `attesto_ciba_requests` |
+| logout sessions | `attesto_logout_sessions` |
+| DPoP nonces | `dpop_nonces` |
+| DPoP replays | `dpop_replays` |
+| pushed authorization requests | `attesto_pushed_authorization_requests` |
+| client metadata cache | `attesto_client_id_metadata` |
+| consent grants | `attesto_consent_grants` |
+| 3.0 refresh-family tombstones | `attesto_refresh_family_revocations` |
 
-SELECT n.nspname AS schema_name, c.relname AS table_name,
-       con.conname, pg_get_constraintdef(con.oid) AS definition
-FROM pg_constraint AS con
-JOIN pg_class AS c ON c.oid = con.conrelid
-JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = 'public' AND left(c.relname, length('oauth_')) = 'oauth_'
-ORDER BY c.relname, con.conname;
-```
+For each row in the table above, inventory all three candidates independently:
 
-Stop if a table is missing, an unexpected table owns the same data, counts are
-not recorded, or the old prefix is not the value used by every 2.x node.
+1. `public.<canonical_name>` — the canonical public relation used by most 2.x
+   stores;
+2. `public.<old_literal_prefix><canonical_name>` — the literal-prefixed
+   relation a 2.x generated migration may have created; and
+3. `<candidate_schema>.<canonical_name>` — the canonical relation in a schema
+   that a CIBA store or sweeper may have selected, or that a host may have
+   chosen manually.
 
-## 2. Cut over the tables
-
-Create the target schema, then verify its owner and that it has no canonical
-table-name collisions before moving anything. The following checks use the
-reviewed literal `oauth` example; substitute only a validated identifier that
-exactly matches `:schema_prefix`:
+Use the exact old literal prefix and candidate schema values found in the
+deployment records. The following query only resolves names; it does not
+create, rename, move, or delete anything. Replace `oauth_` and `oauth` with
+reviewed identifiers before running it:
 
 ```sql
-CREATE SCHEMA IF NOT EXISTS "oauth";
-
-SELECT n.nspname, n.nspowner::regrole AS owner,
-       has_schema_privilege(current_user, n.oid, 'USAGE') AS has_usage,
-       has_schema_privilege(current_user, n.oid, 'CREATE') AS has_create
-FROM pg_namespace AS n
-WHERE n.nspname = 'oauth';
-
-SELECT c.relname AS colliding_relation, c.relkind
-FROM pg_class AS c
-JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = 'oauth'
-  AND c.relname IN (
-    'attesto_authorization_codes', 'attesto_refresh_tokens',
-    'attesto_device_codes', 'attesto_ciba_requests',
-    'attesto_logout_sessions', 'dpop_nonces', 'dpop_replays',
-    'attesto_pushed_authorization_requests', 'attesto_client_id_metadata',
-    'attesto_consent_grants', 'attesto_refresh_family_revocations',
-    'oauth_attesto_authorization_codes', 'oauth_attesto_refresh_tokens',
-    'oauth_attesto_device_codes', 'oauth_attesto_ciba_requests',
-    'oauth_attesto_logout_sessions', 'oauth_dpop_nonces',
-    'oauth_dpop_replays', 'oauth_attesto_pushed_authorization_requests',
-    'oauth_attesto_client_id_metadata', 'oauth_attesto_consent_grants'
-  );
-
 WITH expected(name) AS (VALUES
-  ('attesto_authorization_codes_code_hash_index'),
-  ('attesto_authorization_codes_expires_at_index'),
-  ('attesto_authorization_codes_family_id_index'),
-  ('attesto_authorization_codes_access_token_jti_index'),
-  ('attesto_refresh_tokens_pkey'),
-  ('attesto_refresh_tokens_token_hash_index'),
-  ('attesto_refresh_tokens_family_id_generation_index'),
-  ('attesto_refresh_tokens_family_id_index'),
-  ('attesto_refresh_tokens_expires_at_index'),
-  ('attesto_device_codes_pkey'),
-  ('attesto_device_codes_device_code_hash_index'),
-  ('attesto_device_codes_user_code_index'),
-  ('attesto_device_codes_expires_at_index'),
-  ('attesto_ciba_requests_pkey'),
-  ('attesto_ciba_requests_auth_req_id_hash_index'),
-  ('attesto_ciba_requests_expires_at_index'),
-  ('attesto_logout_sessions_pkey'),
-  ('attesto_logout_sessions_sid_client_id_index'),
-  ('attesto_logout_sessions_subject_index'),
-  ('attesto_logout_sessions_expires_at_index'),
-  ('dpop_nonces_pkey'),
-  ('dpop_nonces_nonce_index'),
-  ('dpop_nonces_unused_index'),
-  ('dpop_replays_pkey'),
-  ('dpop_replays_expires_at_index'),
-  ('attesto_pushed_authorization_requests_pkey'),
-  ('attesto_pushed_authorization_requests_expires_at_index'),
-  ('attesto_client_id_metadata_pkey'),
-  ('attesto_client_id_metadata_expires_at_index'),
-  ('attesto_consent_grants_pkey'),
-  ('attesto_consent_grants_expires_at_index')
-), collision_candidates(name) AS (
-  SELECT name FROM expected
-  UNION ALL
-  SELECT 'oauth_' || name
-  FROM expected
-  -- This index is new in 3.0, so no old literal-prefixed form can exist.
-  WHERE name <> 'attesto_refresh_tokens_family_id_generation_index'
+  ('attesto_authorization_codes'),
+  ('attesto_refresh_tokens'),
+  ('attesto_device_codes'),
+  ('attesto_ciba_requests'),
+  ('attesto_logout_sessions'),
+  ('dpop_nonces'),
+  ('dpop_replays'),
+  ('attesto_pushed_authorization_requests'),
+  ('attesto_client_id_metadata'),
+  ('attesto_consent_grants'),
+  ('attesto_refresh_family_revocations')
 )
-SELECT 'relation' AS object_kind, e.name, c.relkind::text AS definition
-FROM collision_candidates AS e
-JOIN pg_class AS c ON c.relname = e.name
-JOIN pg_namespace AS n ON n.oid = c.relnamespace
-WHERE n.nspname = 'oauth'
-UNION ALL
-SELECT 'constraint' AS object_kind, e.name, pg_get_constraintdef(con.oid)
-FROM collision_candidates AS e
-JOIN pg_constraint AS con ON con.conname = e.name
-JOIN pg_class AS t ON t.oid = con.conrelid
-JOIN pg_namespace AS n ON n.oid = t.relnamespace
-WHERE n.nspname = 'oauth'
-ORDER BY object_kind, name;
+SELECT name AS canonical_name,
+       to_regclass(format('public.%I', name)) AS public_canonical,
+       to_regclass(format('public.%I', 'oauth_' || name)) AS public_literal_prefixed,
+       to_regclass(format('%I.%I', 'oauth', name)) AS schema_canonical
+FROM expected
+ORDER BY name;
 ```
 
-The owner check must show an owner that can move/rename the source tables, and
-the table and object-collision queries must return zero rows (unrelated tables
-may remain). These preflights cover canonical table, index, and constraint
-names, preventing a rename collision after the move. Stop if any check fails.
-Then move and rename each of the ten old tables. PostgreSQL moves a table's
-indexes and constraints with it. Use a reviewed migration with literal,
-validated identifiers; the example below shows the required order and includes
-the complete old-table inventory:
+Also list relation owners, exact row counts, primary keys, indexes, and
+foreign-key or check constraints for every relation that resolves. For exact
+counts, run a reviewed query for each relation, for example:
+
+```sql
+SELECT count(*) FROM public.attesto_refresh_tokens;
+SELECT count(*) FROM public.oauth_attesto_refresh_tokens;
+SELECT count(*) FROM oauth.attesto_refresh_tokens;
+```
+
+Do not use `reltuples` as the cutover count. Save the exact results, including
+zeroes, in the rehearsal and production records. Compare refresh `family_id`
+and token hashes, authorization-code hashes, PAR request URIs, replay keys,
+and other stable identifiers across candidates; equal row counts alone do not
+prove that two relations contain the same data.
+
+Inspect the 2.x source and observed behavior as well as the database:
+
+* review the exact v2.14.2 configuration loaded by every node;
+* review migration source and deployment history to determine whether literal
+  table names were ever created;
+* inspect repository query logs, database audit logs, or a temporary replay of
+  the backed-up 2.x release to see which qualified relations each store read
+  and wrote; and
+* compare the candidate contents with a trusted backup from a time when the
+  deployment was known to be serving traffic.
+
+Use these observations to fill in a source-of-truth record for every logical
+table. The source must be a specific qualified relation, not merely the old
+`:table_prefix` value.
+
+### Stop on split data
+
+Stop the cutover and reconcile the data manually if any logical table has
+non-empty rows in more than one candidate, including a public canonical
+relation plus a public literal-prefixed relation, or a public relation plus a
+schema/canonical relation. Also stop if query history, counts, stable-key
+comparisons, and backups do not identify one live source.
+
+Do not union candidate tables, choose the larger count, or delete one to make
+the layout look consistent. Split authorization codes, refresh families,
+consent grants, PAR references, replay records, CIBA requests, or revocations
+can change security decisions. Preserve both relations and obtain a reviewed
+data-reconciliation plan before continuing.
+
+An empty stale candidate may remain for later audit, but record it and do not
+use it as a source. The 3.0 cutover moves only a verified source relation.
+
+## 2. Select one 3.0 target layout
+
+Choose one PostgreSQL schema for all Ecto-backed Attesto tables:
+
+* use `public` with `schema_prefix: nil` (the Ecto default), or
+* use one application-owned schema, such as `oauth`, with
+  `schema_prefix: "oauth"`.
+
+Create a non-public schema only after checking ownership and privileges. Before
+moving any source, verify that every target canonical relation is absent or is
+the already-verified source, and that target index and constraint names will
+not collide. A relation in the target schema with unrelated rows is a stop
+condition.
+
+Do not run `mix attesto_phoenix.gen.migration` or the generated create-table
+migration against this existing database. That migration is for a fresh
+installation and can attempt to create tables that already exist. A migration
+generator command is not an inventory or data-move tool.
+
+## 3. Move only verified sources
+
+Use a reviewed forward migration or SQL session with validated identifiers.
+Run one operation per verified source and check the result before continuing.
+The examples below use target schema `oauth`; substitute only a reviewed
+identifier.
+
+For a verified canonical public source, move it into the target schema:
+
+```sql
+ALTER TABLE public.attesto_refresh_tokens SET SCHEMA oauth;
+```
+
+For a verified literal-prefixed public source, move and rename it:
+
+```sql
+ALTER TABLE public.oauth_attesto_refresh_tokens SET SCHEMA oauth;
+ALTER TABLE oauth.oauth_attesto_refresh_tokens RENAME TO attesto_refresh_tokens;
+```
+
+Apply the same pattern to each of the ten 2.x logical tables, using the source
+record to select the operation. A verified source that is already
+`oauth.<canonical_name>` needs no move. If the chosen target is `public`, leave
+the verified canonical public source in place and rename a verified literal
+source only after checking that its canonical name is free.
+
+Moving a table carries its indexes and constraints, but their names may still
+contain the old literal prefix. Inventory them after each move and rename only
+when the definition is the expected one and the canonical target name is free.
+Do not drop a unique index or constraint merely to make a name fit. Keep a
+record of old and new qualified names.
+
+If a source relation is missing, a target collides, an ownership/privilege check
+fails, or an operation affects a relation that was not in the source record,
+stop and restore from the backup or roll back the reviewed migration.
+
+## 4. Add the 3.0 invariants
+
+After the verified refresh-token source is in its target schema, add the unique
+generation index. Use the same Ecto prefix as runtime (`nil` for `public`):
 
 ```elixir
 def up do
-  execute("CREATE SCHEMA IF NOT EXISTS \"oauth\"")
-
-  # The ten old literal-prefix tables, in dependency-safe order:
-  execute("ALTER TABLE public.oauth_attesto_authorization_codes SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_authorization_codes RENAME TO attesto_authorization_codes")
-  execute("ALTER TABLE public.oauth_attesto_refresh_tokens SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_refresh_tokens RENAME TO attesto_refresh_tokens")
-  execute("ALTER TABLE public.oauth_attesto_device_codes SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_device_codes RENAME TO attesto_device_codes")
-  execute("ALTER TABLE public.oauth_attesto_ciba_requests SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_ciba_requests RENAME TO attesto_ciba_requests")
-  execute("ALTER TABLE public.oauth_attesto_logout_sessions SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_logout_sessions RENAME TO attesto_logout_sessions")
-  execute("ALTER TABLE public.oauth_dpop_nonces SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_dpop_nonces RENAME TO dpop_nonces")
-  execute("ALTER TABLE public.oauth_dpop_replays SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_dpop_replays RENAME TO dpop_replays")
-  execute("ALTER TABLE public.oauth_attesto_pushed_authorization_requests SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_pushed_authorization_requests RENAME TO attesto_pushed_authorization_requests")
-  execute("ALTER TABLE public.oauth_attesto_client_id_metadata SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_client_id_metadata RENAME TO attesto_client_id_metadata")
-  execute("ALTER TABLE public.oauth_attesto_consent_grants SET SCHEMA \"oauth\"")
-  execute("ALTER TABLE \"oauth\".oauth_attesto_consent_grants RENAME TO attesto_consent_grants")
-
-  # The 3.0 tombstone table is new; create and backfill it after all ten old
-  # tables have moved and before starting any 3.0 writer.
-  create table(:attesto_refresh_family_revocations, primary_key: false, prefix: "oauth") do
-    add :family_id, :string, primary_key: true, null: false
-    add :revoked_at, :utc_datetime, null: false
-  end
-
-  execute("""
-  INSERT INTO "oauth".attesto_refresh_family_revocations (family_id, revoked_at)
-  SELECT DISTINCT family_id, CURRENT_TIMESTAMP
-  FROM "oauth".attesto_refresh_tokens
-  WHERE family_revoked = true
-  ON CONFLICT (family_id) DO NOTHING
-  """)
+  prefix = "oauth" # Use nil for public.
 
   create unique_index(
     :attesto_refresh_tokens,
     [:family_id, :generation],
     name: :attesto_refresh_tokens_family_id_generation_index,
-    prefix: "oauth"
+    prefix: prefix
   )
 end
 ```
 
-The callback above creates the new tombstone and backfills one row per distinct
-revoked family before starting any 3.0 writer. The tombstone row count must equal
-the count of distinct revoked families in
-the moved refresh table. For a public-schema deployment, use `prefix: nil` and
-the corresponding `public.`-qualified SQL. Do not run the complete generated
-create-table migration against these tables.
+If creation reports duplicate `(family_id, generation)` rows, stop. Determine
+the authoritative lineage, reconcile and revoke affected families, preserve
+the audit trail, and retry only after review. Never delete a row just to make
+the index build succeed.
 
-The ten old tables must have moved before the new tombstone table is backfilled;
-the tombstone table did not exist in 2.x and therefore cannot have an old row
-count to preserve.
+Create the new durable refresh-family tombstone table in the target schema and
+backfill it from the verified refresh-token source. This is a forward migration
+for an existing database, not the generated fresh-install migration:
 
-## 3. Align indexes and constraints
+```elixir
+def up do
+  prefix = "oauth" # Use nil for public.
+  schema = prefix || "public"
 
-The 3.0 schemas use canonical table names and Ecto's canonical default index
-names. After the table renames, compare the inventory with the names expected
-by the schemas. In particular, the refresh store requires these unique indexes:
+  create table(:attesto_refresh_family_revocations, primary_key: false, prefix: prefix) do
+    add :family_id, :string, primary_key: true, null: false
+    add :revoked_at, :utc_datetime, null: false
+  end
 
-```text
-attesto_authorization_codes_code_hash_index
-attesto_refresh_tokens_token_hash_index
-attesto_refresh_tokens_family_id_generation_index
-dpop_nonces_nonce_index
+  execute("""
+  INSERT INTO "#{schema}".attesto_refresh_family_revocations (family_id, revoked_at)
+  SELECT DISTINCT family_id, CURRENT_TIMESTAMP
+  FROM "#{schema}".attesto_refresh_tokens
+  WHERE family_revoked = true
+  ON CONFLICT (family_id) DO NOTHING
+  """)
+end
 ```
 
-The remaining lookup indexes must continue to cover the same keys and expiry
-columns: device-code hash and user code, CIBA auth request hash, logout
-`(sid, client_id)` and subject/expiry, DPoP replay expiry, PAR expiry, client
-metadata expiry, consent expiry, and refresh/authorization expiry and family
-lookups. Rename an old index after the table rename when only its name differs,
-or create the canonical index concurrently in a separate migration when its
-definition is missing. Never drop a unique index until its replacement has
-been validated.
+Validate `prefix` and `schema` as fixed migration values before applying this
+code. For `public`, use `prefix = nil` and qualify both tables as `public` (or
+use the corresponding unqualified Ecto operation). Never backfill from a
+different candidate relation, and never start a 3.0 writer before the
+tombstone backfill is complete.
 
-For the complete generated 2.x layout with old literal prefix `oauth_`, the
-following reviewed renames align every generated primary-key constraint and
-index after the ten tables have moved to schema `oauth`. Use the inventory to
-confirm each old name exists. These commands are exact for the reviewed
-`oauth_` example; for any other old prefix, use the exact names returned by the
-inventory rather than mechanically substituting a long value (PostgreSQL can
-truncate identifiers). Substitute only a validated target schema and stop on
-an unexpected or missing name. `ALTER TABLE ... RENAME CONSTRAINT` also renames
-its backing primary-key index. The unique and ordinary indexes use `ALTER INDEX`:
+## 5. Verify before changing application configuration
 
-```sql
--- Primary-key constraints (the authorization-code table has no primary key).
-ALTER TABLE "oauth".attesto_refresh_tokens
-  RENAME CONSTRAINT oauth_attesto_refresh_tokens_pkey TO attesto_refresh_tokens_pkey;
-ALTER TABLE "oauth".attesto_device_codes
-  RENAME CONSTRAINT oauth_attesto_device_codes_pkey TO attesto_device_codes_pkey;
-ALTER TABLE "oauth".attesto_ciba_requests
-  RENAME CONSTRAINT oauth_attesto_ciba_requests_pkey TO attesto_ciba_requests_pkey;
-ALTER TABLE "oauth".attesto_logout_sessions
-  RENAME CONSTRAINT oauth_attesto_logout_sessions_pkey TO attesto_logout_sessions_pkey;
-ALTER TABLE "oauth".dpop_nonces
-  RENAME CONSTRAINT oauth_dpop_nonces_pkey TO dpop_nonces_pkey;
-ALTER TABLE "oauth".dpop_replays
-  RENAME CONSTRAINT oauth_dpop_replays_pkey TO dpop_replays_pkey;
-ALTER TABLE "oauth".attesto_pushed_authorization_requests
-  RENAME CONSTRAINT oauth_attesto_pushed_authorization_requests_pkey
-  TO attesto_pushed_authorization_requests_pkey;
-ALTER TABLE "oauth".attesto_client_id_metadata
-  RENAME CONSTRAINT oauth_attesto_client_id_metadata_pkey TO attesto_client_id_metadata_pkey;
-ALTER TABLE "oauth".attesto_consent_grants
-  RENAME CONSTRAINT oauth_attesto_consent_grants_pkey TO attesto_consent_grants_pkey;
+With writers still stopped:
 
--- Unique and lookup indexes. Their definitions must match the pre-move inventory.
-ALTER INDEX "oauth".oauth_attesto_authorization_codes_code_hash_index
-  RENAME TO attesto_authorization_codes_code_hash_index;
-ALTER INDEX "oauth".oauth_attesto_authorization_codes_expires_at_index
-  RENAME TO attesto_authorization_codes_expires_at_index;
-ALTER INDEX "oauth".oauth_attesto_authorization_codes_family_id_index
-  RENAME TO attesto_authorization_codes_family_id_index;
-ALTER INDEX "oauth".oauth_attesto_authorization_codes_access_token_jti_index
-  RENAME TO attesto_authorization_codes_access_token_jti_index;
-ALTER INDEX "oauth".oauth_attesto_refresh_tokens_token_hash_index
-  RENAME TO attesto_refresh_tokens_token_hash_index;
-ALTER INDEX "oauth".oauth_attesto_refresh_tokens_family_id_index
-  RENAME TO attesto_refresh_tokens_family_id_index;
-ALTER INDEX "oauth".oauth_attesto_refresh_tokens_expires_at_index
-  RENAME TO attesto_refresh_tokens_expires_at_index;
-ALTER INDEX "oauth".oauth_attesto_device_codes_device_code_hash_index
-  RENAME TO attesto_device_codes_device_code_hash_index;
-ALTER INDEX "oauth".oauth_attesto_device_codes_user_code_index
-  RENAME TO attesto_device_codes_user_code_index;
-ALTER INDEX "oauth".oauth_attesto_device_codes_expires_at_index
-  RENAME TO attesto_device_codes_expires_at_index;
-ALTER INDEX "oauth".oauth_attesto_ciba_requests_auth_req_id_hash_index
-  RENAME TO attesto_ciba_requests_auth_req_id_hash_index;
-ALTER INDEX "oauth".oauth_attesto_ciba_requests_expires_at_index
-  RENAME TO attesto_ciba_requests_expires_at_index;
-ALTER INDEX "oauth".oauth_attesto_logout_sessions_sid_client_id_index
-  RENAME TO attesto_logout_sessions_sid_client_id_index;
-ALTER INDEX "oauth".oauth_attesto_logout_sessions_subject_index
-  RENAME TO attesto_logout_sessions_subject_index;
-ALTER INDEX "oauth".oauth_attesto_logout_sessions_expires_at_index
-  RENAME TO attesto_logout_sessions_expires_at_index;
-ALTER INDEX "oauth".oauth_dpop_nonces_nonce_index
-  RENAME TO dpop_nonces_nonce_index;
-ALTER INDEX "oauth".oauth_dpop_nonces_unused_index
-  RENAME TO dpop_nonces_unused_index;
-ALTER INDEX "oauth".oauth_dpop_replays_expires_at_index
-  RENAME TO dpop_replays_expires_at_index;
-ALTER INDEX "oauth".oauth_attesto_pushed_authorization_requests_expires_at_index
-  RENAME TO attesto_pushed_authorization_requests_expires_at_index;
-ALTER INDEX "oauth".oauth_attesto_client_id_metadata_expires_at_index
-  RENAME TO attesto_client_id_metadata_expires_at_index;
-ALTER INDEX "oauth".oauth_attesto_consent_grants_expires_at_index
-  RENAME TO attesto_consent_grants_expires_at_index;
-```
+1. Compare exact post-move counts with the recorded verified-source counts for
+   all ten 2.x tables. Any unexplained difference is a stop condition.
+2. Verify that the tombstone count equals
+   `count(DISTINCT family_id)` in the target refresh-token table where
+   `family_revoked = true`.
+3. Verify the canonical table, primary-key/constraint, lookup-index, and named
+   generation-index definitions in the target schema. Confirm indexes are in
+   the same schema as their tables.
+4. Confirm no unreviewed non-empty candidate relation remains. Keep empty stale
+   relations until they have been audited; do not let them influence 3.0.
+5. Restore the backed-up 2.14.2 deployment against the rehearsal database and
+   confirm that the observed source record explains its reads and writes. Then
+   confirm that 3.0 resolves every store to the one target schema and canonical
+   table name.
 
-After these renames, rerun the `pg_indexes` and `pg_constraint` inventory and
-verify both canonical names and definitions. Do not rename an index whose
-definition differs from the expected schema; create and validate a replacement
-instead.
-
-The complete `up/0` callback above includes the exact refresh-generation index
-operation. If it fails because duplicate `(family_id, generation)` rows exist,
-stop and reconcile/revoke the affected families; do not delete a row merely to
-make the index build succeed. If index creation is split into a separate
-forward migration, copy that operation from the complete `up/0` callback above
-into that callback.
-
-Verify the final definitions and canonical names with `pg_indexes` and
-`pg_constraint` before changing application configuration. Remember that
-Ecto's `prefix:` affects indexes as well as tables; an index in `public` does
-not satisfy a table in `oauth`.
-
-## 4. Switch configuration and deploy
-
-Change the host config to the new public key and generate only future
-migrations with the new flag:
+Only after these checks pass, remove every old `:table_prefix` setting and
+configure the public 3.0 key:
 
 ```elixir
 config :my_app, AttestoPhoenix.Config,
-  schema_prefix: "oauth"
+  schema_prefix: "oauth" # nil means public
 ```
+
+For future fresh databases, generate tables with the schema option:
 
 ```bash
 mix attesto_phoenix.gen.migration --repo MyApp.Repo --schema-prefix oauth
 ```
 
-Do not leave `table_prefix: "oauth_"` in any config file. Do not pass
-`--table-prefix`; both forms fail closed with an upgrade message. Start the
-3.0 application only after the schema, table names, and index/constraint
-definitions are in place. For a fresh installation, use `--schema-prefix` (or
-the installer's `--schema-prefix`) before running the generated migration.
+The installer accepts the same `--schema-prefix` option. Do not pass
+`--table-prefix`, and do not use a fresh create-table migration as a substitute
+for this cutover.
 
-## 5. Verify row counts and runtime routing
-
-Compare the precise counts recorded in step 1 with the renamed tables:
-
-```sql
-SELECT count(*) FROM oauth.attesto_authorization_codes;
-SELECT count(*) FROM oauth.attesto_refresh_tokens;
-SELECT count(*) FROM oauth.attesto_device_codes;
-SELECT count(*) FROM oauth.attesto_ciba_requests;
-SELECT count(*) FROM oauth.attesto_logout_sessions;
-SELECT count(*) FROM oauth.dpop_nonces;
-SELECT count(*) FROM oauth.dpop_replays;
-SELECT count(*) FROM oauth.attesto_pushed_authorization_requests;
-SELECT count(*) FROM oauth.attesto_client_id_metadata;
-SELECT count(*) FROM oauth.attesto_consent_grants;
-SELECT count(*) FROM oauth.attesto_refresh_family_revocations;
-```
-
-The first ten counts must match exactly unless the application was intentionally
-quiesced with a separately documented data change. The tombstone count must
-equal `count(DISTINCT family_id)` over rows where `family_revoked = true` in
-`oauth.attesto_refresh_tokens`; verify that comparison explicitly:
-
-```sql
-SELECT
-  (SELECT count(*) FROM oauth.attesto_refresh_family_revocations) AS tombstones,
-  (SELECT count(DISTINCT family_id)
-   FROM oauth.attesto_refresh_tokens
-   WHERE family_revoked = true) AS distinct_revoked_families;
-```
-
-Confirm no old prefixed tables remain in
-`public`, and confirm each target table resolves in the target schema:
-
-```sql
-SELECT to_regclass('oauth.attesto_authorization_codes'),
-       to_regclass('oauth.attesto_refresh_tokens'),
-       to_regclass('oauth.attesto_refresh_family_revocations');
-```
-
-Finally, perform a controlled authorization-code redemption, refresh rotation,
-PAR consume, DPoP replay check, and revocation-family lookup while monitoring
-the repo. A successful request in the wrong schema is not evidence of a safe
-cutover: verify the SQL logs or database activity show the configured
-`oauth` prefix for every Ecto operation. Keep the 2.x backup until these checks
-and an agreed rollback window have completed.
+Start 3.0 only after the configuration, target tables, unique generation index,
+and durable tombstones are in place. Then run a controlled authorization-code
+redemption, refresh rotation and retry, PAR consume, DPoP replay check, CIBA
+request (if enabled), and revocation check while monitoring qualified database
+relations. Keep the backup until these flows and the first scheduled sweep have
+completed successfully.

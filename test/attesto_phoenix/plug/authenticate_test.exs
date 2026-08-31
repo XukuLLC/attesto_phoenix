@@ -70,6 +70,10 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     end
   end
 
+  defmodule MissingRevocationCallbackStore do
+    @moduledoc false
+  end
+
   @user_kind Attesto.PrincipalKind.new("user", "ou_", required_claims: [{"client_id", :non_empty_string}])
 
   setup do
@@ -324,6 +328,26 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
         end
 
       refute Exception.message(error) =~ "sensitive-result-sentinel"
+    end
+  end
+
+  test "loads configured code stores before probing their optional revocation callback", %{
+    config: config
+  } do
+    token = mint(config, scope: "openid")
+    claims = peek_claims(config, token)
+
+    refute ProtectedResource.access_token_revoked?(
+             %{config | code_store: MissingRevocationCallbackStore},
+             claims
+           )
+
+    for store <- ["not-a-module", AttestoPhoenix.CodeStoreMissing] do
+      config = %{config | code_store: store}
+
+      assert_raise RuntimeError, ~r/configured code_store/, fn ->
+        ProtectedResource.access_token_revoked?(config, claims)
+      end
     end
   end
 

@@ -29,6 +29,20 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     end
   end
 
+  defmodule ConfigStore do
+    @moduledoc false
+
+    def get(token_hash) do
+      send(self(), {:config_store_get, token_hash})
+      :error
+    end
+
+    def revoke_family(family_id) do
+      send(self(), {:config_store_revoke, family_id})
+      :ok
+    end
+  end
+
   defmodule StubEventSink do
     @behaviour AttestoPhoenix.EventSink
 
@@ -119,6 +133,22 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   describe "successful revocation (RFC 7009 §2.1)" do
+    test "honors Config.refresh_store over the legacy conn.private override" do
+      params = %{
+        "token" => @unknown_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      cfg = build_config(refresh_store: ConfigStore)
+      conn = RevocationController.create(build_conn(params, config: cfg), params)
+
+      assert conn.status == 200
+      assert_received {:config_store_get, hash}
+      assert hash == Attesto.Secret.hash(@unknown_token)
+      refute_received {:revoked, _family}
+    end
+
     test "router dispatch invokes the revoke operation and event exactly once" do
       put_record(@live_token, %{
         family_id: @live_family,

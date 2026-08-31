@@ -21,6 +21,16 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   policy such as accounts, roles, audit actors, and error envelopes belongs in
   the host application.
 
+  Configuration resolution is request-aware. When
+  `conn.private[:attesto_phoenix_config]` exists, that validated
+  `%AttestoPhoenix.Config{}` is authoritative and the plug's `:config` and
+  `:otp_app` options are ignored. When the request-private value is absent, the
+  plug uses its `:config` option, then its `:otp_app` option, and finally the
+  library's configured `:otp_app`. A malformed request-private value raises
+  instead of falling back to global application configuration. Mount
+  `AttestoPhoenix.Plug.PutConfig` when a route should use a request-specific
+  profile.
+
   RFC 9728 challenge discovery is selected through
   `AttestoPhoenix.Config.resource_metadata_url/3`: an explicit per-plug
   `:resource_metadata` value (including `nil`) takes precedence on every error

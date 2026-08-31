@@ -117,7 +117,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       `AttestoPhoenix.Config` the host puts in its application environment) is
       used so the generated schema matches the prefix the Ecto stores read at
       runtime; the task never invents a prefix. The 2.x `--table-prefix` option
-      is rejected because it meant literal table-name prefixing.
+      is rejected because it controlled literal names in generated migrations,
+      not one coherent runtime layout: most 2.x stores queried canonical tables
+      in `public`, while only the CIBA store and sweeper treated the value as an
+      Ecto schema prefix. Inventory an existing database before choosing a 3.0
+      schema; this task is for fresh migrations only.
 
     * `--migrations-path` - directory the migration file is written to. Defaults
       to the repo's `priv/<repo>/migrations` directory, the same location
@@ -289,9 +293,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     if Map.has_key?(opts, :table_prefix) do
       Mix.raise(
         "legacy :table_prefix configuration detected. Version 3.0 uses " <>
-          ":schema_prefix for a PostgreSQL schema; 2.x literal table-name " <>
-          "prefixes are incompatible. Rename the key and run the 3.0 migration " <>
-          "after inventorying and migrating the existing tables."
+          ":schema_prefix for a PostgreSQL schema. In 2.x this value did not " <>
+          "identify one runtime layout: generated migrations could create " <>
+          "literal-prefixed public tables, most stores queried canonical public " <>
+          "tables, and only the CIBA store and sweeper used it as an Ecto schema " <>
+          "prefix. Remove the key only after inventorying and migrating verified " <>
+          "sources in the existing database."
       )
     end
   end
@@ -345,9 +352,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   defp reject_legacy_table_prefix_arg!(args) do
     if Enum.any?(args, &legacy_table_prefix_arg?/1) do
       Mix.raise(
-        "--table-prefix was removed in 3.0 because 2.x prefixed literal table " <>
-          "names. Use --schema-prefix for a PostgreSQL schema and migrate existing " <>
-          "tables before deploying."
+        "--table-prefix was removed in 3.0. In 2.x it controlled literal names " <>
+          "in generated migrations but did not identify one runtime layout: most " <>
+          "stores queried canonical public tables, while only the CIBA store and " <>
+          "sweeper used it as an Ecto schema prefix. Use --schema-prefix for a " <>
+          "fresh migration; inventory and migrate verified existing sources before " <>
+          "deploying."
       )
     end
   end
@@ -356,8 +366,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     if Keyword.has_key?(Application.get_all_env(:attesto_phoenix), :table_prefix) do
       Mix.raise(
         "legacy config :attesto_phoenix, :table_prefix detected. Version 3.0 " <>
-          "uses :schema_prefix for a PostgreSQL schema; remove the old key and " <>
-          "complete the 3.0 table cutover before generating a migration."
+          "uses :schema_prefix for a PostgreSQL schema. The 2.x value did not " <>
+          "identify one runtime layout; inventory and complete the 3.0 table " <>
+          "cutover before generating a migration."
       )
     end
   end

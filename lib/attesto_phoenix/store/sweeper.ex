@@ -173,8 +173,11 @@ defmodule AttestoPhoenix.Store.Sweeper do
   table. Test- and diagnostic-facing; the supervised process drives sweeps via
   the configured interval, not this call.
   """
+  @spec sweep_now() :: %{optional(String.t()) => non_neg_integer()}
+  def sweep_now, do: sweep_now(default_server())
+
   @spec sweep_now(GenServer.server()) :: %{optional(String.t()) => non_neg_integer()}
-  def sweep_now(server \\ __MODULE__) do
+  def sweep_now(server) do
     GenServer.call(server, :sweep_now)
   end
 
@@ -280,6 +283,11 @@ defmodule AttestoPhoenix.Store.Sweeper do
   defp default_name(%Config{repo: repo} = config) do
     digest = :crypto.hash(:sha256, :erlang.term_to_binary({repo, Config.table_prefix(config)}))
     String.to_atom("attesto_phoenix_sweeper_" <> Base.encode16(digest, case: :lower))
+  end
+
+  defp default_server do
+    config = Config.request_config() || Config.resolve!()
+    default_name(config)
   end
 
   defp configured_interval(%Config{sweep_interval_ms: nil} = config, opts) do

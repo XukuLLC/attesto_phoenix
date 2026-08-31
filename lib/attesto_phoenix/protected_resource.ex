@@ -90,19 +90,38 @@ defmodule AttestoPhoenix.ProtectedResource do
 
   @doc "Return whether the access token identified by the claims is revoked."
   @spec access_token_revoked?(Config.t(), map()) :: boolean()
-  def access_token_revoked?(%Config{code_store: store}, %{"jti" => jti}) when is_atom(store) and is_binary(jti) do
+  def access_token_revoked?(%Config{code_store: store}, %{"jti" => jti})
+      when is_atom(store) and not is_nil(store) and is_binary(jti) do
+    case Code.ensure_loaded(store) do
+      {:module, ^store} ->
+        access_token_revoked_by_store?(store, jti)
+
+      {:error, _reason} ->
+        raise RuntimeError, "configured code_store could not be loaded for protected-resource revocation checks"
+    end
+  end
+
+  def access_token_revoked?(%Config{code_store: store}, %{"jti" => jti}) when not is_nil(store) and is_binary(jti) do
+    raise RuntimeError,
+          "configured code_store must be a loadable module for protected-resource revocation checks"
+  end
+
+  def access_token_revoked?(_config, _claims), do: false
+
+  defp access_token_revoked_by_store?(store, jti) do
     if function_exported?(store, :access_token_revoked?, 1) do
-      case store.access_token_revoked?(jti) do
-        true -> true
-        false -> false
-        _unexpected -> raise RuntimeError, "code_store access_token_revoked?/1 must return true or false"
-      end
+      require_boolean_revocation_result!(store.access_token_revoked?(jti))
     else
       false
     end
   end
 
-  def access_token_revoked?(_config, _claims), do: false
+  defp require_boolean_revocation_result!(true), do: true
+  defp require_boolean_revocation_result!(false), do: false
+
+  defp require_boolean_revocation_result!(_unexpected) do
+    raise RuntimeError, "code_store access_token_revoked?/1 must return true or false"
+  end
 
   @doc "Build the transport options for a protected-resource error response."
   @spec error_opts(Config.t(), String.t() | nil, keyword()) :: keyword()

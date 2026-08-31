@@ -773,6 +773,83 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
                TestRepo.get(RefreshFamilyRevocation, parent_b.family_id)
     end
 
+    test "recovers a true 2.x v1 row whose child has no parent_hash" do
+      parent_token = "legacy-row-parent-#{System.unique_integer([:positive])}"
+      parent = entry(%{token_hash: Attesto.Secret.hash(parent_token)})
+      token = "legacy-row-child-#{System.unique_integer([:positive])}"
+      child = child(parent, token)
+      legacy_successor = successor(child, token, 1_900_000_010) |> Map.delete(:retry_until)
+      {:ok, legacy_ciphertext} = RefreshSuccessorCipher.encrypt(legacy_successor)
+
+      # Reconstruct the stopped-cutover rows directly. The child is persisted
+      # with the 2.x schema's NULL parent_hash rather than being minted by the
+      # current 3.0 rotate path.
+      assert :ok = EctoRefreshStore.insert(parent)
+
+      child
+      |> RefreshToken.from_store_record(parent_hash: nil)
+      |> then(&RefreshToken.insert_changeset(%RefreshToken{}, &1))
+      |> TestRepo.insert!()
+
+      TestRepo.get_by!(RefreshToken, token_hash: parent.token_hash)
+      |> Ecto.Changeset.change(
+        consumed: true,
+        consumed_at: DateTime.from_unix!(1_900_000_001, :second),
+        successor: %{"v" => 1, "ciphertext" => legacy_ciphertext}
+      )
+      |> TestRepo.update!()
+
+      assert {:ok, loaded} = EctoRefreshStore.get(parent.token_hash)
+      assert loaded.successor.token == token
+      assert loaded.successor.generation == child.generation
+      assert loaded.successor.context == child.data
+      assert loaded.successor.retry_until == 1_900_000_061
+    end
+
+    test "rejects copied valid v1 ciphertext from another row in the same family" do
+      family_id = "legacy-copied-family-#{System.unique_integer([:positive])}"
+      parent_token = "legacy-copied-parent-#{System.unique_integer([:positive])}"
+      parent = entry(%{token_hash: Attesto.Secret.hash(parent_token), family_id: family_id})
+      token_a = "legacy-copied-child-a-#{System.unique_integer([:positive])}"
+      child_a = child(parent, token_a)
+      token_b = "legacy-copied-child-b-#{System.unique_integer([:positive])}"
+      child_b = child(child_a, token_b)
+      legacy_successor_a = successor(child_a, token_a, 1_900_000_010) |> Map.delete(:retry_until)
+      {:ok, ciphertext_a} = RefreshSuccessorCipher.encrypt(legacy_successor_a)
+
+      # Persist a complete stopped-cutover family with NULL parent_hash on
+      # every row. The v1 ciphertext is valid for parent, then copied onto its
+      # already-advanced child row, where generation must reject it.
+      for row <- [parent, child_a, child_b] do
+        row
+        |> RefreshToken.from_store_record(parent_hash: nil)
+        |> then(&RefreshToken.insert_changeset(%RefreshToken{}, &1))
+        |> TestRepo.insert!()
+      end
+
+      TestRepo.get_by!(RefreshToken, token_hash: parent.token_hash)
+      |> Ecto.Changeset.change(
+        consumed: true,
+        consumed_at: DateTime.from_unix!(1_900_000_001, :second),
+        successor: %{"v" => 1, "ciphertext" => ciphertext_a}
+      )
+      |> TestRepo.update!()
+
+      TestRepo.get_by!(RefreshToken, token_hash: child_a.token_hash)
+      |> Ecto.Changeset.change(
+        consumed: true,
+        consumed_at: DateTime.from_unix!(1_900_000_002, :second),
+        successor: %{"v" => 1, "ciphertext" => ciphertext_a}
+      )
+      |> TestRepo.update!()
+
+      assert {:ok, loaded_parent} = EctoRefreshStore.get(parent.token_hash)
+      assert loaded_parent.successor.token == token_a
+
+      assert {:ok, loaded_child} = EctoRefreshStore.get(child_a.token_hash)
+      assert loaded_child.successor == nil
+    end
+
     test "ciphertext, deadline, child binding, and parent binding tampering fail closed" do
       parent = entry()
       token = "tamper-#{System.unique_integer([:positive])}"
