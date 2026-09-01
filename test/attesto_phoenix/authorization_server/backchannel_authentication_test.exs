@@ -338,6 +338,32 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
                )
     end
 
+    test "accepts the request-object media type with randomized casing" do
+      {jwk, pub_map} = es256_key()
+
+      client = %{
+        id: "cli-1",
+        jwks: %{"keys" => [pub_map]},
+        ciba: %{token_delivery_mode: :poll, request_signing_alg: "ES256"}
+      }
+
+      jwt =
+        signed_request(
+          jwk,
+          signed_claims(),
+          "ES256",
+          %{"typ" => "OautH-auThZ-REQ+jWt"}
+        )
+
+      assert {:ok, %{auth_req_id: auth_req_id}} =
+               BackchannelAuthentication.request(
+                 config(ciba: [enabled: true, require_signed_request: true]),
+                 request(client, %{"request" => jwt})
+               )
+
+      assert is_binary(auth_req_id)
+    end
+
     test "rejects a repeated signed request through the configured replay boundary" do
       {jwk, pub_map} = es256_key()
 
@@ -564,7 +590,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
     }
   end
 
-  defp signed_request(jwk, claims, alg \\ "ES256") do
+  defp signed_request(jwk, claims, alg \\ "ES256", protected \\ %{}) do
     now = System.system_time(:second)
 
     payload =
@@ -578,7 +604,8 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
         claims
       )
 
-    {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, %{"alg" => alg}, payload))
+    header = Map.put(protected, "alg", alg)
+    {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, header, payload))
     compact
   end
 
