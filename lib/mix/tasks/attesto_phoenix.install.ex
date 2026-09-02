@@ -37,7 +37,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
       * points the host at `mix attesto_phoenix.gen.migration` for the Ecto
         tables the bundled stores read, including the durable refresh-family
         revocation tombstones. Existing installations upgrading to a release
-        that adds this table must apply its forward migration before boot.
+        that adds this table must apply its forward migration before boot. The
+        authorization-code primary-key upgrade applies only to the historical
+        generated layout after a catalog preflight and needs a controlled lock
+        window; see the CHANGELOG upgrade notes.
 
     Every step is idempotent: re-running the task does not duplicate the config,
     the route, or the scaffolded modules. The task never decides authorization
@@ -1539,10 +1542,24 @@ if Code.ensure_loaded?(Igniter) do
            that index fail. Do not rerun the create-table migration against
            tables that already exist.
 
-           Stop and drain every 2.x token writer before this migration and
-           before starting 3.0, including deployments using the public schema.
-           Mixed 2.x/3.0 writers are unsupported because 2.x does not read or
-           write durable refresh-family revocation tombstones.
+           Stop and drain every 2.x token writer before that 3.0
+           tombstone/backfill and schema-prefix cutover, and before starting
+           3.0, including deployments using the public schema. Mixed 2.x/3.0
+           writers are unsupported because 2.x does not read or write durable
+           refresh-family revocation tombstones.
+
+           A database whose `attesto_authorization_codes` table matches the
+           historical generated layout also needs the forward migration from
+           the CHANGELOG upgrade notes. Run the catalog preflight in
+           `guides/upgrade_3_0_schema_prefix.md#catalog-preflight`; it verifies
+           that `code_hash` is `NOT NULL` and
+           `attesto_authorization_codes_code_hash_index` is safe to promote.
+           Custom layouts need a reviewed migration. Use a controlled window
+           because promotion requests `ACCESS EXCLUSIVE`, and retain the
+           CHANGELOG's short `lock_timeout`. For logical replication, migrate
+           the subscriber first and the publisher second; preserve
+           `REPLICA IDENTITY FULL` until both sides have the key. A database
+           created by this release's generator already has the primary key.
 
         4. The OAuth endpoints are mounted under "#{oauth_path_prefix}". The
            well-known discovery and JWKS documents stay at the host root

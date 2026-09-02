@@ -4,6 +4,182 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Key `attesto_authorization_codes` on `code_hash` as its PRIMARY KEY instead
+  of carrying only a unique index on it. It was the one generated table without
+  a primary key. Under its historical `REPLICA IDENTITY DEFAULT` setting it
+  therefore has no usable identity index; if a logical-replication publication
+  publishes its `UPDATE`s or `DELETE`s, those writes fail at the publisher
+  until an identity is configured. `AttestoPhoenix.Schema.Authorization` now
+  declares the key and maps a duplicate insert onto
+  `attesto_authorization_codes_pkey`, the convention the other keyed tables
+  already follow. Fresh migrations from `mix attesto_phoenix.gen.migration`
+  create the keyed layout. Stored columns, single-use semantics, and the store
+  API are unchanged. Thanks to
+  [@jtippett](https://github.com/jtippett) for the contribution in
+  [#26](https://github.com/XukuLLC/attesto_phoenix/pull/26).
+
+### Upgrade notes
+
+- When upgrading an existing Ecto database, apply a forward migration that
+  promotes the existing unique index on `attesto_authorization_codes.code_hash`
+  to the table's primary key. The application and migration may be deployed in
+  either order: new application code recognizes both the historical unique
+  index and the new primary-key constraint. Once migrated, either application
+  version runs against the keyed layout; a duplicate `code_hash` raises
+  `Ecto.ConstraintError` on the previous release and
+  `Ecto.InvalidChangesetError` on this one.
+
+  That ordering flexibility does not extend to logical replication. The
+  migration must finish before this table is added to a publication that
+  publishes `UPDATE` or `DELETE`. If the historical default-identity table is
+  already in such a publication, the corresponding authorization-code
+  conditional-update or cleanup-delete path fails at the publisher until its
+  replica identity is fixed (or that operation stops being published for the
+  table). PostgreSQL logical replication does not copy DDL: apply the schema
+  change to the subscriber first, then to the publisher. If `REPLICA IDENTITY
+  FULL` was used as a temporary publisher-side bridge, keep it until both
+  sides have the primary key. The generic migration below preserves `FULL`;
+  on the publisher, enable its commented reset only when `FULL` was temporary
+  and the subscriber is already ready.
+
+  The exact operation for the historical generated layout is:
+
+  ```elixir
+  defmodule MyApp.Repo.Migrations.KeyAttestoAuthorizationCodesOnCodeHash do
+    use Ecto.Migration
+
+    # Keep Ecto's default DDL transaction: SET LOCAL must cover ALTER TABLE.
+    # Do not add @disable_ddl_transaction true.
+
+    # Set this explicitly to the runtime Ecto schema prefix. Raw SQL passed to
+    # execute/1 does not inherit a migrator or repository prefix option.
+    @prefix nil
+
+    def up do
+      # Abort instead of waiting indefinitely for ACCESS EXCLUSIVE.
+      execute "SET LOCAL lock_timeout = '5s'"
+
+      execute """
+      ALTER TABLE #{table()}
+        ADD CONSTRAINT attesto_authorization_codes_pkey
+        PRIMARY KEY USING INDEX attesto_authorization_codes_code_hash_index
+      """
+
+      # Publisher only: if its REPLICA IDENTITY FULL setting was temporary and
+      # the subscriber already has this primary key, uncomment the reset so it
+      # shares this transaction and deployment window with the promotion.
+      # execute "ALTER TABLE #{table()} REPLICA IDENTITY DEFAULT"
+    end
+
+    def down do
+      execute "SET LOCAL lock_timeout = '5s'"
+
+      # Preserve REPLICA IDENTITY USING INDEX when it is active on the promoted
+      # primary-key index at rollback time. The marker is LOCAL, so this
+      # migration must retain Ecto's default DDL transaction.
+      execute """
+      DO $$
+      DECLARE
+        restore_identity boolean;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+          FROM pg_index
+          WHERE indrelid = '#{table()}'::regclass
+            AND indisprimary
+            AND indisreplident
+        ) INTO restore_identity;
+
+        PERFORM set_config(
+          'attesto_phoenix.restore_authorization_codes_replica_identity',
+          CASE WHEN restore_identity THEN 'true' ELSE 'false' END,
+          true
+        );
+
+        IF restore_identity THEN
+          EXECUTE 'ALTER TABLE #{table()} REPLICA IDENTITY DEFAULT';
+        END IF;
+      END
+      $$;
+      """
+
+      # Dropping the constraint drops its index, so clear the identity first
+      # when that index was selected before the promotion.
+      execute ~s|ALTER TABLE #{table()} DROP CONSTRAINT attesto_authorization_codes_pkey|
+      create unique_index(:attesto_authorization_codes, [:code_hash], prefix: @prefix)
+
+      execute """
+      DO $$
+      BEGIN
+        IF current_setting(
+             'attesto_phoenix.restore_authorization_codes_replica_identity',
+             true
+           ) = 'true' THEN
+          EXECUTE 'ALTER TABLE #{table()} REPLICA IDENTITY USING INDEX #{index()}';
+        END IF;
+      END
+      $$;
+      """
+    end
+
+    defp table do
+      case @prefix do
+        nil -> ~s|"attesto_authorization_codes"|
+        prefix -> ~s|"#{prefix}"."attesto_authorization_codes"|
+      end
+    end
+
+    # PostgreSQL's REPLICA IDENTITY grammar takes an unqualified index name;
+    # the schema-qualified table above determines which schema is searched.
+    defp index, do: ~s|"attesto_authorization_codes_code_hash_index"|
+  end
+  ```
+
+  This exact migration applies only to the historical generated layout. Run
+  the [catalog preflight](guides/upgrade_3_0_schema_prefix.md#catalog-preflight)
+  and proceed only when it reports `ready_for_primary_key = t`. A custom or
+  renamed table/index needs a reviewed migration; a surrogate-primary-key
+  layout may need no change. The same guide covers literal-prefixed 2.x tables.
+
+  Set `@prefix` to exactly the PostgreSQL schema used by runtime Ecto queries;
+  `nil` is appropriate only for the runtime's default schema. The interpolated
+  raw `ALTER TABLE` does not inherit the prefix passed to `Ecto.Migrator` or the
+  repository.
+
+  When those prerequisites hold, PostgreSQL reuses and renames the existing
+  index, so the forward change is metadata-only: it does not rebuild the index
+  or rewrite the table and is normally fast. `ALTER TABLE` nevertheless takes
+  an `ACCESS EXCLUSIVE` lock. Under live traffic, the ALTER can wait behind
+  existing transactions; because an `ACCESS EXCLUSIVE` request queues ahead of
+  later conflicting work, blocking of new reads and writes can begin while it
+  is still waiting. Once acquired, it blocks reads and writes until the
+  migration transaction commits. PostgreSQL may emit a harmless notice that it
+  is renaming the reused index to match the primary-key constraint. Run the
+  migration in a controlled deployment window. Keep a short `lock_timeout`
+  (as above), below the application's query timeout, so contention aborts the
+  attempt before waiting requests time out; then inspect blockers and retry
+  during a quiet period, or drain traffic touching the table. Keep the shown
+  migration transactional; `SET LOCAL lock_timeout` ends with its transaction
+  and would not cover the following `ALTER TABLE` if
+  `@disable_ddl_transaction true` were added. The optional FULL-to-DEFAULT
+  reset is a second `ACCESS EXCLUSIVE` ALTER and belongs in this same
+  transaction after the subscriber is ready.
+
+  The `down/0` path is materially slower: it drops the primary-key index and
+  rebuilds the plain unique index while the transaction retains the table's
+  `ACCESS EXCLUSIVE` lock. When `REPLICA IDENTITY USING INDEX` is active on the
+  promoted primary-key index at rollback time, it is restored on the rebuilt
+  unique index. Treat rollback as a potentially long, blocking index build
+  rather than the metadata-only inverse of `up/0`.
+
+  Skip the migration for a database whose tables were created by this
+  release's generator: it already has the key, and PostgreSQL rejects adding
+  another primary-key constraint.
+
 ## [3.0.0] - 2026-08-31
 
 ### Breaking
