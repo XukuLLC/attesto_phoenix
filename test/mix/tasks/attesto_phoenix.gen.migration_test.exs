@@ -100,12 +100,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
 
       # Each unique index's Postgres default name (<table>_<col>_index) must be
       # the name the schema's unique_constraint relies on:
-      #   * Authorization: attesto_authorization_codes_code_hash_index
       #   * RefreshToken:  attesto_refresh_tokens_token_hash_index
       #   * DPoPNonce:     dpop_nonces_nonce_index (Ecto default)
-      assert source =~
-               ~s|create unique_index(:attesto_authorization_codes, [:code_hash], prefix: prefix)|
-
       assert source =~
                ~s|create unique_index(:attesto_refresh_tokens, [:token_hash], prefix: prefix)|
 
@@ -129,13 +125,28 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|add :inserted_at, :utc_datetime_usec, null: false|
     end
 
+    test "keys authorization_codes on code_hash so the conflict is attesto_authorization_codes_pkey",
+         %{tmp_dir: tmp_dir} do
+      run!([], tmp_dir)
+      source = generated_migration(tmp_dir)
+
+      # Authorization declares @primary_key {:code_hash, ...} and
+      # unique_constraint(:code_hash, name: :attesto_authorization_codes_pkey).
+      # code_hash must therefore be the table's PRIMARY KEY, not a separate
+      # unique index. A table without a primary key has no default REPLICA
+      # IDENTITY, so PostgreSQL logical replication (blue/green deployments,
+      # major-version upgrades, CDC) cannot replicate its UPDATE/DELETE.
+      assert source =~ ~s|add :code_hash, :string, size: 88, primary_key: true, null: false|
+      refute source =~ ~s|create unique_index(:attesto_authorization_codes, [:code_hash]|
+    end
+
     test "authorization_codes carries the columns the store reads/writes", %{tmp_dir: tmp_dir} do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
       # The drifted columns that broke a by-the-docs deploy: PKCE method, DPoP
       # cnf, mapped claims, OIDC nonce, and the single-use marker.
-      assert source =~ ~s|add :code_hash, :string, size: 88, null: false|
+      assert source =~ ~s|add :code_hash, :string, size: 88, primary_key: true, null: false|
       assert source =~ ~s|add :code_challenge, :string, size: 255|
       assert source =~ ~s|add :code_challenge_method, :string, size: 16|
       refute source =~ ~s|add :code_challenge, :string, size: 255, null: false|
@@ -143,8 +154,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|add :cnf, :map|
       assert source =~ ~s|add :claims, :map, null: false, default: %{}|
       assert source =~ ~s|add :consumed_at, :utc_datetime|
-      # The schema is @primary_key false, keyed on code_hash: the table is
-      # created primary_key: false and there is no surrogate id column in it.
+      # The schema keys on code_hash (no surrogate id): the table is created
+      # primary_key: false so that code_hash itself is the primary key.
       assert source =~
                ~s|create table(:attesto_authorization_codes, primary_key: false, prefix: prefix) do|
     end
@@ -223,8 +234,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|create table(:dpop_nonces, primary_key: false, prefix: prefix)|
       assert source =~ ~s|create table(:dpop_replays, primary_key: false, prefix: prefix)|
 
-      assert source =~
-               ~s|create unique_index(:attesto_authorization_codes, [:code_hash], prefix: prefix)|
+      assert source =~ ~s|add :code_hash, :string, size: 88, primary_key: true, null: false|
 
       assert source =~ "name: :attesto_refresh_tokens_family_id_generation_index"
       assert source =~ "prefix: prefix"

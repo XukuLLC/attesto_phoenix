@@ -1539,6 +1539,12 @@ if Code.ensure_loaded?(Igniter) do
            that index fail. Do not rerun the create-table migration against
            tables that already exist.
 
+           A database whose `attesto_authorization_codes` table was created
+           with only a unique index on `code_hash` also needs the forward
+           migration from the CHANGELOG upgrade notes that promotes that index
+           to the primary key; without it PostgreSQL logical replication
+           cannot replicate the table.
+
            Stop and drain every 2.x token writer before this migration and
            before starting 3.0, including deployments using the public schema.
            Mixed 2.x/3.0 writers are unsupported because 2.x does not read or

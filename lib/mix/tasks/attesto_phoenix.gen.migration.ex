@@ -15,8 +15,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       (RFC 7636), the optional `cnf` key binding (RFC 7800), the OIDC `nonce`,
       mapped `claims`, the descendant `family_id`, consumed markers, and the
       access-token `jti` issued from a successful redemption so code reuse can
-      revoke it. Keyed on `code_hash` (no surrogate id); consulted exactly once
-      at the token endpoint.
+      revoke it. Keyed on `code_hash` as its PRIMARY KEY (no surrogate id);
+      consulted exactly once at the token endpoint.
 
     * `attesto_refresh_tokens` - the refresh token store
       (`AttestoPhoenix.Schema.RefreshToken`, RFC 6749, section 6). Each row
@@ -546,11 +546,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Authorization code grant store (RFC 6749, section 4.1), backing
       # AttestoPhoenix.Schema.Authorization / AttestoPhoenix.Store.EctoCodeStore.
       # One row per issued code. Only the hash of the code is stored (RFC 6749,
-      # section 10.3); the unique index on it is the single-use lookup key
-      # (EctoCodeStore.take/1 deletes by code_hash). The schema declares
-      # `@primary_key false` and keys on :code_hash, so there is no surrogate id.
+      # section 10.3); it is the PRIMARY KEY and the single-use lookup key
+      # (EctoCodeStore.take/1 deletes by code_hash). The schema keys on
+      # :code_hash, so there is no surrogate id. A primary key, not merely a
+      # unique index, also gives the table a default REPLICA IDENTITY, which
+      # PostgreSQL logical replication needs to replicate UPDATE and DELETE.
       create table(:<%= @authorization_codes %>, primary_key: false, prefix: prefix) do
-        add :code_hash, :string, size: <%= @hash_size %>, null: false
+        add :code_hash, :string, size: <%= @hash_size %>, primary_key: true, null: false
         add :client_id, :string, size: <%= @identifier_size %>, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
         add :scope, {:array, :string}, null: false, default: []
@@ -587,10 +589,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :inserted_at, :utc_datetime, null: false
       end
 
-      # Single-use redemption is enforced at the database: the code hash is
-      # globally unique. The default index name attesto_authorization_codes_code_hash_index
-      # matches the schema's unique_constraint(:code_hash, name: ...).
-      create unique_index(:<%= @authorization_codes %>, [:code_hash], prefix: prefix)
+      # Single-use redemption is enforced at the database by the primary key. A
+      # duplicate code hash violates attesto_authorization_codes_pkey, the name
+      # the schema's unique_constraint(:code_hash, name: ...) maps onto the
+      # changeset.
       # Expiry sweeps scan by expiry (AttestoPhoenix.Store.Sweeper).
       create index(:<%= @authorization_codes %>, [:expires_at], prefix: prefix)
       create index(:<%= @authorization_codes %>, [:family_id], prefix: prefix)

@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Key `attesto_authorization_codes` on `code_hash` as its PRIMARY KEY instead
+  of carrying only a unique index on it. It was the one generated table without
+  a primary key, and a PostgreSQL table without one has no default
+  `REPLICA IDENTITY`, so logical replication cannot apply its `UPDATE`s and
+  `DELETE`s. That blocks blue/green deployments, managed major-version
+  upgrades, and change data capture for the whole database until the table is
+  keyed or excluded. `AttestoPhoenix.Schema.Authorization` now declares the
+  key and maps a duplicate insert onto `attesto_authorization_codes_pkey`, the
+  convention the other keyed tables already follow. Fresh migrations from
+  `mix attesto_phoenix.gen.migration` create the keyed layout. Row shape,
+  single-use semantics, and the store API are unchanged.
+
+### Upgrade notes
+
+- When upgrading an existing Ecto database, apply a forward migration that
+  promotes the existing unique index on `attesto_authorization_codes.code_hash`
+  to the table's primary key. The exact operation is:
+
+  ```elixir
+  defmodule MyApp.Repo.Migrations.KeyAttestoAuthorizationCodesOnCodeHash do
+    use Ecto.Migration
+
+    # Replace with your configured PostgreSQL schema name when non-default.
+    @prefix nil
+
+    def up do
+      execute """
+      ALTER TABLE #{table()}
+        ADD CONSTRAINT attesto_authorization_codes_pkey
+        PRIMARY KEY USING INDEX attesto_authorization_codes_code_hash_index
+      """
+    end
+
+    def down do
+      # Dropping the constraint drops the index backing it, so the plain
+      # unique index is recreated under its original name.
+      execute ~s|ALTER TABLE #{table()} DROP CONSTRAINT attesto_authorization_codes_pkey|
+      create unique_index(:attesto_authorization_codes, [:code_hash], prefix: @prefix)
+    end
+
+    defp table do
+      case @prefix do
+        nil -> ~s|"attesto_authorization_codes"|
+        prefix -> ~s|"#{prefix}"."attesto_authorization_codes"|
+      end
+    end
+  end
+  ```
+
+  PostgreSQL reuses the existing index for the constraint and renames it, so
+  the change is catalog-only: no index rebuild, no table rewrite, and only a
+  brief exclusive lock on a small, short-lived table. It is safe to apply
+  while either the previous or this release is serving traffic; a duplicate
+  code hash fails closed under both, raising `Ecto.ConstraintError` on the
+  previous release and `Ecto.InvalidChangesetError` on this one. Skip the
+  migration for a database whose tables were created by this release's
+  generator: it already has the key, and PostgreSQL rejects a second primary
+  key.
+
 ## [3.0.0] - 2026-08-31
 
 ### Breaking

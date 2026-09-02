@@ -1202,6 +1202,14 @@ Then run it:
 mix ecto.migrate
 ```
 
+An `attesto_authorization_codes` table created by a release that keyed it only
+with a unique index needs one forward migration, shown in the CHANGELOG
+upgrade notes: it promotes that index to the table's primary key in place.
+Without a primary key the table has no replica identity, so PostgreSQL logical
+replication (blue/green deployments, managed major-version upgrades, change
+data capture) cannot replicate it. The change is catalog-only and safe to
+apply while either release is running.
+
 ### Clustering
 
 Every mutable OAuth store has a Postgres-backed implementation, so a clustered
