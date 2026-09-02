@@ -1213,36 +1213,19 @@ constraint. The completed schema works with either application version;
 duplicates raise `Ecto.ConstraintError` on the previous release and
 `Ecto.InvalidChangesetError` on this one.
 
-The migration must finish before the table is added to a logical-replication
-publication that publishes `UPDATE` or `DELETE`. Under the historical
-`REPLICA IDENTITY DEFAULT` layout there is no usable identity index; if the
-table is already in such a publication, the corresponding authorization-code
-update or delete paths fail at the publisher until the identity is fixed.
-PostgreSQL does not replicate DDL, so apply this change to both publisher and
-subscriber, or apply it to the source before creating a managed target that
-copies the source schema.
+Before using that migration, run the
+[catalog preflight](guides/upgrade_3_0_schema_prefix.md#catalog-preflight) and
+set its `@prefix` to the runtime Ecto schema. Custom layouts need a reviewed
+migration. The forward operation reuses the existing index, but still requests
+an `ACCESS EXCLUSIVE` lock; run it in a controlled window with the documented
+short `lock_timeout`. Rollback is slower because it rebuilds the unique index.
 
-The documented migration is specifically for the historical generated layout:
-`code_hash` is `NOT NULL`, the table has no existing primary key, and
-`attesto_authorization_codes_code_hash_index` is a valid, unique, ordinary
-B-tree index over only `code_hash`, with default ordering and no predicate or
-expressions. Preflight those facts first, and set its `@prefix` to exactly the
-runtime Ecto schema; raw SQL does not inherit a migrator or repository prefix.
-Custom names, columns, nullability, indexes, or constraints require a tailored
-review. A custom layout with a surrogate primary key may already have a usable
-replica identity and need no migration. If an operator temporarily selected
-`REPLICA IDENTITY FULL`, reset it to `DEFAULT` after adding the primary key.
-
-When the prerequisites hold, `PRIMARY KEY USING INDEX` reuses the index without
-an index rebuild or table rewrite, so the forward operation is metadata-only
-and normally fast; a notice that PostgreSQL renamed the reused index is
-harmless. It still takes an `ACCESS EXCLUSIVE` table lock and can wait behind
-live transactions, then block reads and writes. Run it in a controlled window
-with a short `lock_timeout` below the application's query timeout, and keep the
-shown Ecto migration in its default DDL transaction so `SET LOCAL` covers the
-`ALTER TABLE`. The `down/0` path is slower: it rebuilds the unique index while
-the exclusive lock remains held. See the CHANGELOG upgrade notes for the exact
-migration and operational details.
+For logical replication, migrate the subscriber first and the publisher
+second, before publishing `UPDATE` or `DELETE` for this table. The generic
+migration preserves `REPLICA IDENTITY FULL`; reset a temporary FULL setting
+only after both sides have the key, using the documented publisher-only line.
+See the [upgrade notes](CHANGELOG.md#upgrade-notes) for the exact migration and
+the guide above for operational details.
 
 ### Clustering
 

@@ -242,22 +242,147 @@ The CHANGELOG snippet names the index from the canonical historical table. A
 literal-prefixed source can retain a name such as
 `oauth_attesto_authorization_codes_code_hash_index` after its table is moved
 and renamed. Verify the actual index against every documented preflight
-condition, then tailor `PRIMARY KEY USING INDEX` to that verified name (or
-rename it only after checking for a collision). PostgreSQL will rename the
+condition, including `code_hash` nullability, a single key column, the
+column's default collation and operator class, default ordering, a valid,
+ready, live ordinary B-tree index, no predicate/expressions/`INCLUDE` columns,
+and no constraint backing the index. The
+[pasteable catalog preflight query](#catalog-preflight) checks these conditions.
+Then tailor `PRIMARY KEY USING INDEX` to that verified name
+(or rename it only after checking for a collision). PostgreSQL will rename the
 reused index to `attesto_authorization_codes_pkey` when it installs the
 constraint; the accompanying notice is harmless.
 
+#### Catalog preflight
+
+Paste this query into `psql` after replacing `public` in both names with the
+selected runtime schema. It returns one `ready_for_primary_key` result and a
+list of failure reasons. The historical generated table should return `t` and
+an empty `failure_reasons` array.
+
+```sql
+WITH target AS (
+  SELECT to_regclass('public.attesto_authorization_codes') AS table_oid,
+         to_regclass('public.attesto_authorization_codes_code_hash_index') AS index_oid
+), catalog AS (
+  SELECT target.*,
+         table_rel.relkind AS table_kind,
+         index_rel.relkind AS index_kind,
+         access_method.amname,
+         index_info.indisunique,
+         index_info.indisvalid,
+         index_info.indisready,
+         index_info.indislive,
+         index_info.indnatts,
+         index_info.indnkeyatts,
+         index_info.indkey,
+         index_info.indcollation[0] AS index_collation,
+         index_info.indoption[0] AS index_options,
+         index_info.indpred,
+         index_info.indexprs,
+         code_hash.attnum AS code_hash_attnum,
+         code_hash.atttypid AS code_hash_type,
+         code_hash.attnotnull AS code_hash_not_null,
+         code_hash.attcollation AS code_hash_collation,
+         operator_class.opcdefault AS operator_class_default,
+         operator_class.opcintype AS operator_class_type,
+         constraint_info.constraint_name,
+         COALESCE(primary_key_info.table_has_primary_key, false) AS table_has_primary_key
+  FROM target
+  LEFT JOIN pg_class AS table_rel ON table_rel.oid = target.table_oid
+  LEFT JOIN pg_class AS index_rel ON index_rel.oid = target.index_oid
+  LEFT JOIN pg_index AS index_info
+    ON index_info.indexrelid = target.index_oid
+   AND index_info.indrelid = target.table_oid
+  LEFT JOIN pg_am AS access_method ON access_method.oid = index_rel.relam
+  LEFT JOIN pg_attribute AS code_hash
+    ON code_hash.attrelid = target.table_oid
+   AND code_hash.attname = 'code_hash'
+   AND code_hash.attnum > 0
+  LEFT JOIN pg_opclass AS operator_class
+    ON operator_class.oid = index_info.indclass[0]
+  LEFT JOIN LATERAL (
+    SELECT c.conname AS constraint_name
+    FROM pg_constraint AS c
+    WHERE c.conindid = target.index_oid
+    ORDER BY c.oid
+    LIMIT 1
+  ) AS constraint_info ON true
+  LEFT JOIN LATERAL (
+    SELECT bool_or(indisprimary) AS table_has_primary_key
+    FROM pg_index
+    WHERE indrelid = target.table_oid
+  ) AS primary_key_info ON true
+), checks AS (
+  SELECT table_oid IS NOT NULL AS table_exists,
+         index_oid IS NOT NULL AS index_exists,
+         table_kind = 'r' AS ordinary_table,
+         index_kind = 'i' AND amname = 'btree' AS btree_index,
+         COALESCE(indisunique, false) AS unique_index,
+         COALESCE(indisvalid AND indisready AND indislive, false) AS index_valid_ready_live,
+         COALESCE(indnatts = 1 AND indnkeyatts = 1 AND indkey[0] = code_hash_attnum, false) AS only_code_hash,
+         COALESCE(code_hash_not_null, false) AS code_hash_not_null,
+         COALESCE(index_collation = code_hash_collation, false) AS default_collation,
+         COALESCE(
+           operator_class_default AND
+             (operator_class_type = code_hash_type OR EXISTS (
+               SELECT 1 FROM pg_cast
+               WHERE castsource = code_hash_type
+                 AND casttarget = operator_class_type
+                 AND castcontext = 'i'
+             )), false
+         ) AS default_operator_class,
+         COALESCE(index_options = 0, false) AS default_ordering,
+         indpred IS NULL AS no_predicate,
+         indexprs IS NULL AS no_expressions,
+         constraint_name IS NOT NULL AS constraint_backed,
+         table_has_primary_key
+  FROM catalog
+), failures AS (
+  SELECT checks.*,
+         array_remove(ARRAY[
+           CASE WHEN NOT table_exists THEN 'table_missing' END,
+           CASE WHEN NOT index_exists THEN 'index_missing' END,
+           CASE WHEN NOT ordinary_table THEN 'table_not_ordinary' END,
+           CASE WHEN NOT btree_index THEN 'index_not_btree' END,
+           CASE WHEN NOT unique_index THEN 'index_not_unique' END,
+           CASE WHEN NOT index_valid_ready_live THEN 'index_invalid_not_ready_or_not_live' END,
+           CASE WHEN NOT only_code_hash THEN 'index_is_multicolumn_or_has_include_columns' END,
+           CASE WHEN NOT code_hash_not_null THEN 'code_hash_nullable_or_missing' END,
+           CASE WHEN NOT default_collation THEN 'non_default_collation' END,
+           CASE WHEN NOT default_operator_class THEN 'non_default_operator_class' END,
+           CASE WHEN NOT default_ordering THEN 'non_default_ordering' END,
+           CASE WHEN NOT no_predicate THEN 'partial_index' END,
+           CASE WHEN NOT no_expressions THEN 'expression_index' END,
+           CASE WHEN constraint_backed THEN 'index_backs_constraint' END,
+           CASE WHEN table_has_primary_key THEN 'table_already_has_primary_key' END
+         ], NULL) AS failure_reasons
+  FROM checks
+)
+SELECT cardinality(failure_reasons) = 0 AS ready_for_primary_key,
+       failure_reasons
+FROM failures;
+```
+
 Do not run that snippet against a custom surrogate-primary-key layout. It may
 already provide a usable replica identity and require no database change, but
-it still needs a tailored runtime and constraint review. If the historical
-table used `REPLICA IDENTITY FULL` as a temporary workaround, reset it to
-`DEFAULT` after the primary key is present.
+it still needs a tailored runtime and constraint review.
 
 Complete this promotion before adding the table to a publication that publishes
 `UPDATE` or `DELETE`; under the historical default identity, the corresponding
 writes otherwise fail at the publisher. Logical replication does not copy this
-DDL, so apply it to publisher and subscriber, or apply it to the source before
-a managed target copies the source schema.
+DDL, so apply the schema change to the subscriber first, then to the publisher.
+If the publisher used `REPLICA IDENTITY FULL` as a temporary workaround, keep
+FULL until both sides have the primary key. The generic migration preserves
+FULL. On the publisher only, once the subscriber is ready, add this line
+immediately after the primary-key promotion when FULL was temporary:
+
+```elixir
+execute "ALTER TABLE #{table()} REPLICA IDENTITY DEFAULT"
+```
+
+That keeps the reset's second `ACCESS EXCLUSIVE` ALTER in the promotion
+transaction and avoids another deployment window. Do not add it when FULL is
+deliberate policy.
 
 ### Add the refresh-family invariants
 

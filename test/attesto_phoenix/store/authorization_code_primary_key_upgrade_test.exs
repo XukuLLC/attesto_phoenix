@@ -40,8 +40,51 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
 
     def down do
       execute("SET LOCAL lock_timeout = '5s'")
+
+      # Preserve REPLICA IDENTITY USING INDEX when it is active on the promoted
+      # primary-key index at rollback time. The marker is LOCAL, so this
+      # migration must retain Ecto's default DDL transaction.
+      execute("""
+      DO $$
+      DECLARE
+        restore_identity boolean;
+      BEGIN
+        SELECT EXISTS (
+          SELECT 1
+          FROM pg_index
+          WHERE indrelid = '#{table()}'::regclass
+            AND indisprimary
+            AND indisreplident
+        ) INTO restore_identity;
+
+        PERFORM set_config(
+          'attesto_phoenix.restore_authorization_codes_replica_identity',
+          CASE WHEN restore_identity THEN 'true' ELSE 'false' END,
+          true
+        );
+
+        IF restore_identity THEN
+          EXECUTE 'ALTER TABLE #{table()} REPLICA IDENTITY DEFAULT';
+        END IF;
+      END
+      $$;
+      """)
+
       execute(~s|ALTER TABLE #{table()} DROP CONSTRAINT attesto_authorization_codes_pkey|)
       create(unique_index(:attesto_authorization_codes, [:code_hash], prefix: @prefix))
+
+      execute("""
+      DO $$
+      BEGIN
+        IF current_setting(
+             'attesto_phoenix.restore_authorization_codes_replica_identity',
+             true
+           ) = 'true' THEN
+          EXECUTE 'ALTER TABLE #{table()} REPLICA IDENTITY USING INDEX #{index()}';
+        END IF;
+      END
+      $$;
+      """)
     end
 
     defp table do
@@ -50,6 +93,10 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
         prefix -> ~s|"#{prefix}"."attesto_authorization_codes"|
       end
     end
+
+    # PostgreSQL's REPLICA IDENTITY grammar takes an unqualified index name;
+    # the schema-qualified table above determines which schema is searched.
+    defp index, do: ~s|"attesto_authorization_codes_code_hash_index"|
   end
 
   setup do
@@ -101,6 +148,35 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
     # Down restores the previous layout.
     migrate(:down, 1)
     refute primary_key?()
+    assert index_names() == ["#{@table}_code_hash_index"]
+    assert replica_identity() == "d"
+    assert effective_replica_identity_index_oid() == nil
+  end
+
+  test "down preserves an explicit identity active on the promoted index" do
+    sql!(~s|ALTER TABLE "#{@schema}"."#{@table}" REPLICA IDENTITY USING INDEX "#{@table}_code_hash_index"|)
+    original_index_oid = index_oid("#{@table}_code_hash_index")
+
+    migrate(:up, 1)
+    assert replica_identity() == "i"
+    assert effective_replica_identity_index_oid() == original_index_oid
+
+    migrate(:down, 1)
+    refute primary_key?()
+    assert replica_identity() == "i"
+    assert index_names() == ["#{@table}_code_hash_index"]
+    assert effective_replica_identity_index_oid() == index_oid("#{@table}_code_hash_index")
+  end
+
+  test "down preserves FULL replica identity" do
+    sql!(~s|ALTER TABLE "#{@schema}"."#{@table}" REPLICA IDENTITY FULL|)
+
+    migrate(:up, 1)
+    assert replica_identity() == "f"
+
+    migrate(:down, 1)
+    refute primary_key?()
+    assert replica_identity() == "f"
     assert index_names() == ["#{@table}_code_hash_index"]
   end
 

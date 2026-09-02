@@ -732,6 +732,9 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                  notice =~ "attesto_refresh_tokens_family_id_generation_index" and
                  notice =~ "attesto_authorization_codes_code_hash_index" and
                  notice =~ "`code_hash` is `NOT NULL`" and
+                 notice =~ "subscriber" and
+                 notice =~ "publisher second" and
+                 notice =~ "catalog-preflight" and
                  notice =~ "`ACCESS EXCLUSIVE`" and
                  notice =~ "`lock_timeout`"
              end)

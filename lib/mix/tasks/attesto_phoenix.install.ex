@@ -1550,24 +1550,16 @@ if Code.ensure_loaded?(Igniter) do
 
            A database whose `attesto_authorization_codes` table matches the
            historical generated layout also needs the forward migration from
-           the CHANGELOG upgrade notes. Before using that exact migration,
-           verify that `code_hash` is `NOT NULL`, no primary key exists, and
-           `attesto_authorization_codes_code_hash_index` is a valid, unique,
-           ordinary B-tree index over only `code_hash`, with default ordering
-           and no predicate or expressions. Custom layouts need a reviewed,
-           tailored migration and preflight.
-
-           With those prerequisites, `PRIMARY KEY USING INDEX` is metadata-only
-           and normally fast: it reuses the index without rebuilding it or
-           rewriting the table. It still takes `ACCESS EXCLUSIVE`, so under
-           live traffic it can wait and then block reads and writes. Use a
-           controlled window and keep the short `lock_timeout` shown in the
-           CHANGELOG below the application's query timeout; keep the default
-           DDL transaction so `SET LOCAL` covers `ALTER TABLE`. Retry when
-           quiet, or drain traffic touching the table if the lock cannot be
-           acquired promptly. Under the historical default replica identity,
-           publishing this table for UPDATE or DELETE makes the corresponding
-           writes fail at the publisher until an identity is configured.
+           the CHANGELOG upgrade notes. Run the catalog preflight in
+           `guides/upgrade_3_0_schema_prefix.md#catalog-preflight`; it verifies
+           that `code_hash` is `NOT NULL` and
+           `attesto_authorization_codes_code_hash_index` is safe to promote.
+           Custom layouts need a reviewed migration. Use a controlled window
+           because promotion requests `ACCESS EXCLUSIVE`, and retain the
+           CHANGELOG's short `lock_timeout`. For logical replication, migrate
+           the subscriber first and the publisher second; preserve
+           `REPLICA IDENTITY FULL` until both sides have the key. A database
+           created by this release's generator already has the primary key.
 
         4. The OAuth endpoints are mounted under "#{oauth_path_prefix}". The
            well-known discovery and JWKS documents stay at the host root
