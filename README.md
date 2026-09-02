@@ -502,6 +502,12 @@ optional generation-0 refresh issuance, and code finalization — in one
 synchronous callback, so a host can serialize it with its own database
 transaction:
 
+This is an **initial authorization-code completion hook only**. Scope policy and
+resource-indicator resolution have already completed before it runs, and every
+refresh-token grant bypasses it. It is not a per-request reauthorization hook
+for a resource server or MCP server; enforce request-time policy where the
+access token is used.
+
 ```elixir
 config :my_app, AttestoPhoenix.Config,
   authorization_code_completion: fn context, continuation ->
@@ -531,6 +537,15 @@ config :my_app, AttestoPhoenix.Config,
 its `:family_id`, and the host's `:private_context` — never the authorization
 code or a minted token secret.
 
+> #### One transaction means one Repo {: .warning}
+>
+> Rollback covers only stores that use the **same Ecto Repo and enclosing
+> transaction** as the callback. Point `config :attesto_phoenix, :repo` — used
+> by the bundled Ecto stores — at the Repo used by the callback. A custom store
+> that uses another Repo, opens and commits its own transaction, or writes to an
+> external service is outside this rollback boundary; its writes will not be
+> undone with the host transaction.
+
 The continuation is bound to the callback's process and permits exactly one
 invocation; a second, cross-process, or escaped call is refused before anything
 is minted or persisted. The callback must return the first invocation's result
@@ -542,20 +557,30 @@ callback that never invokes the continuation cannot pass off a fabricated
 refused, because that commit already carried the mint, refresh insert, and
 finalization.
 
+The callback is trusted host code running in the same process. The private
+process entry is a correctness guard against accidental interference (including
+broad mailbox receives) and contract mistakes, not a sandbox against a hostile
+callback that deliberately inspects or mutates its own process dictionary.
+
 > #### Roll back, do not commit-then-refuse {: .warning}
 >
-> If the continuation succeeds and your callback then returns an error, the
-> library honours the error but cannot see whether you committed. If you did,
-> the code is finalized while the client got a failure — and the client's retry
-> presents a successfully-consumed code, which reuse detection correctly scores
-> as replay and answers by revoking the whole grant family. Roll the
-> transaction back instead. The library logs this case at error level naming the
-> consequence, so check your logs for it.
+> If the continuation succeeds and your callback then returns an error, raises,
+> throws, or exits, the library cannot see whether the enclosing transaction
+> rolled back or an earlier transaction committed. If it committed, the code is
+> finalized while the client got a failure — and the client's retry presents a
+> successfully consumed code, which reuse detection correctly scores as replay
+> and answers by revoking the whole grant family. Roll the transaction back
+> instead. An error return is honoured. An exception, throw, or exit is logged
+> with a static, secret-free warning and then re-raised with its original
+> stacktrace. Both logs name the finalized-code/retry hazard without logging the
+> callback reason or context.
 
 The authorization code is atomically claimed before the callback runs. A host
 refusal, malformed private context, missing callback for a context-bearing code,
-or callback failure therefore leaves it spent but unfinalized: `consumed_at` is
-set, `consumed_success` remains false, and no refresh family is recorded.
+or callback failure before the continuation succeeds therefore leaves it spent
+but unfinalized: `consumed_at` is set, `consumed_success` remains false, and no
+refresh family is recorded. A failure after successful continuation has the
+commit-dependent hazard described above.
 
 #### Host-private authorization state
 
@@ -576,6 +601,15 @@ Its return value must be a portable JSON object (string keys at every level,
 JSON-safe values) of at most 4 KiB encoded; anything else refuses the request
 with `server_error` rather than issuing a code whose completion policy could
 never run.
+
+> #### Plaintext state, not encryption {: .warning}
+>
+> Private context is persisted as **plaintext JSONB** in the authorization
+> row's existing `claims` column. Redaction and application query suppression
+> reduce accidental disclosure; they do not encrypt the value or hide it from
+> the database. Store only non-secret identifiers and policy versions such as a
+> subject ID or security epoch. Never place passwords, API keys, bearer tokens,
+> private keys, or other credentials in this map.
 
 The value rides with the code inside the canonical grant `claims` under a
 reserved namespaced key, because `Attesto.AuthorizationCode` admits no sibling

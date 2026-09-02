@@ -362,7 +362,11 @@ defmodule AttestoPhoenix.Config do
       namespaced key, and is supplied only as `:private_context` in the
       completion callback context. It is stripped from the redeemed core grant
       before principal construction, so it never reaches an access token, ID
-      Token, refresh token, or token-exchange input. `nil` stores nothing.
+      Token, refresh token, or token-exchange input. The map is persisted as
+      plaintext JSONB in the authorization row; this feature is not encryption.
+      Store only non-secret identifiers and policy versions such as subject IDs
+      or security epochs, never credentials or token/key material. `nil` stores
+      nothing.
       Configure this only together with `:authorization_code_completion`;
       missing state remains valid so the host can apply flow-specific
       fail-closed policy at completion. The reverse skew fails closed on the
@@ -383,6 +387,11 @@ defmodule AttestoPhoenix.Config do
       host may run it inside its own database transaction after locking and
       revalidating the subject's authorization policy.
 
+      This is an initial authorization-code completion hook only. Scope policy
+      and resource-indicator resolution precede it, and refresh-token grants
+      bypass it. It is not a per-request resource-server or MCP reauthorization
+      mechanism; enforce request-time policy where the access token is used.
+
       AttestoPhoenix binds the continuation to the callback's process and
       dynamic scope and permits exactly one invocation; a second, cross-process,
       or escaped invocation is rejected before token minting or persistence. The
@@ -395,21 +404,30 @@ defmodule AttestoPhoenix.Config do
       different success is refused. The `{:ok, _}` wrapper `Repo.transaction/1`
       places around a committed return is also accepted and unwrapped, because
       that commit already carried the mint, refresh insertion, and finalization.
+      The callback is trusted same-process host code: the private process entry
+      is a correctness guard against accidental interference and contract
+      mistakes, not a sandbox against a hostile callback that deliberately
+      inspects or mutates its own process dictionary.
       If the continuation returns an error inside a transaction, the callback
       must roll that transaction back rather than commit the normal error tuple.
-      Only stores participating in that same transaction can roll back
-      atomically; external or independently transactional custom stores remain
-      outside this boundary. A callback may decline to continue with
+      **Rollback covers only stores using the same Ecto Repo and enclosing
+      transaction as the callback.** Stores using another Repo, an independently
+      committed transaction, or an external service remain outside this
+      boundary. A callback may decline to continue with
       `{:error, reason}`; an `AttestoPhoenix.OAuthError` passes through, while any
       other failure is rendered as a generic token-issuance error without
-      logging the reason. Exceptions are not rescued. The code has already been
+      logging the reason. If the callback returns an error, raises, throws, or
+      exits after the continuation succeeds, a transaction may already have
+      committed code finalization; the failed client retry can then be detected
+      as code reuse and revoke the grant family. Such error returns are logged
+      with this consequence. Exceptions, throws, and exits get the same static,
+      secret-free log before being re-raised with their original stacktrace; the
+      reason and callback context are never logged. The code has already been
       claimed before this callback runs, so refusal, malformed persisted private
       context, a missing callback for a context-bearing code, or any callback
-      failure leaves it spent but unfinalized (`consumed_at` set,
-      `consumed_success: false`, with no refresh family). When unset, the
-      continuation runs directly, preserving existing behavior. This wrapper is
-      authorization-code-specific: refresh rotation and every other grant type
-      bypass it.
+      failure before the continuation succeeds leaves it spent but unfinalized
+      (`consumed_at` set, `consumed_success: false`, with no refresh family).
+      When unset, the continuation runs directly, preserving existing behavior.
     * `:code_store` - module implementing `Attesto.CodeStore`.
     * `:refresh_store` - module implementing `Attesto.RefreshStore`.
       `AttestoPhoenix.Store.EctoRefreshStore` with a non-zero rotation grace

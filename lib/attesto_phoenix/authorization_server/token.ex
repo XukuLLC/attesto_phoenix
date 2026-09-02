@@ -626,9 +626,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # The host wrapper is trusted policy, but continuation cardinality is a
   # protocol invariant rather than a convention. A private atomic gate scopes
-  # the closure to this callback without process-dictionary or global state.
-  # The closure checks its owner and consumes the gate BEFORE completion; the
-  # outer `after` closes it on every callback return or exception.
+  # the closure to this callback. The closure checks its owner and consumes the
+  # gate BEFORE completion; the outer `after` closes it and deletes the private
+  # provenance entry on every callback return or termination.
   defp with_authorization_code_continuation(completion, callback) do
     owner = self()
     ref = make_ref()
@@ -638,20 +638,26 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     try do
       callback.(continuation, ref)
+    catch
+      kind, reason ->
+        maybe_log_completion_termination_after_success(ref, kind)
+        :erlang.raise(kind, reason, __STACKTRACE__)
     after
       :atomics.put(gate, 1, 2)
-      discard_authorization_code_continuation_marker(ref)
+      Process.delete(authorization_code_continuation_key(ref))
     end
   end
 
-  # Cardinality alone bounded the callback to AT MOST one invocation. The marker
-  # message additionally carries a digest and outcome of the continuation's
-  # result, which supplies the missing lower bound and provenance without keeping
-  # minted token strings in process state. A callback that never calls the
-  # continuation, or that substitutes a fabricated `{:ok, response, events}` for
-  # the real one, is detected by `normalize_authorization_code_completion/2`.
-  # The host still sees the plain result, so it can branch on success/failure to
-  # decide whether to commit or roll back.
+  # Cardinality alone bounds the callback to AT MOST one invocation. A private
+  # process-dictionary entry additionally carries a digest and outcome of the
+  # continuation's result, supplying the missing lower bound and provenance
+  # without keeping minted token strings in process state. This state is outside
+  # the ordinary mailbox, so a host callback's broad receive cannot consume it.
+  # A callback that never calls the continuation, or that substitutes a
+  # fabricated `{:ok, response, events}` for the real one, is detected by
+  # `normalize_authorization_code_completion/2`. The host still sees the plain
+  # result, so it can branch on success/failure to decide whether to commit or
+  # roll back.
   defp run_authorization_code_continuation(owner, ref, gate, completion) do
     cond do
       self() != owner ->
@@ -676,10 +682,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       true ->
         result = completion.()
 
-        send(
-          owner,
-          {ref, :authorization_code_continuation_produced, completion_result_digest(result),
-           completion_result_outcome(result)}
+        Process.put(
+          authorization_code_continuation_key(ref),
+          {completion_result_digest(result), completion_result_outcome(result)}
         )
 
         result
@@ -688,7 +693,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # Provenance check. The host is contractually required to return the
   # continuation's result unchanged; this verifies it actually did, rather than
-  # trusting the shape. Three outcomes matter:
+  # trusting the outward tuple form. Three outcomes matter:
   #
   #   * the continuation never ran - nothing was minted, recorded, or finalized,
   #     so a fabricated `{:ok, response, events}` must NOT become a token
@@ -701,21 +706,41 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   #     failing a request whose code is now finalized - failing would score the
   #     client's retry as a replay and revoke the whole family.
   defp normalize_authorization_code_completion(result, ref) do
-    receive do
-      {^ref, :authorization_code_continuation_produced, digest, outcome} ->
+    case Process.get(authorization_code_continuation_key(ref)) do
+      {digest, outcome} when is_binary(digest) and outcome in [:succeeded, :failed] ->
         normalize_produced_completion(result, digest, outcome)
-    after
-      0 ->
+
+      _other ->
         normalize_incomplete_completion(result)
     end
   end
 
-  defp discard_authorization_code_continuation_marker(ref) do
-    receive do
-      {^ref, :authorization_code_continuation_produced, _digest, _outcome} -> :ok
-    after
-      0 -> :ok
+  defp authorization_code_continuation_key(ref) do
+    {__MODULE__, :authorization_code_continuation, ref}
+  end
+
+  defp maybe_log_completion_termination_after_success(ref, kind) do
+    case Process.get(authorization_code_continuation_key(ref)) do
+      {_digest, :succeeded} -> log_completion_termination_after_success(kind)
+      _other -> :ok
     end
+  end
+
+  defp log_completion_termination_after_success(kind) do
+    verb =
+      case kind do
+        :error -> "raised"
+        :throw -> "threw"
+        :exit -> "exited"
+      end
+
+    # Deliberately do not inspect the exception, throw, exit reason, callback
+    # context, or continuation result: any of them may contain host secrets.
+    Logger.error(
+      "authorization code completion callback #{verb} after the continuation succeeded; " <>
+        "the code may already be finalized, and a client retry may trigger code-reuse " <>
+        "detection and revoke the grant family"
+    )
   end
 
   defp normalize_produced_completion(result, digest, outcome) do
@@ -740,51 +765,65 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # The continuation ran but the host returned something else.
   #
-  # An error substituted after the continuation SUCCEEDED is the dangerous case
-  # and the reason this clause is not silent. Two host behaviours reach it and
-  # this library cannot tell them apart from the inside:
+  # Any substituted return after the continuation SUCCEEDED is the dangerous
+  # case and the reason these clauses are not silent. Two host behaviours reach
+  # it and this library cannot tell them apart from the inside:
   #
   #   * the host rolled its transaction back, so the mint, refresh insert, and
   #     finalization went with it. The error is honest and the earlier code
   #     claim remains spent but unfinalized; a retry is refused without being
   #     scored as reuse.
-  #   * the host COMMITTED and then returned an error anyway. The code is now
-  #     finalized, so the client's retry presents a successfully-consumed code,
-  #     which code-reuse detection correctly scores as a replay and answers by
-  #     revoking the whole grant family (OAuth 2.0 Security BCP §4.13). The user
-  #     is signed out by a host bug, and nothing on the wire says why.
+  #   * the host COMMITTED and then returned something else anyway. The code is
+  #     now finalized, so the client's retry presents a successfully-consumed
+  #     code, which code-reuse detection correctly scores as a replay and
+  #     answers by revoking the whole grant family (OAuth 2.0 Security BCP
+  #     §4.13). The user is signed out by a host bug, and nothing on the wire
+  #     says why.
   #
   # Distinguishing them would require knowing the host's transaction outcome,
-  # which is outside this boundary. So the error is honoured - a rollback is the
-  # documented, legitimate pattern - and logged at error level with the
-  # consequence named, so an operator can find the commit-then-error bug instead
-  # of chasing phantom replay revocations.
+  # which is outside this boundary. An OAuth error is honoured and every other
+  # substituted return is normalized for the wire, but all are logged at error
+  # level with the consequence named. This lets an operator find the host bug
+  # instead of chasing phantom replay revocations.
   defp normalize_substituted_completion({:error, %OAuthError{}} = error, :succeeded) do
-    Logger.error(
-      "authorization code completion callback returned an error after the continuation " <>
-        "succeeded; if the callback committed rather than rolled back, the code is finalized " <>
-        "and the client's retry will be scored as code reuse and revoke the grant family"
-    )
-
+    log_substituted_completion_after_success("returned an error")
     error
+  end
+
+  defp normalize_substituted_completion({:error, _reason}, :succeeded) do
+    log_substituted_completion_after_success("returned an error")
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_substituted_completion(_substituted, :succeeded) do
+    log_substituted_completion_after_success("returned a different result")
+    {:error, error(@error_invalid_request, "unable to issue token")}
   end
 
   # The continuation itself failed and the host remapped the reason. Nothing was
   # minted or finalized, so there is no retry hazard to report.
   defp normalize_substituted_completion({:error, %OAuthError{}} = error, :failed), do: error
 
-  defp normalize_substituted_completion({:error, _reason}, _produced) do
+  defp normalize_substituted_completion({:error, _reason}, :failed) do
     Logger.error("authorization code completion callback failed")
     {:error, error(@error_invalid_request, "unable to issue token")}
   end
 
-  defp normalize_substituted_completion(_substituted, _produced) do
+  defp normalize_substituted_completion(_substituted, :failed) do
     Logger.error(
       "authorization code completion callback did not return the continuation's result " <>
         "unchanged; no token was issued"
     )
 
     {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp log_substituted_completion_after_success(action) do
+    Logger.error(
+      "authorization code completion callback #{action} after the continuation succeeded; " <>
+        "the code may already be finalized, and a client retry may trigger code-reuse " <>
+        "detection and revoke the grant family"
+    )
   end
 
   # The continuation was never invoked. Nothing was minted or persisted, so the

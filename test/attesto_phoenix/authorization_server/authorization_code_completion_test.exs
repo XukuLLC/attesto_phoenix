@@ -429,7 +429,9 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
                  Token.issue(config, code_request(config, code))
       end)
 
-    assert log =~ "authorization code completion callback failed"
+    assert log =~ "returned an error after the continuation succeeded"
+    assert log =~ "code may already be finalized"
+    assert log =~ "revoke the grant family"
     refute log =~ "host_policy_changed"
 
     assert_spent_without_completion(family_id)
@@ -485,29 +487,30 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     refute_received {:private_context_at_completion, _context}
   end
 
-  test "continuation provenance keeps only a digest outside the process dictionary" do
+  test "continuation provenance keeps only a digest and outcome outside the mailbox" do
     test_pid = self()
     family_id = "family-digest-marker"
     code = issue_code(family_id)
 
     callback = fn _context, continuation ->
       {:ok, response, _events} = result = continuation.()
-      {:messages, messages} = Process.info(self(), :messages)
+      keys = Process.get_keys()
 
-      marker =
-        Enum.find(messages, fn
-          {_ref, :authorization_code_continuation_produced, digest, :succeeded}
-          when is_binary(digest) and byte_size(digest) == 32 ->
-            true
-
-          _other ->
-            false
+      key =
+        Enum.find(keys, fn
+          {Token, :authorization_code_continuation, ref} when is_reference(ref) -> true
+          _other -> false
         end)
 
-      refute is_nil(marker)
-      refute inspect(marker) =~ response.access_token
-      refute Enum.any?(Process.get_keys(), &match?({Token, :authorization_code_continuation, _ref}, &1))
-      send(test_pid, {:continuation_marker, marker})
+      assert {digest, :succeeded} = state = Process.get(key)
+      assert is_binary(digest)
+      assert byte_size(digest) == 32
+      refute inspect(state) =~ response.access_token
+
+      {:messages, messages} = Process.info(self(), :messages)
+
+      refute Enum.any?(messages, &match?({_ref, :authorization_code_continuation_produced, _, _}, &1))
+      send(test_pid, {:continuation_state, key, state})
       result
     end
 
@@ -515,10 +518,47 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert {:ok, response, _events} = Token.issue(config, code_request(config, code))
     assert is_binary(response.access_token)
 
-    assert_receive {:continuation_marker, {ref, :authorization_code_continuation_produced, digest, :succeeded}}
+    assert_receive {:continuation_state, {Token, :authorization_code_continuation, ref} = key, {digest, :succeeded}}
 
     assert is_reference(ref)
     assert byte_size(digest) == 32
+    assert Process.get(key) == nil
+  end
+
+  test "a broad receive after the continuation cannot erase its provenance" do
+    family_id = "family-broad-receive"
+    code = issue_code(family_id)
+    test_pid = self()
+
+    callback = fn _context, continuation ->
+      # Keep the store wrappers from sending their ordinary test notifications
+      # so the sentinel below is the only mailbox message. Before provenance
+      # moved out of the mailbox, the marker preceded this sentinel and a broad
+      # receive consumed it, falsely reporting that the continuation never ran.
+      Process.delete(:authorization_code_completion_test_pid)
+
+      try do
+        result = continuation.()
+        send(self(), :broad_receive_sentinel)
+
+        receive do
+          _any_message -> :ok
+        after
+          100 -> flunk("expected the mailbox sentinel")
+        end
+
+        result
+      after
+        Process.put(:authorization_code_completion_test_pid, test_pid)
+      end
+    end
+
+    config = config(authorization_code_completion: callback)
+
+    assert {:ok, response, _events} = Token.issue(config, code_request(config, code))
+    assert is_binary(response.access_token)
+    assert authorization_by_code!(code).consumed_success
+    refute_received :broad_receive_sentinel
   end
 
   test "a callback refusal runs before principal construction and leaves completion empty" do
@@ -779,7 +819,9 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
                  Token.issue(config, code_request(config, code))
       end)
 
-    assert log =~ "did not return the continuation's result unchanged"
+    assert log =~ "returned a different result after the continuation succeeded"
+    assert log =~ "code may already be finalized"
+    assert log =~ "revoke the grant family"
     refute log =~ "substituted.access.token"
   end
 
@@ -822,6 +864,114 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert_receive {:exception_continuation, escaped}
     assert {:error, %OAuthError{error: :invalid_request}} = escaped.()
     assert_spent_without_completion(family_id)
+  end
+
+  test "callback termination after a committed success logs the retry hazard and preserves the stacktrace" do
+    test_pid = self()
+
+    cases = [
+      {:error, "family-post-success-raise", "private exception reason", "raised"},
+      {:throw, "family-post-success-throw", {:private_throw_reason, 42}, "threw"},
+      {:exit, "family-post-success-exit", {:private_exit_reason, 43}, "exited"}
+    ]
+
+    Enum.each(cases, fn {kind, family_id, reason, verb} ->
+      context_sentinel = "private-context-#{kind}"
+      code = issue_code(family_id, ["offline_access"], private_context: %{"marker" => context_sentinel})
+
+      callback = fn context, continuation ->
+        assert context.private_context == %{"marker" => context_sentinel}
+
+        assert {:ok, {:ok, _response, _events}} =
+                 TestRepo.transaction(fn -> continuation.() end)
+
+        key = continuation_state_key!()
+        assert {_digest, :succeeded} = Process.get(key)
+        send(test_pid, {:post_success_termination_key, kind, key})
+
+        terminate_completion_callback(kind, reason)
+      end
+
+      config = config(authorization_code_completion: callback)
+
+      log =
+        capture_log(fn ->
+          caught =
+            try do
+              Token.issue(config, code_request(config, code))
+              flunk("the callback termination must propagate")
+            catch
+              caught_kind, caught_reason ->
+                {caught_kind, caught_reason, __STACKTRACE__}
+            end
+
+          assert {^kind, caught_reason, stacktrace} = caught
+
+          case kind do
+            :error -> assert %RuntimeError{message: ^reason} = caught_reason
+            _other -> assert caught_reason == reason
+          end
+
+          assert Enum.any?(stacktrace, fn
+                   {__MODULE__, :terminate_completion_callback, 2, _location} -> true
+                   _frame -> false
+                 end)
+        end)
+
+      assert log =~ "authorization code completion callback #{verb} after the continuation succeeded"
+      assert log =~ "code may already be finalized"
+      assert log =~ "client retry"
+      assert log =~ "revoke the grant family"
+      refute log =~ context_sentinel
+      reason_fragment = if is_binary(reason), do: reason, else: reason |> elem(0) |> Atom.to_string()
+      refute log =~ reason_fragment
+
+      assert_receive {:post_success_termination_key, ^kind, key}
+      assert Process.get(key) == nil
+
+      row = authorization_by_code!(code)
+      assert row.consumed_success
+      assert is_binary(row.access_token_jti)
+      assert is_binary(row.family_id)
+      refute row.family_id == family_id
+    end)
+  end
+
+  test "a throw or exit before continuation does not report a finalized-code retry hazard" do
+    cases = [
+      {:throw, "family-pre-continuation-throw", {:private_early_throw, 44}},
+      {:exit, "family-pre-continuation-exit", {:private_early_exit, 45}}
+    ]
+
+    Enum.each(cases, fn {kind, family_id, reason} ->
+      code = issue_code(family_id)
+
+      config =
+        config(
+          authorization_code_completion: fn _context, _continuation ->
+            terminate_completion_callback(kind, reason)
+          end
+        )
+
+      log =
+        capture_log(fn ->
+          caught =
+            try do
+              Token.issue(config, code_request(config, code))
+              flunk("the callback termination must propagate")
+            catch
+              caught_kind, caught_reason -> {caught_kind, caught_reason}
+            end
+
+          assert {^kind, ^reason} = caught
+        end)
+
+      refute log =~ "after the continuation succeeded"
+      refute log =~ "code may already be finalized"
+      reason_name = reason |> elem(0) |> Atom.to_string()
+      refute log =~ reason_name
+      assert_spent_without_completion(family_id)
+    end)
   end
 
   test "a JTI-store exception rolls back an earlier logout-session write" do
@@ -931,6 +1081,66 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert is_binary(row.family_id)
     refute row.family_id == family_id
     assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 1
+  end
+
+  test "a non-OAuth error after a successful continuation is normalized and names the retry hazard" do
+    family_id = "family-success-then-generic-error"
+    code = issue_code(family_id)
+    private_reason = {:private_policy_failure, "do-not-log-this-value"}
+
+    callback = fn _context, continuation ->
+      assert {:ok, _response, _events} = continuation.()
+      {:error, private_reason}
+    end
+
+    config = config(authorization_code_completion: callback)
+
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    assert log =~ "returned an error after the continuation succeeded"
+    assert log =~ "code may already be finalized"
+    assert log =~ "client retry"
+    assert log =~ "revoke the grant family"
+    refute log =~ "private_policy_failure"
+    refute log =~ "do-not-log-this-value"
+
+    row = authorization_by_code!(code)
+    assert row.consumed_success
+    assert is_binary(row.access_token_jti)
+  end
+
+  test "an arbitrary return after a successful continuation is normalized and names the retry hazard" do
+    family_id = "family-success-then-arbitrary-return"
+    code = issue_code(family_id)
+    private_value = "arbitrary-private-value"
+
+    callback = fn _context, continuation ->
+      assert {:ok, _response, _events} = continuation.()
+      {:unexpected_callback_return, private_value}
+    end
+
+    config = config(authorization_code_completion: callback)
+
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    assert log =~ "returned a different result after the continuation succeeded"
+    assert log =~ "code may already be finalized"
+    assert log =~ "client retry"
+    assert log =~ "revoke the grant family"
+    refute log =~ "unexpected_callback_return"
+    refute log =~ private_value
+
+    row = authorization_by_code!(code)
+    assert row.consumed_success
+    assert is_binary(row.access_token_jti)
   end
 
   test "an error remapped after a FAILED continuation is not reported as a revocation hazard" do
@@ -1187,6 +1397,17 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
   end
 
   defp completion_active?, do: Process.get(:authorization_code_completion_active) == true
+
+  defp continuation_state_key! do
+    Enum.find(Process.get_keys(), fn
+      {Token, :authorization_code_continuation, ref} when is_reference(ref) -> true
+      _other -> false
+    end) || flunk("continuation provenance state was not recorded")
+  end
+
+  defp terminate_completion_callback(:error, reason), do: raise(RuntimeError, reason)
+  defp terminate_completion_callback(:throw, reason), do: throw(reason)
+  defp terminate_completion_callback(:exit, reason), do: exit(reason)
 
   defp claim!(jwt, key) when is_binary(jwt) do
     claims!(jwt)[key]

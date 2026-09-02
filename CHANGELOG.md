@@ -16,24 +16,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-check. The continuation is bound to the callback's process and permits
   exactly one invocation; a second, cross-process, or escaped call is refused
   before anything is minted or persisted. The callback's return is verified by
-  provenance rather than shape, so a callback that never invokes the
-  continuation cannot substitute a fabricated `{:ok, response, events}` for a
-  real token set. The `{:ok, _}` wrapper `Repo.transaction/1` places around a
-  committed return is unwrapped instead of failing a request whose code is
-  already finalized. Refresh rotation and every other grant type bypass the
-  wrapper.
+  provenance rather than its outward tuple form, so a callback that never
+  invokes the continuation cannot substitute a fabricated
+  `{:ok, response, events}` for a real token set. The `{:ok, _}` wrapper that
+  `Repo.transaction/1` places around a committed return is unwrapped instead
+  of failing a request whose code is already finalized. Rollback covers only
+  stores using the same Ecto Repo and enclosing transaction. Scope and resource
+  resolution precede this initial
+  authorization-code completion hook; refresh rotation and every other grant
+  type bypass it. It is not a per-request resource-server or MCP
+  reauthorization mechanism. An exception, throw, or exit after successful
+  continuation emits a static, secret-free error naming the possible
+  finalized-code/retry-family-revocation hazard, then propagates with its
+  original stacktrace.
 - `:authorization_code_private_context` - an optional trusted issuance callback
   for host-private authorization state. It receives exactly the authorized
   `:client_id`, `:subject`, and the freshly generated `:family_id`, and its
   return value is supplied back as `:private_context` in the completion
   callback's context. The value must be a portable JSON object of at most 4 KiB
-  encoded; it rides with the code inside the canonical grant `claims` under a
+  encoded. It is stored as plaintext JSONB, not encrypted, so it is for
+  non-secret identifiers and policy epochs rather than credentials or token/key
+  material. It rides with the code inside the canonical grant `claims` under a
   reserved namespaced key, and is lifted off the grant before principal
   construction so it never reaches an access token, ID Token, refresh token, or
   token-exchange input. **No migration is required.** Configuring it without
   `:authorization_code_completion` is refused at boot, and a code that carries
   private context is refused with `invalid_grant` on a node whose completion
   callback is missing, so config skew cannot silently skip the host's policy.
+  Thanks to [@oliver-kriska](https://github.com/oliver-kriska) for the
+  contribution in [#25](https://github.com/XukuLLC/attesto_phoenix/pull/25).
 
 ### Security
 
@@ -42,16 +53,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for hosts using `:authorization_code_private_context`, host-private state;
   none of it belongs in an `Ecto.InvalidChangesetError`, a crash report, or a
   `Plug.Debugger` page.
-- Suppress application SQL logging and Ecto query telemetry for the
-  `AttestoPhoenix.Store.EctoCodeStore` operations that bind or return the whole
-  authorization row (`put/1`, `take/1`, `get/1`), so claims cannot be disclosed
-  through query params, cast params, or decoded results. Lifecycle updates and
-  the reuse-detection read select only the columns they report and keep normal
-  observability, so code-replay detection stays visible to APM. The suppression
-  is unconditional: the store resolves its repo from
-  `config :attesto_phoenix, :repo` and never receives an `AttestoPhoenix.Config`
-  struct, so it cannot detect whether the hook is enabled. Custom stores and
-  database-server logging remain the host's responsibility.
+- Suppress application SQL logging and Ecto query telemetry for every
+  `AttestoPhoenix.Store.EctoCodeStore` operation, including lifecycle updates
+  and reuse-detection reads, so authorization data cannot be disclosed through
+  query params, cast params, or decoded results. Reuse-detection reads still
+  select only the columns they report, keeping `claims` out of decoded rows as
+  defence in depth. The suppression is unconditional: the store resolves its
+  repo from `config :attesto_phoenix, :repo` and never receives an
+  `AttestoPhoenix.Config` struct, so it cannot detect whether the hook is
+  enabled. Custom stores and database-server logging remain the host's
+  responsibility.
 
 ## [3.0.0] - 2026-08-31
 
