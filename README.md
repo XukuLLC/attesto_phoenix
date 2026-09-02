@@ -1368,16 +1368,42 @@ Then run it:
 mix ecto.migrate
 ```
 
+An `attesto_authorization_codes` table created by a release that keyed it only
+with a unique index needs one forward migration, shown in the
+[CHANGELOG upgrade notes](CHANGELOG.md#upgrade-notes): it promotes that index
+to the table's primary key in place.
+
+The application deploy and this migration may run in either order. New code
+recognizes both the historical unique-index name and the new primary-key
+constraint. The completed schema works with either application version;
+duplicates raise `Ecto.ConstraintError` on the previous release and
+`Ecto.InvalidChangesetError` on this one.
+
+Before using that migration, run the
+[catalog preflight](guides/upgrade_3_0_schema_prefix.md#catalog-preflight) and
+set its `@prefix` to the runtime Ecto schema. Custom layouts need a reviewed
+migration. The forward operation reuses the existing index, but still requests
+an `ACCESS EXCLUSIVE` lock; run it in a controlled window with the documented
+short `lock_timeout`. Rollback is slower because it rebuilds the unique index.
+
+For logical replication, migrate the subscriber first and the publisher
+second, before publishing `UPDATE` or `DELETE` for this table. The generic
+migration preserves `REPLICA IDENTITY FULL`; reset a temporary FULL setting
+only after both sides have the key, using the documented publisher-only line.
+See the [upgrade notes](CHANGELOG.md#upgrade-notes) for the exact migration and
+the guide above for operational details.
+
 ### Clustering
 
 Every mutable OAuth store has a Postgres-backed implementation, so a clustered
 or load-balanced deployment holds no OAuth state per node — a request can bounce
 across machines mid-flow. Access tokens are stateless signed JWTs (any node
 validates any token against the shared keystore); everything else lives in
-Postgres with atomic single-use enforcement (`DELETE … RETURNING` for codes and
-PAR references, conditional `UPDATE` for nonces, `INSERT … ON CONFLICT` for the
-replay cache, and a family-serialized refresh transaction). Refresh rotation
-locks the family and parent, consumes the parent, inserts exactly one child,
+Postgres with atomic single-use enforcement (conditional `UPDATE` for
+authorization codes and nonces, `DELETE … RETURNING` for PAR references,
+`INSERT … ON CONFLICT` for the replay cache, and a family-serialized refresh
+transaction). Refresh rotation locks the family and parent, consumes the
+parent, inserts exactly one child,
 and persists the authenticated-encrypted retry state in one database
 transaction. Matching concurrent retries therefore receive the committed
 successor, while reuse and revocation remain serialized against new family
