@@ -750,6 +750,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         normalize_completion_result(result)
 
       match?({:ok, _inner}, result) and completion_result_digest(elem(result, 1)) == digest ->
+        maybe_log_failed_completion_wrapper(outcome)
         result |> elem(1) |> normalize_completion_result()
 
       true ->
@@ -763,6 +764,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp completion_result_outcome({:ok, _response, _events}), do: :succeeded
   defp completion_result_outcome(_result), do: :failed
+
+  defp maybe_log_failed_completion_wrapper(:failed) do
+    Logger.warning(
+      "authorization code completion callback returned a success wrapper around a failed " <>
+        "continuation result; an enclosing transaction may have committed partial writes"
+    )
+  end
+
+  defp maybe_log_failed_completion_wrapper(:succeeded), do: :ok
 
   # The continuation ran but the host returned something else.
   #
@@ -801,8 +811,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     {:error, error(@error_invalid_request, "unable to issue token")}
   end
 
-  # The continuation itself failed and the host remapped the reason. Nothing was
-  # minted or finalized, so there is no retry hazard to report.
+  # The continuation itself failed and the host remapped the reason. The code
+  # was not finalized and no success response can be returned, so there is no
+  # retry hazard to report. Earlier continuation steps may still have persisted
+  # partial state when the host did not provide a transaction.
   defp normalize_substituted_completion({:error, %OAuthError{}} = error, :failed), do: error
 
   defp normalize_substituted_completion({:error, _reason}, :failed) do
@@ -813,7 +825,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp normalize_substituted_completion(_substituted, :failed) do
     Logger.error(
       "authorization code completion callback did not return the continuation's result " <>
-        "unchanged; no token was issued"
+        "unchanged; completion did not succeed and no token response was returned"
     )
 
     {:error, error(@error_invalid_request, "unable to issue token")}

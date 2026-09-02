@@ -497,10 +497,10 @@ fields. Use a private claim name under a namespace you control; do not use OIDC
 ### Transactional authorization-code completion
 
 Wrap the whole tail of an authorization-code redemption — principal
-construction, access- and ID-token minting, access-token `jti` recording,
-optional generation-0 refresh issuance, and code finalization — in one
-synchronous callback, so a host can serialize it with its own database
-transaction:
+construction, host ID-token claim construction, access- and ID-token minting,
+optional logout-session recording, access-token `jti` recording, optional
+generation-0 refresh issuance, and code finalization — in one synchronous
+callback, so a host can serialize it with its own database transaction:
 
 This is an **initial authorization-code completion hook only**. Scope policy and
 resource-indicator resolution have already completed before it runs. Refresh,
@@ -568,6 +568,10 @@ callback that never invokes the continuation cannot pass off a fabricated
 refused, because that commit already carried the mint, refresh insert, and
 finalization.
 
+A success wrapper around a failed continuation result is also unwrapped so the
+wire error is preserved, but it emits a static warning: unless the callback
+rolled the transaction back, earlier continuation writes may have committed.
+
 Only that single transaction wrapper is accepted. Nested transactions produce
 additional `{:ok, ...}` layers, and `Ecto.Multi` returns a result map; both are
 refused unless the callback unwraps them and returns the continuation's exact
@@ -627,17 +631,20 @@ could never run.
 > and changeset inspection, and the bundled store sanitizes failed-insert
 > exceptions; application query suppression reduces further accidental
 > disclosure. Direct Ecto callers and custom stores must provide equivalent
-> exception handling. None of these controls encrypts the value or hides it
-> from the database. Store only non-secret identifiers and policy versions such
-> as a subject ID or security epoch. Never place passwords, API keys, bearer
-> tokens, private keys, or other credentials in this map.
+> exception handling. A host's own exception or crash formatter may render the
+> callback arguments, including this map. None of these controls encrypts the
+> value or hides it from the database. Store only non-secret identifiers and
+> policy versions such as a subject ID or security epoch. Never place passwords,
+> API keys, bearer tokens, private keys, or other credentials in this map.
 
 The value rides with the code inside the canonical grant `claims` under a
 reserved namespaced key, because `Attesto.AuthorizationCode` admits no sibling
 key beside its nine canonical ones. It is lifted off the grant before principal
 construction, so it never reaches an access token, ID Token, refresh token, or
-token-exchange input, and it is never surfaced as an OIDC claim. **No migration
-is required** — the existing `claims` column carries it.
+token-exchange input, and it is never surfaced as an OIDC claim. **This feature
+adds no column migration** — the existing `claims` column carries it. Existing
+installations must still follow any independent database upgrade in the
+release notes.
 
 Configure the two options together. `:authorization_code_private_context`
 without `:authorization_code_completion` is refused at boot, since it would

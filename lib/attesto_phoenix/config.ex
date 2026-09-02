@@ -385,10 +385,11 @@ defmodule AttestoPhoenix.Config do
       grant `:subject`, its `:family_id`, and the host's `:private_context` map
       (or `nil`); it never contains the authorization code or minted token
       secrets. The zero-arity continuation performs principal construction,
-      access- and ID-token minting, access-token `jti` recording, optional
-      generation-0 refresh-token insertion, and successful code finalization. A
-      host may run it inside its own database transaction after locking and
-      revalidating the subject's authorization policy.
+      host `:build_id_token_claims` invocation, access- and ID-token minting,
+      optional logout-session recording, access-token `jti` recording,
+      optional generation-0 refresh-token insertion, and successful code
+      finalization. A host may run it inside its own database transaction after
+      locking and revalidating the subject's authorization policy.
 
       This is an initial authorization-code completion hook only. Scope policy
       and resource-indicator resolution precede it. Refresh, device-code, CIBA,
@@ -412,10 +413,16 @@ defmodule AttestoPhoenix.Config do
       Only that one wrapper layer is accepted: a nested transaction or
       `Ecto.Multi` container must be unwrapped by the host so the callback
       returns the continuation's exact result.
+      A success wrapper around a failed continuation result is unwrapped to
+      preserve the wire error, but emits a static warning because earlier
+      continuation writes may have committed unless the callback rolled the
+      transaction back.
       The callback is trusted same-process host code: the private process entry
       is a correctness guard against accidental interference and contract
       mistakes, not a sandbox against a hostile callback that deliberately
-      inspects or mutates its own process dictionary.
+      inspects or mutates its own process dictionary. Host exception and crash
+      formatters may render callback arguments, including `:private_context`,
+      which is another reason that map must never contain secrets.
       If the continuation returns an error inside a transaction, the callback
       must roll that transaction back rather than commit the normal error tuple.
       **Rollback covers only stores using the same Ecto Repo and enclosing

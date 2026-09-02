@@ -140,6 +140,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
           EctoCodeStore.put(entry("hash-dup", grant_data(%{subject: "second", claims: claims})))
         end
 
+      assert error.changeset.params == nil
+      assert error.changeset.changes == %{}
+
+      assert error.changeset.errors ==
+               [code_hash: {"authorization code could not be stored", []}]
+
       refute Exception.message(error) =~ sentinel
       refute inspect(error) =~ sentinel
 

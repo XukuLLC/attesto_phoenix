@@ -9,9 +9,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `:authorization_code_completion` - an optional synchronous wrapper around the
-  tail of an authorization-code redemption (principal construction, access- and
-  ID-token minting, access-token `jti` recording, optional generation-0 refresh
-  issuance, and code finalization). A host may run it inside its own
+  tail of an authorization-code redemption (principal construction, host
+  ID-token claim construction, access- and ID-token minting, optional
+  logout-session recording, access-token `jti` recording, optional generation-0
+  refresh issuance, and code finalization). A host may run it inside its own
   `Repo.transaction/1` to serialize token issuance with a subject-authorization
   re-check. The continuation is bound to the callback's process and permits
   exactly one invocation; a second, cross-process, or escaped call is refused
@@ -31,7 +32,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stacktrace. Reuse detection can revoke that response's access token and the
   refresh-token family descended from that redemption, forcing the client
   through a new authorization flow; it does not revoke unrelated authorization
-  grants.
+  grants. A success wrapper around a failed continuation is also unwrapped but
+  emits a static warning because earlier writes may have committed.
 - `:authorization_code_private_context` - an optional trusted issuance callback
   for host-private authorization state. It receives exactly the authorized
   `:client_id`, `:subject`, and the freshly generated authorization-grant
@@ -43,11 +45,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   token/key material. It rides with the code inside the canonical grant
   `claims` under a reserved namespaced key, and is lifted off the grant before
   principal construction so it never reaches an access token, ID Token,
-  refresh token, or token-exchange input. **No migration is required.**
-  Configuring it without
-  `:authorization_code_completion` is refused at boot, and a code that carries
-  private context is refused with `invalid_grant` on a node whose completion
-  callback is missing, so config skew cannot silently skip the host's policy.
+  refresh token, or token-exchange input. **This feature adds no column
+  migration; independent release migrations still apply.** Configuring it
+  without `:authorization_code_completion` is refused at boot, and a code that
+  carries private context is refused with `invalid_grant` on a node whose
+  completion callback is missing, so config skew cannot silently skip the
+  host's policy.
   Thanks to [@oliver-kriska](https://github.com/oliver-kriska) for the
   contribution in [#25](https://github.com/XukuLLC/attesto_phoenix/pull/25).
 

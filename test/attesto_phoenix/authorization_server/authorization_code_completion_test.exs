@@ -452,6 +452,31 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert_spent_without_completion(family_id)
   end
 
+  test "completion stores use the request-local Repo when the package fallback is absent" do
+    family_id = "family-request-local-repo"
+    code = issue_code(family_id, ["offline_access"])
+
+    callback = fn _context, continuation ->
+      assert {:error, :host_policy_changed} =
+               TestRepo.transaction(fn ->
+                 assert {:ok, _response, _events} = continuation.()
+                 TestRepo.rollback(:host_policy_changed)
+               end)
+
+      {:error, :host_policy_changed}
+    end
+
+    config = config(authorization_code_completion: callback)
+    Application.delete_env(:attesto_phoenix, :repo)
+
+    capture_log(fn ->
+      assert {:error, %OAuthError{error: :invalid_request}, _events} =
+               Token.issue(config, code_request(config, code))
+    end)
+
+    assert_spent_without_completion(family_id)
+  end
+
   test "private context is completion-only and leaves OIDC and token claims unchanged" do
     test_pid = self()
     family_id = "family-private-nondisclosure"
@@ -797,7 +822,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 1
   end
 
-  test "a Repo.transaction wrapper around a failed continuation is unwrapped" do
+  test "a Repo.transaction wrapper around a failed continuation is unwrapped and warned" do
     family_id = "family-failed-transaction-wrapper"
     code = issue_code(family_id)
 
@@ -817,6 +842,8 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
                  Token.issue(config, code_request(config, code))
       end)
 
+    assert log =~ "success wrapper around a failed continuation result"
+    assert log =~ "may have committed partial writes"
     refute log =~ "authorization code completion callback failed"
     row = authorization!(family_id)
     assert row.consumed_at
@@ -1216,9 +1243,10 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     family_id = "family-remapped-failure"
     code = issue_code(family_id)
 
-    # The continuation itself failed, so nothing was minted or finalized. A host
-    # remapping that reason is ordinary, and must not raise the commit-then-error
-    # alarm.
+    # The continuation itself failed, so the code was not finalized and no
+    # success response can be returned. A host remapping that reason is ordinary
+    # and must not raise the commit-then-error alarm, even though earlier steps
+    # may have persisted partial state without an enclosing transaction.
     callback = fn _context, continuation ->
       assert {:error, %OAuthError{}} = continuation.()
       {:error, %OAuthError{error: :invalid_grant, error_description: "declined", status: 400}}

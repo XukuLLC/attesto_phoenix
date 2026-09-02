@@ -10,6 +10,7 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
 
   use ExUnit.Case, async: true
 
+  alias Attesto.Claims
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
 
   describe "put/2" do
@@ -49,6 +50,16 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
 
       assert PrivateContext.put(%{}, %{"invalid_utf8" => <<255>>}) ==
                {:error, :invalid_private_context}
+    end
+
+    test "a maximum-depth object is refused when the reserved claims key would over-nest it" do
+      context =
+        Enum.reduce(1..63, %{"leaf" => "value"}, fn depth, nested ->
+          %{"level_#{depth}" => nested}
+        end)
+
+      assert Claims.portable_json_object?(context)
+      assert PrivateContext.put(%{}, context) == {:error, :invalid_private_context}
     end
 
     test "a value over the encoded bound is refused rather than truncated" do

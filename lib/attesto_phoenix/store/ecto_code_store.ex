@@ -100,7 +100,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     |> repo().insert([prefix: prefix] ++ @claims_query_opts)
     |> case do
       {:ok, _row} -> :ok
-      {:error, %Ecto.Changeset{}} -> raise_sanitized_insert_error()
+      {:error, %Ecto.Changeset{} = changeset} -> raise_sanitized_insert_error(changeset)
     end
   end
 
@@ -377,14 +377,24 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   # `Ecto.InvalidChangesetError.message/1` renders the original changes and
   # params without consulting schema redaction. Keep the established exception
   # class while replacing the failed insert changeset with a value-free one.
-  defp raise_sanitized_insert_error do
+  defp raise_sanitized_insert_error(%Ecto.Changeset{} = original) do
     safe_changeset =
-      %Authorization{}
-      |> Ecto.Changeset.change()
-      |> Ecto.Changeset.add_error(:code_hash, "authorization code could not be stored")
+      original.errors
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.uniq()
+      |> Enum.reduce(Ecto.Changeset.change(%Authorization{}), fn field, changeset ->
+        Ecto.Changeset.add_error(changeset, field, "authorization code could not be stored")
+      end)
+      |> ensure_sanitized_error()
 
     raise Ecto.InvalidChangesetError, action: :insert, changeset: safe_changeset
   end
+
+  defp ensure_sanitized_error(%Ecto.Changeset{errors: []} = changeset) do
+    Ecto.Changeset.add_error(changeset, :base, "authorization code could not be stored")
+  end
+
+  defp ensure_sanitized_error(%Ecto.Changeset{} = changeset), do: changeset
 
   defp repo, do: Config.ecto_repo!()
 end

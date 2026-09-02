@@ -12,8 +12,9 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
 
   The value is:
 
-    * validated as a portable JSON object (`Attesto.Claims.portable_json_object?/1`),
-      because the claims map round-trips a JSONB column and must survive it
+    * validated as a portable JSON object (`Attesto.Claims.portable_json_object?/1`)
+      both alone and after nesting under the reserved claims key, because the
+      complete claims map round-trips a JSONB column and must survive it
       unchanged;
     * bounded at #{4 * 1024} bytes once encoded, so a host cannot grow an
       authorization code without limit;
@@ -53,23 +54,29 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
   Folds `private_context` into `claims` under the reserved key.
 
   `nil` stores nothing, leaving `claims` untouched. A value that is not a
-  portable JSON object, or that exceeds `max_encoded_bytes/0` once encoded, is
-  rejected rather than truncated or silently dropped — a host that cannot
-  persist its policy state must not get a code that looks like it carries it.
+  portable JSON object by itself or after nesting under the reserved key, or
+  that exceeds `max_encoded_bytes/0` once encoded, is rejected rather than
+  truncated or silently dropped — a host that cannot persist its policy state
+  must not get a code that looks like it carries it.
   """
   @spec put(map(), t() | nil) :: {:ok, map()} | {:error, :invalid_private_context | :private_context_too_large}
   def put(claims, nil) when is_map(claims), do: {:ok, claims}
 
   def put(claims, private_context) when is_map(claims) and is_map(private_context) do
+    combined_claims = Map.put(claims, @claims_key, private_context)
+
     cond do
       not Claims.portable_json_object?(private_context) ->
+        {:error, :invalid_private_context}
+
+      not Claims.portable_json_object?(combined_claims) ->
         {:error, :invalid_private_context}
 
       encoded_size(private_context) > @max_encoded_bytes ->
         {:error, :private_context_too_large}
 
       true ->
-        {:ok, Map.put(claims, @claims_key, private_context)}
+        {:ok, combined_claims}
     end
   end
 
