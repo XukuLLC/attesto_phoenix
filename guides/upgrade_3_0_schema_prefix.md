@@ -228,6 +228,39 @@ stop and restore from the backup or roll back the reviewed migration.
 
 ## 4. Add the 3.0 invariants
 
+### Promote the authorization-code index to a primary key when required
+
+After moving the verified authorization-code source to its canonical target
+name, inspect its primary key and `code_hash` index. A historical generated
+table with no primary key needs the
+[authorization-code primary-key migration](../CHANGELOG.md#upgrade-notes)
+before writers restart. Set that migration's `@prefix` explicitly to this
+guide's selected runtime schema; its raw `ALTER TABLE` does not inherit an Ecto
+migrator or repository prefix.
+
+The CHANGELOG snippet names the index from the canonical historical table. A
+literal-prefixed source can retain a name such as
+`oauth_attesto_authorization_codes_code_hash_index` after its table is moved
+and renamed. Verify the actual index against every documented preflight
+condition, then tailor `PRIMARY KEY USING INDEX` to that verified name (or
+rename it only after checking for a collision). PostgreSQL will rename the
+reused index to `attesto_authorization_codes_pkey` when it installs the
+constraint; the accompanying notice is harmless.
+
+Do not run that snippet against a custom surrogate-primary-key layout. It may
+already provide a usable replica identity and require no database change, but
+it still needs a tailored runtime and constraint review. If the historical
+table used `REPLICA IDENTITY FULL` as a temporary workaround, reset it to
+`DEFAULT` after the primary key is present.
+
+Complete this promotion before adding the table to a publication that publishes
+`UPDATE` or `DELETE`; under the historical default identity, the corresponding
+writes otherwise fail at the publisher. Logical replication does not copy this
+DDL, so apply it to publisher and subscriber, or apply it to the source before
+a managed target copies the source schema.
+
+### Add the refresh-family invariants
+
 After the verified refresh-token source is in its target schema, add the unique
 generation index. Use the same Ecto prefix as runtime (`nil` for `public`):
 

@@ -60,6 +60,18 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
     Sandbox.mode(TestRepo, {:shared, self()})
     on_exit(fn -> Sandbox.mode(TestRepo, :manual) end)
 
+    on_exit(fn ->
+      # ExUnit runs cleanup after the test's sandbox owner has exited, so the
+      # callback needs its own committed connection.
+      :ok = Sandbox.checkout(TestRepo, sandbox: false)
+
+      try do
+        sql!(~s|DROP SCHEMA IF EXISTS "#{@schema}" CASCADE|)
+      after
+        Sandbox.checkin(TestRepo)
+      end
+    end)
+
     sql!(~s|DROP SCHEMA IF EXISTS "#{@schema}" CASCADE|)
     sql!(~s|CREATE SCHEMA "#{@schema}"|)
 
@@ -74,6 +86,7 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
   test "promotes the unique index to the primary key in place, reversibly" do
     refute primary_key?()
     assert index_names() == ["#{@table}_code_hash_index"]
+    assert effective_replica_identity_index_oid() == nil
     original_index_oid = index_oid("#{@table}_code_hash_index")
 
     # Up: the existing index becomes the primary key under the name the schema
@@ -82,9 +95,8 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
     assert primary_key?()
     assert index_names() == ["#{@table}_pkey"]
     assert index_oid("#{@table}_pkey") == original_index_oid
-    # "d" = default: the primary key is the replica identity logical
-    # replication uses for UPDATE/DELETE.
     assert replica_identity() == "d"
+    assert effective_replica_identity_index_oid() == index_oid("#{@table}_pkey")
 
     # Down restores the previous layout.
     migrate(:down, 1)
@@ -124,6 +136,37 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
       sql!(~s|SELECT relreplident::text FROM pg_class WHERE oid = '"#{@schema}"."#{@table}"'::regclass|)
 
     identity
+  end
+
+  # Resolve the index PostgreSQL can actually use for the table's current
+  # replica-identity mode. A plain unique index does not count under DEFAULT;
+  # DEFAULT needs a usable primary-key index, while INDEX needs the explicitly
+  # selected replica-identity index.
+  defp effective_replica_identity_index_oid do
+    %{rows: [[oid]]} =
+      sql!("""
+      SELECT identity.indexrelid
+      FROM pg_class AS relation
+      LEFT JOIN LATERAL (
+        SELECT candidate.indexrelid
+        FROM pg_index AS candidate
+        WHERE candidate.indrelid = relation.oid
+          AND candidate.indisunique
+          AND candidate.indimmediate
+          AND candidate.indisvalid
+          AND candidate.indisready
+          AND candidate.indislive
+          AND candidate.indpred IS NULL
+          AND (
+            (relation.relreplident = 'd' AND candidate.indisprimary) OR
+            (relation.relreplident = 'i' AND candidate.indisreplident)
+          )
+        LIMIT 1
+      ) AS identity ON true
+      WHERE relation.oid = '"#{@schema}"."#{@table}"'::regclass
+      """)
+
+    oid
   end
 
   defp sql!(statement), do: SQL.query!(TestRepo, statement, [])

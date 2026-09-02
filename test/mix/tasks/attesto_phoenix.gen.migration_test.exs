@@ -133,9 +133,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       # Authorization declares @primary_key {:code_hash, ...} and
       # unique_constraint(:code_hash, name: :attesto_authorization_codes_pkey).
       # code_hash must therefore be the table's PRIMARY KEY, not a separate
-      # unique index. A table without a primary key has no default REPLICA
-      # IDENTITY, so PostgreSQL logical replication (blue/green deployments,
-      # major-version upgrades, CDC) cannot replicate its UPDATE/DELETE.
+      # unique index. Under REPLICA IDENTITY DEFAULT, a table without a primary
+      # key has no usable identity index, so its UPDATE/DELETE paths fail when
+      # they are included in a logical-replication publication.
       assert source =~ ~s|add :code_hash, :string, size: 88, primary_key: true, null: false|
       refute source =~ ~s|create unique_index(:attesto_authorization_codes, [:code_hash]|
     end

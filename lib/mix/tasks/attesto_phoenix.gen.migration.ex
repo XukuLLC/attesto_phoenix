@@ -547,10 +547,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # AttestoPhoenix.Schema.Authorization / AttestoPhoenix.Store.EctoCodeStore.
       # One row per issued code. Only the hash of the code is stored (RFC 6749,
       # section 10.3); it is the PRIMARY KEY and the single-use lookup key
-      # (EctoCodeStore.take/1 deletes by code_hash). The schema keys on
-      # :code_hash, so there is no surrogate id. A primary key, not merely a
-      # unique index, also gives the table a default REPLICA IDENTITY, which
-      # PostgreSQL logical replication needs to replicate UPDATE and DELETE.
+      # (EctoCodeStore.take/1 claims it with a conditional UPDATE by code_hash).
+      # The schema keys on :code_hash, so there is no surrogate id. A primary
+      # key, not merely a unique index, also supplies the usable index selected
+      # by REPLICA IDENTITY DEFAULT. A logical-replication publication needs
+      # that identity when it includes this table's UPDATE or DELETE operations.
       create table(:<%= @authorization_codes %>, primary_key: false, prefix: prefix) do
         add :code_hash, :string, size: <%= @hash_size %>, primary_key: true, null: false
         add :client_id, :string, size: <%= @identifier_size %>, null: false
@@ -589,10 +590,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :inserted_at, :utc_datetime, null: false
       end
 
-      # Single-use redemption is enforced at the database by the primary key. A
-      # duplicate code hash violates attesto_authorization_codes_pkey, the name
-      # the schema's unique_constraint(:code_hash, name: ...) maps onto the
-      # changeset.
+      # A duplicate code hash violates attesto_authorization_codes_pkey, the
+      # primary-key name the schema maps onto the changeset alongside the legacy
+      # unique-index name for rolling upgrades. Single-use redemption is
+      # enforced by take/1's conditional UPDATE of consumed_at.
       # Expiry sweeps scan by expiry (AttestoPhoenix.Store.Sweeper).
       create index(:<%= @authorization_codes %>, [:expires_at], prefix: prefix)
       create index(:<%= @authorization_codes %>, [:family_id], prefix: prefix)

@@ -28,6 +28,25 @@ defmodule AttestoPhoenix.Schema.AuthorizationTest do
     }
   end
 
+  describe "schema contract" do
+    test "code_hash is the primary key and both rolling-deploy constraints are mapped" do
+      assert Authorization.__schema__(:primary_key) == [:code_hash]
+
+      changeset = Authorization.from_record(base_record(), now: @now)
+
+      constraint_names =
+        for constraint <- changeset.constraints,
+            constraint.type == :unique,
+            constraint.field == :code_hash,
+            do: constraint.constraint
+
+      assert constraint_names == [
+               "attesto_authorization_codes_pkey",
+               "attesto_authorization_codes_code_hash_index"
+             ]
+    end
+  end
+
   describe "from_record/2" do
     test "produces a valid changeset spreading grant data across columns" do
       changeset = Authorization.from_record(base_record(), now: @now)

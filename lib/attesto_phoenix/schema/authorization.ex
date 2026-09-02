@@ -19,9 +19,9 @@ defmodule AttestoPhoenix.Schema.Authorization do
   (RFC 6749 §10.5): a database disclosure must not yield a usable code, so
   the column is the output of `Attesto.Secret.hash/1` and is the primary
   key (there is no surrogate id). Keying the table on it, rather than only
-  indexing it, also gives PostgreSQL logical replication a replica identity
-  for the table, which blue/green deployments and managed major-version
-  upgrades rely on.
+  indexing it, also supplies the primary-key index selected by PostgreSQL
+  `REPLICA IDENTITY DEFAULT`. A logical publication needs that identity when
+  it includes this table's `UPDATE`s or `DELETE`s.
 
   The remaining columns are the authorization-request context that must be
   reproduced at redemption time:
@@ -278,6 +278,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
     |> cast(attrs, @required ++ @optional ++ [:inserted_at])
     |> validate_required(@required ++ [:inserted_at])
     |> validate_inclusion(:code_challenge_method, [@code_challenge_method_s256])
+    |> unique_constraint(:code_hash, name: :attesto_authorization_codes_code_hash_index)
     |> unique_constraint(:code_hash, name: :attesto_authorization_codes_pkey)
   end
 

@@ -1203,27 +1203,46 @@ mix ecto.migrate
 ```
 
 An `attesto_authorization_codes` table created by a release that keyed it only
-with a unique index needs one forward migration, shown in the CHANGELOG
-upgrade notes: it promotes that index to the table's primary key in place.
-Without a primary key the table has no replica identity, so PostgreSQL logical
-replication (blue/green deployments, managed major-version upgrades, change
-data capture) cannot replicate it.
+with a unique index needs one forward migration, shown in the
+[CHANGELOG upgrade notes](CHANGELOG.md#upgrade-notes): it promotes that index
+to the table's primary key in place.
+
+The application deploy and this migration may run in either order. New code
+recognizes both the historical unique-index name and the new primary-key
+constraint. The completed schema works with either application version;
+duplicates raise `Ecto.ConstraintError` on the previous release and
+`Ecto.InvalidChangesetError` on this one.
+
+The migration must finish before the table is added to a logical-replication
+publication that publishes `UPDATE` or `DELETE`. Under the historical
+`REPLICA IDENTITY DEFAULT` layout there is no usable identity index; if the
+table is already in such a publication, the corresponding authorization-code
+update or delete paths fail at the publisher until the identity is fixed.
+PostgreSQL does not replicate DDL, so apply this change to both publisher and
+subscriber, or apply it to the source before creating a managed target that
+copies the source schema.
 
 The documented migration is specifically for the historical generated layout:
 `code_hash` is `NOT NULL`, the table has no existing primary key, and
 `attesto_authorization_codes_code_hash_index` is a valid, unique, ordinary
 B-tree index over only `code_hash`, with default ordering and no predicate or
-expressions. Preflight those facts first. Custom names, columns, nullability,
-indexes, or constraints require a reviewed, tailored migration and preflight.
+expressions. Preflight those facts first, and set its `@prefix` to exactly the
+runtime Ecto schema; raw SQL does not inherit a migrator or repository prefix.
+Custom names, columns, nullability, indexes, or constraints require a tailored
+review. A custom layout with a surrogate primary key may already have a usable
+replica identity and need no migration. If an operator temporarily selected
+`REPLICA IDENTITY FULL`, reset it to `DEFAULT` after adding the primary key.
+
 When the prerequisites hold, `PRIMARY KEY USING INDEX` reuses the index without
 an index rebuild or table rewrite, so the forward operation is metadata-only
-and normally fast. It still takes an `ACCESS EXCLUSIVE` table lock and can wait
-behind live transactions, then block reads and writes. Run it in a controlled
-window with a short `lock_timeout`, and keep the shown Ecto migration in its
-default DDL transaction so `SET LOCAL` covers the `ALTER TABLE`; retry when
-traffic is quiet, or drain traffic touching the table if it cannot acquire the
-lock promptly. See the CHANGELOG upgrade notes for the migration and
-operational details.
+and normally fast; a notice that PostgreSQL renamed the reused index is
+harmless. It still takes an `ACCESS EXCLUSIVE` table lock and can wait behind
+live transactions, then block reads and writes. Run it in a controlled window
+with a short `lock_timeout` below the application's query timeout, and keep the
+shown Ecto migration in its default DDL transaction so `SET LOCAL` covers the
+`ALTER TABLE`. The `down/0` path is slower: it rebuilds the unique index while
+the exclusive lock remains held. See the CHANGELOG upgrade notes for the exact
+migration and operational details.
 
 ### Clustering
 
@@ -1231,10 +1250,11 @@ Every mutable OAuth store has a Postgres-backed implementation, so a clustered
 or load-balanced deployment holds no OAuth state per node — a request can bounce
 across machines mid-flow. Access tokens are stateless signed JWTs (any node
 validates any token against the shared keystore); everything else lives in
-Postgres with atomic single-use enforcement (`DELETE … RETURNING` for codes and
-PAR references, conditional `UPDATE` for nonces, `INSERT … ON CONFLICT` for the
-replay cache, and a family-serialized refresh transaction). Refresh rotation
-locks the family and parent, consumes the parent, inserts exactly one child,
+Postgres with atomic single-use enforcement (conditional `UPDATE` for
+authorization codes and nonces, `DELETE … RETURNING` for PAR references,
+`INSERT … ON CONFLICT` for the replay cache, and a family-serialized refresh
+transaction). Refresh rotation locks the family and parent, consumes the
+parent, inserts exactly one child,
 and persists the authenticated-encrypted retry state in one database
 transaction. Matching concurrent retries therefore receive the committed
 successor, while reuse and revocation remain serialized against new family

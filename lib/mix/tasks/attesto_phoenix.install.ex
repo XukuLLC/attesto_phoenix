@@ -1561,11 +1561,13 @@ if Code.ensure_loaded?(Igniter) do
            and normally fast: it reuses the index without rebuilding it or
            rewriting the table. It still takes `ACCESS EXCLUSIVE`, so under
            live traffic it can wait and then block reads and writes. Use a
-           controlled window and the short `lock_timeout` shown in the
-           CHANGELOG; keep its default DDL transaction so `SET LOCAL` covers
-           `ALTER TABLE`. Retry when quiet, or drain traffic touching the table
-           if the lock cannot be acquired promptly. Without the primary key
-           PostgreSQL logical replication cannot replicate the table.
+           controlled window and keep the short `lock_timeout` shown in the
+           CHANGELOG below the application's query timeout; keep the default
+           DDL transaction so `SET LOCAL` covers `ALTER TABLE`. Retry when
+           quiet, or drain traffic touching the table if the lock cannot be
+           acquired promptly. Under the historical default replica identity,
+           publishing this table for UPDATE or DELETE makes the corresponding
+           writes fail at the publisher until an identity is configured.
 
         4. The OAuth endpoints are mounted under "#{oauth_path_prefix}". The
            well-known discovery and JWKS documents stay at the host root
