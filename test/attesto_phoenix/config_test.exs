@@ -643,7 +643,9 @@ defmodule AttestoPhoenix.ConfigTest do
       Application.delete_env(:attesto_phoenix, :repo)
 
       assert_raise ArgumentError,
-                   "AttestoPhoenix: no :repo configured. Set `config :attesto_phoenix, repo: MyApp.Repo`",
+                   "AttestoPhoenix: no :repo configured. Set :repo on the request/host " <>
+                     "AttestoPhoenix.Config; legacy deployments without :otp_app may set " <>
+                     "config :attesto_phoenix, repo: MyApp.Repo",
                    &Config.ecto_repo!/0
     end
   end

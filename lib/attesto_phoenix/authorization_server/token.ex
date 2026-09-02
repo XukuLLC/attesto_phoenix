@@ -704,7 +704,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   #     returned the `{:ok, _}` wrapper. The commit already took the mint,
   #     refresh insert, and code finalization with it, so unwrap rather than
   #     failing a request whose code is now finalized - failing would score the
-  #     client's retry as a replay and revoke the whole family.
+  #     client's retry as a replay and revoke that response's access token and
+  #     the refresh-token family descended from that redemption.
   defp normalize_authorization_code_completion(result, ref) do
     case Process.get(authorization_code_continuation_key(ref)) do
       {digest, outcome} when is_binary(digest) and outcome in [:succeeded, :failed] ->
@@ -739,7 +740,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     Logger.error(
       "authorization code completion callback #{verb} after the continuation succeeded; " <>
         "the code may already be finalized, and a client retry may trigger code-reuse " <>
-        "detection and revoke the grant family"
+        "detection and revoke that response's access token and refresh family"
     )
   end
 
@@ -774,11 +775,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   #     claim remains spent but unfinalized; a retry is refused without being
   #     scored as reuse.
   #   * the host COMMITTED and then returned something else anyway. The code is
-  #     now finalized, so the client's retry presents a successfully-consumed
-  #     code, which code-reuse detection correctly scores as a replay and
-  #     answers by revoking the whole grant family (OAuth 2.0 Security BCP
-  #     §4.13). The user is signed out by a host bug, and nothing on the wire
-  #     says why.
+  #     now finalized, so the client's retry presents a successfully consumed
+  #     code. Reuse detection then revokes that response's access token and the
+  #     refresh-token family descended from that redemption, and returns
+  #     `invalid_grant`, forcing a new authorization flow. Unrelated
+  #     authorization grants are unaffected.
   #
   # Distinguishing them would require knowing the host's transaction outcome,
   # which is outside this boundary. An OAuth error is honoured and every other
@@ -822,7 +823,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     Logger.error(
       "authorization code completion callback #{action} after the continuation succeeded; " <>
         "the code may already be finalized, and a client retry may trigger code-reuse " <>
-        "detection and revoke the grant family"
+        "detection and revoke that response's access token and refresh family"
     )
   end
 

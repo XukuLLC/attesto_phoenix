@@ -503,9 +503,10 @@ synchronous callback, so a host can serialize it with its own database
 transaction:
 
 This is an **initial authorization-code completion hook only**. Scope policy and
-resource-indicator resolution have already completed before it runs, and every
-refresh-token grant bypasses it. It is not a per-request reauthorization hook
-for a resource server or MCP server; enforce request-time policy where the
+resource-indicator resolution have already completed before it runs. Refresh,
+device-code, CIBA, pre-authorized-code, JWT-bearer, client-credentials, and
+token-exchange grants all bypass it. It is not a per-request reauthorization
+hook for a resource server or MCP server; enforce request-time policy where the
 access token is used.
 
 ```elixir
@@ -522,7 +523,13 @@ config :my_app, AttestoPhoenix.Config,
           end
 
         false ->
-          MyApp.Repo.rollback({:error, :subject_revoked})
+          error =
+            AttestoPhoenix.OAuthError.new(
+              :invalid_grant,
+              "subject authorization is no longer valid"
+            )
+
+          MyApp.Repo.rollback({:error, error})
       end
     end)
     |> case do
@@ -535,16 +542,20 @@ config :my_app, AttestoPhoenix.Config,
 
 `context` carries only the authenticated `:client_id`, the grant `:subject`,
 its `:family_id`, and the host's `:private_context` — never the authorization
-code or a minted token secret.
+code or a minted token secret. This `:family_id` is the original authorization
+grant provenance identifier (and the value exposed by
+`:authorization_grant_id_claim`, when configured), not the independently
+generated refresh-rotation family identifier.
 
 > #### One transaction means one Repo {: .warning}
 >
 > Rollback covers only stores that use the **same Ecto Repo and enclosing
-> transaction** as the callback. Point `config :attesto_phoenix, :repo` — used
-> by the bundled Ecto stores — at the Repo used by the callback. A custom store
-> that uses another Repo, opens and commits its own transaction, or writes to an
-> external service is outside this rollback boundary; its writes will not be
-> undone with the host transaction.
+> transaction** as the callback. Set the `:repo` key of the request-local
+> `AttestoPhoenix.Config` to the Repo used by the callback. The package-level
+> `config :attesto_phoenix, :repo` setting is only a legacy fallback when no
+> `:otp_app` pointer exists. A custom store that uses another Repo, opens and
+> commits its own transaction, or writes to an external service is outside this
+> rollback boundary; its writes will not be undone with the host transaction.
 
 The continuation is bound to the callback's process and permits exactly one
 invocation; a second, cross-process, or escaped call is refused before anything
@@ -557,6 +568,11 @@ callback that never invokes the continuation cannot pass off a fabricated
 refused, because that commit already carried the mint, refresh insert, and
 finalization.
 
+Only that single transaction wrapper is accepted. Nested transactions produce
+additional `{:ok, ...}` layers, and `Ecto.Multi` returns a result map; both are
+refused unless the callback unwraps them and returns the continuation's exact
+result.
+
 The callback is trusted host code running in the same process. The private
 process entry is a correctness guard against accidental interference (including
 broad mailbox receives) and contract mistakes, not a sandbox against a hostile
@@ -567,13 +583,14 @@ callback that deliberately inspects or mutates its own process dictionary.
 > If the continuation succeeds and your callback then returns an error, raises,
 > throws, or exits, the library cannot see whether the enclosing transaction
 > rolled back or an earlier transaction committed. If it committed, the code is
-> finalized while the client got a failure — and the client's retry presents a
-> successfully consumed code, which reuse detection correctly scores as replay
-> and answers by revoking the whole grant family. Roll the transaction back
-> instead. An error return is honoured. An exception, throw, or exit is logged
-> with a static, secret-free warning and then re-raised with its original
-> stacktrace. Both logs name the finalized-code/retry hazard without logging the
-> callback reason or context.
+> finalized while the client got a failure. A retry is then scored as reuse and
+> can revoke that response's access token and the refresh-token family descended
+> from that redemption, forcing a new authorization flow; unrelated
+> authorization grants are not revoked. Roll the transaction back instead. An
+> error return is honoured. An exception, throw, or exit is logged with a
+> static, secret-free warning and then re-raised with its original stacktrace.
+> Both logs name the finalized-code/retry hazard without logging the callback
+> reason or context.
 
 The authorization code is atomically claimed before the callback runs. A host
 refusal, malformed private context, missing callback for a context-bearing code,
@@ -596,20 +613,24 @@ config :my_app, AttestoPhoenix.Config,
 ```
 
 The issuance callback sees exactly the authorized `:client_id`, `:subject`, and
-the freshly generated `:family_id` — no request parameters, no token secrets.
-Its return value must be a portable JSON object (string keys at every level,
-JSON-safe values) of at most 4 KiB encoded; anything else refuses the request
-with `server_error` rather than issuing a code whose completion policy could
-never run.
+the freshly generated authorization-grant provenance `:family_id` — not the
+separate refresh-rotation family identifier, and no request parameters or token
+secrets. Its return value must be a portable JSON object (string keys at every
+level, JSON-safe values) of at most 4 KiB encoded; anything else refuses the
+request with `server_error` rather than issuing a code whose completion policy
+could never run.
 
 > #### Plaintext state, not encryption {: .warning}
 >
 > Private context is persisted as **plaintext JSONB** in the authorization
-> row's existing `claims` column. Redaction and application query suppression
-> reduce accidental disclosure; they do not encrypt the value or hide it from
-> the database. Store only non-secret identifiers and policy versions such as a
-> subject ID or security epoch. Never place passwords, API keys, bearer tokens,
-> private keys, or other credentials in this map.
+> row's existing `claims` column. Ecto redaction hides it from ordinary struct
+> and changeset inspection, and the bundled store sanitizes failed-insert
+> exceptions; application query suppression reduces further accidental
+> disclosure. Direct Ecto callers and custom stores must provide equivalent
+> exception handling. None of these controls encrypts the value or hides it
+> from the database. Store only non-secret identifiers and policy versions such
+> as a subject ID or security epoch. Never place passwords, API keys, bearer
+> tokens, private keys, or other credentials in this map.
 
 The value rides with the code inside the canonical grant `claims` under a
 reserved namespaced key, because `Attesto.AuthorizationCode` admits no sibling

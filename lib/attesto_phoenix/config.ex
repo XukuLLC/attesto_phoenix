@@ -354,8 +354,11 @@ defmodule AttestoPhoenix.Config do
     * `:authorization_code_private_context` - `(context -> map | nil)`.
       Optional trusted issuance callback for host-private authorization state.
       `context` contains exactly the authorized `:client_id`, `:subject`, and
-      freshly generated `:family_id`; it contains no request parameters or
-      token secrets. A returned map must be a portable JSON object
+      freshly generated authorization-grant provenance `:family_id`; it contains
+      no request parameters or token secrets. This identifier is the value
+      exposed by `:authorization_grant_id_claim` when configured, not the
+      separately generated refresh-rotation family identifier. A returned map
+      must be a portable JSON object
       (`Attesto.Claims.portable_json_object?/1`: string keys at every level and
       JSON-safe values) and is limited to 4 KiB once encoded. It rides with the
       authorization code inside the canonical grant `:claims` under a reserved
@@ -388,9 +391,11 @@ defmodule AttestoPhoenix.Config do
       revalidating the subject's authorization policy.
 
       This is an initial authorization-code completion hook only. Scope policy
-      and resource-indicator resolution precede it, and refresh-token grants
-      bypass it. It is not a per-request resource-server or MCP reauthorization
-      mechanism; enforce request-time policy where the access token is used.
+      and resource-indicator resolution precede it. Refresh, device-code, CIBA,
+      pre-authorized-code, JWT-bearer, client-credentials, token-exchange, and
+      every other grant type bypass the hook. It is not a per-request
+      resource-server or MCP reauthorization mechanism; enforce request-time
+      policy where the access token is used.
 
       AttestoPhoenix binds the continuation to the callback's process and
       dynamic scope and permits exactly one invocation; a second, cross-process,
@@ -404,6 +409,9 @@ defmodule AttestoPhoenix.Config do
       different success is refused. The `{:ok, _}` wrapper `Repo.transaction/1`
       places around a committed return is also accepted and unwrapped, because
       that commit already carried the mint, refresh insertion, and finalization.
+      Only that one wrapper layer is accepted: a nested transaction or
+      `Ecto.Multi` container must be unwrapped by the host so the callback
+      returns the continuation's exact result.
       The callback is trusted same-process host code: the private process entry
       is a correctness guard against accidental interference and contract
       mistakes, not a sandbox against a hostile callback that deliberately
@@ -419,10 +427,13 @@ defmodule AttestoPhoenix.Config do
       logging the reason. If the callback returns an error, raises, throws, or
       exits after the continuation succeeds, a transaction may already have
       committed code finalization; the failed client retry can then be detected
-      as code reuse and revoke the grant family. Such error returns are logged
-      with this consequence. Exceptions, throws, and exits get the same static,
-      secret-free log before being re-raised with their original stacktrace; the
-      reason and callback context are never logged. The code has already been
+      as code reuse and revoke that response's access token and the refresh-token
+      family descended from that redemption, forcing a new authorization flow
+      without affecting unrelated authorization grants. Such error returns are
+      logged with this consequence. Exceptions, throws, and exits get the same
+      static, secret-free log before being re-raised with their original
+      stacktrace; the reason and callback context are never logged. The code has
+      already been
       claimed before this callback runs, so refusal, malformed persisted private
       context, a missing callback for a context-bearing code, or any callback
       failure before the continuation succeeds leaves it spent but unfinalized
@@ -1612,7 +1623,13 @@ defmodule AttestoPhoenix.Config do
   existing error message; the lookup and default failure stay shared.
   """
   @spec ecto_repo!() :: module()
-  def ecto_repo!, do: ecto_repo!("AttestoPhoenix: no :repo configured. Set `config :attesto_phoenix, repo: MyApp.Repo`")
+  def ecto_repo! do
+    ecto_repo!(
+      "AttestoPhoenix: no :repo configured. Set :repo on the request/host " <>
+        "AttestoPhoenix.Config; legacy deployments without :otp_app may set " <>
+        "config :attesto_phoenix, repo: MyApp.Repo"
+    )
+  end
 
   @spec ecto_repo!(String.t()) :: module()
   def ecto_repo!(missing_message) when is_binary(missing_message) do

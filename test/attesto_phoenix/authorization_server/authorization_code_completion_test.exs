@@ -387,6 +387,21 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert_receive :authorization_code_completion_committed
   end
 
+  test "an MFA completion callback receives configured extra arguments through the token path" do
+    family_id = "family-mfa-completion"
+    private_context = %{"security_epoch" => 43}
+    code = issue_code(family_id, ["offline_access"], private_context: private_context)
+
+    config =
+      config(authorization_code_completion: {__MODULE__, :mfa_completion, [self(), :configured_marker]})
+
+    assert {:ok, response, _events} = Token.issue(config, code_request(config, code))
+    assert is_binary(response.access_token)
+    assert is_binary(response.refresh_token)
+
+    assert_receive {:mfa_completion, :configured_marker, %{family_id: ^family_id, private_context: ^private_context}}
+  end
+
   test "a host rollback after the continuation leaves no JTI, refresh, or finalization writes" do
     family_id = "family-host-rollback"
     private_context = %{"security_epoch" => 7}
@@ -431,7 +446,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
     assert log =~ "returned an error after the continuation succeeded"
     assert log =~ "code may already be finalized"
-    assert log =~ "revoke the grant family"
+    assert log =~ "revoke that response's access token and refresh family"
     refute log =~ "host_policy_changed"
 
     assert_spent_without_completion(family_id)
@@ -570,7 +585,12 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       config(
         authorization_code_completion: fn context, _continuation ->
           send(test_pid, {:completion_refused, context})
-          {:error, :subject_revoked}
+
+          {:error,
+           OAuthError.new(
+             :invalid_grant,
+             "subject authorization is no longer valid"
+           )}
         end,
         build_principal: fn client, subject, scope ->
           send(test_pid, :build_principal_invoked)
@@ -578,10 +598,13 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         end
       )
 
-    capture_log(fn ->
-      assert {:error, %OAuthError{error: :invalid_request}, _events} =
-               Token.issue(config, code_request(config, code))
-    end)
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    refute log =~ "authorization code completion callback failed"
 
     assert_receive {:completion_refused,
                     %{
@@ -752,7 +775,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert_spent_without_completion(family_id)
   end
 
-  test "a committed Repo.transaction wrapper is unwrapped rather than revoking the family on retry" do
+  test "a committed Repo.transaction wrapper is unwrapped rather than failing after commit" do
     family_id = "family-transaction-wrapper"
     code = issue_code(family_id, ["offline_access"])
 
@@ -802,6 +825,33 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert TestRepo.aggregate(RefreshToken, :count) == 0
   end
 
+  test "nested transaction wrappers are refused and report the committed-result retry hazard" do
+    family_id = "family-nested-transaction-wrapper"
+    code = issue_code(family_id, ["offline_access"])
+
+    callback = fn _context, continuation ->
+      TestRepo.transaction(fn ->
+        TestRepo.transaction(fn -> continuation.() end)
+      end)
+    end
+
+    config = config(authorization_code_completion: callback)
+
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    assert log =~ "returned a different result after the continuation succeeded"
+    assert log =~ "revoke that response's access token and refresh family"
+
+    row = authorization_by_code!(code)
+    assert row.consumed_success
+    assert is_binary(row.access_token_jti)
+    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 1
+  end
+
   test "a callback that substitutes a different result after running the continuation is refused" do
     family_id = "family-substituted-response"
     code = issue_code(family_id)
@@ -821,7 +871,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
     assert log =~ "returned a different result after the continuation succeeded"
     assert log =~ "code may already be finalized"
-    assert log =~ "revoke the grant family"
+    assert log =~ "revoke that response's access token and refresh family"
     refute log =~ "substituted.access.token"
   end
 
@@ -921,7 +971,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       assert log =~ "authorization code completion callback #{verb} after the continuation succeeded"
       assert log =~ "code may already be finalized"
       assert log =~ "client retry"
-      assert log =~ "revoke the grant family"
+      assert log =~ "revoke that response's access token and refresh family"
       refute log =~ context_sentinel
       reason_fragment = if is_binary(reason), do: reason, else: reason |> elem(0) |> Atom.to_string()
       refute log =~ reason_fragment
@@ -1050,15 +1100,26 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     refute Map.has_key?(entry.record.data, :attesto_phoenix_private_context)
   end
 
-  test "an error substituted after a SUCCESSFUL continuation names the revocation hazard" do
+  test "retry after a committed-success substitution revokes only that response lineage" do
+    unrelated_code = issue_code("unrelated-authorization-provenance")
+    unrelated_config = config()
+
+    assert {:ok, _unrelated_response, _events} =
+             Token.issue(unrelated_config, code_request(unrelated_config, unrelated_code))
+
+    unrelated_row = authorization_by_code!(unrelated_code)
+    refute EctoCodeStore.access_token_revoked?(unrelated_row.access_token_jti)
+    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^unrelated_row.family_id), :count) == 1
+
     family_id = "family-commit-then-error"
     code = issue_code(family_id)
 
     # The host ran the continuation to success and then returned its own error.
     # If it committed rather than rolled back, the code is finalized and the
-    # client's retry will be scored as reuse and revoke the family. The library
-    # cannot see the transaction outcome, so it honours the error but must say
-    # so - this was the normalizer's only silent path.
+    # client's retry will be scored as reuse and revoke that response's access
+    # token and refresh family. The library cannot see the transaction outcome,
+    # so it honours the error but must say so - this was the normalizer's only
+    # silent path.
     callback = fn _context, continuation ->
       assert {:ok, _response, _events} = continuation.()
       {:error, %OAuthError{error: :access_denied, error_description: "policy changed", status: 400}}
@@ -1073,7 +1134,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       end)
 
     assert log =~ "returned an error after the continuation succeeded"
-    assert log =~ "revoke the grant family"
+    assert log =~ "revoke that response's access token and refresh family"
 
     row = authorization_by_code!(code)
     assert row.consumed_success
@@ -1081,6 +1142,14 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert is_binary(row.family_id)
     refute row.family_id == family_id
     assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 1
+
+    assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+             Token.issue(config, code_request(config, code))
+
+    assert EctoCodeStore.access_token_revoked?(row.access_token_jti)
+    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 0
+    refute EctoCodeStore.access_token_revoked?(unrelated_row.access_token_jti)
+    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^unrelated_row.family_id), :count) == 1
   end
 
   test "a non-OAuth error after a successful continuation is normalized and names the retry hazard" do
@@ -1104,7 +1173,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert log =~ "returned an error after the continuation succeeded"
     assert log =~ "code may already be finalized"
     assert log =~ "client retry"
-    assert log =~ "revoke the grant family"
+    assert log =~ "revoke that response's access token and refresh family"
     refute log =~ "private_policy_failure"
     refute log =~ "do-not-log-this-value"
 
@@ -1134,7 +1203,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert log =~ "returned a different result after the continuation succeeded"
     assert log =~ "code may already be finalized"
     assert log =~ "client retry"
-    assert log =~ "revoke the grant family"
+    assert log =~ "revoke that response's access token and refresh family"
     refute log =~ "unexpected_callback_return"
     refute log =~ private_value
 
@@ -1339,6 +1408,12 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         http_method: "POST"
       }
     }
+  end
+
+  @doc false
+  def mfa_completion(context, continuation, test_pid, marker) do
+    send(test_pid, {:mfa_completion, marker, context})
+    continuation.()
   end
 
   defp transactional_completion(test_pid) do

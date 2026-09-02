@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   presented once is spent, which denies an attacker repeated validation
   attempts against a captured code.
 
-  The plaintext code is never persisted; the primary key is the
+  The plaintext code is never persisted; the unique database key is the
   `Attesto.Secret.hash/1` digest of the code. The column layout and the
   record bridge live in `AttestoPhoenix.Schema.Authorization`; the bridge
   emits core's canonical authorization-code data map, with `S256` implicit and
@@ -27,10 +27,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   by replay containment. Refresh-flow linkage is selected by code hash before
   the core binds the row to its newly issued refresh family.
 
-  The repository module is supplied by the host application (`:repo` under
-  the `:attesto_phoenix` app) and is read at call time. A store with no
-  backing repository can make no guarantees, so a missing `:repo` fails
-  closed rather than silently no-opping.
+  The repository module is resolved at call time from the validated
+  request-local configuration, then the host configuration selected by
+  `:otp_app`; the package-level `:attesto_phoenix` setting is only the legacy
+  fallback when no `:otp_app` pointer exists. A store with no backing
+  repository can make no guarantees, so a missing `:repo` fails closed rather
+  than silently no-opping.
 
   ## Query observability
 
@@ -48,9 +50,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   > #### Suppression is unconditional {: .warning}
   >
   > It applies to every deployment, including one that never enables
-  > `:authorization_code_private_context`. The store resolves its repository
-  > from `config :attesto_phoenix, :repo` and never receives an
-  > `AttestoPhoenix.Config` struct, so it cannot detect whether the hook is on.
+  > `:authorization_code_private_context`. Repository resolution can use the
+  > request-local `AttestoPhoenix.Config`, but observability does not vary with
+  > that option; standalone store calls may have no request-local config at all.
   > Custom stores and database-server logging remain the host's responsibility.
   """
 
@@ -79,12 +81,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   `take/1` contains core's canonical data keys only; database compatibility
   columns for the PKCE method and legacy top-level nonce are not emitted.
 
-  The hash is the primary key, so a duplicate insert is a caller bug:
+  The hash is the unique database key, so a duplicate insert is a caller bug:
   `Attesto.AuthorizationCode` derives the hash from freshly generated random
   bytes, so a collision means the random source repeated or the same entry
-  was put twice. `insert!/1` raises on the unique-constraint violation rather
-  than silently overwriting an existing, possibly already-issued, code. Fail
-  closed; no upsert.
+  was put twice. A unique-constraint violation raises a sanitized
+  `Ecto.InvalidChangesetError` rather than exposing the failed changeset, which
+  can contain authorization claims and host-private context. Fail closed; no
+  upsert.
   """
   @impl Attesto.CodeStore
   @spec put(Attesto.CodeStore.entry()) :: :ok
@@ -94,9 +97,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
     record
     |> Authorization.from_record(prefix: prefix)
-    |> repo().insert!([prefix: prefix] ++ @claims_query_opts)
-
-    :ok
+    |> repo().insert([prefix: prefix] ++ @claims_query_opts)
+    |> case do
+      {:ok, _row} -> :ok
+      {:error, %Ecto.Changeset{}} -> raise_sanitized_insert_error()
+    end
   end
 
   @doc """
@@ -367,6 +372,18 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   defp expect_one_updated!({_unexpected_count, _rows}, operation) do
     raise RuntimeError,
           "#{inspect(__MODULE__)}.#{operation} failed to update exactly one authorization record"
+  end
+
+  # `Ecto.InvalidChangesetError.message/1` renders the original changes and
+  # params without consulting schema redaction. Keep the established exception
+  # class while replacing the failed insert changeset with a value-free one.
+  defp raise_sanitized_insert_error do
+    safe_changeset =
+      %Authorization{}
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.add_error(:code_hash, "authorization code could not be stored")
+
+    raise Ecto.InvalidChangesetError, action: :insert, changeset: safe_changeset
   end
 
   defp repo, do: Config.ecto_repo!()
