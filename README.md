@@ -1207,8 +1207,23 @@ with a unique index needs one forward migration, shown in the CHANGELOG
 upgrade notes: it promotes that index to the table's primary key in place.
 Without a primary key the table has no replica identity, so PostgreSQL logical
 replication (blue/green deployments, managed major-version upgrades, change
-data capture) cannot replicate it. The change is catalog-only and safe to
-apply while either release is running.
+data capture) cannot replicate it.
+
+The documented migration is specifically for the historical generated layout:
+`code_hash` is `NOT NULL`, the table has no existing primary key, and
+`attesto_authorization_codes_code_hash_index` is a valid, unique, ordinary
+B-tree index over only `code_hash`, with default ordering and no predicate or
+expressions. Preflight those facts first. Custom names, columns, nullability,
+indexes, or constraints require a reviewed, tailored migration and preflight.
+When the prerequisites hold, `PRIMARY KEY USING INDEX` reuses the index without
+an index rebuild or table rewrite, so the forward operation is metadata-only
+and normally fast. It still takes an `ACCESS EXCLUSIVE` table lock and can wait
+behind live transactions, then block reads and writes. Run it in a controlled
+window with a short `lock_timeout`, and keep the shown Ecto migration in its
+default DDL transaction so `SET LOCAL` covers the `ALTER TABLE`; retry when
+traffic is quiet, or drain traffic touching the table if it cannot acquire the
+lock promptly. See the CHANGELOG upgrade notes for the migration and
+operational details.
 
 ### Clustering
 

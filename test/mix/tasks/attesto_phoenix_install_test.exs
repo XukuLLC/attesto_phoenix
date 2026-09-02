@@ -729,7 +729,11 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                notice =~ "--schema-prefix tenant_auth" and
                  notice =~ "PostgreSQL schema `tenant_auth`" and
                  notice =~ "{repo, schema_prefix}" and
-                 notice =~ "attesto_refresh_tokens_family_id_generation_index"
+                 notice =~ "attesto_refresh_tokens_family_id_generation_index" and
+                 notice =~ "attesto_authorization_codes_code_hash_index" and
+                 notice =~ "`code_hash` is `NOT NULL`" and
+                 notice =~ "`ACCESS EXCLUSIVE`" and
+                 notice =~ "`lock_timeout`"
              end)
 
       applied =

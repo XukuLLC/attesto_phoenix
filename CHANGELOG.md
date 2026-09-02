@@ -18,7 +18,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key and maps a duplicate insert onto `attesto_authorization_codes_pkey`, the
   convention the other keyed tables already follow. Fresh migrations from
   `mix attesto_phoenix.gen.migration` create the keyed layout. Row shape,
-  single-use semantics, and the store API are unchanged.
+  single-use semantics, and the store API are unchanged. Thanks to
+  [@jtippett](https://github.com/jtippett) for the contribution in
+  [#26](https://github.com/XukuLLC/attesto_phoenix/pull/26).
 
 ### Upgrade notes
 
@@ -30,10 +32,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   defmodule MyApp.Repo.Migrations.KeyAttestoAuthorizationCodesOnCodeHash do
     use Ecto.Migration
 
+    # Keep Ecto's default DDL transaction: SET LOCAL must cover ALTER TABLE.
+    # Do not add @disable_ddl_transaction true.
+
     # Replace with your configured PostgreSQL schema name when non-default.
     @prefix nil
 
     def up do
+      # Abort instead of waiting indefinitely for ACCESS EXCLUSIVE.
+      execute "SET LOCAL lock_timeout = '5s'"
+
       execute """
       ALTER TABLE #{table()}
         ADD CONSTRAINT attesto_authorization_codes_pkey
@@ -42,6 +50,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     end
 
     def down do
+      execute "SET LOCAL lock_timeout = '5s'"
+
       # Dropping the constraint drops the index backing it, so the plain
       # unique index is recreated under its original name.
       execute ~s|ALTER TABLE #{table()} DROP CONSTRAINT attesto_authorization_codes_pkey|
@@ -57,15 +67,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   end
   ```
 
-  PostgreSQL reuses the existing index for the constraint and renames it, so
-  the change is catalog-only: no index rebuild, no table rewrite, and only a
-  brief exclusive lock on a small, short-lived table. It is safe to apply
-  while either the previous or this release is serving traffic; a duplicate
-  code hash fails closed under both, raising `Ecto.ConstraintError` on the
-  previous release and `Ecto.InvalidChangesetError` on this one. Skip the
-  migration for a database whose tables were created by this release's
-  generator: it already has the key, and PostgreSQL rejects a second primary
-  key.
+  This exact migration applies only to the historical generated layout.
+  Preflight the target table and verify that `code_hash` is `NOT NULL`, the
+  table has no primary key, and the named
+  `attesto_authorization_codes_code_hash_index` exists and is a valid, unique,
+  ordinary B-tree index over only `code_hash`, with default ordering and no
+  predicate or expressions. A renamed or otherwise customized table/index,
+  different nullability or index definition, or an existing primary key needs
+  a reviewed, tailored preflight and migration instead of this snippet.
+
+  When those prerequisites hold, PostgreSQL reuses and renames the existing
+  index, so the forward change is metadata-only: it does not rebuild the index
+  or rewrite the table and is normally fast. `ALTER TABLE` nevertheless takes
+  an `ACCESS EXCLUSIVE` lock. Under live traffic it can wait behind existing
+  transactions and, once acquired, blocks reads and writes until the migration
+  transaction commits. Run it in a controlled deployment window. Keep a short
+  `lock_timeout` (as above) so contention aborts the attempt, then inspect
+  blockers and retry during a quiet period; drain traffic touching the table
+  if the lock cannot be acquired promptly. Keep the shown migration
+  transactional; `SET LOCAL lock_timeout` ends with its transaction and would
+  not cover the following `ALTER TABLE` if
+  `@disable_ddl_transaction true` were added. The completed schema is
+  compatible with either application release: a duplicate code hash fails
+  closed, as an `Ecto.ConstraintError` on the previous release or an
+  `Ecto.InvalidChangesetError` on this one.
+
+  Skip the migration for a database whose tables were created by this
+  release's generator: it already has the key, and PostgreSQL rejects a second
+  primary key.
 
 ## [3.0.0] - 2026-08-31
 

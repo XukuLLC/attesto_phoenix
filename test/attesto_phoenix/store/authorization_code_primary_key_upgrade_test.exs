@@ -29,6 +29,8 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
     @prefix "attesto_upgrade_test"
 
     def up do
+      execute("SET LOCAL lock_timeout = '5s'")
+
       execute("""
       ALTER TABLE #{table()}
         ADD CONSTRAINT attesto_authorization_codes_pkey
@@ -37,6 +39,7 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
     end
 
     def down do
+      execute("SET LOCAL lock_timeout = '5s'")
       execute(~s|ALTER TABLE #{table()} DROP CONSTRAINT attesto_authorization_codes_pkey|)
       create(unique_index(:attesto_authorization_codes, [:code_hash], prefix: @prefix))
     end
@@ -71,12 +74,14 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
   test "promotes the unique index to the primary key in place, reversibly" do
     refute primary_key?()
     assert index_names() == ["#{@table}_code_hash_index"]
+    original_index_oid = index_oid("#{@table}_code_hash_index")
 
     # Up: the existing index becomes the primary key under the name the schema
     # maps duplicate inserts onto; nothing is rebuilt.
     migrate(:up, 1)
     assert primary_key?()
     assert index_names() == ["#{@table}_pkey"]
+    assert index_oid("#{@table}_pkey") == original_index_oid
     # "d" = default: the primary key is the replica identity logical
     # replication uses for UPDATE/DELETE.
     assert replica_identity() == "d"
@@ -107,6 +112,11 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
       sql!(~s|SELECT indexname FROM pg_indexes WHERE schemaname = '#{@schema}' AND tablename = '#{@table}' ORDER BY 1|)
 
     List.flatten(rows)
+  end
+
+  defp index_oid(name) do
+    %{rows: [[oid]]} = sql!(~s|SELECT '"#{@schema}"."#{name}"'::regclass::oid|)
+    oid
   end
 
   defp replica_identity do

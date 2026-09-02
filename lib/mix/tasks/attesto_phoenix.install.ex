@@ -37,7 +37,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
       * points the host at `mix attesto_phoenix.gen.migration` for the Ecto
         tables the bundled stores read, including the durable refresh-family
         revocation tombstones. Existing installations upgrading to a release
-        that adds this table must apply its forward migration before boot.
+        that adds this table must apply its forward migration before boot. The
+        authorization-code primary-key upgrade applies only to the historical
+        generated layout after a catalog preflight and needs a controlled lock
+        window; see the CHANGELOG upgrade notes.
 
     Every step is idempotent: re-running the task does not duplicate the config,
     the route, or the scaffolded modules. The task never decides authorization
@@ -1539,16 +1542,30 @@ if Code.ensure_loaded?(Igniter) do
            that index fail. Do not rerun the create-table migration against
            tables that already exist.
 
-           A database whose `attesto_authorization_codes` table was created
-           with only a unique index on `code_hash` also needs the forward
-           migration from the CHANGELOG upgrade notes that promotes that index
-           to the primary key; without it PostgreSQL logical replication
-           cannot replicate the table.
+           Stop and drain every 2.x token writer before that 3.0
+           tombstone/backfill and schema-prefix cutover, and before starting
+           3.0, including deployments using the public schema. Mixed 2.x/3.0
+           writers are unsupported because 2.x does not read or write durable
+           refresh-family revocation tombstones.
 
-           Stop and drain every 2.x token writer before this migration and
-           before starting 3.0, including deployments using the public schema.
-           Mixed 2.x/3.0 writers are unsupported because 2.x does not read or
-           write durable refresh-family revocation tombstones.
+           A database whose `attesto_authorization_codes` table matches the
+           historical generated layout also needs the forward migration from
+           the CHANGELOG upgrade notes. Before using that exact migration,
+           verify that `code_hash` is `NOT NULL`, no primary key exists, and
+           `attesto_authorization_codes_code_hash_index` is a valid, unique,
+           ordinary B-tree index over only `code_hash`, with default ordering
+           and no predicate or expressions. Custom layouts need a reviewed,
+           tailored migration and preflight.
+
+           With those prerequisites, `PRIMARY KEY USING INDEX` is metadata-only
+           and normally fast: it reuses the index without rebuilding it or
+           rewriting the table. It still takes `ACCESS EXCLUSIVE`, so under
+           live traffic it can wait and then block reads and writes. Use a
+           controlled window and the short `lock_timeout` shown in the
+           CHANGELOG; keep its default DDL transaction so `SET LOCAL` covers
+           `ALTER TABLE`. Retry when quiet, or drain traffic touching the table
+           if the lock cannot be acquired promptly. Without the primary key
+           PostgreSQL logical replication cannot replicate the table.
 
         4. The OAuth endpoints are mounted under "#{oauth_path_prefix}". The
            well-known discovery and JWKS documents stay at the host root
