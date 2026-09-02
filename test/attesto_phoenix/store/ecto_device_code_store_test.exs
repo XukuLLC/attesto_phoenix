@@ -44,12 +44,27 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStoreTest do
   defp nested_claims(depth), do: %{"nested" => nested_claims(depth - 1)}
 
   defp unique_user_code do
-    System.unique_integer([:positive])
-    |> :erlang.term_to_binary()
-    |> then(fn bytes ->
-      code = for <<byte <- bytes>>, into: "", do: <<Enum.at(@user_code_alphabet, rem(byte, 20))>>
-      String.pad_leading(code, 8, "B")
-    end)
+    System.unique_integer([:positive, :monotonic])
+    |> user_code_for()
+  end
+
+  defp user_code_for(value) do
+    value
+    |> Integer.digits(20)
+    |> Enum.map(fn digit -> Enum.at(@user_code_alphabet, digit) end)
+    |> to_string()
+    |> String.pad_leading(8, "B")
+  end
+
+  test "test user codes are unique and use the database-safe alphabet" do
+    codes = Enum.map(1..1_000, &user_code_for/1)
+
+    assert length(codes) == length(Enum.uniq(codes))
+
+    assert Enum.all?(codes, fn code ->
+             String.length(code) >= 8 and
+               Enum.all?(String.to_charlist(code), &(&1 in @user_code_alphabet))
+           end)
   end
 
   test "put + lookup_user_code returns the full entry" do
