@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.2.1] - 2026-09-03
+
+### Fixed
+
+- Format every migration that `mix attesto_phoenix.gen.migration` writes with
+  the host project's formatter configuration, plugins included, repeating until
+  the file is stable. The raw templates did not satisfy `mix format
+  --check-formatted`: a heredoc argument followed by `[], log: false)` is
+  rewrapped by the stock formatter, so a host with a format check in CI failed
+  on the generated file. If a host formatter plugin raises, the default Elixir
+  formatter is applied instead and a warning names the file.
+
 ## [3.2.0] - 2026-09-03
 
 ### Added
