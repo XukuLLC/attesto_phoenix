@@ -66,17 +66,23 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
     combined_claims = Map.put(claims, @claims_key, private_context)
 
     cond do
-      not Claims.portable_json_object?(private_context) ->
+      not portable_json_object?(private_context) ->
         {:error, :invalid_private_context}
 
-      not Claims.portable_json_object?(combined_claims) ->
+      not portable_json_object?(combined_claims) ->
         {:error, :invalid_private_context}
-
-      encoded_size(private_context) > @max_encoded_bytes ->
-        {:error, :private_context_too_large}
 
       true ->
-        {:ok, combined_claims}
+        case encoded_size(private_context) do
+          {:ok, size} when size > @max_encoded_bytes ->
+            {:error, :private_context_too_large}
+
+          {:ok, _size} ->
+            {:ok, combined_claims}
+
+          :error ->
+            {:error, :invalid_private_context}
+        end
     end
   end
 
@@ -114,7 +120,22 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
   @spec reserved?(map()) :: boolean()
   def reserved?(claims) when is_map(claims), do: Map.has_key?(claims, @claims_key)
 
+  # Host callbacks can return arbitrary map terms, and the core predicate is a
+  # dependency boundary. Keep this validation total if it ever raises,
+  # throws, or exits while inspecting a value.
+  defp portable_json_object?(value) do
+    Claims.portable_json_object?(value)
+  rescue
+    _exception -> false
+  catch
+    _kind, _reason -> false
+  end
+
   defp encoded_size(private_context) do
-    private_context |> JSON.encode!() |> byte_size()
+    {:ok, private_context |> JSON.encode!() |> byte_size()}
+  rescue
+    _exception -> :error
+  catch
+    _kind, _reason -> :error
   end
 end

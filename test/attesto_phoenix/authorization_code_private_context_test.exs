@@ -44,6 +44,23 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
       end
     end
 
+    test "ordinary Elixir structs and collection types are refused without raising" do
+      for value <- [
+            Date.utc_today(),
+            DateTime.utc_now(),
+            Decimal.new("1.25"),
+            MapSet.new(["private-value"])
+          ] do
+        assert PrivateContext.put(%{}, value) == {:error, :invalid_private_context}
+      end
+
+      assert PrivateContext.put(%{}, %{"date" => Date.utc_today()}) ==
+               {:error, :invalid_private_context}
+
+      assert PrivateContext.put(%{}, %{"set" => MapSet.new(["private-value"])}) ==
+               {:error, :invalid_private_context}
+    end
+
     test "non-JSON nested values and invalid UTF-8 are refused before encoding" do
       assert PrivateContext.put(%{}, %{"tuple" => {:not, "json"}}) ==
                {:error, :invalid_private_context}

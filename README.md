@@ -511,11 +511,23 @@ access token is used.
 
 ```elixir
 config :my_app, AttestoPhoenix.Config,
-  authorization_code_completion: fn context, continuation ->
+  authorization_code_completion: &MyApp.Policy.complete/2
+```
+
+Keep the callback in an application module so the config file contains an
+external capture rather than an anonymous closure:
+
+```elixir
+defmodule MyApp.Policy do
+  def private_context(context) do
+    %{"security_epoch" => epoch_for(context.subject)}
+  end
+
+  def complete(context, continuation) do
     MyApp.Repo.transaction(fn ->
       # Lock and revalidate the subject's authorization under the same
       # transaction the token issuance will commit in.
-      case MyApp.Policy.still_authorized?(context.subject, context.private_context) do
+      case still_authorized?(context.subject, context.private_context) do
         true ->
           case continuation.() do
             {:ok, _response, _events} = ok -> ok
@@ -538,6 +550,7 @@ config :my_app, AttestoPhoenix.Config,
       {:error, reason} -> {:error, reason}
     end
   end
+end
 ```
 
 `context` carries only the authenticated `:client_id`, the grant `:subject`,
@@ -571,6 +584,11 @@ finalization.
 A success wrapper around a failed continuation result is also unwrapped so the
 wire error is preserved, but it emits a static warning: unless the callback
 rolled the transaction back, earlier continuation writes may have committed.
+
+If the continuation raises, throws, or exits before returning and the callback
+catches that termination, AttestoPhoenix accepts an OAuth error response but
+emits a static warning that partial writes may have occurred. A success returned
+in place of the missing continuation result is refused.
 
 Only that single transaction wrapper is accepted. Nested transactions produce
 additional `{:ok, ...}` layers, and `Ecto.Multi` returns a result map; both are
@@ -610,9 +628,7 @@ authorization endpoint and read it back at completion:
 
 ```elixir
 config :my_app, AttestoPhoenix.Config,
-  authorization_code_private_context: fn context ->
-    %{"security_epoch" => MyApp.Policy.epoch_for(context.subject)}
-  end,
+  authorization_code_private_context: &MyApp.Policy.private_context/1,
   authorization_code_completion: &MyApp.Policy.complete/2
 ```
 

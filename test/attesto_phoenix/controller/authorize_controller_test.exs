@@ -300,25 +300,37 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
 
     test "a private context the claims column cannot round-trip fails before a code is returned" do
-      # Atom keys, invalid UTF-8, a float, and an unencodable term all fail the
-      # portable-JSON-object contract the claims column requires. None may yield
-      # a code: the completion callback would demand state that was never stored.
+      # Atom keys, invalid UTF-8, a float, unencodable terms, and ordinary
+      # Elixir structs all fail the portable-JSON-object contract the claims
+      # column requires. None may yield a code: the completion callback would
+      # demand state that was never stored. Keep the values out of diagnostics.
       for invalid <- [
             %{security_epoch: 42},
             %{"invalid_utf8" => <<255>>},
             %{"ratio" => 1.5},
             %{"nested" => %{"value" => {:not, :json}}},
-            %{"payload" => String.duplicate("x", 4_097)}
+            %{"payload" => String.duplicate("x", 4_097)},
+            Date.utc_today(),
+            DateTime.utc_now(),
+            Decimal.new("1.25"),
+            MapSet.new(["private-value"])
           ] do
         put_config(
           authorization_code_completion: &passthrough_completion/2,
           authorization_code_private_context: fn _context -> invalid end
         )
 
-        conn = call(valid_params())
+        log =
+          capture_log(fn ->
+            conn = call(valid_params())
+            query = location_query(conn)
 
-        assert location_query(conn)["error"] == "server_error"
-        refute Map.has_key?(location_query(conn), "code")
+            assert query["error"] == "server_error"
+            refute Map.has_key?(query, "code")
+            refute inspect(query) =~ inspect(invalid)
+          end)
+
+        refute log =~ inspect(invalid)
       end
     end
 

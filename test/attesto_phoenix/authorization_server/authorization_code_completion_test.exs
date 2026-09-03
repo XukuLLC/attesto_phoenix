@@ -167,6 +167,44 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     end
   end
 
+  defmodule PartialWriteTerminationCodeStore do
+    @moduledoc false
+    @behaviour Attesto.CodeStore
+
+    @impl true
+    defdelegate put(record), to: EctoCodeStore
+
+    @impl true
+    defdelegate take(code_hash), to: EctoCodeStore
+
+    @impl true
+    defdelegate get(code_hash), to: EctoCodeStore
+
+    @impl true
+    defdelegate mark_consumed(code_hash, meta), to: EctoCodeStore
+
+    def record_access_token_for_code(_code_hash, _jti, _expires_at) do
+      logout_count = TestRepo.aggregate(LogoutSession, :count)
+      notify({:access_jti_terminating, logout_count})
+
+      case Process.get(:authorization_code_completion_termination_kind) do
+        :error -> raise "injected access JTI failure"
+        :throw -> throw(:injected_access_jti_failure)
+        :exit -> exit(:injected_access_jti_failure)
+      end
+    end
+
+    defdelegate revoke_access_token_for_code(code_hash), to: EctoCodeStore
+
+    defdelegate revoke_family_access_tokens(family_id), to: EctoCodeStore
+
+    defp notify(step) do
+      if pid = Process.get(:authorization_code_completion_test_pid) do
+        send(pid, {:completion_step, step, Process.get(:authorization_code_completion_active) == true})
+      end
+    end
+  end
+
   defmodule FailingFinalizationCodeStore do
     @moduledoc false
     @behaviour Attesto.CodeStore
@@ -1072,6 +1110,122 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert_spent_without_completion(family_id)
   end
 
+  test "a host-caught termination after partial completion is observable without assuming rollback" do
+    test_pid = self()
+
+    cases = [
+      {:error, "family-caught-partial-raise"},
+      {:throw, "family-caught-partial-throw"},
+      {:exit, "family-caught-partial-exit"}
+    ]
+
+    Enum.each(cases, fn {kind, family_id} ->
+      code =
+        issue_code(family_id, ["openid", "offline_access"],
+          code_store: PartialWriteTerminationCodeStore,
+          claims: %{"sid" => "sid-#{family_id}"}
+        )
+
+      callback = fn _context, continuation ->
+        Process.put(:authorization_code_completion_termination_kind, kind)
+
+        try do
+          continuation.()
+        catch
+          caught_kind, caught_reason ->
+            key = continuation_state_key!()
+            send(test_pid, {:caught_partial_termination, kind, caught_kind, caught_reason, Process.get(key)})
+            {:error, OAuthError.new(:invalid_request, "completion interrupted")}
+        after
+          Process.delete(:authorization_code_completion_termination_kind)
+        end
+      end
+
+      config =
+        config(
+          code_store: PartialWriteTerminationCodeStore,
+          authorization_code_completion: callback,
+          logout: [enabled: true],
+          terminate_session: fn conn, _context -> {:ok, conn} end,
+          logout_session_store: EctoLogoutSessionStore,
+          client_backchannel_logout_uri: fn _client -> "https://client.example/logout" end,
+          client_frontchannel_logout_uri: fn _client -> "https://client.example/logout" end
+        )
+
+      log =
+        capture_log(fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end)
+
+      assert_receive {:completion_step, {:access_jti_terminating, logout_count}, false}
+      assert logout_count >= 1
+      assert_receive {:caught_partial_termination, ^kind, ^kind, _reason, :started}
+      assert log =~ "caught a termination after the continuation started"
+      assert log =~ "partial writes may have occurred"
+      refute log =~ "returned without invoking the continuation"
+      refute log =~ "injected_access_jti_failure"
+      refute continuation_state_key()
+
+      # The termination occurs after a real write stage. The callback's
+      # transaction policy determines which earlier writes commit; this test
+      # intentionally asserts only the invariant that no successful code
+      # finalization was reported, not a particular rollback outcome.
+      row = authorization!(family_id)
+      assert row.consumed_at
+      refute row.consumed_success
+    end)
+  end
+
+  test "a host cannot substitute success after catching a continuation termination" do
+    family_id = "family-caught-partial-fabricated-success"
+
+    code =
+      issue_code(family_id, ["openid", "offline_access"],
+        code_store: PartialWriteTerminationCodeStore,
+        claims: %{"sid" => "sid-#{family_id}"}
+      )
+
+    callback = fn _context, continuation ->
+      Process.put(:authorization_code_completion_termination_kind, :error)
+
+      try do
+        continuation.()
+      catch
+        :error, _reason ->
+          {:ok, %{access_token: "fabricated.access.token", token_type: "Bearer"}, []}
+      after
+        Process.delete(:authorization_code_completion_termination_kind)
+      end
+    end
+
+    config =
+      config(
+        code_store: PartialWriteTerminationCodeStore,
+        authorization_code_completion: callback,
+        logout: [enabled: true],
+        terminate_session: fn conn, _context -> {:ok, conn} end,
+        logout_session_store: EctoLogoutSessionStore,
+        client_backchannel_logout_uri: fn _client -> "https://client.example/logout" end,
+        client_frontchannel_logout_uri: fn _client -> "https://client.example/logout" end
+      )
+
+    log =
+      capture_log(fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end)
+
+    assert log =~ "returned a result after the continuation terminated"
+    assert log =~ "partial writes may have occurred"
+    refute log =~ "fabricated.access.token"
+    refute continuation_state_key()
+
+    row = authorization!(family_id)
+    assert row.consumed_at
+    refute row.consumed_success
+  end
+
   test "a finalization exception rolls back JTI, refresh, and logout-session writes" do
     family_id = "family-finalization-failure"
 
@@ -1501,11 +1655,15 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defp completion_active?, do: Process.get(:authorization_code_completion_active) == true
 
-  defp continuation_state_key! do
+  defp continuation_state_key do
     Enum.find(Process.get_keys(), fn
       {Token, :authorization_code_continuation, ref} when is_reference(ref) -> true
       _other -> false
-    end) || flunk("continuation provenance state was not recorded")
+    end)
+  end
+
+  defp continuation_state_key! do
+    continuation_state_key() || flunk("continuation provenance state was not recorded")
   end
 
   defp terminate_completion_callback(:error, reason), do: raise(RuntimeError, reason)

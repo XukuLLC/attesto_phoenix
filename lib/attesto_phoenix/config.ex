@@ -375,9 +375,11 @@ defmodule AttestoPhoenix.Config do
       fail-closed policy at completion. The reverse skew fails closed on the
       library's side: a code that DOES carry private context is refused with
       `invalid_grant` when no `:authorization_code_completion` callback is
-      configured, so a node that lost the callback (a rolling deploy, an
-      unloaded behaviour module) cannot issue tokens with the host's completion
-      policy silently skipped.
+      configured, so a node whose callback configuration or behaviour module is
+      unavailable cannot issue tokens with the host's completion policy
+      silently skipped. Deploy callback-capable nodes before enabling private
+      context; this check cannot detect an older package version on another
+      node.
     * `:authorization_code_completion` - `(context, continuation -> result)`.
       Optional synchronous wrapper around authorization-code completion. It is
       invoked after the code has been redeemed and before `:build_principal` or
@@ -417,6 +419,10 @@ defmodule AttestoPhoenix.Config do
       preserve the wire error, but emits a static warning because earlier
       continuation writes may have committed unless the callback rolled the
       transaction back.
+      If the continuation raises, throws, or exits before returning and the
+      callback catches that termination, an OAuth error is accepted with a
+      static warning that partial writes may have occurred; a substituted
+      success is refused.
       The callback is trusted same-process host code: the private process entry
       is a correctness guard against accidental interference and contract
       mistakes, not a sandbox against a hostile callback that deliberately
@@ -440,11 +446,16 @@ defmodule AttestoPhoenix.Config do
       logged with this consequence. Exceptions, throws, and exits get the same
       static, secret-free log before being re-raised with their original
       stacktrace; the reason and callback context are never logged. The code has
-      already been
-      claimed before this callback runs, so refusal, malformed persisted private
-      context, a missing callback for a context-bearing code, or any callback
-      failure before the continuation succeeds leaves it spent but unfinalized
-      (`consumed_at` set, `consumed_success: false`, with no refresh family).
+      already been claimed before this callback runs, so refusal, malformed
+      persisted private context, a missing callback for a context-bearing code,
+      or any callback failure before the continuation succeeds leaves it spent
+      but unfinalized. Audit events follow the final returned
+      result: a substituted error does not emit the continuation's success
+      events, and `issue/2` returns the normal `:token_denied` event for that
+      error. Persisted or external side effects from a committed continuation
+      remain the host's responsibility to reconcile.
+      The spent row has `consumed_at` set and `consumed_success: false`, with no
+      refresh family.
       When unset, the continuation runs directly, preserving existing behavior.
     * `:code_store` - module implementing `Attesto.CodeStore`.
     * `:refresh_store` - module implementing `Attesto.RefreshStore`.

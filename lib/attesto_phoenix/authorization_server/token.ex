@@ -532,9 +532,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
           {:ok, %{grant | claims: remaining}, private_context}
         else
           # The issuing node persisted state that this node has no callback to
-          # enforce - a rolling deploy, or an unloaded behaviour module. Issuing
-          # tokens here would silently skip the host's completion policy, so
-          # refuse instead.
+          # enforce, such as when its callback configuration or behaviour module
+          # is unavailable. Issuing tokens here would silently skip the host's
+          # completion policy, so refuse instead. Deploy callback-capable nodes
+          # before enabling private context; an older package version cannot be
+          # detected by this check.
           Logger.error(
             "authorization code carries private context but no :authorization_code_completion " <>
               "callback is configured; no token was issued"
@@ -546,11 +548,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   # The authorization code is already atomically claimed by `redeem_code/5`.
-  # Everything after that claim runs in one synchronous continuation so a host
-  # may serialize completion with its own subject-revocation transaction. The
-  # default path calls the continuation directly and is byte-for-byte the old
+  # When configured, the completion callback wraps the remaining synchronous
+  # work so a host may serialize it with its own subject-revocation transaction.
+  # The absent-callback path executes that work directly, preserving the old
   # execution order. No code or minted token is included in the callback
-  # context; the closure keeps protocol secrets inside this module.
+  # context. The continuation is trusted same-process host code: its closure
+  # can be inspected or retained by that host, so this boundary is not a
+  # sandbox for protocol secrets.
   defp complete_authorization_code(request, code, grant, private_context, scope, audience, token_type, binding) do
     %{config: config} = request
 
@@ -627,8 +631,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # The host wrapper is trusted policy, but continuation cardinality is a
   # protocol invariant rather than a convention. A private atomic gate scopes
   # the closure to this callback. The closure checks its owner and consumes the
-  # gate BEFORE completion; the outer `after` closes it and deletes the private
-  # provenance entry on every callback return or termination.
+  # gate before completion, then records a secret-free `:started` marker before
+  # entering host-visible work. The outer `after` closes it and deletes the
+  # private provenance entry on every callback return or termination.
   defp with_authorization_code_continuation(completion, callback) do
     owner = self()
     ref = make_ref()
@@ -640,7 +645,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       callback.(continuation, ref)
     catch
       kind, reason ->
-        maybe_log_completion_termination_after_success(ref, kind)
+        maybe_log_completion_termination(ref, kind)
         :erlang.raise(kind, reason, __STACKTRACE__)
     after
       :atomics.put(gate, 1, 2)
@@ -649,10 +654,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   # Cardinality alone bounds the callback to AT MOST one invocation. A private
-  # process-dictionary entry additionally carries a digest and outcome of the
-  # continuation's result, supplying the missing lower bound and provenance
-  # without keeping minted token strings in process state. This state is outside
-  # the ordinary mailbox, so a host callback's broad receive cannot consume it.
+  # process-dictionary entry first records a secret-free `:started` marker, then
+  # carries a digest and outcome of the continuation's result, supplying the
+  # missing lower bound and provenance without keeping minted token strings in
+  # process state. This state is outside the ordinary mailbox, so a host
+  # callback's broad receive cannot consume it. The started marker is important:
+  # a host may catch a continuation termination after partial writes, before a
+  # normal result exists to replace it.
   # A callback that never calls the continuation, or that substitutes a
   # fabricated `{:ok, response, events}` for the real one, is detected by
   # `normalize_authorization_code_completion/2`. The host still sees the plain
@@ -680,6 +688,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         {:error, error(@error_invalid_request, "unable to issue token")}
 
       true ->
+        # Set this before any completion work. If host code catches a raise,
+        # throw, or exit from the completion, normalization can distinguish a
+        # post-invocation termination from a callback that never invoked us.
+        Process.put(authorization_code_continuation_key(ref), :started)
         result = completion.()
 
         Process.put(
@@ -698,6 +710,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   #   * the continuation never ran - nothing was minted, recorded, or finalized,
   #     so a fabricated `{:ok, response, events}` must NOT become a token
   #     response;
+  #   * the continuation started but terminated before producing a result - a
+  #     host may have caught the termination after partial writes, so an error
+  #     may be honored but a success must never be fabricated;
   #   * the host returned exactly what the continuation produced - the normal
   #     path, including a deliberate `{:error, _}` after `Repo.rollback/1`;
   #   * the host committed the continuation inside `Repo.transaction/1` and
@@ -711,6 +726,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       {digest, outcome} when is_binary(digest) and outcome in [:succeeded, :failed] ->
         normalize_produced_completion(result, digest, outcome)
 
+      :started ->
+        normalize_started_completion(result)
+
       _other ->
         normalize_incomplete_completion(result)
     end
@@ -720,11 +738,28 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     {__MODULE__, :authorization_code_continuation, ref}
   end
 
-  defp maybe_log_completion_termination_after_success(ref, kind) do
+  defp maybe_log_completion_termination(ref, kind) do
     case Process.get(authorization_code_continuation_key(ref)) do
       {_digest, :succeeded} -> log_completion_termination_after_success(kind)
+      :started -> log_completion_termination_after_start(kind)
       _other -> :ok
     end
+  end
+
+  defp log_completion_termination_after_start(kind) do
+    verb =
+      case kind do
+        :error -> "raised"
+        :throw -> "threw"
+        :exit -> "exited"
+      end
+
+    # Deliberately do not inspect the exception, throw, exit reason, callback
+    # context, or continuation result: any of them may contain host secrets.
+    Logger.error(
+      "authorization code completion callback #{verb} after the continuation started; " <>
+        "partial writes may have occurred and no successful token response was returned"
+    )
   end
 
   defp log_completion_termination_after_success(kind) do
@@ -836,6 +871,37 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       "authorization code completion callback #{action} after the continuation succeeded; " <>
         "the code may already be finalized, and a client retry may trigger code-reuse " <>
         "detection and revoke that response's access token and refresh family"
+    )
+  end
+
+  # The continuation started but terminated before returning a result. A host
+  # may catch that termination and return an OAuth error, but the library cannot
+  # infer whether work before the termination committed. Honor a real OAuth
+  # error while warning about the possible partial writes; never serve a result
+  # that could be a fabricated success.
+  defp normalize_started_completion({:error, %OAuthError{}} = error) do
+    log_caught_completion_termination()
+    error
+  end
+
+  defp normalize_started_completion({:error, _reason}) do
+    log_caught_completion_termination()
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_started_completion(_result) do
+    Logger.error(
+      "authorization code completion callback returned a result after the continuation " <>
+        "terminated; partial writes may have occurred and no successful token response was returned"
+    )
+
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp log_caught_completion_termination do
+    Logger.warning(
+      "authorization code completion callback caught a termination after the continuation " <>
+        "started; partial writes may have occurred and the completion result cannot be verified"
     )
   end
 

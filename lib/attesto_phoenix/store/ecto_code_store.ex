@@ -377,6 +377,10 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   # `Ecto.InvalidChangesetError.message/1` renders the original changes and
   # params without consulting schema redaction. Keep the established exception
   # class while replacing the failed insert changeset with a value-free one.
+  # Operators can reproduce the original failure safely in a non-production
+  # test by building an equivalent record with `Authorization.from_record/2`
+  # and inserting its code hash twice. The second exception should have no
+  # params or changes and contain only the generic constraint message.
   defp raise_sanitized_insert_error(%Ecto.Changeset{} = original) do
     safe_changeset =
       original.errors

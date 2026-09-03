@@ -33,7 +33,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refresh-token family descended from that redemption, forcing the client
   through a new authorization flow; it does not revoke unrelated authorization
   grants. A success wrapper around a failed continuation is also unwrapped but
-  emits a static warning because earlier writes may have committed.
+  emits a static warning because earlier writes may have committed. A callback
+  that catches a continuation termination before it returns may return an OAuth
+  error, with a static warning about possible partial writes; a substituted
+  success is refused.
 - `:authorization_code_private_context` - an optional trusted issuance callback
   for host-private authorization state. It receives exactly the authorized
   `:client_id`, `:subject`, and the freshly generated authorization-grant
@@ -72,6 +75,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Token exchange now strips `credential_configuration_ids` from inherited
+  claims, so exchanged tokens cannot inherit credential-issuance entitlement.
 - Mark `claims` `redact: true` on `AttestoPhoenix.Schema.Authorization`, hiding
   the authentication context and optional host-private state from ordinary
   struct and changeset inspection. Because `Ecto.InvalidChangesetError` renders
