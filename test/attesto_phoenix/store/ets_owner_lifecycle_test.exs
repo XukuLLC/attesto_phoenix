@@ -27,14 +27,13 @@ defmodule AttestoPhoenix.Store.ETSOwnerLifecycleTest do
   defp in_crashing_process(fun) do
     parent = self()
 
-    pid =
-      spawn(fn ->
+    {pid, ref} =
+      spawn_monitor(fn ->
         fun.()
         send(parent, :did_work)
         exit(:boom)
       end)
 
-    ref = Process.monitor(pid)
     assert_receive :did_work, 1_000
     assert_receive {:DOWN, ^ref, :process, ^pid, :boom}, 1_000
   end
