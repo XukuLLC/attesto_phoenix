@@ -79,7 +79,12 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
   setup do
     Application.put_env(:attesto_phoenix, :otp_app, :attesto_phoenix)
     Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, config_opts())
-    on_exit(fn -> Application.delete_env(:attesto_phoenix, AttestoPhoenix.Config) end)
+
+    on_exit(fn ->
+      Application.delete_env(:attesto_phoenix, AttestoPhoenix.Config)
+      Application.delete_env(:attesto_phoenix, :otp_app)
+    end)
+
     {:ok, config: Config.new(config_opts())}
   end
 

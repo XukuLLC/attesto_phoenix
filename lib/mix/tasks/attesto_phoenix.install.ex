@@ -36,11 +36,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         documented stub callbacks the host fills in,
       * points the host at `mix attesto_phoenix.gen.migration` for the Ecto
         tables the bundled stores read, including the durable refresh-family
-        revocation tombstones. Existing installations upgrading to a release
-        that adds this table must apply its forward migration before boot. The
-        authorization-code primary-key upgrade applies only to the historical
-        generated layout after a catalog preflight and needs a controlled lock
-        window; see the CHANGELOG upgrade notes.
+        revocation tombstones. Existing 2.x installations use the generated
+        `--upgrade 3.0` and `--upgrade 3.1` migrations, in that order, while
+        writers remain stopped. Each validates canonical pre-existing objects
+        before adoption; custom layouts need a reviewed migration.
 
     Every step is idempotent: re-running the task does not duplicate the config,
     the route, or the scaffolded modules. The task never decides authorization
@@ -70,11 +69,17 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         the host root and are NOT relocated by this prefix.
       * `--schema-prefix` - the PostgreSQL schema selected by Ecto's `prefix:`
         option for every generated table and index. The migration generator
-        uses the same value. The legacy 2.x `--table-prefix` option is rejected
-        because it controlled literal names in generated migrations, not one
-        coherent runtime layout: most stores queried canonical public tables,
-        while only the CIBA store and sweeper treated it as an Ecto schema
-        prefix.
+        uses the same value. On an installer rerun, an explicit value must
+        match the host's existing literal configuration. When different config
+        environments select different concrete schemas, the flag selects the
+        matching non-default branch without rewriting any host config. An
+        omitted/default branch cannot be equated with `public`, because the
+        connection search path may name another schema. The installer never
+        moves a live database or overwrites an existing selection. The legacy
+        2.x `--table-prefix` option and configuration key are rejected because
+        they controlled literal names in generated migrations, not one coherent
+        runtime layout: most stores queried canonical public tables, while only
+        the CIBA store and sweeper treated the value as an Ecto schema prefix.
       * `--callbacks-module` - the base module the scaffolded callback modules
         are generated under. Defaults to `<App>.AuthZ`, yielding
         `<App>.AuthZ.ClientStore` and friends.
@@ -156,7 +161,6 @@ if Code.ensure_loaded?(Igniter) do
     @impl Igniter.Mix.Task
     def igniter(igniter) do
       reject_legacy_table_prefix_args!(igniter.args.argv)
-      igniter = notice_legacy_table_prefix_config(igniter)
 
       app = Igniter.Project.Application.app_name(igniter)
       app_module = ProjectModule.module_name_prefix(igniter)
@@ -212,10 +216,11 @@ if Code.ensure_loaded?(Igniter) do
           igniter
           |> configured_oauth_path_prefix(app)
           |> Kernel.||(@default_oauth_path_prefix)
-          |> validate_oauth_path_prefix!()
+          |> validate_oauth_path_prefix!(:config)
 
         explicit ->
-          validate_oauth_path_prefix!(explicit)
+          explicit = validate_oauth_path_prefix!(explicit, :flag)
+          validate_explicit_oauth_path_prefix_alignment!(explicit, configured_oauth_path_prefix_state(igniter, app))
       end
     end
 
@@ -223,6 +228,16 @@ if Code.ensure_loaded?(Igniter) do
     # previously. Config is inspected as data rather than evaluated so installer
     # execution cannot run arbitrary host code. Anything ambiguous fails closed.
     defp configured_oauth_path_prefix(igniter, app) do
+      case configured_oauth_path_prefix_state(igniter, app) do
+        :not_configured -> nil
+        {:configured, prefix} -> prefix
+        {:ambiguous, prefixes} -> raise_ambiguous_oauth_path_prefix(prefixes)
+        {:dynamic, expression} -> raise_dynamic_oauth_path_prefix(expression)
+        {:invalid, value} -> raise_invalid_configured_oauth_path_prefix(value)
+      end
+    end
+
+    defp configured_oauth_path_prefix_state(igniter, app) do
       config_path = ProjectApplication.config_path(igniter)
       config_dir = config_path |> Path.dirname() |> Path.expand()
       config_glob = Path.join(config_dir, "**/*.exs")
@@ -234,12 +249,14 @@ if Code.ensure_loaded?(Igniter) do
         |> Rewrite.sources()
         |> Enum.flat_map(&configured_oauth_path_prefix_source(&1, app, config_dir_parts))
 
-      configured_oauth_path_prefix_results(results)
+      configured_oauth_path_prefix_state_results(results)
     end
 
     defp configured_oauth_path_prefix_source(source, app, config_dir_parts) do
       if config_source?(source.path, config_dir_parts) do
-        configured_oauth_path_prefix_in_source(source.content, app)
+        source.content
+        |> configured_oauth_path_prefix_in_source(app)
+        |> collapse_partial_oauth_path_prefix_calls()
       else
         []
       end
@@ -247,23 +264,30 @@ if Code.ensure_loaded?(Igniter) do
 
     defp configured_oauth_path_prefix_in_source(content, app) when is_binary(content) do
       case Code.string_to_quoted(content, emit_warnings: false) do
-        {:ok, ast} -> configured_oauth_path_prefix_ast_results(ast, app)
-        {:error, error} -> [{:dynamic, "unparseable config source (#{inspect(error)})"}]
+        {:ok, ast} ->
+          case guarded_config_expression(ast, app, :oauth_path_prefix) do
+            nil -> configured_oauth_path_prefix_ast_results(ast, app)
+            expression -> [{:dynamic, expression}]
+          end
+
+        {:error, error} ->
+          [{:dynamic, "unparseable config source (#{inspect(error)})"}]
       end
     end
 
     defp configured_oauth_path_prefix_ast_results(ast, app) do
-      aliases = config_aliases(ast)
+      {_aliases, results} =
+        Enum.reduce(top_level_expressions(ast), {%{}, []}, fn node, {aliases, results} ->
+          node_results = configured_oauth_path_prefix_node(node, app, aliases)
+          aliases = put_top_level_config_alias(aliases, node)
 
-      {_ast, results} =
-        Macro.prewalk(ast, [], fn node, results ->
-          case configured_oauth_path_prefix_node(node, app, aliases) do
-            :not_found -> {node, results}
-            node_results -> {node, node_results ++ results}
+          case node_results do
+            :not_found -> {aliases, results}
+            node_results -> {aliases, results ++ List.wrap(node_results)}
           end
         end)
 
-      Enum.reverse(results)
+      results
     end
 
     defp configured_oauth_path_prefix_node({:config, _meta, [configured_app, config_module, config_opts]}, app, aliases) do
@@ -279,7 +303,62 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp configured_oauth_path_prefix_node({:config, _meta, [configured_app, entries]}, app, aliases) do
+      case configured_app do
+        ^app ->
+          configured_oauth_path_prefix_entries(entries, aliases)
+
+        configured_app when is_atom(configured_app) ->
+          :not_found
+
+        dynamic_app ->
+          case configured_oauth_path_prefix_entries(entries, aliases) do
+            :not_found -> :not_found
+            _results -> [{:dynamic, "ambiguous config app #{Macro.to_string(dynamic_app)}"}]
+          end
+      end
+    end
+
+    # `Config.config/3` is the fully-qualified form emitted by some config
+    # generators. Keep the accepted remote call deliberately narrow: an
+    # arbitrary module's `config/3` function is application code, not the
+    # Config DSL, and must not influence installer routing.
+    defp configured_oauth_path_prefix_node({{:., _call_meta, [config_module, :config]}, meta, args}, app, aliases)
+         when is_list(args) do
+      if config_module_ast?(config_module, aliases) do
+        configured_oauth_path_prefix_node({:config, meta, args}, app, aliases)
+      else
+        :not_found
+      end
+    end
+
     defp configured_oauth_path_prefix_node(_node, _app, _aliases), do: :not_found
+
+    defp configured_oauth_path_prefix_entries(entries, aliases) when is_list(entries) do
+      results = Enum.flat_map(entries, &oauth_path_prefix_entry_results(&1, aliases))
+      if results == [], do: :not_found, else: results
+    end
+
+    defp configured_oauth_path_prefix_entries(entries, _aliases) do
+      [{:dynamic, "ambiguous two-argument config #{Macro.to_string(entries)}"}]
+    end
+
+    defp oauth_path_prefix_entry_results({config_module, config_opts}, aliases) do
+      cond do
+        attesto_config_module_ast?(config_module, aliases) ->
+          List.wrap(configured_oauth_path_prefix_config(config_opts))
+
+        alias_ast?(config_module) and
+          ambiguous_config_module_ast?(config_module, aliases) and
+            oauth_path_prefix_option_possible?(config_opts) ->
+          [{:dynamic, "ambiguous config module #{Macro.to_string(config_module)}"}]
+
+        true ->
+          []
+      end
+    end
+
+    defp oauth_path_prefix_entry_results(_entry, _aliases), do: []
 
     defp configured_oauth_path_prefix_for_app(config_module, config_opts, aliases) do
       cond do
@@ -320,22 +399,48 @@ if Code.ensure_loaded?(Igniter) do
       cond do
         results != [] -> results
         Enum.any?(pairs, &dynamic_config_option?/1) -> [{:dynamic, Macro.to_string(pairs)}]
-        true -> :not_found
+        true -> [:default]
+      end
+    end
+
+    # An AttestoPhoenix.Config call that omits :oauth_path_prefix selects the
+    # bundled /oauth default. A source with another target call that supplies a
+    # literal prefix is an exception: its partial call must not create a false
+    # cross-environment conflict. Calls that are dynamic remain visible and
+    # fail closed because one compiled route cannot follow them safely.
+    defp collapse_partial_oauth_path_prefix_calls(results) do
+      if Enum.any?(results, &match?({:found, _prefix}, &1)) do
+        Enum.reject(results, &(&1 == :default))
+      else
+        results
       end
     end
 
     defp oauth_path_prefix_pair_result({key, value}) do
       case static_config_key(key) do
-        :oauth_path_prefix -> [{:found, configured_oauth_path_prefix_value(value)}]
-        "oauth_path_prefix" -> [{:invalid, "string key \"oauth_path_prefix\""}]
-        _other -> []
+        :oauth_path_prefix ->
+          case configured_oauth_path_prefix_value(value) do
+            {:dynamic, expression} -> [{:dynamic, expression}]
+            {:invalid, invalid} -> [{:invalid, invalid}]
+            prefix -> [{:found, prefix}]
+          end
+
+        "oauth_path_prefix" ->
+          [{:invalid, "string key \"oauth_path_prefix\""}]
+
+        _other ->
+          []
       end
     end
 
     defp oauth_path_prefix_pair_result(_other), do: []
 
     defp configured_oauth_path_prefix_value(value) when is_binary(value), do: value
-    defp configured_oauth_path_prefix_value(value), do: {:invalid, Macro.to_string(value)}
+
+    defp configured_oauth_path_prefix_value(value) when is_atom(value) or is_number(value) or is_list(value),
+      do: {:invalid, Macro.to_string(value)}
+
+    defp configured_oauth_path_prefix_value(value), do: {:dynamic, Macro.to_string(value)}
 
     defp oauth_path_prefix_option_possible?(opts) when is_list(opts) do
       Enum.any?(opts, fn
@@ -350,44 +455,99 @@ if Code.ensure_loaded?(Igniter) do
 
     defp oauth_path_prefix_option_possible?(_dynamic), do: true
 
-    defp configured_oauth_path_prefix_results(results) do
-      case Enum.find(results, &match?({kind, _value} when kind in [:dynamic, :invalid], &1)) do
-        {:dynamic, expression} -> raise_dynamic_oauth_path_prefix(expression)
-        {:invalid, value} -> raise_invalid_configured_oauth_path_prefix(value)
-        nil -> configured_oauth_path_prefix_literals(results)
+    defp configured_oauth_path_prefix_state_results(results) do
+      case Enum.find(results, &oauth_path_prefix_error_result/1) do
+        {:dynamic, expression} ->
+          {:dynamic, expression}
+
+        {:invalid, value} ->
+          {:invalid, value}
+
+        nil ->
+          case configured_oauth_path_prefix_literals(results) do
+            nil -> :not_configured
+            prefix when is_binary(prefix) -> {:configured, prefix}
+            prefixes -> {:ambiguous, prefixes}
+          end
       end
     end
 
+    defp oauth_path_prefix_error_result({kind, _value}) when kind in [:dynamic, :invalid], do: true
+    defp oauth_path_prefix_error_result(_result), do: false
+
     defp configured_oauth_path_prefix_literals(results) do
-      prefixes = for {:found, prefix} <- results, do: prefix
+      prefixes =
+        for result <- results do
+          case result do
+            {:found, prefix} -> prefix
+            :default -> @default_oauth_path_prefix
+          end
+        end
 
       case Enum.uniq(prefixes) do
         [] -> nil
         [prefix] -> prefix
-        prefixes -> raise_ambiguous_oauth_path_prefix(prefixes)
+        prefixes -> prefixes
       end
+    end
+
+    defp validate_explicit_oauth_path_prefix_alignment!(explicit, :not_configured), do: explicit
+
+    defp validate_explicit_oauth_path_prefix_alignment!(explicit, {:configured, explicit}), do: explicit
+
+    defp validate_explicit_oauth_path_prefix_alignment!(_explicit, {:configured, configured}) do
+      raise Mix.Error,
+        message:
+          "--oauth-path-prefix does not match the existing host configuration " <>
+            "#{inspect(configured)}. The installer will not overwrite the advertised " <>
+            ":oauth_path_prefix while mounting a different route; update the host config " <>
+            "and rerun the installer."
+    end
+
+    defp validate_explicit_oauth_path_prefix_alignment!(_explicit, {:dynamic, expression}) do
+      raise Mix.Error,
+        message:
+          "could not determine configured :oauth_path_prefix expression #{expression}; " <>
+            "an explicit --oauth-path-prefix cannot safely select one compiled route. " <>
+            "Resolve the host configuration to one literal value before rerunning the installer."
+    end
+
+    defp validate_explicit_oauth_path_prefix_alignment!(_explicit, {:invalid, value}) do
+      raise Mix.Error,
+        message:
+          "invalid configured :oauth_path_prefix in the host config: expected a literal " <>
+            "binary, got #{value}; resolve the host configuration before rerunning the installer."
+    end
+
+    defp validate_explicit_oauth_path_prefix_alignment!(_explicit, {:ambiguous, prefixes}) do
+      raise Mix.Error,
+        message:
+          "could not determine a single configured :oauth_path_prefix in the host config; " <>
+            "found multiple literal values #{inspect(prefixes)}. An explicit " <>
+            "--oauth-path-prefix cannot make one compiled route track environment-dependent " <>
+            "paths; select one host value before rerunning the installer."
     end
 
     defp raise_dynamic_oauth_path_prefix(expression) do
       raise Mix.Error,
         message:
           "could not determine configured :oauth_path_prefix expression #{expression}; " <>
-            "pass --oauth-path-prefix explicitly so routing cannot silently drift"
+            "resolve the host configuration to one literal value before rerunning the installer"
     end
 
     defp raise_invalid_configured_oauth_path_prefix(value) do
       raise Mix.Error,
         message:
           "invalid configured :oauth_path_prefix in the host config: expected a literal " <>
-            "binary, got #{value}; pass --oauth-path-prefix explicitly"
+            "binary, got #{value}; resolve the host configuration before rerunning the installer"
     end
 
     defp raise_ambiguous_oauth_path_prefix(prefixes) do
       raise Mix.Error,
         message:
           "could not determine a single configured :oauth_path_prefix in the host config; " <>
-            "found multiple literal values #{inspect(prefixes)}; pass --oauth-path-prefix " <>
-            "explicitly so routing cannot silently drift"
+            "found multiple literal values #{inspect(prefixes)}; select one host value before " <>
+            "rerunning the installer"
     end
 
     # ------------------------------------------------------------------
@@ -520,7 +680,8 @@ if Code.ensure_loaded?(Igniter) do
           keystore: unquote(keystore),
           repo: unquote(repo),
           # PostgreSQL schema selected by Ecto for every generated table and
-          # index. Leave nil for the public schema.
+          # index. Nil defers to the repo/connection search_path (normally
+          # public), rather than selecting a schema by itself.
           schema_prefix: unquote(schema_prefix),
           # Required host callbacks, wired at the scaffolded modules. Fill in the
           # stub callbacks the installer generated.
@@ -577,7 +738,8 @@ if Code.ensure_loaded?(Igniter) do
           |> validate_schema_prefix!()
 
         prefix when is_binary(prefix) ->
-          validate_schema_prefix!(prefix)
+          explicit = validate_schema_prefix!(prefix)
+          validate_explicit_schema_prefix_alignment!(explicit, configured_schema_prefix_state(igniter, app))
 
         other ->
           raise Mix.Error,
@@ -591,6 +753,14 @@ if Code.ensure_loaded?(Igniter) do
     # ambiguous expressions fail closed: guessing `public` would make generated
     # migration instructions disagree with the runtime database layout.
     defp configured_schema_prefix(igniter, app) do
+      case configured_schema_prefix_state(igniter, app) do
+        :not_configured -> nil
+        {:configured, prefix} -> prefix
+        {:ambiguous, prefixes} -> raise_ambiguous_schema_prefix(prefixes)
+      end
+    end
+
+    defp configured_schema_prefix_state(igniter, app) do
       config_path = ProjectApplication.config_path(igniter)
       config_dir = config_path |> Path.dirname() |> Path.expand()
       config_glob = Path.join(config_dir, "**/*.exs")
@@ -605,21 +775,78 @@ if Code.ensure_loaded?(Igniter) do
       configured_schema_prefix_results(results)
     end
 
+    defp validate_explicit_schema_prefix_alignment!(explicit, :not_configured), do: explicit
+    defp validate_explicit_schema_prefix_alignment!(explicit, {:configured, explicit}), do: explicit
+
+    defp validate_explicit_schema_prefix_alignment!(explicit, {:ambiguous, prefixes}) do
+      if explicit in prefixes do
+        explicit
+      else
+        raise Mix.Error,
+          message:
+            "--schema-prefix #{inspect(explicit)} does not match any literal schema selected " <>
+              "by the existing environment-specific host configuration #{inspect(prefixes)}. " <>
+              "Pass one of those values for the environment whose migration instructions you " <>
+              "are generating, or align the host config before rerunning the installer."
+      end
+    end
+
+    defp validate_explicit_schema_prefix_alignment!(explicit, {:configured, configured}) do
+      raise Mix.Error,
+        message:
+          "--schema-prefix #{inspect(explicit)} does not match the existing host configuration " <>
+            "#{inspect(configured)}. The installer will not overwrite an existing schema selection " <>
+            "or imply that database rows were moved. Complete the stopped schema migration, update " <>
+            "every host config source to one literal value, and rerun the installer."
+    end
+
     defp configured_schema_prefix_source(source, app, config_dir_parts) do
       case config_source?(source.path, config_dir_parts) do
         true ->
-          source.content
-          |> configured_schema_prefix_in_source(app)
-          |> Enum.map(&configured_schema_prefix_source_result/1)
+          results =
+            source.content
+            |> configured_schema_prefix_in_source(app)
+            |> Enum.map(&configured_schema_prefix_source_result/1)
+            |> collapse_partial_config_calls()
+
+          case distinct_explicit_schema_prefixes(results) do
+            [_single] -> results
+            [] -> results
+            prefixes -> [{:conflicting_source, source.path, prefixes}]
+          end
 
         false ->
           []
       end
     end
 
+    # Config calls for the same application/module merge. Once a source names
+    # one explicit schema, another call in that source which merely configures
+    # an unrelated option does not reset the schema to the connection default.
+    # A source containing only partial calls still represents an omitted/default
+    # branch and must remain visible when another environment selects a schema.
+    defp collapse_partial_config_calls(results) do
+      if Enum.any?(results, &match?({:found, _prefix}, &1)) do
+        Enum.reject(results, &(&1 == :present))
+      else
+        results
+      end
+    end
+
+    defp distinct_explicit_schema_prefixes(results) do
+      results
+      |> Enum.flat_map(fn
+        {:found, prefix} -> [prefix]
+        _other -> []
+      end)
+      |> Enum.uniq()
+    end
+
     defp configured_schema_prefix_source_result({:ok, prefix}), do: {:found, prefix}
     defp configured_schema_prefix_source_result({:invalid, value}), do: {:invalid, value}
     defp configured_schema_prefix_source_result({:dynamic, expression}), do: {:dynamic, expression}
+    defp configured_schema_prefix_source_result({:legacy, key, value}), do: {:legacy, key, value}
+    defp configured_schema_prefix_source_result(:present), do: :present
 
     defp config_source?(path, config_dir_parts) do
       source_path = Path.expand(path)
@@ -630,24 +857,38 @@ if Code.ensure_loaded?(Igniter) do
 
     defp configured_schema_prefix_results(results) do
       case Enum.find(results, &schema_prefix_error_result?/1) do
-        {:invalid, value} -> raise_invalid_schema_prefix(value)
-        {:dynamic, expression} -> raise_dynamic_schema_prefix(expression)
-        nil -> configured_schema_prefix_literals(results)
+        {:invalid, value} ->
+          raise_invalid_schema_prefix(value)
+
+        {:dynamic, expression} ->
+          raise_dynamic_schema_prefix(expression)
+
+        {:legacy, key, value} ->
+          raise_legacy_schema_prefix(key, value)
+
+        {:conflicting_source, path, prefixes} ->
+          raise_conflicting_schema_prefix_source(path, prefixes)
+
+        nil ->
+          configured_schema_prefix_literals(results)
       end
     end
 
     defp configured_schema_prefix_literals(results) do
       prefixes = for {:found, prefix} <- results, do: prefix
+      prefixes = if :present in results, do: [nil | prefixes], else: prefixes
 
       case Enum.uniq(prefixes) do
-        [] -> nil
-        [prefix] -> prefix
-        prefixes -> raise_ambiguous_schema_prefix(prefixes)
+        [] -> :not_configured
+        [prefix] -> {:configured, prefix}
+        prefixes -> {:ambiguous, prefixes}
       end
     end
 
     defp schema_prefix_error_result?({:invalid, _value}), do: true
     defp schema_prefix_error_result?({:dynamic, _expression}), do: true
+    defp schema_prefix_error_result?({:legacy, _key, _value}), do: true
+    defp schema_prefix_error_result?({:conflicting_source, _path, _prefixes}), do: true
     defp schema_prefix_error_result?(_result), do: false
 
     defp raise_invalid_schema_prefix(value) do
@@ -661,24 +902,50 @@ if Code.ensure_loaded?(Igniter) do
       raise Mix.Error,
         message:
           "could not determine configured :schema_prefix expression #{expression}; " <>
-            "pass --schema-prefix explicitly so the migration and installer cannot " <>
-            "silently target public"
+            "replace it with one literal value before rerunning the installer. An explicit " <>
+            "flag cannot safely override a dynamic host expression"
     end
 
     defp raise_ambiguous_schema_prefix(prefixes) do
       raise Mix.Error,
         message:
           "could not determine a single configured :schema_prefix in the host config; " <>
-            "found multiple literal values #{inspect(prefixes)}; pass --schema-prefix " <>
-            "explicitly so the migration and installer cannot silently target public"
+            "found multiple literal values #{inspect(prefixes)}. Pass --schema-prefix with a " <>
+            "matching concrete value to generate instructions for that environment, or align " <>
+            "the host config before rerunning. An omitted/default prefix is not assumed to mean " <>
+            "public because the connection search path may select another schema"
+    end
+
+    defp raise_conflicting_schema_prefix_source(path, prefixes) do
+      raise Mix.Error,
+        message:
+          "conflicting literal :schema_prefix values #{inspect(prefixes)} were found in " <>
+            "#{path}. An explicit flag cannot choose between values in one config source; " <>
+            "remove the duplicate or conditional conflict before rerunning the installer"
+    end
+
+    defp raise_legacy_schema_prefix(key, value) do
+      raise Mix.Error,
+        message:
+          "legacy #{inspect(key)} configuration detected with value #{value}. The installer " <>
+            "cannot infer one 3.x database schema from that 2.x setting and made no changes. " <>
+            "Inventory and migrate the actual tables with all writers stopped, remove every " <>
+            "legacy entry, configure one literal :schema_prefix, and rerun the installer; see " <>
+            "guides/upgrade_3_0_schema_prefix.md"
     end
 
     defp configured_schema_prefix_in_source(content, app) when is_binary(content) do
       case Code.string_to_quoted(content, emit_warnings: false) do
         {:ok, ast} ->
-          ast
-          |> configured_schema_prefix_ast_results(app)
-          |> Enum.map(&format_configured_schema_prefix_result/1)
+          case guarded_config_expression(ast, app, :schema_prefix) do
+            nil ->
+              ast
+              |> configured_schema_prefix_ast_results(app)
+              |> Enum.map(&format_configured_schema_prefix_result/1)
+
+            expression ->
+              [{:dynamic, expression}]
+          end
 
         {:error, error} ->
           [{:dynamic, "unparseable config source (#{inspect(error)})"}]
@@ -686,20 +953,34 @@ if Code.ensure_loaded?(Igniter) do
     end
 
     defp configured_schema_prefix_ast_results(ast, app) do
-      aliases = config_aliases(ast)
+      {_aliases, results} =
+        Enum.reduce(top_level_expressions(ast), {%{}, []}, fn node, {aliases, results} ->
+          {^node, node_results} = configured_schema_prefix_node(node, app, aliases)
+          aliases = put_top_level_config_alias(aliases, node)
 
-      {_ast, results} =
-        Macro.prewalk(ast, [], &configured_schema_prefix_ast_node(&1, &2, app, aliases))
+          case node_results do
+            :not_found -> {aliases, results}
+            node_results -> {aliases, results ++ List.wrap(node_results)}
+          end
+        end)
 
-      Enum.reverse(results)
+      results
     end
 
-    defp configured_schema_prefix_ast_node(node, results, app, aliases) do
-      node_result = configured_schema_prefix_node(node, app, aliases)
+    defp configured_schema_prefix_node({:config, _meta, [:attesto_phoenix, key, value]} = node, _app, _aliases)
+         when key in [:schema_prefix, "schema_prefix"] do
+      {node, [{:found, configured_schema_prefix_value(value)}]}
+    end
 
-      case node_result do
-        {^node, :not_found} -> {node, results}
-        {^node, node_results} -> {node, node_results ++ results}
+    defp configured_schema_prefix_node({:config, _meta, [:attesto_phoenix, key, value]} = node, _app, _aliases)
+         when key in [:table_prefix, "table_prefix"] do
+      {node, [{:found, {:legacy_key, :table_prefix, value}}]}
+    end
+
+    defp configured_schema_prefix_node({:config, _meta, [:attesto_phoenix, package_opts]} = node, _app, _aliases) do
+      case package_legacy_table_prefix_results(package_opts) do
+        [] -> {node, :not_found}
+        results -> {node, results}
       end
     end
 
@@ -726,7 +1007,92 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp configured_schema_prefix_node({:config, _meta, [configured_app, entries]} = node, app, aliases) do
+      case configured_app do
+        ^app ->
+          configured_schema_prefix_entries(node, entries, aliases)
+
+        configured_app when is_atom(configured_app) ->
+          {node, :not_found}
+
+        dynamic_app ->
+          case configured_schema_prefix_entries(node, entries, aliases) do
+            {^node, :not_found} ->
+              {node, :not_found}
+
+            {^node, _results} ->
+              {node, [{:dynamic, "ambiguous config app #{Macro.to_string(dynamic_app)}"}]}
+          end
+      end
+    end
+
+    # See the corresponding OAuth reader above. Only `Config.config` and
+    # `Elixir.Config.config` are part of the config DSL; unrelated remote calls
+    # remain invisible to the installer.
+    defp configured_schema_prefix_node({{:., _call_meta, [config_module, :config]}, meta, args} = node, app, aliases)
+         when is_list(args) do
+      if config_module_ast?(config_module, aliases) do
+        {_normalized_node, results} =
+          configured_schema_prefix_node({:config, meta, args}, app, aliases)
+
+        {node, results}
+      else
+        {node, :not_found}
+      end
+    end
+
     defp configured_schema_prefix_node(node, _app, _aliases), do: {node, :not_found}
+
+    defp configured_schema_prefix_entries(node, entries, aliases) when is_list(entries) do
+      results = Enum.flat_map(entries, &schema_prefix_entry_results(&1, aliases))
+
+      case results do
+        [] -> {node, :not_found}
+        results -> {node, results}
+      end
+    end
+
+    defp configured_schema_prefix_entries(node, entries, _aliases) do
+      {node, [{:dynamic, "ambiguous two-argument config #{Macro.to_string(entries)}"}]}
+    end
+
+    defp schema_prefix_entry_results({config_module, config_opts}, aliases) do
+      cond do
+        attesto_config_module_ast?(config_module, aliases) ->
+          {_node, results} = configured_schema_prefix_config(:entry, config_opts)
+          List.wrap(results)
+
+        alias_ast?(config_module) and
+          ambiguous_config_module_ast?(config_module, aliases) and
+            ambiguous_schema_prefix_options?(config_opts) ->
+          [{:dynamic, "ambiguous config module #{Macro.to_string(config_module)}"}]
+
+        true ->
+          []
+      end
+    end
+
+    defp schema_prefix_entry_results(_entry, _aliases), do: []
+
+    defp package_legacy_table_prefix_results(opts) when is_list(opts) do
+      results =
+        Enum.flat_map(opts, fn
+          {key, value} when key in [:table_prefix, "table_prefix"] ->
+            [{:found, {:legacy_key, :table_prefix, value}}]
+
+          {_key, _value} ->
+            []
+
+          dynamic ->
+            [{:dynamic, Macro.to_string(dynamic)}]
+        end)
+
+      results
+    end
+
+    defp package_legacy_table_prefix_results(opts) do
+      [{:dynamic, "ambiguous :attesto_phoenix config #{Macro.to_string(opts)}"}]
+    end
 
     defp configured_schema_prefix_node_for_app(node, config_module, config_opts, aliases) do
       if attesto_config_module_ast?(config_module, aliases) do
@@ -775,7 +1141,7 @@ if Code.ensure_loaded?(Igniter) do
           {node, [{:dynamic, Macro.to_string({:%{}, [], pairs})}]}
 
         true ->
-          {node, :not_found}
+          {node, [:present]}
       end
     end
 
@@ -784,7 +1150,10 @@ if Code.ensure_loaded?(Igniter) do
         :schema_prefix ->
           [{:found, configured_schema_prefix_value(value)}]
 
-        key when key in ["schema_prefix", :table_prefix, "table_prefix"] ->
+        :table_prefix ->
+          [{:found, {:legacy_key, :table_prefix, value}}]
+
+        key when key in ["schema_prefix", "table_prefix"] ->
           [{:found, {:string_key, key, value}}]
 
         _other ->
@@ -797,27 +1166,23 @@ if Code.ensure_loaded?(Igniter) do
     defp dynamic_config_map_pair?({key, _value}), do: is_nil(static_config_key(key))
     defp dynamic_config_map_pair?(_other), do: true
 
-    defp format_configured_schema_prefix_result(result) do
-      case result do
-        {:dynamic, expression} ->
-          {:dynamic, expression}
+    defp format_configured_schema_prefix_result({:dynamic, expression}), do: {:dynamic, expression}
 
-        {:found, {:dynamic, expression}} ->
-          {:dynamic, expression}
+    defp format_configured_schema_prefix_result({:found, {:dynamic, expression}}), do: {:dynamic, expression}
 
-        {:found, {:string_key, key, value}} ->
-          {:invalid, "string key #{inspect(key)} (value #{Macro.to_string(value)})"}
+    defp format_configured_schema_prefix_result({:found, {:string_key, key, value}}),
+      do: {:invalid, "string key #{inspect(key)} (value #{Macro.to_string(value)})"}
 
-        {:found, prefix} when is_binary(prefix) or is_nil(prefix) ->
-          {:ok, prefix}
+    defp format_configured_schema_prefix_result({:found, {:legacy_key, key, value}}),
+      do: {:legacy, key, Macro.to_string(value)}
 
-        {:found, invalid} ->
-          {:invalid, Macro.to_string(invalid)}
+    defp format_configured_schema_prefix_result({:found, prefix}) when is_binary(prefix) or is_nil(prefix),
+      do: {:ok, prefix}
 
-        :not_found ->
-          :not_found
-      end
-    end
+    defp format_configured_schema_prefix_result({:found, invalid}), do: {:invalid, Macro.to_string(invalid)}
+
+    defp format_configured_schema_prefix_result(:present), do: :present
+    defp format_configured_schema_prefix_result(:not_found), do: :not_found
 
     defp configured_schema_prefix_option(node, opts) do
       results = Enum.flat_map(opts, &schema_prefix_option_result/1)
@@ -830,7 +1195,7 @@ if Code.ensure_loaded?(Igniter) do
           {node, [{:dynamic, Macro.to_string(opts)}]}
 
         true ->
-          {node, :not_found}
+          {node, [:present]}
       end
     end
 
@@ -840,6 +1205,7 @@ if Code.ensure_loaded?(Igniter) do
     defp schema_prefix_option_result({key, value}) do
       case static_config_key(key) do
         :schema_prefix -> [{:found, configured_schema_prefix_value(value)}]
+        :table_prefix -> [{:found, {:legacy_key, :table_prefix, value}}]
         "schema_prefix" -> [{:found, {:string_key, "schema_prefix", value}}]
         "table_prefix" -> [{:found, {:string_key, "table_prefix", value}}]
         _other -> []
@@ -852,43 +1218,230 @@ if Code.ensure_loaded?(Igniter) do
     defp static_config_key(key) when is_atom(key) or is_binary(key), do: key
     defp static_config_key(_dynamic), do: nil
 
+    # Only direct top-level config calls have one unconditional value that this
+    # source reader can safely use. A target call nested in a function, macro,
+    # branch, quote, or other expression may be dead code or environment
+    # dependent, so fail closed instead of selecting one global route/schema.
+    defp guarded_config_expression(ast, app, setting) do
+      {_, expression} =
+        Enum.reduce_while(top_level_expressions(ast), {%{}, nil}, fn node, state ->
+          guard_top_level_config_expression(node, state, app, setting)
+        end)
+
+      expression
+    end
+
+    defp guard_top_level_config_expression(node, {aliases, _expression}, app, setting) do
+      cond do
+        top_level_config_node?(node, aliases) ->
+          {:cont, {aliases, nil}}
+
+        expression = guarded_nested_config_expression(node, app, setting, aliases) ->
+          {:halt, {aliases, expression}}
+
+        true ->
+          {:cont, {put_top_level_config_alias(aliases, node), nil}}
+      end
+    end
+
+    defp top_level_expressions({:__block__, _meta, expressions}) when is_list(expressions), do: expressions
+    defp top_level_expressions(ast), do: [ast]
+
+    defp top_level_config_node?({:config, _meta, _args}, _aliases), do: true
+    defp top_level_config_node?(node, aliases), do: config_call_node?(node, aliases)
+
+    defp guarded_nested_config_expression(node, app, setting, aliases) do
+      Macro.traverse(
+        node,
+        aliases,
+        fn candidate, nested_aliases ->
+          cond do
+            alias_node?(candidate) ->
+              {candidate, put_config_alias_from_node(nested_aliases, candidate)}
+
+            guarded_config_target?(candidate, app, setting, nested_aliases) ->
+              throw({:guarded_config, candidate})
+
+            true ->
+              {candidate, nested_aliases}
+          end
+        end,
+        fn candidate, nested_aliases ->
+          {candidate, nested_aliases}
+        end
+      )
+
+      nil
+    catch
+      {:guarded_config, candidate} ->
+        "nested config expression #{Macro.to_string(candidate)}"
+    end
+
+    defp guarded_config_target?({:config, _meta, [configured_app, config_module, opts]}, app, setting, aliases) do
+      package_schema_setting?(configured_app, config_module, setting) or
+        guarded_module_config_target?(configured_app, config_module, opts, app, setting, aliases)
+    end
+
+    defp guarded_config_target?({:config, _meta, [configured_app, entries]}, app, setting, aliases) do
+      package_schema_entries?(configured_app, entries, setting) or
+        guarded_entries_config_target?(configured_app, entries, app, setting, aliases)
+    end
+
+    defp guarded_config_target?({{:., _call_meta, [config_module, :config]}, meta, args}, app, setting, aliases)
+         when is_list(args) do
+      if config_module_ast?(config_module, aliases) do
+        guarded_config_target?({:config, meta, args}, app, setting, aliases)
+      else
+        false
+      end
+    end
+
+    defp guarded_config_target?({:config, _meta, [:attesto_phoenix, key, _value]}, _app, :schema_prefix, _aliases)
+         when key in [:schema_prefix, "schema_prefix", :table_prefix, "table_prefix"], do: true
+
+    defp guarded_config_target?({:config, _meta, [:attesto_phoenix, opts]}, _app, :schema_prefix, _aliases),
+      do: ambiguous_schema_prefix_options?(opts)
+
+    defp guarded_config_target?(_node, _app, _setting, _aliases), do: false
+
+    defp package_schema_setting?(:attesto_phoenix, config_key, :schema_prefix) do
+      static_config_key(config_key) in [
+        :schema_prefix,
+        "schema_prefix",
+        :table_prefix,
+        "table_prefix"
+      ]
+    end
+
+    defp package_schema_setting?(_configured_app, _config_key, _setting), do: false
+
+    defp package_schema_entries?(:attesto_phoenix, entries, :schema_prefix) do
+      ambiguous_schema_prefix_options?(entries)
+    end
+
+    defp package_schema_entries?(_configured_app, _entries, _setting), do: false
+
+    defp guarded_module_config_target?(configured_app, config_module, opts, app, setting, aliases) do
+      configured_app_matches?(configured_app, app) and
+        relevant_or_ambiguous_config_module?(config_module, aliases) and
+        guarded_config_options?(opts, setting)
+    end
+
+    defp guarded_entries_config_target?(configured_app, entries, app, setting, aliases) do
+      configured_app_matches?(configured_app, app) and
+        guarded_config_entries?(entries, aliases, setting)
+    end
+
+    defp configured_app_matches?(configured_app, app), do: configured_app == app or not is_atom(configured_app)
+
+    defp relevant_or_ambiguous_config_module?(config_module, aliases) do
+      attesto_config_module_ast?(config_module, aliases) or
+        ambiguous_config_module_ast?(config_module, aliases)
+    end
+
+    defp guarded_config_options?(opts, :schema_prefix), do: ambiguous_schema_prefix_options?(opts)
+    defp guarded_config_options?(opts, :oauth_path_prefix), do: oauth_path_prefix_option_possible?(opts)
+
+    defp guarded_config_entries?(entries, aliases, setting) when is_list(entries) do
+      Enum.any?(entries, fn
+        {config_module, opts} ->
+          (attesto_config_module_ast?(config_module, aliases) or
+             (alias_ast?(config_module) and ambiguous_config_module_ast?(config_module, aliases))) and
+            guarded_config_options?(opts, setting)
+
+        _dynamic ->
+          true
+      end)
+    end
+
+    defp guarded_config_entries?(_entries, _aliases, _setting), do: true
+
     defp configured_schema_prefix_value(value) when is_binary(value) or is_nil(value), do: value
 
     defp configured_schema_prefix_value(value) when is_atom(value) or is_number(value) or is_list(value), do: value
 
     defp configured_schema_prefix_value(value), do: {:dynamic, Macro.to_string(value)}
 
-    defp config_aliases(ast) do
-      {_ast, aliases} =
-        Macro.prewalk(ast, %{}, fn
-          {:alias, _meta, [target]} = node, aliases ->
-            {node, put_config_alias(aliases, target, nil)}
-
-          {:alias, _meta, [target, opts]} = node, aliases when is_list(opts) ->
-            {node, put_config_alias(aliases, target, Keyword.get(opts, :as))}
-
-          node, aliases ->
-            {node, aliases}
-        end)
-
-      aliases
+    defp put_top_level_config_alias(aliases, {:alias, _meta, [target]}) do
+      put_config_alias_from_node(aliases, {:alias, [], [target]})
     end
 
+    defp put_top_level_config_alias(aliases, {:alias, _meta, [target, opts]}) when is_list(opts) do
+      put_config_alias_from_node(aliases, {:alias, [], [target, opts]})
+    end
+
+    defp put_top_level_config_alias(aliases, _node), do: aliases
+
+    defp put_config_alias_from_node(aliases, {:alias, _meta, [target]}), do: put_config_alias(aliases, target, nil)
+
+    defp put_config_alias_from_node(aliases, {:alias, _meta, [target, opts]}) when is_list(opts),
+      do: put_config_alias(aliases, target, Keyword.get(opts, :as))
+
+    defp put_config_alias_from_node(aliases, _node), do: aliases
+
+    defp alias_node?({:alias, _meta, [_target | _rest]}), do: true
+    defp alias_node?(_node), do: false
+
     defp put_config_alias(aliases, {:__aliases__, _meta, target_parts}, as) when is_list(target_parts) do
+      target_parts = normalize_module_alias_parts(target_parts)
       alias_name = alias_name(target_parts, as)
 
-      if is_atom(alias_name) do
-        case Map.get(aliases, alias_name) do
-          nil -> Map.put(aliases, alias_name, target_parts)
-          ^target_parts -> aliases
-          _other -> Map.put(aliases, alias_name, :ambiguous)
-        end
-      else
-        aliases
-      end
+      if is_atom(alias_name),
+        do: put_expanded_config_alias(aliases, alias_name, target_parts),
+        else: aliases
     end
 
     defp put_config_alias(aliases, _target, _as), do: aliases
+
+    defp put_expanded_config_alias(aliases, alias_name, target_parts) do
+      case expand_config_alias_target(target_parts, aliases) do
+        {:ok, expanded_target_parts} -> put_config_alias_value(aliases, alias_name, expanded_target_parts)
+        :ambiguous -> Map.put(aliases, alias_name, :ambiguous)
+      end
+    end
+
+    defp put_config_alias_value(aliases, alias_name, expanded_target_parts) do
+      case Map.get(aliases, alias_name) do
+        nil -> Map.put(aliases, alias_name, expanded_target_parts)
+        ^expanded_target_parts -> aliases
+        _other -> Map.put(aliases, alias_name, :ambiguous)
+      end
+    end
+
+    defp expand_config_alias_target(parts, aliases), do: expand_config_alias_target(parts, aliases, %{})
+
+    defp expand_config_alias_target([], _aliases, _seen), do: {:ok, []}
+
+    defp expand_config_alias_target([first | rest], aliases, seen) do
+      case Map.get(aliases, first) do
+        nil ->
+          {:ok, [first | rest]}
+
+        :ambiguous ->
+          :ambiguous
+
+        target_parts when is_list(target_parts) ->
+          expand_config_alias_target_alias(target_parts, rest, aliases, seen, first)
+      end
+    end
+
+    defp expand_config_alias_target_alias(target_parts, rest, aliases, seen, first) do
+      if Map.has_key?(seen, first) do
+        :ambiguous
+      else
+        expand_config_alias_target_tail(target_parts, rest, aliases, Map.put(seen, first, true))
+      end
+    end
+
+    defp expand_config_alias_target_tail(target_parts, rest, aliases, seen) do
+      case expand_config_alias_target(target_parts, aliases, seen) do
+        {:ok, expanded_target_parts} -> {:ok, expanded_target_parts ++ rest}
+        :ambiguous -> :ambiguous
+      end
+    end
+
+    defp normalize_module_alias_parts([Elixir | parts]), do: parts
+    defp normalize_module_alias_parts(parts), do: parts
 
     defp alias_name(target_parts, nil), do: List.last(target_parts)
 
@@ -902,7 +1455,25 @@ if Code.ensure_loaded?(Igniter) do
       end
     end
 
+    defp config_module_ast?({:__aliases__, _meta, parts} = module, aliases) when is_list(parts) do
+      normalize_module_alias_parts(parts) == [:Config] or module_alias_parts(module, aliases) == [:Config]
+    end
+
+    defp config_module_ast?(_module, _aliases), do: false
+
+    defp config_call_node?({{:., _meta, [config_module, :config]}, _call_meta, args}, aliases) when is_list(args),
+      do: config_module_ast?(config_module, aliases)
+
+    defp config_call_node?(_node, _aliases), do: false
+
+    defp alias_ast?({:__aliases__, _meta, parts}) when is_list(parts), do: true
+    defp alias_ast?(_other), do: false
+
     defp module_alias_parts({:__aliases__, _meta, [:AttestoPhoenix, :Config]}, _aliases), do: [:AttestoPhoenix, :Config]
+
+    defp module_alias_parts({:__aliases__, meta, [Elixir | parts]}, aliases) do
+      module_alias_parts({:__aliases__, meta, parts}, aliases)
+    end
 
     defp module_alias_parts({:__aliases__, _meta, [first | rest]}, aliases) do
       case Map.get(aliases, first) do
@@ -914,7 +1485,17 @@ if Code.ensure_loaded?(Igniter) do
 
     defp module_alias_parts(_module, _aliases), do: nil
 
-    defp ambiguous_config_module_ast?(module, aliases), do: is_nil(module_alias_parts(module, aliases))
+    # A multi-part alias AST is a fully-qualified module reference in config
+    # (for example, OtherApp.Config), not an unknown one-part alias. Treating
+    # every unresolved alias AST as ambiguous made unrelated module settings
+    # block installation when they happened to use a schema/oauth-shaped key.
+    defp ambiguous_config_module_ast?({:__aliases__, _meta, [_alias_name]} = module, aliases) do
+      is_nil(module_alias_parts(module, aliases))
+    end
+
+    defp ambiguous_config_module_ast?({:__aliases__, _meta, _parts}, _aliases), do: false
+
+    defp ambiguous_config_module_ast?(_module, _aliases), do: true
 
     defp ambiguous_schema_prefix_options?(opts) when is_list(opts) do
       Enum.any?(opts, fn
@@ -941,31 +1522,44 @@ if Code.ensure_loaded?(Igniter) do
 
     defp ambiguous_schema_prefix_options?(_dynamic), do: true
 
-    defp validate_oauth_path_prefix!(prefix) when is_binary(prefix) do
+    defp validate_oauth_path_prefix!(prefix, source) when is_binary(prefix) do
       trimmed = String.trim_trailing(prefix, "/")
 
       cond do
         trimmed == "" or not String.starts_with?(trimmed, "/") ->
-          raise_invalid_oauth_path_prefix(prefix)
+          raise_invalid_oauth_path_prefix(prefix, source)
 
         String.contains?(prefix, "//") or
             not Regex.match?(~r/\A\/(?:[A-Za-z0-9_-]+\/)*oauth\z/, trimmed) ->
-          raise_invalid_oauth_path_prefix(prefix)
+          raise_invalid_oauth_path_prefix(prefix, source)
 
         true ->
           trimmed
       end
     end
 
-    defp validate_oauth_path_prefix!(prefix), do: raise_invalid_oauth_path_prefix(prefix)
+    defp validate_oauth_path_prefix!(prefix, source), do: raise_invalid_oauth_path_prefix(prefix, source)
 
-    defp raise_invalid_oauth_path_prefix(prefix) do
+    defp raise_invalid_oauth_path_prefix(prefix, :flag) do
       raise Mix.Error,
         message:
           "unsupported --oauth-path-prefix #{inspect(prefix)}: the bundled router mounts " <>
             "fixed /oauth/* endpoint tails. Use /oauth or slash-separated literal " <>
             "segments containing only letters, digits, `_`, or `-`, ending in /oauth " <>
             "(for example /mcp/oauth, which generates attesto_routes(prefix: \"/mcp\")). " <>
+            "For a different suffix or explicit endpoint paths, mount the routes manually " <>
+            "and configure matching advertised paths; the installer made no changes."
+    end
+
+    defp raise_invalid_oauth_path_prefix(prefix, :config) do
+      raise Mix.Error,
+        message:
+          "unsupported configured :oauth_path_prefix #{inspect(prefix)} in the host's " <>
+            "AttestoPhoenix.Config configuration: review this setting. The bundled router mounts " <>
+            "fixed /oauth/* endpoint tails. Use /oauth or slash-separated literal " <>
+            "segments containing only letters, digits, `_`, or `-`, ending in /oauth " <>
+            "(for example /mcp/oauth, which generates attesto_routes(prefix: \"/mcp\")). " <>
+            "--oauth-path-prefix only selects a supported prefix. " <>
             "For a different suffix or explicit endpoint paths, mount the routes manually " <>
             "and configure matching advertised paths; the installer made no changes."
     end
@@ -1004,50 +1598,6 @@ if Code.ensure_loaded?(Igniter) do
             "--table-prefix was removed in 3.0. In 2.x it controlled literal names in generated migrations but did not identify one runtime layout: most stores queried canonical public tables, while only the CIBA store and sweeper used it as an Ecto schema prefix. Use --schema-prefix for a fresh migration; inventory and migrate verified existing sources before deploying."
       end
     end
-
-    # The installer can repair its own generated AST, but it cannot safely
-    # infer which physical relations a host-owned `:table_prefix` deployment
-    # actually used. Leave the source untouched and emit a fail-closed notice:
-    # Config rejects the key at boot, so a rerun cannot silently route an
-    # existing database to `public`.
-    defp notice_legacy_table_prefix_config(igniter) do
-      config_path = ProjectApplication.config_path(igniter)
-      config_dir = config_path |> Path.dirname() |> Path.expand()
-      config_glob = Path.join(config_dir, "**/*.exs")
-      igniter = Igniter.include_glob(igniter, config_glob)
-
-      if Rewrite.sources(igniter.rewrite)
-         |> Enum.any?(&legacy_table_prefix_config_source?/1) do
-        Igniter.add_notice(igniter, """
-        Legacy `:table_prefix` configuration was found in the host config. The
-        installer leaves that host-owned AST untouched because the setting does
-        not identify one runtime layout. In v2.14.2 the migration generator
-        could create literal-prefixed tables in `public`, most stores queried
-        canonical public tables, and only the CIBA store and sweeper used the
-        value as an Ecto schema prefix. Inventory actual sources from counts,
-        observed behavior, and backups; stop if a logical table has split
-        non-empty candidates; move only verified sources. Then remove every
-        legacy `:table_prefix` entry, set `:schema_prefix` to the PostgreSQL
-        schema containing the migrated canonical tables, and complete the
-        stopped 2.x -> 3.0 cutover before boot. `AttestoPhoenix.Config` will fail closed while the legacy key
-        remains; it will not reinterpret it as a schema. See
-        `guides/upgrade_3_0_schema_prefix.md` for inventory and migration
-        checks.
-        """)
-      else
-        igniter
-      end
-    end
-
-    defp legacy_table_prefix_config_source?(%{path: path, content: content})
-         when is_binary(path) and is_binary(content) do
-      Path.extname(path) == ".exs" and
-        (String.contains?(content, "table_prefix:") or
-           String.contains?(content, ":table_prefix") or
-           String.contains?(content, "\"table_prefix\""))
-    end
-
-    defp legacy_table_prefix_config_source?(_source), do: false
 
     defp legacy_table_prefix_arg?("--table-prefix"), do: true
     defp legacy_table_prefix_arg?(arg) when is_binary(arg), do: String.starts_with?(arg, "--table-prefix=")
@@ -1493,7 +2043,30 @@ if Code.ensure_loaded?(Igniter) do
           prefix -> "mix attesto_phoenix.gen.migration --repo #{inspect(repo)} --schema-prefix #{prefix}"
         end
 
-      selected_schema = schema_prefix || "public (Ecto default)"
+      upgrade_migration_commands =
+        case schema_prefix do
+          nil ->
+            "mix attesto_phoenix.gen.migration --upgrade 3.0 --repo #{inspect(repo)}\n" <>
+              "         mix attesto_phoenix.gen.migration --upgrade 3.1 --repo #{inspect(repo)}"
+
+          prefix ->
+            "mix attesto_phoenix.gen.migration --upgrade 3.0 --repo #{inspect(repo)} " <>
+              "--schema-prefix #{prefix}\n" <>
+              "         mix attesto_phoenix.gen.migration --upgrade 3.1 --repo #{inspect(repo)} " <>
+              "--schema-prefix #{prefix}"
+        end
+
+      schema_notice =
+        case schema_prefix do
+          nil ->
+            "The generated stores and sweeper use the database connection's default " <>
+              "search path (normally `public`). The migration command defers to the " <>
+              "Ecto migrator/repo default; keep it aligned with that runtime search " <>
+              "path, or pass an explicit `--schema-prefix`."
+
+          prefix ->
+            "The generated stores, sweeper, and migration use PostgreSQL schema `#{prefix}`."
+        end
 
       Igniter.add_notice(igniter, """
       attesto_phoenix is installed. Remaining app-owned steps:
@@ -1528,19 +2101,25 @@ if Code.ensure_loaded?(Igniter) do
 
            then `mix ecto.migrate`.
 
-           The generated stores and sweeper use PostgreSQL schema `#{selected_schema}`.
+           #{schema_notice}
            Keep one `AttestoPhoenix.Store.Sweeper` instance per independent
            `{repo, schema_prefix}` pair; do not run multiple sweepers against
            one pair or share one sweeper across independent profiles.
 
-           If this is an upgrade of an existing database, add the tombstone
-           table with a forward migration and backfill it from revoked rows
-           before deploying the new code. Also add the unique
-           `(family_id, generation)` index named
-           `attesto_refresh_tokens_family_id_generation_index` to
-           `attesto_refresh_tokens`; stop and reconcile if duplicate rows make
-           that index fail. Do not rerun the create-table migration against
-           tables that already exist.
+           If this is an upgrade of an existing 2.x database, do not run the
+           fresh create-table command above. After inventorying the existing
+           layout, generate the supported forward migration instead:
+
+               #{upgrade_migration_commands}
+
+           Review and apply both files, in that order, while writers remain
+           stopped. The 3.0 file adds the unique `(family_id, generation)`
+           index, creates the durable refresh-family revocation table, and
+           backfills revoked families. The 3.1 file promotes the exact
+           historical `attesto_authorization_codes_code_hash_index` to the
+           current primary key.
+           Existing canonical objects are validated before adoption. Stop and
+           investigate if either migration rejects the database layout.
 
            Stop and drain every 2.x token writer before that 3.0
            tombstone/backfill and schema-prefix cutover, and before starting
@@ -1548,18 +2127,12 @@ if Code.ensure_loaded?(Igniter) do
            writers are unsupported because 2.x does not read or write durable
            refresh-family revocation tombstones.
 
-           A database whose `attesto_authorization_codes` table matches the
-           historical generated layout also needs the forward migration from
-           the CHANGELOG upgrade notes. Run the catalog preflight in
-           `guides/upgrade_3_0_schema_prefix.md#catalog-preflight`; it verifies
-           that `code_hash` is `NOT NULL` and
-           `attesto_authorization_codes_code_hash_index` is safe to promote.
-           Custom layouts need a reviewed migration. Use a controlled window
-           because promotion requests `ACCESS EXCLUSIVE`, and retain the
-           CHANGELOG's short `lock_timeout`. For logical replication, migrate
-           the subscriber first and the publisher second; preserve
-           `REPLICA IDENTITY FULL` until both sides have the key. A database
-           created by this release's generator already has the primary key.
+           Custom or renamed authorization-code indexes need a reviewed
+           migration; the 3.1 generator deliberately accepts only the canonical
+           historical index or exact already-promoted primary key. For logical
+           replication, migrate the subscriber first and the publisher second.
+           A database created by this release's fresh generator already has the
+           primary key.
 
         4. The OAuth endpoints are mounted under "#{oauth_path_prefix}". The
            well-known discovery and JWKS documents stay at the host root
@@ -1589,7 +2162,7 @@ else
 
           mix igniter.install attesto_phoenix
 
-      or add `{:igniter, "~> 0.5"}` to your deps and run `mix attesto_phoenix.install` again.
+      or add `{:igniter, "~> 0.6"}` to your deps and run `mix attesto_phoenix.install` again.
       """)
 
       exit({:shutdown, 1})

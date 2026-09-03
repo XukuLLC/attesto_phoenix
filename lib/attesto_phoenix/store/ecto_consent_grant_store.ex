@@ -34,6 +34,7 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.ConsentGrant
   alias AttestoPhoenix.Schema.ConsentGrant, as: Grant
+  alias AttestoPhoenix.Store.Sweeper
 
   # The grant token is the only secret in the consent hop and is short-lived, so
   # 32 bytes of CSPRNG output (256 bits) url-base64 encoded is an unguessable,
@@ -51,6 +52,8 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   @spec mint(ConsentGrant.binding(), pos_integer()) :: {:ok, String.t()} | {:error, Ecto.Changeset.t()}
   def mint(%{} = binding, ttl_seconds) when is_integer(ttl_seconds) and ttl_seconds > 0 do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     token = :crypto.strong_rand_bytes(@token_bytes) |> Base.url_encode64(padding: false)
     now = DateTime.utc_now()
 
@@ -62,7 +65,7 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
     }
 
     Grant.changeset(%Grant{}, attrs, prefix: prefix)
-    |> repo().insert(prefix: prefix, log: false, telemetry_event: nil)
+    |> repo.insert(prefix: prefix, log: false, telemetry_event: nil)
     |> case do
       {:ok, _grant} -> {:ok, token}
       {:error, changeset} -> {:error, changeset}
@@ -83,6 +86,8 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
           :ok | {:error, AttestoPhoenix.ConsentGrantStore.consume_error()}
   def consume(token, %{} = binding) when is_binary(token) and token != "" do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now()
     hash = ConsentGrant.binding_hash(binding)
 
@@ -92,13 +97,13 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
           g.token == ^token and g.binding_hash == ^hash and is_nil(g.consumed_at) and
             g.expires_at > ^now
 
-    case repo().update_all(query, [set: [consumed_at: now]],
+    case repo.update_all(query, [set: [consumed_at: now]],
            prefix: prefix,
            log: false,
            telemetry_event: nil
          ) do
       {1, _} -> :ok
-      {0, _} -> disambiguate(token, hash, now, prefix)
+      {0, _} -> disambiguate(repo, token, hash, now, prefix)
     end
   end
 
@@ -108,8 +113,8 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   # a precise reason (fail closed: any reason still refuses consent). The order
   # of clauses matters: an already-consumed grant is reported `:consumed` even
   # when it is also expired, so a replay is never miscategorised as a stale TTL.
-  defp disambiguate(token, hash, now, prefix) do
-    case repo().get(Grant, token, prefix: prefix, log: false, telemetry_event: nil) do
+  defp disambiguate(repo, token, hash, now, prefix) do
+    case repo.get(Grant, token, prefix: prefix, log: false, telemetry_event: nil) do
       nil ->
         {:error, :not_found}
 

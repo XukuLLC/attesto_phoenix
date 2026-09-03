@@ -83,6 +83,7 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DPoPReplay
+  alias AttestoPhoenix.Store.Sweeper
 
   @app :attesto_phoenix
 
@@ -107,12 +108,14 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
   def check_and_record(jti, ttl_seconds \\ @default_ttl_seconds)
       when is_binary(jti) and is_integer(ttl_seconds) and ttl_seconds > 0 do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     expires_at = DateTime.add(DateTime.utc_now(), ttl_seconds, :second)
 
     changeset =
       DPoPReplay.changeset(%DPoPReplay{}, %{jti: jti, expires_at: expires_at}, prefix: prefix)
 
-    case repo().insert(changeset, prefix: prefix, log: false, telemetry_event: nil) do
+    case repo.insert(changeset, prefix: prefix, log: false, telemetry_event: nil) do
       {:ok, _record} ->
         :ok
 

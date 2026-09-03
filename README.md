@@ -117,9 +117,9 @@ authorization server, use `attesto_phoenix`.
 ## Contents
 
 - [Installation](#installation)
+- [Quick start](#quick-start)
 - [Upgrading from 2.x](#upgrading-from-2x)
 - [3.0 schema-prefix cutover guide](guides/upgrade_3_0_schema_prefix.md)
-- [Quick start](#quick-start)
 - [Configuration](#configuration)
 - [Mounting the routes](#mounting-the-routes)
   - [OpenID for Verifiable Credentials (OID4VC / EU wallet)](#openid-for-verifiable-credentials-oid4vc--eu-wallet)
@@ -136,7 +136,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 3.1"}
+    {:attesto_phoenix, "~> 3.2"}
   ]
 end
 ```
@@ -147,129 +147,11 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 3.1"},
-    {:igniter, "~> 0.5", only: [:dev], runtime: false}
+    {:attesto_phoenix, "~> 3.2"},
+    {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
 ```
-
-## Upgrading from 2.x
-
-Version 3.0 requires `attesto` 2.x. Upgrade both packages together, then
-review any custom store modules against the new core contracts:
-
-Drain every 2.x token writer before starting 3.0, even when the old deployment
-used the default `public` schema. Version 3.0 adds durable refresh-family
-revocation tombstones that 2.x nodes do not read or write, so mixed 2.x/3.0
-writers are unsupported. Apply the generation-index migration and create/backfill
-the tombstone table, then start 3.0 and re-enable traffic. A non-empty 2.x
-`:table_prefix` value does not identify one runtime layout: the old migration
-generator could create literal-prefixed tables in `public`, most runtime stores
-used canonical public tables, and only the CIBA store and sweeper treated the
-value as an Ecto schema prefix. Inventory the actual source for every table and
-complete the stopped procedure in the [3.0 schema-prefix upgrade
-guide](guides/upgrade_3_0_schema_prefix.md); do not infer it from configuration.
-
-- A custom `Attesto.RefreshStore` must provide one atomic, family-serialized
-  `rotate/4` transaction. It replaces the old multi-step consume/insert/
-  successor flow and must commit the parent, child, retry state, and family
-  revocation checks together.
-- A custom `Attesto.DeviceCodeStore` must return the full entry from
-  `lookup_user_code/1` and `get/1`, and implement atomic, time-aware
-  `approve/3`, `deny/2`, `poll/2`, and `consume/2` transitions. Pass the
-  `:now`/`:interval` values supplied in the callback options through the
-  store's guards; do not reintroduce read-then-write decisions.
-- Dynamic client registration uses the widened 3.0 default grant catalog,
-  including OAuth token exchange. An explicit empty `grant_types_supported: []`
-  or `token_endpoint_auth_methods_supported: []` remains empty; it does not
-  fall back to the package defaults. Set an explicit narrowed catalog before
-  deployment when token exchange must remain unavailable.
-- Client-authentication method policy is exact in 3.0. In 2.14.2, an unset or
-  empty `token_endpoint_auth_methods_supported` value did not restrict endpoint
-  authentication, so mTLS could work when its callbacks were wired. In 3.0,
-  `nil` defaults to `client_secret_basic`, `client_secret_post`,
-  `private_key_jwt`, and `none`; `tls_client_auth` and
-  `self_signed_tls_client_auth` are not implicit. Add either mTLS method to
-  the list explicitly, together with its required callbacks, if the deployment
-  retains it. Any non-`nil` list, including `[]`, is an exact allowlist, except
-  that `attest_jwt_client_auth` remains conditional on trusted Wallet Provider
-  keys.
-- Optional CIBA, device-authorization, JWT-bearer, and pre-authorized-code
-  features add their grant URNs only when `grant_types_supported` is `nil`.
-  When migrating an explicit 2.14.2 list, add each enabled feature's exact URN
-  yourself; 3.0 no longer widens an explicit catalog.
-
-Before deploying, apply a forward Ecto migration for the unique
-`(family_id, generation)` index on `attesto_refresh_tokens` if your existing
-2.x database does not already have it. The exact Ecto operation is:
-
-```elixir
-def up do
-  prefix = nil # Replace with your configured PostgreSQL schema name when non-default.
-
-  create unique_index(
-    :attesto_refresh_tokens,
-    [:family_id, :generation],
-    name: :attesto_refresh_tokens_family_id_generation_index,
-    prefix: prefix
-  )
-end
-```
-
-Use the same `prefix` value as the runtime Ecto stores (`nil` for `public`, or
-the configured PostgreSQL schema name). The index name is intentionally bound
-to `attesto_refresh_tokens_family_id_generation_index`, including when a
-non-default prefix is used. If creation fails because duplicate
-family/generation rows already exist, stop the migration, reconcile the
-affected families, and revoke those families before retrying. Do not blindly
-delete duplicate rows: first determine which token lineage is authoritative
-and preserve the security audit trail. New installations can generate the
-complete migration with `mix attesto_phoenix.gen.migration --repo MyApp.Repo`;
-do not rerun that create-table migration against an existing database.
-
-The generated migration also creates
-`attesto_refresh_family_revocations`, a durable tombstone table used by the
-bundled refresh store. If an existing database is upgrading to this release,
-apply a forward migration for that table before deploying the new code and
-backfill it from every existing `attesto_refresh_tokens` row where
-`family_revoked = true` (using the same `schema_prefix` as the refresh table):
-
-```elixir
-def up do
-  prefix = "oauth" # Use nil for public; use one validated schema everywhere.
-  schema = prefix || "public"
-
-  create table(:attesto_refresh_family_revocations, primary_key: false, prefix: prefix) do
-    add :family_id, :string, primary_key: true, null: false
-    add :revoked_at, :utc_datetime, null: false
-  end
-
-  execute("""
-  INSERT INTO "#{schema}".attesto_refresh_family_revocations (family_id, revoked_at)
-  SELECT DISTINCT family_id, CURRENT_TIMESTAMP
-  FROM "#{schema}".attesto_refresh_tokens
-  WHERE family_revoked = true
-  ON CONFLICT (family_id) DO NOTHING
-  """)
-end
-```
-
-The example qualifies both tables from the reviewed `schema` value; validate
-that value and keep it identical to `schema_prefix`. Do not rerun the complete
-create-table migration against an existing database.
-
-Keep `AttestoPhoenix.Store.Sweeper` supervised after the host repo and set a
-positive `:sweep_interval_ms`. The sweeper removes expired rows and clears
-expired refresh-successor ciphertext; a custom cleanup job must provide both
-operations. The installer adds the child idempotently when rerun.
-
-If the bundled `AttestoPhoenix.Store.EctoRefreshStore` retains the default
-positive retry grace, set one stable `ATTESTO_REFRESH_SUCCESSOR_SECRET` of at
-least 32 bytes in runtime configuration on every node before boot. Production
-configuration leaves this absent or short value for `AttestoPhoenix.Config.new/1` to reject
-only when that bundled store and positive grace are selected. A custom refresh
-store or `refresh_token_rotation_grace_seconds: 0` remains valid without a
-usable Ecto successor secret.
 
 ## Quick start
 
@@ -318,6 +200,116 @@ After the installer runs, fill in the generated callback modules and configure a
 keystore. The rest of this README shows the same pieces explicitly so you can
 review what the installer generated or wire them by hand.
 
+## Upgrading from 2.x
+
+Version 3.0 requires `attesto` 2.x. Upgrade both packages together, then
+review any custom store modules against the new core contracts:
+
+Drain every 2.x token writer before starting 3.0, even when the old deployment
+used the default `public` schema. Version 3.0 adds durable refresh-family
+revocation tombstones that 2.x nodes do not read or write, so mixed 2.x/3.0
+writers are unsupported. Apply the generation-index migration and create/backfill
+the tombstone table, then start 3.0 and re-enable traffic. A non-empty 2.x
+`:table_prefix` value does not identify one runtime layout: the old migration
+generator could create literal-prefixed tables in `public`, most runtime stores
+used canonical public tables, and only the CIBA store and sweeper treated the
+value as an Ecto schema prefix. Inventory the actual source for every table and
+complete the stopped procedure in the [3.0 schema-prefix upgrade
+guide](guides/upgrade_3_0_schema_prefix.md); do not infer it from configuration.
+
+- A custom `Attesto.RefreshStore` must provide one atomic, family-serialized
+  `rotate/4` transaction. It replaces the old multi-step consume/insert/
+  successor flow and must commit the parent, child, retry state, and family
+  revocation checks together.
+- A custom `Attesto.DeviceCodeStore` must return the full entry from
+  `lookup_user_code/1` and `get/1`, and implement atomic, time-aware
+  `approve/3`, `deny/2`, `poll/2`, and `consume/2` transitions. Pass the
+  `:now`/`:interval` values supplied in the callback options through the
+  store's guards; do not reintroduce read-then-write decisions.
+- Dynamic client registration uses the widened 3.0 default grant catalog,
+  including OAuth token exchange. An explicit empty `grant_types_supported: []`
+  or `token_endpoint_auth_methods_supported: []` remains empty; it does not
+  fall back to the package defaults. Set an explicit narrowed catalog before
+  deployment when token exchange must remain unavailable.
+- Client-authentication method policy is exact in 3.0. In 2.14.2, an unset or
+  empty `token_endpoint_auth_methods_supported` value did not restrict endpoint
+  authentication, so mTLS could work when its callbacks were wired. In 3.0,
+  `nil` defaults to `client_secret_basic`, `client_secret_post`,
+  `private_key_jwt`, and `none`; `tls_client_auth` and
+  `self_signed_tls_client_auth` are not implicit. Add either mTLS method to
+  the list explicitly, together with its required callbacks, if the deployment
+  retains it. Any non-`nil` list, including `[]`, is an exact allowlist, except
+  that `attest_jwt_client_auth` remains conditional on trusted Wallet Provider
+  keys.
+- Optional CIBA, device-authorization, JWT-bearer, and pre-authorized-code
+  features add their grant URNs only when `grant_types_supported` is `nil`.
+  When migrating an explicit 2.14.2 list, add each enabled feature's exact URN
+  yourself; 3.0 no longer widens an explicit catalog.
+
+With attesto_phoenix 3.2 or later, generate and apply both supported upgrade
+migrations while every token writer remains stopped:
+
+Remove every legacy `:table_prefix` setting after the database inventory and
+before running this command. The generator refuses that retired key even when
+`--schema-prefix` is explicit, because the 2.x value cannot identify one safe
+source layout.
+
+```bash
+# Use the configured schema_prefix; without one, the migration defers to the
+# Ecto migrator/repo default (normally public). Keep that aligned with the
+# runtime connection search path:
+mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
+
+# Dedicated PostgreSQL schema:
+mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo --schema-prefix oauth
+mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo --schema-prefix oauth
+```
+
+The 3.0 file adds the unique `(family_id, generation)` index, creates the
+durable `attesto_refresh_family_revocations` table, and backfills every
+currently revoked family. The 3.1 file promotes the exact historical
+`attesto_authorization_codes(code_hash)` unique index to the primary key used
+by current releases. Each migration validates a pre-existing canonical object
+before adopting it and aborts on a malformed or ambiguous layout. If lock
+contention, duplicate generations, or a catalog check stops either migration,
+keep writers stopped and investigate; never delete rows or replace an index
+merely to make the migration pass. A DBA-managed deployment can review and
+apply the generated files through its normal schema-change process.
+
+Rollback is deliberately guarded. It refuses to drop a tombstone unless every
+corresponding legacy refresh-token row exists and has `family_revoked = true`.
+A missing row or a family with mixed true and false rows is rejected because
+2.x cannot represent that durable revocation safely. Keep 3.x writers stopped
+during rollback too. Before starting 2.x, also wait out the longest active
+refresh retry deadline (or accept that an honest retry can be treated as reuse),
+because 2.x cannot recover 3.x successor envelopes.
+
+Never run the fresh create-table migration against an existing database.
+
+Keep `AttestoPhoenix.Store.Sweeper` supervised after the host repo and set a
+positive `:sweep_interval_ms`. The sweeper redacts expired recoverable successor
+ciphertext and prunes expired TTL rows; a custom cleanup job must provide both
+operations. It can register from its own `init/1` with
+`AttestoPhoenix.Store.Sweeper.register_cleanup_worker/1` (or `/2` when
+registering another PID). A registration for a still-live PID survives an
+`:attesto_phoenix` application restart in the same VM; register again when that
+worker itself restarts or on a new node boot. Upgrading to a release that
+introduces the runtime monitor requires an application/node restart; hot code
+reload alone does not start new OTP application children.
+
+Durable family revocation tombstones are intentionally never swept. The
+installer adds the packaged sweeper idempotently when rerun.
+
+If the bundled `AttestoPhoenix.Store.EctoRefreshStore` retains the default
+positive retry grace, set one stable `ATTESTO_REFRESH_SUCCESSOR_SECRET` of at
+least 32 bytes in runtime configuration on every node before boot. Production
+configuration leaves an absent or short value for
+`AttestoPhoenix.Config.new/1` to reject only when that bundled store and
+positive grace are selected. A custom refresh store or
+`refresh_token_rotation_grace_seconds: 0` remains valid without a usable Ecto
+successor secret.
+
 ## Configuration
 
 All behavior is centralized in `AttestoPhoenix.Config`. Anything that is
@@ -363,7 +355,7 @@ config :my_app, AttestoPhoenix.Config,
   access_token_ttl: 900,
   refresh_token_ttl: 1_209_600,
   refresh_token_rotation_grace_seconds: 60,
-  schema_prefix: nil,                   # PostgreSQL schema; nil means `public`
+  schema_prefix: nil,                   # Ecto/repo connection default/search_path (often `public`)
   sweep_interval_ms: 60_000,
   authorization_code_ttl: 60,
   authorization_grant_id_claim: "https://api.example.com/claims/oauth_grant_id",
@@ -433,12 +425,16 @@ children = [
 ```
 
 `mix attesto_phoenix.install` adds this child and the 60-second sweep interval
-for you. A manual Ecto configuration with positive refresh retry grace must do
-both; ordinary expired-row pruning alone does not promptly remove successor
-ciphertext from a still-live refresh-token row.
+for you. A manual configuration using the bundled Ecto stores should do the
+same; positive refresh retry grace additionally requires prompt successor-
+ciphertext redaction from still-live refresh-token rows. Store mutations emit
+a bounded asynchronous warning when no worker is registered.
 Supervise one sweeper per independent `{repo, schema_prefix}` pair when the host
 serves multiple request-scoped profiles; never share one sweeper across schemas
-or start duplicate sweepers for the same pair.
+or start duplicate sweepers for the same pair. Use
+`AttestoPhoenix.Store.Sweeper.verify_running!/1` in a readiness check. A trusted
+equivalent cleanup process can register its live PID with
+`AttestoPhoenix.Store.Sweeper.register_cleanup_worker/2`.
 
 Build the validated struct wherever you need it:
 
@@ -447,8 +443,14 @@ config = AttestoPhoenix.Config.from_otp_app(:my_app)
 ```
 
 Required keys are validated at build time so misconfiguration fails fast.
-`AttestoPhoenix.Plug.PutConfig` performs that resolution for mounted routes and
-places both the host config and its derived `Attesto.Config` in `conn.private`.
+Protocol controllers require the validated `%AttestoPhoenix.Config{}` in
+`conn.private[:attesto_phoenix_config]`, and endpoints needing core protocol
+metadata require the matching derived `%Attesto.Config{}` in
+`conn.private[:attesto_protocol_config]`. `AttestoPhoenix.Plug.PutConfig` is the
+reference implementation that performs that resolution for mounted routes and
+places both configs in `conn.private`. A custom plug may assign them directly,
+but a preinstalled protocol config must equal
+`AttestoPhoenix.Config.to_attesto_config(host_config)` exactly.
 Direct mTLS adapters expose the authenticated certificate through peer data;
 TLS terminators configure `:forwarded_cert_der` plus `:trusted_proxies`.
 
@@ -1365,18 +1367,24 @@ an external client compatibility check.
 ## Database migration
 
 The generated migration owns the operational tables backing the attesto store
-behaviours: `attesto_authorization_codes`, `attesto_refresh_tokens`,
-`dpop_nonces`, `dpop_replays`, and `attesto_pushed_authorization_requests`, plus
-two feature tables — `attesto_client_id_metadata` (the CIMD client-metadata
-cache) and `attesto_consent_grants` (the single-use, request-bound consent-grant
-primitive) — and the `attesto_refresh_family_revocations` table that retains
-refresh-family revocation tombstones after token-row cleanup. It does **not**
-own a clients table (that is yours, behind `:load_client`).
+behaviours: authorization codes, refresh tokens and family revocations, device
+codes, CIBA requests, logout sessions, DPoP nonces and replay records, pushed
+authorization requests, Client ID Metadata cache entries, and consent grants.
+It does **not** own a clients table; that remains behind your `:load_client`
+callback.
 
-Generate the migration into your app:
+For a fresh database, generate the complete schema:
 
 ```bash
 mix attesto_phoenix.gen.migration --repo MyApp.Repo
+```
+
+Existing 2.x databases must not use that command. Generate the 3.0 and 3.1
+upgrade migrations, in that order, and follow the stopped-cutover guide above:
+
+```bash
+mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
 ```
 
 When the host configures a non-default `schema_prefix`, the generator picks it
@@ -1407,30 +1415,27 @@ Then run it:
 mix ecto.migrate
 ```
 
-An `attesto_authorization_codes` table created by a release that keyed it only
-with a unique index needs one forward migration, shown in the
-[CHANGELOG upgrade notes](CHANGELOG.md#upgrade-notes): it promotes that index
-to the table's primary key in place.
+The generated 3.1 migration promotes the canonical historical
+`attesto_authorization_codes(code_hash)` unique index to the table's primary
+key in place. It validates the complete catalog definition before changing or
+adopting the object. A custom or renamed index requires a separately reviewed
+migration; the generator will not infer equivalence from its columns alone.
 
-The application deploy and this migration may run in either order. New code
-recognizes both the historical unique-index name and the new primary-key
-constraint. The completed schema works with either application version;
-duplicates raise `Ecto.ConstraintError` on the previous release and
-`Ecto.InvalidChangesetError` on this one.
+For a deployment already running 3.0, the later application update and this
+3.1 schema migration may run in either order: the code recognizes both the
+historical unique-index name and the new primary-key constraint. That ordering
+flexibility does not relax the stopped procedure for a direct 2.x upgrade;
+apply both generated migrations before starting any 3.x writer.
 
-Before using that migration, run the
-[catalog preflight](guides/upgrade_3_0_schema_prefix.md#catalog-preflight) and
-set its `@prefix` to the runtime Ecto schema. Custom layouts need a reviewed
-migration. The forward operation reuses the existing index, but still requests
-an `ACCESS EXCLUSIVE` lock; run it in a controlled window with the documented
-short `lock_timeout`. Rollback is slower because it rebuilds the unique index.
+The forward operation reuses the existing index, but still requests an
+`ACCESS EXCLUSIVE` lock; run it in the stopped cutover with its short
+transaction-local `lock_timeout`. Rollback rebuilds the historical unique
+index and is therefore slower.
 
 For logical replication, migrate the subscriber first and the publisher
-second, before publishing `UPDATE` or `DELETE` for this table. The generic
-migration preserves `REPLICA IDENTITY FULL`; reset a temporary FULL setting
-only after both sides have the key, using the documented publisher-only line.
-See the [upgrade notes](CHANGELOG.md#upgrade-notes) for the exact migration and
-the guide above for operational details.
+second, before publishing `UPDATE` or `DELETE` for this table. The generated
+migration preserves an explicit replica-identity selection across promotion
+and rollback. See the guide above for operational details.
 
 ### Clustering
 

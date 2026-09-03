@@ -31,6 +31,7 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   alias Attesto.Claims
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.CIBARequest
+  alias AttestoPhoenix.Store.Sweeper
 
   @invalid_approval_claims "CIBA approval has invalid granted claims"
 
@@ -38,10 +39,12 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   @spec put(Attesto.CIBAStore.entry()) :: :ok
   def put(%{auth_req_id_hash: hash} = record) when is_binary(hash) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
 
     record
     |> CIBARequest.from_record(prefix: prefix)
-    |> repo().insert!(prefix: prefix, log: false, telemetry_event: nil)
+    |> repo.insert!(prefix: prefix, log: false, telemetry_event: nil)
 
     :ok
   end
@@ -91,6 +94,8 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
           {:ok, Attesto.CIBAStore.entry()} | {:error, :slow_down} | :error
   def poll(hash, %{now: now}) when is_binary(hash) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now_dt = now |> DateTime.from_unix!() |> DateTime.truncate(:second)
 
     # The §7.3 throttle: accept the first poll (last_polled_at NULL) or a poll
@@ -111,13 +116,13 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
                )),
         select: c
 
-    case repo().update_all(query, [set: [last_polled_at: now_dt]],
+    case repo.update_all(query, [set: [last_polled_at: now_dt]],
            prefix: prefix,
            log: false,
            telemetry_event: nil
          ) do
       {1, [row]} -> {:ok, CIBARequest.to_entry(%{row | last_polled_at: now_dt})}
-      {0, _} -> slow_down_or_missing(hash)
+      {0, _} -> slow_down_or_missing(repo, hash, prefix)
     end
   end
 
@@ -125,6 +130,8 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   @spec consume(Attesto.CIBAStore.auth_req_id_hash(), map()) :: {:ok, Attesto.CIBAStore.entry()} | :error
   def consume(hash, opts) when is_binary(hash) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = opts |> Map.get(:now, System.system_time(:second)) |> DateTime.from_unix!() |> DateTime.truncate(:second)
 
     # Guard on approval AND unexpiry, so a request that expires between the
@@ -134,7 +141,7 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
         where: c.auth_req_id_hash == ^hash and c.status == :approved and c.expires_at > ^now,
         select: c
 
-    case repo().update_all(query, [set: [status: :consumed]],
+    case repo.update_all(query, [set: [status: :consumed]],
            prefix: prefix,
            log: false,
            telemetry_event: nil
@@ -153,6 +160,8 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   # this is not a race).
   defp decide(hash, now, set) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now_dt = now |> DateTime.from_unix!() |> DateTime.truncate(:second)
 
     query =
@@ -160,21 +169,20 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
         where: c.auth_req_id_hash == ^hash and c.status == :pending and c.expires_at > ^now_dt,
         select: c
 
-    case repo().update_all(query, [set: set],
+    case repo.update_all(query, [set: set],
            prefix: prefix,
            log: false,
            telemetry_event: nil
          ) do
       {1, [row]} -> {:ok, CIBARequest.to_entry(Map.merge(row, Map.new(set)))}
-      {0, _} -> decide_miss(hash, now_dt)
+      {0, _} -> decide_miss(repo, hash, now_dt, prefix)
     end
   end
 
-  defp decide_miss(hash, now_dt) do
-    prefix = Config.table_prefix()
+  defp decide_miss(repo, hash, now_dt, prefix) do
     query = from c in CIBARequest, where: c.auth_req_id_hash == ^hash, select: {c.status, c.expires_at}
 
-    case repo().one(query, prefix: prefix, log: false, telemetry_event: nil) do
+    case repo.one(query, prefix: prefix, log: false, telemetry_event: nil) do
       nil -> {:error, :not_found}
       {:pending, expires_at} when not is_nil(expires_at) -> classify_pending(expires_at, now_dt)
       _decided -> {:error, :already_decided}
@@ -185,10 +193,8 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
     if DateTime.after?(expires_at, now_dt), do: {:error, :already_decided}, else: {:error, :expired}
   end
 
-  defp slow_down_or_missing(hash) do
-    prefix = Config.table_prefix()
-
-    if repo().exists?(from(c in CIBARequest, where: c.auth_req_id_hash == ^hash),
+  defp slow_down_or_missing(repo, hash, prefix) do
+    if repo.exists?(from(c in CIBARequest, where: c.auth_req_id_hash == ^hash),
          prefix: prefix,
          log: false,
          telemetry_event: nil

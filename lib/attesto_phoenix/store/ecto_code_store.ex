@@ -62,6 +62,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
+  alias AttestoPhoenix.Store.Sweeper
 
   # Ecto SQL query telemetry includes params/cast_params and decoded results.
   # Every authorization-row query carries at least one security-sensitive value
@@ -94,10 +95,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   def put(%{code_hash: code_hash, data: data, expires_at: expires_at} = record)
       when is_binary(code_hash) and is_map(data) and is_integer(expires_at) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
 
     record
     |> Authorization.from_record(prefix: prefix)
-    |> repo().insert([prefix: prefix] ++ @claims_query_opts)
+    |> repo.insert([prefix: prefix] ++ @claims_query_opts)
     |> case do
       {:ok, _row} -> :ok
       {:error, %Ecto.Changeset{} = changeset} -> raise_sanitized_insert_error(changeset)
@@ -126,6 +129,8 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
           {:ok, Attesto.CodeStore.entry()} | :error | {:error, :consumed, Attesto.CodeStore.consumed_meta()}
   def take(code_hash) when is_binary(code_hash) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     consumed_at = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -133,9 +138,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().update_all(query, [set: [consumed_at: consumed_at]], [prefix: prefix] ++ @claims_query_opts) do
+    case repo.update_all(query, [set: [consumed_at: consumed_at]], [prefix: prefix] ++ @claims_query_opts) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
-      {0, _} -> consumed_or_missing(code_hash, prefix)
+      {0, _} -> consumed_or_missing(repo, code_hash, prefix)
     end
   end
 
@@ -200,11 +205,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   defp mark_consumed_row(code_hash, family_updates) when is_binary(code_hash) and is_list(family_updates) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     query = from a in Authorization, where: a.code_hash == ^code_hash
     updates = [consumed_success: true] ++ family_updates
 
     query
-    |> repo().update_all([set: updates], prefix: prefix, log: false, telemetry_event: nil)
+    |> repo.update_all([set: updates], prefix: prefix, log: false, telemetry_event: nil)
     |> expect_one_updated!(:mark_consumed)
   end
 
@@ -213,9 +220,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   def record_access_token(family_id, jti, expires_at)
       when is_binary(family_id) and is_binary(jti) and is_integer(expires_at) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     query = from a in Authorization, where: a.family_id == ^family_id
 
-    record_access_token_row(query, jti, expires_at, prefix)
+    record_access_token_row(query, jti, expires_at, prefix, repo)
   end
 
   # Records a minted access token against the authorization row for `code_hash`.
@@ -227,14 +236,16 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   def record_access_token_for_code(code_hash, jti, expires_at)
       when is_binary(code_hash) and code_hash != "" and is_binary(jti) and is_integer(expires_at) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     query = from a in Authorization, where: a.code_hash == ^code_hash
 
-    record_access_token_row(query, jti, expires_at, prefix)
+    record_access_token_row(query, jti, expires_at, prefix, repo)
   end
 
-  defp record_access_token_row(query, jti, expires_at, prefix) do
+  defp record_access_token_row(query, jti, expires_at, prefix, repo) do
     expect_one_updated!(
-      repo().update_all(
+      repo.update_all(
         query,
         [
           set: [
@@ -254,13 +265,15 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec revoke_family_access_tokens(String.t()) :: :ok
   def revoke_family_access_tokens(family_id) when is_binary(family_id) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
       from a in Authorization,
         where: a.family_id == ^family_id and not is_nil(a.access_token_jti)
 
-    repo().update_all(query, [set: [access_token_revoked_at: now]],
+    repo.update_all(query, [set: [access_token_revoked_at: now]],
       prefix: prefix,
       log: false,
       telemetry_event: nil
@@ -273,6 +286,8 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec revoke_access_token_for_code(String.t()) :: :ok
   def revoke_access_token_for_code(code_hash) when is_binary(code_hash) and code_hash != "" do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     # 2.14.x consumed-code rows can predate access-token linkage. Replay
@@ -286,7 +301,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
           a.code_hash == ^code_hash and not is_nil(a.access_token_jti) and
             a.access_token_jti != ^""
 
-    case repo().update_all(query, [set: [access_token_revoked_at: now]],
+    case repo.update_all(query, [set: [access_token_revoked_at: now]],
            prefix: prefix,
            log: false,
            telemetry_event: nil
@@ -298,7 +313,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         # A zero count is safe only for an absent row or the legacy nil-JTI
         # record. If a linked row remains, fail closed instead of claiming that
         # its access token was revoked.
-        legacy_or_missing_revoke(code_hash, prefix)
+        legacy_or_missing_revoke(repo, code_hash, prefix)
 
       _unexpected_count ->
         raise RuntimeError,
@@ -309,13 +324,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   # Selects only the linkage column it inspects, for the same reason as
   # `consumed_or_missing/2`: a whole-row read would publish `claims` through
   # query telemetry.
-  defp legacy_or_missing_revoke(code_hash, prefix) do
+  defp legacy_or_missing_revoke(repo, code_hash, prefix) do
     query =
       from a in Authorization,
         where: a.code_hash == ^code_hash,
         select: [:access_token_jti]
 
-    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
+    case repo.one(query, [prefix: prefix] ++ @claims_query_opts) do
       nil ->
         :ok
 
@@ -353,13 +368,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   # context - out of the decoded row entirely, so re-enabling observability here
   # could not leak it. `redact: true` would not help; telemetry carries the raw
   # row, not the struct.
-  defp consumed_or_missing(code_hash, prefix) do
+  defp consumed_or_missing(repo, code_hash, prefix) do
     query =
       from a in Authorization,
         where: a.code_hash == ^code_hash,
         select: [:family_id, :subject, :consumed_success]
 
-    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
+    case repo.one(query, [prefix: prefix] ++ @claims_query_opts) do
       %Authorization{consumed_success: true} = row ->
         {:error, :consumed, Authorization.consumed_meta(row)}
 

@@ -8,7 +8,15 @@
 
 alias AttestoPhoenix.TestRepo
 
-ExUnit.configure(exclude: [:ecto])
+# Diagnostics under test (missing-sweeper warnings, logout and credential
+# refusals) log on purpose. Capture every test's log output and show it only
+# when that test fails; capture_log/1 inside a test still sees its messages.
+ExUnit.configure(exclude: [:ecto], capture_log: true)
+
+# Installer tests evaluate fixture config files that define helper modules, and
+# Igniter evaluates them again on every file update. Those redefinitions are
+# expected and must not print a warning per evaluation.
+Code.put_compiler_option(:ignore_module_conflict, true)
 
 # The default Config uses a non-zero refresh-rotation retry window. Keep one
 # stable test-only secret available for every test that selects the bundled

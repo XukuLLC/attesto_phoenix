@@ -121,7 +121,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     Application.put_env(:attesto_phoenix, :otp_app, :attesto_phoenix)
     Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, config)
 
-    on_exit(fn -> Application.delete_env(:attesto_phoenix, AttestoPhoenix.Config) end)
+    on_exit(fn ->
+      Application.delete_env(:attesto_phoenix, AttestoPhoenix.Config)
+      Application.delete_env(:attesto_phoenix, :otp_app)
+    end)
 
     %{config: config}
   end

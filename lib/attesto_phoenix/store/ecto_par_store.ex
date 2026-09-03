@@ -34,6 +34,7 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.PushedAuthorizationRequest, as: PushedRequest
+  alias AttestoPhoenix.Store.Sweeper
 
   @doc """
   Persists a pushed authorization request under `request_uri` for
@@ -50,13 +51,15 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   def put(request_uri, params, ttl_seconds)
       when is_binary(request_uri) and is_map(params) and is_integer(ttl_seconds) and ttl_seconds > 0 do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.add(now, ttl_seconds, :second)
 
     entry = %{request_uri: request_uri, params: params, expires_at: expires_at, inserted_at: now}
 
     PushedRequest.put_changeset(%PushedRequest{}, entry, prefix: prefix)
-    |> repo().insert(prefix: prefix, log: false, telemetry_event: nil)
+    |> repo.insert(prefix: prefix, log: false, telemetry_event: nil)
     |> case do
       {:ok, _row} -> :ok
       {:error, changeset} -> {:error, changeset}
@@ -100,6 +103,8 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   @spec take(String.t()) :: {:ok, map()} | :error
   def take(request_uri) when is_binary(request_uri) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -107,7 +112,7 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
         where: p.request_uri == ^request_uri and p.expires_at > ^now,
         select: p.params
 
-    case repo().delete_all(query, prefix: prefix, log: false, telemetry_event: nil) do
+    case repo.delete_all(query, prefix: prefix, log: false, telemetry_event: nil) do
       {1, [params]} -> {:ok, params}
       {0, _} -> :error
     end

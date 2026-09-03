@@ -15,6 +15,17 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
   @subject "ou_user-123"
   @signing_pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
 
+  defmodule CaptureAdapter do
+    @moduledoc false
+
+    # Req adapter that hands the outgoing request to the test process instead
+    # of opening a connection.
+    def run(request) do
+      send(request.private.capture_owner, {:request, request})
+      {request, %Req.Response{status: 204}}
+    end
+  end
+
   defmodule Keystore do
     @moduledoc false
     @behaviour Attesto.Keystore
@@ -695,14 +706,9 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
     dpop_key = DPoPKey.generate(:es256)
     token = mint(config, scope: "openid read:reports", dpop_jkt: DPoPKey.thumbprint(dpop_key))
-    parent = self()
 
-    adapter = fn request ->
-      send(parent, {:request, request})
-      {request, %Req.Response{status: 204}}
-    end
-
-    Req.new(base_url: @issuer, adapter: adapter)
+    Req.new(base_url: @issuer, adapter: CaptureAdapter)
+    |> Req.Request.put_private(:capture_owner, self())
     |> ReqDPoP.attach(key: dpop_key, access_token: token)
     |> Req.get!(url: "/reports", params: [page: "1"])
 

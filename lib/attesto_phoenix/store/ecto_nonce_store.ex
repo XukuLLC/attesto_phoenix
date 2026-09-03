@@ -59,6 +59,7 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DPoPNonce
+  alias AttestoPhoenix.Store.Sweeper
 
   # RFC 9449 §8 requires an unpredictable nonce. 256 bits from a CSPRNG,
   # URL-safe base64 with no padding so the value is header-safe.
@@ -89,6 +90,7 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   end
 
   defp issue_with(repo, prefix, ttl_seconds) do
+    Sweeper.check_running_for_store(repo, prefix)
     nonce = :crypto.strong_rand_bytes(@nonce_bytes) |> Base.url_encode64(padding: false)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.add(now, ttl_seconds, :second)
@@ -158,6 +160,7 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   end
 
   defp accept_with(repo, prefix, nonce, ttl) do
+    Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     cutoff = DateTime.add(now, -ttl, :second)
 
