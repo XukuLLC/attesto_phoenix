@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-09-02
+
 ### Added
 
 - `:authorization_code_completion` - an optional synchronous wrapper around the

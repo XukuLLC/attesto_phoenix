@@ -58,12 +58,12 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           repository: XukuLLC/attesto
-          ref: 955aba026ab4f1efeda59077829e5e5341d6007c
+          ref: 8440ee06cea523ffee5d4514a3a1db221c6187c5
           path: attesto
 
       - name: Verify Attesto core revision
         working-directory: attesto
-        run: test "$(git rev-parse HEAD)" = "955aba026ab4f1efeda59077829e5e5341d6007c"
+        run: test "$(git rev-parse HEAD)" = "8440ee06cea523ffee5d4514a3a1db221c6187c5"
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1.24.1
@@ -75,17 +75,17 @@ jobs:
         uses: actions/cache@v6.1.0
         with:
           path: deps
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-955aba026ab4f1efeda59077829e5e5341d6007c-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-8440ee06cea523ffee5d4514a3a1db221c6187c5-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-955aba026ab4f1efeda59077829e5e5341d6007c-${{ hashFiles('attesto/**') }}-mix-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-8440ee06cea523ffee5d4514a3a1db221c6187c5-${{ hashFiles('attesto/**') }}-mix-
 
       - name: Restore build cache
         uses: actions/cache@v6.1.0
         with:
           path: _build
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-955aba026ab4f1efeda59077829e5e5341d6007c-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-8440ee06cea523ffee5d4514a3a1db221c6187c5-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-955aba026ab4f1efeda59077829e5e5341d6007c-${{ hashFiles('attesto/**') }}-build-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-8440ee06cea523ffee5d4514a3a1db221c6187c5-${{ hashFiles('attesto/**') }}-build-
 
       - name: Install dependencies
         run: |
