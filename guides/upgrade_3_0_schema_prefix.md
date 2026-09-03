@@ -253,7 +253,7 @@ Then tailor `PRIMARY KEY USING INDEX` to that verified name
 reused index to `attesto_authorization_codes_pkey` when it installs the
 constraint; the accompanying notice is harmless.
 
-#### Catalog preflight
+### Catalog preflight
 
 Paste this query into `psql` after replacing `public` in both names with the
 selected runtime schema. It returns one `ready_for_primary_key` result and a
