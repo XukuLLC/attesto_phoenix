@@ -175,6 +175,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   import Mix.Ecto, only: [parse_repo: 1, ensure_repo: 2]
   import Mix.Generator
 
+  alias Mix.Tasks.Format
+
   # Column byte-lengths. Hashes are stored, never the secrets themselves: the
   # caller hashes the authorization code / refresh token / nonce before it
   # reaches the store, so these columns hold opaque digests rather than the
@@ -792,9 +794,50 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       write_migration_file!(file, contents)
       ensure_single_migration_kind!(path, file, base_name)
       ensure_single_migration_version!(path, file, version)
+      format_generated_file!(file)
       Mix.shell().info("* creating #{file}")
       file
     end)
+  end
+
+  # The host's `mix format --check-formatted` decides what a well-formed file
+  # looks like, including its line length and formatter plugins, so the file is
+  # formatted in place with the host's own configuration. The Elixir formatter
+  # is not idempotent for every input shape (a heredoc argument followed by
+  # trailing arguments settles only on the second pass), so formatting repeats
+  # until the file stops changing. Formatting preserves semantics; when a host
+  # formatter plugin fails, the stock formatter is applied instead so the file
+  # is still canonical for a plain `mix format`.
+  @format_passes 4
+
+  defp format_generated_file!(file) do
+    format_until_stable!(file, fn -> Format.run([file]) end, @format_passes)
+  rescue
+    exception ->
+      Mix.shell().error(
+        "could not format #{file} with the project's formatter " <>
+          "(#{Exception.message(exception)}); applying the default Elixir formatter instead"
+      )
+
+      format_until_stable!(file, fn -> format_with_default_formatter!(file) end, @format_passes)
+  end
+
+  defp format_until_stable!(_file, _format, 0), do: :ok
+
+  defp format_until_stable!(file, format, passes_left) do
+    before = File.read!(file)
+    format.()
+
+    if File.read!(file) == before do
+      :ok
+    else
+      format_until_stable!(file, format, passes_left - 1)
+    end
+  end
+
+  defp format_with_default_formatter!(file) do
+    formatted = file |> File.read!() |> Code.format_string!(file: file) |> IO.iodata_to_binary()
+    File.write!(file, formatted <> "\n")
   end
 
   defp ensure_migration_kind_available!(path, base_name, :fresh) do

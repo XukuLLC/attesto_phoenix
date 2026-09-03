@@ -6,6 +6,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
   alias AttestoPhoenix.AppEnvSnapshot
   alias AttestoPhoenix.Config
   alias Mix.Tasks.AttestoPhoenix.Gen.Migration
+  alias Mix.Tasks.Format
 
   @moduletag :tmp_dir
 
@@ -556,6 +557,42 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       end
 
       assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_create_attesto_phoenix_tables.exs")) == []
+    end
+
+    test "formats every generated migration with the project's formatter configuration", %{
+      tmp_dir: tmp_dir
+    } do
+      fresh_dir = Path.join(tmp_dir, "fresh")
+      upgrade_dir = Path.join(tmp_dir, "upgrade")
+
+      Migration.run(["--repo", inspect(TestRepo), "--migrations-path", Path.join(fresh_dir, "migrations")])
+
+      Migration.run([
+        "--repo",
+        inspect(TestRepo),
+        "--migrations-path",
+        Path.join(upgrade_dir, "migrations"),
+        "--upgrade",
+        "3.0"
+      ])
+
+      Migration.run([
+        "--repo",
+        inspect(TestRepo),
+        "--migrations-path",
+        Path.join(upgrade_dir, "migrations"),
+        "--upgrade",
+        "3.1"
+      ])
+
+      files = Path.wildcard(Path.join(tmp_dir, "*/migrations/*.exs"))
+      assert length(files) == 3
+
+      # The project's .formatter.exs (plugins included) is what a host's own
+      # `mix format --check-formatted` enforces on the generated file.
+      for file <- files do
+        assert :ok = Format.run(["--check-formatted", file])
+      end
     end
 
     test "requires at least one repo", %{tmp_dir: tmp_dir} do

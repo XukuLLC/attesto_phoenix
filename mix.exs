@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "3.2.0"
+  @version "3.2.1"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
   @attesto_requirement ">= 2.0.0 and < 3.0.0"
