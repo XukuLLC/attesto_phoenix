@@ -27,6 +27,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   alias AttestoPhoenix.RefreshSuccessorCipher
   alias AttestoPhoenix.Schema.RefreshFamilyRevocation
   alias AttestoPhoenix.Schema.RefreshToken
+  alias AttestoPhoenix.Store.Sweeper
 
   @app :attesto_phoenix
   @advisory_lock_namespace 0x4154_5246
@@ -105,10 +106,12 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   def insert(%{} = record) do
     validate_new_record!(record)
     prefix = table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     family_id = record.family_id
 
     result =
-      repo().transaction(
+      repo.transaction(
         fn ->
           lock_family!(family_id)
           insert_locked(record, family_id, prefix)
@@ -181,7 +184,10 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
     with {:ok, now} <- valid_now(now),
          {:ok, protected} <- protect_successor(parent_hash, child, successor, now) do
-      result = rotate_transaction(parent_hash, child, successor, protected, now)
+      repo = repo()
+      prefix = table_prefix()
+      Sweeper.check_running_for_store(repo, prefix)
+      result = rotate_transaction(parent_hash, child, successor, protected, now, repo, prefix)
       result
     else
       {:error, :retry_state_unavailable} -> {:error, :retry_state_unavailable}
@@ -197,8 +203,10 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   @spec revoke_family(Attesto.RefreshStore.family_id()) :: :ok
   def revoke_family(family_id) when is_binary(family_id) do
     prefix = table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
 
-    case repo().transaction(
+    case repo.transaction(
            fn ->
              lock_family!(family_id)
 
@@ -353,10 +361,8 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
     modern_count + legacy_count
   end
 
-  defp rotate_transaction(parent_hash, child, successor, protected, now) do
-    prefix = table_prefix()
-
-    repo().transaction(
+  defp rotate_transaction(parent_hash, child, successor, protected, now, repo, prefix) do
+    repo.transaction(
       fn ->
         parent_query =
           from(r in RefreshToken,
@@ -364,9 +370,9 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
             select: r
           )
 
-        case repo().one(parent_query, prefix: prefix, log: false, telemetry_event: nil) do
+        case repo.one(parent_query, prefix: prefix, log: false, telemetry_event: nil) do
           nil ->
-            repo().rollback(:not_found)
+            repo.rollback(:not_found)
 
           %RefreshToken{family_id: family_id} ->
             # Discover the family from persisted state before taking the family
@@ -383,7 +389,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
               )
 
             rotate_loaded_parent_or_revoke(
-              repo().one(locked_parent_query, prefix: prefix, log: false, telemetry_event: nil),
+              repo.one(locked_parent_query, prefix: prefix, log: false, telemetry_event: nil),
               family_id,
               parent_hash,
               child,

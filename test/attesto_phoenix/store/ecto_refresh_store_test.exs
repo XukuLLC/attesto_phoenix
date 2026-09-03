@@ -19,6 +19,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
   alias AttestoPhoenix.Schema.RefreshToken
   alias AttestoPhoenix.Store.EctoRefreshStore
   alias AttestoPhoenix.Store.Sweeper
+  alias AttestoPhoenix.Store.Sweeper.Signal
   alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag :ecto
@@ -44,12 +45,18 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
   # complete host config for those calls so direct reads and rotations resolve
   # the same validated defaults as a deployed host, even when another test
   # leaves the library's otp_app pointer set.
-  setup do
+  setup context do
     previous_otp_app = Application.get_env(:attesto_phoenix, :otp_app, :missing)
     previous_config = Application.get_env(__MODULE__, Config, :missing)
 
     Application.put_env(:attesto_phoenix, :otp_app, __MODULE__)
     Application.put_env(__MODULE__, Config, prefix_config(nil))
+
+    if !context[:unsupervised_sweeper_runtime_signal] do
+      for target <- [{TestRepo, nil}, {FailingRepo, nil}, {TestRepo, "auth_refresh_test"}] do
+        :ok = Sweeper.register_cleanup_worker(target, self())
+      end
+    end
 
     on_exit(fn ->
       case previous_otp_app do
@@ -1474,5 +1481,274 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
                "recoverable" => false
              }
     end
+  end
+
+  describe "unsupervised sweeper runtime signal" do
+    @describetag unsupervised_sweeper_runtime_signal: true
+
+    setup do
+      target = {TestRepo, nil}
+      worker = spawn(fn -> Process.sleep(:infinity) end)
+      :ok = Sweeper.register_cleanup_worker(target, worker)
+      Process.exit(worker, :kill)
+
+      eventually(fn -> refute Sweeper.running?(target) end)
+      :ok
+    end
+
+    test "emits warning and safe telemetry when store operations run without a sweeper" do
+      config = %{
+        prefix_config(nil)
+        | refresh_store: EctoRefreshStore,
+          refresh_token_rotation_grace_seconds: 5,
+          sweep_interval_ms: 60_000
+      }
+
+      record = entry()
+
+      ref = make_ref()
+      owner = self()
+      handler_id = {__MODULE__, :unsupervised_store_test, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:attesto_phoenix, :store, :sweeper_unsupervised],
+        &__MODULE__.handle_telemetry/4,
+        owner
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert :ok = EctoRefreshStore.insert(record)
+          end)
+
+          assert_receive {:telemetry_event, event, measurements, metadata}, 2_000
+
+          assert event == [:attesto_phoenix, :store, :sweeper_unsupervised]
+          assert measurements == %{count: 1}
+          assert metadata == %{repo: TestRepo, schema_prefix: nil}
+          refute Map.has_key?(metadata, :config)
+          refute Map.has_key?(metadata, :refresh_successor_secret)
+          refute Map.has_key?(metadata, :client_secret)
+
+          await_signal_idle()
+        end)
+
+      assert log =~ "AttestoPhoenix: AttestoPhoenix.Store.Sweeper is not running"
+      assert log =~ "schema_prefix: nil"
+      assert log =~ "Expired TTL rows will not be pruned"
+      assert log =~ "refresh-token successor ciphertext will not be redacted either"
+      refute log =~ "tombstones will not be swept"
+
+      # Subsequent operations for the same config do not re-emit
+      second_log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert :ok = EctoRefreshStore.revoke_family(record.family_id)
+          end)
+
+          await_signal_idle()
+        end)
+
+      refute second_log =~ "AttestoPhoenix.Store.Sweeper is not running"
+      refute_receive {:telemetry_event, _, _, _}
+    end
+
+    test "warns about TTL pruning when refresh retry grace is zero" do
+      config = %{
+        prefix_config(nil)
+        | refresh_store: EctoRefreshStore,
+          refresh_token_rotation_grace_seconds: 0,
+          sweep_interval_ms: 60_000
+      }
+
+      record = entry()
+
+      log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert :ok = EctoRefreshStore.insert(record)
+          end)
+
+          await_signal_idle()
+        end)
+
+      assert log =~ "Expired TTL rows will not be pruned"
+    end
+
+    test "does not emit warning when input validation fails" do
+      config = %{
+        prefix_config(nil)
+        | refresh_store: EctoRefreshStore,
+          refresh_token_rotation_grace_seconds: 5,
+          sweep_interval_ms: 60_000
+      }
+
+      log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert_raise ArgumentError, fn ->
+              EctoRefreshStore.insert(Process.get(make_ref(), %{invalid: "record"}))
+            end
+
+            assert {:error, :invalid_rotation} =
+                     EctoRefreshStore.rotate("parent_hash", %{}, %{}, now: -1)
+          end)
+        end)
+
+      assert log == ""
+    end
+
+    test "does not suppress warning when config points at a delegating store" do
+      config = %{
+        prefix_config(nil)
+        | refresh_store: DelegatingStoreModule,
+          refresh_token_rotation_grace_seconds: 5,
+          sweep_interval_ms: 60_000
+      }
+
+      record = entry()
+
+      ref = make_ref()
+      handler_id = {__MODULE__, :delegating_store_test, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:attesto_phoenix, :store, :sweeper_unsupervised],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert :ok = EctoRefreshStore.insert(record)
+          end)
+
+          assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], %{count: 1},
+                          %{repo: TestRepo, schema_prefix: nil}},
+                         2_000
+
+          await_signal_idle()
+        end)
+
+      assert log =~ "AttestoPhoenix: AttestoPhoenix.Store.Sweeper is not running"
+    end
+
+    test "does not emit warning when host cleanup worker is registered, and rearms after worker exits" do
+      config = %{
+        prefix_config(nil)
+        | refresh_store: EctoRefreshStore,
+          refresh_token_rotation_grace_seconds: 5,
+          sweep_interval_ms: 60_000
+      }
+
+      record = entry()
+
+      worker = spawn(fn -> Process.sleep(10_000) end)
+      on_exit(fn -> if Process.alive?(worker), do: Process.exit(worker, :kill) end)
+
+      target = {TestRepo, nil}
+      assert :ok = Sweeper.register_cleanup_worker(target, worker)
+
+      ref = make_ref()
+      handler_id = {__MODULE__, :host_worker_rearm_test, ref}
+
+      :telemetry.attach(
+        handler_id,
+        [:attesto_phoenix, :store, :sweeper_unsupervised],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert :ok = EctoRefreshStore.insert(record)
+          end)
+        end)
+
+      assert log == ""
+
+      # Kill host worker
+      Process.exit(worker, :kill)
+      eventually(fn -> refute Sweeper.running?(target) end)
+
+      # Now it rearms and warns
+      relapse_log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert :ok = EctoRefreshStore.revoke_family(record.family_id)
+          end)
+
+          assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], %{count: 1},
+                          %{repo: TestRepo, schema_prefix: nil}},
+                         2_000
+
+          await_signal_idle()
+        end)
+
+      assert relapse_log =~ "AttestoPhoenix: AttestoPhoenix.Store.Sweeper is not running"
+    end
+
+    test "does not emit warning or telemetry when sweeper is running" do
+      config = %{
+        prefix_config(nil)
+        | refresh_store: EctoRefreshStore,
+          refresh_token_rotation_grace_seconds: 5,
+          sweep_interval_ms: 60_000
+      }
+
+      record = entry()
+
+      {:ok, pid} = Sweeper.start_link(config: config)
+
+      on_exit(fn ->
+        if Process.alive?(pid), do: GenServer.stop(pid)
+      end)
+
+      log =
+        capture_log(fn ->
+          Config.with_request_config(config, fn ->
+            assert :ok = EctoRefreshStore.insert(record)
+          end)
+        end)
+
+      assert log == ""
+    end
+  end
+
+  def handle_telemetry(event, measurements, metadata, owner) do
+    send(owner, {:telemetry_event, event, measurements, metadata})
+  end
+
+  defp await_signal_idle(attempts \\ 200) do
+    eventually(
+      fn ->
+        state = :sys.get_state(Signal)
+        assert state.active == nil
+        assert :queue.is_empty(state.queue)
+      end,
+      attempts
+    )
+  end
+
+  defp eventually(assertion, attempts \\ 50)
+
+  defp eventually(assertion, 0), do: assertion.()
+
+  defp eventually(assertion, attempts) do
+    assertion.()
+  rescue
+    ExUnit.AssertionError ->
+      Process.sleep(10)
+      eventually(assertion, attempts - 1)
   end
 end

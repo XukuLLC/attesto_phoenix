@@ -19,8 +19,8 @@ mix ecto.migrate
 
 ```elixir
 Mix.install([
-  {:attesto_phoenix, "~> 3.1"},
-  {:req, "~> 0.5"},
+  {:attesto_phoenix, "~> 3.2"},
+  {:req, ">= 0.6.1 and < 1.0.0"},
   {:req_dpop, "~> 0.5"},
   {:bandit, "~> 1.0"},
   {:phoenix, "~> 1.7"}

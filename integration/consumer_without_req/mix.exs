@@ -17,7 +17,8 @@ defmodule AttestoPhoenix.ConsumerWithoutReq.MixProject do
       {:attesto_phoenix, path: "../.."},
       attesto_dep(),
       {:phoenix, "== 1.7.24", override: true},
-      {:plug, "== 1.16.6", override: true}
+      {:plug, "== 1.16.6", override: true},
+      {:telemetry, "== 1.0.0", override: true}
     ]
   end
 

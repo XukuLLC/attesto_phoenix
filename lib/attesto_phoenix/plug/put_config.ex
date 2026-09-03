@@ -24,10 +24,13 @@ defmodule AttestoPhoenix.Plug.PutConfig do
   protocol config must exactly match the value derived from that request's host
   config; otherwise the plug fails closed instead of advertising policy that
   the token endpoints do not enforce. A value of the wrong type also fails
-  closed instead of being silently replaced. Library controllers and
-  `AttestoPhoenix.Plug.Authenticate` bind the private configuration only while
-  their bounded work executes; this plug does not retain tenant state in the
-  process dictionary between pipeline and action dispatch.
+  closed instead of being silently replaced. This plug is the reference
+  implementation and convenient route helper for installing both private values,
+  but hosts may also populate them directly using custom plugs. Library
+  controllers and `AttestoPhoenix.Plug.Authenticate` bind the private
+  configuration only while their bounded work executes; this plug does not
+  retain tenant state in the process dictionary between pipeline and action
+  dispatch.
   """
 
   @behaviour Plug

@@ -36,9 +36,20 @@ Before inspecting or changing the database:
 
 1. Stop every 2.x application node, worker, sweeper, scheduler, and other
    process that can write or delete Attesto rows. Do not start a 3.0 writer
-   until this cutover is complete. Mixed 2.x/3.0 writers are unsupported: 2.x
-   does not read or write the durable refresh-family revocation tombstones that
-   3.0 uses.
+   until this cutover is complete. Mixed 2.x/3.0 writers are strictly
+   unsupported for four concrete reasons:
+     * 3.0 records a durable tombstone and removes the family's refresh rows. A
+       later 2.x insert checks only `family_revoked` rows, sees none, and can
+       add a live token to the revoked family.
+     * 2.x records revocation only on refresh rows. Once 3.0 cleanup removes
+       every expired row in that family, it also removes the only revocation
+       record because 2.x never wrote a tombstone.
+     * 3.0 writes `v: 2` successor envelopes, which bind the child hash. A 2.x
+       node can treat an honest retry of that rotation as reuse and revoke the
+       family because it understands only `v: 1` envelopes.
+     * Once the new `(family_id, generation)` unique index exists, a colliding
+       2.x insert can raise an unhandled `Ecto.ConstraintError`; 3.0 reports the
+       conflict through the store contract.
 2. Take a database backup and rehearse the procedure against a restorable copy.
    Keep the pre-cutover backup until the post-cutover checks and a controlled
    production flow have succeeded.
@@ -170,7 +181,8 @@ outside the target layout.
 
 Choose one PostgreSQL schema for all Ecto-backed Attesto tables:
 
-* use `public` with `schema_prefix: nil` (the Ecto default), or
+* leave `schema_prefix: nil` to use the Ecto/repo connection default/search_path
+  (often `public`), or
 * use one application-owned schema, such as `oauth`, with
   `schema_prefix: "oauth"`.
 
@@ -185,10 +197,11 @@ the already-verified source, and that target index and constraint names will
 not collide. A relation in the target schema with unrelated rows is a stop
 condition.
 
-Do not run `mix attesto_phoenix.gen.migration` or the generated create-table
-migration against this existing database. That migration is for a fresh
-installation and can attempt to create tables that already exist. A migration
-generator command is not an inventory or data-move tool.
+Do not run `mix attesto_phoenix.gen.migration` in fresh-install mode, or run its
+generated create-table migration, against this existing database. Fresh mode
+can attempt to create tables that already exist. The later
+`--upgrade 3.0` mode generates only the two required refresh-family invariants;
+neither mode is an inventory or data-move tool.
 
 ## 3. Move only verified sources
 
@@ -226,236 +239,100 @@ If a source relation is missing, a target collides, an ownership/privilege check
 fails, or an operation affects a relation that was not in the source record,
 stop and restore from the backup or roll back the reviewed migration.
 
-## 4. Add the 3.0 invariants
-
-### Promote the authorization-code index to a primary key when required
-
-After moving the verified authorization-code source to its canonical target
-name, inspect its primary key and `code_hash` index. A historical generated
-table with no primary key needs the
-[authorization-code primary-key migration](../CHANGELOG.md#upgrade-notes)
-before writers restart. Set that migration's `@prefix` explicitly to this
-guide's selected runtime schema; its raw `ALTER TABLE` does not inherit an Ecto
-migrator or repository prefix.
-
-The CHANGELOG snippet names the index from the canonical historical table. A
-literal-prefixed source can retain a name such as
-`oauth_attesto_authorization_codes_code_hash_index` after its table is moved
-and renamed. Verify the actual index against every documented preflight
-condition, including `code_hash` nullability, a single key column, the
-column's and index's database-default collation, a default operator class,
-default ordering, a valid, ready, live ordinary B-tree index, no `NULLS NOT
-DISTINCT` option, no predicate/expressions/`INCLUDE` columns, and no constraint
-backing the index. The
-[pasteable catalog preflight query](#catalog-preflight) checks these conditions.
-Then tailor `PRIMARY KEY USING INDEX` to that verified name
-(or rename it only after checking for a collision). PostgreSQL will rename the
-reused index to `attesto_authorization_codes_pkey` when it installs the
-constraint; the accompanying notice is harmless.
-
-### Catalog preflight
-
-Paste this query into `psql` after replacing `public` in both names with the
-selected runtime schema. It returns one `ready_for_primary_key` result and a
-list of failure reasons. The historical generated table should return `t` and
-an empty `failure_reasons` array. The project CI exercises PostgreSQL 16. The
-query reads the PostgreSQL 15+ `pg_index.indnullsnotdistinct` value through
-`to_jsonb` so it remains parseable on earlier PostgreSQL versions where that
-catalog column is absent; the missing key is treated as the historical
-`false` value.
-
-```sql
-WITH target AS (
-  SELECT to_regclass('public.attesto_authorization_codes') AS table_oid,
-         to_regclass('public.attesto_authorization_codes_code_hash_index') AS index_oid
-), catalog AS (
-  SELECT target.*,
-         table_rel.relkind AS table_kind,
-         index_rel.relkind AS index_kind,
-         access_method.amname,
-         index_info.indisunique,
-         index_info.indisvalid,
-         index_info.indisready,
-         index_info.indislive,
-         index_info.indnatts,
-         index_info.indnkeyatts,
-         index_info.indkey,
-         index_info.indcollation[0] AS index_collation,
-         index_info.indoption[0] AS index_options,
-         /* PostgreSQL 15 added this pg_index column. Reading the row as JSON
-            keeps this query executable on earlier PostgreSQL versions where
-            the column is absent; the missing key is the historical false. */
-         COALESCE((to_jsonb(index_info) ->> 'indnullsnotdistinct')::boolean, false)
-           AS nulls_not_distinct,
-         index_info.indpred,
-         index_info.indexprs,
-         code_hash.attnum AS code_hash_attnum,
-         code_hash.atttypid AS code_hash_type,
-         code_hash.attnotnull AS code_hash_not_null,
-         code_hash.attcollation AS code_hash_collation,
-         default_collation.oid AS database_default_collation,
-         operator_class.opcdefault AS operator_class_default,
-         operator_class.opcintype AS operator_class_type,
-         constraint_info.constraint_name,
-         COALESCE(primary_key_info.table_has_primary_key, false) AS table_has_primary_key
-  FROM target
-  LEFT JOIN pg_class AS table_rel ON table_rel.oid = target.table_oid
-  LEFT JOIN pg_class AS index_rel ON index_rel.oid = target.index_oid
-  LEFT JOIN pg_index AS index_info
-    ON index_info.indexrelid = target.index_oid
-   AND index_info.indrelid = target.table_oid
-  LEFT JOIN pg_am AS access_method ON access_method.oid = index_rel.relam
-  LEFT JOIN pg_attribute AS code_hash
-    ON code_hash.attrelid = target.table_oid
-   AND code_hash.attname = 'code_hash'
-   AND code_hash.attnum > 0
-  LEFT JOIN pg_collation AS default_collation
-    ON default_collation.collnamespace = 'pg_catalog'::regnamespace
-   AND default_collation.collname = 'default'
-  LEFT JOIN pg_opclass AS operator_class
-    ON operator_class.oid = index_info.indclass[0]
-  LEFT JOIN LATERAL (
-    SELECT c.conname AS constraint_name
-    FROM pg_constraint AS c
-    WHERE c.conindid = target.index_oid
-    ORDER BY c.oid
-    LIMIT 1
-  ) AS constraint_info ON true
-  LEFT JOIN LATERAL (
-    SELECT bool_or(indisprimary) AS table_has_primary_key
-    FROM pg_index
-    WHERE indrelid = target.table_oid
-  ) AS primary_key_info ON true
-), checks AS (
-  SELECT table_oid IS NOT NULL AS table_exists,
-         index_oid IS NOT NULL AS index_exists,
-         table_kind = 'r' AS ordinary_table,
-         index_kind = 'i' AND amname = 'btree' AS btree_index,
-         COALESCE(indisunique, false) AS unique_index,
-         COALESCE(indisvalid AND indisready AND indislive, false) AS index_valid_ready_live,
-         COALESCE(indnatts = 1 AND indnkeyatts = 1 AND indkey[0] = code_hash_attnum, false) AS only_code_hash,
-         COALESCE(code_hash_not_null, false) AS code_hash_not_null,
-         COALESCE(
-           code_hash_collation = database_default_collation AND
-             index_collation = database_default_collation,
-           false
-         ) AS default_collation,
-         NOT nulls_not_distinct AS default_null_treatment,
-         COALESCE(
-           operator_class_default AND
-             (operator_class_type = code_hash_type OR EXISTS (
-               SELECT 1 FROM pg_cast
-               WHERE castsource = code_hash_type
-                 AND casttarget = operator_class_type
-                 AND castcontext = 'i'
-             )), false
-         ) AS default_operator_class,
-         COALESCE(index_options = 0, false) AS default_ordering,
-         indpred IS NULL AS no_predicate,
-         indexprs IS NULL AS no_expressions,
-         constraint_name IS NOT NULL AS constraint_backed,
-         table_has_primary_key
-  FROM catalog
-), failures AS (
-  SELECT checks.*,
-         array_remove(ARRAY[
-           CASE WHEN NOT table_exists THEN 'table_missing' END,
-           CASE WHEN NOT index_exists THEN 'index_missing' END,
-           CASE WHEN NOT ordinary_table THEN 'table_not_ordinary' END,
-           CASE WHEN NOT btree_index THEN 'index_not_btree' END,
-           CASE WHEN NOT unique_index THEN 'index_not_unique' END,
-           CASE WHEN NOT index_valid_ready_live THEN 'index_invalid_not_ready_or_not_live' END,
-           CASE WHEN NOT only_code_hash THEN 'index_is_multicolumn_or_has_include_columns' END,
-           CASE WHEN NOT code_hash_not_null THEN 'code_hash_nullable_or_missing' END,
-           CASE WHEN NOT default_collation THEN 'non_default_collation' END,
-           CASE WHEN NOT default_null_treatment THEN 'index_nulls_not_distinct' END,
-           CASE WHEN NOT default_operator_class THEN 'non_default_operator_class' END,
-           CASE WHEN NOT default_ordering THEN 'non_default_ordering' END,
-           CASE WHEN NOT no_predicate THEN 'partial_index' END,
-           CASE WHEN NOT no_expressions THEN 'expression_index' END,
-           CASE WHEN constraint_backed THEN 'index_backs_constraint' END,
-           CASE WHEN table_has_primary_key THEN 'table_already_has_primary_key' END
-         ], NULL) AS failure_reasons
-  FROM checks
-)
-SELECT cardinality(failure_reasons) = 0 AS ready_for_primary_key,
-       failure_reasons
-FROM failures;
-```
-
-Do not run that snippet against a custom surrogate-primary-key layout. It may
-already provide a usable replica identity and require no database change, but
-it still needs a tailored runtime and constraint review.
-
-Complete this promotion before adding the table to a publication that publishes
-`UPDATE` or `DELETE`; under the historical default identity, the corresponding
-writes otherwise fail at the publisher. Logical replication does not copy this
-DDL, so apply the schema change to the subscriber first, then to the publisher.
-If the publisher used `REPLICA IDENTITY FULL` as a temporary workaround, keep
-FULL until both sides have the primary key. The generic migration preserves
-FULL. On the publisher only, once the subscriber is ready, add this line
-immediately after the primary-key promotion when FULL was temporary:
-
-```elixir
-execute "ALTER TABLE #{table()} REPLICA IDENTITY DEFAULT"
-```
-
-That keeps the reset's second `ACCESS EXCLUSIVE` ALTER in the promotion
-transaction and avoids another deployment window. Do not add it when FULL is
-deliberate policy.
+## 4. Add the 3.0 and 3.1 invariants
 
 ### Add the refresh-family invariants
 
-After the verified refresh-token source is in its target schema, add the unique
-generation index. Use the same Ecto prefix as runtime (`nil` for `public`):
+After the verified refresh-token source is in its target schema, use
+attesto_phoenix 3.2 or later to generate the supported 3.0 upgrade migration:
 
-```elixir
-def up do
-  prefix = "oauth" # Use nil for public.
+First remove every legacy `:table_prefix` setting from the Mix environment the
+task loads, after completing the inventory and while all writers remain
+stopped. The generator rejects that retired setting even when an explicit
+`--schema-prefix` is supplied. This prepares the migration command only; do not
+start the 3.x application until the remaining verification and configuration
+steps are complete.
 
-  create unique_index(
-    :attesto_refresh_tokens,
-    [:family_id, :generation],
-    name: :attesto_refresh_tokens_family_id_generation_index,
-    prefix: prefix
-  )
-end
+```bash
+# Use the configured schema_prefix; without one, the migration defers to the
+# Ecto migrator/repo default (normally public). Keep that aligned with the
+# runtime connection search path:
+mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo
+
+# Force public when the repo has a different migration default:
+mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo --schema-prefix public
+
+# When using a dedicated PostgreSQL schema:
+mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo --schema-prefix oauth
 ```
 
-If creation reports duplicate `(family_id, generation)` rows, stop. Determine
+The generated file is named
+`<timestamp>_upgrade_attesto_phoenix_to_3_0.exs`. In one migration transaction
+it:
+
+1. applies a five-second transaction-local lock timeout, validates or creates
+   the canonical unique index on
+   `attesto_refresh_tokens(family_id, generation)`, and rejects a partial,
+   expression, included-column, invalid, differently ordered, or otherwise
+   noncanonical collision;
+2. validates or creates the durable `attesto_refresh_family_revocations`
+   table and its `family_id` primary key, refusing a partial or incompatible
+   pre-existing object; and
+3. backfills every distinct `family_revoked = true` family with an idempotent
+   conflict-safe insert after the required DDL is visible.
+
+The transaction rolls back all of those changes together if duplicate
+generations, malformed catalog objects, or another validation failure is
+found.
+
+Apply the migration with `mix ecto.migrate`.
+
+Contention and retry: If creation encounters lock contention on
+`attesto_refresh_tokens` (PostgreSQL error 55P03:
+`lock_not_available`), keep all token writers stopped, identify and wait for
+or terminate the lock holder, and retry `mix ecto.migrate`.
+
+Rollback also requires all 3.x writers to remain stopped. The migration locks
+both refresh tables and refuses to drop a tombstone unless every corresponding
+legacy `attesto_refresh_tokens` row exists and has `family_revoked = true`. A
+family with a missing row or with mixed `family_revoked = true` and false rows
+is rejected: 2.x cannot represent the durable revocation safely in either case.
+Before starting 2.x code, wait out the longest active refresh retry deadline (or
+accept that an honest retry may be treated as reuse), because 2.x cannot recover
+3.x successor envelopes.
+
+If migration execution reports duplicate `(family_id, generation)` rows, stop. Determine
 the authoritative lineage, reconcile and revoke affected families, preserve
 the audit trail, and retry only after review. Never delete a row just to make
-the index build succeed.
+the index build succeed. Never start a 3.0 writer before the migration and
+tombstone backfill are complete.
 
-Create the new durable refresh-family tombstone table in the target schema and
-backfill it from the verified refresh-token source. This is a forward migration
-for an existing database, not the generated fresh-install migration:
+### Promote the authorization-code index to a primary key
 
-```elixir
-def up do
-  prefix = "oauth" # Use nil for public.
-  schema = prefix || "public"
+After moving the verified authorization-code source to its canonical target
+name and applying the 3.0 migration, generate the 3.1 upgrade migration. It
+accepts only the exact historical generated unique index or the exact
+already-promoted primary key; malformed, renamed, partial, expression,
+included-column, non-default-collation, or otherwise ambiguous layouts fail
+closed for manual review.
 
-  create table(:attesto_refresh_family_revocations, primary_key: false, prefix: prefix) do
-    add :family_id, :string, primary_key: true, null: false
-    add :revoked_at, :utc_datetime, null: false
-  end
+```bash
+mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
 
-  execute("""
-  INSERT INTO "#{schema}".attesto_refresh_family_revocations (family_id, revoked_at)
-  SELECT DISTINCT family_id, CURRENT_TIMESTAMP
-  FROM "#{schema}".attesto_refresh_tokens
-  WHERE family_revoked = true
-  ON CONFLICT (family_id) DO NOTHING
-  """)
-end
+# Dedicated PostgreSQL schema:
+mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo --schema-prefix oauth
 ```
 
-Validate `prefix` and `schema` as fixed migration values before applying this
-code. For `public`, use `prefix = nil` and qualify both tables as `public` (or
-use the corresponding unqualified Ecto operation). Never backfill from a
-different candidate relation, and never start a 3.0 writer before the
-tombstone backfill is complete.
+A source whose historical index retained a noncanonical name after a table
+move needs a separately reviewed migration; the generator will not guess that
+the renamed object has canonical semantics.
+
+Complete this promotion before adding the table to a publication that
+publishes `UPDATE` or `DELETE`; under the historical default identity, those
+writes otherwise fail at the publisher. Logical replication does not copy DDL,
+so apply the migration to the subscriber first, then to the publisher. The
+generated migration preserves an explicit replica-identity selection when it
+promotes or rolls back the canonical index.
 
 ## 5. Verify before changing application configuration
 
@@ -478,12 +355,12 @@ With writers still stopped:
    3.0 and must confirm that every store resolves to the one target schema and
    canonical table name.
 
-Only after these checks pass, remove every old `:table_prefix` setting and
-configure the public 3.0 key:
+Only after these checks pass, confirm every old `:table_prefix` setting remains
+removed and configure the 3.0 `:schema_prefix` key:
 
 ```elixir
 config :my_app, AttestoPhoenix.Config,
-  schema_prefix: "oauth" # nil means public
+  schema_prefix: "oauth" # nil uses the Ecto/repo connection default/search_path (often public)
 ```
 
 For future fresh databases, generate tables with the schema option:

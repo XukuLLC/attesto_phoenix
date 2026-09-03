@@ -30,6 +30,7 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   alias Attesto.Claims
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DeviceCode
+  alias AttestoPhoenix.Store.Sweeper
 
   @invalid_approval_claims "device-code approval has invalid granted claims"
 
@@ -37,10 +38,12 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   @spec put(Attesto.DeviceCodeStore.entry()) :: :ok | {:error, :user_code_taken}
   def put(%{device_code_hash: hash, user_code: user_code} = record) when is_binary(hash) and is_binary(user_code) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
 
     record
     |> DeviceCode.from_record(prefix: prefix)
-    |> repo().insert(prefix: prefix, log: false, telemetry_event: nil)
+    |> repo.insert(prefix: prefix, log: false, telemetry_event: nil)
     |> case do
       {:ok, _row} ->
         :ok
@@ -113,6 +116,8 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
           {:ok, Attesto.DeviceCodeStore.entry()} | {:error, :slow_down} | :error
   def poll(hash, %{now: now, interval: interval}) when is_binary(hash) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now_dt = DateTime.from_unix!(now) |> DateTime.truncate(:second)
     cutoff = DateTime.from_unix!(now - interval) |> DateTime.truncate(:second)
 
@@ -121,13 +126,13 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
         where: d.device_code_hash == ^hash and (is_nil(d.last_polled_at) or d.last_polled_at <= ^cutoff),
         select: d
 
-    case repo().update_all(query, [set: [last_polled_at: now_dt]],
+    case repo.update_all(query, [set: [last_polled_at: now_dt]],
            prefix: prefix,
            log: false,
            telemetry_event: nil
          ) do
       {1, [row]} -> {:ok, DeviceCode.to_entry(%{row | last_polled_at: now_dt})}
-      {0, _} -> slow_down_or_missing(hash)
+      {0, _} -> slow_down_or_missing(repo, hash, prefix)
     end
   end
 
@@ -136,6 +141,8 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
           {:ok, Attesto.DeviceCodeStore.entry()} | :error
   def consume(hash, opts) when is_binary(hash) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = opts |> Map.get(:now, System.system_time(:second)) |> DateTime.from_unix!() |> DateTime.truncate(:second)
 
     # Guard on approval AND unexpiry, so a code that expires between the core's
@@ -145,7 +152,7 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
         where: d.device_code_hash == ^hash and d.status == :approved and d.expires_at > ^now,
         select: d
 
-    case repo().update_all(query, [set: [status: :consumed]],
+    case repo.update_all(query, [set: [status: :consumed]],
            prefix: prefix,
            log: false,
            telemetry_event: nil
@@ -163,6 +170,8 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   # (already_decided) — distinguished by a follow-up read.
   defp decide(user_code, now, set) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now_dt = DateTime.from_unix!(now) |> DateTime.truncate(:second)
 
     query =
@@ -170,21 +179,20 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
         where: d.user_code == ^user_code and d.status == :pending and d.expires_at > ^now_dt,
         select: d
 
-    case repo().update_all(query, [set: set],
+    case repo.update_all(query, [set: set],
            prefix: prefix,
            log: false,
            telemetry_event: nil
          ) do
       {1, [row]} -> {:ok, DeviceCode.to_entry(Map.merge(row, Map.new(set)))}
-      {0, _} -> decide_miss(user_code, now_dt)
+      {0, _} -> decide_miss(repo, user_code, now_dt, prefix)
     end
   end
 
-  defp decide_miss(user_code, now_dt) do
-    prefix = Config.table_prefix()
+  defp decide_miss(repo, user_code, now_dt, prefix) do
     query = from d in DeviceCode, where: d.user_code == ^user_code, select: {d.status, d.expires_at}
 
-    case repo().one(query, prefix: prefix, log: false, telemetry_event: nil) do
+    case repo.one(query, prefix: prefix, log: false, telemetry_event: nil) do
       nil ->
         {:error, :not_found}
 
@@ -196,10 +204,8 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
     end
   end
 
-  defp slow_down_or_missing(hash) do
-    prefix = Config.table_prefix()
-
-    if repo().exists?(from(d in DeviceCode, where: d.device_code_hash == ^hash),
+  defp slow_down_or_missing(repo, hash, prefix) do
+    if repo.exists?(from(d in DeviceCode, where: d.device_code_hash == ^hash),
          prefix: prefix,
          log: false,
          telemetry_event: nil

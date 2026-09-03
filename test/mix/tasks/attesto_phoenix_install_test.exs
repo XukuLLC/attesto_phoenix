@@ -18,11 +18,15 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   import Igniter.Test
 
   alias Attesto.PrincipalKind
+  alias AttestoPhoenix.AppEnvSnapshot
   alias AttestoPhoenix.Config, as: PhoenixConfig
   alias AttestoPhoenix.Store.Sweeper
   alias Test.AuthZ.PrincipalStore
 
   @task "attesto_phoenix.install"
+
+  # The applications configured by test fixtures and the installer task.
+  @isolated_apps [:attesto_phoenix, :test]
 
   # The synthetic project's app is `:test` with module prefix `Test`, so the
   # scaffolded callbacks land under `Test.AuthZ.*` and the router (seeded below)
@@ -217,6 +221,41 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
     schema_prefix: "tenant_auth"
   """
 
+  @existing_oauth_path_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    oauth_path_prefix: "/tenant/oauth"
+  """
+
+  @unsupported_configured_oauth_path_prefix_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    oauth_path_prefix: "/authorization"
+  """
+
+  @dynamic_oauth_path_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    oauth_path_prefix: System.get_env("ATTESTO_OAUTH_PATH", "/tenant/oauth")
+  """
+
+  @multiple_oauth_path_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    oauth_path_prefix: "/tenant/oauth"
+  """
+
+  @omitted_oauth_path_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+  """
+
   @default_schema_prefix_config_fixture """
   import Config
 
@@ -249,6 +288,36 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
     schema_prefix: "tenant_prod"
   """
 
+  @split_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_auth"
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+  """
+
+  @reverse_split_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  config :test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_auth"
+  """
+
+  @partial_only_schema_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  config :test, AttestoPhoenix.Config,
+    audience: "https://api.example"
+  """
+
   @invalid_schema_prefix_config_fixture """
   import Config
 
@@ -278,6 +347,275 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
     schema_prefix: "tenant_auth"
   """
 
+  @elixir_qualified_config_fixture """
+  import Config
+
+  config :test, Elixir.AttestoPhoenix.Config,
+    schema_prefix: "tenant_auth",
+    oauth_path_prefix: "/tenant/oauth"
+  """
+
+  @elixir_qualified_alias_config_fixture """
+  import Config
+
+  alias Elixir.AttestoPhoenix.Config, as: APC
+
+  config :test, APC,
+    schema_prefix: "tenant_auth",
+    oauth_path_prefix: "/tenant/oauth"
+  """
+
+  @remote_config_fixture """
+  import Config
+
+  Config.config(:test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_auth",
+    oauth_path_prefix: "/tenant/oauth"
+  )
+  """
+
+  @elixir_remote_config_fixture """
+  import Config
+
+  Elixir.Config.config(:test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_auth",
+    oauth_path_prefix: "/tenant/oauth"
+  )
+  """
+
+  @aliased_remote_config_fixture """
+  import Config
+
+  alias Config, as: AppConfig
+
+  AppConfig.config(:test, AttestoPhoenix.Config,
+    schema_prefix: "tenant_auth",
+    oauth_path_prefix: "/tenant/oauth"
+  )
+  """
+
+  @chained_namespace_alias_config_fixture """
+  import Config
+
+  alias AttestoPhoenix, as: AP
+  alias AP.Config, as: APC
+
+  Config.config(:test, APC,
+    schema_prefix: "tenant_auth",
+    oauth_path_prefix: "/tenant/oauth"
+  )
+  """
+
+  @unrelated_fully_qualified_config_fixture """
+  import Config
+
+  config :test, OtherApp.Config,
+    schema_prefix: "other_schema",
+    oauth_path_prefix: "/other/oauth"
+  """
+
+  @conditional_if_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  if config_env() == :prod do
+    config :test, AttestoPhoenix.Config,
+      schema_prefix: "tenant_auth"
+  end
+  """
+
+  @conditional_if_oauth_path_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  if config_env() == :prod do
+    config :test, AttestoPhoenix.Config,
+      oauth_path_prefix: "/tenant/oauth"
+  end
+  """
+
+  @conditional_case_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  case config_env() do
+    :prod ->
+      config :test, AttestoPhoenix.Config,
+        schema_prefix: "tenant_auth"
+
+    _other ->
+      config :test, AttestoPhoenix.Config,
+        schema_prefix: nil
+  end
+  """
+
+  @conditional_case_oauth_path_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  case config_env() do
+    :prod ->
+      config :test, AttestoPhoenix.Config,
+        oauth_path_prefix: "/tenant/oauth"
+
+    _other ->
+      config :test, AttestoPhoenix.Config,
+        oauth_path_prefix: "/oauth"
+  end
+  """
+
+  @conditional_runtime_schema_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  if config_env() == :prod do
+    config :test, AttestoPhoenix.Config,
+      schema_prefix: "tenant_auth"
+  end
+  """
+
+  @conditional_runtime_oauth_path_prefix_config_fixture """
+  import Config
+
+  config :test, AttestoPhoenix.Config,
+    issuer: "https://issuer.example"
+
+  if config_env() == :prod do
+    config :test, AttestoPhoenix.Config,
+      oauth_path_prefix: "/tenant/oauth"
+  end
+  """
+
+  @conditional_nested_namespace_alias_schema_fixture """
+  import Config
+
+  if config_env() == :prod do
+    alias AttestoPhoenix, as: AP
+    config :test, AP.Config,
+      schema_prefix: "tenant_auth"
+  end
+  """
+
+  @conditional_nested_namespace_alias_oauth_fixture """
+  import Config
+
+  case config_env() do
+    :prod ->
+      alias AttestoPhoenix, as: AP
+      config :test, AP.Config,
+        oauth_path_prefix: "/tenant/oauth"
+
+    _other ->
+      :ok
+  end
+  """
+
+  @nested_function_schema_prefix_config_fixture """
+  import Config
+
+  defmodule Helper do
+    def apply do
+      config :test, AttestoPhoenix.Config,
+        schema_prefix: "tenant_auth"
+    end
+  end
+  """
+
+  @nested_function_oauth_path_prefix_config_fixture """
+  import Config
+
+  defmodule Helper do
+    def apply do
+      config :test, AttestoPhoenix.Config,
+        oauth_path_prefix: "/tenant/oauth"
+    end
+  end
+  """
+
+  @nested_quote_schema_prefix_config_fixture """
+  import Config
+
+  quote do
+    config :test, AttestoPhoenix.Config,
+      schema_prefix: "tenant_auth"
+  end
+  """
+
+  @nested_quote_oauth_path_prefix_config_fixture """
+  import Config
+
+  quote do
+    config :test, AttestoPhoenix.Config,
+      oauth_path_prefix: "/tenant/oauth"
+  end
+  """
+
+  @alias_after_config_prefixes_fixture """
+  import Config
+
+  config :test, APC,
+    schema_prefix: "tenant_auth",
+    oauth_path_prefix: "/tenant/oauth"
+
+  alias AttestoPhoenix.Config, as: APC
+  """
+
+  @nested_alias_schema_prefix_fixture """
+  import Config
+
+  defmodule AliasHolder do
+    alias AttestoPhoenix.Config, as: APC
+    def config_module, do: APC
+  end
+
+  config :test, APC,
+    schema_prefix: "tenant_auth"
+  """
+
+  @nested_alias_oauth_path_prefix_fixture """
+  import Config
+
+  defmodule AliasHolder do
+    alias AttestoPhoenix.Config, as: APC
+    def config_module, do: APC
+  end
+
+  config :test, APC,
+    oauth_path_prefix: "/tenant/oauth"
+  """
+
+  @quoted_alias_schema_prefix_fixture """
+  import Config
+
+  quote do
+    alias AttestoPhoenix.Config, as: APC
+  end
+
+  config :test, APC,
+    schema_prefix: "tenant_auth"
+  """
+
+  @quoted_alias_oauth_path_prefix_fixture """
+  import Config
+
+  quote do
+    alias AttestoPhoenix.Config, as: APC
+  end
+
+  config :test, APC,
+    oauth_path_prefix: "/tenant/oauth"
+  """
+
   @ambiguous_schema_prefix_module_fixture """
   import Config
 
@@ -297,6 +635,26 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
 
   config Application.get_env(:test, :otp_app, :test), AttestoPhoenix.Config,
     schema_prefix: "tenant_auth"
+  """
+
+  @two_argument_config_fixture """
+  import Config
+
+  config :test,
+    [{AttestoPhoenix.Config,
+      [schema_prefix: "tenant_auth", oauth_path_prefix: "/tenant/oauth"]}]
+  """
+
+  @package_legacy_keyword_config_fixture """
+  import Config
+
+  config :attesto_phoenix, table_prefix: "oauth_"
+  """
+
+  @package_legacy_key_config_fixture """
+  import Config
+
+  config :attesto_phoenix, :table_prefix, "oauth_"
   """
 
   @existing_runtime_secret_fixture """
@@ -349,6 +707,20 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
         @application_path => @application_fixture
       }
     )
+  end
+
+  setup do
+    AppEnvSnapshot.ensure_unset!([
+      {:attesto_phoenix, AttestoPhoenix.Config},
+      {:attesto_phoenix, :otp_app},
+      {:attesto_phoenix, :table_prefix},
+      {:test, AttestoPhoenix.Config}
+    ])
+
+    snapshot = AppEnvSnapshot.snapshot(@isolated_apps)
+    on_exit(fn -> AppEnvSnapshot.restore(snapshot) end)
+
+    :ok
   end
 
   describe "first run" do
@@ -502,6 +874,116 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                "attesto_routes(prefix: \"/mcp\", pipeline: :attesto_phoenix_config)"
     end
 
+    test "requires an explicit oauth path to match existing host config" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @existing_oauth_path_prefix_config_fixture
+          }
+        )
+
+      router_before = source_content(igniter, @router_path)
+
+      assert_raise Mix.Error, ~r/--oauth-path-prefix.*does not match.*tenant\/oauth/, fn ->
+        Igniter.compose_task(igniter, @task, ["--oauth-path-prefix", "/mcp/oauth"])
+      end
+
+      assert source_content(igniter, @router_path) == router_before
+      refute Igniter.exists?(igniter, @client_store_path)
+    end
+
+    test "allows an explicit oauth path that matches existing host config" do
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @existing_oauth_path_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, ["--oauth-path-prefix", "/tenant/oauth"])
+        |> apply_igniter!()
+
+      assert source_content(applied, @router_path) =~
+               "attesto_routes(prefix: \"/tenant\", pipeline: :attesto_phoenix_config)"
+    end
+
+    test "does not let an explicit oauth path bypass dynamic host config" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @dynamic_oauth_path_prefix_config_fixture
+          }
+        )
+
+      assert_raise Mix.Error, ~r/could not determine configured :oauth_path_prefix expression/, fn ->
+        Igniter.compose_task(igniter, @task, ["--oauth-path-prefix", "/mcp/oauth"])
+      end
+
+      refute Igniter.exists?(igniter, @client_store_path)
+    end
+
+    test "does not let an explicit oauth path bypass multiple host config values" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @multiple_oauth_path_prefix_config_fixture,
+            "config/prod.exs" =>
+              String.replace(@multiple_oauth_path_prefix_config_fixture, "/tenant/oauth", "/mcp/oauth")
+          }
+        )
+
+      assert_raise Mix.Error, ~r/multiple literal values.*compiled route/, fn ->
+        Igniter.compose_task(igniter, @task, ["--oauth-path-prefix", "/mcp/oauth"])
+      end
+
+      refute Igniter.exists?(igniter, @client_store_path)
+    end
+
+    test "treats an omitted oauth path as the default when comparing config sources" do
+      files = %{
+        "mix.exs" => @mix_fixture,
+        @router_path => @router_fixture,
+        @application_path => @application_fixture,
+        @config_path => @omitted_oauth_path_prefix_config_fixture,
+        "config/prod.exs" => @existing_oauth_path_prefix_config_fixture
+      }
+
+      assert_raise Mix.Error, ~r/multiple literal values.*oauth/, fn ->
+        Igniter.compose_task(test_project(files: files), @task, [])
+      end
+    end
+
+    test "rejects an explicit oauth path when omitted and explicit config sources disagree" do
+      files = %{
+        "mix.exs" => @mix_fixture,
+        @router_path => @router_fixture,
+        @application_path => @application_fixture,
+        @config_path => @omitted_oauth_path_prefix_config_fixture,
+        "config/prod.exs" => @existing_oauth_path_prefix_config_fixture
+      }
+
+      igniter = test_project(files: files)
+      router_before = source_content(igniter, @router_path)
+
+      assert_raise Mix.Error, ~r/multiple literal values.*compiled route/, fn ->
+        Igniter.compose_task(igniter, @task, ["--oauth-path-prefix", "/tenant/oauth"])
+      end
+
+      assert source_content(igniter, @router_path) == router_before
+      refute Igniter.exists?(igniter, @client_store_path)
+    end
+
     test "flagless rerun preserves a relocated oauth path prefix" do
       first =
         project()
@@ -547,6 +1029,31 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
         assert source_content(igniter, @router_path) == router_before
         refute Igniter.exists?(igniter, @client_store_path)
       end
+    end
+
+    test "refuses an unsupported configured :oauth_path_prefix without naming a flag" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @unsupported_configured_oauth_path_prefix_fixture
+          }
+        )
+
+      config_before = source_content(igniter, @config_path)
+
+      error =
+        assert_raise Mix.Error, fn ->
+          Igniter.compose_task(igniter, @task, [])
+        end
+
+      assert error.message =~ "configured :oauth_path_prefix"
+      assert error.message =~ "/authorization"
+      refute error.message =~ ~s|--oauth-path-prefix "/authorization"|
+      assert source_content(igniter, @config_path) == config_before
+      refute Igniter.exists?(igniter, @client_store_path)
     end
 
     test "normalizes one trailing slash on a supported oauth prefix" do
@@ -727,16 +1234,13 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
 
       assert Enum.any?(composed.notices, fn notice ->
                notice =~ "--schema-prefix tenant_auth" and
+                 notice =~ "gen.migration --upgrade 3.0 --repo Test.Repo" and
+                 notice =~ "gen.migration --upgrade 3.1 --repo Test.Repo" and
                  notice =~ "PostgreSQL schema `tenant_auth`" and
                  notice =~ "{repo, schema_prefix}" and
-                 notice =~ "attesto_refresh_tokens_family_id_generation_index" and
                  notice =~ "attesto_authorization_codes_code_hash_index" and
-                 notice =~ "`code_hash` is `NOT NULL`" and
                  notice =~ "subscriber" and
-                 notice =~ "publisher second" and
-                 notice =~ "catalog-preflight" and
-                 notice =~ "`ACCESS EXCLUSIVE`" and
-                 notice =~ "`lock_timeout`"
+                 notice =~ "publisher second"
              end)
 
       applied =
@@ -767,6 +1271,139 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert source_content(applied, @config_path) =~ "schema_prefix: \"tenant_auth\""
     end
 
+    test "rerun accepts an explicit schema prefix only when existing config already matches" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @existing_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, ["--schema-prefix", "tenant_auth"])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "--schema-prefix tenant_auth" and
+                 notice =~ "PostgreSQL schema \`tenant_auth\`"
+             end)
+
+      applied = apply_igniter!(composed)
+      assert source_content(applied, @config_path) =~ "schema_prefix: \"tenant_auth\""
+    end
+
+    test "partial config calls in the same source do not erase an explicit schema prefix" do
+      for config <- [@split_schema_prefix_config_fixture, @reverse_split_schema_prefix_config_fixture] do
+        composed =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @config_path => config
+            }
+          )
+          |> Igniter.compose_task(@task, [])
+
+        assert Enum.any?(composed.notices, &String.contains?(&1, "--schema-prefix tenant_auth"))
+      end
+    end
+
+    test "multiple partial config calls in one source retain the omitted/default selection" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @partial_only_schema_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "gen.migration --repo Test.Repo" and
+                 notice =~ "connection's default search path"
+             end)
+    end
+
+    test "rerun refuses an explicit schema prefix that differs from existing config" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @existing_schema_prefix_config_fixture
+          }
+        )
+
+      config_before = source_content(igniter, @config_path)
+
+      assert_raise Mix.Error, ~r/does not match the existing host configuration.*will not overwrite/s, fn ->
+        Igniter.compose_task(igniter, @task, ["--schema-prefix", "other_schema"])
+      end
+
+      assert source_content(igniter, @config_path) == config_before
+      refute Igniter.exists?(igniter, @client_store_path)
+    end
+
+    test "rerun distinguishes an explicit schema from an existing explicit nil" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @default_schema_prefix_config_fixture
+          }
+        )
+
+      assert_raise Mix.Error, ~r/does not match the existing host configuration nil/, fn ->
+        Igniter.compose_task(igniter, @task, ["--schema-prefix", "tenant_auth"])
+      end
+    end
+
+    test "rerun refuses a non-public prefix when the existing config omitted the key" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @old_installer_config_fixture
+          }
+        )
+
+      assert_raise Mix.Error, ~r/does not match the existing host configuration nil/, fn ->
+        Igniter.compose_task(igniter, @task, ["--schema-prefix", "tenant_auth"])
+      end
+
+      refute Igniter.exists?(igniter, @client_store_path)
+      refute source_content(igniter, @config_path) =~ "schema_prefix:"
+    end
+
+    test "reads schema and OAuth prefixes from valid two-argument Config syntax" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @two_argument_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, &String.contains?(&1, "--schema-prefix tenant_auth"))
+      assert Enum.any?(composed.notices, &String.contains?(&1, "/tenant/oauth"))
+
+      applied = apply_igniter!(composed)
+      config = source_content(applied, @config_path)
+      assert config =~ "schema_prefix: \"tenant_auth\""
+      assert config =~ "oauth_path_prefix: \"/tenant/oauth\""
+    end
+
     test "resolves a direct AttestoPhoenix.Config alias when reading schema" do
       composed =
         test_project(
@@ -783,6 +1420,111 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                notice =~ "--schema-prefix tenant_auth" and
                  notice =~ "PostgreSQL schema `tenant_auth`"
              end)
+    end
+
+    test "recognizes Elixir-qualified Config while preserving routes and notices" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @elixir_qualified_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "--schema-prefix tenant_auth" and notice =~ "/tenant/oauth"
+             end)
+
+      applied = apply_igniter!(composed)
+      config = source_content(applied, @config_path)
+      router = source_content(applied, @router_path)
+
+      assert config =~ "schema_prefix: \"tenant_auth\""
+      assert config =~ "oauth_path_prefix: \"/tenant/oauth\""
+      assert router =~ "attesto_routes(prefix: \"/tenant\", pipeline: :attesto_phoenix_config)"
+    end
+
+    test "recognizes an Elixir-qualified Config alias while preserving routes and notices" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @elixir_qualified_alias_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "--schema-prefix tenant_auth" and notice =~ "/tenant/oauth"
+             end)
+
+      applied = apply_igniter!(composed)
+      config = source_content(applied, @config_path)
+      router = source_content(applied, @router_path)
+
+      assert config =~ "schema_prefix: \"tenant_auth\""
+      assert config =~ "oauth_path_prefix: \"/tenant/oauth\""
+      assert router =~ "attesto_routes(prefix: \"/tenant\", pipeline: :attesto_phoenix_config)"
+    end
+
+    test "recognizes qualified Config.config calls for both supported module names" do
+      for fixture <- [@remote_config_fixture, @elixir_remote_config_fixture, @aliased_remote_config_fixture] do
+        composed =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @config_path => fixture
+            }
+          )
+          |> Igniter.compose_task(@task, [])
+
+        assert Enum.any?(composed.notices, fn notice ->
+                 notice =~ "--schema-prefix tenant_auth" and notice =~ "/tenant/oauth"
+               end)
+      end
+    end
+
+    test "expands chained namespace aliases before reading qualified Config.config" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @chained_namespace_alias_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~ "--schema-prefix tenant_auth" and notice =~ "/tenant/oauth"
+             end)
+    end
+
+    test "ignores unrelated fully-qualified config modules" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @unrelated_fully_qualified_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+
+      assert Enum.any?(composed.notices, &String.contains?(&1, "connection's default search path"))
+      refute Enum.any?(composed.notices, &String.contains?(&1, "other_schema"))
+
+      applied = apply_igniter!(composed)
+      assert source_content(applied, @config_path) =~ "schema_prefix: nil"
     end
 
     test "refuses dynamic schema options before mutating the project" do
@@ -803,6 +1545,24 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       end
 
       assert source_content(igniter, @router_path) == router_before
+      refute Igniter.exists?(igniter, @client_store_path)
+    end
+
+    test "an explicit prefix cannot bypass dynamic host schema configuration" do
+      igniter =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @dynamic_schema_prefix_config_fixture
+          }
+        )
+
+      assert_raise Mix.Error, ~r/could not determine configured :schema_prefix expression/, fn ->
+        Igniter.compose_task(igniter, @task, ["--schema-prefix", "tenant_auth"])
+      end
+
       refute Igniter.exists?(igniter, @client_store_path)
     end
 
@@ -869,8 +1629,134 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       refute Igniter.exists?(igniter, @client_store_path)
     end
 
-    test "requires an explicit schema prefix when config sources disagree" do
-      assert_raise Mix.Error, ~r/multiple literal values.*--schema-prefix explicitly/, fn ->
+    test "fails closed for conditional schema config in every config source" do
+      fixtures = [
+        {@conditional_if_schema_prefix_config_fixture, @config_path},
+        {@conditional_case_schema_prefix_config_fixture, @config_path},
+        {@conditional_runtime_schema_prefix_config_fixture, @runtime_config_path},
+        {@nested_function_schema_prefix_config_fixture, @config_path},
+        {@nested_quote_schema_prefix_config_fixture, @config_path}
+      ]
+
+      for {fixture, path} <- fixtures, options <- [[], ["--schema-prefix", "tenant_auth"]] do
+        igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              path => fixture
+            }
+          )
+
+        router_before = source_content(igniter, @router_path)
+        source_before = source_content(igniter, path)
+
+        assert_raise Mix.Error,
+                     ~r/could not determine configured :schema_prefix expression.*nested config expression/,
+                     fn ->
+                       Igniter.compose_task(igniter, @task, options)
+                     end
+
+        assert source_content(igniter, path) == source_before
+        assert source_content(igniter, @router_path) == router_before
+        refute Igniter.exists?(igniter, @client_store_path)
+      end
+    end
+
+    test "fails closed for conditional OAuth config in every config source" do
+      fixtures = [
+        {@conditional_if_oauth_path_prefix_config_fixture, @config_path},
+        {@conditional_case_oauth_path_prefix_config_fixture, @config_path},
+        {@conditional_runtime_oauth_path_prefix_config_fixture, @runtime_config_path},
+        {@nested_function_oauth_path_prefix_config_fixture, @config_path},
+        {@nested_quote_oauth_path_prefix_config_fixture, @config_path}
+      ]
+
+      for {fixture, path} <- fixtures, options <- [[], ["--oauth-path-prefix", "/tenant/oauth"]] do
+        igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              path => fixture
+            }
+          )
+
+        router_before = source_content(igniter, @router_path)
+        source_before = source_content(igniter, path)
+
+        assert_raise Mix.Error,
+                     ~r/could not determine configured :oauth_path_prefix expression.*nested config expression/,
+                     fn ->
+                       Igniter.compose_task(igniter, @task, options)
+                     end
+
+        assert source_content(igniter, path) == source_before
+        assert source_content(igniter, @router_path) == router_before
+        refute Igniter.exists?(igniter, @client_store_path)
+      end
+    end
+
+    test "fails closed for conditional config using a nested namespace alias" do
+      fixtures = [
+        {@conditional_nested_namespace_alias_schema_fixture, :schema_prefix},
+        {@conditional_nested_namespace_alias_oauth_fixture, :oauth_path_prefix}
+      ]
+
+      for {fixture, setting} <- fixtures do
+        igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @config_path => fixture
+            }
+          )
+
+        assert_raise Mix.Error,
+                     ~r/could not determine configured :#{setting} expression.*nested config expression/,
+                     fn -> Igniter.compose_task(igniter, @task, []) end
+
+        refute Igniter.exists?(igniter, @client_store_path)
+      end
+    end
+
+    test "fails closed for aliases declared after or inside nested config code" do
+      fixtures = [
+        @alias_after_config_prefixes_fixture,
+        @nested_alias_schema_prefix_fixture,
+        @nested_alias_oauth_path_prefix_fixture,
+        @quoted_alias_schema_prefix_fixture,
+        @quoted_alias_oauth_path_prefix_fixture
+      ]
+
+      for fixture <- fixtures do
+        igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @config_path => fixture
+            }
+          )
+
+        router_before = source_content(igniter, @router_path)
+
+        assert_raise Mix.Error,
+                     ~r/could not determine configured :(?:schema_prefix|oauth_path_prefix) expression.*ambiguous config module APC/,
+                     fn -> Igniter.compose_task(igniter, @task, []) end
+
+        assert source_content(igniter, @router_path) == router_before
+        refute Igniter.exists?(igniter, @client_store_path)
+      end
+    end
+
+    test "refuses ambiguous literal schema prefixes without an explicit environment selection" do
+      assert_raise Mix.Error, ~r/multiple literal values.*Pass --schema-prefix/s, fn ->
         test_project(
           files: %{
             "mix.exs" => @mix_fixture,
@@ -884,8 +1770,66 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       end
     end
 
+    test "refuses an omitted base prefix plus an environment-specific prefix without an explicit selection" do
+      assert_raise Mix.Error, ~r/multiple literal values.*Pass --schema-prefix/s, fn ->
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @old_installer_config_fixture,
+            "config/prod.exs" => @production_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+      end
+    end
+
+    test "accepts an explicit prefix selected by environment-specific host config" do
+      composed =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @old_installer_config_fixture,
+            "config/prod.exs" => @production_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, ["--schema-prefix", "tenant_prod"])
+
+      assert Enum.any?(composed.notices, fn notice ->
+               notice =~
+                 "gen.migration --upgrade 3.0 --repo Test.Repo --schema-prefix tenant_prod" and
+                 notice =~
+                   "gen.migration --upgrade 3.1 --repo Test.Repo --schema-prefix tenant_prod"
+             end)
+
+      applied = apply_igniter!(composed)
+
+      application = source_content(applied, @application_path)
+      assert application =~ "AttestoPhoenix.Store.Sweeper"
+      refute source_content(applied, @config_path) =~ "schema_prefix:"
+      assert source_content(applied, "config/prod.exs") == @production_schema_prefix_config_fixture
+    end
+
+    test "rejects an explicit prefix absent from environment-specific host config" do
+      assert_raise Mix.Error, ~r/does not match any literal schema selected/, fn ->
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @config_path => @default_schema_prefix_config_fixture,
+            "config/prod.exs" => @production_schema_prefix_config_fixture
+          }
+        )
+        |> Igniter.compose_task(@task, ["--schema-prefix", "different"])
+      end
+    end
+
     test "requires an explicit schema prefix when one config source disagrees internally" do
-      assert_raise Mix.Error, ~r/multiple literal values.*--schema-prefix explicitly/, fn ->
+      igniter =
         test_project(
           files: %{
             "mix.exs" => @mix_fixture,
@@ -894,12 +1838,18 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
             @config_path => @same_file_schema_prefix_config_fixture
           }
         )
-        |> Igniter.compose_task(@task, [])
+
+      assert_raise Mix.Error, ~r/conflicting literal :schema_prefix values.*one config source/s, fn ->
+        Igniter.compose_task(igniter, @task, [])
+      end
+
+      assert_raise Mix.Error, ~r/conflicting literal :schema_prefix values.*explicit flag cannot/s, fn ->
+        Igniter.compose_task(igniter, @task, ["--schema-prefix", "tenant_prod"])
       end
     end
 
     test "requires an explicit schema prefix when one config call repeats the key" do
-      assert_raise Mix.Error, ~r/multiple literal values.*--schema-prefix explicitly/, fn ->
+      igniter =
         test_project(
           files: %{
             "mix.exs" => @mix_fixture,
@@ -908,7 +1858,13 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
             @config_path => @duplicate_keyword_schema_prefix_config_fixture
           }
         )
-        |> Igniter.compose_task(@task, [])
+
+      assert_raise Mix.Error, ~r/conflicting literal :schema_prefix values.*one config source/s, fn ->
+        Igniter.compose_task(igniter, @task, [])
+      end
+
+      assert_raise Mix.Error, ~r/conflicting literal :schema_prefix values.*explicit flag cannot/s, fn ->
+        Igniter.compose_task(igniter, @task, ["--schema-prefix", "tenant_prod"])
       end
     end
 
@@ -954,8 +1910,8 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       end
     end
 
-    test "notices and preserves a legacy table-prefix config on rerun" do
-      composed =
+    test "refuses a legacy table-prefix config on rerun before mutating the project" do
+      igniter =
         test_project(
           files: %{
             "mix.exs" => @mix_fixture,
@@ -964,19 +1920,95 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
             @config_path => @legacy_table_prefix_config_fixture
           }
         )
-        |> Igniter.compose_task(@task, [])
 
-      assert Enum.any?(composed.notices, fn notice ->
-               notice =~ "Legacy `:table_prefix` configuration was found" and
-                 notice =~ "not identify one runtime layout" and
-                 notice =~ "will fail closed"
-             end)
+      assert_raise Mix.Error, ~r/legacy :table_prefix configuration detected.*made no changes/s, fn ->
+        Igniter.compose_task(igniter, @task, [])
+      end
 
-      applied =
-        composed
-        |> apply_igniter!()
+      assert_raise Mix.Error, ~r/legacy :table_prefix configuration detected.*made no changes/s, fn ->
+        Igniter.compose_task(igniter, @task, ["--schema-prefix", "oauth"])
+      end
 
-      assert source_content(applied, @config_path) =~ "table_prefix: \"oauth\""
+      assert source_content(igniter, @config_path) =~ "table_prefix: \"oauth\""
+      refute Igniter.exists?(igniter, @client_store_path)
+    end
+
+    test "evaluated fixture config does not leak into the application environment" do
+      before_snapshot = AppEnvSnapshot.snapshot(@isolated_apps)
+
+      AppEnvSnapshot.isolate(@isolated_apps, fn ->
+        legacy_igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @config_path => @legacy_table_prefix_config_fixture
+            }
+          )
+
+        assert_raise Mix.Error, ~r/legacy :table_prefix configuration detected.*made no changes/s, fn ->
+          Igniter.compose_task(legacy_igniter, @task, [])
+        end
+
+        schema_igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @config_path => @existing_schema_prefix_config_fixture
+            }
+          )
+
+        _composed = Igniter.compose_task(schema_igniter, @task, [])
+
+        # Igniter evaluates the project config into the application environment
+        # while it formats files. Whether or not the installed Igniter version
+        # removes those keys afterwards, the isolation must leave no trace, so
+        # a leak is also forced explicitly here.
+        Application.put_env(:test, AttestoPhoenix.Config, table_prefix: "oauth")
+        Application.put_env(:attesto_phoenix, :otp_app, :test)
+      end)
+
+      assert AppEnvSnapshot.snapshot(@isolated_apps) == before_snapshot
+      assert Application.fetch_env(:attesto_phoenix, AttestoPhoenix.Config) == :error
+      assert Application.fetch_env(:attesto_phoenix, :otp_app) == :error
+      assert Application.fetch_env(:test, AttestoPhoenix.Config) == :error
+    end
+
+    test "refuses both package-level legacy table-prefix config syntaxes" do
+      previous = Application.get_env(:attesto_phoenix, :table_prefix, :missing)
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(:attesto_phoenix, :table_prefix)
+          value -> Application.put_env(:attesto_phoenix, :table_prefix, value)
+        end
+      end)
+
+      for config <- [@package_legacy_keyword_config_fixture, @package_legacy_key_config_fixture] do
+        Application.delete_env(:attesto_phoenix, :table_prefix)
+
+        igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @config_path => config
+            }
+          )
+
+        assert_raise Mix.Error, ~r/legacy :table_prefix configuration detected.*made no changes/s, fn ->
+          Igniter.compose_task(igniter, @task, [])
+        end
+
+        refute Igniter.exists?(igniter, @client_store_path)
+        assert source_content(igniter, @config_path) == config
+      end
+
+      Application.delete_env(:attesto_phoenix, :table_prefix)
     end
 
     test "repairs router output from installers that predate the config pipeline" do

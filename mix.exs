@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "3.1.0"
+  @version "3.2.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
   @attesto_requirement ">= 2.0.0 and < 3.0.0"
@@ -60,7 +60,7 @@ defmodule AttestoPhoenix.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger]]
+    [extra_applications: [:logger], mod: {AttestoPhoenix.Application, []}]
   end
 
   defp elixirc_paths(:test), do: ["lib", "test/support"]
@@ -122,6 +122,8 @@ defmodule AttestoPhoenix.MixProject do
       # Ecto-backed CodeStore/RefreshStore/NonceStore/ReplayCheck + the migration
       # generator.
       {:ecto_sql, "~> 3.10"},
+      # Runtime events emitted by the sweeper-liveness monitor.
+      {:telemetry, "~> 1.0"},
       # Controllers + the attesto_routes/1 router macro.
       {:phoenix, "~> 1.7.24 or >= 1.8.9 and < 2.0.0"},
       # Optional OpenAPI structs for hosts that publish an OpenApiSpex spec.
@@ -135,9 +137,9 @@ defmodule AttestoPhoenix.MixProject do
       # hex package never forces igniter onto a consumer that only depends on the
       # library at runtime. The dependency is present for the install task to
       # compile against and for a host that opts into running the installer, but
-      # it is not a transitive runtime requirement. The `~> 0.5` requirement
-      # admits the current 0.6 line.
-      {:igniter, "~> 0.5", optional: true},
+      # it is not a transitive runtime requirement. Igniter 0.6 is the oldest
+      # line that compiles on this package's supported Elixir/OTP floor.
+      {:igniter, "~> 0.6", optional: true},
 
       # HTTP client for the bundled Client ID Metadata/JWT JWKS fetcher, CIBA
       # ping deliverer, and Back-Channel Logout client. Req -> Finch -> Mint

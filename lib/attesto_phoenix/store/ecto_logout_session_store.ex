@@ -25,15 +25,18 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.LogoutSession
+  alias AttestoPhoenix.Store.Sweeper
 
   @impl Attesto.LogoutSessionStore
   @spec record(Attesto.LogoutSessionStore.entry()) :: :ok
   def record(%{sid: sid, client_id: client_id} = entry) when is_binary(sid) and is_binary(client_id) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
 
     entry
     |> LogoutSession.from_record(prefix: prefix)
-    |> repo().insert!(
+    |> repo.insert!(
       on_conflict:
         {:replace,
          [
@@ -80,10 +83,12 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
 
       filter ->
         prefix = Config.table_prefix()
+        repo = repo()
+        Sweeper.check_running_for_store(repo, prefix)
 
         LogoutSession
         |> filter.()
-        |> repo().delete_all(prefix: prefix, log: false, telemetry_event: nil)
+        |> repo.delete_all(prefix: prefix, log: false, telemetry_event: nil)
 
         :ok
     end
@@ -99,6 +104,8 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
       filter ->
         now = now_dt()
         prefix = Config.table_prefix()
+        repo = repo()
+        Sweeper.check_running_for_store(repo, prefix)
 
         # `DELETE ... RETURNING`: enumerate and remove the live rows in one
         # statement, so concurrent logouts cannot both deliver the same session.
@@ -107,7 +114,7 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStore do
           |> filter.()
 
         {_count, rows} =
-          repo().delete_all(query, prefix: prefix, log: false, telemetry_event: nil)
+          repo.delete_all(query, prefix: prefix, log: false, telemetry_event: nil)
 
         Enum.map(rows || [], &LogoutSession.to_target/1)
     end

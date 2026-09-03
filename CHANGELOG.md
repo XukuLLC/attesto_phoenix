@@ -6,6 +6,84 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-09-03
+
+### Added
+
+- Add `--upgrade 3.0` and `--upgrade 3.1` modes to
+  `mix attesto_phoenix.gen.migration`. Existing 2.14.x databases run both, in
+  order: the first installs the refresh-family generation invariant and durable
+  revocation tombstones; the second promotes the historical authorization-code
+  unique index to the current primary key. Both modes honor explicit, migrator,
+  and repository-default schema prefixes, validate existing objects before
+  adopting them, use a short transaction-local lock timeout, and fail the
+  migration transaction on an unsafe or ambiguous database layout. Their
+  rollbacks preserve durable revocation and replica-identity guarantees. The
+  tombstone-table preflight also rejects row-level security, policies, user
+  triggers, and rewrite rules that could alter or suppress the backfill, and a
+  post-backfill invariant confirms that every previously revoked family has a
+  durable tombstone before the transaction can commit. Migration filenames are
+  allocated under a directory-wide exclusive lock, remain strictly ordered
+  after existing or future-dated 14-digit versions, and fail closed on lock
+  residue or a conflicting generated upgrade.
+- Support `-r` as an alias for `--repo` in the migration generator, and resolve
+  repo priv paths correctly for umbrella projects and absolute `:priv` paths.
+- Add `AttestoPhoenix.Store.Sweeper.running?/0,1` and `verify_running!/0,1`
+  to check whether a genuine sweeper or an acknowledged cleanup worker is
+  active for a repository and schema prefix. These functions read process
+  liveness from a registry owned by the package root supervisor, so their
+  answers stay correct while the diagnostics supervisor restarts or remains
+  stopped.
+- Add `AttestoPhoenix.Store.Sweeper.register_cleanup_worker/1,2` to allow
+  applications with an equivalent cleanup process to register its PID and
+  suppress missing-sweeper warnings while it remains alive.
+- Emit an asynchronous warning and
+  `[:attesto_phoenix, :store, :sweeper_unsupervised]` telemetry event when an
+  application-facing mutation in a bundled Ecto store runs without its cleanup
+  worker, including refresh-store deployments with zero retry grace. Repeated
+  signals are limited to once per repository/schema pair per hour and retained
+  diagnostic state is capped at 1,024 pairs. Diagnostic failure never changes
+  store results or blocks on Logger or telemetry handlers. A registration for
+  a still-live local custom worker survives an `:attesto_phoenix` application
+  restart in the same VM; register again after the worker itself restarts or on
+  a new node boot.
+- Start a small package-owned supervision tree for bounded sweeper monitoring
+  and asynchronous diagnostic delivery.
+- Update the installer completion notice to distinguish fresh schema generation
+  from the supported `--upgrade 3.0` and `--upgrade 3.1` migration paths for
+  existing databases.
+- Make `Sweeper.sweep_now/0` resolve the packaged worker registered for the
+  current repository/schema pair. It now raises an actionable `RuntimeError`
+  when that worker is absent instead of surfacing a generic `:noproc` exit; a
+  registered equivalent cleanup worker is intentionally not invoked as the
+  packaged sweeper.
+
+### Changed
+
+- Make the Igniter installer's schema and OAuth-route selection fail closed on
+  retired, dynamic, conditional, internally conflicting, or otherwise
+  ambiguous host configuration. An explicit `--schema-prefix` may select a
+  matching environment-specific literal without rewriting the host's
+  configuration, but cannot override a conflicting value in one source. An
+  explicit `--oauth-path-prefix` must match the single configured literal so
+  the compiled route cannot diverge from advertised endpoints.
+- Replace the hand-transcribed authorization-code primary-key migration in
+  the 3.1.0 upgrade notes with the generated `--upgrade 3.1` migration. Its
+  rollback clears and restores `REPLICA IDENTITY USING INDEX` around the
+  constraint drop, a step a hand copy of that template had already omitted in
+  the field. Generated migrations resolve their schema from `--schema-prefix`,
+  then `Ecto.Migration.prefix/0`, then the repository's
+  `:migration_default_prefix`; host-authored raw SQL can call `prefix/0` the
+  same way instead of a hardcoded module attribute.
+- Raise the optional Igniter dependency floor from 0.5 to 0.6, the oldest line
+  that compiles on this package's supported Elixir/OTP floor.
+- Clarify that the controller contract is the two request-private Attesto
+  configuration values; `AttestoPhoenix.Plug.PutConfig` is the reference
+  implementation, not the only valid way to populate them.
+- Expand the stopped-cutover guide and installer notice around the supported
+  generated upgrade migrations and the concrete hazards of mixed 2.x/3.x
+  token writers.
+
 ## [3.1.0] - 2026-09-02
 
 ### Added
@@ -128,113 +206,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   table). PostgreSQL logical replication does not copy DDL: apply the schema
   change to the subscriber first, then to the publisher. If `REPLICA IDENTITY
   FULL` was used as a temporary publisher-side bridge, keep it until both
-  sides have the primary key. The generic migration below preserves `FULL`;
-  on the publisher, enable its commented reset only when `FULL` was temporary
-  and the subscriber is already ready.
+  sides have the primary key. The generated migration preserves `FULL`; when
+  `FULL` was a temporary publisher-side bridge, reset it to `DEFAULT` in a
+  separate reviewed migration once the subscriber is ready.
 
-  The exact operation for the historical generated layout is:
+  attesto_phoenix 3.2.0 generates this migration:
 
-  ```elixir
-  defmodule MyApp.Repo.Migrations.KeyAttestoAuthorizationCodesOnCodeHash do
-    use Ecto.Migration
-
-    # Keep Ecto's default DDL transaction: SET LOCAL must cover ALTER TABLE.
-    # Do not add @disable_ddl_transaction true.
-
-    # Set this explicitly to the runtime Ecto schema prefix. Raw SQL passed to
-    # execute/1 does not inherit a migrator or repository prefix option.
-    @prefix nil
-
-    def up do
-      # Abort instead of waiting indefinitely for ACCESS EXCLUSIVE.
-      execute "SET LOCAL lock_timeout = '5s'"
-
-      execute """
-      ALTER TABLE #{table()}
-        ADD CONSTRAINT attesto_authorization_codes_pkey
-        PRIMARY KEY USING INDEX attesto_authorization_codes_code_hash_index
-      """
-
-      # Publisher only: if its REPLICA IDENTITY FULL setting was temporary and
-      # the subscriber already has this primary key, uncomment the reset so it
-      # shares this transaction and deployment window with the promotion.
-      # execute "ALTER TABLE #{table()} REPLICA IDENTITY DEFAULT"
-    end
-
-    def down do
-      execute "SET LOCAL lock_timeout = '5s'"
-
-      # Preserve REPLICA IDENTITY USING INDEX when it is active on the promoted
-      # primary-key index at rollback time. The marker is LOCAL, so this
-      # migration must retain Ecto's default DDL transaction.
-      execute """
-      DO $$
-      DECLARE
-        restore_identity boolean;
-      BEGIN
-        SELECT EXISTS (
-          SELECT 1
-          FROM pg_index
-          WHERE indrelid = '#{table()}'::regclass
-            AND indisprimary
-            AND indisreplident
-        ) INTO restore_identity;
-
-        PERFORM set_config(
-          'attesto_phoenix.restore_authorization_codes_replica_identity',
-          CASE WHEN restore_identity THEN 'true' ELSE 'false' END,
-          true
-        );
-
-        IF restore_identity THEN
-          EXECUTE 'ALTER TABLE #{table()} REPLICA IDENTITY DEFAULT';
-        END IF;
-      END
-      $$;
-      """
-
-      # Dropping the constraint drops its index, so clear the identity first
-      # when that index was selected before the promotion.
-      execute ~s|ALTER TABLE #{table()} DROP CONSTRAINT attesto_authorization_codes_pkey|
-      create unique_index(:attesto_authorization_codes, [:code_hash], prefix: @prefix)
-
-      execute """
-      DO $$
-      BEGIN
-        IF current_setting(
-             'attesto_phoenix.restore_authorization_codes_replica_identity',
-             true
-           ) = 'true' THEN
-          EXECUTE 'ALTER TABLE #{table()} REPLICA IDENTITY USING INDEX #{index()}';
-        END IF;
-      END
-      $$;
-      """
-    end
-
-    defp table do
-      case @prefix do
-        nil -> ~s|"attesto_authorization_codes"|
-        prefix -> ~s|"#{prefix}"."attesto_authorization_codes"|
-      end
-    end
-
-    # PostgreSQL's REPLICA IDENTITY grammar takes an unqualified index name;
-    # the schema-qualified table above determines which schema is searched.
-    defp index, do: ~s|"attesto_authorization_codes_code_hash_index"|
-  end
+  ```bash
+  mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
   ```
 
-  This exact migration applies only to the historical generated layout. Run
-  the [catalog preflight](guides/upgrade_3_0_schema_prefix.md#catalog-preflight)
-  and proceed only when it reports `ready_for_primary_key = t`. A custom or
-  renamed table/index needs a reviewed migration; a surrogate-primary-key
-  layout may need no change. The same guide covers literal-prefixed 2.x tables.
+  Upgrade the package to 3.2.0 or later before writing this migration. The
+  generator is a Mix task, so the file can be produced and reviewed before the
+  new application code is deployed. The generated migration validates the
+  historical index against the catalog, promotes it under a 5-second
+  transaction-local `lock_timeout`, and on rollback clears and restores
+  `REPLICA IDENTITY USING INDEX` around the constraint drop, because dropping
+  the primary key drops its index and PostgreSQL refuses that drop while the
+  index is the table's active replica identity. A hand-written copy of this
+  migration is easy to get wrong in exactly that `down/0` step, so this
+  changelog no longer carries one. The generated migration applies only to
+  the historical generated layout and fails closed on a custom or renamed
+  table/index. A surrogate-primary-key layout may need no change. The
+  schema-prefix guide covers literal-prefixed 2.x tables.
 
-  Set `@prefix` to exactly the PostgreSQL schema used by runtime Ecto queries;
-  `nil` is appropriate only for the runtime's default schema. The interpolated
-  raw `ALTER TABLE` does not inherit the prefix passed to `Ecto.Migrator` or the
-  repository.
+  The generated file resolves its schema from an explicit `--schema-prefix`,
+  then `Ecto.Migration.prefix/0`, then the repository's
+  `:migration_default_prefix`, and uses that one value for both its Ecto DSL
+  calls and the raw SQL it executes. A host-authored migration that
+  interpolates raw SQL can call `prefix/0` the same way instead of maintaining
+  a separate hardcoded schema attribute.
 
   When those prerequisites hold, PostgreSQL reuses and renames the existing
   index, so the forward change is metadata-only: it does not rebuild the index
@@ -246,14 +247,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   migration transaction commits. PostgreSQL may emit a harmless notice that it
   is renaming the reused index to match the primary-key constraint. Run the
   migration in a controlled deployment window. Keep a short `lock_timeout`
-  (as above), below the application's query timeout, so contention aborts the
+  (the generated migration uses 5 seconds), below the application's query
+  timeout, so contention aborts the
   attempt before waiting requests time out; then inspect blockers and retry
-  during a quiet period, or drain traffic touching the table. Keep the shown
+  during a quiet period, or drain traffic touching the table. Keep the
   migration transactional; `SET LOCAL lock_timeout` ends with its transaction
   and would not cover the following `ALTER TABLE` if
-  `@disable_ddl_transaction true` were added. The optional FULL-to-DEFAULT
-  reset is a second `ACCESS EXCLUSIVE` ALTER and belongs in this same
-  transaction after the subscriber is ready.
+  `@disable_ddl_transaction true` were added. A FULL-to-DEFAULT reset is a
+  second `ACCESS EXCLUSIVE` ALTER and needs its own controlled window.
 
   The `down/0` path is materially slower: it drops the primary-key index and
   rebuilds the plain unique index while the transaction retains the table's
@@ -281,16 +282,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   PostgreSQL schema through Ecto's `prefix:` option. Legacy keys and flags now
   fail closed with an upgrade message instead of being silently reinterpreted.
 - Require protocol controllers to receive the validated request configuration
-  in `conn.private[:attesto_phoenix_config]`. A missing or malformed request
-  value no longer falls back to global application configuration; hosts must
-  mount `AttestoPhoenix.Plug.PutConfig` in the route pipeline. Thanks to
+  in `conn.private[:attesto_phoenix_config]`. The value must be an
+  `%AttestoPhoenix.Config{}` struct; missing or malformed private values fail
+  closed with `ArgumentError` and no longer fall back to global application
+  configuration. Controllers that consult protocol-level configuration (such as
+  RFC 8414 OAuth Authorization Server Metadata and OpenID Provider
+  Configuration discovery endpoints) also require
+  `conn.private[:attesto_protocol_config]`. That value must be an
+  `%Attesto.Config{}`. `AttestoPhoenix.Plug.PutConfig` is the reference
+  implementation and standard route-pipeline plug: it derives the protocol
+  config from the host config and rejects a preinstalled divergent value.
+  Custom plugs remain supported, but they own deriving and keeping those two
+  private values consistent before controller dispatch. Thanks to
   [@MuNeNiCK](https://github.com/MuNeNiCK) for reporting the request-scoping gap
   and independently proposing a fix in
   [#24](https://github.com/XukuLLC/attesto_phoenix/pull/24).
-- Require a protocol config preinstalled before `AttestoPhoenix.Plug.PutConfig`
-  to exactly match the protocol config derived from the same request's host
-  config. Divergent private values now fail closed instead of letting metadata
-  and endpoint policy disagree.
 - Register the bundled Ecto sweeper under a deterministic repository/schema
   name so multiple policy profiles can coexist. `Sweeper.sweep_now/0` resolves
   that configured default; callers using an explicit custom registration name
@@ -445,10 +451,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Every 2.x-to-3.0 deployment, including one using the default `public`
   schema, requires a stopped cutover for all token writers. Drain 2.x nodes
-  and workers, apply the refresh-generation index migration, create and
-  backfill the 3.0 refresh-family tombstone table, then start 3.0 and re-enable
-  traffic. Mixed 2.x/3.0 writers are unsupported because 2.x does not read or
-  write the tombstones.
+  and workers, apply the refresh-generation index and durable revocation-table
+  migration, then start 3.0 and re-enable traffic. Mixed 2.x/3.0 writers are
+  strictly unsupported because:
+    1. 3.0 records a durable tombstone and removes the family's refresh rows.
+       A later 2.x insert checks only `family_revoked` rows, sees none, and can
+       add a live token to the revoked family.
+    2. 2.x records revocation only on refresh rows. Once 3.0 cleanup removes
+       every expired row in that family, it also removes the only revocation
+       record because 2.x never wrote a tombstone.
+    3. 3.0 writes `v: 2` successor envelopes, which bind the child hash. A 2.x
+       node can treat an honest retry of that rotation as reuse and revoke the
+       family because it understands only `v: 1` envelopes.
+    4. Once the new `(family_id, generation)` unique index exists, a colliding
+       2.x insert can raise an unhandled `Ecto.ConstraintError`; 3.0 reports the
+       conflict through the store contract.
 - A non-empty 2.x `:table_prefix` value does not identify one runtime layout.
   Before any 3.0 node starts, inventory public canonical, public
   literal-prefixed, and schema/canonical candidates for every table using
@@ -458,32 +475,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   this stopped cutover; see `guides/upgrade_3_0_schema_prefix.md`. Remove every
   legacy `:table_prefix` setting, then configure `:schema_prefix` and use
   `--schema-prefix` for future fresh migrations.
-- Before upgrading an existing Ecto database, apply a forward migration that
-  adds the unique `(family_id, generation)` index on `attesto_refresh_tokens` if
-  it is not already present. The exact operation is:
-
-  ```elixir
-  prefix = nil # Replace with your configured PostgreSQL schema name when non-default.
-
-  create unique_index(
-    :attesto_refresh_tokens,
-    [:family_id, :generation],
-    name: :attesto_refresh_tokens_family_id_generation_index,
-    prefix: prefix
-  )
+- When performing this upgrade with attesto_phoenix 3.2 or later, generate the
+  required Ecto migration with:
+  ```bash
+  mix attesto_phoenix.gen.migration --upgrade 3.0
   ```
-
-  Use the runtime Ecto `prefix` (`nil` for `public`, or the configured schema).
-  If creation fails because duplicate family/generation rows exist, stop,
-  reconcile and revoke the affected families, then retry; never blindly delete
-  duplicate rows. Do not rerun the create-table migration.
-- Before deploying this release to an existing Ecto database, create the
-  `attesto_refresh_family_revocations` table with the same runtime prefix and
-  backfill it from every existing refresh row with `family_revoked = true`.
-  This preserves already-revoked families after the sweeper removes their
-  expired token rows. Qualify both source and destination tables with that
-  prefix when it is non-default; do not backfill `public` accidentally. New
-  installations receive the table from `mix attesto_phoenix.gen.migration`.
+  A host whose stores use a schema passes it explicitly:
+  ```bash
+  mix attesto_phoenix.gen.migration --upgrade 3.0 --schema-prefix oauth
+  ```
+  This emits the exact DDL creating the unique index on
+  `attesto_refresh_tokens(family_id, generation)` with a short transaction-local
+  lock timeout (`5s`), creating the `attesto_refresh_family_revocations` durable
+  tombstone table, and safely backfilling already-revoked families
+  (`family_revoked = true`) into the tombstone table using
+  `CURRENT_TIMESTAMP AT TIME ZONE 'UTC'` and `ON CONFLICT (family_id) DO NOTHING`.
+  If creation reports duplicate `(family_id, generation)` rows, stop, reconcile
+  and revoke the affected families, then retry; never blindly delete duplicate
+  rows. Do not rerun the create-table migration. Keep every writer stopped
+  during rollback; its guard aborts unless every corresponding legacy row exists
+  and has `family_revoked = true`, including when a family has mixed true and
+  false rows. Before starting 2.x, drain active 3.x refresh-retry deadlines or
+  accept that honest retries may be invalidated.
 - Dynamic-registration clients inherit the 3.0 default grant catalog, which
   includes token exchange. Set an explicit `grant_types_supported` catalog
   before deployment when token exchange must remain unavailable. Explicit empty
@@ -498,8 +511,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   feature was disabled remain excluded from the claim.
 - Manual Ecto installations must supervise `AttestoPhoenix.Store.Sweeper` with
   a positive `:sweep_interval_ms`; rerunning `mix attesto_phoenix.install` adds
-  the child idempotently. A custom cleanup job must explicitly redact expired
-  refresh-successor ciphertext in addition to deleting expired rows.
+  the child idempotently. The sweeper redacts expired refresh-successor ciphertext
+  and prunes expired TTL rows; durable family revocation tombstones are intentionally
+  never swept. A custom cleanup job must provide equivalent behavior.
 
 ## [2.14.2] - 2026-08-28
 

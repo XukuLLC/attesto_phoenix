@@ -177,6 +177,7 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
     on_exit(fn ->
       Application.delete_env(:attesto_phoenix, AttestoPhoenix.Config)
       Application.delete_env(:attesto_phoenix, Keystore)
+      Application.delete_env(:attesto_phoenix, :otp_app)
     end)
 
     {:ok, base: base}

@@ -46,6 +46,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   alias AttestoPhoenix.ClientIdMetadata.Cache
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.ClientIdMetadata
+  alias AttestoPhoenix.Store.Sweeper
 
   @doc """
   Resolves a live cached document for a CIMD `client_id` URL.
@@ -86,6 +87,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @spec put(String.t(), map(), DateTime.t()) :: :ok
   def put(url, metadata, %DateTime{} = expires_at) when is_binary(url) and is_map(metadata) do
     prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.truncate(expires_at, :second)
 
@@ -93,7 +96,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
 
     %ClientIdMetadata{}
     |> ClientIdMetadata.put_changeset(entry, prefix: prefix)
-    |> repo().insert!(
+    |> repo.insert!(
       on_conflict: [set: [metadata: metadata, expires_at: expires_at]],
       conflict_target: :url,
       prefix: prefix,
@@ -116,8 +119,12 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete(String.t()) :: :ok
   def delete(url) when is_binary(url) do
-    repo().delete_all(from(c in ClientIdMetadata, where: c.url == ^url),
-      prefix: Config.table_prefix(),
+    prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
+
+    repo.delete_all(from(c in ClientIdMetadata, where: c.url == ^url),
+      prefix: prefix,
       log: false,
       telemetry_event: nil
     )
@@ -131,8 +138,12 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete_all() :: :ok
   def delete_all do
-    repo().delete_all(ClientIdMetadata,
-      prefix: Config.table_prefix(),
+    prefix = Config.table_prefix()
+    repo = repo()
+    Sweeper.check_running_for_store(repo, prefix)
+
+    repo.delete_all(ClientIdMetadata,
+      prefix: prefix,
       log: false,
       telemetry_event: nil
     )

@@ -1,4 +1,9 @@
 alias AttestoPhoenix.ConsumerWithoutReq, as: Consumer
+alias AttestoPhoenix.DiagnosticsSupervisor
+alias AttestoPhoenix.Store.Sweeper
+alias AttestoPhoenix.Store.Sweeper.Lifecycle
+alias AttestoPhoenix.Store.Sweeper.Registration
+alias AttestoPhoenix.Store.Sweeper.Signal
 
 defmodule AttestoPhoenix.ConsumerWithoutReq do
   defmodule Adapter do
@@ -13,6 +18,19 @@ defmodule AttestoPhoenix.ConsumerWithoutReq do
   # This script constructs configurations only. If a request ever reaches this
   # placeholder, fail closed instead of pretending to provide replay storage.
   def replay_check(_key, _ttl), do: raise("minimum-consumer replay callback was invoked")
+
+  def eventually!(check, attempts \\ 100)
+
+  def eventually!(check, attempts) when is_function(check, 0) and attempts > 0 do
+    if check.() do
+      :ok
+    else
+      Process.sleep(10)
+      eventually!(check, attempts - 1)
+    end
+  end
+
+  def eventually!(_check, 0), do: raise("condition did not become true")
 
   def config(overrides \\ []) do
     base = [
@@ -77,6 +95,44 @@ for module <- [
     raise "expected #{inspect(module)} to be omitted with its optional dependency"
   end
 end
+
+case Application.ensure_all_started(:attesto_phoenix) do
+  {:ok, _started} -> :ok
+  {:error, reason} -> raise "attesto_phoenix application failed to start: #{inspect(reason)}"
+end
+
+for process_name <- [
+      DiagnosticsSupervisor,
+      Signal,
+      Lifecycle,
+      Registration
+    ] do
+  if !is_pid(Process.whereis(process_name)) do
+    raise "expected #{inspect(process_name)} to be running"
+  end
+end
+
+# A host-owned cleanup worker remains acknowledged across a package application
+# restart in the same VM. The registration is tied to the live PID, so a worker
+# restart or a new node still requires registration from the host's init path.
+restart_target = {Consumer.Repo, "minimum_consumer_restart"}
+cleanup_worker = spawn(fn -> Process.sleep(:infinity) end)
+:ok = Sweeper.register_cleanup_worker(restart_target, cleanup_worker)
+
+if !Sweeper.running?(restart_target) do
+  raise "cleanup worker was not acknowledged before application restart"
+end
+
+:ok = Application.stop(:attesto_phoenix)
+
+case Application.ensure_all_started(:attesto_phoenix) do
+  {:ok, _started} -> :ok
+  {:error, reason} -> raise "attesto_phoenix application failed to restart: #{inspect(reason)}"
+end
+
+Consumer.eventually!(fn -> Sweeper.running?(restart_target) end)
+Process.exit(cleanup_worker, :kill)
+Consumer.eventually!(fn -> not Sweeper.running?(restart_target) end)
 
 # Every feature remains Req-free while disabled or while its outbound path is
 # unused. These are real Config.new/1 calls in a dependency graph without Req.

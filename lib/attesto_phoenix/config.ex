@@ -4042,10 +4042,11 @@ defmodule AttestoPhoenix.Config do
   # this setting conservative: Ecto interpolates it as a schema prefix for all
   # generated stores, so accepting punctuation, whitespace, or quoted names
   # would make migrations and runtime queries disagree.
+  @doc false
   @spec validate_schema_prefix!(term()) :: :ok | no_return()
-  defp validate_schema_prefix!(nil), do: :ok
+  def validate_schema_prefix!(nil), do: :ok
 
-  defp validate_schema_prefix!(prefix) when is_binary(prefix) do
+  def validate_schema_prefix!(prefix) when is_binary(prefix) do
     cond do
       prefix == "" ->
         raise ArgumentError,
@@ -4075,7 +4076,7 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  defp validate_schema_prefix!(_prefix) do
+  def validate_schema_prefix!(_prefix) do
     raise ArgumentError,
           "AttestoPhoenix.Config: :schema_prefix must be nil or a conservative PostgreSQL " <>
             "schema identifier (lowercase ASCII letters, digits, and underscores; maximum " <>
