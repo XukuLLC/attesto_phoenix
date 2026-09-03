@@ -127,8 +127,8 @@ jobs:
         run: mix docs
 
       - name: Compile minimum consumer without optional Req
-        # Before Attesto 2.0.0 is published, this exercises the exact source
-        # checkout above across the minimum-dependency fixture.
+        # Exercise the exact source checkout above while the fixture keeps the
+        # oldest supported Attesto release and dependency set.
         if: ${{ matrix.lint }}
         working-directory: integration/consumer_without_req
         env:
