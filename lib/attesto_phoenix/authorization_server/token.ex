@@ -542,7 +542,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
               "callback is configured; no token was issued"
           )
 
-          {:error, grant_error(:invalid_grant)}
+          {:error, error(@error_invalid_request, "unable to issue token")}
         end
     end
   end

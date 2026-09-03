@@ -28,6 +28,15 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
       assert claims["nonce"] == "n-1"
     end
 
+    test "a valid private context is distinguished from invalid combined code claims" do
+      context = %{"epoch" => 3}
+      claims = %{invalid_key: true}
+
+      assert Claims.portable_json_object?(context)
+      refute Claims.portable_json_object?(claims)
+      assert PrivateContext.put(claims, context) == {:error, :invalid_code_claims}
+    end
+
     test "atom keys are refused rather than silently stringified" do
       # The claims map round-trips a JSONB column; an atom key would not survive
       # it unchanged, so the grant would not be lossless.
@@ -69,14 +78,14 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContextTest do
                {:error, :invalid_private_context}
     end
 
-    test "a maximum-depth object is refused when the reserved claims key would over-nest it" do
+    test "a valid context is refused when the reserved claims key would over-nest combined claims" do
       context =
         Enum.reduce(1..63, %{"leaf" => "value"}, fn depth, nested ->
           %{"level_#{depth}" => nested}
         end)
 
       assert Claims.portable_json_object?(context)
-      assert PrivateContext.put(%{}, context) == {:error, :invalid_private_context}
+      assert PrivateContext.put(%{}, context) == {:error, :invalid_code_claims}
     end
 
     test "a value over the encoded bound is refused rather than truncated" do

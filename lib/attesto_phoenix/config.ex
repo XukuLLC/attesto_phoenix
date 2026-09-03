@@ -370,12 +370,21 @@ defmodule AttestoPhoenix.Config do
       Store only non-secret identifiers and policy versions such as subject IDs
       or security epochs, never credentials or token/key material. `nil` stores
       nothing.
+      The reserved key belongs to the bundled authorization endpoint. A custom
+      authorization-code issuer or custom reconstruction path accepting
+      request-derived claims MUST reject
+      `AttestoPhoenix.AuthorizationCodePrivateContext.claims_key/0` in those
+      claims; `reserved?/1` is provided for that check. Exceptions from this
+      callback propagate. When the authorization request came through PAR, its
+      `request_uri` may already have been claimed before this callback runs, as
+      with other host callbacks.
       Configure this only together with `:authorization_code_completion`;
       missing state remains valid so the host can apply flow-specific
       fail-closed policy at completion. The reverse skew fails closed on the
       library's side: a code that DOES carry private context is refused with
-      `invalid_grant` when no `:authorization_code_completion` callback is
-      configured, so a node whose callback configuration or behaviour module is
+      generic `invalid_request` unable-to-issue-token response when no
+      `:authorization_code_completion` callback is configured, so a node whose
+      callback configuration or behaviour module is
       unavailable cannot issue tokens with the host's completion policy
       silently skipped. Deploy callback-capable nodes before enabling private
       context; this check cannot detect an older package version on another
@@ -431,6 +440,11 @@ defmodule AttestoPhoenix.Config do
       which is another reason that map must never contain secrets.
       If the continuation returns an error inside a transaction, the callback
       must roll that transaction back rather than commit the normal error tuple.
+      If the continuation succeeds and the host transaction rolls back, the
+      callback MUST return an error and MUST NOT return the captured success
+      result. The library cannot distinguish a rollback from a commit after
+      the callback returns; returning that success would serve a response whose
+      writes were rolled back.
       **Rollback covers only stores using the same Ecto Repo and enclosing
       transaction as the callback.** Stores using another Repo, an independently
       committed transaction, or an external service remain outside this
@@ -3330,7 +3344,9 @@ defmodule AttestoPhoenix.Config do
   Returns the configured authorization-code completion callback, or `nil`.
 
   See the `:authorization_code_completion` option. When `nil`, the token
-  endpoint runs the completion continuation directly.
+  endpoint runs the completion continuation directly. The continuation closure
+  captures completion state, including the plaintext authorization code;
+  trusted host code MUST NOT inspect or dump its function environment.
   """
   @spec authorization_code_completion_fun(t()) :: callback() | nil
   def authorization_code_completion_fun(%__MODULE__{} = config),

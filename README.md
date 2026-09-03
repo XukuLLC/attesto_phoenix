@@ -581,6 +581,10 @@ callback that never invokes the continuation cannot pass off a fabricated
 refused, because that commit already carried the mint, refresh insert, and
 finalization.
 
+The continuation closure captures completion state, including the plaintext
+authorization code. Trusted host code MUST NOT inspect or dump the function's
+environment.
+
 A success wrapper around a failed continuation result is also unwrapped so the
 wire error is preserved, but it emits a static warning: unless the callback
 rolled the transaction back, earlier continuation writes may have committed.
@@ -613,6 +617,11 @@ callback that deliberately inspects or mutates its own process dictionary.
 > static, secret-free warning and then re-raised with its original stacktrace.
 > Both logs name the finalized-code/retry hazard without logging the callback
 > reason or context.
+
+If the continuation succeeds and the host transaction rolls back, the callback
+MUST return an error and MUST NOT return the captured success result. The library
+cannot distinguish a rollback from a commit after the callback returns; a
+returned success would serve a response whose writes were rolled back.
 
 The authorization code is atomically claimed before the callback runs. A host
 refusal, malformed private context, missing callback for a context-bearing code,
@@ -662,19 +671,27 @@ adds no column migration** — the existing `claims` column carries it. Existing
 installations must still follow any independent database upgrade in the
 release notes.
 
+The reserved key belongs to the bundled authorization endpoint. A custom
+authorization-code issuer or reconstruction path that accepts request-derived
+claims MUST reject `AttestoPhoenix.AuthorizationCodePrivateContext.claims_key/0`
+in those claims; `reserved?/1` is provided for that check. Exceptions from the
+private-context callback propagate. When the request came through PAR, its
+`request_uri` may already have been claimed before this callback runs, as with
+other host callbacks.
+
 Configure the two options together. `:authorization_code_private_context`
 without `:authorization_code_completion` is refused at boot, since it would
 persist state nothing ever reads.
 
 The reverse skew fails closed at redemption: a code that carries private context
-is refused with `invalid_grant` when this node has no
-`:authorization_code_completion` callback configured, so a node that lost the
-callback cannot issue tokens with the host's policy silently skipped. That is
-the *config-skew* failure mode. The **version-skew** hazard is unchanged and is
-not handled by the library: an AttestoPhoenix node running a release without
-this feature has no such refusal branch at all, so it will redeem a code
-carrying private context and complete normally. Deploy every token-endpoint
-node before enabling the hook.
+is refused with the generic `invalid_request` unable-to-issue-token response
+when this node has no `:authorization_code_completion` callback configured, so a
+node that lost the callback cannot issue tokens with the host's policy silently
+skipped. That is the *config-skew* failure mode. The **version-skew** hazard is
+unchanged and is not handled by the library: an AttestoPhoenix node running a
+release without this feature has no such refusal branch at all, so it will
+redeem a code carrying private context and complete normally. Deploy every
+token-endpoint node before enabling the hook.
 
 ### Resource indicators (RFC 8707)
 

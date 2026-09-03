@@ -860,6 +860,43 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 1
   end
 
+  test "a rolled-back continuation whose captured success is returned is served" do
+    family_id = "family-rollback-then-success"
+    code = issue_code(family_id, ["offline_access"])
+    test_pid = self()
+
+    # A rollback does not undo the continuation's in-memory result or its
+    # provenance marker. The library cannot distinguish this callback return
+    # from a committed success, so the exact captured success is necessarily
+    # accepted. The host contract therefore requires returning an error after
+    # rolling back, never this captured result.
+    callback = fn _context, continuation ->
+      assert {:error, :intentional_rollback} =
+               TestRepo.transaction(fn ->
+                 result = continuation.()
+                 send(test_pid, {:rolled_back_continuation_result, result})
+                 TestRepo.rollback(:intentional_rollback)
+               end)
+
+      assert_receive {:rolled_back_continuation_result, captured_success}
+      captured_success
+    end
+
+    config = config(authorization_code_completion: callback)
+
+    assert {:ok, response, _events} = Token.issue(config, code_request(config, code))
+    assert is_binary(response.access_token)
+    assert is_binary(response.refresh_token)
+
+    # The response was served even though all continuation writes, including
+    # the refresh row, were rolled back. The initial atomic code claim occurred
+    # before the host transaction and remains spent-but-unfinalized.
+    row = authorization_by_code!(code)
+    refute row.consumed_success
+    refute row.access_token_jti
+    assert TestRepo.aggregate(RefreshToken, :count) == 0
+  end
+
   test "a Repo.transaction wrapper around a failed continuation is unwrapped and warned" do
     family_id = "family-failed-transaction-wrapper"
     code = issue_code(family_id)
@@ -940,7 +977,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     refute log =~ "substituted.access.token"
   end
 
-  test "a code carrying private context is refused when no completion callback is configured" do
+  test "a code carrying private context uses the generic issuance error when no completion callback is configured" do
     family_id = "family-context-without-callback"
     code = issue_code(family_id, ["offline_access"], private_context: %{"security_epoch" => 3})
 
@@ -951,7 +988,11 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
     log =
       capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+        assert {:error,
+                %OAuthError{
+                  error: :invalid_request,
+                  error_description: "unable to issue token"
+                }, _events} =
                  Token.issue(config, code_request(config, code))
       end)
 

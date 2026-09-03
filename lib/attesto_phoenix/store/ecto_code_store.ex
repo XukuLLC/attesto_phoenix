@@ -166,8 +166,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @doc """
   Marks a successfully redeemed code as reuse-trackable.
 
-  `Attesto.AuthorizationCode.redeem/4` calls this after every validation step
-  has passed. A later `take/1` for the same hash can then surface
+  The token endpoint calls this during successful finalization, after
+  `Attesto.AuthorizationCode.redeem/4` and all downstream issuance steps have
+  succeeded. A later `take/1` for the same hash can then surface
   `{:error, :consumed, meta}` instead of treating the replay as an unknown code.
   When the core's `issue_refresh_and_finalize/6` composition supplies the
   family actually issued, this update binds that family to the consumed

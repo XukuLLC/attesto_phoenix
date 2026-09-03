@@ -7,8 +7,8 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
   nine keys and rejects a persisted record carrying any sibling key, so
   host-specific values belong inside `:claims`. This module owns the single
   reserved claims key that carries the host's `:authorization_code_private_context`
-  value from the authorization endpoint to the token endpoint, and the rules
-  that keep it from escaping.
+  value from the bundled authorization endpoint to the token endpoint, and the
+  rules that keep it from escaping.
 
   The value is:
 
@@ -23,8 +23,11 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
       token.
 
   The reserved key is namespaced and is refused as host input: a host that
-  stashes its own value under it at the authorization endpoint would otherwise
-  be able to forge private context for the completion callback.
+  stashes its own value under it at the bundled authorization endpoint would
+  otherwise be able to forge private context for the completion callback. A
+  custom authorization-code issuer or custom reconstruction path that accepts
+  request-derived claims MUST reject `claims_key/0` in those claims; use
+  `reserved?/1` for that check before reconstructing or issuing a code.
   """
 
   alias Attesto.Claims
@@ -57,9 +60,16 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
   portable JSON object by itself or after nesting under the reserved key, or
   that exceeds `max_encoded_bytes/0` once encoded, is rejected rather than
   truncated or silently dropped — a host that cannot persist its policy state
-  must not get a code that looks like it carries it.
+  must not get a code that looks like it carries it. A malformed private value
+  returns `:invalid_private_context`; a valid private value combined with
+  non-portable code claims returns `:invalid_code_claims`.
   """
-  @spec put(map(), t() | nil) :: {:ok, map()} | {:error, :invalid_private_context | :private_context_too_large}
+  @spec put(map(), t() | nil) ::
+          {:ok, map()}
+          | {:error,
+             :invalid_private_context
+             | :private_context_too_large
+             | :invalid_code_claims}
   def put(claims, nil) when is_map(claims), do: {:ok, claims}
 
   def put(claims, private_context) when is_map(claims) and is_map(private_context) do
@@ -70,7 +80,7 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
         {:error, :invalid_private_context}
 
       not portable_json_object?(combined_claims) ->
-        {:error, :invalid_private_context}
+        {:error, :invalid_code_claims}
 
       true ->
         case encoded_size(private_context) do
@@ -114,8 +124,11 @@ defmodule AttestoPhoenix.AuthorizationCodePrivateContext do
   @doc """
   Rejects a host-supplied claims map that already carries the reserved key.
 
-  Called on the authorization endpoint's claims before private context is
-  folded in, so the reserved key is only ever written by this library.
+  The bundled authorization endpoint calls this before private context is
+  folded in, so the reserved key is only ever written by this library. Custom
+  authorization-code issuers and reconstruction paths that accept
+  request-derived claims MUST call this helper and reject `true` before
+  issuing or reconstructing a code.
   """
   @spec reserved?(map()) :: boolean()
   def reserved?(claims) when is_map(claims), do: Map.has_key?(claims, @claims_key)

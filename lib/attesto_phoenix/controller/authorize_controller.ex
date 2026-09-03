@@ -678,14 +678,26 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         mint_code_and_redirect(conn, config, request, subject, attrs)
 
       {:error, reason} ->
-        # The host's private-context callback returned something the claims
-        # column cannot round-trip. This is a server/config fault on an
-        # otherwise valid request, and it must fail closed: issuing a code
+        # The private-context value or the combined code claims cannot
+        # round-trip through the claims column. This is a server/config fault on
+        # an otherwise valid request, and it must fail closed: issuing a code
         # without the state the completion callback will demand would strand
         # the redemption.
-        Logger.error("authorization code private context rejected: #{inspect(reason)}")
+        log_private_context_rejection(reason)
         emit_error(conn, config, request, @error_server_error)
     end
+  end
+
+  defp log_private_context_rejection(:invalid_code_claims) do
+    Logger.error("authorization code claims rejected: combined claims are not portable")
+  end
+
+  defp log_private_context_rejection(:reserved_private_context_claim) do
+    Logger.error("authorization code claims rejected: reserved private context key")
+  end
+
+  defp log_private_context_rejection(reason) do
+    Logger.error("authorization code private context rejected: #{inspect(reason)}")
   end
 
   defp mint_code_and_redirect(conn, config, request, subject, attrs) do

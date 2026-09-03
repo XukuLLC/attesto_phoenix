@@ -51,9 +51,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refresh token, or token-exchange input. **This feature adds no column
   migration; independent release migrations still apply.** Configuring it
   without `:authorization_code_completion` is refused at boot, and a code that
-  carries private context is refused with `invalid_grant` on a node whose
-  completion callback is missing, so config skew cannot silently skip the
-  host's policy.
+  carries private context is refused with the generic `invalid_request`
+  unable-to-issue-token response on a node whose completion callback is missing,
+  so config skew cannot silently skip the host's policy. The reserved key
+  belongs to the bundled authorization endpoint; custom authorization-code
+  issuers and reconstruction paths must reject `claims_key/0` in
+  request-derived claims. A private-context callback exception propagates, and
+  a PAR `request_uri` may already be claimed when it does.
   Thanks to [@oliver-kriska](https://github.com/oliver-kriska) for the
   contribution in [#25](https://github.com/XukuLLC/attesto_phoenix/pull/25).
 
