@@ -182,7 +182,10 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
 
       notify = fn auth_req_id, _request, _subject ->
         send(test_pid, {:notify_started, self(), auth_req_id})
-        :error
+
+        receive do
+          :finish_notification -> :error
+        end
       end
 
       config = config(notify_ciba_user: notify)
@@ -199,6 +202,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
           assert auth_req_id == ack.auth_req_id
 
           monitor = Process.monitor(task_pid)
+          send(task_pid, :finish_notification)
           assert_receive {:DOWN, ^monitor, :process, ^task_pid, :normal}, 1_000
           Logger.flush()
         end)
