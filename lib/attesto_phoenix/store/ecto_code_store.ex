@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   presented once is spent, which denies an attacker repeated validation
   attempts against a captured code.
 
-  The plaintext code is never persisted; the primary key is the
+  The plaintext code is never persisted; the unique database key is the
   `Attesto.Secret.hash/1` digest of the code. The column layout and the
   record bridge live in `AttestoPhoenix.Schema.Authorization`; the bridge
   emits core's canonical authorization-code data map, with `S256` implicit and
@@ -27,10 +27,33 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   by replay containment. Refresh-flow linkage is selected by code hash before
   the core binds the row to its newly issued refresh family.
 
-  The repository module is supplied by the host application (`:repo` under
-  the `:attesto_phoenix` app) and is read at call time. A store with no
-  backing repository can make no guarantees, so a missing `:repo` fails
-  closed rather than silently no-opping.
+  The repository module is resolved at call time from the validated
+  request-local configuration, then the host configuration selected by
+  `:otp_app`; the package-level `:attesto_phoenix` setting is only the legacy
+  fallback when no `:otp_app` pointer exists. A store with no backing
+  repository can make no guarantees, so a missing `:repo` fails closed rather
+  than silently no-opping.
+
+  ## Query observability
+
+  The `claims` column carries the authentication context and, for a host that
+  configures `:authorization_code_private_context`, that host's private
+  authorization state. Ecto SQL query telemetry reports params, cast params,
+  and decoded results, and every authorization-row query carries at least one
+  security-sensitive value - a code hash, subject, family ID, or access-token
+  JTI - even when it does not touch the `claims` column. So every operation in
+  this store suppresses both application SQL logging and the
+  `[:my_app, :repo, :query]` telemetry event. The reuse-detection reads
+  additionally select only the columns they report, keeping the `claims` JSONB
+  out of the decoded row as defence in depth.
+
+  > #### Suppression is unconditional {: .warning}
+  >
+  > It applies to every deployment, including one that never enables
+  > `:authorization_code_private_context`. Repository resolution can use the
+  > request-local `AttestoPhoenix.Config`, but observability does not vary with
+  > that option; standalone store calls may have no request-local config at all.
+  > Custom stores and database-server logging remain the host's responsibility.
   """
 
   @behaviour Attesto.CodeStore
@@ -39,6 +62,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
+
+  # Ecto SQL query telemetry includes params/cast_params and decoded results.
+  # Every authorization-row query carries at least one security-sensitive value
+  # - a code hash, subject, family ID, or access-token JTI - even when it does
+  # not select the private-context column, so all of them suppress application
+  # logging and telemetry.
+  @claims_query_opts [log: false, telemetry_event: nil]
 
   @doc """
   Persists an authorization-code record keyed by its `:code_hash`.
@@ -51,12 +81,13 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   `take/1` contains core's canonical data keys only; database compatibility
   columns for the PKCE method and legacy top-level nonce are not emitted.
 
-  The hash is the primary key, so a duplicate insert is a caller bug:
+  The hash is the unique database key, so a duplicate insert is a caller bug:
   `Attesto.AuthorizationCode` derives the hash from freshly generated random
   bytes, so a collision means the random source repeated or the same entry
-  was put twice. `insert!/1` raises on the unique-constraint violation rather
-  than silently overwriting an existing, possibly already-issued, code. Fail
-  closed; no upsert.
+  was put twice. A unique-constraint violation raises a sanitized
+  `Ecto.InvalidChangesetError` rather than exposing the failed changeset, which
+  can contain authorization claims and host-private context. Fail closed; no
+  upsert.
   """
   @impl Attesto.CodeStore
   @spec put(Attesto.CodeStore.entry()) :: :ok
@@ -66,9 +97,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
     record
     |> Authorization.from_record(prefix: prefix)
-    |> repo().insert!(prefix: prefix, log: false, telemetry_event: nil)
-
-    :ok
+    |> repo().insert([prefix: prefix] ++ @claims_query_opts)
+    |> case do
+      {:ok, _row} -> :ok
+      {:error, %Ecto.Changeset{} = changeset} -> raise_sanitized_insert_error(changeset)
+    end
   end
 
   @doc """
@@ -100,11 +133,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().update_all(query, [set: [consumed_at: consumed_at]],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
+    case repo().update_all(query, [set: [consumed_at: consumed_at]], [prefix: prefix] ++ @claims_query_opts) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
       {0, _} -> consumed_or_missing(code_hash, prefix)
     end
@@ -128,7 +157,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo().one(query, prefix: prefix, log: false, telemetry_event: nil) do
+    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
       nil -> :error
       row -> {:ok, Authorization.to_record(row)}
     end
@@ -137,8 +166,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @doc """
   Marks a successfully redeemed code as reuse-trackable.
 
-  `Attesto.AuthorizationCode.redeem/4` calls this after every validation step
-  has passed. A later `take/1` for the same hash can then surface
+  The token endpoint calls this during successful finalization, after
+  `Attesto.AuthorizationCode.redeem/4` and all downstream issuance steps have
+  succeeded. A later `take/1` for the same hash can then surface
   `{:error, :consumed, meta}` instead of treating the replay as an unknown code.
   When the core's `issue_refresh_and_finalize/6` composition supplies the
   family actually issued, this update binds that family to the consumed
@@ -276,12 +306,16 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     end
   end
 
+  # Selects only the linkage column it inspects, for the same reason as
+  # `consumed_or_missing/2`: a whole-row read would publish `claims` through
+  # query telemetry.
   defp legacy_or_missing_revoke(code_hash, prefix) do
-    case repo().get_by(Authorization, [code_hash: code_hash],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
+    query =
+      from a in Authorization,
+        where: a.code_hash == ^code_hash,
+        select: [:access_token_jti]
+
+    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
       nil ->
         :ok
 
@@ -313,12 +347,19 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     repo().exists?(query, prefix: prefix, log: false, telemetry_event: nil)
   end
 
+  # Selects only the three columns it reports, and suppresses logging and
+  # telemetry like every other authorization-row query. The narrow select is
+  # defence in depth: it keeps the `claims` JSONB - which carries host private
+  # context - out of the decoded row entirely, so re-enabling observability here
+  # could not leak it. `redact: true` would not help; telemetry carries the raw
+  # row, not the struct.
   defp consumed_or_missing(code_hash, prefix) do
-    case repo().get_by(Authorization, [code_hash: code_hash],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
+    query =
+      from a in Authorization,
+        where: a.code_hash == ^code_hash,
+        select: [:family_id, :subject, :consumed_success]
+
+    case repo().one(query, [prefix: prefix] ++ @claims_query_opts) do
       %Authorization{consumed_success: true} = row ->
         {:error, :consumed, Authorization.consumed_meta(row)}
 
@@ -333,6 +374,32 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     raise RuntimeError,
           "#{inspect(__MODULE__)}.#{operation} failed to update exactly one authorization record"
   end
+
+  # `Ecto.InvalidChangesetError.message/1` renders the original changes and
+  # params without consulting schema redaction. Keep the established exception
+  # class while replacing the failed insert changeset with a value-free one.
+  # Operators can reproduce the original failure safely in a non-production
+  # test by building an equivalent record with `Authorization.from_record/2`
+  # and inserting its code hash twice. The second exception should have no
+  # params or changes and contain only the generic constraint message.
+  defp raise_sanitized_insert_error(%Ecto.Changeset{} = original) do
+    safe_changeset =
+      original.errors
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.uniq()
+      |> Enum.reduce(Ecto.Changeset.change(%Authorization{}), fn field, changeset ->
+        Ecto.Changeset.add_error(changeset, field, "authorization code could not be stored")
+      end)
+      |> ensure_sanitized_error()
+
+    raise Ecto.InvalidChangesetError, action: :insert, changeset: safe_changeset
+  end
+
+  defp ensure_sanitized_error(%Ecto.Changeset{errors: []} = changeset) do
+    Ecto.Changeset.add_error(changeset, :base, "authorization code could not be stored")
+  end
+
+  defp ensure_sanitized_error(%Ecto.Changeset{} = changeset), do: changeset
 
   defp repo, do: Config.ecto_repo!()
 end

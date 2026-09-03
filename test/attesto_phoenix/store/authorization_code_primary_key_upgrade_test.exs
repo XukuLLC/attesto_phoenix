@@ -11,6 +11,9 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
 
   use ExUnit.Case, async: false
 
+  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Schema.Authorization
+  alias AttestoPhoenix.Store.EctoCodeStore
   alias AttestoPhoenix.TestRepo
   alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
@@ -21,6 +24,10 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
   # old layout without touching the suite's own attesto_authorization_codes.
   @schema "attesto_upgrade_test"
   @table "attesto_authorization_codes"
+
+  defmodule Keystore do
+    @moduledoc false
+  end
 
   # The CHANGELOG snippet, with the prefix set to the scratch schema.
   defmodule Migration do
@@ -122,8 +129,10 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
     sql!(~s|DROP SCHEMA IF EXISTS "#{@schema}" CASCADE|)
     sql!(~s|CREATE SCHEMA "#{@schema}"|)
 
-    # The pre-upgrade layout: unique index on code_hash, no primary key.
-    sql!(~s|CREATE TABLE "#{@schema}"."#{@table}" (code_hash varchar(88) NOT NULL, expires_at timestamp NOT NULL)|)
+    # The pre-upgrade layout: all historical columns, a unique index on
+    # code_hash, and no primary key. LIKE INCLUDING DEFAULTS copies columns
+    # without copying the current release's primary key or secondary indexes.
+    sql!(~s|CREATE TABLE "#{@schema}"."#{@table}" (LIKE public."#{@table}" INCLUDING DEFAULTS)|)
 
     sql!(~s|CREATE UNIQUE INDEX "#{@table}_code_hash_index" ON "#{@schema}"."#{@table}" (code_hash)|)
 
@@ -178,6 +187,29 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
     refute primary_key?()
     assert replica_identity() == "f"
     assert index_names() == ["#{@table}_code_hash_index"]
+  end
+
+  test "sanitizes duplicate inserts before and after primary-key promotion" do
+    Config.with_request_config(prefix_config(), fn ->
+      assert_sanitized_duplicate("old-layout-hash", "old-layout-private-marker")
+
+      migrate(:up, 2)
+
+      assert_sanitized_duplicate("new-layout-hash", "new-layout-private-marker")
+    end)
+  end
+
+  test "the combined schema has one redacted primary key and both constraints" do
+    assert Authorization.__schema__(:primary_key) == [:code_hash]
+    assert Enum.count(Authorization.__schema__(:fields), &(&1 == :code_hash)) == 1
+    assert :claims in Authorization.__schema__(:redact_fields)
+
+    constraints =
+      Authorization.from_record(entry("schema-check-hash", %{"safe" => true}))
+      |> Ecto.Changeset.constraints()
+
+    assert Enum.any?(constraints, &(&1.constraint == "attesto_authorization_codes_code_hash_index"))
+    assert Enum.any?(constraints, &(&1.constraint == "attesto_authorization_codes_pkey"))
   end
 
   # migration_lock: false because the lock's transaction and the migration
@@ -243,6 +275,49 @@ defmodule AttestoPhoenix.Store.AuthorizationCodePrimaryKeyUpgradeTest do
       """)
 
     oid
+  end
+
+  defp assert_sanitized_duplicate(code_hash, sentinel) do
+    assert :ok = EctoCodeStore.put(entry(code_hash, %{"safe" => true}))
+
+    error =
+      assert_raise Ecto.InvalidChangesetError, fn ->
+        EctoCodeStore.put(entry(code_hash, %{"private_marker" => sentinel}))
+      end
+
+    refute Exception.message(error) =~ sentinel
+    refute inspect(error) =~ sentinel
+  end
+
+  defp entry(code_hash, claims) do
+    %{
+      code_hash: code_hash,
+      data: %{
+        client_id: "client-1",
+        subject: "subject-1",
+        scope: ["openid"],
+        resource: [],
+        redirect_uri: "https://client.example/callback",
+        code_challenge: nil,
+        dpop_jkt: nil,
+        family_id: nil,
+        claims: claims
+      },
+      expires_at: System.system_time(:second) + 600
+    }
+  end
+
+  defp prefix_config do
+    Config.new(
+      issuer: "https://issuer.example",
+      audience: "https://resource.example",
+      keystore: Keystore,
+      repo: TestRepo,
+      load_client: fn _ -> {:error, :not_found} end,
+      verify_client_secret: fn _, _ -> false end,
+      load_principal: fn _ -> {:error, :not_found} end,
+      schema_prefix: @schema
+    )
   end
 
   defp sql!(statement), do: SQL.query!(TestRepo, statement, [])

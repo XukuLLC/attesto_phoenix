@@ -248,6 +248,7 @@ defmodule AttestoPhoenix.MixProject do
           DPoPNonce
         ],
         Shared: [
+          AttestoPhoenix.AuthorizationCodePrivateContext,
           AttestoPhoenix.OAuthError,
           AttestoPhoenix.Event,
           AttestoPhoenix.PARStore,

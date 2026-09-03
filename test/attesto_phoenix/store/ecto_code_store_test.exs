@@ -15,8 +15,10 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
   import ExUnit.CaptureLog
 
+  alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
+  alias AttestoPhoenix.TestRepo
   alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag :ecto
@@ -124,11 +126,28 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert :ok = EctoCodeStore.put(entry("hash-dup", grant_data(%{subject: "first"})))
 
       # A repeated primary key is a caller bug; the unique constraint must
-      # surface, never a silent upsert that could replace an issued code.
-      # `insert!/1` maps the constraint onto the changeset and raises.
-      assert_raise Ecto.InvalidChangesetError, fn ->
-        EctoCodeStore.put(entry("hash-dup", grant_data(%{subject: "second"})))
-      end
+      # surface, never a silent upsert that could replace an issued code. The
+      # raised exception is rebuilt from a value-free changeset because Ecto's
+      # exception formatter otherwise prints raw params despite field redaction.
+      sentinel = "private-context-must-not-escape-the-insert-error"
+
+      claims =
+        grant_data().claims
+        |> Map.put(PrivateContext.claims_key(), %{"marker" => sentinel})
+
+      error =
+        assert_raise Ecto.InvalidChangesetError, fn ->
+          EctoCodeStore.put(entry("hash-dup", grant_data(%{subject: "second", claims: claims})))
+        end
+
+      assert error.changeset.params == nil
+      assert error.changeset.changes == %{}
+
+      assert error.changeset.errors ==
+               [code_hash: {"authorization code could not be stored", []}]
+
+      refute Exception.message(error) =~ sentinel
+      refute inspect(error) =~ sentinel
 
       # The original row is untouched.
       assert {:ok, %{data: %{subject: "first"}}} = EctoCodeStore.take("hash-dup")

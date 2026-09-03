@@ -6,6 +6,64 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `:authorization_code_completion` - an optional synchronous wrapper around the
+  tail of an authorization-code redemption (principal construction, host
+  ID-token claim construction, access- and ID-token minting, optional
+  logout-session recording, access-token `jti` recording, optional generation-0
+  refresh issuance, and code finalization). A host may run it inside its own
+  `Repo.transaction/1` to serialize token issuance with a subject-authorization
+  re-check. The continuation is bound to the callback's process and permits
+  exactly one invocation; a second, cross-process, or escaped call is refused
+  before anything is minted or persisted. The callback's return is verified by
+  provenance rather than its outward tuple form, so a callback that never
+  invokes the continuation cannot substitute a fabricated
+  `{:ok, response, events}` for a real token set. The `{:ok, _}` wrapper that
+  `Repo.transaction/1` places around a committed return is unwrapped instead
+  of failing a request whose code is already finalized. Rollback covers only
+  stores using the same Ecto Repo and enclosing transaction. Scope and resource
+  resolution precede this initial authorization-code completion hook; refresh
+  rotation and every other grant type bypass it. It is not a per-request
+  resource-server or MCP reauthorization mechanism. An exception, throw, or
+  exit after successful
+  continuation emits a static, secret-free error naming the possible
+  finalized-code/retry-revocation hazard, then propagates with its original
+  stacktrace. Reuse detection can revoke that response's access token and the
+  refresh-token family descended from that redemption, forcing the client
+  through a new authorization flow; it does not revoke unrelated authorization
+  grants. A success wrapper around a failed continuation is also unwrapped but
+  emits a static warning because earlier writes may have committed. A callback
+  that catches a continuation termination before it returns may return an OAuth
+  error, with a static warning about possible partial writes; a substituted
+  success is refused.
+- `:authorization_code_private_context` - an optional trusted issuance callback
+  for host-private authorization state. It receives exactly the authorized
+  `:client_id`, `:subject`, and the freshly generated authorization-grant
+  provenance `:family_id` (not the separately generated refresh-rotation family
+  identifier), and its return value is supplied back as `:private_context` in
+  the completion callback's context. The value must be a portable JSON object
+  of at most 4 KiB encoded. It is stored as plaintext JSONB, not encrypted, so
+  it is for non-secret identifiers and policy epochs rather than credentials or
+  token/key material. It rides with the code inside the canonical grant
+  `claims` under a reserved namespaced key, and is lifted off the grant before
+  principal construction so it never reaches an access token, ID Token,
+  refresh token, or token-exchange input. **This feature adds no column
+  migration; independent release migrations still apply.** Configuring it
+  without `:authorization_code_completion` is refused at boot, and a code that
+  carries private context is refused with the generic `invalid_request`
+  unable-to-issue-token response on a node whose completion callback is missing,
+  so config skew cannot silently skip the host's policy. The reserved key
+  belongs to the bundled authorization endpoint; custom authorization-code
+  issuers and reconstruction paths must reject `claims_key/0` in
+  request-derived claims. A private-context callback exception propagates, and
+  a PAR `request_uri` may already be claimed when it does. If a host transaction
+  rolls back after the continuation succeeds, the callback must return an error
+  rather than the captured success; the library cannot infer the transaction's
+  outcome after the callback returns.
+  Thanks to [@oliver-kriska](https://github.com/oliver-kriska) for the
+  contribution in [#25](https://github.com/XukuLLC/attesto_phoenix/pull/25).
+
 ### Changed
 
 - Key `attesto_authorization_codes` on `code_hash` as its PRIMARY KEY instead
@@ -21,6 +79,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   API are unchanged. Thanks to
   [@jtippett](https://github.com/jtippett) for the contribution in
   [#26](https://github.com/XukuLLC/attesto_phoenix/pull/26).
+
+### Security
+
+- Token exchange now strips `credential_configuration_ids` from inherited
+  claims, so exchanged tokens cannot inherit credential-issuance entitlement.
+- Mark `claims` `redact: true` on `AttestoPhoenix.Schema.Authorization`, hiding
+  the authentication context and optional host-private state from ordinary
+  struct and changeset inspection. Because `Ecto.InvalidChangesetError` renders
+  raw changes and params independently of schema redaction, the bundled code
+  store now replaces a failed insert changeset with a value-free one before
+  raising that exception. Direct Ecto callers and custom stores remain
+  responsible for equivalent exception handling.
+- Retain the code store's pre-existing suppression of application SQL logging
+  and Ecto query telemetry on every operation. Narrow the two reuse-detection
+  reads to only the columns they report, keeping `claims` out of decoded rows as
+  defence in depth, and add disclosure-focused regression coverage. Suppression
+  remains unconditional; custom stores and database-server logging remain the
+  host's responsibility.
 
 ### Upgrade notes
 
