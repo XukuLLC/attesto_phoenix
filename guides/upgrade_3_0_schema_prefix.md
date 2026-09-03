@@ -243,9 +243,10 @@ literal-prefixed source can retain a name such as
 `oauth_attesto_authorization_codes_code_hash_index` after its table is moved
 and renamed. Verify the actual index against every documented preflight
 condition, including `code_hash` nullability, a single key column, the
-column's default collation and operator class, default ordering, a valid,
-ready, live ordinary B-tree index, no predicate/expressions/`INCLUDE` columns,
-and no constraint backing the index. The
+column's and index's database-default collation, a default operator class,
+default ordering, a valid, ready, live ordinary B-tree index, no `NULLS NOT
+DISTINCT` option, no predicate/expressions/`INCLUDE` columns, and no constraint
+backing the index. The
 [pasteable catalog preflight query](#catalog-preflight) checks these conditions.
 Then tailor `PRIMARY KEY USING INDEX` to that verified name
 (or rename it only after checking for a collision). PostgreSQL will rename the
@@ -257,7 +258,11 @@ constraint; the accompanying notice is harmless.
 Paste this query into `psql` after replacing `public` in both names with the
 selected runtime schema. It returns one `ready_for_primary_key` result and a
 list of failure reasons. The historical generated table should return `t` and
-an empty `failure_reasons` array.
+an empty `failure_reasons` array. The project CI exercises PostgreSQL 16. The
+query reads the PostgreSQL 15+ `pg_index.indnullsnotdistinct` value through
+`to_jsonb` so it remains parseable on earlier PostgreSQL versions where that
+catalog column is absent; the missing key is treated as the historical
+`false` value.
 
 ```sql
 WITH target AS (
@@ -277,12 +282,18 @@ WITH target AS (
          index_info.indkey,
          index_info.indcollation[0] AS index_collation,
          index_info.indoption[0] AS index_options,
+         /* PostgreSQL 15 added this pg_index column. Reading the row as JSON
+            keeps this query executable on earlier PostgreSQL versions where
+            the column is absent; the missing key is the historical false. */
+         COALESCE((to_jsonb(index_info) ->> 'indnullsnotdistinct')::boolean, false)
+           AS nulls_not_distinct,
          index_info.indpred,
          index_info.indexprs,
          code_hash.attnum AS code_hash_attnum,
          code_hash.atttypid AS code_hash_type,
          code_hash.attnotnull AS code_hash_not_null,
          code_hash.attcollation AS code_hash_collation,
+         default_collation.oid AS database_default_collation,
          operator_class.opcdefault AS operator_class_default,
          operator_class.opcintype AS operator_class_type,
          constraint_info.constraint_name,
@@ -298,6 +309,9 @@ WITH target AS (
     ON code_hash.attrelid = target.table_oid
    AND code_hash.attname = 'code_hash'
    AND code_hash.attnum > 0
+  LEFT JOIN pg_collation AS default_collation
+    ON default_collation.collnamespace = 'pg_catalog'::regnamespace
+   AND default_collation.collname = 'default'
   LEFT JOIN pg_opclass AS operator_class
     ON operator_class.oid = index_info.indclass[0]
   LEFT JOIN LATERAL (
@@ -321,7 +335,12 @@ WITH target AS (
          COALESCE(indisvalid AND indisready AND indislive, false) AS index_valid_ready_live,
          COALESCE(indnatts = 1 AND indnkeyatts = 1 AND indkey[0] = code_hash_attnum, false) AS only_code_hash,
          COALESCE(code_hash_not_null, false) AS code_hash_not_null,
-         COALESCE(index_collation = code_hash_collation, false) AS default_collation,
+         COALESCE(
+           code_hash_collation = database_default_collation AND
+             index_collation = database_default_collation,
+           false
+         ) AS default_collation,
+         NOT nulls_not_distinct AS default_null_treatment,
          COALESCE(
            operator_class_default AND
              (operator_class_type = code_hash_type OR EXISTS (
@@ -349,6 +368,7 @@ WITH target AS (
            CASE WHEN NOT only_code_hash THEN 'index_is_multicolumn_or_has_include_columns' END,
            CASE WHEN NOT code_hash_not_null THEN 'code_hash_nullable_or_missing' END,
            CASE WHEN NOT default_collation THEN 'non_default_collation' END,
+           CASE WHEN NOT default_null_treatment THEN 'index_nulls_not_distinct' END,
            CASE WHEN NOT default_operator_class THEN 'non_default_operator_class' END,
            CASE WHEN NOT default_ordering THEN 'non_default_ordering' END,
            CASE WHEN NOT no_predicate THEN 'partial_index' END,

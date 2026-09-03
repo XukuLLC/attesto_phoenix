@@ -80,6 +80,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   [@jtippett](https://github.com/jtippett) for the contribution in
   [#26](https://github.com/XukuLLC/attesto_phoenix/pull/26).
 
+### Fixed
+
+- Tighten the authorization-code catalog preflight: it now rejects
+  `NULLS NOT DISTINCT` indexes and requires both the `code_hash` column and
+  its index to use the database-default collation. The query remains
+  executable on PostgreSQL versions before 15, where
+  `pg_index.indnullsnotdistinct` does not exist.
+
 ### Security
 
 - Token exchange now strips `credential_configuration_ids` from inherited
