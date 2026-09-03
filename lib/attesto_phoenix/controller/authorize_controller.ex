@@ -689,7 +689,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp log_private_context_rejection(:invalid_code_claims) do
-    Logger.error("authorization code claims rejected: combined claims are not portable")
+    Logger.error("authorization code claims rejected after private context insertion: combined claims are not portable")
   end
 
   defp log_private_context_rejection(:reserved_private_context_claim) do

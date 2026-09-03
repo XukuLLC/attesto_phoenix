@@ -693,6 +693,12 @@ release without this feature has no such refusal branch at all, so it will
 redeem a code carrying private context and complete normally. Deploy every
 token-endpoint node before enabling the hook.
 
+A persisted reserved value that is missing, malformed, or no longer portable is
+an invalid authorization grant and returns `invalid_grant`. That differs
+intentionally from the missing-callback configuration fault above, which uses a
+generic `invalid_request` response to avoid prompting a client to restart the
+grant.
+
 ### Resource indicators (RFC 8707)
 
 When one authorization server fronts more than one protected resource (say an

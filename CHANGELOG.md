@@ -57,7 +57,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   belongs to the bundled authorization endpoint; custom authorization-code
   issuers and reconstruction paths must reject `claims_key/0` in
   request-derived claims. A private-context callback exception propagates, and
-  a PAR `request_uri` may already be claimed when it does.
+  a PAR `request_uri` may already be claimed when it does. If a host transaction
+  rolls back after the continuation succeeds, the callback must return an error
+  rather than the captured success; the library cannot infer the transaction's
+  outcome after the callback returns.
   Thanks to [@oliver-kriska](https://github.com/oliver-kriska) for the
   contribution in [#25](https://github.com/XukuLLC/attesto_phoenix/pull/25).
 

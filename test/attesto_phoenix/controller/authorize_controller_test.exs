@@ -354,7 +354,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
           refute Map.has_key?(query, "code")
         end)
 
-      assert log =~ "authorization code claims rejected: combined claims are not portable"
+      assert log =~
+               "authorization code claims rejected after private context insertion: combined claims are not portable"
+
       refute log =~ "authorization code private context rejected"
     end
 
