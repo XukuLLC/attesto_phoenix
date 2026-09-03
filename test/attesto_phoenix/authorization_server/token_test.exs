@@ -1517,6 +1517,46 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
              }
     end
 
+    test "exchange drops grant-bound credential entitlements but preserves ordinary custom claims" do
+      config =
+        config(
+          build_principal: fn client, subject, scope ->
+            %{
+              kind: "client",
+              sub: ensure_sub(subject),
+              scopes: scope,
+              claims: %{
+                "client_id" => client.id,
+                "credential_configuration_ids" => ["UniversityDegreeCredential"],
+                "tenant_id" => "tenant-7"
+              }
+            }
+          end
+        )
+
+      subject_request = request(config, params: %{"scope" => "read"})
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+
+      assert claim!(subject_response.access_token, "credential_configuration_ids") ==
+               ["UniversityDegreeCredential"]
+
+      assert claim!(subject_response.access_token, "tenant_id") == "tenant-7"
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, exchanged, _events} = Token.issue(config, exchange_request)
+      refute claim!(exchanged.access_token, "credential_configuration_ids")
+      assert claim!(exchanged.access_token, "tenant_id") == "tenant-7"
+    end
+
     test "scope policy cannot widen the subject token or replace the requested subset" do
       base_config = config()
       subject_request = request(base_config, params: %{"scope" => "read write"})

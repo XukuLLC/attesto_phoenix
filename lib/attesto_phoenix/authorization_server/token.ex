@@ -45,6 +45,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   """
 
   alias Attesto.{AuthorizationCode, DeviceCode, IDToken, RefreshToken, ResourceIndicator}
+  alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token.Request
@@ -252,48 +253,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              redirect_uri,
              SenderConstraint.binding_jkt(binding)
            ),
+         {:ok, grant, private_context} <- take_private_context(config, grant),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
-         {:ok, audience} <- resolve_code_resource(grant, params),
-         {:ok, response} <-
-           mint(
-             request,
-             grant.subject,
-             scope,
-             token_type,
-             binding,
-             Map.merge(
-               access_token_claims(grant),
-               authorization_grant_id_claims(config, grant.family_id)
-             ),
-             # RFC 8707 §2.2: the access token's `aud` is the resource set the
-             # user authorized (bound to the code), optionally narrowed by a
-             # request-time `resource` — never widened by one. RFC 9470: carry
-             # the authentication context (`acr`/`auth_time`) the code recorded
-             # at authorize onto the access token for step-up enforcement.
-             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
-           ),
-         # OIDC Core §3.1.3.3: when the request was an OpenID Connect
-         # Authentication Request (granted scope contains `openid`), the token
-         # response additionally carries an ID Token.
-         {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
-      # OID4VCI (draft-ietf-oauth-openid4vci) §6.2 / RFC 9396 §7: when the
-      # code carried `openid_credential` credential_configuration_ids
-      # (`access_token_claims/1` already folded them into the minted access
-      # token above), echo the granted `authorization_details` on the token
-      # response. Omitted entirely for a plain authorization_code grant that
-      # carried none — this leaves every non-OID4VCI flow byte-identical.
-      response = maybe_echo_credential_authorization_details(response, grant)
-      issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
-
-      issue_authorization_code_response(
+         {:ok, audience} <- resolve_code_resource(grant, params) do
+      complete_authorization_code(
         request,
         code,
         grant,
+        private_context,
         scope,
         audience,
-        {token_type, binding},
-        response,
-        [issued]
+        token_type,
+        binding
       )
     end
   end
@@ -535,6 +506,432 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §5.2.
   defp dispatch(%Request{grant_type: grant_type}) do
     {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
+  end
+
+  # The host's private authorization state rides with the code inside the
+  # canonical grant `:claims` (`AttestoPhoenix.AuthorizationCodePrivateContext`).
+  # Lift it off the grant BEFORE anything reads claims, so it can never be
+  # surfaced as an OIDC claim, minted into a token, or carried into token
+  # exchange: from here on the grant looks exactly like one that never had it.
+  defp take_private_context(config, grant) do
+    claims = Callback.map_value(grant, :claims)
+
+    case PrivateContext.pop(if(is_map(claims), do: claims, else: %{})) do
+      {nil, _claims} ->
+        {:ok, grant, nil}
+
+      {:invalid, _claims} ->
+        # A reserved key holding a non-map is a tampered or corrupted row, not
+        # host state. Fail closed rather than hand it to the callback.
+        Logger.error("authorization code carried a malformed private context; no token was issued")
+
+        {:error, grant_error(:invalid_grant)}
+
+      {private_context, remaining} ->
+        if Config.authorization_code_completion_fun(config) do
+          {:ok, %{grant | claims: remaining}, private_context}
+        else
+          # The issuing node persisted state that this node has no callback to
+          # enforce, such as when its callback configuration or behaviour module
+          # is unavailable. Issuing tokens here would silently skip the host's
+          # completion policy, so refuse instead. Deploy callback-capable nodes
+          # before enabling private context; an older package version cannot be
+          # detected by this check.
+          Logger.error(
+            "authorization code carries private context but no :authorization_code_completion " <>
+              "callback is configured; no token was issued"
+          )
+
+          {:error, error(@error_invalid_request, "unable to issue token")}
+        end
+    end
+  end
+
+  # The authorization code is already atomically claimed by `redeem_code/5`.
+  # When configured, the completion callback wraps the remaining synchronous
+  # work so a host may serialize it with its own subject-revocation transaction.
+  # The absent-callback path executes that work directly, preserving the old
+  # execution order. No code or minted token is included in the callback
+  # context. The continuation is trusted same-process host code: its closure
+  # can be inspected or retained by that host, so this boundary is not a
+  # sandbox for protocol secrets.
+  defp complete_authorization_code(request, code, grant, private_context, scope, audience, token_type, binding) do
+    %{config: config} = request
+
+    context = %{
+      client_id: token_client_id(request),
+      subject: grant.subject,
+      family_id: grant.family_id,
+      private_context: private_context
+    }
+
+    case Config.authorization_code_completion_fun(config) do
+      nil ->
+        finish_authorization_code(request, code, grant, scope, audience, token_type, binding)
+
+      callback ->
+        with_authorization_code_continuation(
+          fn -> finish_authorization_code(request, code, grant, scope, audience, token_type, binding) end,
+          fn continuation, ref ->
+            callback
+            |> Callback.invoke([context, continuation])
+            |> normalize_authorization_code_completion(ref)
+          end
+        )
+    end
+  end
+
+  defp finish_authorization_code(request, code, grant, scope, audience, token_type, binding) do
+    %{config: config} = request
+
+    with {:ok, response} <-
+           mint(
+             request,
+             grant.subject,
+             scope,
+             token_type,
+             binding,
+             Map.merge(
+               access_token_claims(grant),
+               authorization_grant_id_claims(config, grant.family_id)
+             ),
+             # RFC 8707 §2.2: the access token's `aud` is the resource set the
+             # user authorized (bound to the code), optionally narrowed by a
+             # request-time `resource` — never widened by one. RFC 9470: carry
+             # the authentication context (`acr`/`auth_time`) the code recorded
+             # at authorize onto the access token for step-up enforcement.
+             audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
+           ),
+         # OIDC Core §3.1.3.3: when the request was an OpenID Connect
+         # Authentication Request (granted scope contains `openid`), the token
+         # response additionally carries an ID Token.
+         {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
+      # OID4VCI (draft-ietf-oauth-openid4vci) §6.2 / RFC 9396 §7: when the
+      # code carried `openid_credential` credential_configuration_ids
+      # (`access_token_claims/1` already folded them into the minted access
+      # token above), echo the granted `authorization_details` on the token
+      # response. Omitted entirely for a plain authorization_code grant that
+      # carried none — this leaves every non-OID4VCI flow byte-identical.
+      response = maybe_echo_credential_authorization_details(response, grant)
+      issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
+
+      issue_authorization_code_response(
+        request,
+        code,
+        grant,
+        scope,
+        audience,
+        {token_type, binding},
+        response,
+        [issued]
+      )
+    end
+  end
+
+  # The host wrapper is trusted policy, but continuation cardinality is a
+  # protocol invariant rather than a convention. A private atomic gate scopes
+  # the closure to this callback. The closure checks its owner and consumes the
+  # gate before completion, then records a secret-free `:started` marker before
+  # entering host-visible work. The outer `after` closes it and deletes the
+  # private provenance entry on every callback return or termination.
+  defp with_authorization_code_continuation(completion, callback) do
+    owner = self()
+    ref = make_ref()
+    gate = :atomics.new(1, signed: false)
+
+    continuation = fn -> run_authorization_code_continuation(owner, ref, gate, completion) end
+
+    try do
+      callback.(continuation, ref)
+    catch
+      kind, reason ->
+        maybe_log_completion_termination(ref, kind)
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    after
+      :atomics.put(gate, 1, 2)
+      Process.delete(authorization_code_continuation_key(ref))
+    end
+  end
+
+  # Cardinality alone bounds the callback to AT MOST one invocation. A private
+  # process-dictionary entry first records a secret-free `:started` marker, then
+  # carries a digest and outcome of the continuation's result, supplying the
+  # missing lower bound and provenance without keeping minted token strings in
+  # process state. This state is outside the ordinary mailbox, so a host
+  # callback's broad receive cannot consume it. The started marker is important:
+  # a host may catch a continuation termination after partial writes, before a
+  # normal result exists to replace it.
+  # A callback that never calls the continuation, or that substitutes a
+  # fabricated `{:ok, response, events}` for the real one, is detected by
+  # `normalize_authorization_code_completion/2`. The host still sees the plain
+  # result, so it can branch on success/failure to decide whether to commit or
+  # roll back.
+  defp run_authorization_code_continuation(owner, ref, gate, completion) do
+    cond do
+      self() != owner ->
+        # A continuation invoked from another process is a host bug with
+        # security-relevant intent. The wire answer stays generic; the operator
+        # gets the reason (the module's documented logging contract).
+        Logger.error(
+          "authorization code continuation was invoked from a process that does not own it; " <>
+            "no token was issued"
+        )
+
+        {:error, error(@error_invalid_request, "unable to issue token")}
+
+      :atomics.compare_exchange(gate, 1, 0, 1) != :ok ->
+        Logger.error(
+          "authorization code continuation was invoked more than once or after its scope " <>
+            "ended; no token was issued"
+        )
+
+        {:error, error(@error_invalid_request, "unable to issue token")}
+
+      true ->
+        # Set this before any completion work. If host code catches a raise,
+        # throw, or exit from the completion, normalization can distinguish a
+        # post-invocation termination from a callback that never invoked us.
+        Process.put(authorization_code_continuation_key(ref), :started)
+        result = completion.()
+
+        Process.put(
+          authorization_code_continuation_key(ref),
+          {completion_result_digest(result), completion_result_outcome(result)}
+        )
+
+        result
+    end
+  end
+
+  # Provenance check. The host is contractually required to return the
+  # continuation's result unchanged; this verifies it actually did, rather than
+  # trusting the outward tuple form. Three outcomes matter:
+  #
+  #   * the continuation never ran - nothing was minted, recorded, or finalized,
+  #     so a fabricated `{:ok, response, events}` must NOT become a token
+  #     response;
+  #   * the continuation started but terminated before producing a result - a
+  #     host may have caught the termination after partial writes, so an error
+  #     may be honored but a success must never be fabricated;
+  #   * the host returned exactly what the continuation produced - the normal
+  #     path, including a deliberate `{:error, _}` after `Repo.rollback/1`;
+  #   * the host committed the continuation inside `Repo.transaction/1` and
+  #     returned the `{:ok, _}` wrapper. The commit already took the mint,
+  #     refresh insert, and code finalization with it, so unwrap rather than
+  #     failing a request whose code is now finalized - failing would score the
+  #     client's retry as a replay and revoke that response's access token and
+  #     the refresh-token family descended from that redemption.
+  defp normalize_authorization_code_completion(result, ref) do
+    case Process.get(authorization_code_continuation_key(ref)) do
+      {digest, outcome} when is_binary(digest) and outcome in [:succeeded, :failed] ->
+        normalize_produced_completion(result, digest, outcome)
+
+      :started ->
+        normalize_started_completion(result)
+
+      _other ->
+        normalize_incomplete_completion(result)
+    end
+  end
+
+  defp authorization_code_continuation_key(ref) do
+    {__MODULE__, :authorization_code_continuation, ref}
+  end
+
+  defp maybe_log_completion_termination(ref, kind) do
+    case Process.get(authorization_code_continuation_key(ref)) do
+      {_digest, :succeeded} -> log_completion_termination_after_success(kind)
+      :started -> log_completion_termination_after_start(kind)
+      _other -> :ok
+    end
+  end
+
+  defp log_completion_termination_after_start(kind) do
+    verb =
+      case kind do
+        :error -> "raised"
+        :throw -> "threw"
+        :exit -> "exited"
+      end
+
+    # Deliberately do not inspect the exception, throw, exit reason, callback
+    # context, or continuation result: any of them may contain host secrets.
+    Logger.error(
+      "authorization code completion callback #{verb} after the continuation started; " <>
+        "partial writes may have occurred and no successful token response was returned"
+    )
+  end
+
+  defp log_completion_termination_after_success(kind) do
+    verb =
+      case kind do
+        :error -> "raised"
+        :throw -> "threw"
+        :exit -> "exited"
+      end
+
+    # Deliberately do not inspect the exception, throw, exit reason, callback
+    # context, or continuation result: any of them may contain host secrets.
+    Logger.error(
+      "authorization code completion callback #{verb} after the continuation succeeded; " <>
+        "the code may already be finalized, and a client retry may trigger code-reuse " <>
+        "detection and revoke that response's access token and refresh family"
+    )
+  end
+
+  defp normalize_produced_completion(result, digest, outcome) do
+    cond do
+      completion_result_digest(result) == digest ->
+        normalize_completion_result(result)
+
+      match?({:ok, _inner}, result) and completion_result_digest(elem(result, 1)) == digest ->
+        maybe_log_failed_completion_wrapper(outcome)
+        result |> elem(1) |> normalize_completion_result()
+
+      true ->
+        normalize_substituted_completion(result, outcome)
+    end
+  end
+
+  defp completion_result_digest(result) do
+    :crypto.hash(:sha256, :erlang.term_to_binary(result, [:deterministic]))
+  end
+
+  defp completion_result_outcome({:ok, _response, _events}), do: :succeeded
+  defp completion_result_outcome(_result), do: :failed
+
+  defp maybe_log_failed_completion_wrapper(:failed) do
+    Logger.warning(
+      "authorization code completion callback returned a success wrapper around a failed " <>
+        "continuation result; an enclosing transaction may have committed partial writes"
+    )
+  end
+
+  defp maybe_log_failed_completion_wrapper(:succeeded), do: :ok
+
+  # The continuation ran but the host returned something else.
+  #
+  # Any substituted return after the continuation SUCCEEDED is the dangerous
+  # case and the reason these clauses are not silent. Two host behaviours reach
+  # it and this library cannot tell them apart from the inside:
+  #
+  #   * the host rolled its transaction back, so the mint, refresh insert, and
+  #     finalization went with it. The error is honest and the earlier code
+  #     claim remains spent but unfinalized; a retry is refused without being
+  #     scored as reuse.
+  #   * the host COMMITTED and then returned something else anyway. The code is
+  #     now finalized, so the client's retry presents a successfully consumed
+  #     code. Reuse detection then revokes that response's access token and the
+  #     refresh-token family descended from that redemption, and returns
+  #     `invalid_grant`, forcing a new authorization flow. Unrelated
+  #     authorization grants are unaffected.
+  #
+  # Distinguishing them would require knowing the host's transaction outcome,
+  # which is outside this boundary. An OAuth error is honoured and every other
+  # substituted return is normalized for the wire, but all are logged at error
+  # level with the consequence named. This lets an operator find the host bug
+  # instead of chasing phantom replay revocations.
+  defp normalize_substituted_completion({:error, %OAuthError{}} = error, :succeeded) do
+    log_substituted_completion_after_success("returned an error")
+    error
+  end
+
+  defp normalize_substituted_completion({:error, _reason}, :succeeded) do
+    log_substituted_completion_after_success("returned an error")
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_substituted_completion(_substituted, :succeeded) do
+    log_substituted_completion_after_success("returned a different result")
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  # The continuation itself failed and the host remapped the reason. The code
+  # was not finalized and no success response can be returned, so there is no
+  # retry hazard to report. Earlier continuation steps may still have persisted
+  # partial state when the host did not provide a transaction.
+  defp normalize_substituted_completion({:error, %OAuthError{}} = error, :failed), do: error
+
+  defp normalize_substituted_completion({:error, _reason}, :failed) do
+    Logger.error("authorization code completion callback failed")
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_substituted_completion(_substituted, :failed) do
+    Logger.error(
+      "authorization code completion callback did not return the continuation's result " <>
+        "unchanged; completion did not succeed and no token response was returned"
+    )
+
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp log_substituted_completion_after_success(action) do
+    Logger.error(
+      "authorization code completion callback #{action} after the continuation succeeded; " <>
+        "the code may already be finalized, and a client retry may trigger code-reuse " <>
+        "detection and revoke that response's access token and refresh family"
+    )
+  end
+
+  # The continuation started but terminated before returning a result. A host
+  # may catch that termination and return an OAuth error, but the library cannot
+  # infer whether work before the termination committed. Honor a real OAuth
+  # error while warning about the possible partial writes; never serve a result
+  # that could be a fabricated success.
+  defp normalize_started_completion({:error, %OAuthError{}} = error) do
+    log_caught_completion_termination()
+    error
+  end
+
+  defp normalize_started_completion({:error, _reason}) do
+    log_caught_completion_termination()
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_started_completion(_result) do
+    Logger.error(
+      "authorization code completion callback returned a result after the continuation " <>
+        "terminated; partial writes may have occurred and no successful token response was returned"
+    )
+
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp log_caught_completion_termination do
+    Logger.warning(
+      "authorization code completion callback caught a termination after the continuation " <>
+        "started; partial writes may have occurred and the completion result cannot be verified"
+    )
+  end
+
+  # The continuation was never invoked. Nothing was minted or persisted, so the
+  # only safe answers are the host's own error or a refusal - never a success
+  # the host assembled itself.
+  defp normalize_incomplete_completion({:error, %OAuthError{}} = error), do: error
+
+  defp normalize_incomplete_completion({:error, _reason}) do
+    Logger.error("authorization code completion callback failed")
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_incomplete_completion(_result) do
+    Logger.error(
+      "authorization code completion callback returned without invoking the continuation; " <>
+        "no token was issued"
+    )
+
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp normalize_completion_result({:ok, response, events} = result) when is_map(response) and is_list(events),
+    do: result
+
+  defp normalize_completion_result({:error, %OAuthError{}} = error), do: error
+
+  defp normalize_completion_result(_other) do
+    Logger.error("authorization code completion produced an unusable result; no token was issued")
+    {:error, error(@error_invalid_request, "unable to issue token")}
   end
 
   # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
@@ -1771,9 +2168,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # `acr` / `auth_time` are reserved: an exchanged (machine-authorized) token
     # must not inherit the subject token's authentication context, which would
     # let token exchange forge a step-up-satisfying token (RFC 9470).
+    # `credential_configuration_ids` is also grant-bound: RFC 8693 exchange
+    # creates a new grant boundary and must not turn an OID4VCI subject-token
+    # entitlement into an exchanger entitlement.
     reserved =
       MapSet.new(
-        ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id) ++
+        ~w(iss aud exp iat nbf jti scope sub typ cnf acr auth_time client_id credential_configuration_ids) ++
           [principal_kind_claim] ++ List.wrap(Config.authorization_grant_id_claim(config))
       )
 

@@ -50,7 +50,11 @@ defmodule AttestoPhoenix.Schema.Authorization do
       strings at every level; values are JSON `null`, booleans, strings,
       exact-range integers, arrays, or nested objects. Floats and other VM
       terms are not persisted because the Ecto JSONB boundary must round-trip
-      the grant context unchanged.
+      the grant context unchanged. The column uses Ecto redaction so ordinary
+      struct and changeset inspection hides it. It carries the authentication
+      context and, for a host that configures
+      `:authorization_code_private_context`, that host's private state under the
+      reserved key owned by `AttestoPhoenix.AuthorizationCodePrivateContext`.
 
   ## Lifecycle columns
 
@@ -166,7 +170,14 @@ defmodule AttestoPhoenix.Schema.Authorization do
     field :code_challenge_method, :string
     field :cnf, :map
     field :nonce, :string
-    field :claims, :map, default: %{}
+    # `redact: true`: the claims map carries the authentication context (nonce,
+    # acr, amr, sid) and, when the host configures
+    # `:authorization_code_private_context`, host-private authorization state
+    # under a reserved key. This hides the field from ordinary struct and
+    # changeset inspection. Ecto exception messages can render raw changes and
+    # params, so the bundled store sanitizes failed-insert exceptions; direct
+    # callers and custom stores must provide equivalent handling.
+    field :claims, :map, default: %{}, redact: true
     field :family_id, :string
     field :access_token_jti, :string
     field :access_token_expires_at, :utc_datetime

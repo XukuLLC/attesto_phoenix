@@ -15,6 +15,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
   alias Attesto.AuthorizationCode
   alias Attesto.RequestObject.Policy
+  alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Store.PAR.ETS
@@ -151,6 +152,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     )
   end
 
+  # `:authorization_code_private_context` is only valid alongside a completion
+  # callback, so the issuance tests pair it with a pass-through.
+  defp passthrough_completion(_context, continuation), do: continuation.()
+
   defp put_config(overrides) do
     Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, base_config(overrides))
   end
@@ -254,6 +259,105 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert grant.subject == "user-42"
       assert grant.scope == ["openid", "profile"]
+    end
+
+    test "an absent private-context hook preserves the ordinary stored record" do
+      conn = call(valid_params(%{"authorization_code_private_context" => "client-controlled"}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, PrivateContext.claims_key())
+      refute Map.has_key?(record.data.claims, "authorization_code_private_context")
+    end
+
+    test "the host attaches bounded private context from trusted authorization state" do
+      test_pid = self()
+
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn context ->
+          send(test_pid, {:private_context_issuance, context})
+          %{"security_epoch" => 42}
+        end
+      )
+
+      conn = call(valid_params(%{"authorization_code_private_context" => "client-controlled"}))
+      code = location_query(conn)["code"]
+      record = TestStore.peek(code)
+
+      assert_receive {:private_context_issuance,
+                      %{client_id: @client_id, subject: "user-42", family_id: family_id} = context}
+
+      # Exactly the authorized identifiers - no request params, no secrets.
+      assert map_size(context) == 3
+      assert family_id == record.data.family_id
+
+      # Core admits no sibling key beside the nine canonical ones, so the value
+      # rides inside claims under the reserved key.
+      assert record.data.claims[PrivateContext.claims_key()] == %{"security_epoch" => 42}
+      refute Map.has_key?(record.data, :attesto_phoenix_private_context)
+      refute Map.has_key?(record.data.claims, "security_epoch")
+    end
+
+    test "a private context the claims column cannot round-trip fails before a code is returned" do
+      # Atom keys, invalid UTF-8, a float, unencodable terms, and ordinary
+      # Elixir structs all fail the portable-JSON-object contract the claims
+      # column requires. None may yield a code: the completion callback would
+      # demand state that was never stored. Keep the values out of diagnostics.
+      for invalid <- [
+            %{security_epoch: 42},
+            %{"invalid_utf8" => <<255>>},
+            %{"ratio" => 1.5},
+            %{"nested" => %{"value" => {:not, :json}}},
+            %{"payload" => String.duplicate("x", 4_097)},
+            Date.utc_today(),
+            DateTime.utc_now(),
+            Decimal.new("1.25"),
+            MapSet.new(["private-value"])
+          ] do
+        put_config(
+          authorization_code_completion: &passthrough_completion/2,
+          authorization_code_private_context: fn _context -> invalid end
+        )
+
+        log =
+          capture_log(fn ->
+            conn = call(valid_params())
+            query = location_query(conn)
+
+            assert query["error"] == "server_error"
+            refute Map.has_key?(query, "code")
+            refute inspect(query) =~ inspect(invalid)
+          end)
+
+        assert log =~ "authorization code private context rejected"
+        refute log =~ "authorization code claims rejected"
+        refute log =~ inspect(invalid)
+      end
+    end
+
+    test "invalid combined code claims are logged as claims rejection" do
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context -> %{"security_epoch" => 42} end,
+        authenticate_resource_owner: fn _conn, _request, _auth_opts ->
+          {:authenticated, %{subject: "user-42", acr: %{invalid: :term}}}
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          conn = call(valid_params())
+          query = location_query(conn)
+
+          assert query["error"] == "server_error"
+          refute Map.has_key?(query, "code")
+        end)
+
+      assert log =~
+               "authorization code claims rejected after private context insertion: combined claims are not portable"
+
+      refute log =~ "authorization code private context rejected"
     end
 
     test "the issued code preserves the OIDC claims request object" do
@@ -835,6 +939,29 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       query = location_query(conn)
       assert is_binary(query["code"])
       assert query["state"] == "xyz"
+    end
+
+    test "a raising private-context callback propagates after PAR claims the request_uri" do
+      request_uri = "urn:ietf:params:oauth:request_uri:private-context-raise"
+
+      put_config(
+        require_pushed_authorization_requests: true,
+        par_store: PARStore,
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context ->
+          raise "injected private-context callback failure"
+        end
+      )
+
+      :ok = PARStore.put(request_uri, valid_params(), 60)
+
+      assert_raise RuntimeError, "injected private-context callback failure", fn ->
+        call(%{"client_id" => @client_id, "request_uri" => request_uri})
+      end
+
+      # The PAR reference is claimed before the private-context callback runs;
+      # a raised host callback therefore cannot leave it available for retry.
+      assert :error = PARStore.fetch(request_uri)
     end
 
     test "completion consumes the PAR request_uri (RFC 9126 single-use)" do

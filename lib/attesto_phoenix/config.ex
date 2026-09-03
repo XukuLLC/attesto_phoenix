@@ -351,6 +351,126 @@ defmodule AttestoPhoenix.Config do
       refresh token (RFC 6749 §6). When unset, the token controller issues one
       iff the granted scope contains `offline_access` (OIDC Core §11) and a
       `:refresh_store` is configured.
+    * `:authorization_code_private_context` - `(context -> map | nil)`.
+      Optional trusted issuance callback for host-private authorization state.
+      `context` contains exactly the authorized `:client_id`, `:subject`, and
+      freshly generated authorization-grant provenance `:family_id`; it contains
+      no request parameters or token secrets. This identifier is the value
+      exposed by `:authorization_grant_id_claim` when configured, not the
+      separately generated refresh-rotation family identifier. A returned map
+      must be a portable JSON object
+      (`Attesto.Claims.portable_json_object?/1`: string keys at every level and
+      JSON-safe values) and is limited to 4 KiB once encoded. It rides with the
+      authorization code inside the canonical grant `:claims` under a reserved
+      namespaced key, and is supplied only as `:private_context` in the
+      completion callback context. It is stripped from the redeemed core grant
+      before principal construction, so it never reaches an access token, ID
+      Token, refresh token, or token-exchange input. The map is persisted as
+      plaintext JSONB in the authorization row; this feature is not encryption.
+      Store only non-secret identifiers and policy versions such as subject IDs
+      or security epochs, never credentials or token/key material. `nil` stores
+      nothing.
+      The reserved key belongs to the bundled authorization endpoint. A custom
+      authorization-code issuer or custom reconstruction path accepting
+      request-derived claims MUST reject
+      `AttestoPhoenix.AuthorizationCodePrivateContext.claims_key/0` in those
+      claims; `reserved?/1` is provided for that check. Exceptions from this
+      callback propagate. When the authorization request came through PAR, its
+      `request_uri` may already have been claimed before this callback runs, as
+      with other host callbacks.
+      Configure this only together with `:authorization_code_completion`;
+      missing state remains valid so the host can apply flow-specific
+      fail-closed policy at completion. The reverse skew fails closed on the
+      library's side: a code that DOES carry private context is refused with
+      generic `invalid_request` unable-to-issue-token response when no
+      `:authorization_code_completion` callback is configured, so a node whose
+      callback configuration or behaviour module is
+      unavailable cannot issue tokens with the host's completion policy
+      silently skipped. Deploy callback-capable nodes before enabling private
+      context; this check cannot detect an older package version on another
+      node.
+    * `:authorization_code_completion` - `(context, continuation -> result)`.
+      Optional synchronous wrapper around authorization-code completion. It is
+      invoked after the code has been redeemed and before `:build_principal` or
+      token minting. `context` contains only the authenticated `:client_id`, the
+      grant `:subject`, its `:family_id`, and the host's `:private_context` map
+      (or `nil`); it never contains the authorization code or minted token
+      secrets. The zero-arity continuation performs principal construction,
+      host `:build_id_token_claims` invocation, access- and ID-token minting,
+      optional logout-session recording, access-token `jti` recording,
+      optional generation-0 refresh-token insertion, and successful code
+      finalization. A host may run it inside its own database transaction after
+      locking and revalidating the subject's authorization policy.
+
+      This is an initial authorization-code completion hook only. Scope policy
+      and resource-indicator resolution precede it. Refresh, device-code, CIBA,
+      pre-authorized-code, JWT-bearer, client-credentials, token-exchange, and
+      every other grant type bypass the hook. It is not a per-request
+      resource-server or MCP reauthorization mechanism; enforce request-time
+      policy where the access token is used.
+
+      AttestoPhoenix binds the continuation to the callback's process and
+      dynamic scope and permits exactly one invocation; a second, cross-process,
+      or escaped invocation is rejected before token minting or persistence. The
+      callback must return the first invocation's `{:ok, response, events}` or
+      `{:error, oauth_error}` result unchanged. This is enforced, not merely
+      documented: a digest and outcome of the continuation's result are recorded
+      and compared without retaining token strings in process state, so a
+      callback that never invokes the continuation cannot pass off a fabricated
+      `{:ok, response, events}` as a token set, and a callback that substitutes a
+      different success is refused. The `{:ok, _}` wrapper `Repo.transaction/1`
+      places around a committed return is also accepted and unwrapped, because
+      that commit already carried the mint, refresh insertion, and finalization.
+      Only that one wrapper layer is accepted: a nested transaction or
+      `Ecto.Multi` container must be unwrapped by the host so the callback
+      returns the continuation's exact result.
+      A success wrapper around a failed continuation result is unwrapped to
+      preserve the wire error, but emits a static warning because earlier
+      continuation writes may have committed unless the callback rolled the
+      transaction back.
+      If the continuation raises, throws, or exits before returning and the
+      callback catches that termination, an OAuth error is accepted with a
+      static warning that partial writes may have occurred; a substituted
+      success is refused.
+      The callback is trusted same-process host code: the private process entry
+      is a correctness guard against accidental interference and contract
+      mistakes, not a sandbox against a hostile callback that deliberately
+      inspects or mutates its own process dictionary. Host exception and crash
+      formatters may render callback arguments, including `:private_context`,
+      which is another reason that map must never contain secrets.
+      If the continuation returns an error inside a transaction, the callback
+      must roll that transaction back rather than commit the normal error tuple.
+      If the continuation succeeds and the host transaction rolls back, the
+      callback MUST return an error and MUST NOT return the captured success
+      result. The library cannot distinguish a rollback from a commit after
+      the callback returns; returning that success would serve a response whose
+      writes were rolled back.
+      **Rollback covers only stores using the same Ecto Repo and enclosing
+      transaction as the callback.** Stores using another Repo, an independently
+      committed transaction, or an external service remain outside this
+      boundary. A callback may decline to continue with
+      `{:error, reason}`; an `AttestoPhoenix.OAuthError` passes through, while any
+      other failure is rendered as a generic token-issuance error without
+      logging the reason. If the callback returns an error, raises, throws, or
+      exits after the continuation succeeds, a transaction may already have
+      committed code finalization; the failed client retry can then be detected
+      as code reuse and revoke that response's access token and the refresh-token
+      family descended from that redemption, forcing a new authorization flow
+      without affecting unrelated authorization grants. Such error returns are
+      logged with this consequence. Exceptions, throws, and exits get the same
+      static, secret-free log before being re-raised with their original
+      stacktrace; the reason and callback context are never logged. The code has
+      already been claimed before this callback runs, so refusal, malformed
+      persisted private context, a missing callback for a context-bearing code,
+      or any callback failure before the continuation succeeds leaves it spent
+      but unfinalized. Audit events follow the final returned
+      result: a substituted error does not emit the continuation's success
+      events, and `issue/2` returns the normal `:token_denied` event for that
+      error. Persisted or external side effects from a committed continuation
+      remain the host's responsibility to reconcile.
+      The spent row has `consumed_at` set and `consumed_success: false`, with no
+      refresh family.
+      When unset, the continuation runs directly, preserving existing behavior.
     * `:code_store` - module implementing `Attesto.CodeStore`.
     * `:refresh_store` - module implementing `Attesto.RefreshStore`.
       `AttestoPhoenix.Store.EctoRefreshStore` with a non-zero rotation grace
@@ -792,6 +912,8 @@ defmodule AttestoPhoenix.Config do
     :client_requires_dpop?,
     :client_grant_types,
     :issue_refresh_token?,
+    :authorization_code_private_context,
+    :authorization_code_completion,
     :resolve_jwt_bearer_subject,
     :code_store,
     :refresh_store,
@@ -941,6 +1063,8 @@ defmodule AttestoPhoenix.Config do
           client_requires_dpop?: callback() | nil,
           client_grant_types: callback() | nil,
           issue_refresh_token?: callback() | nil,
+          authorization_code_private_context: callback() | nil,
+          authorization_code_completion: callback() | nil,
           resolve_jwt_bearer_subject: callback() | nil,
           code_store: module() | nil,
           refresh_store: module() | nil,
@@ -1531,7 +1655,13 @@ defmodule AttestoPhoenix.Config do
   existing error message; the lookup and default failure stay shared.
   """
   @spec ecto_repo!() :: module()
-  def ecto_repo!, do: ecto_repo!("AttestoPhoenix: no :repo configured. Set `config :attesto_phoenix, repo: MyApp.Repo`")
+  def ecto_repo! do
+    ecto_repo!(
+      "AttestoPhoenix: no :repo configured. Set :repo on the request/host " <>
+        "AttestoPhoenix.Config; legacy deployments without :otp_app may set " <>
+        "config :attesto_phoenix, repo: MyApp.Repo"
+    )
+  end
 
   @spec ecto_repo!(String.t()) :: module()
   def ecto_repo!(missing_message) when is_binary(missing_message) do
@@ -2891,6 +3021,8 @@ defmodule AttestoPhoenix.Config do
     authenticate_ciba_user: 1,
     notify_ciba_user: 3,
     issue_refresh_token?: 2,
+    authorization_code_private_context: 1,
+    authorization_code_completion: 2,
     replay_check: 2,
     terminate_session: 2,
     render_logged_out: 2
@@ -3196,6 +3328,29 @@ defmodule AttestoPhoenix.Config do
 
   @type credential_result ::
           sd_jwt_credential_result() | jwt_vc_credential_result() | mdoc_credential_result()
+
+  @doc """
+  Returns the configured authorization-code private-context callback, or `nil`.
+
+  See the `:authorization_code_private_context` option. The value the callback
+  returns rides with the code inside the canonical grant `:claims` and is
+  surfaced only to `:authorization_code_completion`.
+  """
+  @spec authorization_code_private_context_fun(t()) :: callback() | nil
+  def authorization_code_private_context_fun(%__MODULE__{} = config),
+    do: Callback.config_callback(config, :authorization_code_private_context)
+
+  @doc """
+  Returns the configured authorization-code completion callback, or `nil`.
+
+  See the `:authorization_code_completion` option. When `nil`, the token
+  endpoint runs the completion continuation directly. The continuation closure
+  captures completion state, including the plaintext authorization code;
+  trusted host code MUST NOT inspect or dump its function environment.
+  """
+  @spec authorization_code_completion_fun(t()) :: callback() | nil
+  def authorization_code_completion_fun(%__MODULE__{} = config),
+    do: Callback.config_callback(config, :authorization_code_completion)
 
   @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
   @spec build_credential_fun(t()) :: callback() | nil
@@ -3571,6 +3726,7 @@ defmodule AttestoPhoenix.Config do
     validate_dpop_nonce!(config)
     validate_key_attestation!(config)
     validate_authorization_grant_id_claim!(config)
+    validate_authorization_code_private_context!(config)
     validate_supported_value_lists!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
@@ -3646,6 +3802,20 @@ defmodule AttestoPhoenix.Config do
 
   @authorization_grant_id_claim_conflicts @registered_access_token_claims ++
                                             @library_owned_access_token_claims
+
+  # `:authorization_code_private_context` without `:authorization_code_completion`
+  # would persist host state that nothing ever reads: the issuance half of the
+  # feature is only meaningful paired with the redemption half. Arity is checked
+  # centrally via @flat_callback_arities; this is the cross-field rule.
+  defp validate_authorization_code_private_context!(%__MODULE__{authorization_code_private_context: nil}), do: :ok
+
+  defp validate_authorization_code_private_context!(%__MODULE__{authorization_code_completion: nil}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :authorization_code_private_context requires " <>
+            ":authorization_code_completion so persisted private state is enforced."
+  end
+
+  defp validate_authorization_code_private_context!(%__MODULE__{}), do: :ok
 
   defp validate_authorization_grant_id_claim!(%__MODULE__{authorization_grant_id_claim: nil}), do: :ok
 
