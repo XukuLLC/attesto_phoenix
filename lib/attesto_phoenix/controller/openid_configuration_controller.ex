@@ -160,7 +160,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   defp discovery_opts(%Config{} = config, %Plug.Conn{} = conn) do
     [
       userinfo_endpoint: userinfo_endpoint(config, conn),
-      revocation_endpoint: Config.revocation_endpoint_url(config),
       frontchannel_logout_supported: frontchannel_logout_supported(config),
       frontchannel_logout_session_supported: frontchannel_logout_session_supported(config),
       # OpenID Connect Session Management 1.0 §3.3: the check_session_iframe,

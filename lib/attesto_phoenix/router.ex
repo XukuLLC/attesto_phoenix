@@ -209,6 +209,10 @@ defmodule AttestoPhoenix.Router do
 
       This route control does not enable OIDC. Runtime config must also set
       `openid_provider: true`; otherwise the mounted controller answers 404.
+      When both bundled OIDC routes are explicitly disabled, router compilation
+      warns if the host application's `AttestoPhoenix.Config` leaves
+      `:openid_provider` implicit. Set it explicitly to `false` for an OAuth-only
+      server or `true` when replacement OIDC routes are served elsewhere.
     * `:device` - when `true`, mounts the RFC 8628 device-authorization
       endpoint and verification page. Defaults to `false`.
     * `:credential_issuance` - when `true`, mounts the OID4VCI nonce,
@@ -263,8 +267,11 @@ defmodule AttestoPhoenix.Router do
       match. More than one entry is a compile-time error: one controller
       document cannot equal two identifiers; multi-resource hosts should use
       `attesto_mcp`'s `AttestoMCP.Router.attesto_mcp_protected_resource_metadata/2`,
-      which serves per-resource documents. Defaults to `[]` (root only,
-      today's behavior).
+      which serves per-resource documents and per-resource scope catalogs. The
+      root and optional single path-inserted document mounted here are two
+      locations for the same resource and share
+      `AttestoPhoenix.Config.protected_resource_scopes_supported/1`. Defaults to
+      `[]` (root only, today's behavior).
     * `:protected_resource_root` - when `false`, does not mount the root
       `/.well-known/oauth-protected-resource` document. Use this when PRM
       ownership lives elsewhere: a host that mounts `attesto_mcp`'s
@@ -451,6 +458,7 @@ defmodule AttestoPhoenix.Router do
     session_management? = Keyword.get(opts, :session_management, false)
     userinfo? = normalize_route_mount_control!(opts, :userinfo, true)
     openid_configuration? = normalize_route_mount_control!(opts, :openid_configuration, true)
+    warn_if_oidc_capability_is_implicit!(userinfo?, openid_configuration?, __CALLER__)
     validate_userinfo_suppression_prefix!(prefix, userinfo?, openid_configuration?)
     protected_resource_root? = Keyword.get(opts, :protected_resource_root, true)
 
@@ -897,6 +905,41 @@ defmodule AttestoPhoenix.Router do
   end
 
   defp validate_userinfo_suppression_prefix!(_prefix, _userinfo?, _openid_configuration?), do: :ok
+
+  # Route removal and protocol capability are deliberately separate: an OIDC
+  # host may replace both bundled routes, while an OAuth-only host must disable
+  # the protocol capability as well. Warn only when both routes are explicitly
+  # removed and the host application left `:openid_provider` implicit. An
+  # explicit true or false is sufficient evidence of host intent.
+  defp warn_if_oidc_capability_is_implicit!(false, false, caller) do
+    otp_app = caller_otp_app()
+    configured = if otp_app, do: Application.get_env(otp_app, AttestoPhoenix.Config, :missing), else: :missing
+
+    if implicit_openid_provider?(configured) do
+      IO.warn(
+        "attesto_routes/1 disables the bundled OpenID Provider Metadata and UserInfo routes, " <>
+          "but #{inspect(otp_app || :the_host_app)} does not explicitly configure " <>
+          "AttestoPhoenix.Config :openid_provider. Route controls do not disable OIDC; " <>
+          "OAuth-only hosts must set openid_provider: false, while OIDC hosts serving " <>
+          "replacement routes should set openid_provider: true.",
+        Macro.Env.stacktrace(caller)
+      )
+    end
+  end
+
+  defp warn_if_oidc_capability_is_implicit!(_userinfo?, _openid_configuration?, _caller), do: :ok
+
+  defp caller_otp_app do
+    if Code.ensure_loaded?(Mix.Project) and Mix.Project.get() do
+      Mix.Project.config()[:app]
+    end
+  end
+
+  defp implicit_openid_provider?(:missing), do: true
+  defp implicit_openid_provider?(%AttestoPhoenix.Config{}), do: false
+  defp implicit_openid_provider?(opts) when is_list(opts), do: not Keyword.has_key?(opts, :openid_provider)
+  defp implicit_openid_provider?(opts) when is_map(opts), do: not Map.has_key?(opts, :openid_provider)
+  defp implicit_openid_provider?(_other), do: true
 
   defp normalize_route_pipeline_option!(opts, default_pipelines) do
     case Keyword.get_values(opts, :route_pipelines) do

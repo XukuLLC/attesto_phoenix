@@ -91,7 +91,11 @@ catalog. This does not update existing client rows or bypass host callbacks;
 migrate existing clients that should be allowed to request `openid` through
 your normal client-policy process. Protected-resource and MCP tool catalogs
 stay separate and never receive this identity scope automatically. Configure
-the bundled RFC 9728 document with `protected_resource_scopes_supported`.
+the bundled RFC 9728 document with `protected_resource_scopes_supported`. Its
+root and optional path-inserted URI describe the same resource and share that
+catalog. Multi-resource hosts must publish a separate metadata document and
+scope catalog per resource, for example with `attesto_mcp`'s per-resource
+router.
 
 ## 6. Verify discovery
 

@@ -43,6 +43,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       "token_endpoint_auth_signing_alg_values_supported" => config.client_auth_signing_algs,
       "introspection_endpoint" => Config.introspection_endpoint_url(config),
       "introspection_endpoint_auth_methods_supported" => introspection_auth_methods(config),
+      "revocation_endpoint" => Config.revocation_endpoint_url(config),
       "pushed_authorization_request_endpoint" => Config.par_endpoint_url(config)
     })
     |> put_if_present("require_pushed_authorization_requests", require_pushed_authorization_requests(config))

@@ -83,6 +83,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       # resolution as token_endpoint.
       assert body["authorization_endpoint"] == "#{@issuer}/oauth/authorize"
       assert body["token_endpoint"] == "#{@issuer}/oauth/token"
+      assert body["revocation_endpoint"] == "#{@issuer}/oauth/revoke"
       assert body["jwks_uri"] == "#{@issuer}/.well-known/jwks.json"
       assert "code" in body["response_types_supported"]
 
@@ -168,6 +169,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         "jwks_uri" => "https://issuer.example/.well-known/jwks.json",
         "pushed_authorization_request_endpoint" => "https://issuer.example/oauth/par",
         "registration_endpoint" => "https://issuer.example/oauth/register",
+        "revocation_endpoint" => "https://issuer.example/oauth/revoke",
         "request_object_signing_alg_values_supported" => [
           "PS256",
           "ES256",
@@ -478,6 +480,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       # config's resolved token path into the protocol config the same way
       # to_attesto_config/2 does in production.
       assert body["pushed_authorization_request_endpoint"] == "#{@issuer}/mcp/oauth/par"
+      assert body["revocation_endpoint"] == "#{@issuer}/mcp/oauth/revoke"
       assert body["registration_endpoint"] == "#{@issuer}/mcp/oauth/register"
       # The well-known JWKS document is anchored at the host root (RFC 8615) and
       # is NOT relocated by the prefix.

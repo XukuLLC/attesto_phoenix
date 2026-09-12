@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.3.1] - 2026-09-12
+
+### Added
+
+- Warn during router compilation when both bundled OIDC routes are disabled but
+  the host application's `AttestoPhoenix.Config` leaves `openid_provider`
+  implicit. Explicit `false` identifies an OAuth-only server; explicit `true`
+  records that replacement OIDC routes are intentional.
+
+### Fixed
+
+- Advertise the mounted `revocation_endpoint` in RFC 8414 authorization-server
+  metadata as well as OpenID Provider Metadata, using the shared metadata
+  builder so the endpoint cannot drift between the two documents.
+- Clarify that the bundled root and optional path-inserted RFC 9728 documents
+  describe one resource and share one `protected_resource_scopes_supported`
+  catalog; multi-resource installations need per-resource metadata catalogs.
+
 ## [3.3.0] - 2026-09-11
 
 ### Added
