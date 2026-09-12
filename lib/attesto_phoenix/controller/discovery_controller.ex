@@ -108,7 +108,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   # with OpenID Provider Metadata are added by Metadata.enrich_common/2.
   @spec discovery_opts(Config.t()) :: keyword()
   defp discovery_opts(%Config{} = config) do
-    [scopes_supported: presence(config.scopes_supported)]
+    [scopes_supported: config |> Config.effective_scopes_supported() |> presence()]
   end
 
   # An empty list means "not advertised": collapse it to nil so the core

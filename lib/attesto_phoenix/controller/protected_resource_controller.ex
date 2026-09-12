@@ -26,8 +26,10 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
       its own tokens, so the issuer is the authorization server for this
       resource; a client that reads this document then fetches that issuer's
       RFC 8414 metadata to run the flow.
-    * `scopes_supported` - the host's `:scopes_supported`, the same list the
-      RFC 8414 document advertises, so the two never drift.
+    * `scopes_supported` - the host's independent
+      `:protected_resource_scopes_supported` catalog. Its compatibility
+      fallback is the raw `:scopes_supported` input, so an `openid` scope added
+      to authorization-server metadata is not copied into resource metadata.
     * `bearer_methods_supported` - the host's `:bearer_methods_supported`
       (`AttestoPhoenix.Config`), the RFC 6750 token-presentation methods the
       resource server accepts. Defaults to `["header"]`, matching
@@ -134,14 +136,13 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
     end
   end
 
-  # Source the RFC 9728 §2 host-specific members from the configuration the
-  # server already carries, so the protected-resource document never drifts
-  # from the authorization-server metadata. nil/empty values are dropped by the
-  # core builder.
+  # Source RFC 9728 host members from the resource-specific configuration.
+  # The protected resource owns a distinct catalog: enabling OIDC on the
+  # authorization server must never inject identity scopes into this document.
   defp metadata_opts(%Config{} = config) do
     [
       authorization_servers: [config.issuer],
-      scopes_supported: presence(config.scopes_supported),
+      scopes_supported: config |> Config.protected_resource_scopes_supported() |> presence(),
       # RFC 9728 §2 `bearer_methods_supported`: the RFC 6750 token-presentation
       # methods the resource server accepts, from `AttestoPhoenix.Config`
       # `:bearer_methods_supported` (default `["header"]`, matching

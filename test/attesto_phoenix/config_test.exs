@@ -889,9 +889,53 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe ":registration_default_scope (RFC 7591 §2)" do
+    test "OIDC normalization creates one effective scope catalog" do
+      omitted = config(openid_provider: true, scopes_supported: ["profile", "email"])
+      explicit = config(openid_provider: true, scopes_supported: ["openid", "profile"])
+
+      assert Config.openid_provider?(omitted)
+      assert Config.effective_scopes_supported(omitted) == ["openid", "profile", "email"]
+      assert Config.effective_scopes_supported(explicit) == ["openid", "profile"]
+    end
+
+    test "OAuth-only configuration does not gain identity scopes" do
+      oauth = config(openid_provider: false, scopes_supported: ["read", "write"])
+
+      refute Config.openid_provider?(oauth)
+      assert Config.effective_scopes_supported(oauth) == ["read", "write"]
+    end
+
+    test "protected-resource compatibility never copies normalized openid" do
+      config = config(openid_provider: true, scopes_supported: ["api.read"])
+
+      assert Config.effective_scopes_supported(config) == ["openid", "api.read"]
+      assert Config.protected_resource_scopes_supported(config) == ["api.read"]
+    end
+
     test "resolves :scopes_supported to the full catalog" do
       config = config(scopes_supported: ["read", "write"], registration_default_scope: :scopes_supported)
-      assert Config.registration_default_scope(config) == ["read", "write"]
+      assert Config.registration_default_scope(config) == ["openid", "read", "write"]
+    end
+
+    test "OIDC defaulting uses the effective catalog including openid" do
+      config =
+        config(
+          openid_provider: true,
+          scopes_supported: ["profile"],
+          registration_default_scope: :scopes_supported
+        )
+
+      assert Config.registration_default_scope(config) == ["openid", "profile"]
+    end
+
+    test "built-in scope policy uses the same effective OIDC catalog" do
+      config = config(openid_provider: true, scopes_supported: ["profile"])
+      authorize_scope = Config.authorize_scope_fun(config)
+
+      assert authorize_scope.(:client, ["openid", "profile"]) ==
+               {:ok, ["openid", "profile"]}
+
+      assert authorize_scope.(:client, ["unknown"]) == {:error, :invalid_scope}
     end
 
     test "resolves an explicit list" do
@@ -903,7 +947,7 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.registration_default_scope(config(scopes_supported: ["read"])) == nil
     end
 
-    test "rejects an explicit default scope outside :scopes_supported at boot" do
+    test "rejects an explicit default scope outside the effective catalog at boot" do
       assert_raise ArgumentError, ~r/:registration_default_scope contains scope/, fn ->
         config(scopes_supported: ["read"], registration_default_scope: ["read", "admin"])
       end

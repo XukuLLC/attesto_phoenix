@@ -30,6 +30,12 @@ behaviours - `AttestoPhoenix.ClientStore`, `AttestoPhoenix.PrincipalStore`,
 `AttestoPhoenix.RegistrationStore`, `AttestoPhoenix.EventSink` - wired into the
 matching Config keys. See `guides/examples.md` for minimal configs.
 
+Declare protocol capability explicitly. OIDC hosts should set
+`openid_provider: true` (also the compatibility default); OAuth-only hosts set
+it to `false` and may mount routes with
+`openid_configuration: false, userinfo: false`. Signing keys are required by
+both protocols and do not imply OIDC support.
+
 Point the library's global resolver and Ecto-backed stores at the same host:
 
 ```elixir
@@ -77,6 +83,15 @@ Move scope policy into `:authorize_scope` (or `AttestoPhoenix.ScopePolicy`) and
 the principal/claim shaping into `:build_principal` /
 `:build_userinfo_claims`. Attesto owns the JWT/JWKS/DPoP mechanics; your host
 owns who the subject is and which scopes a client may hold.
+
+With `openid_provider: true`, config adds `openid` once to the
+authorization-server catalog. Discovery, dynamic-registration validation,
+registration defaults, and the default authorization policy then read the same
+catalog. This does not update existing client rows or bypass host callbacks;
+migrate existing clients that should be allowed to request `openid` through
+your normal client-policy process. Protected-resource and MCP tool catalogs
+stay separate and never receive this identity scope automatically. Configure
+the bundled RFC 9728 document with `protected_resource_scopes_supported`.
 
 ## 6. Verify discovery
 

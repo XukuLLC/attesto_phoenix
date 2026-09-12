@@ -559,8 +559,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp acceptable_redirect_uri?(%URI{}, _application_type), do: false
 
   # RFC 7591 §2 / RFC 6749 §3.3: the requested scope is a space-delimited
-  # string; every requested scope must be in the server's catalog
-  # (`:scopes_supported`). Absent, the server MAY assign a default scope
+  # string; every requested scope must be in the server's effective
+  # authorization-server catalog. Absent, the server MAY assign a default scope
   # (RFC 7591 §2) — `:registration_default_scope`, echoed back in the §3.2.1
   # response so the client learns what it got; with no default configured the
   # client registers with no scope (fail-closed).
@@ -595,7 +595,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # Every requested scope must be in the catalog. MapSet membership is O(1) per
   # token; `&(&1 in catalog)` over a list was O(requested x catalog).
   defp check_requested_scope(scope, config) do
-    catalog = MapSet.new(List.wrap(config.scopes_supported))
+    catalog = MapSet.new(Config.effective_scopes_supported(config))
 
     scope
     |> String.split(" ", trim: true)
