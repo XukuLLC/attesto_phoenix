@@ -4,7 +4,7 @@ defmodule AttestoPhoenix.RouterTest do
   optional `:prefix` and `:registration` toggles, and `:pipeline` wiring.
   """
 
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   import Plug.Conn
   import Plug.Test
@@ -270,6 +270,9 @@ defmodule AttestoPhoenix.RouterTest do
     end
   end
 
+  previous_router_host_config = Application.compile_env(:attesto_phoenix, Config, :missing)
+  Application.put_env(:attesto_phoenix, Config, openid_provider: false)
+
   defmodule CapabilityInteractionRouter do
     use Phoenix.Router
     use AttestoPhoenix.Router
@@ -302,6 +305,11 @@ defmodule AttestoPhoenix.RouterTest do
         openid_configuration: false
       )
     end
+  end
+
+  case previous_router_host_config do
+    :missing -> Application.delete_env(:attesto_phoenix, Config)
+    config -> Application.put_env(:attesto_phoenix, Config, config)
   end
 
   defmodule LogoutRouter do
@@ -1131,6 +1139,16 @@ defmodule AttestoPhoenix.RouterTest do
           end
         end
       end
+
+      previous = Application.get_env(:attesto_phoenix, Config, :missing)
+      Application.put_env(:attesto_phoenix, Config, openid_provider: false)
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(:attesto_phoenix, Config)
+          config -> Application.put_env(:attesto_phoenix, Config, config)
+        end
+      end)
 
       defmodule DynamicPrefixWithoutProviderMetadataRouter do
         use Phoenix.Router

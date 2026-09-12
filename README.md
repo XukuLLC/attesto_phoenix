@@ -946,7 +946,10 @@ These flags are compile-time route-mount controls; metadata is built later from
 runtime `AttestoPhoenix.Config`. They do not enable OIDC. `userinfo: false` removes both local UserInfo
 verbs. `openid_configuration: false` removes only the OIDC Provider Metadata
 route; the RFC 8414 authorization-server document remains mounted and its
-contents are unchanged.
+contents are unchanged. When both bundled OIDC routes are disabled, compilation
+warns unless the host config explicitly declares `openid_provider: false` (an
+OAuth-only server) or `openid_provider: true` (an OIDC provider whose replacement
+routes live elsewhere).
 
 UserInfo metadata keeps explicit host intent separate from a mechanically
 derived local endpoint:
@@ -1351,7 +1354,11 @@ Publish one document per exact resource identifier, with the path-inserted
 well-known URI and matching `resource`
 member; do not collapse multiple identifiers into a root document. When no
 resource owns the origin root, use `protected_resource_root: false` and let the
-per-resource integration mount only the documents it owns.
+per-resource integration mount only the documents it owns. The root and optional
+single path-inserted document mounted by `attesto_routes/1` are two locations for
+one resource and share one `protected_resource_scopes_supported` catalog. Use
+the per-resource integration when different resources need different scope
+catalogs.
 
 For first-party web flows, keep cookie semantics in your app and pass a generic
 credential extractor to the plug:

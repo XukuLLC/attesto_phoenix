@@ -581,6 +581,11 @@ defmodule AttestoPhoenix.Config do
       (the compatibility default), the raw `:scopes_supported` input is used;
       the centrally added `openid` scope is never copied. Set an explicit list
       to keep authorization-server and protected-resource policy fully separate.
+      One config supplies one protected-resource document: the root URI and an
+      optional `:protected_resource_paths` URI are two locations for that same
+      resource and therefore share this catalog. Multi-resource hosts need a
+      distinct per-resource metadata owner and scope catalog for each resource;
+      `attesto_mcp` provides that routing model.
     * `:bearer_methods_supported` - the RFC 6750 access-token presentation
       methods the resource server accepts, advertised as
       `bearer_methods_supported` in the RFC 9728 protected-resource metadata
