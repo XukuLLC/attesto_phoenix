@@ -58,8 +58,9 @@ defmodule AttestoPhoenix.Config do
   ### Optional callbacks
 
     * `:authorize_scope` - `(client, requested_scope -> {:ok, granted_scope} |
-      {:error, :invalid_scope})`. Validates/narrows requested scope using
-      `Attesto.Scope` algebra. Defaults to "subset of `:scopes_supported`".
+      {:error, :invalid_scope})`. Validates or narrows requested scope. Defaults
+      to requiring every requested scope to appear in the effective
+      authorization-server scope catalog.
     * `:on_event` - `(%AttestoPhoenix.Event{} -> any)`. Audit/telemetry hook.
       No-op by default; the library never stores events itself.
     * `:send_error` - `(conn, status, body_map -> conn)`. Optional transport
@@ -562,11 +563,24 @@ defmodule AttestoPhoenix.Config do
       the policy's `enforce_fapi_alg_policy` field is `true`; the named FAPI
       policy sets that field explicitly, so narrowing its list keeps the key
       gate enabled.
-    * `:scopes_supported` - list of supported scope strings (concrete and
-      wildcard) advertised in discovery and used as the default scope catalog.
-      For an OpenID Provider the reserved `openid` scope (OpenID Connect Core
-      §3.1.2.1) is added to the OpenID Provider Metadata automatically by the
-      core builder; it need not be listed here.
+    * `:openid_provider` - whether this authorization server provides OpenID
+      Connect authentication. Defaults to `true` for compatibility. OAuth-only
+      hosts set it to `false`. When enabled, the reserved
+      `openid` scope is added once to the effective authorization-server scope
+      catalog. Provider Metadata, dynamic registration, registration defaults,
+      and the built-in scope policy all consume that same catalog. This flag is
+      independent of signing-key availability and of whether the optional
+      bundled UserInfo route is mounted.
+    * `:scopes_supported` - list of supported authorization-server scope strings
+      (concrete and wildcard) advertised in discovery and used as the default
+      scope catalog. With `openid_provider: true`, `openid` may be omitted from
+      this input because config normalization adds it centrally. This catalog is
+      not reused for protected-resource or MCP tool scope catalogs.
+    * `:protected_resource_scopes_supported` - independent scope catalog for
+      the bundled RFC 9728 protected-resource metadata document. When `nil`
+      (the compatibility default), the raw `:scopes_supported` input is used;
+      the centrally added `openid` scope is never copied. Set an explicit list
+      to keep authorization-server and protected-resource policy fully separate.
     * `:bearer_methods_supported` - the RFC 6750 access-token presentation
       methods the resource server accepts, advertised as
       `bearer_methods_supported` in the RFC 9728 protected-resource metadata
@@ -962,7 +976,9 @@ defmodule AttestoPhoenix.Config do
     :check_session_path,
     :mtls_endpoint_aliases,
     oauth_path_prefix: "/oauth",
+    openid_provider: true,
     scopes_supported: [],
+    protected_resource_scopes_supported: nil,
     registration_default_scope: nil,
     bearer_methods_supported: ["header"],
     claims_supported: [],
@@ -1072,6 +1088,7 @@ defmodule AttestoPhoenix.Config do
           consent_grant_store: module() | nil,
           grant_types_supported: [String.t()] | nil,
           token_endpoint_auth_methods_supported: [String.t()] | nil,
+          openid_provider: boolean(),
           require_pushed_authorization_requests: boolean(),
           authorization_response_iss: boolean(),
           authorization_endpoint: String.t() | nil,
@@ -1089,6 +1106,7 @@ defmodule AttestoPhoenix.Config do
           registration_path: String.t() | nil,
           userinfo_path: String.t() | nil,
           scopes_supported: [String.t()],
+          protected_resource_scopes_supported: [String.t()] | nil,
           registration_default_scope: [String.t()] | :scopes_supported | nil,
           bearer_methods_supported: [String.t()],
           claims_supported: [String.t()],
@@ -1219,6 +1237,35 @@ defmodule AttestoPhoenix.Config do
         logout: normalize_logout(config.logout),
         session_management: normalize_session_management(config.session_management)
     }
+  end
+
+  defp normalize_authorization_server_scopes(scopes, true) when is_list(scopes) do
+    ["openid" | Enum.reject(scopes, &(&1 == "openid"))]
+  end
+
+  defp normalize_authorization_server_scopes(scopes, false) when is_list(scopes) do
+    Enum.reject(scopes, &(&1 == "openid"))
+  end
+
+  defp normalize_authorization_server_scopes(scopes, _openid_provider), do: scopes
+
+  @doc "Returns the RFC 9728 catalog without copying centrally added OIDC scopes."
+  @spec protected_resource_scopes_supported(t()) :: [String.t()]
+  def protected_resource_scopes_supported(%__MODULE__{
+        protected_resource_scopes_supported: nil,
+        scopes_supported: scopes
+      }), do: scopes
+
+  def protected_resource_scopes_supported(%__MODULE__{protected_resource_scopes_supported: scopes}), do: scopes
+
+  @doc "Returns whether this authorization server is configured as an OpenID Provider."
+  @spec openid_provider?(t()) :: boolean()
+  def openid_provider?(%__MODULE__{openid_provider: enabled}), do: enabled == true
+
+  @doc "Returns the normalized scope catalog shared by authorization-server surfaces."
+  @spec effective_scopes_supported(t()) :: [String.t()]
+  def effective_scopes_supported(%__MODULE__{} = config) do
+    normalize_authorization_server_scopes(config.scopes_supported, config.openid_provider)
   end
 
   # The CIMD defaults the host's `:client_id_metadata` keyword list is merged
@@ -2321,9 +2368,10 @@ defmodule AttestoPhoenix.Config do
   default scope). Resolves the `:registration_default_scope` setting to a
   concrete list:
 
-    * `:scopes_supported` — every scope in `scopes_supported`.
+    * `:scopes_supported` — every scope in the effective authorization-server
+      catalog.
     * a list of scope strings — that explicit default (the registration layer
-      still rejects any member outside `scopes_supported`).
+      still rejects any member outside the effective catalog).
     * `nil` (the default) — no defaulting; a scopeless registration stays
       scopeless (fail-closed).
 
@@ -2332,7 +2380,7 @@ defmodule AttestoPhoenix.Config do
   @spec registration_default_scope(t()) :: [String.t()] | nil
   def registration_default_scope(%__MODULE__{registration_default_scope: setting} = config) do
     case setting do
-      :scopes_supported -> scope_list_or_nil(config.scopes_supported)
+      :scopes_supported -> config |> effective_scopes_supported() |> scope_list_or_nil()
       list when is_list(list) -> scope_list_or_nil(list)
       _ -> nil
     end
@@ -3208,11 +3256,13 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  # One resolver fun per flat callback key. Each is a thin alias over
+  # One resolver fun per flat callback key except `:authorize_scope`, whose
+  # public resolver supplies the documented catalog-based default below. Each
+  # generated function is a thin alias over
   # `resolve_callback/2` so consumers read the callback by name without knowing
   # the resolution table, matching the integrator's "resolver funs on Config"
   # surface. They return the same `callback()`-or-`nil` value.
-  for {key, _} <- @resolution do
+  for {key, _} <- Map.delete(@resolution, :authorize_scope) do
     name = key |> Atom.to_string() |> String.trim_trailing("?") |> Kernel.<>("_fun")
     name = String.to_atom(name)
 
@@ -3221,6 +3271,34 @@ defmodule AttestoPhoenix.Config do
     """
     @spec unquote(name)(t()) :: callback() | nil
     def unquote(name)(%__MODULE__{} = config), do: resolve_callback(config, unquote(key))
+  end
+
+  @doc """
+  Resolve the host's scope-authorization callback, or return the built-in
+  policy that accepts only scopes in the effective authorization-server
+  catalog.
+
+  An explicit `:authorize_scope` callback or installed `:scope_policy` module
+  always takes precedence, so host client and user restrictions are preserved.
+  """
+  @spec authorize_scope_fun(t()) :: callback()
+  def authorize_scope_fun(%__MODULE__{} = config) do
+    case resolve_callback(config, :authorize_scope) do
+      nil -> default_authorize_scope_fun(effective_scopes_supported(config))
+      callback -> callback
+    end
+  end
+
+  defp default_authorize_scope_fun(scopes_supported) do
+    catalog = MapSet.new(scopes_supported)
+
+    fn _client, requested ->
+      if is_list(requested) and Enum.all?(requested, &MapSet.member?(catalog, &1)) do
+        {:ok, requested}
+      else
+        {:error, :invalid_scope}
+      end
+    end
   end
 
   @doc """
@@ -3481,7 +3559,7 @@ defmodule AttestoPhoenix.Config do
   # by construction.)
   defp validate_registration_default_scope!(%__MODULE__{registration_default_scope: list} = config)
        when is_list(list) do
-    catalog = List.wrap(config.scopes_supported)
+    catalog = effective_scopes_supported(config)
 
     case Enum.reject(list, &(&1 in catalog)) do
       [] ->
@@ -3839,6 +3917,8 @@ defmodule AttestoPhoenix.Config do
   defp validate_supported_value_lists!(%__MODULE__{} = config) do
     Enum.each(
       [
+        scopes_supported: config.scopes_supported,
+        protected_resource_scopes_supported: config.protected_resource_scopes_supported,
         grant_types_supported: config.grant_types_supported,
         token_endpoint_auth_methods_supported: config.token_endpoint_auth_methods_supported
       ],
@@ -4177,6 +4257,7 @@ defmodule AttestoPhoenix.Config do
   defp validate_refresh_sweeper!(_config, _grace, _sweep_interval_ms), do: :ok
 
   @strict_boolean_keys [
+    :openid_provider,
     :claims_parameter_supported,
     :require_nonce,
     :require_pkce,

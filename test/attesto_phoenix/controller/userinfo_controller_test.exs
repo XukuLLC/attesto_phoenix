@@ -106,6 +106,7 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       verify_client_secret: fn _, _ -> false end,
       load_principal: fn _ -> {:error, :not_found} end,
       principal_kinds: [@user_kind],
+      openid_provider: true,
       # The endpoint is exercised over plain Plug.Test conns; the verify path
       # would otherwise refuse a non-HTTPS request.
       require_https: false,

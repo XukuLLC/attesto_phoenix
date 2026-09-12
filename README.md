@@ -340,7 +340,9 @@ config :my_app, AttestoPhoenix.Config,
   event_sink: MyApp.OAuth.Events,
 
   # --- optional policy ---
+  openid_provider: true,
   scopes_supported: ["profile", "email", "read:*", "write:*"],
+  protected_resource_scopes_supported: ["read:*", "write:*"],
   send_error: &MyApp.OAuthErrors.render/3,
   #   (conn, status, body_map -> conn), optional custom OAuth error envelope
   client_auth_signing_algs: Attesto.SigningAlg.fapi_algs(),
@@ -920,10 +922,12 @@ submitted OAuth POST endpoints behind generic browser CSRF or browser-only
 Phoenix `scope`; module attributes are not available when Phoenix expands the
 nested route macro.
 
-The OIDC-only local route mounts default on for compatibility. An OAuth
-authorization server that does not act as an OpenID Provider can retain
+The OIDC-only local route mounts default on for route compatibility. Runtime
+config also defaults `openid_provider` to `true`, preserving existing OIDC
+hosts. An OAuth authorization server that does not act as an OpenID Provider
+sets `openid_provider: false` and can retain
 authorization, token, PAR, revocation, introspection, JWKS, and RFC 8414
-metadata while omitting both declarations:
+metadata without OIDC advertising. It may also omit both unused routes:
 
 ```elixir
 attesto_routes(
@@ -932,8 +936,14 @@ attesto_routes(
 )
 ```
 
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  openid_provider: false,
+  scopes_supported: ["api.read"]
+```
+
 These flags are compile-time route-mount controls; metadata is built later from
-runtime `AttestoPhoenix.Config`. `userinfo: false` removes both local UserInfo
+runtime `AttestoPhoenix.Config`. They do not enable OIDC. `userinfo: false` removes both local UserInfo
 verbs. `openid_configuration: false` removes only the OIDC Provider Metadata
 route; the RFC 8414 authorization-server document remains mounted and its
 contents are unchanged.

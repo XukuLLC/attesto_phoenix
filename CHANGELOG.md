@@ -6,6 +6,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-09-11
+
+### Added
+
+- Add the explicit `openid_provider` runtime capability flag. It defaults to
+  `true` for compatibility; OAuth-only hosts set it to `false`, causing Provider
+  Metadata and the bundled UserInfo endpoint to answer 404. When enabled,
+  config adds `openid` once to the shared
+  authorization-server scope catalog used by discovery, dynamic registration,
+  registration defaults, and the built-in token scope policy. Explicit host
+  authorization callbacks continue to take precedence, so existing client
+  permissions are not expanded. OAuth-only hosts retain RFC 8414 discovery and
+  may omit the OIDC routes with
+  `openid_configuration: false, userinfo: false`.
+- Add `protected_resource_scopes_supported` for an independent RFC 9728 scope
+  catalog. When omitted it retains the legacy raw `scopes_supported` catalog;
+  centrally added OIDC scopes are never copied into protected-resource metadata.
+
 ## [3.2.1] - 2026-09-03
 
 ### Fixed

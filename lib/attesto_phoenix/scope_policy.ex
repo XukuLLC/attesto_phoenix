@@ -6,8 +6,8 @@ defmodule AttestoPhoenix.ScopePolicy do
   given client may be granted is host policy. A host implements this behaviour
   and wires the callback into `AttestoPhoenix.Config` under `:authorize_scope`;
   this module is the contract that key installs and the recommended production
-  shape. When the key is unset, the library defaults to "the requested scope
-  must be a subset of `:scopes_supported`".
+  interface. When the key is unset, the library requires every requested scope
+  to appear in the effective authorization-server scope catalog.
   """
 
   @doc """

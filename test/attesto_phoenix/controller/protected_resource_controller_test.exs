@@ -42,7 +42,7 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceControllerTest do
           audience: @audience,
           keystore: StubKeystore,
           repo: StubRepo,
-          scopes_supported: ["openid", "profile", "api.read"],
+          protected_resource_scopes_supported: ["api.read"],
           load_client: fn _ -> {:error, :not_found} end,
           verify_client_secret: fn _, _ -> false end,
           load_principal: fn _ -> {:error, :not_found} end
@@ -90,7 +90,7 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceControllerTest do
       # RFC 6750 §2.1: the default matching AttestoPhoenix.Plug.Authenticate is
       # header-only.
       assert body["bearer_methods_supported"] == ["header"]
-      assert body["scopes_supported"] == ["openid", "profile", "api.read"]
+      assert body["scopes_supported"] == ["api.read"]
     end
 
     test "advertises only the host-configured bearer_methods_supported (RFC 9728 §2)" do
@@ -107,11 +107,28 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceControllerTest do
     end
 
     test "omits scopes_supported when the host advertises none (RFC 9728 §2: OPTIONAL)" do
-      body = call_show(host_config(scopes_supported: []), protocol_config()) |> decode_body()
+      body =
+        call_show(host_config(protected_resource_scopes_supported: []), protocol_config())
+        |> decode_body()
 
       refute Map.has_key?(body, "scopes_supported")
       # The REQUIRED member is still present.
       assert body["resource"] == @audience
+    end
+
+    test "OIDC normalization never injects openid into the legacy resource catalog" do
+      body =
+        call_show(
+          host_config(
+            openid_provider: true,
+            scopes_supported: ["api.read"],
+            protected_resource_scopes_supported: nil
+          ),
+          protocol_config()
+        )
+        |> decode_body()
+
+      assert body["scopes_supported"] == ["api.read"]
     end
 
     test "sets a public, cacheable Cache-Control header (RFC 9728 §3.1)" do

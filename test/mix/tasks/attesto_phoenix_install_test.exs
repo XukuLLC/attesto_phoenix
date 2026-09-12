@@ -747,6 +747,8 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert config =~ "audience:"
       assert config =~ "principal_kinds: {Test.AuthZ.PrincipalStore, :principal_kinds}"
       assert config =~ "oauth_path_prefix: \"/oauth\""
+      assert config =~ "openid_provider: true"
+      assert config =~ "protected_resource_scopes_supported: []"
       assert config =~ "schema_prefix:"
       assert config =~ "code_store: AttestoPhoenix.Store.EctoCodeStore"
       assert config =~ "load_client: {Test.AuthZ.ClientStore, :load_client}"

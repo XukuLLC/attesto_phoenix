@@ -45,8 +45,8 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   and `userinfo_endpoint` (OpenID Connect Core §5.3), whose generic
   controllers can be mounted by `AttestoPhoenix.Router` while authentication,
   consent, and claim values remain host callbacks; the supported scopes
-  (`scopes_supported`, to which the core builder adds the reserved `openid`
-  scope per OpenID Connect Core §3.1.2.1); the supported claims
+  (`scopes_supported`, normalized centrally by `AttestoPhoenix.Config` to
+  include the reserved `openid` scope when OIDC is enabled); the supported claims
   (`claims_supported`); the supported ACR values (`acr_values_supported`,
   OpenID Connect Discovery §3) and UI locales (`ui_locales_supported`,
   OpenID Connect Discovery §3), each advertised only when the host configures
@@ -79,7 +79,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import Plug.Conn, only: [put_resp_header: 3]
+  import Plug.Conn, only: [put_resp_header: 3, send_resp: 3]
 
   alias Attesto.OpenIDDiscovery
   alias AttestoPhoenix.AuthorizationServer.Metadata
@@ -110,16 +110,21 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
     config = Config.resolve!(conn)
-    protocol_config = fetch_protocol_config!(conn)
 
-    metadata =
-      protocol_config
-      |> OpenIDDiscovery.metadata(discovery_opts(config, conn))
-      |> Metadata.enrich_common(config)
+    if Config.openid_provider?(config) do
+      protocol_config = fetch_protocol_config!(conn)
 
-    conn
-    |> put_cache_control()
-    |> json(metadata)
+      metadata =
+        protocol_config
+        |> OpenIDDiscovery.metadata(discovery_opts(config, conn))
+        |> Metadata.enrich_common(config)
+
+      conn
+      |> put_cache_control()
+      |> json(metadata)
+    else
+      send_resp(conn, :not_found, "")
+    end
   end
 
   # Fail closed: a missing config is a wiring error, not a runtime condition to
@@ -148,9 +153,9 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   # The core builder drops nil-valued members, so optional members advertise
   # only what the provider actually implements. `scopes_supported` is always
   # passed (never collapsed to nil): an OpenID Provider MUST support the
-  # reserved `openid` scope (OpenID Connect Core §3.1.2.1), so the core builder
-  # adds it to the host's catalog, yielding `["openid"]` even when the host
-  # configures no other scopes.
+  # reserved `openid` scope (OpenID Connect Core §3.1.2.1). Config normalization
+  # owns that effective catalog so metadata, registration, and authorization
+  # policy all receive the identical value.
   @spec discovery_opts(Config.t(), Plug.Conn.t()) :: keyword()
   defp discovery_opts(%Config{} = config, %Plug.Conn{} = conn) do
     [
@@ -161,7 +166,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       # OpenID Connect Session Management 1.0 §3.3: the check_session_iframe,
       # advertised only when session management is enabled.
       check_session_iframe: check_session_iframe(config),
-      scopes_supported: config.scopes_supported,
+      scopes_supported: Config.effective_scopes_supported(config),
       claims_supported: presence(config.claims_supported),
       # OpenID Connect Discovery §3 capability flags reflecting what is wired.
       # `request_parameter_supported` tracks actual capability: the authorization

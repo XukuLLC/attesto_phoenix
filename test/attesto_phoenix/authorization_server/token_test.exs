@@ -1843,6 +1843,18 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert event.metadata.cnf == nil
     end
 
+    test "the built-in policy grants only scopes in the effective OIDC catalog" do
+      config = config(authorize_scope: nil, scopes_supported: ["profile"])
+
+      assert {:ok, response, _events} =
+               Token.issue(config, request(config, params: %{"scope" => "openid profile"}))
+
+      assert claim!(response.access_token, "scope") == "openid profile"
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} =
+               Token.issue(config, request(config, params: %{"scope" => "unknown"}))
+    end
+
     test "an unexpected scope-policy failure is not converted to a client error" do
       config = config(authorize_scope: fn _client, _requested -> {:error, :store_unavailable} end)
       request = request(config, params: %{"scope" => "read"})

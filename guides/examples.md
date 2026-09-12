@@ -75,9 +75,10 @@ AttestoPhoenix.Config.new(
   authenticate_resource_owner: &MyApp.AuthZ.authenticate_resource_owner/3,
   consent: &MyApp.AuthZ.consent/3,
 
-  # Scope policy (AttestoPhoenix.ScopePolicy); omit to default to
-  # "subset of :scopes_supported".
+  # Scope policy (AttestoPhoenix.ScopePolicy); omit to default to the
+  # effective authorization-server scope catalog.
   authorize_scope: &MyApp.AuthZ.authorize_scope/2,
+  openid_provider: true,
   scopes_supported: ["openid", "profile", "email"],
 
   # Shared production token stores.
@@ -116,6 +117,7 @@ AttestoPhoenix.Config.new(
   authenticate_resource_owner: &MyApp.AuthZ.authenticate_resource_owner/3,
 
   # require_pkce defaults to true; PKCE is enforced for the code grant.
+  openid_provider: true,
   scopes_supported: ["openid", "profile"],
 
   code_store: AttestoPhoenix.Store.EctoCodeStore,
@@ -169,6 +171,7 @@ AttestoPhoenix.Config.new(
   build_principal: &MyApp.AuthZ.build_principal/3,
   authenticate_resource_owner: &MyApp.AuthZ.authenticate_resource_owner/3,
 
+  openid_provider: true,
   scopes_supported: ["openid", "profile"],
 
   code_store: AttestoPhoenix.Store.EctoCodeStore,

@@ -178,7 +178,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         "require_signed_request_object" => true,
         "response_modes_supported" => ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"],
         "response_types_supported" => ["code"],
-        "scopes_supported" => ["profile", "email"],
+        "scopes_supported" => ["openid", "profile", "email"],
         "token_endpoint" => "https://issuer.example/oauth/token",
         "token_endpoint_auth_methods_supported" => [
           "client_secret_basic",
@@ -435,13 +435,13 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         call_show(host_config(scopes_supported: ["read", "write"]), protocol_config())
         |> decode_body()
 
-      assert body["scopes_supported"] == ["read", "write"]
+      assert body["scopes_supported"] == ["openid", "read", "write"]
     end
 
-    test "omits scopes_supported when none are configured" do
+    test "advertises the effective OIDC catalog when no additional scopes are configured" do
       body = call_show(host_config(scopes_supported: []), protocol_config()) |> decode_body()
 
-      refute Map.has_key?(body, "scopes_supported")
+      assert body["scopes_supported"] == ["openid"]
     end
 
     test "omits registration_endpoint when dynamic registration is disabled" do

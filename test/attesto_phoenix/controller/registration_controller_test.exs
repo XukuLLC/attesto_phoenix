@@ -34,6 +34,7 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       verify_client_secret: fn _client, _secret -> false end,
       load_principal: fn _subject -> {:error, :not_found} end,
       register_client: fn attrs -> {:ok, attrs} end,
+      openid_provider: false,
       scopes_supported: ["read", "write"]
     }
 

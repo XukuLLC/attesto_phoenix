@@ -698,10 +698,17 @@ if Code.ensure_loaded?(Igniter) do
           # The client-visible OAuth mount prefix. The mounted routes and the
           # discovery metadata derive from this same value so they cannot drift.
           oauth_path_prefix: unquote(oauth_path_prefix),
+          # This scaffold includes OIDC login and claims callbacks. The flag is
+          # the runtime capability gate for Provider Metadata and UserInfo and
+          # adds `openid` to the authorization-server scope catalog below.
+          openid_provider: true,
           # Supported scopes advertised in discovery and used as the default
-          # scope catalog. `openid` is added automatically for an OpenID
-          # Provider; the rest are examples to replace.
+          # scope catalog. The remaining entries are examples to replace.
           scopes_supported: ["profile", "email", "offline_access"],
+          # RFC 9728 protected-resource scopes are independent. Add only scopes
+          # accepted by the resource served by this host; identity scopes are
+          # not copied here.
+          protected_resource_scopes_supported: [],
           # Ecto-backed stores. Run `mix attesto_phoenix.gen.migration` to create
           # the backing tables, including durable refresh-family revocation
           # tombstones.

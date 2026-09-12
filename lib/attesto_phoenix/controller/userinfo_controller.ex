@@ -112,14 +112,19 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   @spec userinfo(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def userinfo(conn, _params) do
     config = Config.resolve!(conn)
-    resource_metadata = Config.resource_metadata_url(config, conn)
 
-    case ProtectedResource.authenticate(conn, config, resource_metadata) do
-      {:ok, conn, claims} ->
-        respond(conn, config, resource_metadata, claims)
+    if Config.openid_provider?(config) do
+      resource_metadata = Config.resource_metadata_url(config, conn)
 
-      {:halt, conn} ->
-        conn
+      case ProtectedResource.authenticate(conn, config, resource_metadata) do
+        {:ok, conn, claims} ->
+          respond(conn, config, resource_metadata, claims)
+
+        {:halt, conn} ->
+          conn
+      end
+    else
+      send_resp(conn, :not_found, "")
     end
   end
 

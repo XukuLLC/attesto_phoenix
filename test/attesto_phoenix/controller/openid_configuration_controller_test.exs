@@ -8,7 +8,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
   alias Attesto.PrincipalKind
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Config
-  alias AttestoPhoenix.Controller.OpenIDConfigurationController
+  alias AttestoPhoenix.Controller.{OpenIDConfigurationController, RegistrationController}
   alias Plug.Router.Utils
 
   @issuer "https://issuer.example"
@@ -43,6 +43,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
           verify_client_secret: fn _, _ -> false end,
           load_principal: fn _ -> {:error, :not_found} end,
           replay_check: fn _key, _ttl -> :ok end,
+          openid_provider: true,
           authorization_endpoint: @authorization_endpoint,
           userinfo_endpoint: @userinfo_endpoint,
           scopes_supported: ["profile", "email"],
@@ -92,7 +93,81 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
 
   defp decode_body(conn), do: JSON.decode!(conn.resp_body)
 
+  defp register(config, metadata) do
+    :post
+    |> conn("/oauth/register", metadata)
+    |> Map.put(:scheme, :https)
+    |> put_req_header("content-type", "application/json")
+    |> Map.put(:body_params, metadata)
+    |> put_private(:attesto_phoenix_config, config)
+    |> RegistrationController.create(%{})
+  end
+
   describe "show/2" do
+    test "discovery and explicit registration share normalized OIDC scopes" do
+      config =
+        host_config(
+          scopes_supported: ["profile", "email"],
+          register_client: fn attrs -> {:ok, attrs} end
+        )
+
+      discovery = config |> call_show(protocol_config()) |> decode_body()
+
+      registration =
+        config
+        |> register(%{"grant_types" => ["client_credentials"], "scope" => "openid profile"})
+
+      assert discovery["scopes_supported"] == ["openid", "profile", "email"]
+      assert registration.status == 201
+      assert decode_body(registration)["scope"] == "openid profile"
+    end
+
+    test "explicit openid is not duplicated and omitted registration scope uses the effective catalog" do
+      config =
+        host_config(
+          scopes_supported: ["openid", "profile"],
+          registration_default_scope: :scopes_supported,
+          register_client: fn attrs -> {:ok, attrs} end
+        )
+
+      discovery = config |> call_show(protocol_config()) |> decode_body()
+      registration = register(config, %{"grant_types" => ["client_credentials"]})
+
+      assert discovery["scopes_supported"] == ["openid", "profile"]
+      assert registration.status == 201
+      assert decode_body(registration)["scope"] == "openid profile"
+    end
+
+    test "OAuth-only configuration serves no Provider Metadata and rejects openid registration" do
+      config =
+        host_config(
+          openid_provider: false,
+          scopes_supported: ["read"],
+          register_client: fn attrs -> {:ok, attrs} end
+        )
+
+      provider_metadata = call_show(config, protocol_config())
+      registration = register(config, %{"grant_types" => ["client_credentials"], "scope" => "openid"})
+
+      assert provider_metadata.status == 404
+      assert registration.status == 400
+      assert decode_body(registration)["error_description"] =~ ~s(scope "openid" is unknown)
+    end
+
+    test "normalization does not bypass host registration denial" do
+      config =
+        host_config(
+          scopes_supported: ["profile"],
+          register_client: fn _attrs -> {:error, :client_restricted} end
+        )
+
+      registration =
+        register(config, %{"grant_types" => ["client_credentials"], "scope" => "openid"})
+
+      assert registration.status == 400
+      assert decode_body(registration)["error"] == "invalid_client_metadata"
+    end
+
     test "renders the required OIDC Provider Metadata fields as JSON" do
       conn = call_show(host_config(), protocol_config())
       body = decode_body(conn)

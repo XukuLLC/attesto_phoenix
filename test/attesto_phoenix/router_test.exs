@@ -443,7 +443,8 @@ defmodule AttestoPhoenix.RouterTest do
           repo: __MODULE__.StubRepo,
           load_client: fn _client_id -> {:error, :not_found} end,
           verify_client_secret: fn _client, _secret -> false end,
-          load_principal: fn _subject -> {:error, :not_found} end
+          load_principal: fn _subject -> {:error, :not_found} end,
+          openid_provider: true
         ],
         overrides
       )

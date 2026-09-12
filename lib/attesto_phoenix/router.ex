@@ -206,6 +206,9 @@ defmodule AttestoPhoenix.Router do
       features such as CIBA, logout, and session management relies on Provider
       Metadata, so deployments using those features must keep it enabled unless
       equivalent metadata is served separately.
+
+      This route control does not enable OIDC. Runtime config must also set
+      `openid_provider: true`; otherwise the mounted controller answers 404.
     * `:device` - when `true`, mounts the RFC 8628 device-authorization
       endpoint and verification page. Defaults to `false`.
     * `:credential_issuance` - when `true`, mounts the OID4VCI nonce,
