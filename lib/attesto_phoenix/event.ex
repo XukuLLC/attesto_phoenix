@@ -81,6 +81,9 @@ defmodule AttestoPhoenix.Event do
   * `:auth_succeeded` - a presented access token authenticated a protected
     resource request (RFC 6750 §2.1).
   * `:auth_denied` - a protected resource request was rejected (RFC 6750 §3.1).
+    The authentication plug invokes the callback before sending the 401. The
+    host must commit its audit write before returning for durable recording;
+    see `AttestoPhoenix.EventSink`.
   * `:client_registered` - a client was registered (RFC 7591).
   """
   @type name ::
