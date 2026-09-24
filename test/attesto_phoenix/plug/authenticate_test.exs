@@ -6,6 +6,7 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
   import Plug.Test
 
   alias Attesto.DPoP.ReplayCache
+  alias Attesto.Test.DPoP
   alias Attesto.Token
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.Plug.Authenticate
@@ -728,6 +729,198 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert conn.assigns.attesto_claims["cnf"]["jkt"] == DPoPKey.thumbprint(dpop_key)
     assert conn.assigns.attesto_context.scope == ["openid", "read:reports"]
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
+  end
+
+  # Read the audit store inside Plug's synchronous send boundary. These tests
+  # cannot pass merely because the event appears after Authenticate.call/2.
+  @denial_paths ~w(missing malformed invalid audience mtls_missing mtls_invalid
+    mtls_mismatch dpop_missing dpop_invalid dpop_scheme dpop_binding dpop_replay
+    dpop_nonce dpop_unconfigured step_up revoked principal tls)a
+
+  for path <- @denial_paths do
+    @tag :denial_ordering
+    test "records #{path} denial before the 401 is sent", %{config: config} do
+      {request, config, opts, error} = denial_request(unquote(path), config)
+      audit = :ets.new(:denial_audit, [:set])
+      config = %{config | on_event: fn event -> :ets.insert(audit, {event.name, event}) end}
+
+      request =
+        register_before_send(request, fn response ->
+          assert response.status == 401
+          assert [{:auth_denied, event}] = :ets.lookup(audit, :auth_denied)
+          assert event.metadata.path == "/reports"
+          assert event.metadata.method == "GET"
+          assert :ets.lookup(audit, :auth_succeeded) == []
+          response
+        end)
+
+      response = Authenticate.call(request, Authenticate.init([config: config] ++ opts))
+      assert response.halted
+      assert {401, _, body} = sent_resp(request)
+      assert JSON.decode!(body)["error"] == error
+      if unquote(path) == :dpop_nonce, do: assert(get_resp_header(response, "dpop-nonce") == ["audit-nonce"])
+    end
+
+    @tag :denial_ordering
+    test "surfaces recording failure and refuses #{path}", %{config: config} do
+      {request, config, opts, _error} = denial_request(unquote(path), config)
+      config = %{config | on_event: fn _event -> {:error, :audit_unavailable} end}
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          response = Authenticate.call(request, Authenticate.init([config: config] ++ opts))
+          assert response.status == 401
+          assert response.halted
+          refute Map.has_key?(response.assigns, :attesto_principal)
+        end)
+
+      assert log =~ "event callback reported an error"
+    end
+
+    @tag :denial_ordering
+    test "a recording exception aborts #{path} before sending", %{config: config} do
+      {request, config, opts, _error} = denial_request(unquote(path), config)
+      config = %{config | on_event: fn _event -> raise "audit unavailable" end}
+
+      assert_raise RuntimeError, "audit unavailable", fn ->
+        Authenticate.call(request, Authenticate.init([config: config] ++ opts))
+      end
+
+      assert_raise RuntimeError, ~r/no sent response/, fn -> sent_resp(request) end
+      assert Config.request_config() == nil
+    end
+  end
+
+  defmodule AuditTransport do
+    @moduledoc false
+    import ExUnit.Assertions
+    import Plug.Conn
+
+    def send_error(conn, status, body, marker \\ "pair") do
+      assert_received {:event, %AttestoPhoenix.Event{name: :auth_denied}}
+      refute_received {:event, %AttestoPhoenix.Event{name: :auth_denied}}
+
+      conn
+      |> put_resp_header("x-audit-transport", marker)
+      |> send_resp(status, JSON.encode!(%{"wrapped" => body}))
+      |> halt()
+    end
+  end
+
+  @tag :denial_ordering
+  test "audits once before all configured and per-plug transport forms", %{config: config} do
+    for transport <- [
+          &AuditTransport.send_error/3,
+          {AuditTransport, :send_error},
+          {AuditTransport, :send_error, ["extra"]}
+        ],
+        placement <- [:config, :plug],
+        path <- @denial_paths do
+      {request, case_config, opts, error} = denial_request(path, config)
+
+      {case_config, opts} =
+        case placement do
+          :config ->
+            {%{case_config | send_error: transport}, opts}
+
+          :plug ->
+            {%{case_config | send_error: fn _, _, _ -> flunk("overridden transport ran") end},
+             Keyword.put(opts, :send_error, transport)}
+        end
+
+      response = Authenticate.call(request, Authenticate.init([config: case_config] ++ opts))
+      assert response.halted
+      assert response.status == 401
+      assert JSON.decode!(response.resp_body)["wrapped"]["error"] == error
+      refute_received {:event, %AttestoPhoenix.Event{name: :auth_denied}}
+    end
+  end
+
+  defp denial_request(path, config) do
+    token = mint(config, scope: "openid")
+    request = conn(:get, @issuer <> "/reports")
+    bearer = put_req_header(request, "authorization", "Bearer " <> token)
+    invalid = "invalid_token"
+
+    case path do
+      :missing ->
+        {request, config, [], invalid}
+
+      :malformed ->
+        {put_req_header(request, "authorization", "Basic bad"), config, [], invalid}
+
+      :invalid ->
+        {put_req_header(request, "authorization", "Bearer bad"), config, [], invalid}
+
+      :audience ->
+        {bearer, %{config | audience: "https://other.example"}, [], invalid}
+
+      :tls ->
+        {%{bearer | scheme: :http}, %{config | require_https: true}, [], invalid}
+
+      :principal ->
+        {bearer, %{config | load_principal: fn _ -> {:error, :not_found} end}, [], invalid}
+
+      :revoked ->
+        Process.put(:attesto_phoenix_revoked_jti, peek_claims(config, token)["jti"])
+        {bearer, %{config | code_store: __MODULE__.RevokedTokenStore}, [], invalid}
+
+      :step_up ->
+        {bearer, config, [step_up: [acr_values: ["phr"]]], "insufficient_user_authentication"}
+
+      path when path in [:mtls_missing, :mtls_invalid, :mtls_mismatch] ->
+        der = self_signed_cert_der()
+        {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
+        token = mint(config, scope: "openid", mtls_cert_thumbprint: thumbprint)
+
+        presented =
+          case path do
+            :mtls_missing -> nil
+            :mtls_invalid -> "invalid DER"
+            :mtls_mismatch -> self_signed_cert_der()
+          end
+
+        config = %{config | mtls_enabled: true, cert_der: fn _ -> presented end, trusted_proxies: [:loopback]}
+        {put_req_header(request, "authorization", "Bearer " <> token), config, [], invalid}
+
+      path ->
+        dpop_denial_request(path, request, config)
+    end
+  end
+
+  defp dpop_denial_request(path, request, config) do
+    key = DPoP.generate_key()
+    {_, public} = key |> JOSE.JWK.to_public() |> JOSE.JWK.to_map()
+    token = mint(config, scope: "openid", dpop_jkt: Attesto.DPoP.compute_jkt(public))
+    proof = DPoP.proof(key, "GET", @issuer <> "/reports", access_token: token)
+    request = request |> put_req_header("authorization", "DPoP " <> token) |> put_req_header("dpop", proof)
+    opts = [replay_check: fn _, _ -> :ok end]
+
+    case path do
+      :dpop_missing ->
+        {delete_req_header(request, "dpop"), config, opts, "invalid_dpop_proof"}
+
+      :dpop_invalid ->
+        {put_req_header(request, "dpop", "bad"), config, opts, "invalid_dpop_proof"}
+
+      :dpop_scheme ->
+        {put_req_header(request, "authorization", "Bearer " <> token), config, opts, "invalid_dpop_proof"}
+
+      :dpop_binding ->
+        request = request |> delete_req_header("dpop") |> put_req_header("authorization", "Bearer " <> token)
+        {request, config, opts, "invalid_token"}
+
+      :dpop_unconfigured ->
+        {request, config, [replay_check: nil], "invalid_dpop_proof"}
+
+      :dpop_replay ->
+        {request, config, [replay_check: fn _, _ -> {:error, :replay} end], "invalid_dpop_proof"}
+
+      :dpop_nonce ->
+        {request, config,
+         opts ++ [nonce_check: fn _ -> {:error, :use_dpop_nonce} end, nonce_issue: fn -> "audit-nonce" end],
+         "use_dpop_nonce"}
+    end
   end
 
   defp mint(config, opts) do
