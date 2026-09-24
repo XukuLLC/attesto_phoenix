@@ -883,6 +883,23 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     RequireScopes.call(request, RequireScopes.init("openid"))
   end
 
+  defp denial_request(path, config) when path in [:mtls_missing, :mtls_invalid, :mtls_mismatch] do
+    mtls_denial_request(path, conn(:get, @issuer <> "/reports"), config)
+  end
+
+  defp denial_request(path, config)
+       when path in [
+              :dpop_missing,
+              :dpop_invalid,
+              :dpop_scheme,
+              :dpop_binding,
+              :dpop_replay,
+              :dpop_nonce,
+              :dpop_unconfigured
+            ] do
+    dpop_denial_request(path, conn(:get, @issuer <> "/reports"), config)
+  end
+
   defp denial_request(path, config) do
     token = mint(config, scope: "openid")
     request = conn(:get, @issuer <> "/reports")
@@ -914,12 +931,6 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
       :step_up ->
         {bearer, config, [step_up: [acr_values: ["phr"]]], "insufficient_user_authentication"}
-
-      path when path in [:mtls_missing, :mtls_invalid, :mtls_mismatch] ->
-        mtls_denial_request(path, request, config)
-
-      path ->
-        dpop_denial_request(path, request, config)
     end
   end
 

@@ -10,6 +10,15 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   host's `:load_principal` callback, and assigns neutral values for downstream
   Phoenix code.
 
+  Every authentication rejection emits `:auth_denied` synchronously before
+  sending the 401, including before invoking a custom `:send_error` transport.
+  For a durable audit guarantee, the host's `:on_event` callback must commit
+  its write before returning; enqueueing background work or writing inside a
+  transaction that commits after the response is insufficient. No audit store
+  is provided when the callback is unset. An explicit `{:error, reason}` is
+  warned through `AttestoPhoenix.Event` and the request is still refused;
+  callback exceptions propagate before the response is sent.
+
   Defaults:
 
     * `:claims_key` - `:attesto_claims`
@@ -50,7 +59,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   alias Attesto.Plug.Authenticate, as: CoreAuthenticate
   alias Attesto.Plug.OAuthError
-  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, Event, ProtectedResource, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, DenialAudit, DPoP.Adapter, Event, ProtectedResource, RequestContext}
 
   @claims_key :attesto_claims
   @principal_key :attesto_principal
@@ -95,7 +104,6 @@ defmodule AttestoPhoenix.Plug.Authenticate do
           |> CoreAuthenticate.call(CoreAuthenticate.init(core_opts(config, claims_key, opts, resource_metadata)))
 
         if conn.halted do
-          emit_denied(config, conn, :invalid_token)
           conn
         else
           reject_revoked_or_assign_principal(conn, config, claims_key, opts, resource_metadata)
@@ -198,6 +206,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     # options are merged, so the delegated core path sees the same selected URL
     # as the wrapper-owned TLS, revocation, and principal failures.
     |> Keyword.put(:resource_metadata, resource_metadata)
+    |> DenialAudit.wrap(config)
   end
 
   defp configured_core_opts(config, claims_key, resource_metadata) do
@@ -220,20 +229,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
     })
   end
 
-  defp emit_denied(config, conn, result) do
-    Event.emit(config, :auth_denied, %{
-      result: result,
-      metadata: request_metadata(conn, config)
-    })
-  end
-
-  defp request_metadata(conn, config) do
-    %{
-      method: conn.method,
-      path: conn.request_path,
-      client_ip: RequestContext.client_ip(conn, config)
-    }
-  end
+  defp emit_denied(config, conn, result), do: DenialAudit.emit(config, conn, result)
 
   defp resolve_config_without_request(_conn, opts) do
     case Keyword.get(opts, :config) do

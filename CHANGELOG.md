@@ -6,6 +6,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-09-24
+
+### Fixed
+
+- Complete the synchronous `:auth_denied` callback before sending any
+  protected-resource authentication 401, including core Bearer, DPoP, mTLS,
+  nonce and step-up failures and wrapper TLS, revocation and principal failures.
+  The audit also precedes custom error transports and is emitted exactly once.
+  Shared controller authentication uses the same guarantee. `RequireScopes`
+  audits unauthenticated 401s when request-private or explicit configuration
+  supplies an event sink; ordinary scope refusals remain 403.
+  Hosts must commit their audit write before the callback returns to guarantee
+  durable recording before the client sees the response. An explicit recording
+  error remains operator-visible as a warning and the request is still refused;
+  a callback exception propagates before the response is sent. Uses the existing
+  Attesto 2.0 transport contract; no core upgrade is required.
+- Refresh the development/test lock to Mint 1.10.1, which addresses
+  EEF-CVE-2026-82672, and its compatible HPAX dependency.
+
 ## [3.3.1] - 2026-09-12
 
 ### Added

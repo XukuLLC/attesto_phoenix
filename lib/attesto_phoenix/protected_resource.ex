@@ -4,12 +4,14 @@ defmodule AttestoPhoenix.ProtectedResource do
 
   This module owns the transport check, access-token verification wiring, and
   revoked-token check used by protected-resource controllers. Endpoint actions
-  receive the verified claims only after this common work succeeds.
+  receive the verified claims only after this common work succeeds. Every 401
+  completes the synchronous `:auth_denied` callback before sending the response;
+  hosts must commit audit writes before returning (see `AttestoPhoenix.EventSink`).
   """
 
   alias Attesto.Plug.Authenticate
   alias Attesto.Plug.OAuthError
-  alias AttestoPhoenix.{Config, DPoP.Adapter, RequestContext}
+  alias AttestoPhoenix.{Config, DenialAudit, DPoP.Adapter, RequestContext}
 
   # The conn assign `Attesto.Plug.Authenticate` writes the verified claims
   # under its default `:claims_key`.
@@ -41,6 +43,7 @@ defmodule AttestoPhoenix.ProtectedResource do
 
           access_token_revoked?(config, conn.assigns[@claims_key]) ->
             claims = conn.assigns[@claims_key]
+            DenialAudit.emit(config, conn, :invalid_token)
 
             {:halt,
              OAuthError.unauthorized(
@@ -55,6 +58,8 @@ defmodule AttestoPhoenix.ProtectedResource do
         end
 
       {:error, :insecure_transport} ->
+        DenialAudit.emit(config, conn, :insecure_transport)
+
         {:halt,
          OAuthError.unauthorized(
            conn,
@@ -77,6 +82,7 @@ defmodule AttestoPhoenix.ProtectedResource do
     # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it
     # must also carry the protected-resource metadata pointer when configured.
     |> put_optional(:resource_metadata, resource_metadata)
+    |> DenialAudit.wrap(config)
   end
 
   @doc "Translate the Phoenix configuration into the core Attesto configuration."
