@@ -10,6 +10,7 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
   alias Attesto.Token
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.Plug.Authenticate
+  alias AttestoPhoenix.Plug.RequireScopes
   alias ReqDPoP.Key, as: DPoPKey
 
   @issuer "https://issuer.example"
@@ -836,6 +837,52 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     end
   end
 
+  for entry <- [:protected_resource, :scope_plug], path <- [:missing, :invalid, :revoked, :tls] do
+    @tag :denial_ordering
+    test "#{entry} records #{path} rejection before sending", %{config: config} do
+      {request, config, _opts, _error} = denial_request(unquote(path), config)
+      request = put_private(request, :attesto_phoenix_config, config)
+
+      request =
+        register_before_send(request, fn response ->
+          assert response.status == 401
+          assert_received {:event, %AttestoPhoenix.Event{name: :auth_denied}}
+          refute_received {:event, %AttestoPhoenix.Event{name: :auth_denied}}
+          response
+        end)
+
+      response = alternate_denial(unquote(entry), request, config)
+      assert response.halted
+      assert response.status == 401
+      refute_received {:event, %AttestoPhoenix.Event{name: :auth_denied}}
+    end
+
+    @tag :denial_ordering
+    test "#{entry} surfaces recording failure for #{path}", %{config: config} do
+      {request, config, _opts, _error} = denial_request(unquote(path), config)
+      config = %{config | on_event: fn _ -> {:error, :audit_unavailable} end}
+      request = put_private(request, :attesto_phoenix_config, config)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          response = alternate_denial(unquote(entry), request, config)
+          assert response.halted
+          assert response.status == 401
+        end)
+
+      assert log =~ "event callback reported an error"
+    end
+  end
+
+  defp alternate_denial(:protected_resource, request, config) do
+    {:halt, response} = ProtectedResource.authenticate(request, config, nil)
+    response
+  end
+
+  defp alternate_denial(:scope_plug, request, _config) do
+    RequireScopes.call(request, RequireScopes.init("openid"))
+  end
+
   defp denial_request(path, config) do
     token = mint(config, scope: "openid")
     request = conn(:get, @issuer <> "/reports")
@@ -869,23 +916,27 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
         {bearer, config, [step_up: [acr_values: ["phr"]]], "insufficient_user_authentication"}
 
       path when path in [:mtls_missing, :mtls_invalid, :mtls_mismatch] ->
-        der = self_signed_cert_der()
-        {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
-        token = mint(config, scope: "openid", mtls_cert_thumbprint: thumbprint)
-
-        presented =
-          case path do
-            :mtls_missing -> nil
-            :mtls_invalid -> "invalid DER"
-            :mtls_mismatch -> self_signed_cert_der()
-          end
-
-        config = %{config | mtls_enabled: true, cert_der: fn _ -> presented end, trusted_proxies: [:loopback]}
-        {put_req_header(request, "authorization", "Bearer " <> token), config, [], invalid}
+        mtls_denial_request(path, request, config)
 
       path ->
         dpop_denial_request(path, request, config)
     end
+  end
+
+  defp mtls_denial_request(path, request, config) do
+    der = self_signed_cert_der()
+    {:ok, thumbprint} = Attesto.MTLS.compute_thumbprint(der)
+    token = mint(config, scope: "openid", mtls_cert_thumbprint: thumbprint)
+
+    presented =
+      case path do
+        :mtls_missing -> nil
+        :mtls_invalid -> "invalid DER"
+        :mtls_mismatch -> self_signed_cert_der()
+      end
+
+    config = %{config | mtls_enabled: true, cert_der: fn _ -> presented end, trusted_proxies: [:loopback]}
+    {put_req_header(request, "authorization", "Bearer " <> token), config, [], "invalid_token"}
   end
 
   defp dpop_denial_request(path, request, config) do
