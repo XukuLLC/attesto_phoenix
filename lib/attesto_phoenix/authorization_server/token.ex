@@ -1550,10 +1550,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # legitimate key rotation.
       |> put_optional_kw(:dpop_jkt, refresh_rotation_dpop_jkt(request, presented, jkt))
       |> Keyword.put(:rotation_grace_seconds, config.refresh_token_rotation_grace_seconds)
-      # A successor gets the same configured lifetime as an initial token.
-      # Without `:ttl`, Attesto.RefreshToken falls back to its own default, so
-      # a rotated token would outlive a shorter host policy and would expire
-      # before its own parent under a longer one.
+      # A successor gets the same configured lifetime as an initial token;
+      # Attesto.RefreshToken defaults an absent `:ttl` to 14 days.
       |> Keyword.put(:ttl, config.refresh_token_ttl)
 
     case RefreshToken.rotate(grant_store(config, :refresh_store), presented, opts) do

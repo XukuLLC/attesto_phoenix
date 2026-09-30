@@ -1094,7 +1094,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       end
     end
 
-    test "a rotated refresh token is refused once the configured TTL has elapsed" do
+    test "the refresh core refuses a rotated token once the configured TTL has elapsed" do
       ttl = 86_400
       config = refresh_ttl_config(ttl)
 
@@ -1116,10 +1116,11 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert %{consumed: false} = refresh_record!(rotated)
     end
 
-    # The sweeper deletes each refresh row by its own `expires_at`. Expiry that
-    # never decreases along a family means a sweep can only remove a prefix of
-    # the lineage, never a generation between two surviving ones.
-    test "expiry never decreases along a refresh family" do
+    # The sweeper deletes each refresh row by its own `expires_at`. While
+    # `:refresh_token_ttl` is unchanged, expiry never decreases along a family,
+    # so a sweep can only remove a prefix of the lineage, never a generation
+    # between two surviving ones.
+    test "expiry never decreases along a refresh family under one configured TTL" do
       config = refresh_ttl_config(30 * 86_400)
 
       assert {:ok, %{refresh_token: generation_0}, _events} = Token.issue(config, grant_id_code_request(config))

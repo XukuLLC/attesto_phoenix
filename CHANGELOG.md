@@ -28,6 +28,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lifetime can still observe a family whose later generations were swept ahead
   of an earlier one, until that earlier row expires: at most one configured
   lifetime after the upgrade.
+- Rotated tokens now follow the configured lifetime in both directions. A host
+  configured above 14 days sees a rotated token's lifetime grow from 14 days to
+  the configured value. A host configured below 14 days sees a rotated token's
+  reuse-detection window shrink with it: once the sweeper deletes the consumed
+  row, replaying that token returns `invalid_grant` without revoking the family
+  or emitting the reuse event, as was already the case for the first token of a
+  family.
 
 ## [3.3.2] - 2026-09-24
 
