@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.3.3] - 2026-09-30
+
 ### Fixed
 
 - Refresh the development/test lock to Mint 1.11.0, which addresses
@@ -35,6 +37,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   row, replaying that token returns `invalid_grant` without revoking the family
   or emitting the reuse event, as was already the case for the first token of a
   family.
+
+### Contributors
+
+- Thanks to [@oliver-kriska](https://github.com/oliver-kriska) for the
+  configured refresh-token lifetime fix
+  ([#37](https://github.com/XukuLLC/attesto_phoenix/pull/37)) and the Mint
+  security lock refresh
+  ([#38](https://github.com/XukuLLC/attesto_phoenix/pull/38)).
 
 ## [3.3.2] - 2026-09-24
 
