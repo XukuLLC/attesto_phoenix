@@ -10,6 +10,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Refresh the development/test lock to Mint 1.11.0, which addresses
   EEF-CVE-2026-91043, EEF-CVE-2026-92103 and EEF-CVE-2026-94194.
+- Refresh-token rotation now gives each successor the configured
+  `:refresh_token_ttl`. Rotation did not pass the lifetime to the Attesto core,
+  so every rotated token received the core's 14-day default and only the first
+  token of a family honoured the setting. Under a shorter configured lifetime,
+  rotated tokens outlived it. Under a longer one, a successor expired before
+  its own parent, so `AttestoPhoenix.Store.Sweeper` could delete later
+  generations of a family while an earlier, consumed generation remained. Hosts
+  using the default lifetime of 14 days are unaffected.
+
+### Upgrade notes
+
+- The rotation fix applies to successors minted after the upgrade. A refresh
+  token rotated before it keeps its stored 14-day expiry until it is rotated
+  again or expires. A host configured with a shorter lifetime that needs it
+  enforced at once must revoke those families. A host configured with a longer
+  lifetime can still observe a family whose later generations were swept ahead
+  of an earlier one, until that earlier row expires: at most one configured
+  lifetime after the upgrade.
 
 ## [3.3.2] - 2026-09-24
 

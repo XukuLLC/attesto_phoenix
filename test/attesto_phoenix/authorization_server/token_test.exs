@@ -335,6 +335,21 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     Attesto.RefreshStore.ETS
   end
 
+  # An authorization-code config whose code redeems into a refresh family
+  # (`offline_access`) under the given refresh-token lifetime.
+  defp refresh_ttl_config(ttl) do
+    config(
+      code_store: start_code_store("oc_user-1", ["read", "offline_access"]),
+      refresh_store: start_refresh_store(),
+      refresh_token_ttl: ttl
+    )
+  end
+
+  defp refresh_record!(token) do
+    {:ok, record} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(token))
+    record
+  end
+
   defp dpop_proof_and_jkt do
     jwk = JOSE.JWK.generate_key({:ec, "P-256"})
     {_, public_map} = JOSE.JWK.to_public_map(jwk)
@@ -1053,6 +1068,75 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       # perpetual freshness.
       assert claim!(response.access_token, "acr") == "phr"
       assert claim!(response.access_token, "auth_time") == original_auth_time
+    end
+
+    # A rotated refresh token carries the host's `:refresh_token_ttl`, exactly
+    # like an initial one. `Attesto.RefreshToken.rotate/3` defaults an absent
+    # `:ttl` to 14 days, so both sides of that default are covered: above it a
+    # successor would expire before its own parent, below it a successor would
+    # outlive the configured policy.
+    for {side, ttl} <- [{"above", 30 * 86_400}, {"below", 86_400}] do
+      test "a rotated refresh token expires after the configured TTL (#{side} the core default)" do
+        ttl = unquote(ttl)
+        config = refresh_ttl_config(ttl)
+
+        assert {:ok, %{refresh_token: initial}, _events} = Token.issue(config, grant_id_code_request(config))
+
+        earliest = System.system_time(:second)
+
+        assert {:ok, %{refresh_token: rotated}, _events} =
+                 Token.issue(config, grant_id_refresh_request(config, initial))
+
+        latest = System.system_time(:second)
+
+        assert %{generation: 1, expires_at: expires_at} = refresh_record!(rotated)
+        assert expires_at in (earliest + ttl)..(latest + ttl)
+      end
+    end
+
+    test "a rotated refresh token is refused once the configured TTL has elapsed" do
+      ttl = 86_400
+      config = refresh_ttl_config(ttl)
+
+      assert {:ok, %{refresh_token: initial}, _events} = Token.issue(config, grant_id_code_request(config))
+
+      assert {:ok, %{refresh_token: rotated}, _events} =
+               Token.issue(config, grant_id_refresh_request(config, initial))
+
+      # The token core has no clock override, so present the successor to the
+      # refresh core directly at an instant just past the configured lifetime.
+      past_configured_ttl = System.system_time(:second) + ttl + 1
+
+      assert {:error, :expired} =
+               Attesto.RefreshToken.rotate(config.refresh_store, rotated,
+                 client_id: "client-1",
+                 now: past_configured_ttl
+               )
+
+      assert %{consumed: false} = refresh_record!(rotated)
+    end
+
+    # The sweeper deletes each refresh row by its own `expires_at`. Expiry that
+    # never decreases along a family means a sweep can only remove a prefix of
+    # the lineage, never a generation between two surviving ones.
+    test "expiry never decreases along a refresh family" do
+      config = refresh_ttl_config(30 * 86_400)
+
+      assert {:ok, %{refresh_token: generation_0}, _events} = Token.issue(config, grant_id_code_request(config))
+
+      assert {:ok, %{refresh_token: generation_1}, _events} =
+               Token.issue(config, grant_id_refresh_request(config, generation_0))
+
+      assert {:ok, %{refresh_token: generation_2}, _events} =
+               Token.issue(config, grant_id_refresh_request(config, generation_1))
+
+      records = Enum.map([generation_0, generation_1, generation_2], &refresh_record!/1)
+
+      assert [0, 1, 2] == Enum.map(records, & &1.generation)
+      assert [_one_family] = records |> Enum.map(& &1.family_id) |> Enum.uniq()
+
+      expiries = Enum.map(records, & &1.expires_at)
+      assert expiries == Enum.sort(expiries)
     end
   end
 
