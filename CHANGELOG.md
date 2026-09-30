@@ -6,6 +6,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Refresh the development/test lock to Mint 1.11.0, which addresses
+  EEF-CVE-2026-91043, EEF-CVE-2026-92103 and EEF-CVE-2026-94194.
+
 ## [3.3.2] - 2026-09-24
 
 ### Fixed
