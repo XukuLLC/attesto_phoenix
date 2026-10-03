@@ -4,9 +4,10 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "Attesto and test-only Postgrex reject their affected predecessors" do
     case dependency!(:attesto) do
       {:attesto, requirement} when is_binary(requirement) ->
-        # Phoenix 3 directly needs Attesto 2's `AuthorizationCode.issue_refresh_and_finalize/6`
-        # and `RefreshStore.rotate/4` contracts; Attesto 1.15 lacks both.
-        assert Version.match?("2.0.0", requirement)
+        # Phoenix 3.4 needs Attesto 2.2's public JWKS validation, attestation
+        # Challenge verification, and absolute refresh family deadlines.
+        assert Version.match?("2.2.0", requirement)
+        refute Version.match?("2.1.0", requirement)
         refute Version.match?("1.15.0", requirement)
 
       {:attesto, opts} when is_list(opts) ->
@@ -49,7 +50,8 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "an empty source path selects the released requirement" do
     with_environment(%{"ATTESTO_SOURCE_PATH" => "", "ATTESTO_PATH" => nil}, fn ->
       assert {:attesto, requirement} = dependency!(:attesto)
-      assert Version.match?("2.0.0", requirement)
+      assert Version.match?("2.2.0", requirement)
+      refute Version.match?("2.1.0", requirement)
       refute Version.match?("1.15.0", requirement)
     end)
   end
@@ -76,7 +78,7 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
 
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
-    assert metadata =~ ~s(<<"requirement">>,<<">= 2.0.0 and < 3.0.0">>)
+    assert metadata =~ ~s(<<"requirement">>,<<">= 2.2.0 and < 3.0.0">>)
   end
 
   defp with_environment(values, fun) do

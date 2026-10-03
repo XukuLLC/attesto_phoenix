@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @moduledoc """
   Postgres-backed `AttestoPhoenix.ClientIdMetadata.Cache` for clustered
-  deployments - CIMD (`draft-ietf-oauth-client-id-metadata-document-01`, IETF
+  deployments - CIMD (`draft-ietf-oauth-client-id-metadata-document-02`, IETF
   OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
@@ -60,17 +60,25 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec get(String.t()) :: {:ok, map()} | :miss
   def get(url) when is_binary(url) do
+    case get_entry(url) do
+      {:ok, metadata, _expiry} -> {:ok, Cache.metadata_only(metadata)}
+      :miss -> :miss
+    end
+  end
+
+  @impl Cache
+  def get_entry(url) when is_binary(url) do
     prefix = Config.table_prefix()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
       from c in ClientIdMetadata,
         where: c.url == ^url and c.expires_at > ^now,
-        select: c.metadata
+        select: {c.metadata, c.expires_at}
 
     case repo().one(query, prefix: prefix, log: false, telemetry_event: nil) do
       nil -> :miss
-      metadata -> {:ok, metadata}
+      {metadata, expiry} -> {:ok, metadata, expiry}
     end
   end
 
@@ -105,6 +113,25 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
     )
 
     :ok
+  end
+
+  @impl Cache
+  def put_jwks(url, expected_metadata, %DateTime{} = expires_at, keys) do
+    prefix = Config.table_prefix()
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    expires_at = DateTime.truncate(expires_at, :second)
+    metadata = Cache.with_resolved_jwks(expected_metadata, keys)
+
+    query =
+      from c in ClientIdMetadata,
+        where:
+          c.url == ^url and c.metadata == ^expected_metadata and
+            c.expires_at == ^expires_at and c.expires_at > ^now
+
+    case repo().update_all(query, [set: [metadata: metadata]], prefix: prefix, log: false, telemetry_event: nil) do
+      {1, _} -> :ok
+      {0, _} -> :stale
+    end
   end
 
   @doc """

@@ -6,6 +6,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **3.4 upgrade:** Pre-3.4 attested refresh families now fail closed because
+  their original Client Instance Key was not persisted. Revoke those families
+  and authorize again. This release rejects binding an existing family on
+  first use.
+- Load the configured VC keystore before checking its optional certificate
+  callback so the first issued credential includes the available `x5c` chain.
+- Include the VC keystore's certificate chain in mdoc issuer authentication
+  and forward the callback's integer `:issued_at` into MSO `validityInfo.signed`.
+  Reject malformed chains or timestamps before issuing a credential.
+- Require host-chosen mdoc `:valid_until` and valid timestamp ordering; reject
+  missing or zero-length validity instead of issuing an unusable credential.
+- Keep the 3.x private-key JWT audience defaults compatible with existing
+  clients and FAPI-CIBA plans. Hosts can select issuer-only rfc7523bis-11
+  policy after updating clients; accepted legacy audiences emit telemetry.
+- Resolve CIMD `jwks_uri` through the pinned, bounded metadata fetcher and reject
+  private or symmetric keys in both inline and fetched public JWKS documents.
+- Support client-attestation draft 11 Challenge errors and fresh-attestation
+  errors with bounded JWT time-claim validation, and retain its three optional
+  client capability metadata fields during registration.
+- Require the authentication declared by a CIMD private-key JWT client.
+- Preserve validated credential authorizations through refresh, distinguish
+  scope and explicit RAR permissions, and reject credential requests that
+  exceed the original grant.
+- Bind attested clients' refresh families to their verified Client Instance
+  Key independently of DPoP. Revoke and reauthorize pre-upgrade attested
+  families, which lack the persisted key binding and now fail closed.
+- Allow a credential callback to supply integer `:issued_at` for SD-JWT VC
+  timestamp policy; reject invalid supplied values without issuing a credential.
+- Add optional absolute refresh-token family deadlines and experimental
+  refresh-token expiration metadata. Existing databases must run the additive
+  `--upgrade 3.4` migration before deploying this runtime, even when the maximum
+  lifetime option is disabled.
+- Document RFC 10017 browser/BFF and RFC 10027 cross-device host policies.
+- Widen older CIBA notification-token columns to `TEXT` in the 3.4 migration
+  so permitted 1,024-character tokens do not fail database insertion.
+- Exclude vulnerable Igniter releases and require patched Mint when the
+  optional HTTP stack is selected.
+
 ## [3.3.3] - 2026-09-30
 
 ### Fixed

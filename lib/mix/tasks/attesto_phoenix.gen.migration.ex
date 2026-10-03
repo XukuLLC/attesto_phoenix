@@ -109,11 +109,21 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # primary key (run after the 3.0 migration when upgrading 2.x):
       mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
 
+      # Add refresh-family deadlines and independent client-instance bindings:
+      mix attesto_phoenix.gen.migration --upgrade 3.4 --repo MyApp.Repo
+
   ## Options
 
     * `--upgrade` - generate a migration to upgrade an existing database rather
       than creating fresh tables. Supported values: `3.0`/`3.0.0` and
-      `3.1`/`3.1.0`. The 3.0 migration adopts or creates the exact unique index
+      `3.1`/`3.1.0` and `3.4`/`3.4.0`. The 3.4 migration adds the nullable
+      immutable `family_expires_at` and `attestation_jkt` columns without
+      changing existing families. Pre-upgrade attested families require
+      revocation and re-authorization because their original instance key was
+      not persisted. The migration also widens an existing CIBA
+      `client_notification_token` column to `text` for the full 1,024-character
+      protocol limit. Installations without a CIBA table skip that change.
+      The 3.0 migration adopts or creates the exact unique index
       on `attesto_refresh_tokens(family_id, generation)`, creates or adopts the
       `attesto_refresh_family_revocations` table, and safely backfills every
       currently-revoked refresh-token family. The 3.1 migration promotes the
@@ -489,9 +499,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       {:ok, version} when version in ["3.1", "3.1.0"] ->
         "3.1"
 
+      {:ok, version} when version in ["3.4", "3.4.0"] ->
+        "3.4"
+
       {:ok, version} ->
         Mix.raise(
-          ~s|unsupported --upgrade version #{inspect(version)}; currently supported upgrade versions: "3.0", "3.1"|
+          ~s|unsupported --upgrade version #{inspect(version)}; currently supported upgrade versions: "3.0", "3.1", "3.4"|
         )
 
       :error ->
@@ -545,6 +558,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     case upgrade_version do
       "3.0" -> generate_upgrade_3_0_for_repo(repo, opts, prefix)
       "3.1" -> generate_upgrade_3_1_for_repo(repo, opts, prefix)
+      "3.4" -> generate_upgrade_3_4_for_repo(repo, opts, prefix)
       nil -> generate_fresh_for_repo(repo, opts, prefix)
     end
   end
@@ -638,6 +652,15 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       authorization_code_upgrade_migration_template(assigns),
       :upgrade_3_1
     )
+  end
+
+  defp generate_upgrade_3_4_for_repo(repo, opts, prefix) do
+    ensure_repo(repo, [])
+    path = migrations_path(repo, opts)
+    create_directory(path)
+    base_name = "upgrade_attesto_phoenix_to_3_4"
+    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+    create_migration_file(path, base_name, refresh_family_upgrade_migration_template(assigns), :upgrade_3_4)
   end
 
   defp migrations_path(repo, opts) do
@@ -850,7 +873,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
     upgrade_files =
       migration_kind_files(path, "upgrade_attesto_phoenix_to_3_0") ++
-        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_1")
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_1") ++
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_4")
 
     if upgrade_files != [] do
       file_names =
@@ -903,6 +927,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
       multiple ->
         Mix.raise("multiple #{inspect(base_name)} migrations exist in #{path}: #{inspect(multiple)}")
+    end
+  end
+
+  defp ensure_migration_kind_available!(path, base_name, :upgrade_3_4) do
+    if migration_kind_files(path, base_name) != [] do
+      Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
     end
   end
 
@@ -1144,6 +1174,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         # (auth_time is never re-stamped). auth_time is unix seconds.
         add :acr, :string
         add :auth_time, :bigint
+        add :family_expires_at, :bigint
+        add :attestation_jkt, :string, size: 43
         add :cnf, :map
         add :claims, :map, null: false, default: %{}
         # consumed is flipped false -> true by the atomic rotation claim
@@ -1245,8 +1277,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :binding_message, :string
         # Ping/push only: the client-generated bearer secret the notification POST
         # carries (NULL for poll). A single-flow-scoped, short-lived secret.
-        # `:text`, not `:string(255)`: CIBA Core §7.3 sets no length bound and a
-        # client may present a long high-entropy token (the conformance client does).
+        # CIBA Core §7.1 permits up to 1024 characters, so the database column
+        # must support the entire accepted token rather than varchar(255).
         add :client_notification_token, :text
         # The hint-resolved end-user the OP set out to authenticate (CIBA §7.1:
         # identified BEFORE the auth_req_id is issued). Bound at issue.
@@ -2001,6 +2033,37 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
     defp quote_identifier(identifier) do
       "\\"" <> String.replace(to_string(identifier), "\\"", "\\"\\"") <> "\\""
+    end
+  end
+  """)
+
+  embed_template(:refresh_family_upgrade_migration, """
+  defmodule <%= inspect @module %> do
+    use Ecto.Migration
+
+    def up do
+      alter table(:attesto_refresh_tokens, prefix: <%= inspect @prefix %>) do
+        add :family_expires_at, :bigint
+        add :attestation_jkt, :string, size: 43
+      end
+
+      # Historical host migrations may have used varchar(255), which rejects
+      # valid CIBA §7.1 notification tokens. CIBA persistence is optional.
+      prefix = <%= inspect @prefix %> || Ecto.Migration.prefix() || repo().config()[:migration_default_prefix]
+      table = qualify_table("attesto_ciba_requests", prefix)
+      execute("ALTER TABLE IF EXISTS " <> table <> " ALTER COLUMN client_notification_token TYPE text")
+    end
+
+    def down do
+      raise "Revoke bound refresh families before manually removing family_expires_at or attestation_jkt; dropping security state would widen their authority."
+    end
+
+    defp qualify_table(table, nil), do: quote_identifier(table)
+    defp qualify_table(table, ""), do: quote_identifier(table)
+    defp qualify_table(table, prefix), do: quote_identifier(prefix) <> "." <> quote_identifier(table)
+
+    defp quote_identifier(identifier) do
+      "\\\"" <> String.replace(to_string(identifier), "\\\"", "\\\"\\\"") <> "\\\""
     end
   end
   """)

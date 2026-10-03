@@ -28,6 +28,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
   alias AttestoPhoenix.TestRepo.Migrations.CreateAttestoPhoenixTables
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo30
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo31
+  alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo34
   alias Ecto.Adapters.SQL.Sandbox
   alias Mix.Tasks.AttestoPhoenix.Gen.Migration
 
@@ -136,7 +137,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
   end
 
   defp compile_generated_upgrade(tmp_dir, prefix, version, module) do
-    upgrade = if version == "3.0", do: "3_0", else: "3_1"
+    upgrade = String.replace(version, ".", "_")
     generated_tmp_dir = Path.join(tmp_dir, "generated-#{System.unique_integer([:positive])}")
     generated_migrations_dir = migrations_dir(generated_tmp_dir)
 
@@ -162,6 +163,37 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     version_number = next_migration_version()
     assert :ok = Ecto.Migrator.up(TestRepo, version_number, module, log: false)
     {module, version_number}
+  end
+
+  defp assert_upgrade_34_ciba_prefix(tmp_dir, prefix, column_type, migrator_opts) do
+    TestRepo.query!(~s|CREATE TABLE "#{prefix}"."attesto_ciba_requests" (client_notification_token #{column_type})|)
+
+    migration_dir = Path.join(tmp_dir, "upgrade34")
+
+    Migration.run([
+      "--repo",
+      inspect(TestRepo),
+      "--migrations-path",
+      migration_dir,
+      "--upgrade",
+      "3.4"
+    ])
+
+    [file] = Path.wildcard(Path.join(migration_dir, "*_upgrade_attesto_phoenix_to_3_4.exs"))
+    migration = compile_migration(file, UpgradeAttestoPhoenixTo34)
+    assert :ok = Ecto.Migrator.up(TestRepo, next_migration_version(), migration, [log: false] ++ migrator_opts)
+
+    assert %{rows: [["text"]]} =
+             TestRepo.query!(
+               "SELECT data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'attesto_ciba_requests' AND column_name = 'client_notification_token'",
+               [prefix]
+             )
+
+    assert %{rows: [["attestation_jkt"], ["family_expires_at"]]} =
+             TestRepo.query!(
+               "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'attesto_refresh_tokens' AND column_name IN ('attestation_jkt', 'family_expires_at') ORDER BY column_name",
+               [prefix]
+             )
   end
 
   defp compile_migration(file, module) do
@@ -362,6 +394,26 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
              )
   end
 
+  test "3.4 supports a refresh-only installation without creating optional CIBA tables", %{tmp_dir: tmp_dir} do
+    prefix = "attesto_refresh_only_#{System.unique_integer([:positive])}"
+    Sandbox.mode(TestRepo, :auto)
+    on_exit(fn -> Sandbox.mode(TestRepo, :manual) end)
+    on_exit(fn -> TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{prefix}" CASCADE|) end)
+
+    TestRepo.query!(~s|CREATE SCHEMA "#{prefix}"|)
+    create_legacy_refresh_table(prefix)
+    generated_upgrade(tmp_dir, prefix, "3.4", UpgradeAttestoPhoenixTo34)
+
+    assert %{rows: [["attestation_jkt"], ["family_expires_at"]]} =
+             TestRepo.query!(
+               "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'attesto_refresh_tokens' AND column_name IN ('attestation_jkt', 'family_expires_at') ORDER BY column_name",
+               [prefix]
+             )
+
+    assert %{rows: [[nil]]} =
+             TestRepo.query!("SELECT to_regclass($1)", ["#{prefix}.attesto_ciba_requests"])
+  end
+
   test "upgrades a 2.14-era database to 3.0: creates index, table, and backfills revocations", %{
     tmp_dir: tmp_dir
   } do
@@ -467,6 +519,37 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
         [expires_at]
       )
     end
+
+    # Historical host CIBA tables used varchar(255). Preserve an existing
+    # notification token while widening the column in the combined upgrade.
+    TestRepo.query!(~s|CREATE TABLE "#{prefix}"."attesto_ciba_requests" (client_notification_token varchar(255))|)
+    TestRepo.query!(~s|INSERT INTO "#{prefix}"."attesto_ciba_requests" VALUES ('existing-token')|)
+
+    # Current code requires both additive refresh columns; apply the combined
+    # upgrade before exercising the current schema against legacy rows.
+    generated_upgrade(tmp_dir, prefix, "3.4", UpgradeAttestoPhoenixTo34)
+
+    assert %{rows: [[nil, nil]]} =
+             TestRepo.query!(
+               ~s|SELECT family_expires_at, attestation_jkt FROM "#{prefix}"."attesto_refresh_tokens" WHERE token_hash = 'hash-active-0'|
+             )
+
+    assert %{rows: [["text"]]} =
+             TestRepo.query!(
+               "SELECT data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'attesto_ciba_requests' AND column_name = 'client_notification_token'",
+               [prefix]
+             )
+
+    assert %{rows: [["existing-token"]]} =
+             TestRepo.query!(~s|SELECT client_notification_token FROM "#{prefix}"."attesto_ciba_requests"|)
+
+    token = String.duplicate("A", 1024)
+
+    assert %{rows: [[^token]]} =
+             TestRepo.query!(
+               ~s|INSERT INTO "#{prefix}"."attesto_ciba_requests" VALUES ($1) RETURNING client_notification_token|,
+               [token]
+             )
 
     # 7. Verify EctoRefreshStore runtime integration
     config = prefix_config(prefix)
@@ -1310,6 +1393,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     # Run with Ecto.Migrator prefix: option
     assert :ok = Ecto.Migrator.up(TestRepo, version, migration, prefix: prefix, log: false)
 
+    assert_upgrade_34_ciba_prefix(tmp_dir, prefix, "varchar(255)", prefix: prefix)
+
     # Target schema has the tombstone
     %{rows: rows} =
       TestRepo.query!(~s|SELECT family_id FROM "#{prefix}"."attesto_refresh_family_revocations"|)
@@ -1403,6 +1488,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
 
     # Run without migrator prefix: option (inherits repo migration_default_prefix)
     assert :ok = Ecto.Migrator.up(TestRepo, version, migration, log: false)
+
+    # The combined upgrade must also inherit the repo prefix, and an existing
+    # TEXT column can be widened again without error or data loss.
+    assert_upgrade_34_ciba_prefix(tmp_dir, prefix, "text", [])
 
     # Target schema has the tombstone
     %{rows: rows} =

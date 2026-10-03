@@ -14,6 +14,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
   alias Attesto.CIBAStore.ETS, as: Store
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController, as: Controller
+  alias AttestoPhoenix.Store.EctoCIBAStore
 
   @config_key AttestoPhoenix.Config
   @path "/oauth/bc-authorize"
@@ -102,6 +103,40 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
     conn = call(params, [basic("ping-1", "s3cr3t")])
     assert conn.status == 200
     assert is_binary(body(conn)["auth_req_id"])
+  end
+
+  @tag :ecto
+  test "ping persists the complete 1024-character notification token in PostgreSQL", %{config_opts: config_opts} do
+    owner = Ecto.Adapters.SQL.Sandbox.start_owner!(AttestoPhoenix.TestRepo, shared: true)
+    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+
+    opts =
+      config_opts
+      |> Keyword.put(:repo, AttestoPhoenix.TestRepo)
+      |> Keyword.put(:ciba_store, EctoCIBAStore)
+
+    Application.put_env(:attesto_phoenix, @config_key, opts)
+    token = String.duplicate("A", 1024)
+
+    params = %{
+      "scope" => "openid",
+      "login_hint" => "alice@example.test",
+      "client_notification_token" => token
+    }
+
+    conn = call(params, [basic("ping-1", "s3cr3t")])
+    assert conn.status == 200
+    auth_req_id = body(conn)["auth_req_id"]
+
+    Config.with_request_config(Config.new(opts), fn ->
+      assert {:ok, entry} = EctoCIBAStore.lookup(Attesto.Secret.hash(auth_req_id))
+      assert entry.data.client_notification_token == token
+      assert entry.data.delivery_mode == :ping
+    end)
+
+    conn = call(Map.put(params, "client_notification_token", token <> "A"), [basic("ping-1", "s3cr3t")])
+    assert conn.status == 400
+    assert body(conn)["error"] == "invalid_request"
   end
 
   test "a request with no client credentials is rejected (invalid_client, confidential-only)" do

@@ -46,6 +46,20 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
   end
 
   describe "run/1" do
+    test "generates the refresh binding and CIBA capacity upgrade for an existing installation", %{tmp_dir: tmp_dir} do
+      run!(["--upgrade", "3.4", "--schema-prefix", "auth"], tmp_dir)
+      assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_4.exs"))
+      source = File.read!(file)
+      assert source =~ ~s|alter table(:attesto_refresh_tokens, prefix: "auth")|
+      assert source =~ ~s|add :family_expires_at, :bigint|
+      assert source =~ ~s|add :attestation_jkt, :string, size: 43|
+      assert source =~ ~s|ALTER TABLE IF EXISTS |
+      assert source =~ ~s|ALTER COLUMN client_notification_token TYPE text|
+
+      assert source =~ "prefix = \"auth\" || Ecto.Migration.prefix() || repo().config()[:migration_default_prefix]"
+      assert source =~ "Revoke bound refresh families"
+    end
+
     setup do
       AppEnvSnapshot.ensure_unset!([
         {:attesto_phoenix, :otp_app},
@@ -189,12 +203,18 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|add :token_hash, :string, size: 88, null: false|
       assert source =~ ~s|add :family_id, :string, size: 255, null: false|
       assert source =~ ~s|add :generation, :integer, null: false, default: 0|
+      assert source =~ ~s|add :family_expires_at, :bigint|
       assert source =~ ~s|add :consumed, :boolean, null: false, default: false|
       assert source =~ ~s|add :consumed_at, :utc_datetime|
       assert source =~ ~s|add :successor, :map|
       assert source =~ ~s|add :family_revoked, :boolean, null: false, default: false|
       assert source =~ ~s|add :parent_hash, :string, size: 88|
       assert source =~ ~s|create index(:attesto_refresh_tokens, [:family_id], prefix: prefix)|
+    end
+
+    test "CIBA notification tokens use a column that accepts the full protocol limit", %{tmp_dir: tmp_dir} do
+      run!([], tmp_dir)
+      assert generated_migration(tmp_dir) =~ ~s|add :client_notification_token, :text|
     end
 
     test "dpop_nonces carries issued_at/used_at", %{tmp_dir: tmp_dir} do

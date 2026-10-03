@@ -124,6 +124,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   alias Attesto.{ClientAssertion, MTLS, WalletAttestation}
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
+  alias AttestoPhoenix.Store.NonceStore
 
   require Logger
 
@@ -221,12 +222,15 @@ defmodule AttestoPhoenix.ClientAuthentication do
             {true, [config.issuer]}
 
           :backchannel_authentication ->
-            {false,
-             [
-               config.issuer,
-               Config.token_endpoint_url(config),
-               Config.backchannel_authentication_endpoint_url(config)
-             ]}
+            audiences =
+              if is_nil(config.client_assertion_audiences) do
+                Config.client_assertion_audiences(config) ++
+                  [Config.backchannel_authentication_endpoint_url(config)]
+              else
+                Config.client_assertion_audiences(config)
+              end
+
+            {false, audiences}
 
           :revocation ->
             {false, []}
@@ -269,6 +273,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
     (`:client_secret_basic`, `:client_secret_post`, `:private_key_jwt`,
     `:tls_client_auth`, `:self_signed_tls_client_auth`,
     `:attest_jwt_client_auth`, or `:none` for the public-client path).
+    `:attestation_jkt` carries the verified Client Instance Key thumbprint only
+    for attestation authentication; refresh families must remain bound to it.
     """
 
     @type method ::
@@ -283,11 +289,12 @@ defmodule AttestoPhoenix.ClientAuthentication do
     @type t :: %__MODULE__{
             client: term(),
             client_id: String.t() | nil,
+            attestation_jkt: String.t() | nil,
             method: method()
           }
 
     @enforce_keys [:client, :method]
-    defstruct [:client, :client_id, :method]
+    defstruct [:client, :client_id, :method, :attestation_jkt]
   end
 
   defmodule ErrorContext do
@@ -707,6 +714,14 @@ defmodule AttestoPhoenix.ClientAuthentication do
            ),
          {:ok, result} <- result(config, client, client_id, :private_key_jwt),
          :ok <- consume_client_assertion_jti(config, policy, client_id, claims) do
+      if List.wrap(claims["aud"]) != [config.issuer] do
+        :telemetry.execute(
+          [:attesto_phoenix, :client_authentication, :legacy_assertion_audience],
+          %{count: 1},
+          %{method: :private_key_jwt}
+        )
+      end
+
       {:ok, result}
     else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
@@ -726,9 +741,16 @@ defmodule AttestoPhoenix.ClientAuthentication do
          {:ok, client} <- resolve_client(config, client_id),
          {:ok, result} <- result(config, client, client_id, :attest_jwt_client_auth),
          :ok <- consume_wallet_attestation_replay(config, verified) do
-      {:ok, result}
+      {:ok, %{result | attestation_jkt: verified.instance_key.jkt}}
     else
-      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+      {:error, :invalid_pop_challenge} ->
+        {:error, wallet_attestation_challenge_error(config)}
+
+      {:error, :expired} ->
+        {:error, OAuthError.new(:use_fresh_attestation, "a fresh Client Attestation is required", status: 400)}
+
+      _other ->
+        {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
 
@@ -830,7 +852,26 @@ defmodule AttestoPhoenix.ClientAuthentication do
         nil -> opts
       end
 
-    maybe_put_client_id(opts, presented_client_id)
+    opts
+    |> maybe_put_client_id(presented_client_id)
+    |> maybe_put_wallet_attestation_challenge_check(config)
+  end
+
+  defp maybe_put_wallet_attestation_challenge_check(opts, %Config{wallet_attestation_challenge_store: nil}), do: opts
+
+  defp maybe_put_wallet_attestation_challenge_check(opts, %Config{wallet_attestation_challenge_store: store} = config) do
+    Keyword.put(opts, :challenge_check, fn challenge ->
+      if is_binary(challenge) and challenge != "" and NonceStore.valid?(config, store, challenge),
+        do: :ok,
+        else: {:error, :invalid_pop_challenge}
+    end)
+  end
+
+  defp wallet_attestation_challenge_error(%Config{wallet_attestation_challenge_store: store} = config) do
+    OAuthError.new(:use_attestation_challenge, "a fresh Client Attestation Challenge is required",
+      status: 400,
+      headers: [{"oauth-client-attestation-challenge", NonceStore.issue(config, store)}]
+    )
   end
 
   defp maybe_put_client_id(opts, client_id) when is_binary(client_id) and client_id != "",
@@ -863,12 +904,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `jwks` / `jwks_uri` (RFC 7523 / OIDC Core §9), not the host's `:client_jwks`
   # callback. A document that carried neither has no keys, so `private_key_jwt`
   # is impossible for it and authentication fails closed.
-  defp client_jwks(_config, %CIMDClient{metadata: metadata}) do
-    case ClientIdMetadata.jwks(metadata) do
-      nil -> {:error, :missing_client_jwks}
-      jwks -> {:ok, jwks}
-    end
-  end
+  defp client_jwks(config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.resolve_jwks(metadata, config)
 
   defp client_jwks(config, client) do
     case Config.client_jwks_fun(config) do
@@ -967,10 +1003,13 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # that forgets it cannot accidentally let confidential clients
   # authenticate without a secret.
   # A CIMD client holds no shared symmetric secret (the document validation
-  # strips `client_secret_*` and the symmetric auth methods), so it is a public
-  # client by construction - it relies on PKCE downstream. A registered client
-  # defers to the host's `:client_public?` discriminator.
-  defp client_public?(_config, %CIMDClient{metadata: _metadata}), do: true
+  # strips `client_secret_*` and the symmetric auth methods). Draft 02 §8.2
+  # requires authentication when the document declares private_key_jwt; only
+  # the none method is public and relies on PKCE downstream. A registered
+  # client defers to the host's :client_public? discriminator.
+  defp client_public?(_config, %CIMDClient{metadata: metadata}) do
+    Map.get(metadata, "token_endpoint_auth_method", "none") == "none"
+  end
 
   # Absent the host's `:client_public?` callback the answer normally fails
   # closed to `false`: an unclassified client must not be admitted on the

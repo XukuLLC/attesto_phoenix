@@ -356,6 +356,8 @@ config :my_app, AttestoPhoenix.Config,
   trusted_proxies: ["10.0.0.0/8"],     # honor X-Forwarded-* only from these
   access_token_ttl: 900,
   refresh_token_ttl: 1_209_600,
+  refresh_token_max_lifetime: nil,      # optional fixed family limit, seconds
+  refresh_token_expiration_metadata: false, # experimental refresh-expiration draft03
   refresh_token_rotation_grace_seconds: 60,
   schema_prefix: nil,                   # Ecto/repo connection default/search_path (often `public`)
   sweep_interval_ms: 60_000,
@@ -455,6 +457,52 @@ but a preinstalled protocol config must equal
 `AttestoPhoenix.Config.to_attesto_config(host_config)` exactly.
 Direct mTLS adapters expose the authenticated certificate through peer data;
 TLS terminators configure `:forwarded_cert_der` plus `:trusted_proxies`.
+
+### Refresh inactivity and fixed family lifetime
+
+`refresh_token_ttl` expires an unused token after the configured interval.
+Set `refresh_token_max_lifetime` to additionally bound the entire family's
+lifetime from its initial issuance. Each successor and retry retains that
+original deadline, including when the configuration later increases either
+limit. A fresh authorization creates a fresh family. Existing families without
+a persisted deadline retain their inactivity policy.
+
+The Ecto schema requires nullable `family_expires_at` and `attestation_jkt`
+columns even when the maximum lifetime option is disabled. Existing installations must apply
+`mix attesto_phoenix.gen.migration --upgrade 3.4 --repo MyApp.Repo` followed by
+`mix ecto.migrate`. Upgrade every refresh-token writer before issuing
+deadline-bound or attestation-bound families. Custom stores must preserve both
+optional context keys and their values through rotation and encrypted retry recovery.
+
+The same migration widens an existing CIBA `client_notification_token` column
+to `TEXT`, allowing the specification's maximum of 1,024 characters. It skips
+that change when the optional CIBA table is absent.
+
+Attested clients bind each new refresh family to the verified Client Instance
+Key from the attestation's `cnf` claim, independently of any DPoP key. The same
+instance key is required for rotation and grace retries. Pre-upgrade attested
+families do not contain this binding and fail closed; revoke them and have
+their clients authorize again. The original attestation key cannot safely be
+reconstructed from a replacement attestation during refresh.
+
+`refresh_token_expiration_metadata: true` enables the experimental
+[refresh-expiration draft03](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-refresh-token-expiration-03):
+responses carrying a refresh token also report its actual remaining
+`refresh_token_timeout`, and discovery declares `["token_timeout"]` in
+`refresh_token_expiration_types_supported`. A family credential deadline does
+not establish authorization expiry, so this option does not emit
+`authorization_expires_in`.
+
+### Browser applications
+
+[RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html) recommends a backend
+for frontend where the backend keeps OAuth tokens and authenticates as a
+confidential client using Authorization Code with PKCE. Give its session cookie
+`Secure` and `HttpOnly`, prefer `SameSite=Strict`, `Path=/`, and a `__Host-`
+name without `Domain`. Protect cookie-authenticated application actions against
+CSRF and restrict proxy destinations. For public browser clients, enforce PKCE,
+exact registered redirects, and refresh rotation with inactivity expiry or a
+fixed family limit. The host owns browser sessions and authorization screens.
 
 ### Authorization-grant identity
 
@@ -1076,16 +1124,23 @@ enforced list must be a subset of `Attesto.SigningAlg.fapi_algs/0`; invalid or
 incoherent lists fail when the server configuration is built rather than being
 advertised and rejected only at request time.
 
-`:client_assertion_audiences` controls which `aud` values a `private_key_jwt`
-assertion may carry at the **token endpoint** (RFC 7523 §3). It defaults to the
-issuer identifier *and* the token endpoint URL, because the profiles disagree:
-FAPI 2.0 Security Profile Final §5.3.2.1 requires the issuer, while FAPI-CIBA
-ID1 audiences a token-endpoint assertion to the token endpoint URL. A
-deployment certifying to only one of them can narrow it to `[config.issuer]`.
-The other endpoints (PAR, introspection, device authorization) are
-issuer-only already. Narrowing is a conformance choice rather than a security
-one: both values name *this* server, so accepting either does not admit an
-assertion minted for a different authorization server.
+`:client_assertion_audiences` controls accepted `private_key_jwt` audiences
+at the token and backchannel authentication endpoints. The 3.x default
+continues to accept issuer and endpoint identifiers for existing clients and
+certification profiles. The next major version can adopt the issuer-only
+default in `draft-ietf-oauth-rfc7523bis-11` (RFC Editor queue, RFC 10070).
+After updating clients to use trusted issuer audiences, select that policy:
+
+```elixir
+client_assertion_audiences: fn config ->
+  [config.issuer]
+end
+```
+
+PAR, introspection and device registration continue to require the issuer
+identifier. Successful legacy assertions emit
+`[:attesto_phoenix, :client_authentication, :legacy_assertion_audience]` with
+neutral method metadata so a host can measure migration progress.
 
 When `:request_object_policy` is configured, signed request objects are verified
 at PAR submission and re-verified at `/authorize`; verified request-object
@@ -1154,6 +1209,12 @@ attesto_routes(
   `urn:ietf:params:oauth:grant-type:pre-authorized_code`. The ordinary
   **authorization_code** flow issues credentials when the request carries
   `openid_credential` `authorization_details`.
+
+Refresh retains the credential permissions granted by the issuer. Scope-based
+permissions follow scope narrowing; explicit `authorization_details` permissions
+remain separate. A refresh request can select a subset of its granted credential
+configurations, and requests for additional configurations are rejected before
+rotation. Internal permission provenance stays in grant storage.
 
 Requires: `:build_credential`, `:credential_configurations_supported`, a
 `:pre_authorized_code_store` and `:c_nonce_store`, the `:credential_offer_store`
@@ -1233,6 +1294,17 @@ automatically. `POST /oauth/device_authorization` returns a `device_code` and a 
 human-typable `user_code`; the user enters that code on a second device at the
 verification page (`/oauth/device_verification`), while the device polls the
 token endpoint with the `device_code` until the user approves.
+
+[RFC 10027](https://www.rfc-editor.org/rfc/rfc10027.html) calls for controls
+against cross-device consent phishing across device grants, CIBA, and wallet
+flows. Prefer WebAuthn hybrid authentication when supported; use device grants
+only when device constraints require them. Restrict initiation to trusted
+clients or devices and rate-limit attempts. On approval screens, show the
+requesting party, intended action, and consequence; make decline prominent and
+ask users to reject requests they did not initiate. Codes, QR images, CIBA
+binding messages, and DPoP alone do not establish that two devices belong to
+the same user. Apply these policies in the host's initiation and approval
+callbacks, and revoke grants and derived tokens when abuse is detected.
 
 ### Logout and session management
 
@@ -1396,12 +1468,13 @@ For a fresh database, generate the complete schema:
 mix attesto_phoenix.gen.migration --repo MyApp.Repo
 ```
 
-Existing 2.x databases must not use that command. Generate the 3.0 and 3.1
+Existing 2.x databases must not use that command. Generate the 3.0, 3.1, and 3.4
 upgrade migrations, in that order, and follow the stopped-cutover guide above:
 
 ```bash
 mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 3.4 --repo MyApp.Repo
 ```
 
 When the host configures a non-default `schema_prefix`, the generator picks it

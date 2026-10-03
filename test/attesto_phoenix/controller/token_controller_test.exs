@@ -24,6 +24,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   alias Attesto.CodeStore.ETS
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.CredentialController
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Schema.RefreshToken
@@ -768,10 +769,33 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
-    test "accepts private_key_jwt assertion audience set to the token endpoint URL" do
-      # RFC 7523 §3 allows the assertion audience to identify the authorization
-      # server by token endpoint URL; some FAPI-CIBA suites use that spelling.
-      # Client auth succeeds, so the intentionally unsupported grant is what fails.
+    test "issuer-only profile rejects token endpoint private_key_jwt audience" do
+      # rfc7523bis-11 requires the authorization server issuer identifier.
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+        client_assertion_audiences: fn config -> [config.issuer] end
+      )
+
+      assertion =
+        client_assertion(client_key, "confidential-1", %{
+          "aud" => "https://issuer.example/oauth/token"
+        })
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => assertion
+        })
+
+      assert body(conn)["error"] == "invalid_client"
+    end
+
+    test "accepts legacy endpoint assertion audience with the 3.x default" do
+      # A legacy deployment can retain endpoint audiences through explicit policy.
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
 
@@ -2184,6 +2208,223 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   # FIX 5 - INITIAL REFRESH-TOKEN ISSUANCE (RFC 6749 §4.1.4 / §6).
   describe "initial refresh-token issuance (RFC 6749 §6)" do
+    for {backend, label} <- [{Attesto.RefreshStore.ETS, "ETS"}, {EctoRefreshStore, "Postgres"}] do
+      @tag ecto: backend == EctoRefreshStore
+      test "#{label} attested refresh families bind the Client Instance Key independently of DPoP" do
+        enable_minting()
+        refresh_store = attested_refresh_store(unquote(backend))
+        provider = JOSE.JWK.generate_key({:ec, "P-256"})
+        instance = JOSE.JWK.generate_key({:ec, "P-256"})
+        instance_jkt = JOSE.JWK.thumbprint(instance)
+        dpop_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+        code_store =
+          start_unbound_confidential_code_store("oc_sub-1", ["read", "offline_access"],
+            code_challenge: @code_challenge,
+            code_challenge_method: "S256",
+            claims: %{"credential_configuration_ids" => ["PID"], "private_host_context" => "must-not-propagate"}
+          )
+
+        put_config(
+          refresh_store: refresh_store,
+          sweep_interval_ms: 1_000,
+          code_store: code_store,
+          dpop_enabled: true,
+          credential_configurations_supported: %{
+            "PID" => %{format: "dc+sd-jwt", vct: "https://issuer.example/credentials/pid", scope: "read"}
+          },
+          c_nonce_store: ensure_started(Attesto.CNonceStore.ETS),
+          load_principal: fn subject -> {:ok, subject} end,
+          build_credential: fn _subject, "PID", _holder ->
+            {:ok, %{vct: "https://issuer.example/credentials/pid", claims: %{"given_name" => "Alice"}}}
+          end,
+          trusted_wallet_provider_jwks: %{"keys" => [public_jwk(provider)]}
+        )
+
+        {proof, _} = dpop_proof_and_jkt(jwk: dpop_key)
+
+        initial =
+          post_attested_token(
+            %{
+              "grant_type" => "authorization_code",
+              "code" => Process.get(:auth_code),
+              "code_verifier" => @code_verifier,
+              "redirect_uri" => @redirect_uri
+            },
+            provider,
+            instance,
+            proof
+          )
+
+        assert initial.status == 200
+        token = body(initial)["refresh_token"]
+        assert {:ok, stored} = refresh_store.get(Attesto.Secret.hash(token))
+        assert stored.data.attestation_jkt == instance_jkt
+        assert stored.data.dpop_jkt == nil
+        assert stored.data.claims["credential_configuration_ids"] == ["PID"]
+        refute Map.has_key?(stored.data.claims, "private_host_context")
+
+        # A new valid attestation for the same OAuth client, using the SAME DPoP
+        # key, cannot redeem this instance's refresh token or consume the parent.
+        {proof, _} = dpop_proof_and_jkt(jwk: dpop_key)
+        changed_instance = JOSE.JWK.generate_key({:ec, "P-256"})
+
+        denied =
+          post_attested_token(
+            %{"grant_type" => "refresh_token", "refresh_token" => token},
+            provider,
+            changed_instance,
+            proof
+          )
+
+        assert denied.status == 400
+        assert body(denied)["error"] == "invalid_grant"
+        assert {:ok, %{consumed: false}} = refresh_store.get(Attesto.Secret.hash(token))
+
+        # The separate DPoP key may rotate: client authentication is still proved
+        # by the originally attested Client Instance Key.
+        next_dpop_key = JOSE.JWK.generate_key({:ec, "P-256"})
+        {proof, next_dpop_jkt} = dpop_proof_and_jkt(jwk: next_dpop_key)
+
+        rotated =
+          post_attested_token(%{"grant_type" => "refresh_token", "refresh_token" => token}, provider, instance, proof)
+
+        assert rotated.status == 200
+        successor = body(rotated)["refresh_token"]
+        rotated_claims = peek_claims(body(rotated)["access_token"])
+        assert rotated_claims["cnf"]["jkt"] == next_dpop_jkt
+        assert rotated_claims["credential_configuration_ids"] == ["PID"]
+        refute Map.has_key?(rotated_claims, "attesto_phoenix.credential_scope_bindings")
+        assert [%{"credential_identifiers" => ["PID"]}] = body(rotated)["authorization_details"]
+        assert {:ok, child} = refresh_store.get(Attesto.Secret.hash(successor))
+        assert child.data.attestation_jkt == instance_jkt
+        assert child.data.claims["credential_configuration_ids"] == ["PID"]
+
+        credential = post_refreshed_credential(body(rotated)["access_token"], next_dpop_key, "PID")
+        assert credential.status == 200
+        assert [%{"credential" => signed}] = body(credential)["credentials"]
+        assert is_binary(signed) and signed != ""
+
+        {proof, _} = dpop_proof_and_jkt(jwk: next_dpop_key)
+
+        retry =
+          post_attested_token(%{"grant_type" => "refresh_token", "refresh_token" => token}, provider, instance, proof)
+
+        assert retry.status == 200
+        assert body(retry)["refresh_token"] == successor
+        assert peek_claims(body(retry)["access_token"])["credential_configuration_ids"] == ["PID"]
+
+        {proof, _} = dpop_proof_and_jkt(jwk: dpop_key)
+
+        denied_child =
+          post_attested_token(
+            %{"grant_type" => "refresh_token", "refresh_token" => successor},
+            provider,
+            changed_instance,
+            proof
+          )
+
+        assert denied_child.status == 400
+        assert body(denied_child)["error"] == "invalid_grant"
+      end
+    end
+
+    for {backend, label} <- [{Attesto.RefreshStore.ETS, "ETS"}, {EctoRefreshStore, "Postgres"}] do
+      @tag ecto: backend == EctoRefreshStore
+      test "#{label} credential refresh keeps RAR rights independent while narrowing scope and request details" do
+        enable_minting()
+        refresh_store = attested_refresh_store(unquote(backend))
+        key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+        code_store =
+          start_unbound_confidential_code_store("oc_sub-1", ["read", "offline_access"],
+            code_challenge: @code_challenge,
+            code_challenge_method: "S256",
+            family_id: "credential-origin",
+            claims: %{
+              "credential_configuration_ids" => ["ScopeOnly", "Explicit", "ExplicitOther"],
+              "attesto_phoenix.credential_authorization_details_ids" => ["Explicit", "ExplicitOther"]
+            }
+          )
+
+        put_config(
+          code_store: code_store,
+          refresh_store: refresh_store,
+          sweep_interval_ms: 1_000,
+          dpop_enabled: true,
+          authorization_grant_id_claim: @authorization_grant_id_claim,
+          credential_configurations_supported: %{
+            "ScopeOnly" => %{format: "dc+sd-jwt", vct: "https://issuer.example/credentials/pid", scope: "read"},
+            "Explicit" => %{format: "dc+sd-jwt", vct: "https://issuer.example/credentials/pid", scope: "read"},
+            "ExplicitOther" => %{format: "dc+sd-jwt", vct: "https://issuer.example/credentials/pid", scope: "read"},
+            "Ungrant" => %{format: "dc+sd-jwt", vct: "https://issuer.example/credentials/pid", scope: "read"}
+          },
+          c_nonce_store: ensure_started(Attesto.CNonceStore.ETS),
+          load_principal: fn subject -> {:ok, subject} end,
+          build_credential: fn _subject, id, _holder ->
+            {:ok, %{vct: "https://issuer.example/credentials/pid", claims: %{"configuration" => id}}}
+          end
+        )
+
+        initial = post_dpop_confidential_auth_code(dpop_proof(jwk: key))
+        assert initial.status == 200
+        token = body(initial)["refresh_token"]
+        detail = %{"type" => "openid_credential", "credential_configuration_id" => "Explicit"}
+
+        for invalid <- [
+              JSON.encode!([%{detail | "credential_configuration_id" => "Ungrant"}]),
+              JSON.encode!([%{detail | "credential_configuration_id" => "ScopeOnly"}]),
+              JSON.encode!([Map.put(detail, "credential_identifiers", ["Ungrant"])]),
+              JSON.encode!([Map.put(detail, "claims", %{"select" => "ignored"})]),
+              "malformed"
+            ] do
+          denied =
+            post_dpop_confidential_refresh(token, dpop_proof(jwk: key), %{
+              "scope" => "offline_access",
+              "authorization_details" => invalid
+            })
+
+          assert denied.status == 400
+          assert body(denied)["error"] == "invalid_authorization_details"
+          assert {:ok, %{consumed: false}} = refresh_store.get(Attesto.Secret.hash(token))
+        end
+
+        # RAR authorized this ID independently of its advertised scope. The
+        # request removes that scope and therefore removes only the scope ID.
+        params = %{"scope" => "offline_access", "authorization_details" => JSON.encode!([detail])}
+        rotated = post_dpop_confidential_refresh(token, dpop_proof(jwk: key), params)
+        assert rotated.status == 200
+        claims = peek_claims(body(rotated)["access_token"])
+        assert claims["scope"] == "offline_access"
+        assert claims["credential_configuration_ids"] == ["Explicit"]
+        assert claims[@authorization_grant_id_claim] == "credential-origin"
+        assert [%{"credential_configuration_id" => "Explicit"}] = body(rotated)["authorization_details"]
+
+        credential = post_refreshed_credential(body(rotated)["access_token"], key, "Explicit")
+        assert credential.status == 200
+        denied_credential = post_refreshed_credential(body(rotated)["access_token"], key, "ScopeOnly")
+        assert denied_credential.status == 400
+        assert body(denied_credential)["error"] == "unknown_credential_identifier"
+
+        retry = post_dpop_confidential_refresh(token, dpop_proof(jwk: key), params)
+        assert retry.status == 200
+        assert body(retry)["refresh_token"] == body(rotated)["refresh_token"]
+        assert peek_claims(body(retry)["access_token"])["credential_configuration_ids"] == ["Explicit"]
+
+        successor = body(rotated)["refresh_token"]
+        escalation = post_dpop_confidential_refresh(successor, dpop_proof(jwk: key), %{"scope" => "read"})
+        assert escalation.status == 400
+        assert body(escalation)["error"] == "invalid_scope"
+        assert {:ok, %{consumed: false}} = refresh_store.get(Attesto.Secret.hash(successor))
+
+        next = post_dpop_confidential_refresh(successor, dpop_proof(jwk: key), %{"scope" => "offline_access"})
+        assert next.status == 200
+        # RFC 9396 §6.1 keeps the user grant unchanged by a token-request RAR
+        # subset. Both explicit rights remain, while the removed scope does not.
+        assert peek_claims(body(next)["access_token"])["credential_configuration_ids"] == ["Explicit", "ExplicitOther"]
+      end
+    end
+
     test "no refresh token without a configured :refresh_store" do
       enable_minting()
 
@@ -3048,6 +3289,27 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    test "draft 02 requires a CIMD client's declared private-key authentication" do
+      CimdFetcher.script(@cimd_pkjwt_client_id, %{
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "private_key_jwt"
+      })
+
+      conn = post_token(%{"grant_type" => "unsupported", "client_id" => @cimd_pkjwt_client_id})
+      assert body(conn)["error"] == "invalid_client"
+    end
+
+    test "a redirect-free CIMD none client cannot obtain client credentials tokens" do
+      CimdFetcher.script(@cimd_public_client_id, %{
+        "grant_types" => ["client_credentials"],
+        "token_endpoint_auth_method" => "none"
+      })
+
+      conn = post_token(%{"grant_type" => "client_credentials", "client_id" => @cimd_public_client_id})
+      assert body(conn)["error"] == "invalid_client"
+      refute Map.has_key?(body(conn), "access_token")
+    end
+
     test "a CIMD client authenticates via private_key_jwt keyed by the document's jwks" do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
 
@@ -3194,6 +3456,9 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # from an earlier test in this serial (`async: false`) run and clears its
   # state so each test sees an empty store.
   defp start_refresh_store, do: ensure_started(Attesto.RefreshStore.ETS)
+
+  defp attested_refresh_store(Attesto.RefreshStore.ETS), do: start_refresh_store()
+  defp attested_refresh_store(EctoRefreshStore), do: EctoRefreshStore
 
   defp start_nonce_store, do: ensure_started(Attesto.DPoP.NonceStore.ETS)
 
@@ -3428,15 +3693,48 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     payload =
       %{
         "htm" => "POST",
-        "htu" => "https://issuer.example" <> @endpoint_path,
+        "htu" => "https://issuer.example" <> Keyword.get(opts, :path, @endpoint_path),
         "iat" => System.system_time(:second),
         "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
       }
       |> maybe_put("nonce", nonce)
+      |> maybe_put("ath", Keyword.get(opts, :ath))
 
     header = %{"alg" => "ES256", "typ" => "dpop+jwt", "jwk" => pub_map}
     {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, header, payload))
     {compact, Attesto.DPoP.compute_jkt(pub_map)}
+  end
+
+  defp post_refreshed_credential(access_token, key, id) do
+    nonce = Attesto.CNonceStore.ETS.issue(60)
+
+    {_, holder_proof} =
+      key
+      |> JOSE.JWT.sign(
+        %{"alg" => "ES256", "typ" => "openid4vci-proof+jwt", "jwk" => public_jwk(key)},
+        %{
+          "iss" => "confidential-1",
+          "aud" => "https://issuer.example",
+          "iat" => System.system_time(:second),
+          "nonce" => nonce
+        }
+      )
+      |> JOSE.JWS.compact()
+
+    {proof, _} =
+      dpop_proof_and_jkt(
+        jwk: key,
+        path: "/oauth/credential",
+        ath: :crypto.hash(:sha256, access_token) |> Base.url_encode64(padding: false)
+      )
+
+    params = %{"credential_identifier" => id, "proof" => %{"proof_type" => "jwt", "jwt" => holder_proof}}
+    base = conn(:post, "/oauth/credential", params)
+
+    %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_req_header("authorization", "DPoP " <> access_token)
+    |> put_req_header("dpop", proof)
+    |> CredentialController.create(params)
   end
 
   defp maybe_put(map, _k, nil), do: map
@@ -3507,12 +3805,14 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     |> TokenController.create(params)
   end
 
-  defp post_dpop_confidential_refresh(refresh_token, proof) do
+  defp post_dpop_confidential_refresh(refresh_token, proof, overrides \\ %{}) do
     params = %{
       "grant_type" => "refresh_token",
       "refresh_token" => refresh_token,
       "scope" => "openid offline_access"
     }
+
+    params = Map.merge(params, overrides)
 
     %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
 
@@ -3618,6 +3918,18 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     :post
     |> conn(@endpoint_path, params)
     |> put_token_content_type()
+    |> TokenController.create(params)
+  end
+
+  defp post_attested_token(params, provider, instance, proof) do
+    {attestation, pop} = wallet_attestation_pair(provider, instance, "confidential-1")
+    %Plug.Conn{} = base = conn(:post, @endpoint_path, params)
+
+    %{base | scheme: :https, host: "issuer.example", port: 443}
+    |> put_token_content_type()
+    |> put_req_header("oauth-client-attestation", attestation)
+    |> put_req_header("oauth-client-attestation-pop", pop)
+    |> put_req_header("dpop", proof)
     |> TokenController.create(params)
   end
 

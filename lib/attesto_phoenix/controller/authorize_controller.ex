@@ -465,7 +465,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # The request-object (JAR) verification keys for the client. For a CIMD client
   # the keys are the document's `jwks` / `jwks_uri` (RFC 9101 §6.2); for a
   # registered client they are the host's `:client_jwks` callback.
-  defp client_jwks(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.jwks(metadata)
+  defp client_jwks(config, %CIMDClient{metadata: metadata}) do
+    case ClientIdMetadata.resolve_jwks(metadata, config) do
+      {:ok, jwks} -> jwks
+      {:error, _} -> nil
+    end
+  end
 
   defp client_jwks(config, client) do
     case Config.client_jwks_fun(config) do
@@ -811,6 +816,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       "credential_configuration_ids",
       Map.get(conn.private, :attesto_credential_configuration_ids)
     )
+    |> put_optional(
+      "attesto_phoenix.credential_authorization_details_ids",
+      Map.get(conn.private, :attesto_credential_authorization_details_ids)
+    )
   end
 
   # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ───────
@@ -845,7 +854,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       |> Enum.flat_map(&entry_credential_configuration_ids/1)
       |> Enum.filter(&Map.has_key?(supported, &1))
 
-    Enum.uniq(from_authorization_details ++ credential_configuration_ids_from_scope(supported, params))
+    %{
+      ids: Enum.uniq(from_authorization_details ++ credential_configuration_ids_from_scope(supported, params)),
+      authorization_details_ids: Enum.uniq(from_authorization_details)
+    }
   end
 
   # OID4VCI §5.1.2 / HAIP §4.1: a requested `scope` matching a credential
@@ -890,10 +902,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `issue_and_redirect_authorized/5` can read them without threading a new
   # parameter through the whole authenticate/consent chain — the same idiom
   # `stash_par_request_uri/3` uses for the PAR reference.
-  defp stash_credential_configuration_ids(conn, []), do: conn
+  defp stash_credential_configuration_ids(conn, %{ids: []}), do: conn
 
-  defp stash_credential_configuration_ids(conn, ids) when is_list(ids),
-    do: Plug.Conn.put_private(conn, :attesto_credential_configuration_ids, ids)
+  defp stash_credential_configuration_ids(conn, %{ids: ids, authorization_details_ids: explicit_ids}) do
+    conn
+    |> Plug.Conn.put_private(:attesto_credential_configuration_ids, ids)
+    |> Plug.Conn.put_private(:attesto_credential_authorization_details_ids, explicit_ids)
+  end
 
   # ── Host callbacks (login / consent) ─────────────────────────────────────
 

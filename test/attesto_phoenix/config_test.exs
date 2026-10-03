@@ -208,6 +208,7 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.keystore(cfg) == Keystore
       assert Config.vc_keystore(cfg) == Keystore
       assert Config.vc_signing_pem(cfg) == "main-pem"
+      assert Config.vc_signing_x5c(cfg) == nil
     end
 
     test "uses a separately configured vc_keystore" do
@@ -216,6 +217,41 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.keystore(cfg) == Keystore
       assert Config.vc_keystore(cfg) == VcKeystore
       assert Config.vc_signing_pem(cfg) == "vc-pem"
+      assert Config.vc_signing_x5c(cfg) == nil
+    end
+
+    @tag :tmp_dir
+    test "the first certificate-chain lookup loads an unloaded keystore", %{tmp_dir: tmp_dir} do
+      module = Module.concat(__MODULE__, ColdCertificateKeystore)
+
+      [{^module, beam}] =
+        Code.compile_string("""
+        defmodule #{inspect(module)} do
+          def signing_pem, do: "cold-pem"
+          def verification_pems, do: [signing_pem()]
+          def x5c, do: ["Y2VydGlmaWNhdGU="]
+        end
+        """)
+
+      File.write!(Path.join(tmp_dir, Atom.to_string(module) <> ".beam"), beam)
+      Code.prepend_path(tmp_dir)
+
+      on_exit(fn ->
+        Code.delete_path(tmp_dir)
+        :code.purge(module)
+        :code.delete(module)
+      end)
+
+      for key <- [:vc_keystore, :keystore] do
+        cfg = config([{key, module}])
+        :code.purge(module)
+        :code.delete(module)
+        assert :code.is_loaded(module) == false
+        refute function_exported?(module, :x5c, 0)
+
+        assert Config.vc_signing_x5c(cfg) == ["Y2VydGlmaWNhdGU="]
+        assert Config.vc_signing_x5c(cfg) == ["Y2VydGlmaWNhdGU="]
+      end
     end
   end
 
@@ -258,6 +294,22 @@ defmodule AttestoPhoenix.ConfigTest do
       end
 
       assert %Config{} = config(refresh_token_ttl: 60, refresh_token_rotation_grace_seconds: 60)
+    end
+
+    test "validates the optional fixed family limit and experimental expiry metadata" do
+      assert config().refresh_token_max_lifetime == nil
+      assert config(refresh_token_max_lifetime: 60).refresh_token_max_lifetime == 60
+      assert config(refresh_token_expiration_metadata: true).refresh_token_expiration_metadata
+
+      for value <- [0, -1, 1.5, "60", false, 2_147_483_648] do
+        assert_raise ArgumentError, ~r/:refresh_token_max_lifetime must be a positive integer/, fn ->
+          config(refresh_token_max_lifetime: value)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:refresh_token_expiration_metadata must be a boolean/, fn ->
+        config(refresh_token_expiration_metadata: "true")
+      end
     end
 
     test "validates the sweep interval and requires it for Ecto retry-state cleanup" do
@@ -1322,6 +1374,19 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.trusted_wallet_provider_jwks(config()) == nil
       assert Config.trusted_wallet_provider_jwks(config(trusted_wallet_provider_jwks: jwks)) == jwks
+    end
+  end
+
+  describe ":wallet_attestation_challenge_store" do
+    test "accepts a capable store and rejects unusable Challenge policy" do
+      assert config().wallet_attestation_challenge_store == nil
+      assert config(wallet_attestation_challenge_store: ETS).wallet_attestation_challenge_store == ETS
+
+      for invalid <- [false, "store", Keystore, :missing_attestation_challenge_store] do
+        assert_raise ArgumentError, ~r/:wallet_attestation_challenge_store/, fn ->
+          config(wallet_attestation_challenge_store: invalid)
+        end
+      end
     end
   end
 

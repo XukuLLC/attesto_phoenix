@@ -2,7 +2,7 @@ if Code.ensure_loaded?(Req) do
   defmodule AttestoPhoenix.ClientIdMetadata.Fetcher.Req do
     @moduledoc """
     The default, SSRF-guarded Client ID Metadata Document fetcher - CIMD
-    (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG).
+    (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
 
     This is the only component of the CIMD feature that makes an outbound request,
     so it is where the draft's Security Considerations are enforced. Implements
@@ -139,6 +139,17 @@ if Code.ensure_loaded?(Req) do
            {:ok, ips} <- resolve(uri.host, opts),
            {:ok, pinned} <- screen(ips, allow_loopback) do
         request(uri, pinned, opts)
+      end
+    end
+
+    @impl Fetcher
+    def preflight(url, opts \\ []) when is_binary(url) and is_list(opts) do
+      allow_loopback = allow_loopback!(opts)
+
+      with {:ok, uri} <- revalidate(url),
+           {:ok, ips} <- resolve(uri.host, opts),
+           {:ok, _pinned} <- screen(ips, allow_loopback) do
+        :ok
       end
     end
 
@@ -430,6 +441,7 @@ if Code.ensure_loaded?(Req) do
       |> put_flag(:no_store, Map.has_key?(directives, "no-store"))
       |> put_flag(:no_cache, Map.has_key?(directives, "no-cache"))
       |> put_expires(resp)
+      |> put_age(resp)
     end
 
     defp cache_control_directives(%Req.Response{} = resp) do
@@ -467,6 +479,19 @@ if Code.ensure_loaded?(Req) do
       case Req.Response.get_header(resp, "expires") do
         [value | _rest] -> Keyword.put(acc, :expires, value)
         [] -> acc
+      end
+    end
+
+    defp put_age(acc, %Req.Response{} = resp) do
+      case Req.Response.get_header(resp, "age") do
+        [value] ->
+          case Integer.parse(value) do
+            {seconds, ""} when seconds >= 0 -> Keyword.put(acc, :age, seconds)
+            _ -> acc
+          end
+
+        _ ->
+          acc
       end
     end
 

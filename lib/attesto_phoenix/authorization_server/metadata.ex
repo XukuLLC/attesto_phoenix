@@ -62,6 +62,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     |> put_if_present("request_object_signing_alg_values_supported", RequestObjectMetadata.signing_alg_values(config))
     |> put_if_present("require_signed_request_object", RequestObjectMetadata.require_signed(config))
     |> put_if_present("client_id_metadata_document_supported", client_id_metadata_document_supported(config))
+    |> put_if_present("refresh_token_expiration_types_supported", refresh_expiration_types(config))
     |> put_if_present(
       "authorization_details_types_supported",
       authorization_details_types_supported(config)
@@ -92,6 +93,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       Map.get(metadata, "id_token_signing_alg_values_supported") ||
       SigningAlg.keystore_algs(config.keystore)
   end
+
+  defp refresh_expiration_types(%Config{refresh_token_expiration_metadata: true}), do: ["token_timeout"]
+  defp refresh_expiration_types(_config), do: nil
 
   defp put_signing_alg_metadata(metadata, []), do: metadata
 

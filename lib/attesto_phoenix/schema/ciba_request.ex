@@ -25,6 +25,11 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
   lifetime), and the ping deliverer needs it back to authenticate the
   notification, so it cannot be one-way hashed. A deployment that wants it
   encrypted at rest supplies its own store.
+
+  The PostgreSQL column must be `text`: CIBA Core §7.1 permits notification
+  tokens up to 1,024 characters. Ecto represents both SQL `text` and `varchar`
+  with the `:string` field type; a historical `varchar(255)` column requires
+  the generated `--upgrade 3.4` migration before accepting longer tokens.
   """
 
   use Ecto.Schema

@@ -243,6 +243,11 @@ defmodule AttestoPhoenix.Config do
       format-specific claim material and optional validity window for the
       OID4VCI Credential endpoint. For SD-JWT VC and JWT VC, the library binds
       `holder_jwk` as `cnf`; for mdoc, it binds the key as the MSO device key.
+      An optional integer `:issued_at` sets SD-JWT VC's `iat` or mdoc MSO's
+      `validityInfo.signed`; omission uses the issuance clock.
+      For mdoc, the host must supply an integer `:valid_until` later than
+      `:valid_from` (which defaults to the issuance clock), with `:issued_at`
+      no later than `:valid_from`. The library does not choose a validity period.
       The library signs the resulting credential. Required when credential
       issuance is mounted.
     * `:build_deferred_credential` - `(subject, transaction_id -> {:ok,
@@ -509,11 +514,26 @@ defmodule AttestoPhoenix.Config do
       explicitly, together with the required mTLS callbacks, when those methods
       are retained. Any non-`nil` list, including `[]`, is exact, except that
       `attest_jwt_client_auth` is omitted when trusted Wallet Provider keys are
-      absent.
+      absent and the unsupported `attest_jwt_client_auth_dpop` combined mode
+      is always omitted.
     * `:trusted_wallet_provider_jwks` - trusted Wallet Provider public keys for
       `attest_jwt_client_auth`, as an RFC 7517 JWK Set, a single public JWK map,
       or a list of public JWK maps. The method is disabled and omitted from
       discovery metadata when this is unset.
+    * `:wallet_attestation_challenge_store` - optional module exporting
+      `issue/1` and `valid?/1`, or the config-aware `issue/2` and `valid?/2`
+      callbacks used by `AttestoPhoenix.Store.NonceStore`. When configured,
+      every Client Attestation PoP must carry a live server-issued Challenge.
+      Missing or rejected Challenges return HTTP 400
+      `use_attestation_challenge` with a fresh
+      `OAuth-Client-Attestation-Challenge` header (attestation draft 11 §6).
+      Use a dedicated store namespace, separate from DPoP nonces. Defaults to
+      `nil`, which disables Challenge policy while retaining PoP replay checks.
+      The optional `attest_jwt_client_auth_dpop` combined mode is unsupported
+      and is always omitted from discovery; independent DPoP may accompany
+      `attest_jwt_client_auth`.
+      A validly signed, expired Client Attestation returns
+      `use_fresh_attestation`; malformed credentials retain `invalid_client`.
     * `:key_attestation_trusted_jwks` - trusted keys for verifying a
       `key_attestation` header carried in a credential proof (OID4VCI key
       attestation), same shapes as `:trusted_wallet_provider_jwks`. When unset,
@@ -532,20 +552,12 @@ defmodule AttestoPhoenix.Config do
       Ed25519, and explicit Ed25519). A non-FAPI deployment can widen it;
       verification and the advertised metadata stay in lockstep because both
       read this one value.
-    * `:client_assertion_audiences` - the `aud` values a `private_key_jwt`
-      client assertion may carry (RFC 7523 §3), as a list or a one-arity
-      function of the config. Defaults to `[issuer, token_endpoint_url]`.
-
-      Both are accepted by default because the profiles disagree: FAPI 2.0
-      Security Profile Final §5.3.2.1 requires the issuer identifier, while
-      FAPI-CIBA ID1 audiences a token-endpoint assertion to the token endpoint
-      URL. A deployment certifying to only one of them can narrow this to
-      `[config.issuer]` and refuse the other.
-
-      Narrowing does not add much: both values identify THIS server, so
-      accepting either does not let an assertion minted for a different
-      authorization server be replayed here — which is what RFC 7523's audience
-      restriction is for. It is a conformance knob, not a security one.
+    * `:client_assertion_audiences` - accepted `private_key_jwt` audiences,
+      as a list or a one-arity function of the config. The 3.x compatibility
+      default accepts the issuer and token endpoint identifiers. For the
+      issuer-only rfc7523bis-11 profile, configure a callback returning
+      `[config.issuer]` after updating clients. Assertions still carry exactly
+      one audience, including a single-member array.
     * `:client_auth_enforce_fapi_alg_policy` - additionally enforce FAPI's RSA
       modulus and Edwards-curve restrictions for `private_key_jwt`. When unset,
       this defaults to `true` if `:client_auth_signing_algs` is omitted and to
@@ -650,8 +662,16 @@ defmodule AttestoPhoenix.Config do
     * `:trusted_proxies` - list of trusted proxy CIDRs/IPs controlling whether
       `X-Forwarded-*` headers are honored. Default `[]` (no forwarded trust).
     * `:access_token_ttl` - access-token lifetime, seconds. Default `900`.
-    * `:refresh_token_ttl` - refresh-token lifetime, seconds. Must be a positive
+    * `:refresh_token_ttl` - refresh-token inactivity lifetime, seconds. Must be a positive
       integer no greater than `2_147_483_647`. Default `1_209_600`.
+    * `:refresh_token_max_lifetime` - optional positive lifetime, seconds, for
+      an entire refresh family. New families persist a fixed deadline and
+      every rotation is capped by it (RFC 10017 §6.3.2.3). Default `nil`;
+      existing families without a deadline retain their inactivity policy.
+    * `:refresh_token_expiration_metadata` - opt into the experimental
+      `draft-ietf-oauth-refresh-token-expiration-03` token-timeout response and
+      discovery fields. Default `false`. This advertises credential expiry;
+      it does not assert an authorization lifetime.
     * `:refresh_token_rotation_grace_seconds` - idempotency window, in
       seconds, during which a just-rotated refresh token can be retried and
       receive the same successor refresh token instead of being treated as a
@@ -680,7 +700,7 @@ defmodule AttestoPhoenix.Config do
       (fail-closed). Setting this lets a scopeless DCR client (e.g. an MCP/agent
       client) register with a usable scope without each host reinventing it.
     * `:client_id_metadata` - Client ID Metadata Document support - CIMD
-      (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG). A
+      (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG). A
       keyword list configuring whether (and how) the authorization server
       dereferences an HTTPS `client_id` URL to a client metadata document. The
       whole feature is off by default; when `enabled: true`, discovery
@@ -886,6 +906,7 @@ defmodule AttestoPhoenix.Config do
     :client_auth_enforce_fapi_alg_policy,
     :client_assertion_audiences,
     :trusted_wallet_provider_jwks,
+    :wallet_attestation_challenge_store,
     :key_attestation_trusted_jwks,
     :require_key_attestation,
     :request_object_policy,
@@ -998,6 +1019,8 @@ defmodule AttestoPhoenix.Config do
     trusted_proxies: [],
     access_token_ttl: 900,
     refresh_token_ttl: 1_209_600,
+    refresh_token_max_lifetime: nil,
+    refresh_token_expiration_metadata: false,
     refresh_token_rotation_grace_seconds: 60,
     authorization_code_ttl: 60,
     par_ttl: 90,
@@ -1045,6 +1068,7 @@ defmodule AttestoPhoenix.Config do
           client_auth_enforce_fapi_alg_policy: boolean() | nil,
           client_assertion_audiences: [String.t()] | (t() -> [String.t()]) | nil,
           trusted_wallet_provider_jwks: map() | [map()] | nil,
+          wallet_attestation_challenge_store: module() | nil,
           key_attestation_trusted_jwks: map() | [map()] | nil,
           require_key_attestation: boolean() | nil,
           request_object_policy: Policy.t() | nil,
@@ -1124,6 +1148,8 @@ defmodule AttestoPhoenix.Config do
           trusted_proxies: [String.t()],
           access_token_ttl: pos_integer(),
           refresh_token_ttl: pos_integer(),
+          refresh_token_max_lifetime: pos_integer() | nil,
+          refresh_token_expiration_metadata: boolean(),
           refresh_token_rotation_grace_seconds: non_neg_integer(),
           authorization_code_ttl: pos_integer(),
           par_ttl: pos_integer(),
@@ -1274,7 +1300,7 @@ defmodule AttestoPhoenix.Config do
   end
 
   # The CIMD defaults the host's `:client_id_metadata` keyword list is merged
-  # over (`draft-ietf-oauth-client-id-metadata-document-01` §9). The whole
+  # over (`draft-ietf-oauth-client-id-metadata-document-02` §9). The whole
   # feature is off by default; a host enables it with `enabled: true` and may
   # override any individual member. The merged list is what `client_id_metadata/1`
   # returns and what the resolver / discovery wiring read.
@@ -1692,7 +1718,7 @@ defmodule AttestoPhoenix.Config do
   @spec vc_signing_x5c(t()) :: [String.t()] | nil
   def vc_signing_x5c(%__MODULE__{} = config) do
     keystore = vc_keystore(config)
-    if function_exported?(keystore, :x5c, 0), do: keystore.x5c()
+    if Code.ensure_loaded?(keystore) and function_exported?(keystore, :x5c, 0), do: keystore.x5c()
   end
 
   @doc """
@@ -1772,7 +1798,7 @@ defmodule AttestoPhoenix.Config do
   Returns the merged, defaulted Client ID Metadata Document (CIMD) options.
 
   This is the host's `:client_id_metadata` keyword list merged over the library
-  defaults (`draft-ietf-oauth-client-id-metadata-document-01` §9), so every
+  defaults (`draft-ietf-oauth-client-id-metadata-document-02` §9), so every
   recognized member (`:enabled`, `:fetcher`, `:cache`, `:allow_loopback`,
   `:max_document_bytes`, `:request_timeout_ms`, `:cache_ttl_bounds`,
   `:require_same_origin_redirect_uri`, `:allowed_hosts`, `:blocked_hosts`) is
@@ -2745,10 +2771,10 @@ defmodule AttestoPhoenix.Config do
   @doc """
   The `aud` values a `private_key_jwt` client assertion may carry (RFC 7523 §3).
 
-  Defaults to the issuer identifier and the token endpoint URL, because the
-  profiles disagree about which one is required — see
-  `:client_assertion_audiences` in the moduledoc. A deployment certifying to a
-  single profile can narrow it.
+  The 3.x compatibility default accepts the issuer and token endpoint URL.
+  Configure a callback returning `[config.issuer]` for rfc7523bis-11 after
+  updating clients. An issuer-only default belongs in the next major version;
+  see the moduledoc.
   """
   @spec client_assertion_audiences(t()) :: [String.t()]
   def client_assertion_audiences(%__MODULE__{} = config) do
@@ -2888,6 +2914,8 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp maybe_enable_wallet_attestation(methods, config, add_when_configured?) do
+    methods = Enum.reject(methods, &(&1 == "attest_jwt_client_auth_dpop"))
+
     case trusted_wallet_provider_jwks(config) do
       nil -> Enum.reject(methods, &(&1 == @wallet_attestation_auth_method))
       _jwks when add_when_configured? -> methods ++ [@wallet_attestation_auth_method]
@@ -3389,6 +3417,7 @@ defmodule AttestoPhoenix.Config do
   @type sd_jwt_credential_result :: %{
           required(:vct) => String.t(),
           required(:claims) => map(),
+          optional(:issued_at) => integer(),
           optional(:valid_from) => integer(),
           optional(:valid_until) => integer()
         }
@@ -3404,9 +3433,10 @@ defmodule AttestoPhoenix.Config do
   @typedoc "The host-provided values used to issue one mdoc credential."
   @type mdoc_credential_result :: %{
           required(:namespaces) => %{String.t() => %{String.t() => term()}},
+          required(:valid_until) => integer(),
           optional(:doc_type) => String.t(),
-          optional(:valid_from) => integer(),
-          optional(:valid_until) => integer()
+          optional(:issued_at) => integer(),
+          optional(:valid_from) => integer()
         }
 
   @type credential_result ::
@@ -3807,6 +3837,7 @@ defmodule AttestoPhoenix.Config do
     validate_required_par_store!(config)
     validate_refresh_rotation!(config)
     validate_dpop_nonce!(config)
+    validate_wallet_attestation_challenge_store!(config)
     validate_key_attestation!(config)
     validate_authorization_grant_id_claim!(config)
     validate_authorization_code_private_context!(config)
@@ -4078,6 +4109,8 @@ defmodule AttestoPhoenix.Config do
     sweep_interval_ms = config.sweep_interval_ms
 
     validate_refresh_token_ttl!(ttl)
+    validate_refresh_max_lifetime!(config.refresh_token_max_lifetime)
+    validate_refresh_expiration_metadata!(config.refresh_token_expiration_metadata)
     validate_refresh_grace!(grace, ttl)
     validate_sweep_interval!(sweep_interval_ms)
     validate_refresh_successor_secret!(config, grace)
@@ -4112,6 +4145,23 @@ defmodule AttestoPhoenix.Config do
           "AttestoPhoenix.Config: :refresh_token_rotation_grace_seconds must be a " <>
             "non-negative integer; got #{inspect(grace)}."
   end
+
+  defp validate_refresh_max_lifetime!(nil), do: :ok
+
+  defp validate_refresh_max_lifetime!(ttl) when is_integer(ttl) and ttl > 0 and ttl <= @max_refresh_token_ttl_seconds,
+    do: :ok
+
+  defp validate_refresh_max_lifetime!(_invalid),
+    do:
+      raise(
+        ArgumentError,
+        "AttestoPhoenix.Config: :refresh_token_max_lifetime must be a positive integer not exceeding 2147483647 or nil."
+      )
+
+  defp validate_refresh_expiration_metadata!(value) when is_boolean(value), do: :ok
+
+  defp validate_refresh_expiration_metadata!(_invalid),
+    do: raise(ArgumentError, "AttestoPhoenix.Config: :refresh_token_expiration_metadata must be a boolean.")
 
   defp validate_sweep_interval!(nil), do: :ok
   defp validate_sweep_interval!(interval) when is_integer(interval) and interval > 0, do: :ok
@@ -4398,6 +4448,23 @@ defmodule AttestoPhoenix.Config do
           "AttestoPhoenix.Config: :dpop_nonce_required is true, but :nonce_store " <>
             "#{inspect(store)} is not a loadable nonce store. Configure a module exporting " <>
             "issue/1 and valid?/1, or the config-aware issue/2 and valid?/2 callbacks."
+  end
+
+  defp validate_wallet_attestation_challenge_store!(%__MODULE__{wallet_attestation_challenge_store: nil}), do: :ok
+
+  defp validate_wallet_attestation_challenge_store!(%__MODULE__{wallet_attestation_challenge_store: store}) do
+    valid? =
+      is_atom(store) and Code.ensure_loaded?(store) and
+        (function_exported?(store, :issue, 1) or function_exported?(store, :issue, 2)) and
+        (function_exported?(store, :valid?, 1) or function_exported?(store, :valid?, 2))
+
+    if not valid? do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :wallet_attestation_challenge_store must export issue/1 and valid?/1, " <>
+              "or config-aware issue/2 and valid?/2; got #{inspect(store)}."
+    end
+
+    :ok
   end
 
   defp validate_key_attestation!(%__MODULE__{} = config) do

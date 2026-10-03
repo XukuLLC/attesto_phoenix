@@ -83,6 +83,30 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
              CIBA.redeem(Store, auth_req_id, %{client_id: "cli-1"}, now: now)
   end
 
+  test "a maximum-length ping token survives issue, approval, and consume" do
+    now = System.system_time(:second)
+    token = String.duplicate("A", 1024)
+
+    request = %Request{
+      client_id: "cli-1",
+      delivery_mode: :ping,
+      client_notification_token: token,
+      hint: {:login_hint, "user:alice"},
+      scope: ["openid"]
+    }
+
+    assert {:ok, %{auth_req_id: auth_req_id}} =
+             CIBA.issue(Store, request, %{subject: "user:alice"}, now: now, interval: 1)
+
+    assert {:ok, %{data: %{client_notification_token: ^token}}} = Store.lookup(Attesto.Secret.hash(auth_req_id))
+
+    assert {:ok, %{client_notification_token: ^token}} =
+             CIBA.approve(Store, auth_req_id, %{subject: "user:alice"}, now: now)
+
+    assert {:ok, %Grant{client_id: "cli-1", subject: "user:alice"}} =
+             CIBA.redeem(Store, auth_req_id, %{client_id: "cli-1"}, now: now)
+  end
+
   test "put rejects an extra canonical data key before database projection" do
     assert_raise ArgumentError, "CIBA request has invalid canonical data", fn ->
       record = put_record()

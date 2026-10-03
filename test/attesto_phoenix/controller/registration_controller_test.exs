@@ -72,6 +72,29 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
   defp body(conn), do: JSON.decode!(conn.resp_body)
 
+  test "draft 11 client capabilities survive registration and reject forbidden algorithms" do
+    capabilities = %{
+      "client_attestation_signing_alg_values_supported" => ["ES256"],
+      "client_attestation_pop_signing_alg_values_supported" => ["ES256"],
+      "client_attestation_pop_methods_supported" => ["jwt"]
+    }
+
+    base = %{"redirect_uris" => ["https://client.example/callback"]}
+    conn = post_register(config([]), Map.merge(base, capabilities))
+    assert conn.status == 201
+    for {key, value} <- capabilities, do: assert(body(conn)[key] == value)
+
+    for {key, value} <- [
+          {"client_attestation_signing_alg_values_supported", ["none"]},
+          {"client_attestation_pop_signing_alg_values_supported", ["HS256"]},
+          {"client_attestation_pop_methods_supported", "jwt"}
+        ] do
+      conn = post_register(config([]), Map.put(base, key, value))
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
+  end
+
   # OpenID Connect Registration §2 `application_type`, the standard wire signal
   # a client uses to declare itself an installed app. Recognising it is what
   # lets a host answer `client_native?/1` from a dynamic registration instead of

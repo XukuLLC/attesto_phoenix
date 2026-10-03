@@ -152,6 +152,165 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
   end
 
   describe "insert/1 and get/1" do
+    test "atomic SQL rotation rejects attestation binding erasure, replacement, and introduction" do
+      now = System.system_time(:second)
+      instance = Attesto.Secret.hash("instance")
+
+      assert {:ok, initial} =
+               CoreRefreshToken.issue(
+                 EctoRefreshStore,
+                 %{subject: "sub-1", client_id: "client-1", attestation_jkt: instance},
+                 now: now
+               )
+
+      assert {:ok, parent} = EctoRefreshStore.get(Attesto.Secret.hash(initial.token))
+
+      for data <- [
+            Map.delete(parent.data, :attestation_jkt),
+            %{parent.data | attestation_jkt: Attesto.Secret.hash("other-instance")}
+          ] do
+        candidate = child(parent, "attested-candidate", %{data: data})
+
+        assert {:error, :invalid_rotation} =
+                 EctoRefreshStore.rotate(
+                   parent.token_hash,
+                   candidate,
+                   successor(candidate, "attested-candidate", now + 10),
+                   now: now
+                 )
+
+        assert_parent_unchanged(parent)
+      end
+
+      assert {:ok, legacy} =
+               CoreRefreshToken.issue(EctoRefreshStore, %{subject: "sub-1", client_id: "client-1"}, now: now)
+
+      assert {:ok, legacy_parent} = EctoRefreshStore.get(Attesto.Secret.hash(legacy.token))
+
+      candidate =
+        child(legacy_parent, "introduced-binding", %{data: Map.put(legacy_parent.data, :attestation_jkt, instance)})
+
+      assert {:error, :invalid_rotation} =
+               EctoRefreshStore.rotate(
+                 legacy_parent.token_hash,
+                 candidate,
+                 successor(candidate, "introduced-binding", now + 10),
+                 now: now
+               )
+
+      assert_parent_unchanged(legacy_parent)
+    end
+
+    test "SQL and encrypted retries preserve independent attestation and DPoP bindings" do
+      now = System.system_time(:second)
+      instance = Attesto.Secret.hash("instance")
+      dpop = Attesto.Secret.hash("independent-dpop")
+
+      assert {:ok, initial} =
+               CoreRefreshToken.issue(
+                 EctoRefreshStore,
+                 %{subject: "sub-1", client_id: "client-1", attestation_jkt: instance, dpop_jkt: dpop},
+                 now: now,
+                 ttl: 100,
+                 family_ttl: 150
+               )
+
+      opts = [client_id: "client-1", attestation_jkt: instance, dpop_jkt: dpop, now: now + 10, ttl: 1_000]
+
+      assert {:error, :attestation_binding_mismatch} =
+               CoreRefreshToken.rotate(
+                 EctoRefreshStore,
+                 initial.token,
+                 Keyword.put(opts, :attestation_jkt, Attesto.Secret.hash("other-instance"))
+               )
+
+      assert {:ok, %{consumed: false}} = EctoRefreshStore.get(Attesto.Secret.hash(initial.token))
+      assert {:ok, rotated} = CoreRefreshToken.rotate(EctoRefreshStore, initial.token, opts)
+      assert rotated.context.attestation_jkt == instance
+      assert rotated.context.dpop_jkt == dpop
+      assert rotated.context.family_expires_at == now + 150
+
+      assert {:ok, ^rotated} =
+               CoreRefreshToken.rotate(EctoRefreshStore, initial.token, Keyword.put(opts, :now, now + 11))
+
+      assert {:ok, row} = EctoRefreshStore.get(Attesto.Secret.hash(rotated.token))
+      assert row.data.attestation_jkt == instance
+      assert row.data.dpop_jkt == dpop
+
+      assert {:error, :reuse_detected} =
+               CoreRefreshToken.rotate(
+                 EctoRefreshStore,
+                 initial.token,
+                 Keyword.put(opts, :attestation_jkt, Attesto.Secret.hash("other-instance"))
+               )
+
+      assert :error = EctoRefreshStore.get(Attesto.Secret.hash(rotated.token))
+    end
+
+    test "the atomic SQL transition cannot discard or extend a family's fixed deadline" do
+      now = System.system_time(:second)
+
+      assert {:ok, issued} =
+               CoreRefreshToken.issue(
+                 EctoRefreshStore,
+                 %{subject: "sub-1", client_id: "client-1"},
+                 now: now,
+                 ttl: 100,
+                 family_ttl: 150
+               )
+
+      assert {:ok, parent} = EctoRefreshStore.get(Attesto.Secret.hash(issued.token))
+
+      for {data, expiry} <- [
+            {Map.delete(parent.data, :family_expires_at), now + 150},
+            {%{parent.data | family_expires_at: now + 200}, now + 150},
+            {parent.data, now + 151}
+          ] do
+        candidate = child(parent, "deadline-child", %{data: data, expires_at: expiry})
+        retry = successor(candidate, "deadline-child", now + 10)
+        assert {:error, :invalid_rotation} = EctoRefreshStore.rotate(parent.token_hash, candidate, retry, now: now)
+        assert_parent_unchanged(parent)
+      end
+    end
+
+    test "fixed family expiry survives SQL rotation and encrypted lost-response retries" do
+      now = System.system_time(:second)
+
+      assert {:ok, initial} =
+               CoreRefreshToken.issue(
+                 EctoRefreshStore,
+                 %{subject: "sub-1", client_id: "client-1"},
+                 now: now,
+                 ttl: 100,
+                 family_ttl: 150
+               )
+
+      assert {:ok, first} =
+               CoreRefreshToken.rotate(EctoRefreshStore, initial.token,
+                 client_id: "client-1",
+                 now: now + 90,
+                 ttl: 10_000
+               )
+
+      assert first.expires_at == now + 150
+      assert first.context.family_expires_at == now + 150
+
+      assert {:ok, retry} =
+               CoreRefreshToken.rotate(EctoRefreshStore, initial.token,
+                 client_id: "client-1",
+                 now: now + 91,
+                 ttl: 20_000
+               )
+
+      assert retry == first
+      assert {:ok, stored} = EctoRefreshStore.get(Attesto.Secret.hash(first.token))
+      assert stored.data.family_expires_at == now + 150
+      assert stored.expires_at == now + 150
+
+      assert {:error, :expired} =
+               CoreRefreshToken.rotate(EctoRefreshStore, first.token, client_id: "client-1", now: now + 150)
+    end
+
     test "refresh writes and full-row reads emit no telemetry or sensitive logs" do
       capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
       on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)

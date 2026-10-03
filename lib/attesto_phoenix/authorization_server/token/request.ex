@@ -32,6 +32,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
       When omitted for backward compatibility, `Token.issue/2` resolves the
       host `:client_id` callback once before processing and never re-resolves it
       during the grant.
+    * `:attestation_jkt` - the Client Instance Key thumbprint from verified
+      attestation authentication, copied from `ClientAuthentication.Result`.
+      Required for an attested request, including direct callers; a request
+      parameter or an independent DPoP key must never supply this value.
   """
 
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
@@ -46,7 +50,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
           params: map(),
           sender_constraint_input: SenderConstraint.input(),
           client_ip: String.t() | nil,
-          request_client_id: String.t() | nil
+          request_client_id: String.t() | nil,
+          attestation_jkt: String.t() | nil
         }
 
   @enforce_keys [:config, :client, :client_auth_method, :grant_type, :params, :sender_constraint_input]
@@ -58,6 +63,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token.Request do
     :params,
     :sender_constraint_input,
     :client_ip,
-    :request_client_id
+    :request_client_id,
+    :attestation_jkt
   ]
 end

@@ -396,6 +396,20 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "client_credentials grant (RFC 6749 §4.4)" do
+    test "direct attested requests require the verified Client Instance Key" do
+      config = config()
+
+      for invalid <- [nil, "", "not-a-thumbprint"] do
+        unverified = request(config, client_auth_method: :attest_jwt_client_auth, attestation_jkt: invalid)
+        assert {:error, %OAuthError{error: :invalid_client}, _events} = Token.issue(config, unverified)
+      end
+
+      instance_jkt = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.thumbprint()
+      verified = request(config, client_auth_method: :attest_jwt_client_auth, attestation_jkt: instance_jkt)
+      assert {:ok, response, _events} = Token.issue(config, verified)
+      assert is_binary(response.access_token)
+    end
+
     test "returns the RFC 6749 §5.1 body and a :token_issued event as data" do
       config = config()
       request = request(config, params: %{"scope" => "read write"})
@@ -1114,6 +1128,36 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                )
 
       assert %{consumed: false} = refresh_record!(rotated)
+    end
+
+    test "an initial family deadline survives configured lifetime increases" do
+      config = %{refresh_ttl_config(86_400) | refresh_token_max_lifetime: 120}
+      assert {:ok, %{refresh_token: initial}, _} = Token.issue(config, grant_id_code_request(config))
+      initial_record = refresh_record!(initial)
+      assert initial_record.expires_at == initial_record.data.family_expires_at
+
+      changed_config = %{config | refresh_token_ttl: 30 * 86_400, refresh_token_max_lifetime: 90 * 86_400}
+
+      assert {:ok, %{refresh_token: rotated}, _} =
+               Token.issue(changed_config, grant_id_refresh_request(changed_config, initial))
+
+      assert refresh_record!(rotated).expires_at == initial_record.expires_at
+      assert refresh_record!(rotated).data.family_expires_at == initial_record.data.family_expires_at
+    end
+
+    test "experimental token timeout reports the issued credential's capped remaining lifetime" do
+      config = %{refresh_ttl_config(86_400) | refresh_token_max_lifetime: 120, refresh_token_expiration_metadata: true}
+
+      assert {:ok, %{refresh_token: initial, refresh_token_timeout: timeout} = response, _} =
+               Token.issue(config, grant_id_code_request(config))
+
+      assert timeout in 119..120
+      refute Map.has_key?(response, :authorization_expires_in)
+
+      assert {:ok, %{refresh_token_timeout: rotated_timeout}, _} =
+               Token.issue(config, grant_id_refresh_request(config, initial))
+
+      assert rotated_timeout in 119..120
     end
 
     # The sweeper deletes each refresh row by its own `expires_at`. While

@@ -72,6 +72,16 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
   defp decode_body(conn), do: JSON.decode!(conn.resp_body)
 
   describe "show/2" do
+    test "experimental refresh expiration discovery is opt-in and declares only token timeouts" do
+      refute Map.has_key?(
+               decode_body(call_show(host_config(), protocol_config())),
+               "refresh_token_expiration_types_supported"
+             )
+
+      body = decode_body(call_show(host_config(refresh_token_expiration_metadata: true), protocol_config()))
+      assert body["refresh_token_expiration_types_supported"] == ["token_timeout"]
+    end
+
     test "renders the RFC 8414 protocol members as JSON" do
       conn = call_show(host_config(), protocol_config())
       body = decode_body(conn)

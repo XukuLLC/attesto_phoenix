@@ -116,6 +116,15 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
   end
 
   describe "fetch/2 SSRF rejections via injected resolver" do
+    test "preflight repeats the same DNS screening without dereferencing the URL" do
+      assert :ok = Fetcher.preflight(@url, resolver: resolver([{93, 184, 216, 34}]))
+
+      assert {:error, {:blocked_ip, {10, 1, 2, 3}}} =
+               Fetcher.preflight(@url, resolver: resolver([{93, 184, 216, 34}, {10, 1, 2, 3}]))
+
+      assert {:error, :unresolvable} = Fetcher.preflight(@url, resolver: resolver([]))
+    end
+
     test "rejects loopback by default" do
       assert {:error, {:blocked_ip, {127, 0, 0, 1}}} =
                Fetcher.fetch(@url, resolver: resolver([{127, 0, 0, 1}]))
@@ -279,6 +288,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
         conn
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.put_resp_header("cache-control", "max-age=600, no-cache")
+        |> Plug.Conn.put_resp_header("age", "120")
         |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}","redirect_uris":["#{@url}"]}))
       end)
 
@@ -286,6 +296,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       assert Jason.decode!(body)["client_id"] == @url
       assert cache_control[:max_age] == 600
       assert cache_control[:no_cache] == true
+      assert cache_control[:age] == 120
     end
   end
 

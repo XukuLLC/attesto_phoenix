@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   @moduledoc """
   Resolves a Client ID Metadata Document URL into a client - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL
@@ -232,6 +232,33 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
       cache_control
       |> raw_ttl()
       |> clamp(min, max)
+
+    DateTime.add(DateTime.utc_now(), ttl, :second)
+  end
+
+  @doc false
+  def key_cache_expires_at(cache_control, opts) do
+    {minimum, maximum} = Keyword.fetch!(opts, :cache_ttl_bounds)
+
+    # A remote JWKS's explicit freshness deadline is an upper bound. In
+    # particular max-age=0 must not be extended by the host's minimum TTL.
+    ttl =
+      cond do
+        is_integer(cache_control[:max_age]) ->
+          age =
+            case cache_control[:age] do
+              age when is_integer(age) and age >= 0 -> age
+              _ -> 0
+            end
+
+          max(0, min(cache_control[:max_age] - age, maximum))
+
+        is_binary(cache_control[:expires]) ->
+          cache_control |> raw_ttl() |> Kernel.max(0) |> Kernel.min(maximum)
+
+        true ->
+          minimum
+      end
 
     DateTime.add(DateTime.utc_now(), ttl, :second)
   end

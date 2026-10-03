@@ -123,6 +123,9 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # RP-Initiated Logout 1.0 §3) is the registered set the end-session endpoint
   # exact-matches the request `post_logout_redirect_uri` against.
   @string_array_metadata ~w(contacts)
+  @attestation_alg_metadata ~w(client_attestation_signing_alg_values_supported)
+  @attestation_pop_alg_metadata ~w(client_attestation_pop_signing_alg_values_supported)
+  @attestation_method_metadata ~w(client_attestation_pop_methods_supported)
 
   # `post_logout_redirect_uris` is an array like `contacts`, but each entry is a
   # redirect target the end-session endpoint will later render into a link /
@@ -286,6 +289,9 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # with the shape it must satisfy.
   defp passthrough_specs do
     Enum.map(@display_string_metadata, &{&1, :string}) ++
+      Enum.map(@attestation_alg_metadata, &{&1, :attestation_algs}) ++
+      Enum.map(@attestation_pop_alg_metadata, &{&1, :attestation_pop_algs}) ++
+      Enum.map(@attestation_method_metadata, &{&1, :capability_strings}) ++
       Enum.map(@string_array_metadata, &{&1, :string_array}) ++
       Enum.map(@redirect_uri_array_metadata, &{&1, :redirect_uri_array}) ++
       Enum.map(@map_metadata, &{&1, :map}) ++
@@ -303,6 +309,23 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   defp validate_passthrough_value(key, :string, _value) do
     {:error, error(@error_invalid_client_metadata, "#{key} must be a string (RFC 7591 §2)")}
+  end
+
+  defp validate_passthrough_value(key, kind, value)
+       when kind in [:attestation_algs, :attestation_pop_algs, :capability_strings] do
+    prohibited =
+      case kind do
+        :attestation_algs -> ["none"]
+        :attestation_pop_algs -> ["none", "HS256", "HS384", "HS512"]
+        :capability_strings -> []
+      end
+
+    if is_list(value) and Enum.all?(value, &(is_binary(&1) and &1 != "" and &1 not in prohibited)) do
+      {:ok, value}
+    else
+      {:error,
+       error(@error_invalid_client_metadata, "#{key} must contain valid attestation capabilities (draft 11 §9)")}
+    end
   end
 
   defp validate_passthrough_value(_key, :string_array, value) when is_list(value) do

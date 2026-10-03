@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "3.3.3"
+  @version "3.4.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.0.0 and < 3.0.0"
+  @attesto_requirement ">= 2.2.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -139,7 +139,8 @@ defmodule AttestoPhoenix.MixProject do
       # compile against and for a host that opts into running the installer, but
       # it is not a transitive runtime requirement. Igniter 0.6 is the oldest
       # line that compiles on this package's supported Elixir/OTP floor.
-      {:igniter, "~> 0.6", optional: true},
+      {:igniter, ">= 0.6.0 and < 0.8.1 or >= 0.8.4 and < 1.0.0", optional: true},
+      {:mint, ">= 1.10.2 and < 2.0.0", optional: true},
 
       # HTTP client for the bundled Client ID Metadata/JWT JWKS fetcher, CIBA
       # ping deliverer, and Back-Channel Logout client. Req -> Finch -> Mint

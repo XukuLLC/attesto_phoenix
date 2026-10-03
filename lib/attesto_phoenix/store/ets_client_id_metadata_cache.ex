@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
   @moduledoc """
   Single-node ETS `AttestoPhoenix.ClientIdMetadata.Cache` - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
 
   Caches a validated Client ID Metadata Document in per-node memory keyed by its
   `client_id` URL. A per-node cache is correct for CIMD - a miss simply
@@ -36,15 +36,23 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
   @impl Cache
   @spec get(String.t()) :: {:ok, map()} | :miss
   def get(url) when is_binary(url) do
+    case get_entry(url) do
+      {:ok, metadata, _expiry} -> {:ok, Cache.metadata_only(metadata)}
+      :miss -> :miss
+    end
+  end
+
+  @impl Cache
+  def get_entry(url) when is_binary(url) do
     ensure_table()
     now = System.system_time(:second)
 
     case :ets.lookup(@table, url) do
       [{^url, metadata, expires_at}] when expires_at > now ->
-        {:ok, metadata}
+        {:ok, metadata, DateTime.from_unix!(expires_at)}
 
-      [{^url, _metadata, _expires_at}] ->
-        :ets.delete(@table, url)
+      [{^url, metadata, expires_at}] ->
+        :ets.select_delete(@table, [{{url, :"$1", expires_at}, [{:"=:=", :"$1", {:const, metadata}}], [true]}])
         :miss
 
       [] ->
@@ -64,6 +72,24 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
     ensure_table()
     true = :ets.insert(@table, {url, metadata, DateTime.to_unix(expires_at)})
     :ok
+  end
+
+  @impl Cache
+  def put_jwks(url, expected_metadata, %DateTime{} = expires_at, keys) do
+    ensure_table()
+    expiry = DateTime.to_unix(expires_at)
+    replacement = {url, Cache.with_resolved_jwks(expected_metadata, keys), expiry}
+
+    guards = [
+      {:"=:=", :"$1", {:const, expected_metadata}},
+      {:"=:=", :"$2", expiry},
+      {:>, :"$2", System.system_time(:second)}
+    ]
+
+    case :ets.select_replace(@table, [{{url, :"$1", :"$2"}, guards, [{:const, replacement}]}]) do
+      1 -> :ok
+      0 -> :stale
+    end
   end
 
   @doc """

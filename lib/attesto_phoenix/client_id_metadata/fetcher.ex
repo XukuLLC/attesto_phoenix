@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Fetcher do
   @moduledoc """
   Behaviour for dereferencing a Client ID Metadata Document URL - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL
@@ -57,4 +57,12 @@ defmodule AttestoPhoenix.ClientIdMetadata.Fetcher do
   """
   @callback fetch(url :: String.t(), opts :: keyword()) ::
               {:ok, result()} | {:error, term()}
+
+  @doc """
+  Revalidates URL and current DNS/SSRF policy without making an HTTP request.
+  Optional: remote JWKS caching is disabled for fetchers without this callback,
+  ensuring cached keys never bypass the fetcher's address policy.
+  """
+  @callback preflight(String.t(), keyword()) :: :ok | {:error, term()}
+  @optional_callbacks preflight: 2
 end

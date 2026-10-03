@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata do
   @moduledoc """
   Integration façade for Client ID Metadata Documents - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL
@@ -54,7 +54,7 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   """
 
   alias Attesto.ClientIdMetadata, as: Core
-  alias AttestoPhoenix.ClientIdMetadata.Resolver
+  alias AttestoPhoenix.ClientIdMetadata.{JWKSResolver, Resolver}
   alias AttestoPhoenix.Config
 
   @typedoc """
@@ -102,8 +102,8 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   @doc """
   The CIMD client's registered redirect URIs (RFC 9700), used by the
   authorization endpoint as the exact-match set in place of the host's
-  `:client_redirect_uris` callback. Document validation guarantees a non-empty
-  list of strings.
+  `:client_redirect_uris` callback. Redirect-based grants require a non-empty
+  list; a document declaring only other grants can have an empty list.
   """
   @spec redirect_uris(client()) :: [String.t()]
   def redirect_uris(%{"redirect_uris" => redirect_uris}), do: redirect_uris
@@ -121,9 +121,55 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   def jwks(_client), do: nil
 
   @doc """
+  Resolve the document's public verification keys, fetching `jwks_uri` through
+  the configured CIMD fetcher and its DNS, redirect, timeout and size guards.
+
+  Both inline and fetched sets reject private or symmetric key material.
+  Valid remote keys may be cached within the live document record, bounded by
+  both HTTP freshness and the document's expiry. Evicting or replacing the
+  document also discards its remote keys. DNS and host policy are rechecked
+  before key cache hits; custom fetchers without `preflight/2` or caches without
+  the optional atomic entry API fetch keys on each request. Fetch failures,
+  invalid sets and responses marked no-store or no-cache are never cached.
+  """
+  @spec resolve_jwks(client(), Config.t()) :: {:ok, map()} | {:error, term()}
+  def resolve_jwks(metadata, %Config{} = config) do
+    case jwks(metadata) do
+      keys when is_map(keys) -> validate_jwks(keys)
+      uri when is_binary(uri) -> fetch_jwks(metadata, uri, config)
+      _ -> {:error, :missing_client_jwks}
+    end
+  end
+
+  defp fetch_jwks(metadata, uri, config) do
+    opts = Config.client_id_metadata(config)
+
+    with {:ok, parsed} <- Core.validate_client_id(uri),
+         :ok <- jwks_host_policy(parsed.host, opts),
+         {:ok, keys} <- Config.with_request_config(config, fn -> JWKSResolver.resolve(metadata, uri, opts) end) do
+      {:ok, keys}
+    else
+      _ -> {:error, :missing_client_jwks}
+    end
+  end
+
+  defp jwks_host_policy(host, opts) do
+    allowed = Keyword.get(opts, :allowed_hosts)
+
+    if host in Keyword.get(opts, :blocked_hosts, []) or
+         (is_list(allowed) and host not in allowed),
+       do: {:error, :blocked_host},
+       else: :ok
+  end
+
+  defp validate_jwks(keys) do
+    with :ok <- Core.validate_public_jwks(keys), do: {:ok, keys}
+  end
+
+  @doc """
   The scopes the CIMD document *declares*, as a list.
 
-  `draft-ietf-oauth-client-id-metadata-document-01` §7 carries the RFC 7591 §2
+  `draft-ietf-oauth-client-id-metadata-document-02` §7 carries the RFC 7591 §2
   client-metadata field set, in which `scope` is an OPTIONAL, space-delimited
   string. A document that omits it declares no scopes, so this returns `[]` — an
   empty *declared* set, never a missing key. A CIMD client therefore has no

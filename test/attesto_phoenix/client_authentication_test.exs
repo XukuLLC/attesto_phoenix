@@ -42,6 +42,16 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     @moduledoc false
   end
 
+  defmodule AttestationChallengeStore do
+    def issue(_ttl) do
+      challenge = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+      Process.put(__MODULE__, [challenge | Process.get(__MODULE__, [])])
+      challenge
+    end
+
+    def valid?(challenge), do: challenge in Process.get(__MODULE__, [])
+  end
+
   setup do
     clients =
       Map.new(
@@ -812,11 +822,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
               Config.client_assertion_audiences(config)
 
             :backchannel_authentication ->
-              [
-                config.issuer,
-                Config.token_endpoint_url(config),
-                Config.backchannel_authentication_endpoint_url(config)
-              ]
+              Config.client_assertion_audiences(config) ++
+                [Config.backchannel_authentication_endpoint_url(config)]
 
             _other ->
               [config.issuer]
@@ -899,6 +906,88 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "attest_jwt_client_auth" do
+    test "missing or rejected Challenges return a fresh Challenge and valid retry authenticates", %{config: config} do
+      provider = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance = JOSE.JWK.generate_key({:ec, "P-256"})
+      owner = self()
+
+      config = %{
+        trust_wallet_provider(config, provider)
+        | wallet_attestation_challenge_store: AttestationChallengeStore,
+          replay_check: fn _key, _ttl ->
+            send(owner, :proof_consumed)
+            :ok
+          end
+      }
+
+      challenges =
+        for pop_overrides <- [%{}, %{"challenge" => "not-issued"}] do
+          headers = wallet_attestation_headers(provider, instance, "confidential-1", %{}, nil, pop_overrides)
+
+          assert {:error, %OAuthError{error: :use_attestation_challenge, status: 400} = error} =
+                   authenticate(headers, %{}, config, allow_public: false)
+
+          assert [{"oauth-client-attestation-challenge", challenge}] = error.headers
+          assert AttestationChallengeStore.valid?(challenge)
+          refute_received :proof_consumed
+
+          conn = OAuthError.render(Plug.Test.conn(:post, "/token"), error, config: config)
+          assert conn.status == 400
+          assert Plug.Conn.get_resp_header(conn, "oauth-client-attestation-challenge") == [challenge]
+          assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store"]
+          assert JSON.decode!(conn.resp_body)["error"] == "use_attestation_challenge"
+
+          headers =
+            wallet_attestation_headers(provider, instance, "confidential-1", %{}, nil, %{"challenge" => challenge})
+
+          assert {:ok, %Result{method: :attest_jwt_client_auth, attestation_jkt: jkt}} =
+                   authenticate(headers, %{}, config, allow_public: false)
+
+          assert jkt == JOSE.JWK.thumbprint(instance)
+
+          assert_received :proof_consumed
+          challenge
+        end
+
+      assert length(Enum.uniq(challenges)) == 2
+    end
+
+    test "an unauthenticated proof cannot elicit a Challenge", %{config: config} do
+      provider = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      config = %{
+        trust_wallet_provider(config, provider)
+        | wallet_attestation_challenge_store: AttestationChallengeStore
+      }
+
+      headers =
+        wallet_attestation_headers(provider, instance, "confidential-1", %{}, JOSE.JWK.generate_key({:ec, "P-256"}))
+
+      assert {:error, %OAuthError{error: :invalid_client, headers: []}} =
+               authenticate(headers, %{}, config, allow_public: false)
+    end
+
+    test "combined DPoP authentication stays unadvertised and missing separate PoP is rejected", %{config: config} do
+      provider = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      config = %{
+        trust_wallet_provider(config, provider)
+        | token_endpoint_auth_methods_supported: ["attest_jwt_client_auth", "attest_jwt_client_auth_dpop"]
+      }
+
+      assert Config.token_endpoint_auth_methods_supported(config) == ["attest_jwt_client_auth"]
+
+      headers =
+        wallet_attestation_headers(provider, instance, "confidential-1")
+        |> Map.put(:oauth_client_attestation_pop, [])
+        |> Map.put(:dpop, ["present-but-unsupported-combined-proof"])
+
+      assert {:error, %OAuthError{error: :invalid_client}} =
+               authenticate(headers, %{}, config, allow_public: false)
+    end
+
     test "authenticates as the verified attestation sub", %{config: config} do
       wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
       instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -932,7 +1021,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                )
     end
 
-    test "rejects wrong-key and expired attestations and an invalid PoP", %{config: config} do
+    test "rejects wrong-key or malformed attestations and an invalid PoP", %{config: config} do
       wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
       wrong_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
       instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -941,7 +1030,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
       invalid_headers = [
         wallet_attestation_headers(wrong_provider_key, instance_key, "confidential-1"),
-        wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1", %{"exp" => 0}),
+        wallet_attestation_headers(wallet_provider_key, instance_key, "confidential-1", %{"exp" => nil}),
         wallet_attestation_headers(
           wallet_provider_key,
           instance_key,
@@ -956,6 +1045,16 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
         |> authenticate(%{}, config, allow_public: false)
         |> assert_generic_invalid_client()
       end
+    end
+
+    test "an expired signed attestation requests a fresh attestation", %{config: config} do
+      provider = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance = JOSE.JWK.generate_key({:ec, "P-256"})
+      config = trust_wallet_provider(config, provider)
+      headers = wallet_attestation_headers(provider, instance, "confidential-1", %{"exp" => 0})
+
+      assert {:error, %OAuthError{error: :use_fresh_attestation, status: 400, headers: []}} =
+               authenticate(headers, %{}, config, allow_public: false)
     end
 
     test "requires both headers and rejects mixing with another authentication method", %{config: config} do
@@ -1161,7 +1260,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
          instance_key,
          client_id,
          attestation_overrides \\ %{},
-         pop_signing_key \\ nil
+         pop_signing_key \\ nil,
+         pop_overrides \\ %{}
        ) do
     now = System.system_time(:second)
     pop_signing_key = pop_signing_key || instance_key
@@ -1192,11 +1292,14 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       sign_jwt(
         pop_signing_key,
         %{"alg" => "ES256", "typ" => "oauth-client-attestation-pop+jwt"},
-        %{
-          "aud" => "https://issuer.example",
-          "iat" => now,
-          "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
-        }
+        Map.merge(
+          %{
+            "aud" => "https://issuer.example",
+            "iat" => now,
+            "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+          },
+          pop_overrides
+        )
       )
 
     %{

@@ -256,7 +256,8 @@ defmodule AttestoPhoenix.Controller.TokenController do
       params: params,
       sender_constraint_input: sender_constraint_input(config, conn),
       client_ip: RequestContext.client_ip(conn, config),
-      request_client_id: result.client_id
+      request_client_id: result.client_id,
+      attestation_jkt: result.attestation_jkt
     }
   end
 

@@ -57,6 +57,12 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
     @impl true
     def verification_pems, do: [signing_pem()]
+
+    def x5c do
+      :attesto_phoenix
+      |> Application.fetch_env!(__MODULE__)
+      |> Keyword.get(:x5c)
+    end
   end
 
   defmodule InvalidCNonceStore do
@@ -138,6 +144,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
   describe "POST /credential" do
     test "authenticates, verifies the proof, and issues a holder-bound SD-JWT VC" do
+      before_issuance = System.system_time(:second)
       nonce = CNonceStore.issue(60)
       response = post_credential(mint_token(), credential_request(nonce))
 
@@ -156,12 +163,61 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert Config.resolve!() |> Config.vc_keystore() == Keystore
       assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk, accepted_algs: ["ES256"])
       assert verified.vct == @vct
+      assert verified.claims["iat"] >= before_issuance
+      assert verified.claims["iat"] <= System.system_time(:second)
       assert verified.claims["degree"] == "Bachelor"
       assert verified.claims["student_id"] == "student-123"
       assert verified.cnf == %{"jwk" => public_map(@holder_key)}
 
       assert_receive {:credential_requested, @subject, @configuration_id, holder_jwk}
       assert holder_jwk == public_map(@holder_key)
+    end
+
+    test "honors callback issued_at for either SD-JWT VC media type" do
+      issued_at = System.system_time(:second) - 120
+      issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+
+      for format <- ["vc+sd-jwt", "dc+sd-jwt"] do
+        config = Application.fetch_env!(:attesto_phoenix, Config)
+
+        config
+        |> Keyword.put(:credential_configurations_supported, %{@configuration_id => %{format: format, vct: @vct}})
+        |> Keyword.put(:build_credential, fn _subject, _configuration, _holder ->
+          {:ok, %{vct: @vct, claims: %{"degree" => "Bachelor"}, issued_at: issued_at}}
+        end)
+        |> put_config()
+
+        nonce = CNonceStore.issue(60)
+        response = post_credential(mint_token(), credential_request(nonce))
+        assert response.status == 200
+        assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+        assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk, accepted_algs: ["ES256"])
+        assert verified.claims["iat"] == issued_at
+      end
+    end
+
+    test "invalid callback issued_at fails closed instead of signing a credential" do
+      for invalid <- [nil, false, "issued-at-sentinel", 1.5, %{}] do
+        config = Application.fetch_env!(:attesto_phoenix, Config)
+
+        config
+        |> Keyword.put(:build_credential, fn _subject, _configuration, _holder ->
+          {:ok, %{vct: @vct, claims: %{}, issued_at: invalid}}
+        end)
+        |> put_config()
+
+        nonce = CNonceStore.issue(60)
+
+        log =
+          capture_log(fn ->
+            response = post_credential(mint_token(), credential_request(nonce))
+            assert response.status == 400
+            assert body(response)["error"] == "invalid_credential_request"
+            refute Map.has_key?(body(response), "credentials")
+          end)
+
+        refute log =~ "issued-at-sentinel"
+      end
     end
 
     test "stamps the JOSE typ from a dc+sd-jwt credential configuration format" do
@@ -295,7 +351,13 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       })
       |> Keyword.put(:build_credential, fn subject, credential_configuration_id, holder_jwk ->
         send(self(), {:credential_requested, subject, credential_configuration_id, holder_jwk})
-        {:ok, %{doc_type: @mdoc_doc_type, namespaces: namespaces}}
+
+        {:ok,
+         %{
+           doc_type: @mdoc_doc_type,
+           namespaces: namespaces,
+           valid_until: System.system_time(:second) + 3600
+         }}
       end)
       |> put_config()
 
@@ -318,6 +380,81 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       assert_receive {:credential_requested, @subject, @mdoc_configuration_id, holder_jwk}
       assert holder_jwk == public_map(@holder_key)
+    end
+
+    test "mdoc carries the VC certificate chain and callback issuance time" do
+      issued_at = System.system_time(:second) - 120
+      chain = [<<48, 3, 2, 1, 1>>, <<48, 3, 2, 1, 2>>]
+
+      Application.put_env(:attesto_phoenix, VcKeystore,
+        signing_pem: @vc_signing_pem,
+        x5c: Enum.map(chain, &Base.encode64/1)
+      )
+
+      configure_mdoc_builder(%{issued_at: issued_at})
+      response = post_mdoc_credential()
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      issuer_jwk = @vc_signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+      assert {:ok, verified} = Mdoc.verify(credential, issuer_jwk)
+      assert verified.validity.signed == issued_at
+      assert verified.device_key == public_map(@holder_key)
+
+      assert {:ok, issuer_signed, <<>>} =
+               credential |> Base.url_decode64!(padding: false) |> CBOR.decode()
+
+      [_protected, unprotected, _payload, _signature] = issuer_signed["issuerAuth"]
+      assert Enum.map(unprotected[33], fn %CBOR.Tag{tag: :bytes, value: der} -> der end) == chain
+    end
+
+    test "invalid mdoc callback issuance time denies issuance" do
+      for invalid <- [nil, false, "issued-at-sentinel", 1.5, %{}] do
+        configure_mdoc_builder(%{issued_at: invalid})
+
+        capture_log(fn ->
+          response = post_mdoc_credential()
+          assert response.status == 400
+          assert body(response)["error"] == "invalid_credential_request"
+        end)
+      end
+    end
+
+    test "missing or misordered mdoc validity denies issuance" do
+      now = System.system_time(:second)
+
+      for invalid <- [
+            %{},
+            %{valid_until: nil},
+            %{issued_at: now + 60, valid_until: now + 3600},
+            %{valid_until: now - 1}
+          ] do
+        configure_mdoc_builder(%{})
+
+        Application.fetch_env!(:attesto_phoenix, Config)
+        |> Keyword.put(:build_credential, fn _subject, _configuration, _holder ->
+          {:ok,
+           Map.merge(
+             %{doc_type: @mdoc_doc_type, namespaces: %{@mdoc_namespace => %{"family_name" => "Doe"}}},
+             invalid
+           )}
+        end)
+        |> put_config()
+
+        response = post_mdoc_credential()
+        assert response.status == 400
+        assert body(response)["error"] == "invalid_credential_request"
+      end
+    end
+
+    test "malformed VC certificate encoding denies mdoc issuance" do
+      for invalid <- [["not base64!"], [""], [nil], "unexpected-chain"] do
+        Application.put_env(:attesto_phoenix, VcKeystore, signing_pem: @vc_signing_pem, x5c: invalid)
+        configure_mdoc_builder(%{})
+        response = post_mdoc_credential()
+        assert response.status == 400
+        assert body(response)["error"] == "invalid_credential_request"
+      end
     end
 
     test "returns a clean invalid_credential_request when mso_mdoc signing is not EC P-256" do
@@ -773,6 +910,35 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   defp fail_builder(:raise), do: raise("sensitive-builder-failure")
   defp fail_builder(:throw), do: throw("sensitive-builder-failure")
   defp fail_builder(:exit), do: exit("sensitive-builder-failure")
+
+  defp configure_mdoc_builder(extra) do
+    Application.fetch_env!(:attesto_phoenix, Config)
+    |> Keyword.put(:vc_keystore, VcKeystore)
+    |> Keyword.put(:credential_configurations_supported, %{
+      @mdoc_configuration_id => %{format: "mso_mdoc", doctype: @mdoc_doc_type}
+    })
+    |> Keyword.put(:build_credential, fn _subject, _configuration, _holder ->
+      {:ok,
+       Map.merge(
+         %{
+           doc_type: @mdoc_doc_type,
+           namespaces: %{@mdoc_namespace => %{"family_name" => "Doe"}},
+           valid_until: System.system_time(:second) + 3600
+         },
+         extra
+       )}
+    end)
+    |> put_config()
+  end
+
+  defp post_mdoc_credential do
+    nonce = CNonceStore.issue(60)
+
+    post_credential(
+      mint_token(credential_configuration_ids: [@mdoc_configuration_id]),
+      credential_request(nonce, credential_configuration_id: @mdoc_configuration_id)
+    )
+  end
 
   defp mint_token(opts \\ []) do
     config =

@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
   @moduledoc """
   Behaviour-conformance tests for the Postgres-backed Client ID Metadata
-  Document cache (`draft-ietf-oauth-client-id-metadata-document-01`):
+  Document cache (`draft-ietf-oauth-client-id-metadata-document-02`):
   cross-node coherence, string-keyed jsonb round-trip, `:miss` on absence,
   expiry re-checked on read, and upsert on re-fetch.
 
@@ -66,6 +66,44 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
     # The freshest accepted document wins; there is a single row for the URL.
     assert {:ok, %{"client_name" => "New Name"}} = Cache.get(@url)
     assert TestRepo.aggregate(ClientIdMetadata, :count, :url) == 1
+  end
+
+  test "attaches remote keys atomically without extending document freshness or exposing cache internals" do
+    expiry = soon() |> DateTime.truncate(:second)
+
+    keys = %{
+      "uri" => "https://app.example/keys.json",
+      "keys" => %{"keys" => []},
+      "expires_at" => DateTime.to_unix(expiry) - 20
+    }
+
+    assert :ok = Cache.put(@url, @metadata, expiry)
+    assert {:ok, @metadata, ^expiry} = Cache.get_entry(@url)
+    assert :ok = Cache.put_jwks(@url, @metadata, expiry, keys)
+    assert {:ok, @metadata} = Cache.get(@url)
+    assert {:ok, stored, ^expiry} = Cache.get_entry(@url)
+    assert CacheAPI.resolved_jwks(stored) == keys
+
+    # A stale writer cannot overwrite another key fetch, a newer document,
+    # an extended document deadline or an eviction.
+    assert :stale = Cache.put_jwks(@url, @metadata, expiry, keys)
+    rotated = Map.put(@metadata, "client_name", "Rotated")
+    assert :ok = Cache.put(@url, rotated, expiry)
+    assert :stale = Cache.put_jwks(@url, stored, expiry, keys)
+    assert {:ok, ^rotated, ^expiry} = Cache.get_entry(@url)
+    extended = DateTime.add(expiry, 60, :second)
+    assert :ok = Cache.put(@url, rotated, extended)
+    assert :stale = Cache.put_jwks(@url, rotated, expiry, keys)
+    assert :ok = Cache.delete(@url)
+    assert :stale = Cache.put_jwks(@url, rotated, extended, keys)
+    assert :miss = Cache.get_entry(@url)
+  end
+
+  test "expired document cannot acquire cached remote keys" do
+    expiry = DateTime.utc_now() |> DateTime.add(-1, :second) |> DateTime.truncate(:second)
+    assert :ok = Cache.put(@url, @metadata, expiry)
+    assert :miss = Cache.get_entry(@url)
+    assert :stale = Cache.put_jwks(@url, @metadata, expiry, %{})
   end
 
   test "put refreshes an expired entry on re-fetch (replaces metadata and expiry)" do
@@ -169,6 +207,10 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert {:ok, ^metadata} = Cache.get(url)
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert {:ok, stored, expiry} = Cache.get_entry(url)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :ok = Cache.put_jwks(url, stored, expiry, %{"keys" => "public-key-sentinel"})
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert :ok = Cache.delete(url)
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert :ok = Cache.put(url, metadata, soon())
@@ -179,5 +221,6 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.EctoTest do
 
     refute log =~ url
     refute log =~ "telemetry-metadata-sentinel"
+    refute log =~ "public-key-sentinel"
   end
 end

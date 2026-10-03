@@ -9,6 +9,13 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   form). The host supplies only the credential type and claim values through
   `:build_credential`; the library owns proof verification, holder binding,
   signing, format-specific issuance, and response framing.
+
+  For SD-JWT VC and mdoc issuance, a successful `:build_credential` result may
+  include `:issued_at`, an integer NumericDate copied to the signed `iat` claim
+  or MSO `validityInfo.signed`, respectively. The default remains the current
+  time. Hosts can round issuance timestamps under
+  RFC 9901 §10.1 to reduce correlation; an explicitly supplied invalid value
+  denies issuance instead of signing an invalid credential.
   """
 
   use AttestoPhoenix.Controller, formats: [:json]
@@ -385,7 +392,9 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
       {:ok, %{vct: vct, claims: claims} = result}
       when is_binary(vct) and is_map(claims) ->
-        {:ok, issue_credential(config, result, holder_jwk, format)}
+        if valid_issued_at?(result),
+          do: {:ok, issue_credential(config, result, holder_jwk, format)},
+          else: normalize_build_result(:invalid_issued_at)
 
       other ->
         normalize_build_result(other)
@@ -405,9 +414,17 @@ defmodule AttestoPhoenix.Controller.CredentialController do
         typ: format
       ]
       |> maybe_put_option(:x5c, Config.vc_signing_x5c(config))
+      |> maybe_put_option(:iat, Map.get(result, :issued_at))
       |> maybe_put_option(:exp, Map.get(result, :valid_until))
       |> maybe_put_option(:nbf, Map.get(result, :valid_from))
     )
+  end
+
+  defp valid_issued_at?(result) do
+    case Map.fetch(result, :issued_at) do
+      :error -> true
+      {:ok, value} -> is_integer(value)
+    end
   end
 
   defp build_jwt_vc_credential(config, subject, credential_configuration_id, holder_jwk) do
@@ -441,7 +458,9 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   defp build_mdoc_credential(config, subject, credential_configuration_id, holder_jwk, credential_configuration) do
     case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
       {:ok, %{namespaces: namespaces} = result} when is_map(namespaces) ->
-        issue_mdoc_credential(config, result, holder_jwk, credential_configuration)
+        if valid_issued_at?(result),
+          do: issue_mdoc_credential(config, result, holder_jwk, credential_configuration),
+          else: normalize_build_result(:invalid_issued_at)
 
       other ->
         normalize_build_result(other)
@@ -467,20 +486,44 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     now = System.system_time(:second)
     doc_type = Map.get(result, :doc_type) || configuration_doc_type(credential_configuration)
 
-    with {:ok, issuer_pem} <- mdoc_signing_pem(config) do
+    with {:ok, issuer_pem} <- mdoc_signing_pem(config),
+         {:ok, x5chain} <- mdoc_signing_chain(Config.vc_signing_x5c(config)) do
       Mdoc.issue(
         doc_type: doc_type,
         namespaces: result.namespaces,
         device_key: holder_jwk,
         issuer_pem: issuer_pem,
+        x5chain: x5chain,
         validity: %{
-          signed: now,
+          signed: Map.get(result, :issued_at, now),
           valid_from: Map.get(result, :valid_from, now),
           valid_until: Map.get(result, :valid_until, now)
         }
       )
     end
   end
+
+  defp mdoc_signing_chain(nil), do: {:ok, nil}
+  defp mdoc_signing_chain([]), do: {:ok, nil}
+
+  defp mdoc_signing_chain(chain) when is_list(chain) do
+    Enum.reduce_while(chain, {:ok, []}, fn
+      certificate, {:ok, certificates} when is_binary(certificate) ->
+        case Base.decode64(certificate) do
+          {:ok, der} when byte_size(der) > 0 -> {:cont, {:ok, [der | certificates]}}
+          _other -> {:halt, {:error, :invalid_credential}}
+        end
+
+      _certificate, _acc ->
+        {:halt, {:error, :invalid_credential}}
+    end)
+    |> case do
+      {:ok, certificates} -> {:ok, Enum.reverse(certificates)}
+      error -> error
+    end
+  end
+
+  defp mdoc_signing_chain(_chain), do: {:error, :invalid_credential}
 
   defp mdoc_signing_pem(config) do
     pem = Config.vc_signing_pem(config)

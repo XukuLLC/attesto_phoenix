@@ -574,11 +574,26 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
     consumed_at = Map.get(child, :consumed_at)
 
     cond do
-      not is_binary(token_hash) or token_hash == parent_hash -> {:error, :invalid_rotation}
-      family_id != row.family_id -> {:error, :invalid_rotation}
-      generation != row.generation + 1 -> {:error, :invalid_rotation}
-      consumed != false or not is_nil(consumed_at) -> {:error, :invalid_rotation}
-      true -> :ok
+      not is_binary(token_hash) or token_hash == parent_hash ->
+        {:error, :invalid_rotation}
+
+      family_id != row.family_id ->
+        {:error, :invalid_rotation}
+
+      generation != row.generation + 1 ->
+        {:error, :invalid_rotation}
+
+      consumed != false or not is_nil(consumed_at) ->
+        {:error, :invalid_rotation}
+
+      child_family_deadline(child) != stored_family_deadline(row) ->
+        {:error, :invalid_rotation}
+
+      child_attestation_binding(child) != stored_attestation_binding(row) ->
+        {:error, :invalid_rotation}
+
+      true ->
+        :ok
     end
   end
 
@@ -587,6 +602,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
     cond do
       not is_integer(child_expires_at) or child_expires_at <= now -> {:error, :invalid_rotation}
+      not is_nil(row.family_expires_at) and child_expires_at > row.family_expires_at -> {:error, :invalid_rotation}
       DateTime.to_unix(row.expires_at, :second) <= now -> {:error, :expired}
       true -> :ok
     end
@@ -597,6 +613,17 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       do: {:error, :family_integrity_error},
       else: :ok
   end
+
+  defp stored_family_deadline(%RefreshToken{family_expires_at: nil}), do: :error
+  defp stored_family_deadline(%RefreshToken{family_expires_at: deadline}), do: {:ok, deadline}
+
+  defp child_family_deadline(%{data: data}) when is_map(data), do: Map.fetch(data, :family_expires_at)
+  defp child_family_deadline(_child), do: :invalid
+
+  defp stored_attestation_binding(%RefreshToken{attestation_jkt: nil}), do: :error
+  defp stored_attestation_binding(%RefreshToken{attestation_jkt: thumbprint}), do: {:ok, thumbprint}
+  defp child_attestation_binding(%{data: data}) when is_map(data), do: Map.fetch(data, :attestation_jkt)
+  defp child_attestation_binding(_child), do: :invalid
 
   defp validate_token_hash(child, prefix) do
     if token_hash_taken?(Map.get(child, :token_hash), prefix),

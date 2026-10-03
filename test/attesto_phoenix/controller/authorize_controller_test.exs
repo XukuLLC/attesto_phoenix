@@ -1886,6 +1886,29 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       record = TestStore.peek(code)
       assert record.data.claims["credential_configuration_ids"] == ["UniversityDegreeCredential"]
+
+      assert record.data.claims["attesto_phoenix.credential_authorization_details_ids"] == [
+               "UniversityDegreeCredential"
+             ]
+    end
+
+    test "RAR provenance remains separate from matching scope-based credential rights" do
+      put_config(
+        credential_configurations_supported: %{
+          "Explicit" => %{format: "dc+sd-jwt", scope: "profile"},
+          "ScopeOnly" => %{format: "dc+sd-jwt", scope: "profile"}
+        }
+      )
+
+      details =
+        authorization_details_json([
+          %{"type" => "openid_credential", "credential_configuration_id" => "Explicit"}
+        ])
+
+      response = call(valid_params(%{"authorization_details" => details}))
+      record = TestStore.peek(location_query(response)["code"])
+      assert Enum.sort(record.data.claims["credential_configuration_ids"]) == ["Explicit", "ScopeOnly"]
+      assert record.data.claims["attesto_phoenix.credential_authorization_details_ids"] == ["Explicit"]
     end
 
     test "an authorization_details entry naming an unconfigured credential id is dropped" do

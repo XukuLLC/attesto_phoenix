@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Cache do
   @moduledoc """
   Behaviour for caching a validated Client ID Metadata Document - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL
@@ -72,6 +72,20 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache do
   @callback put(url :: String.t(), metadata :: metadata(), expires_at :: DateTime.t()) :: :ok
 
   @doc """
+  Reads a fresh record, including its document expiry and any internal resolved
+  JWKS entry. Optional; remote keys remain uncached on backends without this API.
+  """
+  @callback get_entry(String.t()) :: {:ok, metadata(), DateTime.t()} | :miss
+
+  @doc """
+  Attaches one validated remote JWKS entry only if the live document and expiry
+  still equal the values read by `get_entry/1`. This atomic comparison prevents
+  a concurrent document rotation or eviction from being undone by a key fetch.
+  The document's expiry MUST remain unchanged. Optional.
+  """
+  @callback put_jwks(String.t(), metadata(), DateTime.t(), map()) :: :ok | :stale
+
+  @doc """
   Evicts the cached document for a CIMD `client_id` URL, if one is present.
 
   A cached document is otherwise honored until the `expires_at` it was stored
@@ -90,7 +104,18 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache do
   """
   @callback delete_all() :: :ok
 
-  @optional_callbacks delete: 1, delete_all: 0
+  @optional_callbacks delete: 1, delete_all: 0, get_entry: 1, put_jwks: 4
+
+  @resolved_jwks_key "__attesto_resolved_jwks"
+
+  @doc false
+  def metadata_only(metadata), do: Map.delete(metadata, @resolved_jwks_key)
+
+  @doc false
+  def resolved_jwks(metadata), do: Map.get(metadata, @resolved_jwks_key)
+
+  @doc false
+  def with_resolved_jwks(metadata, keys), do: Map.put(metadata, @resolved_jwks_key, keys)
 
   @doc """
   Evicts `url` from `cache`, or returns `{:error, :not_supported}` when that

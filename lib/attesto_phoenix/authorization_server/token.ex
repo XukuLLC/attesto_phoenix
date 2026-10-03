@@ -89,6 +89,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # becoming an access-token claim or requiring store/schema changes.
   @refresh_grant_type_claim "attesto_phoenix.authorization_grant_type"
   @refresh_grant_family_claim "attesto_phoenix.authorization_grant_family_id"
+  @credential_details_ids_claim "attesto_phoenix.credential_authorization_details_ids"
+  @credential_scope_bindings_claim "attesto_phoenix.credential_scope_bindings"
 
   # RFC 8628 §3.5: the polling errors that MUST be rendered with their own error
   # codes (NOT collapsed to invalid_grant) — clients depend on distinguishing
@@ -163,11 +165,20 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp run(%Request{} = request) do
     with :ok <- require_supported_grant_type(request),
+         :ok <- require_attestation_instance_key(request),
          :ok <- require_confidential_client(request),
          :ok <- require_registered_grant_type(request) do
       dispatch(request)
     end
   end
+
+  defp require_attestation_instance_key(%Request{client_auth_method: :attest_jwt_client_auth, attestation_jkt: jkt}) do
+    if Attesto.Thumbprint.valid?(jkt),
+      do: :ok,
+      else: {:error, error(@error_invalid_client, "verified Client Instance Key is required")}
+  end
+
+  defp require_attestation_instance_key(%Request{}), do: :ok
 
   # RFC 6749 §4.4 / RFC 8693: a public client (auth method `:none`) presented no
   # client credential, so it may not run a confidential-only grant. Rejected as
@@ -275,6 +286,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, presented} <- require_param(params, "refresh_token"),
          requested = parse_requested_scope(params),
+         {:ok, requested_credentials} <- requested_credential_configurations(params),
+         :ok <- validate_refresh_credential_request(config, presented, requested, requested_credentials),
          {:ok, resource} <- refresh_requested_resource(params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          :ok <- commit_claim_for_presented_grant(request, :refresh, presented, pending_claim),
@@ -287,6 +300,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              SenderConstraint.binding_jkt(binding)
            ),
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
+         credential_claims = refresh_credential_claims(config, rotated.context, scope, requested_credentials),
          {:ok, response} <-
            mint(
              request,
@@ -294,13 +308,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             refresh_authorization_grant_id_claims(config, rotated),
+             Map.merge(credential_claims, refresh_authorization_grant_id_claims(config, rotated)),
              # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
              # (never re-stamped on rotation), so the refreshed access token
              # reports the real authentication event.
              audience_opts(rotated.context.resource) ++ context_auth_context_opts(rotated.context)
            ) do
-      response = Map.put(response, :refresh_token, rotated.token)
+      response =
+        response
+        |> put_refresh_response(rotated, config)
+        |> maybe_echo_credential_authorization_details(%{claims: credential_claims})
 
       {:ok, response,
        [refresh_rotated_event(request, rotated.context.subject, scope, "refresh_token", token_type, binding)]}
@@ -1549,9 +1566,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # token would make rotation reject the proof as unexpected and prevent a
       # legitimate key rotation.
       |> put_optional_kw(:dpop_jkt, refresh_rotation_dpop_jkt(request, presented, jkt))
+      |> put_optional_kw(:attestation_jkt, refresh_attestation_jkt(request))
       |> Keyword.put(:rotation_grace_seconds, config.refresh_token_rotation_grace_seconds)
-      # A successor gets the same configured lifetime as an initial token;
-      # Attesto.RefreshToken defaults an absent `:ttl` to 14 days.
+      # The configured TTL bounds inactivity; the core also caps successors
+      # by the immutable deadline stored on a family issued with family_ttl.
       |> Keyword.put(:ttl, config.refresh_token_ttl)
 
     case RefreshToken.rotate(grant_store(config, :refresh_store), presented, opts) do
@@ -1653,10 +1671,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
                grant,
                refresh_store,
                context,
-               ttl: config.refresh_token_ttl
+               ttl: config.refresh_token_ttl,
+               family_ttl: config.refresh_token_max_lifetime
              ) do
-          {:ok, %{token: token, family_id: _family_id}} ->
-            response = Map.put(response, :refresh_token, token)
+          {:ok, %{token: _token, family_id: _family_id} = refresh} ->
+            response = put_refresh_response(response, refresh, config)
             issued = refresh_issued_event(request, grant.subject, scope, "authorization_code", token_type, binding)
             {:ok, response, events ++ [issued]}
 
@@ -1683,6 +1702,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
     |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
     |> put_optional(:dpop_jkt, refresh_context_dpop_jkt(request, grant, binding))
+    |> put_optional(:attestation_jkt, refresh_attestation_jkt(request))
+    |> put_refresh_credential_authorization(config, grant, scope)
     |> put_refresh_grant_provenance(config, grant_type, Map.get(grant, :family_id))
   end
 
@@ -1701,6 +1722,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # The proof was still verified above and is used to bind the new access token.
   defp refresh_rotation_dpop_jkt(%Request{}, _presented, _jkt), do: nil
 
+  # Draft attestation client authentication §10.3 binds refresh families to the
+  # attested Client Instance Key, independently of the optional DPoP proof key.
+  defp refresh_attestation_jkt(%Request{client_auth_method: :attest_jwt_client_auth, attestation_jkt: jkt}), do: jkt
+  defp refresh_attestation_jkt(%Request{}), do: nil
+
   defp issue_initial_refresh_token(request, grant, scope, sender, refresh_store, response, events, grant_type) do
     # RFC 8707: carry the code's bound resource set onto the initial refresh
     # token so a refreshed access token stays audienced to the same resources.
@@ -1713,10 +1739,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # `Attesto.RefreshToken.issue/3` owns the initial family identifier. The
     # authorization code's family remains in the opaque context only as the
     # provenance value used by the optional public grant-ID claim.
-    case RefreshToken.issue(refresh_store, context, ttl: config.refresh_token_ttl) do
-      {:ok, %{token: token, family_id: family_id}}
+    case RefreshToken.issue(refresh_store, context,
+           ttl: config.refresh_token_ttl,
+           family_ttl: config.refresh_token_max_lifetime
+         ) do
+      {:ok, %{token: token, family_id: family_id} = refresh}
       when is_binary(token) and token != "" and is_binary(family_id) and family_id != "" ->
-        response = Map.put(response, :refresh_token, token)
+        response = put_refresh_response(response, refresh, config)
         issued = refresh_issued_event(request, grant.subject, scope, grant_type, token_type, binding)
         {:ok, response, events ++ [issued]}
 
@@ -1730,6 +1759,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       {:ok, _invalid_result} ->
         Logger.error("refresh token issuance returned an invalid result")
         {:error, error(@error_invalid_request, "unable to issue token")}
+    end
+  end
+
+  defp put_refresh_response(response, refresh, config) do
+    response = Map.put(response, :refresh_token, refresh.token)
+
+    if config.refresh_token_expiration_metadata do
+      # This is the issued credential's remaining lifetime, including any
+      # family cap. Grant authorization expiry is a separate host policy.
+      Map.put(response, :refresh_token_timeout, max(refresh.expires_at - Attesto.NumericDate.now([]), 0))
+    else
+      response
     end
   end
 
@@ -2308,6 +2349,127 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     }
   end
 
+  # Persist only issuer-validated credential IDs and their authorization origin.
+  # Scope and RAR permissions are independent (OID4VCI §5.1.2); a removed scope
+  # must remove its credential without erasing an explicitly authorized RAR ID.
+  # The reserved origin fields stay in grant storage, never in access tokens.
+  defp put_refresh_credential_authorization(context, config, grant, scope) do
+    supported = Config.credential_configurations_supported(config) || %{}
+    ids = valid_credential_ids(Map.get(grant.claims, "credential_configuration_ids"))
+    ids = Enum.filter(ids, &Map.has_key?(supported, &1))
+
+    if ids == [] do
+      context
+    else
+      bindings =
+        for id <- ids,
+            configuration = Map.fetch!(supported, id),
+            bound_scope = Map.get(configuration, :scope) || Map.get(configuration, "scope"),
+            is_binary(bound_scope) and bound_scope != "" and bound_scope in grant.scope,
+            into: %{},
+            do: {id, bound_scope}
+
+      # Older codes lacked origin metadata. Keep their scope-backed IDs tied to
+      # the original scope; other configured IDs were explicit grant rights.
+      explicit =
+        case Map.fetch(grant.claims, @credential_details_ids_claim) do
+          {:ok, values} -> valid_credential_ids(values) |> Enum.filter(&(&1 in ids))
+          :error -> ids -- Map.keys(bindings)
+        end
+
+      claims = %{
+        "credential_configuration_ids" => ids,
+        @credential_details_ids_claim => explicit,
+        @credential_scope_bindings_claim => bindings
+      }
+
+      # Preserve only rights still authorized by token-endpoint scope policy.
+      effective = refresh_credential_ids(config, %{claims: claims}, scope)
+      claims = Map.put(claims, "credential_configuration_ids", effective)
+      Map.put(context, :claims, claims)
+    end
+  end
+
+  defp refresh_credential_ids(config, context, scope) do
+    claims = Map.get(context, :claims, %{})
+    supported = Config.credential_configurations_supported(config) || %{}
+    ids = valid_credential_ids(Map.get(claims, "credential_configuration_ids"))
+    explicit = valid_credential_ids(Map.get(claims, @credential_details_ids_claim))
+    bindings = Map.get(claims, @credential_scope_bindings_claim, %{})
+    bindings = if is_map(bindings), do: bindings, else: %{}
+
+    Enum.filter(ids, fn id ->
+      Map.has_key?(supported, id) and
+        (id in explicit or (is_binary(bindings[id]) and bindings[id] in scope))
+    end)
+  end
+
+  defp refresh_credential_claims(config, context, scope, requested) do
+    if Map.has_key?(Map.get(context, :claims, %{}), "credential_configuration_ids") do
+      ids = refresh_credential_ids(config, context, scope)
+      ids = if is_nil(requested), do: ids, else: Enum.filter(ids, &(&1 in requested))
+      %{"credential_configuration_ids" => ids}
+    else
+      %{}
+    end
+  end
+
+  defp valid_credential_ids(values) when is_list(values) do
+    if Enum.all?(values, &(is_binary(&1) and &1 != "")), do: Enum.uniq(values), else: []
+  end
+
+  defp valid_credential_ids(_values), do: []
+
+  # RFC 9396 §6.1: a token-request subset narrows this access token; the
+  # underlying user authorization is unchanged. Never add request-provided IDs.
+  defp requested_credential_configurations(params) do
+    case Map.fetch(params, "authorization_details") do
+      :error -> {:ok, nil}
+      {:ok, value} when is_binary(value) -> parse_requested_credential_configurations(value)
+      _ -> invalid_credential_authorization_details()
+    end
+  end
+
+  defp parse_requested_credential_configurations(value) do
+    with {:ok, [_ | _] = entries} <- JSON.decode(value),
+         true <- Enum.all?(entries, &valid_requested_credential_entry?/1) do
+      {:ok, entries |> Enum.map(& &1["credential_configuration_id"]) |> Enum.uniq()}
+    else
+      _ -> invalid_credential_authorization_details()
+    end
+  end
+
+  defp valid_requested_credential_entry?(%{"type" => "openid_credential", "credential_configuration_id" => id} = entry)
+       when is_binary(id) and id != "" do
+    Enum.all?(Map.keys(entry), &(&1 in ["type", "credential_configuration_id", "credential_identifiers"])) and
+      case Map.fetch(entry, "credential_identifiers") do
+        :error -> true
+        {:ok, [_ | _] = identifiers} -> Enum.all?(identifiers, &(&1 == id))
+        _ -> false
+      end
+  end
+
+  defp valid_requested_credential_entry?(_entry), do: false
+
+  defp validate_refresh_credential_request(_config, _presented, _scope, nil), do: :ok
+
+  defp validate_refresh_credential_request(config, presented, requested_scope, requested) do
+    with store when is_atom(store) and not is_nil(store) <- grant_store(config, :refresh_store),
+         {:ok, %{data: context}} <- store.get(Attesto.Secret.hash(presented)),
+         true <- is_map(context),
+         scope = if(requested_scope == [], do: context.scope, else: requested_scope),
+         permitted = refresh_credential_ids(config, context, scope),
+         true <- Enum.all?(requested, &(&1 in permitted)) do
+      :ok
+    else
+      _ -> invalid_credential_authorization_details()
+    end
+  end
+
+  defp invalid_credential_authorization_details do
+    {:error, error(:invalid_authorization_details, "credential authorization details exceed the grant or are invalid")}
+  end
+
   # The single eligibility rule for the public grant-ID claim: the ORIGINAL
   # authorization code must have carried a usable family id. Initial emission
   # and refresh provenance both consult this one predicate so the two can never
@@ -2578,10 +2740,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # the generated identifier from becoming a public claim by accident.
   defp put_refresh_grant_provenance(context, config, grant_type, family_id) do
     if Config.authorization_grant_id_claim(config) && eligible_grant_family_id?(family_id) do
-      Map.put(context, :claims, %{
+      provenance = %{
         @refresh_grant_type_claim => grant_type,
         @refresh_grant_family_claim => family_id
-      })
+      }
+
+      Map.update(context, :claims, provenance, &Map.merge(&1, provenance))
     else
       context
     end

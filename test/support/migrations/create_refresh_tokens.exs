@@ -24,6 +24,8 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateRefreshTokens do
       add(:resource, {:array, :string}, null: false, default: [])
       add(:acr, :string)
       add(:auth_time, :bigint)
+      add(:family_expires_at, :bigint)
+      add(:attestation_jkt, :string, size: 43)
       add(:cnf, :map)
       add(:claims, :map, null: false, default: %{})
       add(:consumed, :boolean, null: false, default: false)

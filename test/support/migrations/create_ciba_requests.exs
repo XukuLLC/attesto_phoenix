@@ -20,7 +20,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateCibaRequests do
       add(:scope, {:array, :string}, null: false, default: [])
       add(:acr_values, {:array, :string}, null: false, default: [])
       add(:binding_message, :string)
-      add(:client_notification_token, :string)
+      add(:client_notification_token, :text)
       add(:hint_subject, :string, null: false)
       add(:resource, {:array, :string}, null: false, default: [])
       add(:dpop_jkt, :string)

@@ -110,6 +110,10 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     # event (auth_time is never re-stamped). `auth_time` is unix seconds.
     field :acr, :string
     field :auth_time, :integer
+    # Optional immutable refresh-family deadline (Unix seconds).
+    field :family_expires_at, :integer
+    # OAuth Client Attestation Client Instance Key; distinct from DPoP cnf.
+    field :attestation_jkt, :string
     field :cnf, :map
     field :claims, :map, default: %{}
     field :consumed, :boolean, default: false
@@ -133,6 +137,8 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     :resource,
     :acr,
     :auth_time,
+    :family_expires_at,
+    :attestation_jkt,
     :cnf,
     :claims,
     :consumed,
@@ -158,6 +164,10 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     |> validate_required(@required)
     |> normalize_claims()
     |> validate_json_claims()
+    |> validate_family_expiry()
+    |> validate_change(:attestation_jkt, fn :attestation_jkt, thumbprint ->
+      if Thumbprint.valid?(thumbprint), do: [], else: [attestation_jkt: "must be a canonical SHA-256 thumbprint"]
+    end)
     |> validate_empty_successor()
     |> validate_inclusion(:consumed, [false], message: "a new refresh token must be unconsumed (RFC 6749 §6)")
     |> validate_inclusion(:family_revoked, [false], message: "a new refresh token must not start revoked")
@@ -205,6 +215,8 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       resource: Map.get(data, :resource, []),
       acr: Map.get(data, :acr),
       auth_time: Map.get(data, :auth_time),
+      family_expires_at: Map.get(data, :family_expires_at),
+      attestation_jkt: Map.get(data, :attestation_jkt),
       client_id: Map.get(data, :client_id),
       cnf: cnf_from_context(data),
       claims: Map.get(data, :claims, %{}),
@@ -243,16 +255,21 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       token_hash: row.token_hash,
       family_id: row.family_id,
       generation: row.generation,
-      data: %{
-        subject: row.subject,
-        scope: row.scope,
-        resource: row.resource,
-        acr: row.acr,
-        auth_time: row.auth_time,
-        client_id: row.client_id,
-        dpop_jkt: jkt_from_cnf(row.cnf),
-        claims: row.claims
-      },
+      data:
+        put_family_deadline(
+          %{
+            subject: row.subject,
+            scope: row.scope,
+            resource: row.resource,
+            acr: row.acr,
+            auth_time: row.auth_time,
+            client_id: row.client_id,
+            dpop_jkt: jkt_from_cnf(row.cnf),
+            claims: row.claims
+          },
+          row.family_expires_at
+        )
+        |> put_attestation_binding(row.attestation_jkt),
       expires_at: to_unix(row.expires_at),
       consumed: row.consumed,
       consumed_at: nullable_unix(row.consumed_at),
@@ -315,6 +332,31 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       [successor: "must be empty when inserting an unconsumed refresh token"]
     end)
   end
+
+  defp validate_family_expiry(changeset) do
+    deadline = get_field(changeset, :family_expires_at)
+    expires_at = get_field(changeset, :expires_at)
+
+    cond do
+      is_nil(deadline) ->
+        changeset
+
+      not valid_unix_seconds?(deadline) ->
+        add_error(changeset, :family_expires_at, "must be a non-negative Unix second")
+
+      match?(%DateTime{}, expires_at) and DateTime.to_unix(expires_at) > deadline ->
+        add_error(changeset, :expires_at, "must not exceed the fixed family deadline")
+
+      true ->
+        changeset
+    end
+  end
+
+  defp put_family_deadline(context, nil), do: context
+  defp put_family_deadline(context, deadline), do: Map.put(context, :family_expires_at, deadline)
+
+  defp put_attestation_binding(context, nil), do: context
+  defp put_attestation_binding(context, thumbprint), do: Map.put(context, :attestation_jkt, thumbprint)
 
   # ----- time rendering -----
 
@@ -502,6 +544,8 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       dpop_jkt: value(context, :dpop_jkt),
       claims: value(context, :claims)
     }
+    |> put_family_deadline(value(context, :family_expires_at))
+    |> put_attestation_binding(value(context, :attestation_jkt))
   end
 
   defp exact_successor_keys?(successor, retry_until) do
@@ -533,6 +577,7 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       is_integer(Map.get(record, :generation)) and Map.get(record, :generation) >= 0 and
       valid_context?(Map.get(record, :data), :atoms) and
       valid_unix_seconds?(Map.get(record, :expires_at)) and
+      valid_family_expiry?(record) and
       is_boolean(Map.get(record, :consumed)) and
       valid_nullable_unix_seconds?(Map.get(record, :consumed_at))
   end
@@ -553,15 +598,39 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       valid_optional_jkt?(value(context, :dpop_jkt)) and
       valid_optional_binary?(value(context, :acr)) and
       valid_optional_integer?(value(context, :auth_time)) and
+      valid_optional_family_deadline?(context) and
+      valid_optional_attestation_binding?(context) and
       valid_claims?(value(context, :claims))
   end
 
-  defp exact_context_keys?(context, :atoms), do: exact_keys?(context, @canonical_context_keys)
-  defp exact_context_keys?(context, :strings), do: exact_keys?(context, @canonical_context_string_keys)
+  defp exact_context_keys?(context, :atoms) do
+    optional = Enum.filter([:family_expires_at, :attestation_jkt], &Map.has_key?(context, &1))
+    exact_keys?(context, @canonical_context_keys ++ optional)
+  end
+
+  defp exact_context_keys?(context, :strings) do
+    optional = Enum.filter(["family_expires_at", "attestation_jkt"], &Map.has_key?(context, &1))
+    exact_keys?(context, @canonical_context_string_keys ++ optional)
+  end
 
   defp exact_context_keys?(context, :either) do
     exact_context_keys?(context, :atoms) or exact_context_keys?(context, :strings)
   end
+
+  defp valid_optional_family_deadline?(context) do
+    if Map.has_key?(context, :family_expires_at) or Map.has_key?(context, "family_expires_at"),
+      do: valid_unix_seconds?(value(context, :family_expires_at)),
+      else: true
+  end
+
+  defp valid_optional_attestation_binding?(context) do
+    if Map.has_key?(context, :attestation_jkt) or Map.has_key?(context, "attestation_jkt"),
+      do: Thumbprint.valid?(value(context, :attestation_jkt)),
+      else: true
+  end
+
+  defp valid_family_expiry?(%{data: %{family_expires_at: deadline}, expires_at: expires_at}), do: expires_at <= deadline
+  defp valid_family_expiry?(_record), do: true
 
   defp exact_keys?(map, expected) when is_map(map), do: Map.keys(map) |> Enum.sort() == Enum.sort(expected)
 

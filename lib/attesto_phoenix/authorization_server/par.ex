@@ -359,7 +359,12 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # A CIMD client's request-object verification keys are the document's
   # `jwks` / `jwks_uri` (RFC 9101 §6.2); a registered client's are the host's
   # `:client_jwks` callback.
-  defp client_jwks(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.jwks(metadata)
+  defp client_jwks(config, %CIMDClient{metadata: metadata}) do
+    case ClientIdMetadata.resolve_jwks(metadata, config) do
+      {:ok, jwks} -> jwks
+      {:error, _} -> nil
+    end
+  end
 
   defp client_jwks(config, client) do
     case Config.client_jwks_fun(config) do

@@ -20,6 +20,50 @@ defmodule AttestoPhoenix.Schema.RefreshTokenTest do
   end
 
   describe "insert_changeset/2" do
+    test "the independent client attestation binding round trips with a family deadline" do
+      instance = Attesto.Secret.hash("instance")
+      deadline = 1_900_000_000
+
+      attrs =
+        base_attrs(%{
+          attestation_jkt: instance,
+          cnf: %{"jkt" => @dpop_jkt},
+          family_expires_at: deadline,
+          expires_at: DateTime.from_unix!(deadline)
+        })
+
+      changeset = RefreshToken.insert_changeset(%RefreshToken{}, attrs)
+      assert changeset.valid?
+      record = changeset |> Ecto.Changeset.apply_changes() |> RefreshToken.to_store_record()
+      assert record.data.attestation_jkt == instance
+      assert record.data.dpop_jkt == @dpop_jkt
+      assert record.data.family_expires_at == deadline
+      assert RefreshToken.from_store_record(record).attestation_jkt == instance
+      assert RefreshToken.valid_context?(record.data)
+      refute RefreshToken.valid_context?(Map.put(record.data, :attestation_jkt, nil))
+
+      malformed = RefreshToken.insert_changeset(%RefreshToken{}, %{attrs | attestation_jkt: "bad"})
+      refute malformed.valid?
+      assert %{attestation_jkt: [_]} = errors_on(malformed)
+    end
+
+    test "a fixed family deadline survives the column round trip and bounds expiry" do
+      deadline = 1_900_000_000
+      attrs = base_attrs(%{family_expires_at: deadline, expires_at: DateTime.from_unix!(deadline)})
+      changeset = RefreshToken.insert_changeset(%RefreshToken{}, attrs)
+      assert changeset.valid?
+      record = changeset |> Ecto.Changeset.apply_changes() |> RefreshToken.to_store_record()
+      assert record.data.family_expires_at == deadline
+      assert RefreshToken.from_store_record(record).family_expires_at == deadline
+
+      invalid = RefreshToken.insert_changeset(%RefreshToken{}, %{attrs | expires_at: DateTime.from_unix!(deadline + 1)})
+      refute invalid.valid?
+      assert %{expires_at: [_]} = errors_on(invalid)
+
+      legacy = RefreshToken.insert_changeset(%RefreshToken{}, base_attrs()) |> Ecto.Changeset.apply_changes()
+      refute Map.has_key?(RefreshToken.to_store_record(legacy).data, :family_expires_at)
+    end
+
     test "is valid with the required columns" do
       changeset = RefreshToken.insert_changeset(%RefreshToken{}, base_attrs())
       assert changeset.valid?
