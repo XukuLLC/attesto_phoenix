@@ -893,7 +893,7 @@ allow loopback client-metadata URLs or weaken the outbound fetch guard.
 The preferred install surface groups host-owned callbacks by concern:
 
 - **client registry** -> `:client_store`
-  (`load_client`, `verify_client_secret`, `client_jwks`, client metadata)
+  (`load_client`, `verify_client_secret`, `client_auth_method`, `client_jwks`, client metadata)
 - **principals** -> `:principal_store`
   (`load_principal`, `build_principal`, principal kinds)
 - **scope policy** -> `:scope_policy`
@@ -905,10 +905,17 @@ The preferred install surface groups host-owned callbacks by concern:
 - **audit / telemetry** -> `:event_sink` (`on_event`)
 - **dynamic registration** -> `:registration` (only with registration)
 
-Flat callback keys such as `:load_client`, `:verify_client_secret`,
+Flat callback keys such as `:load_client`, `:verify_client_secret`, `:client_auth_method`,
 `:client_jwks`, `:load_principal`, and `:authorize_scope` are still accepted and
 take precedence when present. Use them for small installs or targeted overrides;
 use behaviour modules for production wiring.
+
+From 3.4.1, each presented authentication method must match the client's
+registered `token_endpoint_auth_method`. Hosts with confidential clients must expose that
+trusted value with `ClientStore.client_auth_method/1` or the flat
+`:client_auth_method` callback. Missing or invalid method data fails closed;
+Basic and POST are distinct methods. Read the
+[3.4.1 security upgrade guide](guides/upgrade_3_4_1_security.md) before upgrading.
 
 Other deployment callbacks remain flat because they are endpoint mechanics, not
 domain policy: `:send_error`, `:www_authenticate`, `:no_store`, `:cert_der`,

@@ -148,7 +148,6 @@ jobs:
 
   released-consumer:
     name: Released Attesto 2.2.1 minimum consumer
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     env:

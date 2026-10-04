@@ -131,7 +131,8 @@ if Code.ensure_loaded?(Igniter) do
     # RFC per callback); the function names match the loose
     # `AttestoPhoenix.Config` keys the config skeleton wires.
     @scaffolds [
-      {ClientStore, AttestoPhoenix.ClientStore, [{:load_client, 1}, {:verify_client_secret, 2}]},
+      {ClientStore, AttestoPhoenix.ClientStore,
+       [{:load_client, 1}, {:verify_client_secret, 2}, {:client_auth_method, 1}]},
       {PrincipalStore, AttestoPhoenix.PrincipalStore,
        [{:load_principal, 1}, {:principal_kinds, 0}, {:build_principal, 3}]},
       {ScopePolicy, AttestoPhoenix.ScopePolicy, [{:authorize_scope, 2}]},
@@ -687,6 +688,9 @@ if Code.ensure_loaded?(Igniter) do
           # stub callbacks the installer generated.
           load_client: {unquote(client_store), :load_client},
           verify_client_secret: {unquote(client_store), :verify_client_secret},
+          # Read the client's trusted registration, never request credentials.
+          # Hosts must implement this callback before authenticating confidential clients.
+          client_auth_method: {unquote(client_store), :client_auth_method},
           load_principal: {unquote(principal_store), :load_principal},
           principal_kinds: {unquote(principal_store), :principal_kinds},
           # Recommended host callbacks (RFC 6749 §3.3/§4.1.1, OIDC Core §3.1.2).
@@ -1975,7 +1979,22 @@ if Code.ensure_loaded?(Igniter) do
           end
         end)
 
-      ensure_principal_kinds_callback(igniter, callbacks_module)
+      igniter
+      |> ensure_principal_kinds_callback(callbacks_module)
+      |> ensure_client_auth_method_callback(callbacks_module)
+    end
+
+    # Older generated registries may already be host-edited. Add only a missing
+    # fail-closed method lookup, preserving all existing implementations.
+    defp ensure_client_auth_method_callback(igniter, callbacks_module) do
+      client_store = Module.concat(callbacks_module, ClientStore)
+
+      ProjectModule.find_and_update_module!(igniter, client_store, fn zipper ->
+        case Function.move_to_def(zipper, :client_auth_method, 1, target: :at) do
+          {:ok, _definition} -> {:ok, zipper}
+          :error -> {:ok, Common.add_code(zipper, stub_callback({:client_auth_method, 1}))}
+        end
+      end)
     end
 
     # Older installer output already has a host-owned PrincipalStore module but

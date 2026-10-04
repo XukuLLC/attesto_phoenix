@@ -2,7 +2,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
   @moduledoc false
 
   alias Attesto.ClientIdMetadata, as: Core
-  alias AttestoPhoenix.ClientIdMetadata.{Cache, Resolver}
+  alias AttestoPhoenix.ClientIdMetadata.{Cache, FlowControl, HostPolicy, Resolver}
 
   require Logger
 
@@ -13,6 +13,16 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
     fetcher = Keyword.fetch!(opts, :fetcher)
     cache = Keyword.get(opts, :cache)
 
+    with {:ok, host} <- HostPolicy.canonicalize(URI.parse(uri).host) do
+      # Cache hits still perform DNS preflight. Admit that outbound work too,
+      # rather than allowing unauthenticated callers to bypass the DNS budget.
+      FlowControl.run(host, uri, {:jwks, metadata, fetcher, cache, opts}, opts, fn ->
+        do_resolve(fetcher, cache, metadata, uri, opts)
+      end)
+    end
+  end
+
+  defp do_resolve(fetcher, cache, metadata, uri, opts) do
     if cache_supported?(cache, fetcher) do
       resolve_cached(fetcher, cache, metadata, uri, opts)
     else

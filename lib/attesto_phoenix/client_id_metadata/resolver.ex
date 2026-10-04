@@ -59,6 +59,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   """
 
   alias Attesto.ClientIdMetadata
+  alias AttestoPhoenix.ClientIdMetadata.{Cache, FlowControl, HostPolicy}
   alias AttestoPhoenix.Config
 
   require Logger
@@ -114,13 +115,9 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   # `nil` allowlist means "any public host" (the fetcher's SSRF guard still
   # applies). Checked before the cache and the network so policy is authoritative.
   defp check_host(host, opts) do
-    blocked = Keyword.get(opts, :blocked_hosts, [])
-    allowed = Keyword.get(opts, :allowed_hosts)
-
-    cond do
-      host in blocked -> {:error, {:blocked_host, host}}
-      is_list(allowed) and host not in allowed -> {:error, {:blocked_host, host}}
-      true -> :ok
+    case HostPolicy.check(host, opts) do
+      :ok -> :ok
+      {:error, :blocked_host} -> {:error, {:blocked_host, host}}
     end
   end
 
@@ -133,8 +130,15 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
 
     case cache_get(cache, client_id) do
       {:ok, metadata} -> {:ok, metadata}
-      :miss -> fetch_and_validate(client_id, opts)
+      :miss -> fetch_with_admission(client_id, opts)
     end
+  end
+
+  defp fetch_with_admission(client_id, opts) do
+    {:ok, host} = client_id |> URI.parse() |> Map.fetch!(:host) |> HostPolicy.canonicalize()
+    scope = {Keyword.fetch!(opts, :fetcher), Keyword.fetch!(opts, :cache), opts}
+
+    FlowControl.run(host, client_id, scope, opts, fn -> fetch_and_validate(client_id, opts) end)
   end
 
   defp cache_get(cache, client_id) do
@@ -165,6 +169,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
     with {:ok, %{body: body, cache_control: cache_control}} <- fetch(fetcher, client_id, opts),
          {:ok, doc} <- decode(body),
          {:ok, metadata} <- ClientIdMetadata.validate_document(client_id, doc) do
+      metadata = Cache.metadata_only(metadata)
       cache_put(client_id, metadata, cache_control, opts)
       {:ok, metadata}
     end
@@ -191,17 +196,17 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   end
 
   defp cache_put(client_id, metadata, cache_control, opts) do
-    if Keyword.get(cache_control, :no_store, false) or
-         Keyword.get(cache_control, :no_cache, false) do
-      :ok
-    else
-      cache = Keyword.fetch!(opts, :cache)
-      expires_at = expires_at(cache_control, opts)
+    case cache_freshness(cache_control, opts) do
+      {ttl, expires_at} when ttl > 0 ->
+        cache = Keyword.fetch!(opts, :cache)
 
-      case cache.put(client_id, metadata, expires_at) do
-        :ok -> :ok
-        _fault -> warn_cache_write_fault()
-      end
+        case cache.put(client_id, metadata, expires_at) do
+          :ok -> :ok
+          _fault -> warn_cache_write_fault()
+        end
+
+      _stale ->
+        :ok
     end
   rescue
     _exception -> warn_cache_write_fault()
@@ -219,83 +224,87 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
     :ok
   end
 
-  # Derive `expires_at` from the response's RFC 9111 freshness directives and
-  # clamp it to the configured `{min, max}` bounds. `Cache-Control: max-age`
-  # wins; an `Expires` date is the fallback; absent both, the minimum bound is
-  # used so a document is still cached (the draft permits a self-chosen TTL).
-  # Explicit `no-store` / `no-cache` directives are handled by `cache_put/4`
-  # before this helper and therefore never reach a cache backend.
-  defp expires_at(cache_control, opts) do
-    {min, max} = Keyword.fetch!(opts, :cache_ttl_bounds)
-
-    ttl =
-      cache_control
-      |> raw_ttl()
-      |> clamp(min, max)
-
-    DateTime.add(DateTime.utc_now(), ttl, :second)
-  end
-
   @doc false
   def key_cache_expires_at(cache_control, opts) do
-    {minimum, maximum} = Keyword.fetch!(opts, :cache_ttl_bounds)
-
-    # A remote JWKS's explicit freshness deadline is an upper bound. In
-    # particular max-age=0 must not be extended by the host's minimum TTL.
-    ttl =
-      cond do
-        is_integer(cache_control[:max_age]) ->
-          age =
-            case cache_control[:age] do
-              age when is_integer(age) and age >= 0 -> age
-              _ -> 0
-            end
-
-          max(0, min(cache_control[:max_age] - age, maximum))
-
-        is_binary(cache_control[:expires]) ->
-          cache_control |> raw_ttl() |> Kernel.max(0) |> Kernel.min(maximum)
-
-        true ->
-          minimum
-      end
-
-    DateTime.add(DateTime.utc_now(), ttl, :second)
+    {_ttl, expires_at} = cache_freshness(cache_control, opts)
+    expires_at
   end
 
-  defp raw_ttl(cache_control) do
+  # Explicit origin freshness is an upper bound, never raised to the configured
+  # heuristic minimum. RFC 9111 sections 4.2.1 and 4.2.3 require subtracting the
+  # response's age before storing either documents or their verification keys.
+  defp cache_freshness(cache_control, opts) do
+    {minimum, maximum} = Keyword.fetch!(opts, :cache_ttl_bounds)
+    now = Keyword.get(opts, :clock, &DateTime.utc_now/0).()
+    received_at = response_received_at(cache_control, now)
+
+    remaining_ms =
+      cache_control
+      |> freshness_lifetime_ms(received_at, minimum)
+      |> Kernel.-(response_age_ms(cache_control, received_at, now))
+      |> Kernel.max(0)
+      |> Kernel.min(maximum * 1000)
+
+    {remaining_ms, DateTime.add(now, remaining_ms, :millisecond)}
+  end
+
+  defp freshness_lifetime_ms(cache_control, received_at, minimum) do
     cond do
       Keyword.get(cache_control, :no_store, false) -> 0
       Keyword.get(cache_control, :no_cache, false) -> 0
-      is_integer(cache_control[:max_age]) -> cache_control[:max_age]
-      true -> expires_ttl(cache_control[:expires])
+      is_integer(cache_control[:max_age]) -> cache_control[:max_age] * 1000
+      is_binary(cache_control[:expires]) -> expires_ttl_ms(cache_control, received_at)
+      true -> minimum * 1000
     end
   end
 
-  # An `Expires` header value is an HTTP-date; the freshness lifetime is the
-  # seconds from now until that instant (negative/zero when already past). Any
-  # unparseable value yields 0, deferring to the minimum bound after clamping.
-  defp expires_ttl(value) when is_binary(value) do
-    case parse_http_date(value) do
-      {:ok, %DateTime{} = expires} -> DateTime.diff(expires, DateTime.utc_now(), :second)
+  defp expires_ttl_ms(cache_control, received_at) do
+    case parse_http_date(cache_control[:expires]) do
+      {:ok, %DateTime{} = expires} -> DateTime.diff(expires, response_date(cache_control, received_at), :millisecond)
       :error -> 0
     end
   end
 
-  defp expires_ttl(_value), do: 0
+  defp response_age_ms(cache_control, received_at, now) do
+    age = nonnegative_integer(cache_control[:age]) * 1000
+    delay = nonnegative_integer(cache_control[:response_delay_ms])
+    apparent_age = max(0, DateTime.diff(received_at, response_date(cache_control, received_at), :millisecond))
+    resident_age = max(0, DateTime.diff(now, received_at, :millisecond))
+    max(age + delay, apparent_age) + resident_age
+  end
 
-  defp parse_http_date(value) do
-    with {:ok, datetime, _offset} <- parse_rfc1123(value) do
-      {:ok, datetime}
+  defp nonnegative_integer(value) when is_integer(value) and value >= 0, do: value
+  defp nonnegative_integer(_value), do: 0
+
+  defp response_received_at(cache_control, now) do
+    case cache_control[:received_at] do
+      %DateTime{} = received_at -> received_at
+      _ -> now
     end
   end
+
+  defp response_date(cache_control, now) do
+    case parse_http_date(cache_control[:date]) do
+      {:ok, date} -> date
+      :error -> now
+    end
+  end
+
+  defp parse_http_date(value) when is_binary(value) do
+    case parse_rfc1123(value) do
+      {:ok, datetime, _offset} -> {:ok, datetime}
+      _ -> :error
+    end
+  end
+
+  defp parse_http_date(_value), do: :error
 
   @rfc1123 ~r/^\w{3}, (\d{2}) (\w{3}) (\d{4}) (\d{2}:\d{2}:\d{2}) GMT$/
 
   @months ~w(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec)
 
   # RFC 9110 §5.6.7 / RFC 1123: "Sun, 06 Nov 1994 08:49:37 GMT". Reformat into
-  # the RFC 3339 shape `DateTime.from_iso8601/1` parses, in UTC (CIMD origins
+  # the RFC 3339 form `DateTime.from_iso8601/1` parses, in UTC (CIMD origins
   # serve GMT/UTC dates per HTTP-date).
   defp parse_rfc1123(value) do
     case Regex.run(@rfc1123, value) do
@@ -315,8 +324,4 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
       index -> {:ok, index |> Kernel.+(1) |> Integer.to_string() |> String.pad_leading(2, "0")}
     end
   end
-
-  defp clamp(value, min, _max) when value < min, do: min
-  defp clamp(value, _min, max) when value > max, do: max
-  defp clamp(value, _min, _max), do: value
 end

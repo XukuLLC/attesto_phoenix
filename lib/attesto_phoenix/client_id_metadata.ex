@@ -54,7 +54,7 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   """
 
   alias Attesto.ClientIdMetadata, as: Core
-  alias AttestoPhoenix.ClientIdMetadata.{JWKSResolver, Resolver}
+  alias AttestoPhoenix.ClientIdMetadata.{HostPolicy, JWKSResolver, Resolver}
   alias AttestoPhoenix.Config
 
   @typedoc """
@@ -134,6 +134,10 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   """
   @spec resolve_jwks(client(), Config.t()) :: {:ok, map()} | {:error, term()}
   def resolve_jwks(metadata, %Config{} = config) do
+    Config.with_request_config(config, fn -> do_resolve_jwks(metadata, config) end)
+  end
+
+  defp do_resolve_jwks(metadata, config) do
     case jwks(metadata) do
       keys when is_map(keys) -> validate_jwks(keys)
       uri when is_binary(uri) -> fetch_jwks(metadata, uri, config)
@@ -145,21 +149,12 @@ defmodule AttestoPhoenix.ClientIdMetadata do
     opts = Config.client_id_metadata(config)
 
     with {:ok, parsed} <- Core.validate_client_id(uri),
-         :ok <- jwks_host_policy(parsed.host, opts),
-         {:ok, keys} <- Config.with_request_config(config, fn -> JWKSResolver.resolve(metadata, uri, opts) end) do
+         :ok <- HostPolicy.check(parsed.host, opts),
+         {:ok, keys} <- JWKSResolver.resolve(metadata, uri, opts) do
       {:ok, keys}
     else
       _ -> {:error, :missing_client_jwks}
     end
-  end
-
-  defp jwks_host_policy(host, opts) do
-    allowed = Keyword.get(opts, :allowed_hosts)
-
-    if host in Keyword.get(opts, :blocked_hosts, []) or
-         (is_list(allowed) and host not in allowed),
-       do: {:error, :blocked_host},
-       else: :ok
   end
 
   defp validate_jwks(keys) do

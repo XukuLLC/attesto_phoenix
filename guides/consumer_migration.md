@@ -45,9 +45,14 @@ config :attesto_phoenix, otp_app: :my_app, repo: MyApp.Repo
 ## 3. Map your existing client store
 
 Your old provider already has a client table. Point `:load_client`,
-`:verify_client_secret`, `:client_id`, `:client_redirect_uris`, and
+`:verify_client_secret`, `:client_auth_method`, `:client_id`, `:client_redirect_uris`, and
 `:client_public?` at it. You do not need to migrate the rows into a new schema;
 you need callbacks that read your existing rows.
+
+`:client_auth_method` must return the client's trusted registered
+`token_endpoint_auth_method`, including the distinction between Basic and POST.
+Confidential authentication fails closed without this callback from 3.4.1;
+see the [security upgrade guide](upgrade_3_4_1_security.md).
 
 ## 4. Remove the runtime provider, keep historical migrations
 

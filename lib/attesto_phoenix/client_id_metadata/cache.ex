@@ -69,7 +69,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache do
   re-fetched document legitimately supersedes a stale one, so `put/3` replaces
   any existing entry for the same `url` rather than failing on conflict.
   """
-  @callback put(url :: String.t(), metadata :: metadata(), expires_at :: DateTime.t()) :: :ok
+  @callback put(url :: String.t(), metadata :: metadata(), expires_at :: DateTime.t()) ::
+              :ok | {:error, :too_large}
 
   @doc """
   Reads a fresh record, including its document expiry and any internal resolved
@@ -83,7 +84,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache do
   a concurrent document rotation or eviction from being undone by a key fetch.
   The document's expiry MUST remain unchanged. Optional.
   """
-  @callback put_jwks(String.t(), metadata(), DateTime.t(), map()) :: :ok | :stale
+  @callback put_jwks(String.t(), metadata(), DateTime.t(), map()) :: :ok | :stale | {:error, :too_large}
 
   @doc """
   Evicts the cached document for a CIMD `client_id` URL, if one is present.

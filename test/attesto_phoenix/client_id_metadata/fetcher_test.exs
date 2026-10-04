@@ -13,6 +13,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
   use ExUnit.Case, async: true
 
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req, as: Fetcher
+  alias AttestoPhoenix.ClientIdMetadata.Resolver
 
   @url "https://app.example/cb"
 
@@ -116,6 +117,21 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
   end
 
   describe "fetch/2 SSRF rejections via injected resolver" do
+    test "IDNA DNS canonicalization keeps the special-use IP screen authoritative" do
+      test_pid = self()
+
+      resolver = fn host, family ->
+        send(test_pid, {:dns_host, host, family})
+        if family == :inet, do: {:ok, [{127, 0, 0, 1}]}, else: {:ok, []}
+      end
+
+      assert {:error, {:blocked_ip, {127, 0, 0, 1}}} =
+               Fetcher.preflight("https://XN--BCHER-KVA.example./client.json", resolver: resolver)
+
+      assert_received {:dns_host, ~c"xn--bcher-kva.example", :inet}
+      assert_received {:dns_host, ~c"xn--bcher-kva.example", :inet6}
+    end
+
     test "preflight repeats the same DNS screening without dereferencing the URL" do
       assert :ok = Fetcher.preflight(@url, resolver: resolver([{93, 184, 216, 34}]))
 
@@ -238,6 +254,20 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       assert {:error, {:status, 404}} = fetch_via(server)
     end
 
+    test "rejects 304 and sends no unsupported ETag conditional request", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
+        assert Plug.Conn.get_req_header(conn, "if-none-match") == []
+        assert Plug.Conn.get_req_header(conn, "if-modified-since") == []
+
+        conn
+        |> Plug.Conn.put_resp_header("etag", ~s("v1"))
+        |> Plug.Conn.put_resp_header("cache-control", "max-age=600")
+        |> Plug.Conn.resp(304, "")
+      end)
+
+      assert {:error, {:status, 304}} = fetch_via(server)
+    end
+
     test "rejects any redirect (redirects disabled, surfaced as 3xx)", %{server: server} do
       AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         conn
@@ -289,6 +319,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
         |> Plug.Conn.put_resp_content_type("application/json")
         |> Plug.Conn.put_resp_header("cache-control", "max-age=600, no-cache")
         |> Plug.Conn.put_resp_header("age", "120")
+        |> Plug.Conn.put_resp_header("date", "Sun, 04 Oct 2026 12:00:00 GMT")
         |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}","redirect_uris":["#{@url}"]}))
       end)
 
@@ -297,7 +328,90 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       assert cache_control[:max_age] == 600
       assert cache_control[:no_cache] == true
       assert cache_control[:age] == 120
+      assert cache_control[:date] == "Sun, 04 Oct 2026 12:00:00 GMT"
     end
+
+    test "includes transport delay in remaining HTTP freshness", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
+        Process.sleep(25)
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.put_resp_header("cache-control", "max-age=600")
+        |> Plug.Conn.put_resp_header("age", "0")
+        |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
+      end)
+
+      assert {:ok, %{cache_control: directives}} = fetch_via(server)
+      assert directives[:response_delay_ms] >= 25
+      assert %DateTime{} = received_at = directives[:received_at]
+      expiry = Resolver.key_cache_expires_at(directives, cache_ttl_bounds: {60, 3600}, clock: fn -> received_at end)
+      assert DateTime.diff(expiry, received_at, :millisecond) <= 600_000 - directives[:response_delay_ms]
+    end
+
+    test "uses the first Age field and list member rather than discarding duplicates", %{server: server} do
+      for headers <- [[{"age", "300"}, {"age", "0"}], [{"age", "300, 0"}]] do
+        AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
+          conn =
+            conn
+            |> Plug.Conn.put_resp_content_type("application/json")
+            |> Plug.Conn.put_resp_header("cache-control", "max-age=300")
+
+          %{conn | resp_headers: headers ++ conn.resp_headers}
+          |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
+        end)
+
+        assert {:ok, %{cache_control: directives}} = fetch_via(server)
+        assert directives[:age] == 300
+        assert_stale(directives)
+      end
+    end
+
+    test "uses the first duplicate max-age and treats malformed explicit freshness as stale", %{server: server} do
+      for header <- [
+            "max-age=0, max-age=600",
+            "max-age, max-age=600",
+            "max-age=invalid, max-age=600",
+            "max-age=-1",
+            "max-age=+600",
+            "max-age=\"invalid\"",
+            "extension=\"ignored,max-age=600,ignored\", max-age=0",
+            "extension=\"escaped\\\",max-age=600,ignored\", max-age=0",
+            "extension=\"unterminated,max-age=600"
+          ] do
+        AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.put_resp_header("cache-control", header)
+          |> Plug.Conn.put_resp_header("expires", "Tue, 04 Oct 2028 12:00:00 GMT")
+          |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
+        end)
+
+        assert {:ok, %{cache_control: directives}} = fetch_via(server)
+        assert directives[:max_age] == 0
+        assert_stale(directives)
+      end
+    end
+
+    test "accepts quoted max-age and ignores an invalid first Age value", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.put_resp_header("cache-control", "max-age = \"300\"")
+        |> Plug.Conn.put_resp_header("age", "invalid, 300")
+        |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
+      end)
+
+      assert {:ok, %{cache_control: directives}} = fetch_via(server)
+      assert directives[:max_age] == 300
+      refute Keyword.has_key?(directives, :age)
+    end
+  end
+
+  defp assert_stale(directives) do
+    received_at = Keyword.fetch!(directives, :received_at)
+    expiry = Resolver.key_cache_expires_at(directives, cache_ttl_bounds: {60, 3600}, clock: fn -> received_at end)
+    assert DateTime.compare(expiry, received_at) == :eq
   end
 
   describe "fetch/2 DNS-rebinding: pins the first validated IP" do

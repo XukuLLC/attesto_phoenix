@@ -328,6 +328,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     # this module's package-repo fixture so the default suite remains free of
     # a database dependency.
     repo = if context[:ecto], do: AttestoPhoenix.TestRepo, else: __MODULE__.Repo
+    registered_auth_method = context[:registered_auth_method] || :client_secret_post
 
     base = [
       issuer: "https://issuer.example",
@@ -350,6 +351,12 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       # RFC 6749 §2.1: the public/confidential discriminator. Only a client
       # flagged `public?: true` may authenticate without a secret.
       client_public?: fn client -> Map.get(client, :public?, false) end,
+      # The fixture declares its registration independently of request data.
+      # Individual tests explicitly select a different registered method.
+      client_auth_method: fn
+        %{public?: true} -> :none
+        _client -> registered_auth_method
+      end,
       # RFC 6749 §3.3: grant exactly what was requested (the tests don't
       # exercise scope policy, only that the granted scope round-trips).
       authorize_scope: fn _client, requested -> {:ok, requested} end,
@@ -460,6 +467,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert www_authenticate(conn) == []
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "rejects a wrong Basic secret as 401 with a Basic challenge" do
       credentials = Base.encode64("confidential-1:wrong")
 
@@ -490,6 +498,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error_description"] == "client authentication failed"
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "accepts HTTP Basic credentials (RFC 6749 §2.3.1)" do
       credentials = Base.encode64("confidential-1:s3cr3t")
 
@@ -504,6 +513,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "url-decodes Basic credentials per application/x-www-form-urlencoded" do
       clients = %{"sp ace" => %{id: "sp ace", secret: "p:w"}}
 
@@ -527,6 +537,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "accepts a redundant body client_id matching the Basic credentials (RFC 6749 §2.3.1)" do
       # A bare body `client_id` is identification (RFC 6749 §2.3.1), not a
       # second authentication method. When it matches the Basic userid the
@@ -545,6 +556,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "rejects a body client_id that conflicts with the Basic credentials (RFC 6749 §2.3.1)" do
       # A body `client_id` that disagrees with the authoritative Basic userid
       # is an internally inconsistent request and is rejected before any
@@ -563,6 +575,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_request"
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "rejects two credentials presented by both Basic and body (RFC 6749 §2.3)" do
       # A body `client_secret` alongside Basic is genuine double authentication
       # (two credentials), which RFC 6749 §2.3 forbids.
@@ -585,6 +598,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_request"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "accepts private_key_jwt client authentication" do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -604,6 +618,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "accepts a 2048-bit RSA RS256 assertion under an explicit non-FAPI policy" do
       client_key = JOSE.JWK.generate_key({:rsa, 2048})
       client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "RS256"})]}
@@ -626,6 +641,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "the default FAPI-tight policy rejects a 2048-bit RSA RS256 assertion" do
       client_key = JOSE.JWK.generate_key({:rsa, 2048})
       client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "RS256"})]}
@@ -645,6 +661,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
     end
 
+    @tag registered_auth_method: :attest_jwt_client_auth
     test "accepts Client Attestation JWT + PoP headers as attest_jwt_client_auth" do
       wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
       instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -669,6 +686,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "rejects a private_key_jwt assertion signed with an alg outside :client_auth_signing_algs" do
       # The ES256 assertion authenticates by default, but configuring
       # :client_auth_signing_algs to a set that excludes ES256 must reject it -
@@ -694,6 +712,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "default private_key_jwt policy rejects a weak PS256 key" do
       client_key = JOSE.JWK.generate_key({:rsa, 1024})
       client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
@@ -710,6 +729,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "a narrowed FAPI client-auth policy retains the weak-RSA gate" do
       client_key = JOSE.JWK.generate_key({:rsa, 1024})
       client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
@@ -731,6 +751,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "an explicit non-FAPI client-auth policy can accept a weak PS256 key" do
       client_key = JOSE.JWK.generate_key({:rsa, 1024})
       client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
@@ -750,6 +771,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "accepts private_key_jwt assertion audience set to issuer" do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -769,6 +791,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "issuer-only profile rejects token endpoint private_key_jwt audience" do
       # rfc7523bis-11 requires the authorization server issuer identifier.
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -794,6 +817,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "accepts legacy endpoint assertion audience with the 3.x default" do
       # A legacy deployment can retain endpoint audiences through explicit policy.
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -816,6 +840,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "rejects private_key_jwt assertion audience that is neither the issuer nor the endpoint" do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -836,6 +861,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_client"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "rejects replayed private_key_jwt assertions" do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -862,6 +888,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(second)["error_description"] == "client authentication failed"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "rejects client_secret_basic when configured for private_key_jwt only" do
       put_config(token_endpoint_auth_methods_supported: ["private_key_jwt"])
 
@@ -879,6 +906,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert www_authenticate(conn) == [~s(Basic realm="OAuth")]
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "allows private_key_jwt when configured for private_key_jwt only" do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -900,6 +928,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "rejects private_key_jwt with a mismatched trusted client key" do
       assertion = client_assertion(JOSE.JWK.generate_key({:ec, "P-256"}), "confidential-1")
       other_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -918,6 +947,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error_description"] == "client authentication failed"
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "rejects a malformed Basic header" do
       conn =
         :post
@@ -946,6 +976,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   end
 
   describe "RFC 8705 section 2 token-endpoint authentication" do
+    @tag registered_auth_method: :tls_client_auth
     test "authenticates tls_client_auth end to end through a trusted TLS terminator" do
       enable_minting()
       der = mtls_auth_cert_der()
@@ -1376,6 +1407,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
                       }}
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "missing-grant audit retains a private_key_jwt authenticated client_id" do
       capture_events()
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -2210,6 +2242,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   describe "initial refresh-token issuance (RFC 6749 §6)" do
     for {backend, label} <- [{Attesto.RefreshStore.ETS, "ETS"}, {EctoRefreshStore, "Postgres"}] do
       @tag ecto: backend == EctoRefreshStore
+      @tag registered_auth_method: :attest_jwt_client_auth
       test "#{label} attested refresh families bind the Client Instance Key independently of DPoP" do
         enable_minting()
         refresh_store = attested_refresh_store(unquote(backend))
@@ -2331,6 +2364,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     for {backend, label} <- [{Attesto.RefreshStore.ETS, "ETS"}, {EctoRefreshStore, "Postgres"}] do
       @tag ecto: backend == EctoRefreshStore
+      @tag registered_auth_method: :client_secret_basic
       test "#{label} credential refresh keeps RAR rights independent while narrowing scope and request details" do
         enable_minting()
         refresh_store = attested_refresh_store(unquote(backend))
@@ -2459,6 +2493,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert is_binary(body(conn)["refresh_token"])
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "a confidential authorization-code DPoP proof does not pin the refresh token" do
       enable_minting()
       refresh_store = start_refresh_store()
@@ -2556,6 +2591,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert is_binary(body(conn)["refresh_token"])
     end
 
+    @tag registered_auth_method: :private_key_jwt
     test "confidential private_key_jwt DPoP refresh accepts a newly rotated proof key" do
       enable_minting()
       start_refresh_store()
@@ -2594,6 +2630,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert peek_claims(body(rotated)["access_token"])["cnf"]["jkt"] == rotated_jkt
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "a confidential DPoP-bound authorization code issues an unbound refresh token" do
       enable_minting()
       start_refresh_store()
@@ -2626,6 +2663,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert peek_claims(body(rotated)["access_token"])["cnf"]["jkt"] == rotated_jkt
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "confidential DPoP refresh retry returns the same successor within configured grace" do
       enable_minting()
       start_refresh_store()
@@ -2673,6 +2711,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert peek_claims(body(retry)["access_token"])["cnf"]["jkt"] == retry_jkt
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "confidential DPoP refresh without proof returns standard OAuth invalid_request" do
       enable_minting()
       start_refresh_store()
@@ -2708,6 +2747,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error_description"] =~ "DPoP"
     end
 
+    @tag registered_auth_method: :client_secret_basic
     test "configured zero refresh rotation grace treats immediate retry as reuse" do
       enable_minting()
       start_refresh_store()
@@ -3361,8 +3401,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         "token_endpoint_auth_method" => "none"
       })
 
-      # CIMD clients hold no symmetric secret; the secret path never resolves the
-      # CIMD document and fails with the generic invalid_client message.
+      # CIMD clients hold no symmetric secret; the resolved document's registered
+      # method rejects secret authentication with the generic invalid_client message.
       conn =
         post_token(%{
           "grant_type" => "authorization_code",
@@ -3373,6 +3413,91 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client"
       assert body(conn)["error_description"] == "client authentication failed"
+    end
+
+    test "CIMD methods override colliding registry secrets before Basic or post verification" do
+      test_pid = self()
+
+      for {client_id, document_method} <- [
+            {@cimd_public_client_id, "none"},
+            {@cimd_pkjwt_client_id, "private_key_jwt"}
+          ] do
+        CimdFetcher.script(client_id, %{
+          "redirect_uris" => ["https://app.example/cb"],
+          "token_endpoint_auth_method" => document_method
+        })
+
+        legacy_client = %{id: client_id, secret: "old-valid-secret"}
+
+        for presented_method <- [:client_secret_basic, :client_secret_post] do
+          put_config(
+            load_client: fn _id ->
+              send(test_pid, :colliding_registry_lookup)
+              {:ok, legacy_client}
+            end,
+            client_auth_method: fn _client -> presented_method end,
+            verify_client_secret: fn client, supplied ->
+              send(test_pid, :colliding_secret_verification)
+              client == legacy_client and supplied == legacy_client.secret
+            end
+          )
+
+          conn =
+            case presented_method do
+              :client_secret_basic ->
+                params = %{"grant_type" => "unsupported"}
+
+                :post
+                |> conn(@endpoint_path, params)
+                |> put_token_content_type()
+                |> put_req_header(
+                  "authorization",
+                  "Basic " <> Base.encode64(URI.encode_www_form(client_id) <> ":" <> legacy_client.secret)
+                )
+                |> TokenController.create(params)
+
+              :client_secret_post ->
+                post_token(%{
+                  "grant_type" => "unsupported",
+                  "client_id" => client_id,
+                  "client_secret" => legacy_client.secret
+                })
+            end
+
+          assert body(conn)["error"] == "invalid_client"
+          refute_receive :colliding_registry_lookup
+          refute_receive :colliding_secret_verification
+        end
+      end
+    end
+
+    test "unavailable CIMD metadata refuses colliding registry credentials without crashing" do
+      test_pid = self()
+      unavailable_client_id = "https://app.example/clients/unavailable.json"
+
+      put_config(
+        load_client: fn _id ->
+          send(test_pid, :colliding_registry_lookup)
+          {:ok, %{id: unavailable_client_id, secret: "old-valid-secret"}}
+        end,
+        client_auth_method: fn _client -> :client_secret_post end,
+        verify_client_secret: fn client, _secret ->
+          send(test_pid, {:secret_verification_client, client})
+          false
+        end
+      )
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_id" => unavailable_client_id,
+          "client_secret" => "old-valid-secret"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
+      assert_receive {:secret_verification_client, :unknown_client}
+      refute_receive :colliding_registry_lookup
     end
 
     test "an authorization_code exchange runs :authorize_scope on a CIMD client with no scope member" do

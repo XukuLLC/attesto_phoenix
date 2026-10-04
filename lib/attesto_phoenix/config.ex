@@ -57,6 +57,15 @@ defmodule AttestoPhoenix.Config do
 
   ### Optional callbacks
 
+    * `:client_auth_method` - `(client -> method | {:ok, method})`. Returns the
+      client's registered `token_endpoint_auth_method` as a string or atom
+      from trusted registry data. Required for host-owned confidential clients.
+      The presented method must match
+      exactly, including Basic versus POST. Unknown or malformed callback
+      results fail authentication; they never fall back to another method.
+      Without this callback, confidential clients fail authentication;
+      explicitly public clients may use `none`. CIMD clients use their
+      validated metadata document's declared method.
     * `:authorize_scope` - `(client, requested_scope -> {:ok, granted_scope} |
       {:error, :invalid_scope})`. Validates or narrows requested scope. Defaults
       to requiring every requested scope to appear in the effective
@@ -727,9 +736,11 @@ defmodule AttestoPhoenix.Config do
           (draft's recommended 5 KB). Default `5_120`.
         * `:request_timeout_ms` - connect and receive timeout for the fetch.
           Default `5_000`.
-        * `:cache_ttl_bounds` - `{min_seconds, max_seconds}` the resolver clamps
-          the response's `Cache-Control: max-age` / `Expires` freshness to
-          (RFC 9111). Default `{60, 86_400}`.
+        * `:cache_ttl_bounds` - `{fallback_seconds, max_seconds}` for HTTP
+          freshness (RFC 9111). Explicit freshness is reduced by the response's
+          current age and capped at the maximum, never raised to the fallback.
+          Responses without explicit freshness use the age-adjusted fallback.
+          Default `{60, 86_400}`.
         * `:require_same_origin_redirect_uri` - additionally require the request
           `redirect_uri` to be same-origin with the `client_id` URL, on top of
           the exact-match against the document's `redirect_uris` (draft §2 MAY,
@@ -739,6 +750,25 @@ defmodule AttestoPhoenix.Config do
           fetcher's SSRF guard). Default `nil`.
         * `:blocked_hosts` - hostnames a CIMD `client_id` URL must never resolve
           through, checked before any network work. Default `[]`.
+          Host policies use lowercase IDNA ASCII names with one terminal root
+          dot removed, for both metadata documents and remote JWKS.
+        * `:max_concurrent_fetches` / `:max_concurrent_fetches_per_host` -
+          node-wide outbound concurrency limits. Defaults `16` / `4`.
+        * `:max_fetches_per_window` / `:max_fetches_per_host_per_window` -
+          node-wide outbound request limits. Defaults `120` / `30` within
+          `:fetch_rate_window_ms` (default `60_000`). Documents and remote
+          JWKS share these quotas; requests over a limit fail closed.
+        * `:failure_backoff_ms` - short failure suppression. Default `1_000`.
+        * `:max_flow_entries` - maximum coordinator bookkeeping entries.
+          Default `1_024`.
+        * `:max_singleflight_waiters` - maximum followers sharing one
+          concurrent resolution. Default `32`.
+        * `:cache_max_entries` - maximum entries in the built-in ETS and Ecto
+          caches, with expired entries pruned before the earliest-expiring
+          entries are evicted. ETS is node-wide; Ecto is per repository/schema.
+          Default `1_024`. Custom caches must implement their own bounds.
+        * `:cache_max_record_bytes` - maximum serialized size of a built-in
+          cache record, including attached JWKS. Default `16_384` bytes.
     * `:replay_check` - DPoP `jti` replay check as a two-argument function,
       `{module, function}`, or `{module, function, extra_args}` callback.
       DPoP defaults to the single-node ETS replay cache. CIBA configurations
@@ -894,6 +924,7 @@ defmodule AttestoPhoenix.Config do
     :repo,
     :load_client,
     :verify_client_secret,
+    :client_auth_method,
     :load_principal,
     :client_store,
     :principal_store,
@@ -1056,6 +1087,7 @@ defmodule AttestoPhoenix.Config do
           repo: module(),
           load_client: callback(),
           verify_client_secret: callback(),
+          client_auth_method: callback() | nil,
           load_principal: callback(),
           client_store: module() | nil,
           principal_store: module() | nil,
@@ -1315,7 +1347,17 @@ defmodule AttestoPhoenix.Config do
     cache_ttl_bounds: {60, 86_400},
     require_same_origin_redirect_uri: true,
     allowed_hosts: nil,
-    blocked_hosts: []
+    blocked_hosts: [],
+    max_concurrent_fetches: 16,
+    max_concurrent_fetches_per_host: 4,
+    max_fetches_per_window: 120,
+    max_fetches_per_host_per_window: 30,
+    fetch_rate_window_ms: 60_000,
+    failure_backoff_ms: 1_000,
+    max_flow_entries: 1_024,
+    max_singleflight_waiters: 32,
+    cache_max_entries: 1_024,
+    cache_max_record_bytes: 16_384
   ]
 
   defp normalize_client_id_metadata(nil), do: @client_id_metadata_defaults
@@ -3054,6 +3096,7 @@ defmodule AttestoPhoenix.Config do
   @resolution %{
     load_client: {:client_store, :load_client, 1},
     verify_client_secret: {:client_store, :verify_client_secret, 2},
+    client_auth_method: {:client_store, :client_auth_method, 1},
     client_id: {:client_store, :client_id, 1},
     client_jwks: {:client_store, :client_jwks, 1},
     client_mtls_metadata: {:client_store, :client_mtls_metadata, 1},
@@ -3720,6 +3763,37 @@ defmodule AttestoPhoenix.Config do
     :ok
   end
 
+  @client_id_metadata_limit_keys [
+    :max_document_bytes,
+    :request_timeout_ms,
+    :max_concurrent_fetches,
+    :max_concurrent_fetches_per_host,
+    :max_fetches_per_window,
+    :max_fetches_per_host_per_window,
+    :fetch_rate_window_ms,
+    :failure_backoff_ms,
+    :max_flow_entries,
+    :max_singleflight_waiters,
+    :cache_max_entries,
+    :cache_max_record_bytes
+  ]
+
+  defp validate_client_id_metadata_limits!(%__MODULE__{} = config) do
+    opts = client_id_metadata(config)
+
+    Enum.each(@client_id_metadata_limit_keys, fn key ->
+      value = Keyword.fetch!(opts, key)
+
+      if !(is_integer(value) and value > 0) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: client_id_metadata #{inspect(key)} must be a " <>
+                "positive integer; got #{inspect(value)}."
+      end
+    end)
+
+    :ok
+  end
+
   defp validate_outbound_adapter!(selected, bundled, fun, arity, config_path) do
     cond do
       selected == bundled and not callback_exported?(bundled, fun, arity) ->
@@ -3836,6 +3910,7 @@ defmodule AttestoPhoenix.Config do
     validate_resource_metadata!(config)
     validate_boolean_flags!(config)
     validate_nested_boolean_flags!(config)
+    validate_client_id_metadata_limits!(config)
     validate_required_par_store!(config)
     validate_refresh_rotation!(config)
     validate_dpop_nonce!(config)

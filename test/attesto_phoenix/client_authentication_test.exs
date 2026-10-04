@@ -76,10 +76,235 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       client_id: fn client -> client.id end,
       client_public?: fn client -> Map.get(client, :public?, false) end,
       client_native?: fn client -> Map.get(client, :native?, false) end,
+      client_auth_method: fn
+        @pki_mtls -> "tls_client_auth"
+        @self_signed_mtls -> "self_signed_tls_client_auth"
+        %{public?: true} -> "none"
+        _client -> "client_secret_basic"
+      end,
       replay_check: fn _key, _ttl -> :ok end
     }
 
     {:ok, config: config}
+  end
+
+  describe "registered authentication method enforcement" do
+    @authentication_endpoints [
+      :token,
+      :par,
+      :introspection,
+      :device_authorization,
+      :backchannel_authentication,
+      :revocation
+    ]
+
+    test "a legacy private_key_jwt registration cannot use its valid old secret on any authentication route", %{
+      config: config
+    } do
+      test_process = self()
+
+      config = %{
+        registered_method_config(config, :private_key_jwt)
+        | verify_client_secret: fn _client, _secret ->
+            send(test_process, :secret_checked)
+            true
+          end
+      }
+
+      for endpoint <- @authentication_endpoints do
+        policy = Policy.for_endpoint(config, endpoint)
+
+        assert_generic_invalid_client(
+          ClientAuthentication.authenticate(basic(@confidential.id, @confidential.secret), %{}, config, policy)
+        )
+
+        assert_generic_invalid_client(
+          ClientAuthentication.authenticate(
+            [],
+            %{
+              "client_id" => @confidential.id,
+              "client_secret" => @confidential.secret,
+              "token_endpoint_auth_method" => "client_secret_post"
+            },
+            config,
+            policy
+          )
+        )
+      end
+
+      refute_received :secret_checked
+    end
+
+    test "Basic and post registrations are distinct even when both methods are supported", %{config: config} do
+      for registered <- [:client_secret_basic, :client_secret_post], endpoint <- @authentication_endpoints do
+        configured = registered_method_config(config, registered)
+        policy = Policy.for_endpoint(configured, endpoint)
+
+        basic_result =
+          ClientAuthentication.authenticate(basic(@confidential.id, @confidential.secret), %{}, configured, policy)
+
+        post_result =
+          ClientAuthentication.authenticate(
+            [],
+            %{"client_id" => @confidential.id, "client_secret" => @confidential.secret},
+            configured,
+            policy
+          )
+
+        if registered == :client_secret_basic do
+          assert {:ok, %Result{method: :client_secret_basic}} = basic_result
+          assert_generic_invalid_client(post_result)
+        else
+          assert {:ok, %Result{method: :client_secret_post}} = post_result
+          assert_generic_invalid_client(basic_result)
+        end
+      end
+    end
+
+    test "registered private_key_jwt still accepts a valid assertion at each supporting endpoint", %{config: config} do
+      key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      config = %{
+        registered_method_config(config, :private_key_jwt)
+        | client_jwks: fn @confidential -> %{"keys" => [public_jwk(key)]} end,
+          client_auth_signing_algs: Attesto.SigningAlg.fapi_algs(),
+          client_auth_enforce_fapi_alg_policy: true
+      }
+
+      for endpoint <- @authentication_endpoints do
+        assert {:ok, %Result{method: :private_key_jwt}} =
+                 ClientAuthentication.authenticate(
+                   [],
+                   assertion_params(key, "ES256"),
+                   config,
+                   Policy.for_endpoint(config, endpoint)
+                 )
+      end
+    end
+
+    test "a mismatched JWT method is rejected before key lookup or replay consumption", %{config: config} do
+      test_process = self()
+      key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      config = %{
+        config
+        | client_jwks: fn _client ->
+            send(test_process, :keys_loaded)
+            %{"keys" => [public_jwk(key)]}
+          end,
+          replay_check: fn _key, _ttl ->
+            send(test_process, :replay_consumed)
+            :ok
+          end
+      }
+
+      assert_generic_invalid_client(authenticate([], assertion_params(key, "ES256"), config, allow_public: false))
+      refute_received :keys_loaded
+      refute_received :replay_consumed
+    end
+
+    test "valid attestation credentials cannot replace a registered private_key_jwt method", %{config: config} do
+      provider = JOSE.JWK.generate_key({:ec, "P-256"})
+      instance = JOSE.JWK.generate_key({:ec, "P-256"})
+      config = config |> registered_method_config(:private_key_jwt) |> trust_wallet_provider(provider)
+
+      assert_generic_invalid_client(
+        authenticate(wallet_attestation_headers(provider, instance, @confidential.id), %{}, config, allow_public: false)
+      )
+    end
+
+    test "certificate authentication cannot replace another registered method", %{config: config} do
+      test_process = self()
+
+      config = %{
+        config
+        | token_endpoint_auth_methods_supported: ["self_signed_tls_client_auth", "client_secret_basic"],
+          client_mtls_metadata: fn _client -> %{"token_endpoint_auth_method" => "self_signed_tls_client_auth"} end,
+          client_jwks: fn _client ->
+            send(test_process, :certificate_keys_loaded)
+            %{"keys" => []}
+          end
+      }
+
+      assert_generic_invalid_client(
+        authenticate(mtls_headers(mtls_certificate_der()), %{"client_id" => @confidential.id}, config,
+          allow_public: false
+        )
+      )
+
+      refute_received :certificate_keys_loaded
+    end
+
+    test "a public classification cannot omit authentication required by the registration", %{config: config} do
+      config = %{config | client_auth_method: fn _client -> "private_key_jwt" end}
+      assert_generic_invalid_client(authenticate([], %{"client_id" => @public.id}, config, allow_public: true))
+
+      assert_generic_invalid_client(
+        authenticate(mtls_headers(mtls_certificate_der()), %{"client_id" => @public.id}, config, allow_public: true)
+      )
+    end
+
+    test "unknown or malformed trusted method lookup fails closed, including a single-method host", %{config: config} do
+      for invalid <- [
+            nil,
+            {:error, :unavailable},
+            "unknown",
+            [:client_secret_basic],
+            {:ok, {:ok, "client_secret_basic"}}
+          ] do
+        configured = %{
+          config
+          | token_endpoint_auth_methods_supported: ["client_secret_basic"],
+            client_auth_method: fn _client -> invalid end
+        }
+
+        assert_generic_invalid_client(
+          authenticate(basic(@confidential.id, @confidential.secret), %{}, configured, allow_public: true)
+        )
+      end
+    end
+
+    test "an absent lookup denies confidential clients even with one supported method but admits explicit public clients",
+         %{config: config} do
+      legacy_key_client = Map.put(@confidential, :token_endpoint_auth_method, "private_key_jwt")
+      original_lookup = config.load_client
+
+      config = %{
+        config
+        | client_auth_method: nil,
+          load_client: fn
+            "confidential-1" -> {:ok, legacy_key_client}
+            id -> original_lookup.(id)
+          end,
+          token_endpoint_auth_methods_supported: ["client_secret_basic", "none"]
+      }
+
+      assert_generic_invalid_client(
+        authenticate(basic(@confidential.id, @confidential.secret), %{}, config, allow_public: true)
+      )
+
+      assert {:ok, %Result{method: :none}} = authenticate([], %{"client_id" => @public.id}, config, allow_public: true)
+
+      assert_generic_invalid_client(
+        authenticate([], %{"client_id" => @confidential.id, "client_secret" => @confidential.secret}, config,
+          allow_public: true
+        )
+      )
+
+      mixed = %{config | token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"]}
+
+      assert_generic_invalid_client(
+        authenticate(basic(@confidential.id, @confidential.secret), %{}, mixed, allow_public: true)
+      )
+
+      assert_generic_invalid_client(
+        authenticate([], %{"client_id" => @confidential.id, "client_secret" => @confidential.secret}, mixed,
+          allow_public: true
+        )
+      )
+
+      assert {:ok, %Result{method: :none}} = authenticate([], %{"client_id" => @public.id}, mixed, allow_public: true)
+    end
   end
 
   describe "RFC 8705 mutual-TLS client authentication" do
@@ -106,6 +331,14 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                  %{"client_id" => @pki_mtls.id},
                  config,
                  allow_public: false
+               )
+
+      assert {:ok, %Result{client: @pki_mtls, method: :tls_client_auth}} =
+               ClientAuthentication.authenticate(
+                 mtls_headers(der, chain_validated: true),
+                 %{"client_id" => @pki_mtls.id},
+                 config,
+                 Policy.for_endpoint(config, :revocation)
                )
 
       assert_generic_invalid_client(
@@ -142,6 +375,14 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                  allow_public: false
                )
 
+      assert {:ok, %Result{client: @self_signed_mtls, method: :self_signed_tls_client_auth}} =
+               ClientAuthentication.authenticate(
+                 mtls_headers(der, chain_validated: false),
+                 %{"client_id" => @self_signed_mtls.id},
+                 config,
+                 Policy.for_endpoint(config, :revocation)
+               )
+
       assert_generic_invalid_client(
         authenticate(
           mtls_headers(other_der, chain_validated: false),
@@ -154,12 +395,13 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
     test "treats a certificate as sender constraint when another client credential authenticates", %{config: config} do
       der = mtls_certificate_der()
+      post_config = %{config | client_auth_method: fn _client -> "client_secret_post" end}
 
       assert {:ok, %Result{method: :client_secret_post}} =
                authenticate(
                  mtls_headers(der),
                  %{"client_id" => @confidential.id, "client_secret" => @confidential.secret},
-                 config,
+                 post_config,
                  allow_public: true
                )
 
@@ -365,6 +607,10 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "body credentials: client_secret_post and the public path" do
+    setup %{config: config} do
+      {:ok, config: registered_method_config(config, :client_secret_post)}
+    end
+
     test "body client_id + client_secret -> client_secret_post (allow_public: true)", %{
       config: config
     } do
@@ -470,7 +716,11 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
 
     test "body credentials reject a conflicting host client_id", %{config: config} do
-      config = %{config | client_id: fn _client -> "different-client" end}
+      config = %{
+        registered_method_config(config, :client_secret_post)
+        | client_id: fn _client -> "different-client" end
+      }
+
       params = %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"}
 
       assert_generic_invalid_client(authenticate([], params, config, allow_public: true))
@@ -540,6 +790,10 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "private_key_jwt identity agreement" do
+    setup %{config: config} do
+      {:ok, config: registered_method_config(config, :private_key_jwt)}
+    end
+
     test "rejects a conflicting host client_id after verification without consuming jti", %{
       config: config
     } do
@@ -606,6 +860,10 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "private_key_jwt key-bound algorithm policy" do
+    setup %{config: config} do
+      {:ok, config: registered_method_config(config, :private_key_jwt)}
+    end
+
     test "the default FAPI policy rejects weak PS256 while an explicit non-FAPI policy can opt in", %{
       config: config
     } do
@@ -670,6 +928,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
   describe "native apps: client authentication must be none (RFC 8252 §8.4)" do
     test "a native public client presenting client_secret_basic is rejected", %{config: config} do
+      config = %{config | client_auth_method: fn _client -> "client_secret_basic" end}
+
       # The secret is correct - `verify_client_secret` returns true for it - and
       # the authentication is still refused, with the generic message that
       # reveals nothing about the client's registration.
@@ -679,6 +939,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
 
     test "a native public client presenting client_secret_post is rejected", %{config: config} do
+      config = %{config | client_auth_method: fn _client -> "client_secret_post" end}
       params = %{"client_id" => "native-public-1", "client_secret" => "shipped-in-the-binary"}
 
       assert_generic_invalid_client(authenticate([], params, config, allow_public: true))
@@ -690,6 +951,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
 
     test "a native public client cannot use PAR at all", %{config: config} do
+      config = %{config | client_auth_method: fn _client -> "client_secret_basic" end}
+
       # Under the PAR policy `allow_public: false` already rejects the
       # secretless path. The load-bearing half is the SECRET path: without the
       # §8.4 check that would authenticate, since the secret verifies.
@@ -755,7 +1018,12 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       # than a shared secret, so the assertion path is closed too: the client
       # authenticates with `none` and relies on PKCE (§8.1).
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
-      config = %{config | client_jwks: fn @native_public -> %{"keys" => [public_jwk(client_key)]} end}
+
+      config = %{
+        config
+        | client_auth_method: fn _client -> "private_key_jwt" end,
+          client_jwks: fn @native_public -> %{"keys" => [public_jwk(client_key)]} end
+      }
 
       params = %{
         "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
@@ -776,7 +1044,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
 
     test "a host that exposes no :client_native? callback sees no change", %{config: config} do
-      config = %{config | client_native?: nil}
+      config = %{config | client_native?: nil, client_auth_method: fn _client -> "client_secret_basic" end}
 
       assert {:ok, %Result{client: @native_public, method: :client_secret_basic}} =
                authenticate(basic("native-public-1", "shipped-in-the-binary"), %{}, config, allow_public: true)
@@ -789,7 +1057,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       {:par, false},
       {:introspection, false},
       {:device_authorization, true},
-      {:backchannel_authentication, false}
+      {:backchannel_authentication, false},
+      {:revocation, false}
     ]
 
     @all_methods [
@@ -853,7 +1122,10 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     end
 
     defp authenticate_endpoint_method(:client_secret_post, policy, config) do
-      config = %{config | token_endpoint_auth_methods_supported: ["client_secret_post"]}
+      config = %{
+        registered_method_config(config, :client_secret_post)
+        | token_endpoint_auth_methods_supported: ["client_secret_post"]
+      }
 
       ClientAuthentication.authenticate(
         [],
@@ -867,7 +1139,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
 
       config = %{
-        config
+        registered_method_config(config, :private_key_jwt)
         | token_endpoint_auth_methods_supported: ["private_key_jwt"],
           client_jwks: fn @confidential -> %{"keys" => [public_jwk(client_key)]} end
       }
@@ -880,7 +1152,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       instance_key = JOSE.JWK.generate_key({:ec, "P-256"})
 
       config = %{
-        config
+        registered_method_config(config, :attest_jwt_client_auth)
         | token_endpoint_auth_methods_supported: ["attest_jwt_client_auth"],
           trusted_wallet_provider_jwks: %{"keys" => [public_jwk(wallet_provider_key)]}
       }
@@ -906,6 +1178,10 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "attest_jwt_client_auth" do
+    setup %{config: config} do
+      {:ok, config: %{config | client_auth_method: fn _client -> "attest_jwt_client_auth" end}}
+    end
+
     test "missing or rejected Challenges return a fresh Challenge and valid retry authenticates", %{config: config} do
       provider = JOSE.JWK.generate_key({:ec, "P-256"})
       instance = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -1076,7 +1352,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
     test "absent attestation headers leave Basic authentication unchanged", %{config: config} do
       wallet_provider_key = JOSE.JWK.generate_key({:ec, "P-256"})
-      config = trust_wallet_provider(config, wallet_provider_key)
+      config = config |> trust_wallet_provider(wallet_provider_key) |> registered_method_config(:client_secret_basic)
 
       assert {:ok, %Result{method: :client_secret_basic}} =
                authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: false)
@@ -1128,20 +1404,25 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "revocation endpoint client-authentication policy" do
-    test "allows only Basic/post and gives Basic precedence over body credentials", %{
+    test "allows registered confidential methods and gives Basic precedence over body credentials", %{
       config: config
     } do
       policy = Policy.for_endpoint(config, :revocation)
 
       assert policy.allow_public == false
-      assert policy.assertion_audiences == []
-      assert policy.allowed_methods == [:client_secret_basic, :client_secret_post]
-      assert policy.basic_precedence == true
-      # Revocation historically accepted Basic/post independently of the
-      # token endpoint's configured method advertisement.
-      assert policy.honor_configured_methods == false
+      assert policy.assertion_audiences == [config.issuer]
 
-      config = %{config | token_endpoint_auth_methods_supported: ["private_key_jwt"]}
+      assert policy.allowed_methods == [
+               :client_secret_basic,
+               :client_secret_post,
+               :private_key_jwt,
+               :attest_jwt_client_auth,
+               :tls_client_auth,
+               :self_signed_tls_client_auth
+             ]
+
+      assert policy.basic_precedence == true
+      assert policy.honor_configured_methods == true
 
       assert {:ok, %Result{method: :client_secret_basic}} =
                ClientAuthentication.authenticate(
@@ -1159,7 +1440,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                ClientAuthentication.authenticate(
                  [],
                  %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"},
-                 config,
+                 registered_method_config(config, :client_secret_post),
                  policy
                )
 
@@ -1189,6 +1470,16 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     }
 
     ClientAuthentication.authenticate(headers, params, config, policy)
+  end
+
+  defp registered_method_config(config, method) do
+    %{
+      config
+      | client_auth_method: fn
+          %{public?: true} -> "none"
+          _client -> method
+        end
+    }
   end
 
   defp basic(client_id, secret) do

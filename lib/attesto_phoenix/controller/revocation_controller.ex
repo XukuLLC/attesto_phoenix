@@ -13,10 +13,10 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   ## Client authentication (RFC 7009 §2.1, RFC 6749 §2.3)
 
   The revocation endpoint requires the same client authentication as the
-  token endpoint. A confidential client authenticates with
-  `client_secret_basic` (HTTP Basic) or `client_secret_post` (form
-  parameters). Authentication is fail-closed: a request that names a
-  client but does not prove the secret is rejected `invalid_client`
+  token endpoint. A confidential client authenticates with its exact registered
+  method, using the configured secret, private-key JWT, mTLS, or attestation
+  verification policy. Authentication is fail-closed: a request that names a
+  client but does not prove its registered credentials is rejected `invalid_client`
   (HTTP 401, RFC 6749 §5.2), and a request that names no client at all is
   likewise rejected, since this endpoint serves confidential clients. The
   authenticated `client_id` is then threaded into revocation so one client
@@ -47,6 +47,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
     * `:load_client` - resolve an OAuth client by `client_id`.
     * `:verify_client_secret` - constant-time client-secret comparison.
+    * `:client_auth_method` - the trusted registered authentication method.
     * `:on_event` or `:event_sink` (optional) - audit/telemetry hook; receives a
       `:token_revoked` `AttestoPhoenix.Event` after a successful revocation
       request.
@@ -138,6 +139,10 @@ defmodule AttestoPhoenix.Controller.RevocationController do
           "the request is missing the required \"token\" parameter"
         )
 
+      {:error, %OAuthError{error: method_error} = error}
+      when method_error in [:use_attestation_challenge, :use_fresh_attestation] ->
+        OAuthError.render(conn, error, config: config, auth_scheme: :none)
+
       {:error, %OAuthError{}} ->
         # RFC 6749 §5.2: client authentication failed. This endpoint serves
         # confidential clients authenticating with HTTP Basic, so the 401
@@ -181,11 +186,9 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     |> halt()
   end
 
-  # RFC 7009 §2.1: revocation accepts only client_secret_basic and
-  # client_secret_post. The shared endpoint policy preserves the established
-  # Basic-first precedence and deliberately does not apply the token endpoint's
-  # configurable method allowlist, which the legacy revocation endpoint never
-  # consulted.
+  # RFC 7009 §2.1: use the client's registered authentication method. The shared
+  # policy applies the server allowlist and preserves established Basic-first
+  # precedence over redundant body credentials.
   defp authenticate_client(config, conn, params) do
     policy = ClientAuthentication.Policy.for_endpoint(config, :revocation)
 

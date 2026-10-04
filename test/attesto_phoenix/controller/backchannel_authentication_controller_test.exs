@@ -35,7 +35,14 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
     {jwk, pub_map} = es256_key()
     Application.put_env(:attesto_phoenix, :test_jwk, jwk)
 
-    client = %{id: "cli-1", secret: "s3cr3t", jwks: %{"keys" => [pub_map]}, ciba: %{token_delivery_mode: :poll}}
+    client = %{
+      id: "cli-1",
+      secret: "s3cr3t",
+      token_endpoint_auth_method: "client_secret_basic",
+      jwks: %{"keys" => [pub_map]},
+      ciba: %{token_delivery_mode: :poll}
+    }
+
     ping_client = %{client | id: "ping-1", ciba: %{token_delivery_mode: :ping}}
 
     prev_otp = Application.get_env(:attesto_phoenix, :otp_app)
@@ -46,6 +53,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
       audience: "https://issuer.example",
       keystore: __MODULE__.Keystore,
       repo: __MODULE__.Repo,
+      client_auth_method: fn client -> client.token_endpoint_auth_method end,
       load_client: fn
         "cli-1" -> {:ok, client}
         "ping-1" -> {:ok, ping_client}
@@ -151,6 +159,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
 
     client = %{
       id: "cli-1",
+      token_endpoint_auth_method: "private_key_jwt",
       jwks: %{"keys" => [public_jwk(client_key, "PS256")]},
       ciba: %{token_delivery_mode: :poll}
     }

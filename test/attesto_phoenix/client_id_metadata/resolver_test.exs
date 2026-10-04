@@ -22,6 +22,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
   import ExUnit.CaptureLog
 
   alias AttestoPhoenix.ClientIdMetadata.Cache.ETS
+  alias AttestoPhoenix.ClientIdMetadata.FlowControl
   alias AttestoPhoenix.ClientIdMetadata.Resolver
   alias AttestoPhoenix.Config
 
@@ -73,12 +74,14 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
     def get(_url), do: respond(Process.get({__MODULE__, :get}, :miss))
 
     @impl true
-    def put(_url, _metadata, _expires_at) do
+    def put(url, metadata, expires_at) do
       Process.put({__MODULE__, :put_calls}, Process.get({__MODULE__, :put_calls}, 0) + 1)
+      Process.put({__MODULE__, :last_put}, {url, metadata, expires_at})
       respond(Process.get({__MODULE__, :put}, :ok))
     end
 
     def put_calls, do: Process.get({__MODULE__, :put_calls}, 0)
+    def last_put, do: Process.get({__MODULE__, :last_put})
 
     defp respond({:raise, message}), do: raise(message)
     defp respond(result), do: result
@@ -87,6 +90,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
   setup do
     {:ok, agent} = StubFetcher.start_link()
     Process.put(StubFetcher, agent)
+    Process.put(FlowControl, start_supervised!({FlowControl, []}))
     %{agent: agent}
   end
 
@@ -115,7 +119,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
         [
           enabled: true,
           fetcher: StubFetcher,
-          cache: ETS
+          cache: ETS,
+          flow_control_server: Process.get(FlowControl)
         ],
         overrides
       )
@@ -293,9 +298,10 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       StubFetcher.script(agent, url, {:ok, %{body: invalid, cache_control: [max_age: 3600]}})
 
       assert {:error, :symmetric_auth_method} = Resolver.resolve(url, resolver_config())
-      assert {:error, :symmetric_auth_method} = Resolver.resolve(url, resolver_config())
+      assert {:error, {:fetch, :failure_backoff}} = Resolver.resolve(url, resolver_config())
 
-      assert StubFetcher.calls(agent, url) == 2
+      assert StubFetcher.calls(agent, url) == 1
+      assert :miss = ETS.get(url)
     end
 
     test "errors and never caches a client_id mismatch", %{agent: agent} do
@@ -311,9 +317,10 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       StubFetcher.script(agent, url, {:ok, %{body: mismatched, cache_control: [max_age: 3600]}})
 
       assert {:error, :client_id_mismatch} = Resolver.resolve(url, resolver_config())
-      assert {:error, :client_id_mismatch} = Resolver.resolve(url, resolver_config())
+      assert {:error, {:fetch, :failure_backoff}} = Resolver.resolve(url, resolver_config())
 
-      assert StubFetcher.calls(agent, url) == 2
+      assert StubFetcher.calls(agent, url) == 1
+      assert :miss = ETS.get(url)
     end
 
     test "errors on a malformed JSON body and does not cache", %{agent: agent} do
@@ -321,9 +328,10 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       StubFetcher.script(agent, url, {:ok, %{body: "{not json", cache_control: []}})
 
       assert {:error, :invalid_json} = Resolver.resolve(url, resolver_config())
-      assert {:error, :invalid_json} = Resolver.resolve(url, resolver_config())
+      assert {:error, {:fetch, :failure_backoff}} = Resolver.resolve(url, resolver_config())
 
-      assert StubFetcher.calls(agent, url) == 2
+      assert StubFetcher.calls(agent, url) == 1
+      assert :miss = ETS.get(url)
     end
 
     test "wraps a fetcher error and does not cache", %{agent: agent} do
@@ -359,16 +367,100 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
     test "refetches once a cached entry has expired", %{agent: agent} do
       url = unique_url()
 
-      # max-age below the cache_ttl_bounds floor clamps the TTL up to the floor,
-      # so this entry would live. Override the floor to 0 and pass max_age: 0 so
-      # the stored entry is already expired and the next resolve must refetch.
-      config = resolver_config(cache_ttl_bounds: {0, 86_400})
+      # The origin's explicit zero freshness must not be raised to the default
+      # heuristic minimum, so no stale entry is written.
+      config = resolver_config()
       StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: [max_age: 0]}})
 
       assert {:ok, _client} = Resolver.resolve(url, config)
       assert {:ok, _client} = Resolver.resolve(url, config)
 
       assert StubFetcher.calls(agent, url) == 2
+    end
+
+    test "subtracts Age without extending remaining freshness to the heuristic minimum", %{agent: agent} do
+      url = unique_url()
+      now = ~U[2026-10-04 12:00:00Z]
+      FaultCache.script(:miss)
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: [max_age: 300, age: 295]}})
+      config = resolver_config(cache: FaultCache, cache_ttl_bounds: {60, 3600}, clock: fn -> now end)
+
+      assert {:ok, client} = Resolver.resolve(url, config)
+      assert {^url, ^client, expiry} = FaultCache.last_put()
+      assert DateTime.compare(expiry, ~U[2026-10-04 12:00:05Z]) == :eq
+      assert FaultCache.put_calls() == 1
+    end
+
+    test "stale Age, Expires and apparent Date age never write a cache entry", %{agent: agent} do
+      now = ~U[2026-10-04 12:00:00Z]
+
+      for directives <- [
+            [max_age: 300, age: 300],
+            [max_age: 300, age: 301],
+            [max_age: 300, age: 295, response_delay_ms: 5001, received_at: now],
+            [max_age: 0],
+            [max_age: 60, date: "Sun, 04 Oct 2026 11:58:00 GMT"],
+            [expires: "Sun, 04 Oct 2026 11:59:59 GMT"],
+            [expires: "not a date"],
+            [age: 60]
+          ] do
+        url = unique_url()
+        FaultCache.script(:miss, {:error, :cache_write_must_not_run})
+        StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: directives}})
+        config = resolver_config(cache: FaultCache, clock: fn -> now end)
+
+        assert {:ok, _client} = Resolver.resolve(url, config)
+        assert {:ok, _client} = Resolver.resolve(url, config)
+        assert FaultCache.put_calls() == 0
+        assert StubFetcher.calls(agent, url) == 2
+      end
+    end
+
+    test "Expires lifetime uses Date and Age with the injected clock", %{agent: agent} do
+      url = unique_url()
+      now = ~U[2026-10-04 12:00:00Z]
+      directives = [date: "Sun, 04 Oct 2026 11:58:00 GMT", expires: "Sun, 04 Oct 2026 12:03:00 GMT", age: 200]
+      FaultCache.script(:miss)
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: directives}})
+      config = resolver_config(cache: FaultCache, clock: fn -> now end)
+
+      assert {:ok, client} = Resolver.resolve(url, config)
+      assert {^url, ^client, expiry} = FaultCache.last_put()
+      assert DateTime.compare(expiry, ~U[2026-10-04 12:01:40Z]) == :eq
+
+      assert DateTime.compare(Resolver.key_cache_expires_at(directives, Config.client_id_metadata(config)), expiry) ==
+               :eq
+    end
+
+    test "adds resident time once and preserves subsecond remaining freshness" do
+      now = ~U[2026-10-04 12:00:00Z]
+      opts = [cache_ttl_bounds: {60, 3600}, clock: fn -> now end]
+
+      directives = [
+        max_age: 10,
+        age: 1,
+        response_delay_ms: 2000,
+        received_at: ~U[2026-10-04 11:59:58Z],
+        date: "Sun, 04 Oct 2026 11:59:55 GMT"
+      ]
+
+      assert DateTime.diff(Resolver.key_cache_expires_at(directives, opts), now, :millisecond) == 5000
+
+      assert DateTime.diff(
+               Resolver.key_cache_expires_at([max_age: 1, response_delay_ms: 1, received_at: now], opts),
+               now,
+               :millisecond
+             ) == 999
+    end
+
+    test "a 304 response cannot revive expired metadata", %{agent: agent} do
+      url = unique_url()
+      :ok = ETS.put(url, JSON.decode!(valid_body(url)), DateTime.add(DateTime.utc_now(), -1, :second))
+      StubFetcher.script(agent, url, {:error, {:status, 304}})
+
+      assert {:error, {:fetch, {:status, 304}}} = Resolver.resolve(url, resolver_config())
+      assert :miss = ETS.get(url)
+      assert StubFetcher.calls(agent, url) == 1
     end
 
     test "fails fast on a non-CIMD client_id without fetching", %{agent: agent} do
@@ -387,6 +479,43 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       config = resolver_config(blocked_hosts: ["blocked.example"])
 
       assert {:error, {:blocked_host, "blocked.example"}} = Resolver.resolve(url, config)
+      assert Agent.get(agent, & &1) == %{}
+    end
+
+    test "block policy screens case, root-dot and IDNA aliases before fetching", %{agent: agent} do
+      for {host, blocked} <- [
+            {"APP.Example", "app.example"},
+            {"app.example.", "APP.Example"},
+            {"app.example", "APP.Example."},
+            {"xn--bcher-kva.example", "bücher.example"},
+            {"XN--BCHER-KVA.example.", "BÜCHER.Example"}
+          ] do
+        url = "https://#{host}/clients/metadata.json"
+        assert {:error, {:blocked_host, ^host}} = Resolver.resolve(url, resolver_config(blocked_hosts: [blocked]))
+      end
+
+      assert Agent.get(agent, & &1) == %{}
+    end
+
+    test "allow policy compares canonical names without changing the document identifier", %{agent: agent} do
+      url = "https://XN--BCHER-KVA.example./clients/#{System.unique_integer([:positive])}/metadata.json"
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: [max_age: 3600]}})
+      config = resolver_config(allowed_hosts: ["BÜCHER.example"])
+
+      assert {:ok, %{"client_id" => ^url}} = Resolver.resolve(url, config)
+      assert {:ok, %{"client_id" => ^url}} = Resolver.resolve(url, config)
+      assert StubFetcher.calls(agent, url) == 1
+
+      assert {:error, {:blocked_host, "XN--BCHER-KVA.example."}} =
+               Resolver.resolve(url, resolver_config(blocked_hosts: ["xn--bcher-kva.example"]))
+
+      assert StubFetcher.calls(agent, url) == 1
+    end
+
+    test "a raw Unicode URL fails the URI grammar before reaching DNS", %{agent: agent} do
+      assert {:error, {:invalid_client_id, :not_a_url}} =
+               Resolver.resolve("https://bücher.example/client.json", resolver_config())
+
       assert Agent.get(agent, & &1) == %{}
     end
 

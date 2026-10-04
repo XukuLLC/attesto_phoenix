@@ -42,8 +42,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   ## Issued credentials
 
   This controller owns credential generation: it mints the `client_id` and (for
-  a confidential client, i.e. any `token_endpoint_auth_method` other than
-  `none`) a high-entropy `client_secret` via `Attesto.Secret` (RFC 6749 §2.3.1
+  `client_secret_basic`, `client_secret_post`, or `client_secret_jwt`) a
+  high-entropy `client_secret` via `Attesto.Secret` (RFC 6749 §2.3.1
   high-entropy secret). The plaintext secret appears in the RFC 7591 §3.2.1
   response exactly once, accompanied by the REQUIRED `client_secret_expires_at`
   (`0`, non-expiring); only its one-way hash is handed to the host for
@@ -90,11 +90,10 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   @max_scope_metadata_bytes 8_192
   @error_invalid_token :invalid_token
 
-  # RFC 7591 §2 / RFC 6749 §2.1: a public client (token_endpoint_auth_method
-  # "none") holds no secret; any other method designates a confidential client,
-  # which is issued one. Absent the member, the client defaults to confidential
-  # (RFC 7591 §2 default is client_secret_basic).
-  @auth_method_none "none"
+  # Only shared-secret authentication requires a client_secret. Asymmetric,
+  # certificate and attestation methods must not acquire a downgrade credential.
+  # RFC 7591 §2 defaults an omitted method to client_secret_basic.
+  @secret_auth_methods ~w(client_secret_basic client_secret_post client_secret_jwt)
   @default_auth_method "client_secret_basic"
 
   # RFC 7591 §3.2.1: when a `client_secret` is issued, `client_secret_expires_at`
@@ -634,7 +633,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   # ── Credential issuance ──────────────────────────────────────────────────
 
-  # Mint the client identifier and (for a confidential client) the client
+  # Mint the client identifier and, for a secret-based method, the client
   # secret. The plaintext secret is held only long enough to put it in the
   # response and its hash in the persisted attributes; it is never logged or
   # evented. `client_id_issued_at` is the RFC 7591 §3.2.1 issuance time.
@@ -654,9 +653,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     {:ok, issued}
   end
 
-  # RFC 6749 §2.1: a public client holds no secret.
-  defp generate_secret(@auth_method_none), do: nil
-  defp generate_secret(_confidential_method), do: Secret.generate()
+  defp generate_secret(method) when method in @secret_auth_methods, do: Secret.generate()
+  defp generate_secret(_method), do: nil
 
   # RFC 7591 §3.2.1: `client_secret` and, when a secret is issued,
   # `client_secret_expires_at` are returned together. The latter is REQUIRED in

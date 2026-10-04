@@ -18,6 +18,17 @@ defmodule AttestoPhoenix.ClientAuthentication do
   Client Attestation JWT + PoP header pairs. Presenting more than one
   client-authentication method is rejected (RFC 6749 §2.3).
 
+  Each client must also use its registered method. The trusted
+  `:client_auth_method` / `ClientStore.client_auth_method/1` callback supplies
+  that registration for opaque host clients. Basic and post are distinct
+  methods; a valid old secret cannot replace a registered assertion,
+  certificate, or attestation. A server-wide method allowlist does not establish
+  a client's registration, even if only one method is enabled. Confidential
+  clients without the callback fail closed. Explicitly classified public
+  clients may retain the `none` path, and CIMD clients use their validated
+  document's method. The registered-method check applies to every endpoint,
+  including revocation, before verifying credentials or consuming replay state.
+
   A presented client certificate is not inherently a second authentication
   method: RFC 8705 certificate-bound tokens use it independently as
   proof-of-possession. Explicit Basic, post-body, JWT, or attestation
@@ -50,18 +61,19 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   ## Client ID Metadata Documents (CIMD)
 
-  When CIMD (`draft-ietf-oauth-client-id-metadata-document-01`) is enabled and
+  When CIMD (`draft-ietf-oauth-client-id-metadata-document-02`) is enabled and
   the presented `client_id` is a CIMD URL, the client is dereferenced from that
   URL (`AttestoPhoenix.ClientIdMetadata`) rather than looked up in the host
   registry. A CIMD client carries no shared symmetric secret (the document
   validation strips `client_secret_*` and the symmetric auth methods), so it can
   only authenticate as a **public client** (`none` + PKCE) or with
   **`private_key_jwt`** keyed by the document's `jwks` / `jwks_uri`. The Basic /
-  body-secret paths therefore never resolve a CIMD client: a `client_secret`
-  presented for a CIMD `client_id` finds no secret to verify and fails with the
+  body-secret paths therefore never authenticate a CIMD client: a `client_secret`
+  presented for a CIMD `client_id` fails the registered-method check with the
   generic `invalid_client` message like any other failed authentication. CIMD
-  resolution is consulted only on the secretless (`none`) and `private_key_jwt`
-  paths, where the host registry would not hold the URL.
+  resolution takes precedence over a colliding host registry entry on every
+  authentication path. A stale host secret therefore cannot authenticate a
+  URL whose validated document requires `none` or `private_key_jwt`.
 
   ## Policy
 
@@ -121,7 +133,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
       `invalid_request` (RFC 6749 §2.3).
   """
 
-  alias Attesto.{ClientAssertion, MTLS, WalletAttestation}
+  alias Attesto.{ClientAssertion, JWS, MTLS, WalletAttestation}
   alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Store.NonceStore
@@ -200,10 +212,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
     Build the client-authentication policy for an endpoint.
 
     This is the authoritative endpoint matrix. The client-authentication
-    methods themselves remain the configured Basic, post-body, and
-    `private_key_jwt` methods; `allow_public` controls whether the `none`
-    method is admitted. Revocation uses the same service with its RFC 7009
-    Basic/post-only policy and Basic precedence over body credentials.
+    methods themselves remain the configured confidential methods;
+    `allow_public` controls whether the `none` method is admitted. Revocation
+    requires the registered confidential method and retains Basic precedence
+    over body credentials.
     """
     @spec for_endpoint(Config.t(), endpoint()) :: t()
     def for_endpoint(%Config{} = config, endpoint) do
@@ -225,13 +237,13 @@ defmodule AttestoPhoenix.ClientAuthentication do
             {false, backchannel_assertion_audiences(config)}
 
           :revocation ->
-            {false, []}
+            {false, [config.issuer]}
         end
 
       {allowed_methods, basic_precedence, honor_configured_methods} =
         case endpoint do
           :revocation ->
-            {[:client_secret_basic, :client_secret_post], true, false}
+            {@all_methods -- [:none], true, true}
 
           _other ->
             {@all_methods, false, true}
@@ -327,6 +339,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # authentication path (RFC 6749 §2.3): an attacker must not be able to tell
   # an unknown client from a wrong secret.
   @client_auth_failed "client authentication failed"
+
+  @registered_auth_methods ~w(client_secret_basic client_secret_post client_secret_jwt
+                              private_key_jwt attest_jwt_client_auth tls_client_auth
+                              self_signed_tls_client_auth none)
 
   @type request_headers ::
           [String.t()]
@@ -671,6 +687,48 @@ defmodule AttestoPhoenix.ClientAuthentication do
       else: {:error, error(@error_invalid_client, @client_auth_failed)}
   end
 
+  # A server-wide allowlist does not authorize a client to switch away from
+  # its registered authentication method. The host callback is trusted registry
+  # data, never a request parameter. Even a single server-wide method cannot
+  # establish what an opaque client previously registered. Without the lookup,
+  # only an explicitly classified public client can use the none path.
+  defp require_registered_client_auth_method(config, client, method) do
+    expected = Atom.to_string(method)
+
+    case registered_client_auth_method(config, client) do
+      {:ok, ^expected} -> :ok
+      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp registered_client_auth_method(_config, %CIMDClient{metadata: metadata}) do
+    normalize_registered_auth_method(Map.get(metadata, "token_endpoint_auth_method", "none"))
+  end
+
+  defp registered_client_auth_method(config, client) do
+    case Config.client_auth_method_fun(config) do
+      nil -> classified_public_auth_method(config, client)
+      callback -> normalize_registered_auth_method(invoke(callback, [client]))
+    end
+  end
+
+  defp normalize_registered_auth_method({:ok, method}), do: normalize_registered_auth_method_value(method)
+  defp normalize_registered_auth_method(method), do: normalize_registered_auth_method_value(method)
+
+  defp normalize_registered_auth_method_value(method) when is_atom(method),
+    do: normalize_registered_auth_method_value(Atom.to_string(method))
+
+  defp normalize_registered_auth_method_value(method) when method in @registered_auth_methods, do: {:ok, method}
+  defp normalize_registered_auth_method_value(_other), do: {:error, :unknown_registered_method}
+
+  defp classified_public_auth_method(config, client) do
+    if client_public?(config, client) do
+      {:ok, "none"}
+    else
+      {:error, :missing_registered_method}
+    end
+  end
+
   defp has_body_secret?(%{"client_secret" => secret}) when is_binary(secret) and secret != "", do: true
 
   defp has_body_secret?(_params), do: false
@@ -683,15 +741,16 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp verify_confidential_client(config, client_id, secret, method) do
     verify_client_secret = Config.verify_client_secret_fun(config)
 
-    case Config.client_store_load(config, client_id) do
+    case resolve_client(config, client_id) do
       {:ok, client} ->
-        if Callback.invoke_boolean(verify_client_secret, [client, secret], false, :verify_client_secret) do
+        with :ok <- require_registered_client_auth_method(config, client, method),
+             true <- Callback.invoke_boolean(verify_client_secret, [client, secret], false, :verify_client_secret) do
           result(config, client, client_id, method)
         else
-          {:error, error(@error_invalid_client, @client_auth_failed)}
+          _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
         end
 
-      {:error, reason} when reason in [:not_found, :revoked] ->
+      {:error, _reason} ->
         # RFC 6749 §2.3 / OWASP: do not leak whether the client exists or is
         # revoked. Run a dummy verification so the lookup-failure path matches
         # the wrong-secret path in observable timing, and return one message.
@@ -705,6 +764,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp verify_private_key_jwt_client(config, policy, assertion) do
     with {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
          {:ok, client} <- resolve_client(config, client_id),
+         :ok <- require_registered_client_auth_method(config, client, :private_key_jwt),
          {:ok, jwks} <- client_jwks(config, client),
          {:ok, claims} <-
            ClientAssertion.verify(
@@ -731,16 +791,16 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   defp verify_attested_client(config, policy, attestation, pop, presented_client_id) do
-    with trusted_jwks when not is_nil(trusted_jwks) <- Config.trusted_wallet_provider_jwks(config),
+    with {:ok, client_id} <- attested_client_id(attestation, presented_client_id),
+         {:ok, client} <- resolve_client(config, client_id),
+         :ok <- require_registered_client_auth_method(config, client, :attest_jwt_client_auth),
+         trusted_jwks when not is_nil(trusted_jwks) <- Config.trusted_wallet_provider_jwks(config),
          {:ok, verified} <-
            WalletAttestation.verify(
              attestation,
              pop,
-             wallet_attestation_verify_opts(config, policy, trusted_jwks, presented_client_id)
+             wallet_attestation_verify_opts(config, policy, trusted_jwks, client_id)
            ),
-         client_id when is_binary(client_id) and client_id != "" <-
-           get_in(verified, [:attestation_claims, "sub"]),
-         {:ok, client} <- resolve_client(config, client_id),
          {:ok, result} <- result(config, client, client_id, :attest_jwt_client_auth),
          :ok <- consume_wallet_attestation_replay(config, verified) do
       {:ok, %{result | attestation_jkt: verified.instance_key.jkt}}
@@ -753,6 +813,16 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
       _other ->
         {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  defp attested_client_id(attestation, presented_client_id) do
+    with {:ok, %{"sub" => client_id}} <- JWS.peek_json(attestation, :payload),
+         true <- is_binary(client_id) and client_id != "",
+         true <- is_nil(presented_client_id) or presented_client_id == client_id do
+      {:ok, client_id}
+    else
+      _other -> {:error, :invalid_client_id}
     end
   end
 
@@ -781,6 +851,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp authenticate_registered_mtls_client(config, policy, client, client_id, certificate, metadata) do
     with {:ok, method} <- mtls_method(metadata),
          :ok <- require_client_auth_method(config, policy, method),
+         :ok <- require_registered_client_auth_method(config, client, method),
          :ok <- require_mtls_transport(method, certificate),
          {:ok, metadata} <- maybe_resolve_self_signed_jwks(config, client, method, metadata),
          :ok <- MTLS.authenticate_client(certificate.der, method, metadata),
@@ -794,6 +865,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp authenticate_certificate_bearing_public(config, policy, client, client_id) do
     with true <- policy.allow_public,
          :ok <- require_client_auth_method(config, policy, :none),
+         :ok <- require_registered_client_auth_method(config, client, :none),
          true <- client_public?(config, client),
          {:ok, result} <- result(config, client, client_id, :none) do
       {:ok, result}
@@ -965,6 +1037,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # presenting no secret - fails closed with the single generic message.
   defp load_public_client(config, client_id) do
     with {:ok, client} <- resolve_client(config, client_id),
+         :ok <- require_registered_client_auth_method(config, client, :none),
          true <- client_public?(config, client),
          {:ok, result} <- result(config, client, client_id, :none) do
       {:ok, result}

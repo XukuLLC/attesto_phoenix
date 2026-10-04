@@ -329,6 +329,70 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
   end
 
   describe "successful registration (RFC 7591 §3.2.1)" do
+    test "only shared-secret methods issue and persist secret credentials" do
+      test_process = self()
+
+      for method <- ~w(client_secret_basic client_secret_post client_secret_jwt) do
+        registered_config =
+          config(
+            token_endpoint_auth_methods_supported: [method],
+            register_client: fn attrs ->
+              send(test_process, {:stored, attrs})
+              {:ok, attrs}
+            end
+          )
+
+        conn =
+          post_register(registered_config, %{
+            "grant_types" => ["client_credentials"],
+            "token_endpoint_auth_method" => method
+          })
+
+        assert conn.status == 201
+        payload = body(conn)
+        assert is_binary(payload["client_secret"])
+        assert payload["client_secret_expires_at"] == 0
+        assert_receive {:stored, attrs}
+        assert attrs["token_endpoint_auth_method"] == method
+        assert attrs["client_secret_hash"] == Attesto.Secret.hash(payload["client_secret"])
+        refute Map.has_key?(attrs, "client_secret")
+      end
+    end
+
+    test "key, certificate, attestation and public registrations have no shared-secret downgrade credential" do
+      test_process = self()
+      {_kty, provider_key} = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_public_map()
+
+      for method <- ~w(private_key_jwt tls_client_auth self_signed_tls_client_auth attest_jwt_client_auth none) do
+        registered_config =
+          config(
+            token_endpoint_auth_methods_supported: [method],
+            trusted_wallet_provider_jwks: %{"keys" => [provider_key]},
+            register_client: fn attrs ->
+              send(test_process, {:stored, attrs})
+              {:ok, attrs}
+            end
+          )
+
+        conn =
+          post_register(registered_config, %{
+            "grant_types" => ["client_credentials"],
+            "token_endpoint_auth_method" => method
+          })
+
+        assert conn.status == 201
+        payload = body(conn)
+        refute Map.has_key?(payload, "client_secret")
+        refute Map.has_key?(payload, "client_secret_expires_at")
+        assert is_binary(payload["registration_access_token"])
+        assert_receive {:stored, attrs}
+        assert attrs["token_endpoint_auth_method"] == method
+        refute Map.has_key?(attrs, "client_secret")
+        refute Map.has_key?(attrs, "client_secret_hash")
+        refute Map.has_key?(attrs, "client_secret_expires_at")
+      end
+    end
+
     test "registers a confidential client and returns 201 with credentials" do
       conn =
         post_register(config([]), %{

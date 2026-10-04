@@ -125,6 +125,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
     {client_id, secret} = {body["client_id"], body["client_secret"]}
     assert is_binary(client_id) and client_id != ""
     assert is_binary(secret) and secret != ""
+    assert body["token_endpoint_auth_method"] == "client_secret_basic"
     {client_id, secret}
   end
 
@@ -173,7 +174,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
   # issued secret (RFC 6749 §2.3.1), and `:client_id`/`:build_principal` apply the
   # same subject seam. `require_https: false` so the Plug.Test conn is accepted.
   defp controller_token_config(client_id, secret, build_principal) do
-    client = %{id: client_id, public?: false, secret: secret}
+    client = %{id: client_id, public?: false, secret: secret, auth_method: "client_secret_basic"}
 
     opts = [
       issuer: "https://issuer.example",
@@ -187,6 +188,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
         _client, _given -> false
       end,
       client_public?: fn c -> Map.get(c, :public?, false) end,
+      client_auth_method: fn c -> c.auth_method end,
       client_id: fn c -> c.id end,
       authorize_scope: fn _client, requested -> {:ok, requested} end,
       load_principal: fn _ -> {:error, :not_found} end,
@@ -214,7 +216,12 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
   end
 
   defp private_key_jwt_token_config(client_id, persisted, test_pid) do
-    client = %{id: client_id, public?: false, jwks: persisted["jwks"]}
+    client = %{
+      id: client_id,
+      public?: false,
+      jwks: persisted["jwks"],
+      auth_method: persisted["token_endpoint_auth_method"]
+    }
 
     Config.new(
       issuer: "https://issuer.example",
@@ -233,6 +240,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       end,
       verify_client_secret: fn _client, _given -> false end,
       client_public?: fn _client -> false end,
+      client_auth_method: fn loaded -> loaded.auth_method end,
       client_id: fn loaded -> loaded.id end,
       client_jwks: fn loaded ->
         send(test_pid, {:private_key_jwt_jwks_resolved, loaded.jwks})
@@ -396,9 +404,12 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       assert registration_conn.status == 201
       payload = JSON.decode!(registration_conn.resp_body)
       assert payload["jwks"] == client_jwks
+      refute Map.has_key?(payload, "client_secret")
+      refute Map.has_key?(payload, "client_secret_expires_at")
       assert_receive {:persisted_private_key_jwt_client, persisted}
       assert persisted["client_id"] == payload["client_id"]
       assert persisted["jwks"] == client_jwks
+      refute Map.has_key?(persisted, "client_secret_hash")
 
       client_id = persisted["client_id"]
       config = private_key_jwt_token_config(client_id, persisted, test_pid)

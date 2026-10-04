@@ -63,6 +63,7 @@ AttestoPhoenix.Config.new(
   # Client registry (AttestoPhoenix.ClientStore).
   load_client: &MyApp.AuthZ.load_client/1,
   verify_client_secret: &MyApp.AuthZ.verify_client_secret/2,
+  client_auth_method: &MyApp.AuthZ.client_auth_method/1,
   client_id: &MyApp.AuthZ.client_id/1,
   client_redirect_uris: &MyApp.AuthZ.client_redirect_uris/1,
   client_public?: fn _client -> false end,

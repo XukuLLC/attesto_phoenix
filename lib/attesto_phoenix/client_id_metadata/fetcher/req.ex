@@ -65,6 +65,7 @@ if Code.ensure_loaded?(Req) do
     import Bitwise, only: [&&&: 2, >>>: 2, <<<: 2]
 
     alias AttestoPhoenix.ClientIdMetadata.Fetcher
+    alias AttestoPhoenix.ClientIdMetadata.HostPolicy
 
     @default_max_document_bytes 5_120
     @default_request_timeout_ms 5_000
@@ -163,7 +164,14 @@ if Code.ensure_loaded?(Req) do
     # Step 1: re-validate https + draft §2 grammar; never trust the caller.
     defp revalidate(url) do
       case Attesto.ClientIdMetadata.validate_client_id(url) do
-        {:ok, uri} -> {:ok, uri}
+        {:ok, uri} -> canonicalize_host(uri)
+        {:error, reason} -> {:error, {:invalid_url, reason}}
+      end
+    end
+
+    defp canonicalize_host(uri) do
+      case HostPolicy.canonicalize(uri.host) do
+        {:ok, host} -> {:ok, %{uri | host: host}}
         {:error, reason} -> {:error, {:invalid_url, reason}}
       end
     end
@@ -329,9 +337,10 @@ if Code.ensure_loaded?(Req) do
       max_bytes = Keyword.get(opts, :max_document_bytes, @default_max_document_bytes)
 
       req = build_req(uri, pinned_ip, timeout, max_bytes, opts)
+      started_at = System.monotonic_time(:millisecond)
 
       case Req.request(req) do
-        {:ok, %Req.Response{status: 200} = resp} -> on_ok(resp, max_bytes)
+        {:ok, %Req.Response{status: 200} = resp} -> on_ok(resp, max_bytes, started_at)
         {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
         {:error, %{__exception__: true} = exception} -> {:error, {:transport, exception}}
         {:error, reason} -> {:error, {:transport, reason}}
@@ -378,10 +387,19 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    defp on_ok(%Req.Response{} = resp, max_bytes) do
+    defp on_ok(%Req.Response{} = resp, max_bytes, started_at) do
+      received_at = DateTime.utc_now()
+      response_delay_ms = max(0, System.monotonic_time(:millisecond) - started_at)
+
       with :ok <- check_content_type(resp),
            {:ok, body} <- check_size(resp, max_bytes) do
-        {:ok, %{body: body, cache_control: parse_cache_control(resp)}}
+        cache_control =
+          resp
+          |> parse_cache_control()
+          |> Keyword.put(:response_delay_ms, response_delay_ms)
+          |> Keyword.put(:received_at, received_at)
+
+        {:ok, %{body: body, cache_control: cache_control}}
       end
     end
 
@@ -442,34 +460,81 @@ if Code.ensure_loaded?(Req) do
       |> put_flag(:no_cache, Map.has_key?(directives, "no-cache"))
       |> put_expires(resp)
       |> put_age(resp)
+      |> put_date(resp)
     end
 
     defp cache_control_directives(%Req.Response{} = resp) do
-      resp
-      |> Req.Response.get_header("cache-control")
-      |> Enum.join(",")
-      |> String.split(",", trim: true)
-      |> Map.new(&parse_directive/1)
+      value = resp |> Req.Response.get_header("cache-control") |> Enum.join(",")
+
+      case split_cache_control(value, [], [], false) do
+        {:ok, directives} ->
+          Enum.reduce(directives, %{}, fn directive, acc ->
+            {name, value} = parse_directive(directive)
+            Map.put_new(acc, name, value)
+          end)
+
+        :error ->
+          %{"max-age" => 0}
+      end
     end
+
+    defp split_cache_control(<<>>, current, parts, false), do: {:ok, Enum.reverse([directive_binary(current) | parts])}
+
+    defp split_cache_control(<<>>, _current, _parts, true), do: :error
+
+    defp split_cache_control(<<?\\, char, rest::binary>>, current, parts, true),
+      do: split_cache_control(rest, [char, ?\\ | current], parts, true)
+
+    defp split_cache_control(<<?", rest::binary>>, current, parts, quoted?),
+      do: split_cache_control(rest, [?" | current], parts, not quoted?)
+
+    defp split_cache_control(<<?,, rest::binary>>, current, parts, false),
+      do: split_cache_control(rest, [], [directive_binary(current) | parts], false)
+
+    defp split_cache_control(<<char, rest::binary>>, current, parts, quoted?),
+      do: split_cache_control(rest, [char | current], parts, quoted?)
+
+    defp directive_binary(reversed), do: reversed |> Enum.reverse() |> :erlang.list_to_binary()
 
     defp parse_directive(directive) do
       directive
       |> String.trim()
-      |> String.downcase()
       |> String.split("=", parts: 2)
       |> case do
-        [name, value] -> {name, value}
-        [name] -> {name, true}
+        [name, value] -> {name |> String.trim() |> String.downcase(:ascii), String.trim(value)}
+        [name] -> {String.downcase(name, :ascii), true}
       end
     end
 
     defp put_max_age(acc, directives) do
-      with {:ok, raw} <- Map.fetch(directives, "max-age"),
-           {seconds, ""} <- Integer.parse(raw) do
-        Keyword.put(acc, :max_age, seconds)
-      else
-        _other -> acc
+      case Map.fetch(directives, "max-age") do
+        {:ok, raw} ->
+          case max_age_seconds(raw) do
+            {:ok, seconds} -> Keyword.put(acc, :max_age, seconds)
+            :error -> Keyword.put(acc, :max_age, 0)
+          end
+
+        :error ->
+          acc
       end
+    end
+
+    defp max_age_seconds(raw) when is_binary(raw) do
+      value =
+        case Regex.run(~r/\A"([0-9]+)"\z/, raw) do
+          [_quoted, value] -> value
+          _ -> raw
+        end
+
+      delta_seconds(value)
+    end
+
+    defp max_age_seconds(_raw), do: :error
+
+    defp delta_seconds(value) do
+      if Regex.match?(~r/\A[0-9]+\z/, value),
+        do: {:ok, String.to_integer(value)},
+        else: :error
     end
 
     defp put_flag(acc, _key, false), do: acc
@@ -484,14 +549,23 @@ if Code.ensure_loaded?(Req) do
 
     defp put_age(acc, %Req.Response{} = resp) do
       case Req.Response.get_header(resp, "age") do
-        [value] ->
-          case Integer.parse(value) do
-            {seconds, ""} when seconds >= 0 -> Keyword.put(acc, :age, seconds)
-            _ -> acc
+        [value | _rest] ->
+          first = value |> String.split(",", parts: 2) |> hd() |> String.trim()
+
+          case delta_seconds(first) do
+            {:ok, seconds} -> Keyword.put(acc, :age, seconds)
+            :error -> acc
           end
 
         _ ->
           acc
+      end
+    end
+
+    defp put_date(acc, %Req.Response{} = resp) do
+      case Req.Response.get_header(resp, "date") do
+        [value | _rest] -> Keyword.put(acc, :date, value)
+        _ -> acc
       end
     end
 

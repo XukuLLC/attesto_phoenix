@@ -15,16 +15,24 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
   `Attesto.ClientIdMetadata.validate_document/2` succeeds), and freshness is
   re-checked on read against the stored `expires_at`, so an expired entry is a
   `:miss` and is evicted in passing - never served stale.
+
+  Serialized writes atomically prune expired entries and retain at most
+  `:cache_max_entries` records (default 1,024), evicting earliest expiries first.
+  Each serialized URL and metadata record, including attached remote keys,
+  must fit `:cache_max_record_bytes` (default 16 KiB). Default retained payload
+  is therefore at most 16 MiB; ETS and Elixir term overhead is additional.
   """
 
   @behaviour AttestoPhoenix.ClientIdMetadata.Cache
 
   alias AttestoPhoenix.ClientIdMetadata.Cache
+  alias AttestoPhoenix.ClientIdMetadata.CacheCapacity
   alias AttestoPhoenix.Store.ETSOwner
 
   @table :attesto_phoenix_client_id_metadata
 
   @table_options [:set, :public, :named_table, read_concurrency: true]
+  @key_expiry_match [{{:"$1", :_, :"$2"}, [], [{{:"$1", :"$2"}}]}]
 
   @doc """
   Resolves a live cached document for a CIMD `client_id` URL.
@@ -67,11 +75,74 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
   entry for the same `url` (`:ets.insert/2` replaces a set row), keyed by URL.
   """
   @impl Cache
-  @spec put(String.t(), map(), DateTime.t()) :: :ok
+  @spec put(String.t(), map(), DateTime.t()) :: :ok | {:error, :too_large}
   def put(url, metadata, %DateTime{} = expires_at) when is_binary(url) and is_map(metadata) do
+    metadata = Cache.metadata_only(metadata)
+
+    if CacheCapacity.fits?(url, metadata) do
+      bounded_put(url, metadata, expires_at)
+    else
+      {:error, :too_large}
+    end
+  end
+
+  defp bounded_put(url, metadata, expires_at) do
     ensure_table()
-    true = :ets.insert(@table, {url, metadata, DateTime.to_unix(expires_at)})
+
+    case :global.trans({{__MODULE__, :capacity}, self()}, fn -> locked_put(url, metadata, expires_at) end, [node()]) do
+      :ok -> :ok
+      :aborted -> raise "CIMD cache write could not acquire its capacity lock"
+    end
+  end
+
+  defp locked_put(url, metadata, expires_at) do
+    prune_expired()
+    # Remove the previous value before counting, so replacement consumes no
+    # extra slot. Serializing writes makes eviction+insertion one operation.
+    :ets.delete(@table, url)
+
+    if DateTime.to_unix(expires_at) > System.system_time(:second) do
+      make_room(CacheCapacity.limit())
+      true = :ets.insert(@table, {url, metadata, DateTime.to_unix(expires_at)})
+    end
+
     :ok
+  end
+
+  defp prune_expired do
+    :ets.select_delete(@table, [{{:"$1", :"$2", :"$3"}, [{:"=<", :"$3", System.system_time(:second)}], [true]}])
+  end
+
+  defp make_room(capacity) do
+    excess = :ets.info(@table, :size) - capacity + 1
+
+    if excess > 0 do
+      keepers =
+        entry_batches()
+        |> Enum.reduce([], fn batch, keepers -> keep_latest(batch, keepers, capacity) end)
+        |> MapSet.new(fn {url, _expiry} -> url end)
+
+      Enum.each(entry_batches(), fn batch -> evict_except(batch, keepers) end)
+    end
+  end
+
+  defp keep_latest(batch, keepers, capacity) do
+    (batch ++ keepers)
+    |> Enum.sort_by(fn {url, expiry} -> {expiry, url} end, :desc)
+    |> Enum.take(capacity - 1)
+  end
+
+  defp entry_batches do
+    Stream.unfold(:ets.select(@table, @key_expiry_match, 256), fn
+      :"$end_of_table" -> nil
+      {entries, continuation} -> {entries, :ets.select(continuation)}
+    end)
+  end
+
+  defp evict_except(batch, keepers) do
+    Enum.each(batch, fn {url, _expiry} ->
+      if not MapSet.member?(keepers, url), do: :ets.delete(@table, url)
+    end)
   end
 
   @impl Cache
@@ -86,9 +157,13 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
       {:>, :"$2", System.system_time(:second)}
     ]
 
-    case :ets.select_replace(@table, [{{url, :"$1", :"$2"}, guards, [{:const, replacement}]}]) do
-      1 -> :ok
-      0 -> :stale
+    if CacheCapacity.fits?(url, elem(replacement, 1)) do
+      case :ets.select_replace(@table, [{{url, :"$1", :"$2"}, guards, [{:const, replacement}]}]) do
+        1 -> :ok
+        0 -> :stale
+      end
+    else
+      {:error, :too_large}
     end
   end
 

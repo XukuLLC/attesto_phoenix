@@ -3,11 +3,13 @@ defmodule AttestoPhoenix.Application do
 
   use Application
 
+  alias AttestoPhoenix.ClientIdMetadata.FlowControl
   alias AttestoPhoenix.Store.Sweeper.Liveness
 
   @impl true
   def start(_type, _args) do
     children = [
+      {FlowControl, name: FlowControl},
       # Liveness lookups for the public API come from this registry so
       # a diagnostics outage cannot change their answers.
       Liveness,

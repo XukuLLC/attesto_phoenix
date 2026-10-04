@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1] - 2026-10-04
+
+### Security
+
+- Enforce each client's registered authentication method before verifying its
+  credentials across token, PAR, introspection, revocation, device authorization,
+  and CIBA endpoints. Basic and POST must match exactly. Hosts with confidential
+  clients must provide `:client_auth_method`
+  or `ClientStore.client_auth_method/1` using trusted registration data; absent,
+  unknown, or malformed method data fails closed. See the
+  [3.4.1 upgrade guide](guides/upgrade_3_4_1_security.md).
+- Issue client secrets only for secret-based authentication methods, removing
+  unintended secrets from private-key JWT, mTLS, and attestation registrations.
+  Existing secrets cannot authenticate a client registered for another method.
+- Allow registered private-key JWT, mTLS, and attestation clients to revoke
+  tokens with their own credentials, under the configured method allowlist,
+  rather than requiring an unrelated client secret. Preserve wallet Challenge
+  and fresh-attestation errors for authenticated retries.
+- Bound CIMD and remote-JWKS outbound concurrency, request rates, concurrent
+  resolution followers, failure backoff, and built-in ETS/Ecto cache capacity.
+  Concurrent identical requests share one resolution. Built-in caches evict
+  expired and earliest-expiring records and limit serialized record sizes.
+- Resolve enabled CIMD URL identifiers through their validated documents for
+  secret authentication too, preventing fallback to a colliding registry secret.
+- Discard origin-supplied internal key-cache annotations before storing or
+  returning client metadata. CIMD-enabled hosts must invalidate persisted
+  metadata/key caches during upgrade; old freshness cannot be corrected
+  without the original response headers.
+- Canonicalize hostname allowlists and denylists using lowercase IDNA ASCII
+  names and remove one terminal DNS root dot before comparison and resolution.
+  Preserve DNS/IP pinning and private-address screening.
+- Account for HTTP response age when caching client metadata, including `Age`
+  and apparent age from `Date`, transport delay, and local residence time.
+  Parse duplicate and malformed freshness headers conservatively and honor
+  quoted directive values. Explicit freshness is never extended by the
+  configured fallback TTL; `no-cache` and `no-store` remain uncached.
+
+### Fixed
+
+- Refresh the development/test dependency lock to the published Attesto 2.2.1,
+  satisfying the package's existing minimum core requirement.
+
 ## [3.4.0] - 2026-10-03
 
 ### Changed

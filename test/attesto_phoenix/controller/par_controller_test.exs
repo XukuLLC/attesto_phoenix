@@ -80,8 +80,9 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     end
   end
 
-  setup do
+  setup context do
     PARStore.reset()
+    registered_auth_method = context[:registered_auth_method] || :client_secret_basic
 
     put_config(
       issuer: "https://issuer.example",
@@ -98,6 +99,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       end,
       load_principal: fn _ -> {:error, :not_found} end,
       client_id: fn client -> client.id end,
+      client_auth_method: fn _client -> registered_auth_method end,
       # RFC 9126 §2.1 step 3: the PAR endpoint validates the pushed request as
       # the authorization endpoint would, so the client's registered redirect
       # URIs must resolve for the exact-match check (RFC 6749 §3.1.2.3).
@@ -188,6 +190,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["redirect_uri"] == "https://client.example/cb"
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "uses the default ETS PAR store for private_key_jwt when par_store is unset" do
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
     client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -222,6 +225,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     refute Map.has_key?(stored, "client_assertion_type")
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "stores a pushed authorization request authenticated with private_key_jwt" do
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
     client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -247,6 +251,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     refute Map.has_key?(stored, "client_assertion_type")
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "rejects a weak PS256 private_key_jwt under the default FAPI policy" do
     client_key = JOSE.JWK.generate_key({:rsa, 1024})
     client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
@@ -382,6 +387,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert JSON.decode!(conn.resp_body)["error"] == "invalid_dpop_proof"
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "accepts private_key_jwt assertion audience set to issuer" do
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
     client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -402,6 +408,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert conn.status == 201
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "rejects a private_key_jwt assertion audienced to the PAR endpoint URL (FAPI: issuer only)" do
     # FAPI 2.0 §5.3.2.1 requires the client-assertion `aud` to be the issuer
     # identifier; the concrete endpoint URL must NOT be accepted (conformance
@@ -429,6 +436,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "rejects private_key_jwt assertion audience that is neither the issuer nor the endpoint" do
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
     client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -450,6 +458,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "rejects replayed private_key_jwt assertions" do
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
     client_jwks = %{"keys" => [public_jwk(client_key)]}
@@ -482,6 +491,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert JSON.decode!(second.resp_body)["error"] == "invalid_client"
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "rejects client_secret_basic when configured for private_key_jwt only" do
     put_config(token_endpoint_auth_methods_supported: ["private_key_jwt"])
 
@@ -498,6 +508,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
   end
 
+  @tag registered_auth_method: :private_key_jwt
   test "allows private_key_jwt when configured for private_key_jwt only" do
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
     client_jwks = %{"keys" => [public_jwk(client_key)]}

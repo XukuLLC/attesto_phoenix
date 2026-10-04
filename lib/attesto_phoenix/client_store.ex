@@ -8,7 +8,7 @@ defmodule AttestoPhoenix.ClientStore do
   host implements this behaviour and wires each callback into
   `AttestoPhoenix.Config` as an anonymous function, a `{module, function}`
   pair, or a `{module, function, extra_args}` triple. This module is the
-  contract those Config keys install; it is the recommended production shape
+  contract those Config keys install; it is the recommended production arrangement
   but the wiring is unchanged from passing the callbacks individually.
 
   Each `@callback` corresponds to the identically named `AttestoPhoenix.Config`
@@ -18,6 +18,7 @@ defmodule AttestoPhoenix.ClientStore do
     * `verify_client_secret/2` (`:verify_client_secret`, required)
     * `client_id/1` (`:client_id`)
     * `client_jwks/1` (`:client_jwks`)
+    * `client_auth_method/1` (`:client_auth_method`)
     * `client_mtls_metadata/1` (`:client_mtls_metadata`)
     * `client_redirect_uris/1` (`:client_redirect_uris`)
     * `client_public?/1` (`:client_public?`)
@@ -64,6 +65,34 @@ defmodule AttestoPhoenix.ClientStore do
   client that does not authenticate with a signed assertion.
   """
   @callback client_jwks(client()) :: map() | nil
+
+  @doc """
+  The client's exact registered token-endpoint authentication method.
+
+  Return the trusted registry's `token_endpoint_auth_method`, as a string or
+  atom, optionally wrapped in `{:ok, method}`. The same method is required at
+  token, PAR, introspection, device, CIBA, and revocation endpoints before
+  credentials are verified. `client_secret_basic` and `client_secret_post`
+  are distinct registrations. When registration omitted this member, persist
+  or explicitly return the RFC 7591 §2 / OIDC Registration §2 default,
+  `"client_secret_basic"`.
+
+  `nil`, errors and malformed results deny authentication. Never derive this
+  value from request parameters, headers, or whichever credentials the client
+  presented. Persist the registration controller's validated
+  `token_endpoint_auth_method` and read it back here:
+
+      def client_auth_method(client), do: client.token_endpoint_auth_method
+
+  Every opaque confidential client must expose this callback. A server-wide
+  method allowlist cannot establish a client's registration, even when it
+  contains only one method. Without the callback, only an explicitly public
+  client (`none`) can authenticate. Existing deployments must add the callback
+  when upgrading. A fixed-method host may explicitly return its trusted method
+  for clients whose registrations the host controls.
+  """
+  @callback client_auth_method(client()) ::
+              String.t() | atom() | {:ok, String.t() | atom()} | nil | {:error, term()}
 
   @doc """
   The client's RFC 8705 mutual-TLS authentication registration metadata.
@@ -219,6 +248,7 @@ defmodule AttestoPhoenix.ClientStore do
 
   @optional_callbacks client_id: 1,
                       client_jwks: 1,
+                      client_auth_method: 1,
                       client_mtls_metadata: 1,
                       client_redirect_uris: 1,
                       client_public?: 1,

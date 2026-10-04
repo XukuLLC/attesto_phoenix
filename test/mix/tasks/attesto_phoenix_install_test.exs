@@ -752,6 +752,7 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert config =~ "schema_prefix:"
       assert config =~ "code_store: AttestoPhoenix.Store.EctoCodeStore"
       assert config =~ "load_client: {Test.AuthZ.ClientStore, :load_client}"
+      assert config =~ "client_auth_method: {Test.AuthZ.ClientStore, :client_auth_method}"
 
       runtime_config = source_content(applied, @runtime_config_path)
       assert runtime_config =~ "ATTESTO_REFRESH_SUCCESSOR_SECRET"
@@ -779,6 +780,8 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert client_store =~ "@behaviour AttestoPhoenix.ClientStore"
       assert client_store =~ "def load_client(_arg1) do"
       assert client_store =~ "def verify_client_secret(_arg1, _arg2) do"
+      assert client_store =~ "def client_auth_method(_arg1) do"
+      assert client_store =~ "implement client_auth_method/1"
 
       principal_store = source_content(applied, @principal_store_path)
       assert principal_store =~ "def principal_kinds() do"
@@ -2072,6 +2075,75 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
   end
 
   describe "re-run idempotency" do
+    test "upgrades an older client store with a failing method stub without replacing its implementation" do
+      legacy_store = """
+      defmodule Test.AuthZ.ClientStore do
+        @behaviour AttestoPhoenix.ClientStore
+        @impl true
+        def load_client(id), do: {:ok, %{id: id}}
+        @impl true
+        def verify_client_secret(_client, _secret), do: false
+      end
+      """
+
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @client_store_path => legacy_store
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      store = source_content(applied, @client_store_path)
+      assert store =~ "def load_client(id), do: {:ok, %{id: id}}"
+      assert store =~ "def verify_client_secret(_client, _secret), do: false"
+      assert store =~ "def client_auth_method(_arg1) do"
+      [{registry, _beam}] = Code.compile_string(store)
+
+      assert_raise RuntimeError, ~r/implement client_auth_method\/1/, fn ->
+        registry.client_auth_method(%{id: "registered-client"})
+      end
+
+      assert source_content(applied, @config_path) =~
+               "client_auth_method: {Test.AuthZ.ClientStore, :client_auth_method}"
+
+      applied |> Igniter.compose_task(@task, []) |> assert_unchanged()
+    end
+
+    test "preserves an existing trusted authentication method callback" do
+      implemented_store = """
+      defmodule Test.AuthZ.ClientStore do
+        @behaviour AttestoPhoenix.ClientStore
+        @impl true
+        def load_client(id), do: {:ok, %{id: id}}
+        @impl true
+        def verify_client_secret(_client, _secret), do: false
+        @impl true
+        def client_auth_method(client), do: client.registered_method
+      end
+      """
+
+      applied =
+        test_project(
+          files: %{
+            "mix.exs" => @mix_fixture,
+            @router_path => @router_fixture,
+            @application_path => @application_fixture,
+            @client_store_path => implemented_store
+          }
+        )
+        |> Igniter.compose_task(@task, [])
+        |> apply_igniter!()
+
+      store = source_content(applied, @client_store_path)
+      assert store =~ "def client_auth_method(client), do: client.registered_method"
+      refute store =~ "implement client_auth_method/1"
+    end
+
     test "a second run on the installed project changes nothing" do
       first =
         project()

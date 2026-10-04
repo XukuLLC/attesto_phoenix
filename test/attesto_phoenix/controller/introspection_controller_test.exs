@@ -59,6 +59,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       audience: "https://issuer.test",
       keystore: Keystore,
       repo: Repo,
+      client_auth_method: fn _client -> "client_secret_basic" end,
       load_client: fn
         @client_id -> {:ok, %{id: @client_id}}
         @token_client_id -> {:ok, %{id: @token_client_id}}
@@ -324,7 +325,11 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       client_key = JOSE.JWK.generate_key({:rsa, 1024})
       client_jwks = %{"keys" => [public_jwk(client_key, "PS256")]}
 
-      opts = Keyword.put(config_opts(), :client_jwks, fn %{id: @client_id} -> client_jwks end)
+      opts =
+        config_opts()
+        |> Keyword.put(:client_jwks, fn %{id: @client_id} -> client_jwks end)
+        |> Keyword.put(:client_auth_method, fn _client -> "private_key_jwt" end)
+
       Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
 
       params = %{

@@ -7,6 +7,16 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.RevocationController
 
+  defmodule AttestationChallengeStore do
+    def issue(_ttl) do
+      challenge = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+      Process.put(__MODULE__, challenge)
+      challenge
+    end
+
+    def valid?(challenge), do: challenge == Process.get(__MODULE__)
+  end
+
   # A stub Attesto.RefreshStore that records the revoked family (and the
   # client_id revocation was bound to) so tests can assert on RFC 7009 §2.1
   # binding and the §2.2 no-existence-oracle behavior without a database.
@@ -78,6 +88,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       audience: "https://api.example.com",
       keystore: __MODULE__.Keystore,
       repo: __MODULE__.Repo,
+      client_auth_method: fn _client -> "client_secret_post" end,
       load_client: fn
         @client_id -> {:ok, %{id: @client_id}}
         _other -> {:error, :not_found}
@@ -102,6 +113,181 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       )
 
     Process.put({:record, Attesto.Secret.hash(token)}, {:ok, record})
+  end
+
+  defp assertion_config do
+    key = JOSE.JWK.generate_key({:ec, :secp256r1})
+    public_key = key |> JOSE.JWK.to_public_map() |> elem(1) |> Map.put("alg", "ES256")
+
+    config =
+      build_config(
+        token_endpoint_auth_methods_supported: ["private_key_jwt", "client_secret_basic"],
+        client_auth_method: fn _client -> "private_key_jwt" end,
+        client_jwks: fn _client -> %{"keys" => [public_key]} end,
+        replay_check: fn _key, _ttl -> :ok end,
+        verify_client_secret: fn _client, _secret ->
+          send(self(), :secret_verification_called)
+          true
+        end
+      )
+
+    {config, key}
+  end
+
+  defp assertion_params(key, audience \\ "https://issuer.test") do
+    now = System.system_time(:second)
+
+    claims = %{
+      "iss" => @client_id,
+      "sub" => @client_id,
+      "aud" => audience,
+      "iat" => now,
+      "exp" => now + 60,
+      "jti" => Integer.to_string(System.unique_integer([:positive]))
+    }
+
+    assertion =
+      key
+      |> JOSE.JWT.sign(%{"alg" => "ES256", "typ" => "client-authentication+jwt"}, claims)
+      |> JOSE.JWS.compact()
+      |> elem(1)
+
+    %{
+      "token" => @live_token,
+      "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+      "client_assertion" => assertion
+    }
+  end
+
+  defp attested_conn(config, provider, instance, challenge, expired?) do
+    now = System.system_time(:second)
+    instance_public = instance |> JOSE.JWK.to_public_map() |> elem(1)
+
+    attestation =
+      signed_proof(provider, "oauth-client-attestation+jwt", %{
+        "sub" => @client_id,
+        "iat" => now - 60,
+        "exp" => if(expired?, do: now - 1, else: now + 300),
+        "cnf" => %{"jwk" => instance_public}
+      })
+
+    pop_claims = %{
+      "aud" => config.issuer,
+      "iat" => now,
+      "jti" => Integer.to_string(System.unique_integer([:positive]))
+    }
+
+    pop_claims = if challenge, do: Map.put(pop_claims, "challenge", challenge), else: pop_claims
+
+    %{"token" => @live_token}
+    |> build_conn(config: config)
+    |> put_req_header("oauth-client-attestation", attestation)
+    |> put_req_header(
+      "oauth-client-attestation-pop",
+      signed_proof(instance, "oauth-client-attestation-pop+jwt", pop_claims)
+    )
+  end
+
+  defp signed_proof(key, typ, claims) do
+    key
+    |> JOSE.JWT.sign(%{"alg" => "ES256", "typ" => typ}, claims)
+    |> JOSE.JWS.compact()
+    |> elem(1)
+  end
+
+  test "attested revocation preserves challenge and fresh-attestation errors, and a challenged retry revokes" do
+    provider = JOSE.JWK.generate_key({:ec, :secp256r1})
+    instance = JOSE.JWK.generate_key({:ec, :secp256r1})
+    provider_public = provider |> JOSE.JWK.to_public_map() |> elem(1)
+
+    config =
+      build_config(
+        token_endpoint_auth_methods_supported: ["attest_jwt_client_auth"],
+        client_auth_method: fn _client -> "attest_jwt_client_auth" end,
+        trusted_wallet_provider_jwks: %{"keys" => [provider_public]},
+        wallet_attestation_challenge_store: AttestationChallengeStore,
+        replay_check: fn _key, _ttl -> :ok end
+      )
+
+    put_record(@live_token, %{
+      family_id: @live_family,
+      data: %{client_id: @client_id},
+      expires_at: System.system_time(:second) + 300
+    })
+
+    params = %{"token" => @live_token}
+    result = RevocationController.create(attested_conn(config, provider, instance, nil, false), params)
+    assert result.status == 400
+    assert JSON.decode!(result.resp_body)["error"] == "use_attestation_challenge"
+    assert [challenge] = get_resp_header(result, "oauth-client-attestation-challenge")
+    assert AttestationChallengeStore.valid?(challenge)
+    refute_received {:revoked, _family}
+
+    result = RevocationController.create(attested_conn(config, provider, instance, challenge, true), params)
+    assert result.status == 400
+    assert JSON.decode!(result.resp_body)["error"] == "use_fresh_attestation"
+    refute_received {:revoked, _family}
+
+    result = RevocationController.create(attested_conn(config, provider, instance, challenge, false), params)
+    assert result.status == 200
+    assert_received {:revoked, @live_family}
+  end
+
+  describe "registered private-key client revocation" do
+    test "a signed assertion revokes the client's family without any secret" do
+      {config, key} = assertion_config()
+
+      put_record(@live_token, %{
+        family_id: @live_family,
+        data: %{client_id: @client_id},
+        expires_at: System.system_time(:second) + 300
+      })
+
+      params = assertion_params(key)
+      result = RevocationController.create(build_conn(params, config: config), params)
+
+      assert result.status == 200
+      assert result.resp_body == ""
+      assert_received {:revoked, @live_family}
+      refute_received :secret_verification_called
+    end
+
+    test "a legacy secret cannot revoke for a registered private-key client" do
+      {config, _key} = assertion_config()
+
+      put_record(@live_token, %{
+        family_id: @live_family,
+        data: %{client_id: @client_id},
+        expires_at: System.system_time(:second) + 300
+      })
+
+      params = %{"token" => @live_token}
+      conn = build_conn(params, config: config, basic: {@client_id, @client_secret})
+      result = RevocationController.create(conn, params)
+
+      assert result.status == 401
+      refute_received {:revoked, _family}
+      refute_received :secret_verification_called
+    end
+
+    test "a wrong audience cannot revoke and a valid client cannot revoke another client's family" do
+      {config, key} = assertion_config()
+
+      put_record(@live_token, %{
+        family_id: @live_family,
+        data: %{client_id: "another-client"},
+        expires_at: System.system_time(:second) + 300
+      })
+
+      params = assertion_params(key, "https://another-issuer.example")
+      assert RevocationController.create(build_conn(params, config: config), params).status == 401
+      refute_received {:revoked, _family}
+
+      params = assertion_params(key)
+      assert RevocationController.create(build_conn(params, config: config), params).status == 200
+      refute_received {:revoked, _family}
+      refute_received :secret_verification_called
+    end
   end
 
   defp build_conn(params, opts) do
@@ -198,15 +384,18 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
         {conn, params} =
           case method do
             :client_secret_basic ->
-              {build_conn(base_params, basic: {@client_id, @client_secret}), base_params}
+              config = build_config(client_auth_method: fn _client -> "client_secret_basic" end)
+              {build_conn(base_params, config: config, basic: {@client_id, @client_secret}), base_params}
 
             :client_secret_post ->
               params = Map.merge(base_params, %{"client_id" => @client_id, "client_secret" => @client_secret})
-              {build_conn(params, []), params}
+              config = build_config(client_auth_method: fn _client -> "client_secret_post" end)
+              {build_conn(params, config: config), params}
 
             :client_secret_basic_with_body_credentials ->
               params = Map.merge(base_params, %{"client_id" => @client_id, "client_secret" => @client_secret})
-              {build_conn(params, basic: {@client_id, @client_secret}), params}
+              config = build_config(client_auth_method: fn _client -> "client_secret_basic" end)
+              {build_conn(params, config: config, basic: {@client_id, @client_secret}), params}
 
             :none ->
               {build_conn(base_params, []), base_params}
@@ -255,6 +444,8 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     end
 
     test "authenticates via HTTP Basic (client_secret_basic, RFC 6749 §2.3.1)" do
+      config = build_config(client_auth_method: fn _client -> "client_secret_basic" end)
+
       put_record(@live_token, %{
         family_id: @live_family,
         data: %{client_id: @client_id},
@@ -265,7 +456,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
       conn =
         params
-        |> build_conn(basic: {@client_id, @client_secret})
+        |> build_conn(config: config, basic: {@client_id, @client_secret})
         |> RevocationController.create(params)
 
       assert conn.status == 200
@@ -275,6 +466,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     test "form-decodes HTTP Basic credentials before verification" do
       cfg =
         build_config(
+          client_auth_method: fn _client -> "client_secret_basic" end,
           load_client: fn
             "client space" -> {:ok, %{id: "client space"}}
             _other -> {:error, :not_found}
@@ -528,7 +720,13 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   # native-client secret refusal used by the other credential endpoints.
   describe "native clients (RFC 8252 §8.4)" do
     defp revoke_as_native(overrides) do
-      cfg = build_config([client_native?: fn _client -> true end] ++ overrides)
+      cfg =
+        build_config(
+          [
+            client_native?: fn _client -> true end,
+            client_auth_method: fn _client -> "client_secret_post" end
+          ] ++ overrides
+        )
 
       params = %{
         "token" => @live_token,
@@ -555,7 +753,12 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     end
 
     test "a non-native client is unaffected" do
-      cfg = build_config(client_native?: fn _client -> false end, client_public?: fn _client -> true end)
+      cfg =
+        build_config(
+          client_native?: fn _client -> false end,
+          client_public?: fn _client -> true end,
+          client_auth_method: fn _client -> "client_secret_post" end
+        )
 
       params = %{
         "token" => @live_token,

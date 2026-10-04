@@ -4,6 +4,12 @@ defmodule AttestoPhoenix.ClientIdMetadataJWKSTest do
   alias AttestoPhoenix.{ClientIdMetadata, Config}
   alias AttestoPhoenix.ClientIdMetadata.Cache
   alias AttestoPhoenix.ClientIdMetadata.Cache.ETS
+  alias AttestoPhoenix.ClientIdMetadata.FlowControl
+
+  setup do
+    Process.put(FlowControl, start_supervised!({FlowControl, []}))
+    :ok
+  end
 
   defmodule Fetcher do
     def preflight(uri, opts) do
@@ -34,7 +40,12 @@ defmodule AttestoPhoenix.ClientIdMetadataJWKSTest do
       issuer: "https://issuer.example",
       keystore: Fetcher,
       repo: Fetcher,
-      client_id_metadata: [fetcher: Fetcher, test_pid: self(), test_keys: keys]
+      client_id_metadata: [
+        fetcher: Fetcher,
+        test_pid: self(),
+        test_keys: keys,
+        flow_control_server: Process.get(FlowControl)
+      ]
     }
 
     uri = "https://client.example/keys.json"
@@ -52,13 +63,67 @@ defmodule AttestoPhoenix.ClientIdMetadataJWKSTest do
       issuer: "https://issuer.example",
       keystore: Fetcher,
       repo: Fetcher,
-      client_id_metadata: [fetcher: Fetcher, test_pid: self(), blocked_hosts: ["blocked.example"]]
+      client_id_metadata: [
+        fetcher: Fetcher,
+        test_pid: self(),
+        blocked_hosts: ["blocked.example"],
+        flow_control_server: Process.get(FlowControl)
+      ]
     }
 
     assert {:error, :missing_client_jwks} =
              ClientIdMetadata.resolve_jwks(%{"jwks_uri" => "https://blocked.example/keys.json"}, config)
 
     refute_receive {:fetch, _}
+  end
+
+  test "remote JWK block policy screens case, root-dot and IDNA aliases before DNS or fetch" do
+    for {host, blocked} <- [
+          {"BLOCKED.Example", "blocked.example"},
+          {"blocked.example.", "Blocked.Example"},
+          {"blocked.example", "BLOCKED.Example."},
+          {"xn--bcher-kva.example", "bücher.example"},
+          {"XN--BCHER-KVA.example.", "BÜCHER.Example"}
+        ] do
+      config = %Config{
+        issuer: "https://issuer.example",
+        keystore: Fetcher,
+        repo: Fetcher,
+        client_id_metadata: [
+          fetcher: Fetcher,
+          test_pid: self(),
+          blocked_hosts: [blocked],
+          flow_control_server: Process.get(FlowControl)
+        ]
+      }
+
+      assert {:error, :missing_client_jwks} =
+               ClientIdMetadata.resolve_jwks(%{"jwks_uri" => "https://#{host}/keys.json"}, config)
+    end
+
+    refute_received {:preflight, _}
+    refute_received {:fetch, _}
+  end
+
+  test "remote JWK allow policy compares canonical names while retaining the exact URI" do
+    uri = "https://XN--BCHER-KVA.example./keys.json"
+    keys = %{"keys" => [%{"kty" => "EC", "crv" => "P-256", "x" => "x", "y" => "y"}]}
+
+    config = %Config{
+      issuer: "https://issuer.example",
+      keystore: Fetcher,
+      repo: Fetcher,
+      client_id_metadata: [
+        fetcher: Fetcher,
+        test_pid: self(),
+        test_keys: keys,
+        allowed_hosts: ["BÜCHER.example"],
+        flow_control_server: Process.get(FlowControl)
+      ]
+    }
+
+    assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(%{"jwks_uri" => uri}, config)
+    assert_received {:fetch, ^uri}
   end
 
   defp cached_client(directives \\ [max_age: 300], ttl \\ 600) do
@@ -85,6 +150,7 @@ defmodule AttestoPhoenix.ClientIdMetadataJWKSTest do
       repo: Fetcher,
       client_id_metadata: [
         fetcher: Fetcher,
+        flow_control_server: Process.get(FlowControl),
         cache: ETS,
         cache_ttl_bounds: {30, 3600},
         test_pid: self(),
@@ -179,12 +245,15 @@ defmodule AttestoPhoenix.ClientIdMetadataJWKSTest do
     {metadata, uri, keys, _, config} = cached_client()
     private = put_in(keys, ["keys", Access.at(0), "d"], "private")
 
-    for _ <- 1..2 do
-      assert {:error, :missing_client_jwks} =
-               ClientIdMetadata.resolve_jwks(metadata, with_option(config, :test_keys, private))
+    assert {:error, :missing_client_jwks} =
+             ClientIdMetadata.resolve_jwks(metadata, with_option(config, :test_keys, private))
 
-      assert_receive {:fetch, ^uri}
-    end
+    assert_receive {:fetch, ^uri}
+
+    assert {:error, :missing_client_jwks} =
+             ClientIdMetadata.resolve_jwks(metadata, with_option(config, :test_keys, private))
+
+    refute_receive {:fetch, _}
 
     assert {:ok, stored, _} = ETS.get_entry(metadata["client_id"])
     assert Cache.resolved_jwks(stored) == nil

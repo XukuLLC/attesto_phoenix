@@ -2,6 +2,39 @@ defmodule AttestoPhoenix.ClientIdMetadataTest do
   use ExUnit.Case, async: true
 
   alias AttestoPhoenix.ClientIdMetadata
+  alias AttestoPhoenix.ClientIdMetadata.HostPolicy
+
+  describe "CIMD hostname policy" do
+    test "compares lowercase IDNA names after removing one DNS root dot" do
+      for host <- ["BÜCHER.Example", "bücher.example.", "XN--BCHER-KVA.EXAMPLE."] do
+        assert {:ok, "xn--bcher-kva.example"} = HostPolicy.canonicalize(host)
+        assert {:error, :blocked_host} = HostPolicy.check(host, blocked_hosts: ["Bücher.Example."])
+        assert :ok = HostPolicy.check(host, allowed_hosts: ["xn--bcher-kva.example"])
+      end
+
+      assert {:error, :blocked_host} =
+               HostPolicy.check("sub.bücher.example", allowed_hosts: ["BÜCHER.Example."])
+    end
+
+    test "rejects invalid or repeated root dots rather than deleting every dot" do
+      for host <- ["app.example..", "app..example", ".", "", "*.example", "bad_host.example", nil] do
+        assert {:error, :invalid_host} = HostPolicy.canonicalize(host)
+        assert {:error, :blocked_host} = HostPolicy.check(host, [])
+      end
+
+      assert {:error, :blocked_host} = HostPolicy.check("app.example", blocked_hosts: ["bad_host.example"])
+      assert {:error, :blocked_host} = HostPolicy.check("app.example", blocked_hosts: nil)
+    end
+
+    test "canonicalizes IP literals without exempting them from host policy" do
+      assert {:ok, "2001:db8::1"} = HostPolicy.canonicalize("2001:DB8:0:0:0:0:0:1")
+
+      assert {:error, :blocked_host} =
+               HostPolicy.check("2001:DB8:0:0:0:0:0:1", blocked_hosts: ["2001:db8::1"])
+
+      assert {:error, :blocked_host} = HostPolicy.check("127.0.0.1", blocked_hosts: ["127.0.0.1"])
+    end
+  end
 
   describe "scopes/1" do
     test "splits a space-delimited RFC 7591 scope member into a list" do
