@@ -50,10 +50,16 @@ For CIMD-enabled deployments, invalidate persisted metadata and attached JWKS
 caches during the upgrade, after stopping older writers. Old records do not
 contain the response headers needed to correct their previous freshness, and
 the new resolver discards origin-supplied internal cache annotations. Call the
-built-in cache's `delete_all/0` for each repository/schema-prefix context,
-using `Config.with_request_config/2` for the Ecto cache; use your own
+built-in cache's `delete_all/0` for each repository/schema-prefix context;
+install that context for the Ecto cache as shown below. Use your own
 invalidation mechanism for a custom backend. The built-in
 ETS cache is empty on a fresh node; clear it explicitly for an in-place upgrade.
+
+```elixir
+AttestoPhoenix.Config.with_request_config(config, fn ->
+  AttestoPhoenix.ClientIdMetadata.Cache.Ecto.delete_all()
+end)
+```
 
 CIMD remains disabled by default. When enabled, metadata and remote JWKS share
 node-wide outbound limits: 16 concurrent requests, 4 per host, 120 requests per
