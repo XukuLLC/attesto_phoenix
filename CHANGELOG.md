@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.4.0] - 2026-10-03
 
 ### Changed
 
@@ -12,6 +12,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   their original Client Instance Key was not persisted. Revoke those families
   and authorize again. This release rejects binding an existing family on
   first use.
+- Require Attesto 2.2.0 or later within the 2.x line for the new refresh-family
+  and credential metadata APIs.
 - Load the configured VC keystore before checking its optional certificate
   callback so the first issued credential includes the available `x5c` chain.
 - Include the VC keystore's certificate chain in mdoc issuer authentication
@@ -37,9 +39,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Allow a credential callback to supply integer `:issued_at` for SD-JWT VC
   timestamp policy; reject invalid supplied values without issuing a credential.
 - Add optional absolute refresh-token family deadlines and experimental
-  refresh-token expiration metadata. Existing databases must run the additive
-  `--upgrade 3.4` migration before deploying this runtime, even when the maximum
-  lifetime option is disabled.
+  refresh-token expiration metadata. Existing Ecto installations must generate
+  `mix attesto_phoenix.gen.migration --upgrade 3.4 --repo MyApp.Repo` and run
+  `mix ecto.migrate` before deploying this runtime, even when the maximum lifetime
+  option is disabled. The migration adds nullable `family_expires_at` and
+  `attestation_jkt` columns; upgrade every refresh-token writer before issuing
+  families with fixed deadlines or Client Instance Key bindings.
 - Document RFC 10017 browser/BFF and RFC 10027 cross-device host policies.
 - Widen older CIBA notification-token columns to `TEXT` in the 3.4 migration
   so permitted 1,024-character tokens do not fail database insertion.

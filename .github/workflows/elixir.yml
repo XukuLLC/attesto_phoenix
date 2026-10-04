@@ -147,7 +147,7 @@ jobs:
 
 
   released-consumer:
-    name: Released Attesto 2.0 minimum consumer
+    name: Released Attesto 2.2 minimum consumer
     if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
@@ -164,8 +164,8 @@ jobs:
           elixir-version: "1.20.4"
           otp-version: "29.0.5"
 
-      - name: Compile minimum consumer against released Attesto 2.0.0
-        # Attesto 2.0.0 is published before the Phoenix release tag is created.
+      - name: Compile minimum consumer against released Attesto 2.2.0
+        # Attesto 2.2.0 is published before the Phoenix release tag is created.
         # This fresh job has no source opt-in or source-built artifacts.
         working-directory: integration/consumer_without_req
         run: |
@@ -177,7 +177,7 @@ jobs:
           compile_log="${RUNNER_TEMP}/attesto_phoenix_released_minimum_compile.log"
           mix deps.compile attesto_phoenix --force 2>&1 | tee "$compile_log"
           if grep -F "warning:" "$compile_log"; then
-            echo "AttestoPhoenix emitted a compiler warning against released Attesto 2.0.0" >&2
+            echo "AttestoPhoenix emitted a compiler warning against released Attesto 2.2.0" >&2
             exit 1
           fi
           mix run --no-start verify.exs
