@@ -29,7 +29,10 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTelemetryTest do
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
   alias AttestoPhoenix.TestRepo
+  alias Ecto.Adapters.SQL
   alias Ecto.Adapters.SQL.Sandbox
+
+  require Logger
 
   @moduletag :ecto
 
@@ -136,6 +139,43 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTelemetryTest do
         assert :ok = EctoCodeStore.mark_consumed("hash-private-consume", %{family_id: "fam-private-consume"})
       end)
     end
+
+    test "an unrelated sweeper warning is allowed without exposing query or private context" do
+      {private_data, sentinel} = private_grant_data()
+
+      assert_private_query_suppressed(sentinel, fn ->
+        Logger.warning(
+          "AttestoPhoenix: AttestoPhoenix.Store.Sweeper is not running; expired TTL rows will not be pruned"
+        )
+
+        assert :ok = EctoCodeStore.put(entry("hash-private-warning", private_data))
+      end)
+    end
+
+    test "a query log is still rejected alongside an unrelated warning with query telemetry disabled" do
+      assertion =
+        assert_raise ExUnit.AssertionError, fn ->
+          assert_private_query_suppressed("unused-private-sentinel", fn ->
+            Logger.warning("AttestoPhoenix: AttestoPhoenix.Store.Sweeper is not running")
+            SQL.query!(TestRepo, "SELECT 1", [], telemetry_event: nil, log: :debug)
+          end)
+        end
+
+      assert assertion.message == "protected EctoCodeStore operation emitted SQL Logger output"
+    end
+
+    test "private context is rejected even in a warning without SQL query output" do
+      {_private_data, sentinel} = private_grant_data()
+
+      for private_value <- [sentinel, PrivateContext.claims_key()] do
+        assertion =
+          assert_raise ExUnit.AssertionError, fn ->
+            assert_private_query_suppressed(sentinel, fn -> Logger.warning("private context: " <> private_value) end)
+          end
+
+        assert assertion.message == "private context appeared in SQL Logger output"
+      end
+    end
   end
 
   defp grant_data(overrides) do
@@ -186,11 +226,11 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTelemetryTest do
 
       refute_received {:ecto_code_store_query, ^event_ref, _metadata}
 
-      if String.contains?(log, sentinel) do
+      if String.contains?(log, [sentinel, PrivateContext.claims_key()]) do
         flunk("private context appeared in SQL Logger output")
       end
 
-      if log != "" do
+      if Regex.match?(~r/\bQUERY (?:OK|ERROR)\b/, log) or String.contains?(log, Authorization.__schema__(:source)) do
         flunk("protected EctoCodeStore operation emitted SQL Logger output")
       end
     after
