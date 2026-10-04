@@ -222,15 +222,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
             {true, [config.issuer]}
 
           :backchannel_authentication ->
-            audiences =
-              if is_nil(config.client_assertion_audiences) do
-                Config.client_assertion_audiences(config) ++
-                  [Config.backchannel_authentication_endpoint_url(config)]
-              else
-                Config.client_assertion_audiences(config)
-              end
-
-            {false, audiences}
+            {false, backchannel_assertion_audiences(config)}
 
           :revocation ->
             {false, []}
@@ -255,6 +247,16 @@ defmodule AttestoPhoenix.ClientAuthentication do
         basic_precedence: basic_precedence,
         honor_configured_methods: honor_configured_methods
       }
+    end
+
+    defp backchannel_assertion_audiences(config) do
+      audiences = Config.client_assertion_audiences(config)
+
+      if is_nil(config.client_assertion_audiences) do
+        audiences ++ [Config.backchannel_authentication_endpoint_url(config)]
+      else
+        audiences
+      end
     end
   end
 

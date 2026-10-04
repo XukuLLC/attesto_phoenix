@@ -594,13 +594,17 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
     non_empty_binary?(value(context, :subject)) and
       Scope.valid_list?(value(context, :scope)) and
       is_list(value(context, :resource)) and Enum.all?(value(context, :resource), &non_empty_binary?/1) and
-      valid_optional_binary?(value(context, :client_id)) and
-      valid_optional_jkt?(value(context, :dpop_jkt)) and
-      valid_optional_binary?(value(context, :acr)) and
-      valid_optional_integer?(value(context, :auth_time)) and
+      valid_optional_authentication_context?(context) and
       valid_optional_family_deadline?(context) and
       valid_optional_attestation_binding?(context) and
       valid_claims?(value(context, :claims))
+  end
+
+  defp valid_optional_authentication_context?(context) do
+    valid_optional_binary?(value(context, :client_id)) and
+      valid_optional_jkt?(value(context, :dpop_jkt)) and
+      valid_optional_binary?(value(context, :acr)) and
+      valid_optional_integer?(value(context, :auth_time))
   end
 
   defp exact_context_keys?(context, :atoms) do

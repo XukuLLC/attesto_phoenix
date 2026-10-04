@@ -1221,10 +1221,11 @@ defmodule AttestoPhoenix.Config do
     reject_malformed_prefix_keys!(opts)
     reject_legacy_table_prefix!(opts)
 
-    # Validate this raw input before struct construction so malformed prefixes
-    # are still rejected even though the validated `t()` field is typed as
-    # `String.t() | nil`.
+    # Validate raw input before struct construction so malformed values are
+    # still rejected even though `t()` describes only validated field types.
     validate_schema_prefix!(Map.get(opts, :schema_prefix))
+    validate_refresh_expiration_metadata!(Map.get(opts, :refresh_token_expiration_metadata, false))
+    validate_wallet_attestation_challenge_store!(Map.get(opts, :wallet_attestation_challenge_store))
 
     __MODULE__
     |> struct!(opts)
@@ -1709,13 +1710,14 @@ defmodule AttestoPhoenix.Config do
   def vc_signing_pem(%__MODULE__{} = config), do: vc_keystore(config).signing_pem()
 
   @doc """
-  The VC signing key's X.509 certificate chain, or `nil`.
+  The VC keystore's raw X.509 certificate-chain callback value, or `nil`.
 
   A list of base64 DER certificate strings stamped as the issued credential's
   JOSE `x5c` header (HAIP), sourced from the VC keystore's optional `x5c/0`
-  callback. `nil` when the keystore does not provide one.
+  callback. `nil` when the keystore does not provide one. Credential issuance
+  validates the callback value and rejects malformed chains.
   """
-  @spec vc_signing_x5c(t()) :: [String.t()] | nil
+  @spec vc_signing_x5c(t()) :: term()
   def vc_signing_x5c(%__MODULE__{} = config) do
     keystore = vc_keystore(config)
     if Code.ensure_loaded?(keystore) and function_exported?(keystore, :x5c, 0), do: keystore.x5c()
@@ -3837,7 +3839,7 @@ defmodule AttestoPhoenix.Config do
     validate_required_par_store!(config)
     validate_refresh_rotation!(config)
     validate_dpop_nonce!(config)
-    validate_wallet_attestation_challenge_store!(config)
+    validate_wallet_attestation_challenge_store!(config.wallet_attestation_challenge_store)
     validate_key_attestation!(config)
     validate_authorization_grant_id_claim!(config)
     validate_authorization_code_private_context!(config)
@@ -4158,6 +4160,7 @@ defmodule AttestoPhoenix.Config do
         "AttestoPhoenix.Config: :refresh_token_max_lifetime must be a positive integer not exceeding 2147483647 or nil."
       )
 
+  @spec validate_refresh_expiration_metadata!(term()) :: :ok | no_return()
   defp validate_refresh_expiration_metadata!(value) when is_boolean(value), do: :ok
 
   defp validate_refresh_expiration_metadata!(_invalid),
@@ -4450,9 +4453,10 @@ defmodule AttestoPhoenix.Config do
             "issue/1 and valid?/1, or the config-aware issue/2 and valid?/2 callbacks."
   end
 
-  defp validate_wallet_attestation_challenge_store!(%__MODULE__{wallet_attestation_challenge_store: nil}), do: :ok
+  @spec validate_wallet_attestation_challenge_store!(term()) :: :ok | no_return()
+  defp validate_wallet_attestation_challenge_store!(nil), do: :ok
 
-  defp validate_wallet_attestation_challenge_store!(%__MODULE__{wallet_attestation_challenge_store: store}) do
+  defp validate_wallet_attestation_challenge_store!(store) do
     valid? =
       is_atom(store) and Code.ensure_loaded?(store) and
         (function_exported?(store, :issue, 1) or function_exported?(store, :issue, 2)) and

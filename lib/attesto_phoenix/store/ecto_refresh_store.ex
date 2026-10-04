@@ -570,8 +570,6 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
     token_hash = Map.get(child, :token_hash)
     family_id = Map.get(child, :family_id)
     generation = Map.get(child, :generation)
-    consumed = Map.get(child, :consumed)
-    consumed_at = Map.get(child, :consumed_at)
 
     cond do
       not is_binary(token_hash) or token_hash == parent_hash ->
@@ -583,7 +581,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       generation != row.generation + 1 ->
         {:error, :invalid_rotation}
 
-      consumed != false or not is_nil(consumed_at) ->
+      not child_unconsumed?(child) ->
         {:error, :invalid_rotation}
 
       child_family_deadline(child) != stored_family_deadline(row) ->
@@ -595,6 +593,10 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       true ->
         :ok
     end
+  end
+
+  defp child_unconsumed?(child) do
+    Map.get(child, :consumed) == false and is_nil(Map.get(child, :consumed_at))
   end
 
   defp validate_expiry(row, child, now) do

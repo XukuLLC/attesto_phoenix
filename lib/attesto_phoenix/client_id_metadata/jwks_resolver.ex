@@ -14,16 +14,20 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
     cache = Keyword.get(opts, :cache)
 
     if cache_supported?(cache, fetcher) do
-      with :ok <- fetcher.preflight(uri, opts) do
-        entry = current_document(cache, metadata)
-
-        case cached_keys(entry, uri) do
-          {:ok, keys} -> {:ok, keys}
-          :miss -> fetch_and_cache(fetcher, cache, metadata, uri, entry, opts)
-        end
-      end
+      resolve_cached(fetcher, cache, metadata, uri, opts)
     else
       fetch_and_cache(fetcher, cache, metadata, uri, nil, opts)
+    end
+  end
+
+  defp resolve_cached(fetcher, cache, metadata, uri, opts) do
+    with :ok <- fetcher.preflight(uri, opts) do
+      entry = current_document(cache, metadata)
+
+      case cached_keys(entry, uri) do
+        {:ok, keys} -> {:ok, keys}
+        :miss -> fetch_and_cache(fetcher, cache, metadata, uri, entry, opts)
+      end
     end
   end
 

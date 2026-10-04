@@ -15,6 +15,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController, as: Controller
   alias AttestoPhoenix.Store.EctoCIBAStore
+  alias Ecto.Adapters.SQL.Sandbox
 
   @config_key AttestoPhoenix.Config
   @path "/oauth/bc-authorize"
@@ -107,8 +108,8 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
 
   @tag :ecto
   test "ping persists the complete 1024-character notification token in PostgreSQL", %{config_opts: config_opts} do
-    owner = Ecto.Adapters.SQL.Sandbox.start_owner!(AttestoPhoenix.TestRepo, shared: true)
-    on_exit(fn -> Ecto.Adapters.SQL.Sandbox.stop_owner(owner) end)
+    owner = Sandbox.start_owner!(AttestoPhoenix.TestRepo, shared: true)
+    on_exit(fn -> Sandbox.stop_owner(owner) end)
 
     opts =
       config_opts
