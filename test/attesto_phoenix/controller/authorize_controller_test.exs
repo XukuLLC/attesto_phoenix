@@ -1446,8 +1446,45 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert location_query(conn)["error"] == "server_error"
     end
 
-    test "absent consent callback implicitly grants consent and issues a code" do
-      put_config(consent: nil)
+    test "absent consent callback implicitly grants only for an explicitly confidential client" do
+      put_config(consent: nil, client_public?: fn _client -> false end)
+
+      conn = call(valid_params())
+
+      assert conn.status == 302
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    test "a public client cannot receive implicit consent when the callback is absent" do
+      put_config(consent: nil, client_public?: fn _client -> true end)
+
+      log =
+        capture_log(fn ->
+          conn = call(valid_params())
+
+          assert conn.status == 302
+          assert location_query(conn)["error"] == "server_error"
+          refute Map.has_key?(location_query(conn), "code")
+        end)
+
+      assert log =~ "public-client authorization requires an explicit :consent callback"
+    end
+
+    test "prompt=none reports consent_required for a public client without a consent callback" do
+      put_config(consent: nil, client_public?: fn _client -> true end)
+
+      conn = call(valid_params(%{"prompt" => "none"}))
+
+      assert conn.status == 302
+      assert location_query(conn)["error"] == "consent_required"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "an explicit approval still authorizes a public client" do
+      put_config(
+        client_public?: fn _client -> true end,
+        consent: fn _conn, _request, subject -> {:consented, subject} end
+      )
 
       conn = call(valid_params())
 

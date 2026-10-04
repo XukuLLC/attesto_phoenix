@@ -53,6 +53,13 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     end
   end
 
+  defmodule FaultStore do
+    @moduledoc false
+
+    def get(_token_hash), do: {:error, :unavailable}
+    def revoke_family(_family_id), do: :ok
+  end
+
   defmodule StubEventSink do
     @behaviour AttestoPhoenix.EventSink
 
@@ -73,6 +80,8 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
   @client_id "client-123"
   @client_secret "s3cr3t"
+  @issuer "https://issuer.test"
+  @refresh_issuer_claim "urn:attesto:refresh-token:issuer"
 
   # A known refresh token whose record StubStore returns; revoking it must
   # tear down its family.
@@ -84,7 +93,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
   defp build_config(overrides) do
     base = [
-      issuer: "https://issuer.test",
+      issuer: @issuer,
       audience: "https://api.example.com",
       keystore: __MODULE__.Keystore,
       repo: __MODULE__.Repo,
@@ -105,12 +114,23 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     Config.new(Keyword.merge(base, overrides))
   end
 
-  defp put_record(token, record) do
+  defp put_record(token, record, opts \\ []) do
+    data = Map.get(record, :data, %{})
+
+    data =
+      case Keyword.get(opts, :issuer, @issuer) do
+        nil ->
+          data
+
+        issuer ->
+          claims = Map.get(data, :claims, %{})
+          Map.put(data, :claims, Map.put(claims, @refresh_issuer_claim, issuer))
+      end
+
     record =
-      Map.merge(
-        %{token_hash: Attesto.Secret.hash(token), consumed: false},
-        record
-      )
+      %{token_hash: Attesto.Secret.hash(token), consumed: false}
+      |> Map.merge(record)
+      |> Map.put(:data, data)
 
     Process.put({:record, Attesto.Secret.hash(token)}, {:ok, record})
   end
@@ -127,7 +147,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
         replay_check: fn _key, _ttl -> :ok end,
         verify_client_secret: fn _client, _secret ->
           send(self(), :secret_verification_called)
-          true
+          false
         end
       )
 
@@ -267,6 +287,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
       assert result.status == 401
       refute_received {:revoked, _family}
+      assert_received :secret_verification_called
       refute_received :secret_verification_called
     end
 
@@ -319,6 +340,74 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   describe "successful revocation (RFC 7009 §2.1)" do
+    test "shared storage isolates issuer revocation, including consumed family handles" do
+      put_record(@live_token, %{
+        family_id: @live_family,
+        consumed: true,
+        data: %{client_id: @client_id},
+        expires_at: System.system_time(:second) + 1_000
+      })
+
+      params = %{
+        "token" => @live_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      other_config =
+        build_config(
+          issuer: "https://other-issuer.test",
+          audience: "https://other-issuer.test"
+        )
+
+      conn = RevocationController.create(build_conn(params, config: other_config), params)
+      assert conn.status == 200
+      refute_received {:revoked, _family}
+
+      conn = RevocationController.create(build_conn(params, config: build_config([])), params)
+      assert conn.status == 200
+      assert_received {:revoked, @live_family}
+    end
+
+    test "a legacy unbound family is indistinguishable from unknown and is not revoked" do
+      put_record(
+        @live_token,
+        %{
+          family_id: @live_family,
+          data: %{client_id: @client_id},
+          expires_at: System.system_time(:second) + 1_000
+        },
+        issuer: nil
+      )
+
+      params = %{
+        "token" => @live_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      conn = RevocationController.create(build_conn(params, []), params)
+      assert conn.status == 200
+      assert conn.resp_body == ""
+      refute_received {:revoked, _family}
+    end
+
+    test "a refresh-store fault cannot be rendered as an RFC 7009 success" do
+      params = %{
+        "token" => @unknown_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      config = build_config(refresh_store: FaultStore)
+
+      assert_raise RuntimeError, "refresh store get/1 violated its contract", fn ->
+        RevocationController.create(build_conn(params, config: config), params)
+      end
+
+      refute_received {:event, %AttestoPhoenix.Event{name: :token_revoked}}
+    end
+
     test "honors Config.refresh_store over the legacy conn.private override" do
       params = %{
         "token" => @unknown_token,

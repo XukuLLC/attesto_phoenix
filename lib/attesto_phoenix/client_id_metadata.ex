@@ -127,10 +127,13 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   Both inline and fetched sets reject private or symmetric key material.
   Valid remote keys may be cached within the live document record, bounded by
   both HTTP freshness and the document's expiry. Evicting or replacing the
-  document also discards its remote keys. DNS and host policy are rechecked
-  before key cache hits; custom fetchers without `preflight/2` or caches without
-  the optional atomic entry API fetch keys on each request. Fetch failures,
-  invalid sets and responses marked no-store or no-cache are never cached.
+  document also discards its remote keys. The configured host allow/block policy
+  is checked before lookup, while a valid key cache hit performs no DNS lookup,
+  flow-control admission, or other outbound work. A miss is rechecked after
+  admission and then fetched under the configured fetcher's DNS and SSRF policy.
+  Caches without the optional atomic entry API fetch keys on each request.
+  Fetch failures, invalid sets, and responses marked private, no-store, or
+  no-cache are never cached.
   """
   @spec resolve_jwks(client(), Config.t()) :: {:ok, map()} | {:error, term()}
   def resolve_jwks(metadata, %Config{} = config) do

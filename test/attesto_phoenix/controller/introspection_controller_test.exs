@@ -15,6 +15,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
   @token_client_id "oauth-client-1"
   @client_secret "s3cr3t"
   @signed_media_type "application/token-introspection+jwt"
+  @refresh_issuer_claim "urn:attesto:refresh-token:issuer"
 
   defmodule Keystore do
     @moduledoc false
@@ -34,15 +35,12 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     @moduledoc false
   end
 
-  # The tokens these tests introspect are access-token JWTs; the refresh path is
-  # exercised in Attesto.IntrospectionTest. This stub just answers "unknown" so
-  # inactive cases don't fall through to the Ecto store (which needs a database).
   defmodule StubRefreshStore do
     @moduledoc false
     @behaviour Attesto.RefreshStore
 
     @impl true
-    def get(_hash), do: :error
+    def get(hash), do: Process.get({__MODULE__, hash}, :error)
     @impl true
     def insert(_entry), do: :ok
     @impl true
@@ -108,6 +106,30 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     jwt
   end
 
+  defp put_refresh_record(token, issuer) do
+    claims = if issuer, do: %{@refresh_issuer_claim => issuer}, else: %{}
+    token_hash = Attesto.Secret.hash(token)
+
+    record = %{
+      token_hash: token_hash,
+      family_id: "refresh-family",
+      generation: 0,
+      expires_at: System.system_time(:second) + 600,
+      consumed: false,
+      consumed_at: nil,
+      successor: nil,
+      data: %{
+        subject: "oc_abc123",
+        client_id: @token_client_id,
+        scope: ["documents.read"],
+        resource: [],
+        claims: claims
+      }
+    }
+
+    Process.put({StubRefreshStore, token_hash}, {:ok, record})
+  end
+
   defp call(params, headers \\ []) do
     base =
       conn(:post, "/oauth/introspect", params)
@@ -159,6 +181,34 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     test "an invalid token returns active:false", %{config: _config} do
       conn = call(%{"token" => "not-a-real-token"})
 
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
+
+    test "refresh introspection is isolated by issuer and legacy families fail closed" do
+      bound = "issuer-bound-refresh-token"
+      legacy = "legacy-unbound-refresh-token"
+      put_refresh_record(bound, "https://issuer.test")
+      put_refresh_record(legacy, nil)
+
+      conn = call(%{"token" => bound, "token_type_hint" => "refresh_token"})
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body)["active"] == true
+
+      other_opts =
+        config_opts()
+        |> Keyword.put(:issuer, "https://other-issuer.test")
+        |> Keyword.put(:audience, "https://other-issuer.test")
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, other_opts)
+
+      conn = call(%{"token" => bound, "token_type_hint" => "refresh_token"})
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, config_opts())
+
+      conn = call(%{"token" => legacy, "token_type_hint" => "refresh_token"})
       assert conn.status == 200
       assert JSON.decode!(conn.resp_body) == %{"active" => false}
     end

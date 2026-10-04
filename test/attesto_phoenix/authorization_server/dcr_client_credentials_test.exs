@@ -82,6 +82,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       verify_client_secret: fn _client, _secret -> false end,
       load_principal: fn _subject -> {:error, :not_found} end,
       register_client: fn attrs -> {:ok, attrs} end,
+      registration_enabled: true,
       scopes_supported: ["read", "write"]
     })
   end
@@ -391,7 +392,9 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
         | register_client: fn attrs ->
             send(test_pid, {:persisted_private_key_jwt_client, attrs})
             {:ok, attrs}
-          end
+          end,
+          client_auth_signing_algs: ["RS256"],
+          client_auth_enforce_fapi_alg_policy: false
       }
 
       registration_conn =

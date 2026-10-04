@@ -165,40 +165,32 @@ defmodule AttestoPhoenix.ClientIdMetadataJWKSTest do
   defp with_option(config, key, value),
     do: %{config | client_id_metadata: Keyword.put(config.client_id_metadata, key, value)}
 
-  test "caches valid keys within the document record and rechecks DNS before hits" do
+  test "caches valid keys within the document record without network work on hits" do
     {metadata, uri, keys, expiry, config} = cached_client()
     assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, config)
-    assert_receive {:preflight, ^uri}
     assert_receive {:fetch, ^uri}
+    refute_receive {:preflight, _}
     assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, config)
-    assert_receive {:preflight, ^uri}
     refute_receive {:fetch, _}
+    refute_receive {:preflight, _}
     assert {:ok, stored, ^expiry} = ETS.get_entry(metadata["client_id"])
     assert Cache.resolved_jwks(stored)["uri"] == uri
     assert {:ok, ^metadata} = ETS.get(metadata["client_id"])
     assert {:ok, ^metadata} = ClientIdMetadata.resolve(metadata["client_id"], config)
-
-    denied = with_option(config, :test_preflight, {:error, {:blocked_ip, {127, 0, 0, 1}}})
-    assert {:error, :missing_client_jwks} = ClientIdMetadata.resolve_jwks(metadata, denied)
-    assert_receive {:preflight, ^uri}
-    refute_receive {:fetch, _}
-    denied = with_option(config, :blocked_hosts, [URI.parse(uri).host])
-    assert {:error, :missing_client_jwks} = ClientIdMetadata.resolve_jwks(metadata, denied)
-    refute_receive {:preflight, _}
   end
 
-  test "custom fetchers without preflight continue working and never cache remote keys" do
+  test "custom fetchers without preflight continue working and cache validated remote keys" do
     {metadata, uri, keys, _, config} = cached_client()
     config = with_option(config, :fetcher, LegacyFetcher)
 
-    for _ <- 1..2 do
-      assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, config)
-      assert_receive {:fetch, ^uri}
-    end
+    assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, config)
+    assert_receive {:fetch, ^uri}
+    assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, config)
+    refute_receive {:fetch, _}
 
     refute_receive {:preflight, _}
     assert {:ok, stored, _} = ETS.get_entry(metadata["client_id"])
-    assert Cache.resolved_jwks(stored) == nil
+    assert Cache.resolved_jwks(stored)["uri"] == uri
   end
 
   test "bounds key freshness by HTTP max-age and document expiry, then refetches rotated keys" do

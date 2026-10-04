@@ -474,8 +474,11 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
 
   defp child_token_matches?(successor, child_hash) do
     case value(successor, :token) do
-      token when is_binary(token) and token != "" -> Attesto.Secret.hash(token) == child_hash
-      _ -> false
+      token when is_binary(token) and token != "" ->
+        Attesto.SecureCompare.equal?(Attesto.Secret.hash(token), child_hash)
+
+      _ ->
+        false
     end
   end
 

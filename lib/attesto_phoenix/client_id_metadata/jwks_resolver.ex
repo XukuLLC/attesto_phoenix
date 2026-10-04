@@ -14,37 +14,48 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
     cache = Keyword.get(opts, :cache)
 
     with {:ok, host} <- HostPolicy.canonicalize(URI.parse(uri).host) do
-      # Cache hits still perform DNS preflight. Admit that outbound work too,
-      # rather than allowing unauthenticated callers to bypass the DNS budget.
-      FlowControl.run(host, uri, {:jwks, metadata, fetcher, cache, opts}, opts, fn ->
-        do_resolve(fetcher, cache, metadata, uri, opts)
-      end)
+      resolve_cached_or_fetch(host, fetcher, cache, metadata, uri, opts)
+    end
+  end
+
+  defp resolve_cached_or_fetch(host, fetcher, cache, metadata, uri, opts) do
+    case cached_keys(cache, metadata, uri) do
+      {:ok, keys} ->
+        {:ok, keys}
+
+      {:miss, _entry} ->
+        FlowControl.run(host, uri, {:jwks, metadata, fetcher, cache, opts}, opts, fn ->
+          # A different request may have populated the cache after our first
+          # read but before admission. Recheck inside the admitted operation
+          # so that race does not trigger a redundant DNS lookup and fetch.
+          do_resolve(fetcher, cache, metadata, uri, opts)
+        end)
     end
   end
 
   defp do_resolve(fetcher, cache, metadata, uri, opts) do
-    if cache_supported?(cache, fetcher) do
-      resolve_cached(fetcher, cache, metadata, uri, opts)
-    else
-      fetch_and_cache(fetcher, cache, metadata, uri, nil, opts)
+    case cached_keys(cache, metadata, uri) do
+      {:ok, keys} -> {:ok, keys}
+      {:miss, entry} -> fetch_and_cache(fetcher, cache, metadata, uri, entry, opts)
     end
   end
 
-  defp resolve_cached(fetcher, cache, metadata, uri, opts) do
-    with :ok <- fetcher.preflight(uri, opts) do
+  defp cached_keys(cache, metadata, uri) do
+    if cache_supported?(cache) do
       entry = current_document(cache, metadata)
 
-      case cached_keys(entry, uri) do
+      case cached_entry_keys(entry, uri) do
         {:ok, keys} -> {:ok, keys}
-        :miss -> fetch_and_cache(fetcher, cache, metadata, uri, entry, opts)
+        :miss -> {:miss, entry}
       end
+    else
+      {:miss, nil}
     end
   end
 
-  defp cache_supported?(cache, fetcher) do
+  defp cache_supported?(cache) do
     Code.ensure_loaded?(cache) and function_exported?(cache, :get_entry, 1) and
-      function_exported?(cache, :put_jwks, 4) and Code.ensure_loaded?(fetcher) and
-      function_exported?(fetcher, :preflight, 2)
+      function_exported?(cache, :put_jwks, 4)
   end
 
   defp current_document(cache, %{"client_id" => client_id} = metadata) do
@@ -65,7 +76,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
 
   defp current_document(_cache, _metadata), do: nil
 
-  defp cached_keys({metadata, document_expiry}, uri) do
+  defp cached_entry_keys({metadata, document_expiry}, uri) do
     with %{"uri" => ^uri, "keys" => keys, "expires_at" => expiry} <- Cache.resolved_jwks(metadata),
          true <- is_integer(expiry) and expiry > System.system_time(:second),
          true <- expiry <= DateTime.to_unix(document_expiry),
@@ -76,7 +87,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
     end
   end
 
-  defp cached_keys(nil, _uri), do: :miss
+  defp cached_entry_keys(nil, _uri), do: :miss
 
   defp fetch_and_cache(fetcher, cache, metadata, uri, entry, opts) do
     with {:ok, %{body: body} = response} <- fetcher.fetch(uri, opts),
@@ -88,7 +99,9 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
   end
 
   defp cache_keys(cache, %{"client_id" => client_id}, uri, keys, {stored, document_expiry}, directives, opts) do
-    if not Keyword.get(directives, :no_store, false) and not Keyword.get(directives, :no_cache, false) do
+    if not Keyword.get(directives, :no_store, false) and
+         not Keyword.get(directives, :no_cache, false) and
+         not Keyword.get(directives, :private, false) do
       http_expiry = Resolver.key_cache_expires_at(directives, opts)
       expiry = min(DateTime.to_unix(document_expiry), DateTime.to_unix(http_expiry))
 

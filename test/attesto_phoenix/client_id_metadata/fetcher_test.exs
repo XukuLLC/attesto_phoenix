@@ -331,6 +331,43 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       assert cache_control[:date] == "Sun, 04 Oct 2026 12:00:00 GMT"
     end
 
+    test "parses shared-cache s-maxage and private directives", %{server: server} do
+      AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.put_resp_header("cache-control", ~s(max-age=600, s-maxage="120", private="Set-Cookie"))
+        |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
+      end)
+
+      assert {:ok, %{cache_control: directives}} = fetch_via(server)
+      assert directives[:max_age] == 600
+      assert directives[:s_maxage] == 120
+      assert directives[:private] == true
+    end
+
+    test "treats the first malformed s-maxage as zero instead of falling back to max-age", %{server: server} do
+      for header <- [
+            "s-maxage=0, s-maxage=600, max-age=600",
+            "s-maxage, max-age=600",
+            "s-maxage=invalid, max-age=600",
+            "s-maxage=-1, max-age=600",
+            "s-maxage=+600, max-age=600",
+            ~s(s-maxage="invalid", max-age=600)
+          ] do
+        AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
+          conn
+          |> Plug.Conn.put_resp_content_type("application/json")
+          |> Plug.Conn.put_resp_header("cache-control", header)
+          |> Plug.Conn.resp(200, ~s({"client_id":"#{@url}"}))
+        end)
+
+        assert {:ok, %{cache_control: directives}} = fetch_via(server)
+        assert directives[:s_maxage] == 0
+        assert directives[:max_age] == 600
+        assert_stale(directives)
+      end
+    end
+
     test "includes transport delay in remaining HTTP freshness", %{server: server} do
       AttestoPhoenix.TestHTTPServer.expect_once(server, "GET", "/cb", fn conn ->
         Process.sleep(25)

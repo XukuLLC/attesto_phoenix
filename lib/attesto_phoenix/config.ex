@@ -228,6 +228,17 @@ defmodule AttestoPhoenix.Config do
       The protocol layer injects the authenticated OAuth `client_id` claim
       required by RFC 9068; the callback may omit it or return the same value,
       but a conflicting value fails issuance.
+    * `:build_refresh_principal` - optional
+      `(client, refresh_context -> map | {:error, :invalid_grant})` live policy
+      check for refresh grants. It receives the authenticated client plus the
+      persisted issuer and subject, effective scope, resource, refresh
+      family/generation, original `acr`/`auth_time`, and authorization-session
+      `session_id`. Its returned principal is used without a second
+      `:build_principal` lookup; protocol-owned claims and the authenticated
+      `client_id` are reconciled before minting. A deliberate denial revokes the
+      refresh family before returning a generic `invalid_grant`; use it to
+      enforce subject lock/deactivation, session termination, and tenant
+      membership at refresh time.
     * `:authorization_grant_id_claim` - optional access-token claim name for a
       stable, opaque authorization-code family identifier. When configured,
       authorization-code and descendant refresh access tokens carry the
@@ -308,7 +319,11 @@ defmodule AttestoPhoenix.Config do
       identifier from the host's client struct.
     * `:client_jwks` - `(client -> jwks)`. Returns the client's trusted public
       JWK Set for `private_key_jwt` client authentication. Required only for
-      clients that authenticate with `private_key_jwt`.
+      clients that authenticate with `private_key_jwt`. If this callback
+      dereferences a dynamically registered `jwks_uri`, treat it as untrusted:
+      reject redirects, screen DNS and the connected IP, pin the approved
+      address, and enforce response size, time, and media-type limits. Ordinary
+      DCR does not automatically use the SSRF guarded CIMD fetcher.
     * `:client_redirect_uris` - `(client -> [String.t()])`. Returns the
       client's registered redirect URIs (RFC 6749 §3.1.2.2). The authorization
       endpoint exact-matches the request `redirect_uri` against this set
@@ -337,8 +352,9 @@ defmodule AttestoPhoenix.Config do
       consent-derived claims), `{:halt, conn}` to take over the connection (e.g.
       render a consent screen that re-enters the authorization endpoint), or
       `{:denied, reason}` to refuse (reported to the client as `access_denied`,
-      RFC 6749 §4.1.2.1). When unset, consent is implicitly granted for the
-      authenticated subject.
+      RFC 6749 §4.1.2.1). When unset, consent is implicitly granted only for a
+      client the host explicitly classifies as confidential. Public clients
+      require an explicit consent callback before a code can be issued.
     * `:notify_ciba_user` - `(auth_req_id, request, subject -> :ok | {:error,
       reason})`. Starts the out-of-band user-authentication step for a CIBA
       request. It runs asynchronously after the request is persisted, so the
@@ -960,6 +976,7 @@ defmodule AttestoPhoenix.Config do
     :introspection_authorize,
     :principal_kinds,
     :build_principal,
+    :build_refresh_principal,
     :authorization_grant_id_claim,
     :build_userinfo_claims,
     :build_credential,
@@ -1124,6 +1141,7 @@ defmodule AttestoPhoenix.Config do
           introspection_authorize: callback() | nil,
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
           build_principal: callback() | nil,
+          build_refresh_principal: callback() | nil,
           authorization_grant_id_claim: String.t() | nil,
           build_userinfo_claims: callback() | nil,
           build_credential: callback() | nil,
@@ -2914,6 +2932,13 @@ defmodule AttestoPhoenix.Config do
     "private_key_jwt",
     "none"
   ]
+  @supported_token_endpoint_auth_methods @default_token_endpoint_auth_methods_supported ++
+                                           [
+                                             "attest_jwt_client_auth",
+                                             "attest_jwt_client_auth_dpop",
+                                             "tls_client_auth",
+                                             "self_signed_tls_client_auth"
+                                           ]
   @wallet_attestation_auth_method "attest_jwt_client_auth"
 
   @spec grant_types_supported(t()) :: [String.t()]
@@ -3114,6 +3139,7 @@ defmodule AttestoPhoenix.Config do
     client_ciba_registration: {:client_store, :client_ciba_registration, 1},
     load_principal: {:principal_store, :load_principal, 1},
     build_principal: {:principal_store, :build_principal, 3},
+    build_refresh_principal: {:principal_store, :build_refresh_principal, 2},
     resolve_jwt_bearer_subject: {:principal_store, :resolve_jwt_bearer_subject, 1},
     authenticate_resource_owner: {:consent_policy, :authenticate_resource_owner, 3},
     consent: {:consent_policy, :consent, 3},
@@ -4042,6 +4068,20 @@ defmodule AttestoPhoenix.Config do
         end
       end
     )
+
+    case config.token_endpoint_auth_methods_supported do
+      nil ->
+        :ok
+
+      methods ->
+        unsupported = methods -- @supported_token_endpoint_auth_methods
+
+        if unsupported != [] do
+          raise ArgumentError,
+                "AttestoPhoenix.Config: :token_endpoint_auth_methods_supported contains unsupported " <>
+                  "client authentication methods: #{inspect(unsupported)}"
+        end
+    end
   end
 
   defp valid_optional_string_list?(nil), do: true

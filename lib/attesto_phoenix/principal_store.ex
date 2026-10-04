@@ -15,12 +15,34 @@ defmodule AttestoPhoenix.PrincipalStore do
     * `load_principal/1` (`:load_principal`, required)
     * `principal_kinds/0` (`:principal_kinds`)
     * `build_principal/3` (`:build_principal`)
+    * `build_refresh_principal/2` (`:build_refresh_principal`)
     * `resolve_jwt_bearer_subject/1` (`:resolve_jwt_bearer_subject`, required only
       when the ID-JAG `jwt-bearer` grant is enabled)
   """
 
   @typedoc "The host's opaque principal/subject representation."
   @type principal :: term()
+
+  @typedoc """
+  Security context for a validated and atomically rotated refresh grant.
+
+  `:scope` is the effective scope after token-endpoint policy. `:resource`,
+  `:subject`, `:issuer`, authentication context, family identity, and
+  `:session_id` come from the persisted grant rather than request parameters.
+  `:client_id` is the client identity authenticated for this token request.
+  """
+  @type refresh_context :: %{
+          required(:subject) => String.t(),
+          required(:client_id) => String.t(),
+          required(:issuer) => String.t(),
+          required(:scope) => [String.t()],
+          required(:resource) => [String.t()],
+          required(:family_id) => String.t(),
+          required(:generation) => non_neg_integer(),
+          required(:acr) => String.t() | nil,
+          required(:auth_time) => non_neg_integer() | nil,
+          required(:session_id) => String.t() | nil
+        }
 
   @doc """
   Resolve the subject/principal by its identifier during protected-resource
@@ -60,6 +82,32 @@ defmodule AttestoPhoenix.PrincipalStore do
             ) :: map()
 
   @doc """
+  Revalidate host-owned principal and session state for a refresh grant, and
+  build the principal map used without a second `build_principal/3` lookup.
+  Protocol-owned claims and the authenticated `client_id` are reconciled before
+  the map is passed to `Attesto.Token.mint/3`.
+
+  This callback runs after the refresh credential, authenticated client,
+  sender constraint, scope, resource, and rotation state have been validated
+  atomically, but before an access token is minted or the successor refresh
+  token is returned. Return a principal map to allow issuance. Return
+  `{:error, :invalid_grant}` when the subject is locked or deactivated, its
+  session is terminated, or its persisted tenant context is no longer valid.
+  A denial revokes the entire refresh family and produces a generic OAuth
+  `invalid_grant` response.
+
+  The callback receives only stable grant identifiers and authorization
+  context; it never receives either plaintext refresh token. It is optional so
+  existing installations retain their current `build_principal/3` behavior.
+  Immediate lost-response retries can invoke it again for the same family and
+  generation, so keep it side-effect-free or idempotent.
+  """
+  @callback build_refresh_principal(
+              client :: term(),
+              context :: refresh_context()
+            ) :: map() | {:error, :invalid_grant}
+
+  @doc """
   Map a validated Identity Assertion JWT Authorization Grant (ID-JAG) to a local
   subject for the `urn:ietf:params:oauth:grant-type:jwt-bearer` grant
   (`draft-ietf-oauth-identity-assertion-authz-grant-04`).
@@ -83,5 +131,8 @@ defmodule AttestoPhoenix.PrincipalStore do
   @callback resolve_jwt_bearer_subject(claims :: map()) ::
               {:ok, subject :: String.t()} | String.t() | {:error, term()}
 
-  @optional_callbacks principal_kinds: 0, build_principal: 3, resolve_jwt_bearer_subject: 1
+  @optional_callbacks principal_kinds: 0,
+                      build_principal: 3,
+                      build_refresh_principal: 2,
+                      resolve_jwt_bearer_subject: 1
 end

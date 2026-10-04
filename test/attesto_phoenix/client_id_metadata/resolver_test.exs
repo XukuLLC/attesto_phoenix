@@ -201,6 +201,65 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       assert StubFetcher.calls(agent, url) == 2
     end
 
+    test "Cache-Control private skips shared-cache writes and refetches", %{agent: agent} do
+      url = unique_url()
+      FaultCache.script(:miss, {:error, :cache_write_must_not_run})
+
+      StubFetcher.script(
+        agent,
+        url,
+        {:ok, %{body: valid_body(url), cache_control: [private: true, max_age: 3600]}}
+      )
+
+      config = resolver_config(cache: FaultCache)
+
+      assert {:ok, _client} = Resolver.resolve(url, config)
+      assert {:ok, _client} = Resolver.resolve(url, config)
+
+      assert FaultCache.put_calls() == 0
+      assert StubFetcher.calls(agent, url) == 2
+    end
+
+    test "s-maxage strictly overrides max-age for the shared document cache", %{agent: agent} do
+      url = unique_url()
+      now = ~U[2026-10-04 12:00:00Z]
+      FaultCache.script(:miss)
+
+      StubFetcher.script(
+        agent,
+        url,
+        {:ok, %{body: valid_body(url), cache_control: [s_maxage: 5, max_age: 300]}}
+      )
+
+      config = resolver_config(cache: FaultCache, clock: fn -> now end)
+
+      assert {:ok, client} = Resolver.resolve(url, config)
+      assert {^url, ^client, expiry} = FaultCache.last_put()
+      assert DateTime.compare(expiry, ~U[2026-10-04 12:00:05Z]) == :eq
+    end
+
+    test "zero or malformed s-maxage cannot fall back to a fresh max-age", %{agent: agent} do
+      now = ~U[2026-10-04 12:00:00Z]
+
+      for s_maxage <- [0, "invalid"] do
+        url = unique_url()
+        FaultCache.script(:miss, {:error, :cache_write_must_not_run})
+
+        StubFetcher.script(
+          agent,
+          url,
+          {:ok, %{body: valid_body(url), cache_control: [s_maxage: s_maxage, max_age: 300]}}
+        )
+
+        config = resolver_config(cache: FaultCache, clock: fn -> now end)
+
+        assert {:ok, _client} = Resolver.resolve(url, config)
+        assert {:ok, _client} = Resolver.resolve(url, config)
+        assert FaultCache.put_calls() == 0
+        assert StubFetcher.calls(agent, url) == 2
+      end
+    end
+
     test "a cache read error is visible and falls back to a fresh document", %{agent: agent} do
       url = unique_url()
       FaultCache.script({:error, :private_backend_detail})

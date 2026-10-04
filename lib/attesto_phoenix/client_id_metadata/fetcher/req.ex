@@ -448,16 +448,18 @@ if Code.ensure_loaded?(Req) do
 
     defp check_size(_resp, _max_bytes), do: {:error, :too_large}
 
-    # Parse the RFC 9111 freshness directives the caller clamps and stores. Only
-    # the members the resolver needs are surfaced: `max-age` / `no-store` /
-    # `no-cache` from Cache-Control, and the raw `Expires` value as a fallback.
+    # Parse the RFC 9111 freshness directives the caller clamps and stores. This
+    # is a shared cache, so `s-maxage` takes precedence over `max-age`, and a
+    # `private` response is not stored. The raw `Expires` value is the fallback.
     defp parse_cache_control(%Req.Response{} = resp) do
       directives = cache_control_directives(resp)
 
       []
-      |> put_max_age(directives)
+      |> put_delta_seconds(:max_age, "max-age", directives)
+      |> put_delta_seconds(:s_maxage, "s-maxage", directives)
       |> put_flag(:no_store, Map.has_key?(directives, "no-store"))
       |> put_flag(:no_cache, Map.has_key?(directives, "no-cache"))
+      |> put_flag(:private, Map.has_key?(directives, "private"))
       |> put_expires(resp)
       |> put_age(resp)
       |> put_date(resp)
@@ -506,12 +508,12 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    defp put_max_age(acc, directives) do
-      case Map.fetch(directives, "max-age") do
+    defp put_delta_seconds(acc, key, name, directives) do
+      case Map.fetch(directives, name) do
         {:ok, raw} ->
           case max_age_seconds(raw) do
-            {:ok, seconds} -> Keyword.put(acc, :max_age, seconds)
-            :error -> Keyword.put(acc, :max_age, 0)
+            {:ok, seconds} -> Keyword.put(acc, key, seconds)
+            :error -> Keyword.put(acc, key, 0)
           end
 
         :error ->

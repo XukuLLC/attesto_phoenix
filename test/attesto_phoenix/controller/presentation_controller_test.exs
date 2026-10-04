@@ -249,6 +249,49 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert_pending(session.id)
   end
 
+  test "direct_post.jwt rejects malformed AES-GCM segments before decryption", %{conn: conn} = ctx do
+    config = configure_response_mode(ctx.config, "direct_post.jwt")
+    ctx = %{ctx | config: config}
+    session = create_request(ctx)
+    encryption_jwk = advertised_encryption_jwk(session.id, ctx.request_jwk)
+
+    valid =
+      encrypt_response(
+        encryption_jwk,
+        JSON.encode!(%{"vp_token" => valid_vp_token(ctx, session.nonce), "state" => session.id})
+      )
+
+    [_protected, "", iv, _ciphertext, tag] = String.split(valid, ".")
+    {:ok, iv_bytes} = Base.url_decode64(iv, padding: false)
+    {:ok, tag_bytes} = Base.url_decode64(tag, padding: false)
+
+    malformed = [
+      replace_jwe_segment(valid, 1, "AA"),
+      replace_jwe_segment(valid, 2, encode64(binary_part(iv_bytes, 0, 11))),
+      replace_jwe_segment(valid, 2, encode64(iv_bytes <> <<0>>)),
+      replace_jwe_segment(valid, 4, ""),
+      replace_jwe_segment(valid, 4, encode64(binary_part(tag_bytes, 0, 15))),
+      replace_jwe_segment(valid, 4, encode64(tag_bytes <> <<0>>))
+    ]
+
+    Enum.reduce(malformed, conn, fn encrypted_response, request_conn ->
+      response = post_encrypted_response(request_conn, config, encrypted_response)
+      assert_invalid_request(response)
+      assert_pending(session.id)
+      recycle(response)
+    end)
+  end
+
+  test "direct_post.jwt rejects separator floods without globally splitting them", %{conn: conn} = ctx do
+    config = configure_response_mode(ctx.config, "direct_post.jwt")
+    session = create_request(%{ctx | config: config})
+
+    response = post_encrypted_response(conn, config, String.duplicate(".", 100_000))
+
+    assert_invalid_request(response)
+    assert_pending(session.id)
+  end
+
   test "direct_post.jwt rejects undecryptable and plaintext responses without completion",
        %{
          conn: conn
@@ -488,6 +531,15 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     |> JOSE.JWE.compact()
     |> elem(1)
   end
+
+  defp replace_jwe_segment(jwe, index, replacement) do
+    jwe
+    |> String.split(".")
+    |> List.replace_at(index, replacement)
+    |> Enum.join(".")
+  end
+
+  defp encode64(bytes), do: Base.url_encode64(bytes, padding: false)
 
   defp configure_response_mode(config, mode) do
     opts =

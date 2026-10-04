@@ -14,6 +14,14 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   alias AttestoPhoenix.{Config, OAuthError, RequestContext}
   alias Plug.Conn.Unfetched
 
+  # `response` is attacker-controlled input at a public endpoint. Bound it and
+  # parse at most four separators before JOSE performs Base64URL decoding or
+  # authenticated decryption. Presentations may be substantially larger than
+  # ordinary JWTs, so the ciphertext receives a 16 MiB total envelope while the
+  # protected header retains the hardened 256 KiB JOSE ceiling.
+  @max_compact_jwe_bytes 16 * 1_024 * 1_024
+  @max_protected_segment_bytes 256 * 1_024
+
   @doc "Verify and atomically complete an OID4VP presentation session."
   @spec create(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def create(conn, _params) do
@@ -73,13 +81,15 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     # The JWE `kid` is the presentation session id (the verifier advertised a
     # fresh, per-request encryption key keyed by it); recover that session's
     # private key to decrypt.
-    with :ok <- compact_jwe(encrypted_response),
-         :ok <- encrypted_response_algorithms(encrypted_response),
-         {:ok, kid} <- jwe_kid(encrypted_response),
+    with {:ok, segments} <- compact_jwe(encrypted_response),
+         {:ok, header} <- protected_header(segments.protected),
+         :ok <- encrypted_response_algorithms(header),
+         :ok <- encrypted_response_parameters(segments),
+         {:ok, kid} <- jwe_kid(header),
          {:ok, jwk_map} <- PresentationSession.response_encryption_jwk(store, kid),
          %JOSE.JWK{} = private_jwk <- JOSE.JWK.from_map(jwk_map),
          {plaintext, %JOSE.JWE{}} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
-         {:ok, %{} = params} <- JSON.decode(plaintext),
+         {:ok, params} <- decode_json_map(plaintext),
          {:ok, state, vp_token} <- decoded_response(params) do
       {:ok, state, vp_token}
     else
@@ -93,13 +103,48 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
   defp decrypt_response(_encrypted_response, _store), do: {:error, :malformed}
 
-  defp jwe_kid(encrypted_response) do
-    with [protected_b64 | _] <- String.split(encrypted_response, "."),
-         {:ok, json} <- Base.url_decode64(protected_b64, padding: false),
-         {:ok, %{"kid" => kid}} when is_binary(kid) and kid != "" <- JSON.decode(json) do
-      {:ok, kid}
+  defp jwe_kid(%{"kid" => kid}) when is_binary(kid) and kid != "" do
+    {:ok, kid}
+  end
+
+  defp jwe_kid(_header), do: {:error, :malformed}
+
+  defp protected_header(encoded) do
+    with {:ok, json} <- decode64(encoded),
+         {:ok, header} <- decode_json_map(json) do
+      {:ok, header}
     else
       _ -> {:error, :malformed}
+    end
+  end
+
+  defp decode_json_map(bytes) do
+    decoders = [
+      object_start: fn _old_acc -> %{} end,
+      object_push: fn key, value, object ->
+        if Map.has_key?(object, key),
+          do: throw(:duplicate_json_member),
+          else: Map.put(object, key, value)
+      end,
+      object_finish: fn object, old_acc -> {object, old_acc} end
+    ]
+
+    case JSON.decode(bytes, nil, decoders) do
+      {%{} = map, nil, ""} -> {:ok, map}
+      _other -> {:error, :malformed}
+    end
+  rescue
+    _error -> {:error, :malformed}
+  catch
+    :duplicate_json_member -> {:error, :malformed}
+  end
+
+  defp decode64(encoded) do
+    with {:ok, decoded} <- Base.url_decode64(encoded, padding: false),
+         true <- Base.url_encode64(decoded, padding: false) == encoded do
+      {:ok, decoded}
+    else
+      _other -> {:error, :malformed}
     end
   end
 
@@ -112,23 +157,35 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     end
   end
 
-  defp compact_jwe(encrypted_response) do
-    case String.split(encrypted_response, ".") do
-      [_protected, _encrypted_key, _iv, _ciphertext, _tag] -> :ok
+  defp compact_jwe(encrypted_response) when byte_size(encrypted_response) <= @max_compact_jwe_bytes do
+    with [protected, rest] <- :binary.split(encrypted_response, "."),
+         [encrypted_key, rest] <- :binary.split(rest, "."),
+         [iv, rest] <- :binary.split(rest, "."),
+         [ciphertext, tag] <- :binary.split(rest, "."),
+         :nomatch <- :binary.match(tag, "."),
+         true <- protected != "" and byte_size(protected) <= @max_protected_segment_bytes do
+      {:ok,
+       %{
+         protected: protected,
+         encrypted_key: encrypted_key,
+         iv: iv,
+         ciphertext: ciphertext,
+         tag: tag
+       }}
+    else
       _parts -> {:error, :malformed}
     end
   end
+
+  defp compact_jwe(_encrypted_response), do: {:error, :malformed}
 
   # Validate the JWE alg/enc from the compact response's protected header — the
   # first segment is base64url-encoded JSON — before decrypting, rather than
   # introspecting the decoded %JOSE.JWE{} struct.
   @accepted_response_encs ~w(A128GCM A256GCM)
 
-  defp encrypted_response_algorithms(encrypted_response) do
-    with [protected_b64 | _] <- String.split(encrypted_response, "."),
-         {:ok, json} <- Base.url_decode64(protected_b64, padding: false),
-         {:ok, %{"alg" => "ECDH-ES", "enc" => enc} = header} when enc in @accepted_response_encs <-
-           JSON.decode(json),
+  defp encrypted_response_algorithms(header) do
+    with %{"alg" => "ECDH-ES", "enc" => enc} when enc in @accepted_response_encs <- header,
          # Reject a compressed JWE (`zip`, RFC 7516 §4.1.3) BEFORE decrypting. The
          # recipient key is the per-session key we advertise to the wallet, so
          # anyone can mint a valid `direct_post.jwt`; a `zip:"DEF"` payload would
@@ -143,11 +200,28 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     end
   end
 
+  # RFC 7518 §4.6 uses direct key agreement for ECDH-ES, so the encrypted-key
+  # segment is empty. AES-GCM requires a 96-bit IV and a 128-bit authentication
+  # tag (§8.5). Validate those fixed boundaries before passing input to JOSE;
+  # this keeps correctness independent of a dependency's permissive decoder.
+  defp encrypted_response_parameters(%{encrypted_key: "", iv: iv, ciphertext: ciphertext, tag: tag})
+       when byte_size(iv) == 16 and byte_size(tag) == 22 do
+    with {:ok, iv} when byte_size(iv) == 12 <- decode64(iv),
+         {:ok, ciphertext} when byte_size(ciphertext) > 0 <- decode64(ciphertext),
+         {:ok, tag} when byte_size(tag) == 16 <- decode64(tag) do
+      :ok
+    else
+      _other -> {:error, :malformed}
+    end
+  end
+
+  defp encrypted_response_parameters(_segments), do: {:error, :malformed}
+
   defp decode_vp_token(%{} = vp_token), do: {:ok, vp_token}
 
   defp decode_vp_token(vp_token) when is_binary(vp_token) do
-    case JSON.decode(vp_token) do
-      {:ok, %{} = decoded} -> {:ok, decoded}
+    case decode_json_map(vp_token) do
+      {:ok, decoded} -> {:ok, decoded}
       _ -> {:error, :malformed}
     end
   end

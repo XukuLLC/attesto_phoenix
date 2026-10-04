@@ -63,6 +63,12 @@ defmodule AttestoPhoenix.ClientStore do
   The client's trusted public JWK Set for `private_key_jwt` client
   authentication (RFC 7523 / OpenID Connect Core §9). Returns `nil` for a
   client that does not authenticate with a signed assertion.
+
+  If the host resolves a dynamically registered `jwks_uri` here, that URI is
+  untrusted network input. The resolver must reject redirects, screen every DNS
+  result and connected IP against its outbound policy, pin the approved
+  address for the connection, and bound response bytes, time, and media type.
+  The SSRF guarded CIMD fetcher is not invoked for ordinary registered clients.
   """
   @callback client_jwks(client()) :: map() | nil
 

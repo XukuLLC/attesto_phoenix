@@ -108,6 +108,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       config =
         host_config(
           scopes_supported: ["profile", "email"],
+          registration_enabled: true,
           register_client: fn attrs -> {:ok, attrs} end
         )
 
@@ -127,6 +128,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
         host_config(
           scopes_supported: ["openid", "profile"],
           registration_default_scope: :scopes_supported,
+          registration_enabled: true,
           register_client: fn attrs -> {:ok, attrs} end
         )
 
@@ -143,6 +145,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
         host_config(
           openid_provider: false,
           scopes_supported: ["read"],
+          registration_enabled: true,
           register_client: fn attrs -> {:ok, attrs} end
         )
 
@@ -151,13 +154,14 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
 
       assert provider_metadata.status == 404
       assert registration.status == 400
-      assert decode_body(registration)["error_description"] =~ ~s(scope "openid" is unknown)
+      assert decode_body(registration)["error_description"] == "scope contains an unknown value"
     end
 
     test "normalization does not bypass host registration denial" do
       config =
         host_config(
           scopes_supported: ["profile"],
+          registration_enabled: true,
           register_client: fn _attrs -> {:error, :client_restricted} end
         )
 

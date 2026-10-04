@@ -165,7 +165,10 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     # returns `:ok` for an unknown, expired, or already-revoked token
     # (no-existence oracle, RFC 7009 §2.2), and `{:error,
     # :unauthorized_client}` when the token is bound to a different client.
-    case Revocation.revoke(refresh_store(config, conn), token, client_id: client_id) do
+    case Revocation.revoke(refresh_store(config, conn), token,
+           client_id: client_id,
+           issuer: config.issuer
+         ) do
       :ok ->
         # The token was unknown to this client OR was revoked; either way the
         # response is an indistinguishable empty 200 (no-existence oracle).

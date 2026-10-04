@@ -139,7 +139,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
              dpop_jkt: nil,
              acr: nil,
              auth_time: nil,
-             claims: %{}
+             # The fake row uses the same issuer binding as a persisted core refresh context.
+             claims: %{"urn:attesto:refresh-token:issuer" => "https://issuer.example"}
            },
            expires_at: System.system_time(:second) + 600,
            consumed: false,
@@ -386,7 +387,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
   end
 
-  if function_exported?(Attesto.RefreshStore.ETS, :rotate, 4) do
+  if Code.ensure_loaded?(Attesto.RefreshStore.ETS) and function_exported?(Attesto.RefreshStore.ETS, :rotate, 4) do
     describe "temporarily unavailable refresh rotation" do
       test "renders OAuth 503, emits the matching denial, and logs no store reason" do
         capture_events()
@@ -1270,7 +1271,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         Attesto.RefreshToken.issue(refresh_store, %{
           subject: "oc_sub-1",
           scope: ["read"],
-          client_id: "public-1"
+          client_id: "public-1",
+          issuer: "https://issuer.example"
         })
 
       put_config(
@@ -3437,7 +3439,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
             end,
             client_auth_method: fn _client -> presented_method end,
             verify_client_secret: fn client, supplied ->
-              send(test_pid, :colliding_secret_verification)
+              send(test_pid, {:colliding_secret_verification, client})
               client == legacy_client and supplied == legacy_client.secret
             end
           )
@@ -3466,7 +3468,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
           assert body(conn)["error"] == "invalid_client"
           refute_receive :colliding_registry_lookup
-          refute_receive :colliding_secret_verification
+          assert_receive {:colliding_secret_verification, :unknown_client}
+          refute_receive {:colliding_secret_verification, ^legacy_client}
         end
       end
     end

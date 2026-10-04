@@ -6,9 +6,18 @@ defmodule AttestoPhoenix.Controller do
     quote do
       use Phoenix.Controller, unquote(opts)
 
-      alias AttestoPhoenix.Config
+      alias AttestoPhoenix.{Config, DuplicateParameterGuard}
 
       def action(conn, options) do
+        conn =
+          case DuplicateParameterGuard.validate_and_forget(conn) do
+            {:ok, conn} ->
+              conn
+
+            {:error, _reason, _conn} ->
+              raise Plug.BadRequestError, message: "request contains an ambiguous parameter"
+          end
+
         config = Config.resolve!(conn)
 
         Config.with_request_config(config, fn ->

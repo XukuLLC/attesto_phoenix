@@ -73,8 +73,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       connection (e.g. render a consent screen that re-enters this endpoint), or
       `{:denied, _reason}` to refuse, which is reported back to the client as
       the RFC 6749 §4.1.2.1 `access_denied` error by redirect. When the host
-      does not supply `:consent`, consent is treated as implicitly granted for
-      the authenticated subject.
+      does not supply `:consent`, consent is treated as implicitly granted only
+      for a client the host explicitly classifies as confidential. Public
+      clients require an explicit consent callback before a code can be issued.
 
   Both callbacks may hand control back to a host-rendered page; the controller
   only proceeds to mint a code when both yield a subject. The actual login and
@@ -569,7 +570,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp interaction_error_code(:interaction_required), do: @error_interaction_required
 
   defp run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt) do
-    case consent(conn, config, request, subject) do
+    case consent(conn, config, client, request, subject) do
       {:consented, subject} ->
         issue_and_redirect(conn, config, client, request, subject, dpop_jkt)
 
@@ -594,6 +595,23 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
         error_code = if prompt_none?, do: @error_consent_required, else: @error_access_denied
         emit_error(conn, config, request, error_code)
+
+      :missing_public_client_consent ->
+        # RFC 8252 §8.6: a public client's identity cannot be established from
+        # its client_id alone, so a remembered or implicit approval can be
+        # claimed by an impersonating app. A host that serves public clients
+        # must make an explicit consent decision for each authorization request.
+        # Under prompt=none the protocol response is consent_required; on an
+        # interactive request, absence of the callback is a host configuration
+        # error because this library does not render consent UI itself.
+        emit_failure(conn, config, @error_consent_required)
+
+        if prompt_none? do
+          emit_error(conn, config, request, @error_consent_required)
+        else
+          Logger.error("public-client authorization requires an explicit :consent callback")
+          emit_error(conn, config, request, @error_server_error)
+        end
 
       _other ->
         Logger.error("consent callback returned an invalid result")
@@ -960,13 +978,20 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     }
   end
 
-  # The host consent hook. Optional: when unset, consent is implicitly granted
-  # for the authenticated subject (a deployment that wants an explicit consent
-  # screen supplies the callback).
-  defp consent(conn, config, request, subject) do
+  # The host consent hook. A confidential client may retain the historical
+  # implicit-consent behavior when the hook is absent. Public clients require
+  # an explicit decision on every request: their client_id does not authenticate
+  # the calling app, so remembered or automatic approval is vulnerable to
+  # client impersonation (RFC 8252 §8.6).
+  defp consent(conn, config, client, request, subject) do
     case Config.consent_fun(config) do
-      nil -> {:consented, subject}
-      callback -> Callback.invoke(callback, [conn, request, subject])
+      nil ->
+        if RequestPolicy.client_public?(config, client),
+          do: :missing_public_client_consent,
+          else: {:consented, subject}
+
+      callback ->
+        Callback.invoke(callback, [conn, request, subject])
     end
   end
 

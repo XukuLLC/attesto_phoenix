@@ -25,7 +25,7 @@ defmodule AttestoPhoenix.MixProject do
   @version "3.4.1"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.2.0 and < 3.0.0"
+  @attesto_requirement ">= 2.2.2 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,10 +76,10 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # The 2.0 floor is load-bearing: this package implements the atomic refresh
-  # rotation transaction and device-code decision contracts introduced by that
-  # major. Resolving an older core would leave the Ecto adapters and grant
-  # orchestration on incompatible public callbacks.
+  # The 2.2.2 floor is load-bearing: Phoenix supplies the configured issuer to
+  # the refresh issuance, rotation, introspection, and revocation APIs added in
+  # that release. Resolving an older core would silently omit the cross-issuer
+  # family boundary.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 

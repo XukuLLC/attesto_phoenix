@@ -42,6 +42,20 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     @moduledoc false
   end
 
+  defmodule CIMDProbeFetcher do
+    @moduledoc false
+
+    def preflight(uri, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:cimd_preflight, uri})
+      :ok
+    end
+
+    def fetch(uri, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:cimd_fetch, uri})
+      {:error, :unexpected_fetch}
+    end
+  end
+
   defmodule AttestationChallengeStore do
     def issue(_ttl) do
       challenge = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
@@ -105,9 +119,9 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
       config = %{
         registered_method_config(config, :private_key_jwt)
-        | verify_client_secret: fn _client, _secret ->
-            send(test_process, :secret_checked)
-            true
+        | verify_client_secret: fn client, _secret ->
+            send(test_process, {:secret_checked, client})
+            false
           end
       }
 
@@ -117,6 +131,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
         assert_generic_invalid_client(
           ClientAuthentication.authenticate(basic(@confidential.id, @confidential.secret), %{}, config, policy)
         )
+
+        assert_receive {:secret_checked, :unknown_client}
 
         assert_generic_invalid_client(
           ClientAuthentication.authenticate(
@@ -130,9 +146,42 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
             policy
           )
         )
-      end
 
-      refute_received :secret_checked
+        assert_receive {:secret_checked, :unknown_client}
+      end
+    end
+
+    test "Basic and post reject CIMD URLs without resolving them", %{config: config} do
+      test_process = self()
+
+      cimd_options =
+        Keyword.merge(config.client_id_metadata,
+          enabled: true,
+          fetcher: CIMDProbeFetcher,
+          test_pid: test_process
+        )
+
+      config = %{
+        config
+        | client_id_metadata: cimd_options,
+          verify_client_secret: fn client, _secret ->
+            send(test_process, {:secret_checked, client})
+            false
+          end
+      }
+
+      client_id = "https://client.example/client.json"
+
+      assert_generic_invalid_client(authenticate(basic(client_id, "secret"), %{}, config, allow_public: false))
+      assert_receive {:secret_checked, :unknown_client}
+
+      assert_generic_invalid_client(
+        authenticate([], %{"client_id" => client_id, "client_secret" => "secret"}, config, allow_public: false)
+      )
+
+      assert_receive {:secret_checked, :unknown_client}
+      refute_received {:cimd_preflight, _uri}
+      refute_received {:cimd_fetch, _uri}
     end
 
     test "Basic and post registrations are distinct even when both methods are supported", %{config: config} do
@@ -179,6 +228,36 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                    config,
                    Policy.for_endpoint(config, endpoint)
                  )
+      end
+    end
+
+    test "a private_key_jwt consumed at PAR is replayed at every other authentication endpoint", %{config: config} do
+      key = JOSE.JWK.generate_key({:ec, "P-256"})
+      {:ok, replay_state} = Agent.start_link(fn -> MapSet.new() end)
+
+      config = %{
+        registered_method_config(config, :private_key_jwt)
+        | client_jwks: fn @confidential -> %{"keys" => [public_jwk(key)]} end,
+          client_auth_signing_algs: Attesto.SigningAlg.fapi_algs(),
+          client_auth_enforce_fapi_alg_policy: true,
+          replay_check: fn replay_key, _ttl ->
+            Agent.get_and_update(replay_state, fn seen ->
+              if MapSet.member?(seen, replay_key),
+                do: {{:error, :replay}, seen},
+                else: {:ok, MapSet.put(seen, replay_key)}
+            end)
+          end
+      }
+
+      params = assertion_params(key, "ES256")
+
+      assert {:ok, %Result{method: :private_key_jwt}} =
+               ClientAuthentication.authenticate([], params, config, Policy.for_endpoint(config, :par))
+
+      for endpoint <- @authentication_endpoints -- [:par] do
+        assert_generic_invalid_client(
+          ClientAuthentication.authenticate([], params, config, Policy.for_endpoint(config, endpoint))
+        )
       end
     end
 

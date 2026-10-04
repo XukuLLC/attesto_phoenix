@@ -8,6 +8,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- Bind every refresh family to the configured authorization-server issuer and
+  enforce that binding before rotation, retry, introspection, or revocation.
+  This prevents cross-issuer substitution when tenants share a refresh store.
+  Pre-3.4.1 families lack the binding and require reauthorization.
+- Add an optional live refresh-principal callback with the persisted issuer,
+  subject, session, authorization context, and family identity. A denial
+  revokes the family before returning a generic `invalid_grant`.
+- Reject ambiguous duplicate query and URL-encoded form parameters, plus
+  duplicate JSON object members at every nesting level, before OAuth dispatch.
+  Preserve repeated RFC 8707 `resource` values and document the endpoint body
+  reader needed to inspect the original encoded body.
+- Harden dynamic client registration: require a JSON object and enabled runtime
+  gate; bound metadata collections and strings; validate redirect, logout,
+  RFC 8705 identity, and public JWK metadata; apply configured private-key JWT
+  algorithm policy; reject unsupported `client_secret_jwt`; and require
+  unambiguous credential and Content-Type headers.
+- Apply the RFC 7591 `authorization_code` default when `grant_types` is omitted,
+  and reject explicit JSON `null` for `grant_types`, `redirect_uris`, or `scope`
+  instead of treating a present malformed member as absent.
+- Require an explicit consent callback before a public client can complete an
+  authorization request, preventing unauthenticated first-party treatment.
+- Bound encrypted presentation JWE input and segments, reject non-canonical
+  Base64URL and duplicate protected-header members, and enforce direct ECDH,
+  IV, and authentication-tag constraints before decryption.
+- Keep CIMD/JWKS cache misses and outbound work behind request rate and
+  concurrency controls, recheck the cache after admission, honor `private` and
+  `s-maxage` cache directives, and avoid unnecessary remote JWKS work for Basic
+  or form-post client authentication.
+- Run the configured dummy `:verify_client_secret` path for registered-method
+  mismatches, compare Ecto cached refresh-successor token hashes in constant
+  time, and isolate replay namespaces across private-key JWT and
+  identity-assertion grants.
+
 - Enforce each client's registered authentication method before verifying its
   credentials across token, PAR, introspection, revocation, device authorization,
   and CIBA endpoints. Basic and POST must match exactly. Hosts with confidential
@@ -43,8 +76,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Refresh the development/test dependency lock to the published Attesto 2.2.1,
-  satisfying the package's existing minimum core requirement.
+- Merge refreshed credential authorization into persisted internal claims so
+  the original authorization-session identifier is retained.
+- Normalize client and registration errors so private values and oversized
+  attacker-controlled metadata are not reflected to logs or responses.
+
+### Changed
+
+- Require Attesto 2.2.2 or later within the 2.x line for refresh issuer binding
+  and the coordinated JOSE/parser hardening.
+- Validate an explicit `token_endpoint_auth_methods_supported` catalog at boot;
+  reject `client_secret_jwt` and unknown custom extension values rather than
+  advertising them. The documented unsupported combined attestation value
+  continues to be omitted from the effective catalog.
 
 ## [3.4.0] - 2026-10-03
 

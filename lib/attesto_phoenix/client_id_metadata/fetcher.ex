@@ -60,8 +60,11 @@ defmodule AttestoPhoenix.ClientIdMetadata.Fetcher do
 
   @doc """
   Revalidates URL and current DNS/SSRF policy without making an HTTP request.
-  Optional: remote JWKS caching is disabled for fetchers without this callback,
-  ensuring cached keys never bypass the fetcher's address policy.
+
+  Optional compatibility callback for callers that need an explicit preflight.
+  The CIMD resolver does not invoke it for remote-JWKS cache hits because a hit
+  performs no outbound work; `fetch/2` remains responsible for DNS and SSRF
+  enforcement on every cache miss.
   """
   @callback preflight(String.t(), keyword()) :: :ok | {:error, term()}
   @optional_callbacks preflight: 2

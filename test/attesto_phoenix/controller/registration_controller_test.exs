@@ -34,6 +34,7 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       verify_client_secret: fn _client, _secret -> false end,
       load_principal: fn _subject -> {:error, :not_found} end,
       register_client: fn attrs -> {:ok, attrs} end,
+      registration_enabled: true,
       openid_provider: false,
       scopes_supported: ["read", "write"]
     }
@@ -71,6 +72,30 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
   end
 
   defp body(conn), do: JSON.decode!(conn.resp_body)
+
+  defp public_ec_jwk do
+    {_metadata, public} = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_public_map()
+    public
+  end
+
+  defp public_x25519_jwk do
+    {_metadata, public} = JOSE.JWK.generate_key({:okp, :X25519}) |> JOSE.JWK.to_public_map()
+    public
+  end
+
+  defp certificate_jwks do
+    der =
+      :public_key.pkix_test_data(%{
+        root: [],
+        intermediates: [],
+        peer: [key: {:namedCurve, :secp256r1}]
+      })[:cert]
+
+    pem = :public_key.pem_encode([{:Certificate, der, :not_encrypted}])
+    {_metadata, public} = pem |> JOSE.JWK.from_pem() |> JOSE.JWK.to_public_map()
+
+    %{"keys" => [Map.put(public, "x5c", [Base.encode64(der)])]}
+  end
 
   test "draft 11 client capabilities survive registration and reject forbidden algorithms" do
     capabilities = %{
@@ -169,6 +194,64 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     end
   end
 
+  describe "registration document and RFC 7591 defaults" do
+    test "requires a JSON object instead of minting credentials for an empty or non-object document" do
+      for metadata <- [%{}, [], nil, "not-an-object"] do
+        conn = post_register(config([]), metadata)
+
+        assert conn.status == 400
+        assert body(conn)["error"] in ["invalid_client_metadata", "invalid_redirect_uri"]
+        refute Map.has_key?(body(conn), "client_id")
+        refute Map.has_key?(body(conn), "client_secret")
+        refute Map.has_key?(body(conn), "registration_access_token")
+      end
+    end
+
+    test "defaults an omitted grant_types member to authorization_code" do
+      conn =
+        post_register(config([]), %{
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 201
+      assert body(conn)["grant_types"] == ["authorization_code"]
+    end
+
+    test "does not treat an explicit null grant_types member as absent" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => nil,
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
+
+    test "does not treat explicit null redirect_uris or scope as absent" do
+      for metadata <- [
+            %{"grant_types" => ["client_credentials"], "redirect_uris" => nil},
+            %{"grant_types" => ["client_credentials"], "scope" => nil}
+          ] do
+        conn = post_register(config(registration_default_scope: ["read"]), metadata)
+        assert conn.status == 400
+      end
+    end
+
+    test "requires the registration media type" do
+      conn =
+        :post
+        |> conn(@endpoint_path, %{"redirect_uris" => ["https://client.example/callback"]})
+        |> Map.put(:scheme, :https)
+        |> Map.put(:body_params, %{"redirect_uris" => ["https://client.example/callback"]})
+        |> put_private(:attesto_phoenix_config, config([]))
+        |> RegistrationController.create(%{})
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
+  end
+
   # RFC 8252 §7.1: the FIRST redirect type prescribed for a native app is a
   # private-use URI scheme, whose canonical form carries no authority at all.
   describe "native app redirect URIs (RFC 8252 §7.1 / §7.3)" do
@@ -195,6 +278,30 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
         })
 
       assert conn.status == 201
+    end
+
+    test "rejects plain HTTP redirects except native loopback literals" do
+      for metadata <- [
+            %{
+              "grant_types" => ["authorization_code"],
+              "application_type" => "web",
+              "redirect_uris" => ["http://client.example/cb"]
+            },
+            %{
+              "grant_types" => ["authorization_code"],
+              "application_type" => "native",
+              "redirect_uris" => ["http://client.example/cb"]
+            },
+            %{
+              "grant_types" => ["authorization_code"],
+              "application_type" => "native",
+              "redirect_uris" => ["http://localhost/cb"]
+            }
+          ] do
+        conn = post_register(config([]), metadata)
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
     end
 
     defp register_native(uri) do
@@ -332,7 +439,7 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     test "only shared-secret methods issue and persist secret credentials" do
       test_process = self()
 
-      for method <- ~w(client_secret_basic client_secret_post client_secret_jwt) do
+      for method <- ~w(client_secret_basic client_secret_post) do
         registered_config =
           config(
             token_endpoint_auth_methods_supported: [method],
@@ -359,6 +466,24 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       end
     end
 
+    test "fails closed when a manually assembled config advertises client_secret_jwt" do
+      # Config.new/1 rejects this unsupported method. Build the struct through
+      # the local helper to retain controller-level defense if a host bypasses
+      # configuration construction or restores an old serialized struct.
+      conn =
+        post_register(
+          config(token_endpoint_auth_methods_supported: ["client_secret_jwt"]),
+          %{
+            "grant_types" => ["client_credentials"],
+            "token_endpoint_auth_method" => "client_secret_jwt"
+          }
+        )
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+      refute Map.has_key?(body(conn), "client_secret")
+    end
+
     test "key, certificate, attestation and public registrations have no shared-secret downgrade credential" do
       test_process = self()
       {_kty, provider_key} = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_public_map()
@@ -374,11 +499,25 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
             end
           )
 
+        method_metadata =
+          case method do
+            "private_key_jwt" -> %{"jwks" => %{"keys" => [public_ec_jwk()]}}
+            "tls_client_auth" -> %{"tls_client_auth_san_dns" => "client.example.com"}
+            "self_signed_tls_client_auth" -> %{"jwks" => certificate_jwks()}
+            _other -> %{}
+          end
+
         conn =
-          post_register(registered_config, %{
-            "grant_types" => ["client_credentials"],
-            "token_endpoint_auth_method" => method
-          })
+          post_register(
+            registered_config,
+            Map.merge(
+              %{
+                "grant_types" => ["client_credentials"],
+                "token_endpoint_auth_method" => method
+              },
+              method_metadata
+            )
+          )
 
         assert conn.status == 201
         payload = body(conn)
@@ -534,6 +673,7 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
   describe "RFC 7591 §2 metadata passthrough" do
     test "carries known client-identity metadata through to the host store and response" do
       test_pid = self()
+      jwks = %{"keys" => [public_ec_jwk()]}
 
       config =
         config(
@@ -553,7 +693,7 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
           "tos_uri" => "https://acme.example/tos",
           "policy_uri" => "https://acme.example/privacy",
           "contacts" => ["ops@acme.example"],
-          "jwks" => %{"keys" => [%{"kty" => "RSA", "kid" => "client-key"}]}
+          "jwks" => jwks
         })
 
       payload = body(conn)
@@ -565,12 +705,12 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert payload["tos_uri"] == "https://acme.example/tos"
       assert payload["policy_uri"] == "https://acme.example/privacy"
       assert payload["contacts"] == ["ops@acme.example"]
-      assert payload["jwks"] == %{"keys" => [%{"kty" => "RSA", "kid" => "client-key"}]}
+      assert payload["jwks"] == jwks
 
       assert_receive {:persisted, attrs}
       assert attrs["client_name"] == "Acme MCP"
       assert attrs["contacts"] == ["ops@acme.example"]
-      assert attrs["jwks"] == %{"keys" => [%{"kty" => "RSA", "kid" => "client-key"}]}
+      assert attrs["jwks"] == jwks
     end
 
     test "drops unknown fields and never hands them to the host store" do
@@ -639,6 +779,56 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert body(conn)["error"] == "invalid_client_metadata"
     end
 
+    test "Spring DCR regression bounds human metadata while preserving markup for escaped rendering" do
+      test_pid = self()
+      markup = ~s(<b>Acme & "Partners"</b>)
+
+      registered_config =
+        config(
+          register_client: fn attrs ->
+            send(test_pid, {:persisted_human_metadata, attrs})
+            {:ok, attrs}
+          end
+        )
+
+      metadata = %{
+        "grant_types" => ["client_credentials"],
+        "client_name" => markup,
+        "software_id" => "com.example.<client>",
+        "software_version" => "1.0 & beta"
+      }
+
+      conn = post_register(registered_config, metadata)
+
+      assert conn.status == 201, conn.resp_body
+      assert body(conn)["client_name"] == markup
+      assert body(conn)["software_id"] == metadata["software_id"]
+      assert body(conn)["software_version"] == metadata["software_version"]
+
+      assert_receive {:persisted_human_metadata, attrs}
+      assert attrs["client_name"] == markup
+    end
+
+    test "Spring DCR regression rejects malformed and oversized human metadata" do
+      invalid = [
+        {"client_name", nil},
+        {"client_name", "line one\nline two"},
+        {"software_id", <<255>>},
+        {"software_version", String.duplicate("v", 4_097)}
+      ]
+
+      for {field, value} <- invalid do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["client_credentials"],
+            field => value
+          })
+
+        assert conn.status == 400, "expected #{field}=#{inspect(value, limit: 40)} to be rejected"
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
     test "rejects a non-array contacts member" do
       conn =
         post_register(config([]), %{
@@ -659,6 +849,211 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client_metadata"
+    end
+
+    test "Spring DCR regression rejects executable schemes and malformed display URIs" do
+      invalid = [
+        {"client_uri", "javascript:alert(1)"},
+        {"logo_uri", "data:image/svg+xml,<svg/>"},
+        {"tos_uri", "file:///etc/passwd"},
+        {"policy_uri", "/relative/privacy"},
+        {"client_uri", nil},
+        {"client_uri", "https://user:password@client.example/"},
+        {"backchannel_logout_uri", "http://client.example/logout"},
+        {"backchannel_logout_uri", "https://client.example/logout#fragment"},
+        {"frontchannel_logout_uri", "http://client.example/logout"},
+        {"frontchannel_logout_uri", "https://client.example/logout#fragment"},
+        {"policy_uri", "https://client.example/%ZZ"},
+        {"policy_uri", "https:\\evil.example\\privacy"},
+        {"client_uri", "https://client.example/about\nnext"},
+        {"client_uri", "https://client.example/" <> String.duplicate("a", 2_048)}
+      ]
+
+      for {field, value} <- invalid do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["client_credentials"],
+            field => value
+          })
+
+        assert conn.status == 400, "expected #{field}=#{inspect(value, limit: 40)} to be rejected"
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
+    test "Keycloak jwks_uri regression requires an absolute clean HTTPS URL" do
+      invalid = [
+        "keys.example/jwks.json",
+        "//keys.example/jwks.json",
+        "http://keys.example/jwks.json",
+        "https:///jwks.json",
+        "https://user:secret@keys.example/jwks.json",
+        "https://keys.example/jwks.json#key",
+        "https:\\keys.example\\jwks.json"
+      ]
+
+      for jwks_uri <- invalid do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["client_credentials"],
+            "jwks_uri" => jwks_uri
+          })
+
+        assert conn.status == 400, "expected jwks_uri=#{jwks_uri} to be rejected"
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
+    test "accepts bounded web metadata fragments and private deployment hosts" do
+      metadata = %{
+        "grant_types" => ["client_credentials"],
+        "redirect_uris" => ["https://[::1]/callback"],
+        "client_uri" => "http://localhost/about?lang=en#team",
+        "logo_uri" => "https://10.0.0.5/logo.png#brand",
+        "tos_uri" => "https://service.local/terms#current",
+        "policy_uri" => "https://metadata.internal/privacy#v2",
+        "jwks_uri" => "https://keys.service.local/jwks.json",
+        "backchannel_logout_uri" => "https://127.0.0.1/backchannel",
+        "frontchannel_logout_uri" => "https://[::1]/frontchannel"
+      }
+
+      conn = post_register(config([]), metadata)
+
+      assert conn.status == 201, conn.resp_body
+
+      for field <- ~w(client_uri logo_uri tos_uri policy_uri jwks_uri backchannel_logout_uri frontchannel_logout_uri) do
+        assert body(conn)[field] == metadata[field]
+      end
+    end
+
+    test "frontchannel_logout_uri must share an origin with a registered redirect_uri" do
+      for metadata <- [
+            %{
+              "grant_types" => ["client_credentials"],
+              "frontchannel_logout_uri" => "https://client.example/logout"
+            },
+            %{
+              "grant_types" => ["authorization_code"],
+              "redirect_uris" => ["https://client.example/callback"],
+              "frontchannel_logout_uri" => "https://other.example/logout"
+            },
+            %{
+              "grant_types" => ["authorization_code"],
+              "redirect_uris" => ["https://client.example:8443/callback"],
+              "frontchannel_logout_uri" => "https://client.example/logout"
+            }
+          ] do
+        conn = post_register(config([]), metadata)
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_client_metadata"
+        assert body(conn)["error_description"] =~ "frontchannel_logout_uri"
+      end
+    end
+
+    test "frontchannel_logout_uri accepts the registered redirect origin including an explicit default port" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/callback"],
+          "frontchannel_logout_uri" => "https://client.example:443/logout"
+        })
+
+      assert conn.status == 201, conn.resp_body
+      assert body(conn)["frontchannel_logout_uri"] == "https://client.example:443/logout"
+    end
+
+    test "bounds registration metadata collections" do
+      oversized_values = [
+        {"contacts", Enum.map(1..65, &"security-#{&1}@example.com")},
+        {"client_attestation_signing_alg_values_supported", Enum.map(1..65, &"future-alg-#{&1}")},
+        {"post_logout_redirect_uris", Enum.map(1..65, &"https://client.example/logout/#{&1}")},
+        {"redirect_uris", Enum.map(1..65, &"https://client.example/callback/#{&1}")}
+      ]
+
+      for {field, values} <- oversized_values do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["client_credentials"],
+            field => values
+          })
+
+        assert conn.status == 400, "expected oversized #{field} to be rejected"
+      end
+    end
+
+    test "requires jwks and jwks_uri to be mutually exclusive" do
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["client_credentials"],
+          "jwks" => %{"keys" => [public_ec_jwk()]},
+          "jwks_uri" => "https://keys.client.example/jwks.json"
+        })
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+      assert body(conn)["error_description"] =~ "must not both be present"
+    end
+
+    test "validates inline jwks as a bounded public asymmetric JWK Set" do
+      {_metadata, private_ec} = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_map()
+      public_ec = public_ec_jwk()
+      certificate_key = certificate_jwks()["keys"] |> hd()
+      mismatched_certificate_key = Map.put(public_ec_jwk(), "x5c", certificate_key["x5c"])
+
+      invalid_sets = [
+        %{},
+        %{"keys" => [%{"kty" => "oct", "k" => Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)}]},
+        %{"keys" => [private_ec]},
+        %{"keys" => [%{"kty" => "RSA", "n" => "AQAB"}]},
+        %{"keys" => [%{"kty" => "EC", "x5c" => ["not-base64"]}]},
+        %{"keys" => [mismatched_certificate_key]},
+        %{"keys" => [Map.put(public_ec, "use", 42)]},
+        %{"keys" => [Map.put(public_ec, "alg", "ES256\nignored")]},
+        %{"keys" => [Map.put(public_ec, "key_ops", nil)]},
+        %{"keys" => [Map.put(public_ec, "key_ops", "verify")]},
+        %{"keys" => [Map.merge(public_ec, %{"alg" => "ES256", "use" => "enc"})]},
+        %{"keys" => [Map.merge(public_ec, %{"alg" => "ES256", "key_ops" => ["sign"]})]},
+        %{"keys" => [Map.merge(public_ec, %{"use" => "sig", "key_ops" => ["deriveKey"]})]},
+        %{"keys" => [Map.put(public_ec, "x5t", "AA")]},
+        %{"keys" => List.duplicate(public_ec, 17)},
+        %{"keys" => [Map.put(public_ec, "padding", String.duplicate("x", 65_536))]}
+      ]
+
+      for jwks <- invalid_sets do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["client_credentials"],
+            "jwks" => jwks
+          })
+
+        assert conn.status == 400, "expected invalid JWK Set to be rejected"
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
+    test "accepts empty, future public, signing, encryption-only, and certificate-bearing JWKs" do
+      encryption_key =
+        public_x25519_jwk()
+        |> Map.merge(%{"use" => "enc", "alg" => "ECDH-ES", "key_ops" => ["deriveKey"]})
+
+      future_public_key = %{"kty" => "future-public-key", "kid" => "future-1"}
+
+      for jwks <- [
+            %{"keys" => []},
+            %{"keys" => [future_public_key]},
+            %{"keys" => [public_ec_jwk()]},
+            %{"keys" => [encryption_key]},
+            certificate_jwks()
+          ] do
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["client_credentials"],
+            "jwks" => jwks
+          })
+
+        assert conn.status == 201, conn.resp_body
+        assert body(conn)["jwks"] == jwks
+      end
     end
 
     test "carries the logout metadata (Back-Channel §3 + Front-Channel §2 + RP-Initiated §3) through" do
@@ -718,6 +1113,167 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client_metadata"
+    end
+  end
+
+  describe "RFC 8705 registration metadata" do
+    test "tls_client_auth accepts each identity field individually" do
+      identities = %{
+        "tls_client_auth_subject_dn" => "CN=client,O=Example",
+        "tls_client_auth_san_dns" => "client.example.com",
+        "tls_client_auth_san_uri" => "spiffe://example.com/client/123",
+        "tls_client_auth_san_ip" => "192.0.2.10",
+        "tls_client_auth_san_email" => "client@example.com"
+      }
+
+      for {field, value} <- identities do
+        conn =
+          post_register(
+            config(token_endpoint_auth_methods_supported: ["tls_client_auth"]),
+            %{
+              "grant_types" => ["client_credentials"],
+              "token_endpoint_auth_method" => "tls_client_auth",
+              field => value
+            }
+          )
+
+        assert conn.status == 201, "expected #{field} to be accepted: #{conn.resp_body}"
+        assert body(conn)[field] == value
+        refute Map.has_key?(body(conn), "client_secret")
+      end
+    end
+
+    test "tls_client_auth requires exactly one non-empty bounded identity" do
+      auth_config = config(token_endpoint_auth_methods_supported: ["tls_client_auth"])
+
+      for extra <- [
+            %{},
+            %{"tls_client_auth_san_dns" => ""},
+            %{"tls_client_auth_san_dns" => "   "},
+            %{"tls_client_auth_san_dns" => "client.example.com\nother.example.com"},
+            %{"tls_client_auth_san_ip" => "999.999.999.999"},
+            %{"tls_client_auth_san_uri" => "not an absolute URI"},
+            %{"tls_client_auth_san_email" => "not-an-email"},
+            %{"tls_client_auth_subject_dn" => " CN=client,O=Example"},
+            %{"tls_client_auth_subject_dn" => String.duplicate("x", 4_097)},
+            %{
+              "tls_client_auth_san_dns" => "client.example.com",
+              "tls_client_auth_san_uri" => "spiffe://example.com/client/123"
+            }
+          ] do
+        conn =
+          post_register(
+            auth_config,
+            Map.merge(
+              %{
+                "grant_types" => ["client_credentials"],
+                "token_endpoint_auth_method" => "tls_client_auth"
+              },
+              extra
+            )
+          )
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
+    test "private_key_jwt requires a usable signing key or https jwks_uri" do
+      auth_config = config(token_endpoint_auth_methods_supported: ["private_key_jwt"])
+
+      base = %{
+        "grant_types" => ["client_credentials"],
+        "token_endpoint_auth_method" => "private_key_jwt"
+      }
+
+      signing_key = Map.merge(public_ec_jwk(), %{"use" => "sig", "alg" => "ES256", "key_ops" => ["verify"]})
+
+      encryption_key =
+        public_x25519_jwk()
+        |> Map.merge(%{"use" => "enc", "alg" => "ECDH-ES", "key_ops" => ["deriveKey"]})
+
+      for key_source <- [
+            %{"jwks" => %{"keys" => [encryption_key, signing_key]}},
+            %{"jwks_uri" => "https://keys.internal/jwks.json"}
+          ] do
+        conn = post_register(auth_config, Map.merge(base, key_source))
+        assert conn.status == 201, conn.resp_body
+        refute Map.has_key?(body(conn), "client_secret")
+      end
+
+      for key_source <- [
+            %{},
+            %{"jwks" => %{"keys" => [encryption_key]}},
+            %{"jwks" => %{"keys" => [Map.put(signing_key, "alg", "ES384")]}},
+            %{"jwks_uri" => "http://keys.internal/jwks.json"}
+          ] do
+        conn = post_register(auth_config, Map.merge(base, key_source))
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
+    test "private_key_jwt inline keys must satisfy the configured assertion algorithm policy" do
+      {_metadata, p384} = JOSE.JWK.generate_key({:ec, "P-384"}) |> JOSE.JWK.to_public_map()
+
+      metadata = %{
+        "grant_types" => ["client_credentials"],
+        "token_endpoint_auth_method" => "private_key_jwt",
+        "jwks" => %{"keys" => [Map.put(p384, "alg", "ES384")]}
+      }
+
+      default_fapi =
+        post_register(
+          config(token_endpoint_auth_methods_supported: ["private_key_jwt"]),
+          metadata
+        )
+
+      assert default_fapi.status == 400
+
+      explicit_non_fapi =
+        post_register(
+          config(
+            token_endpoint_auth_methods_supported: ["private_key_jwt"],
+            client_auth_signing_algs: ["ES384"],
+            client_auth_enforce_fapi_alg_policy: false
+          ),
+          metadata
+        )
+
+      assert explicit_non_fapi.status == 201, explicit_non_fapi.resp_body
+    end
+
+    test "self_signed_tls_client_auth requires a matching x5c key or https jwks_uri" do
+      auth_config = config(token_endpoint_auth_methods_supported: ["self_signed_tls_client_auth"])
+
+      base = %{
+        "grant_types" => ["client_credentials"],
+        "token_endpoint_auth_method" => "self_signed_tls_client_auth"
+      }
+
+      for key_source <- [
+            %{"jwks" => certificate_jwks()},
+            %{"jwks_uri" => "https://127.0.0.1/jwks.json"}
+          ] do
+        conn = post_register(auth_config, Map.merge(base, key_source))
+        assert conn.status == 201, conn.resp_body
+        refute Map.has_key?(body(conn), "client_secret")
+      end
+
+      certificate_key = certificate_jwks()["keys"] |> hd()
+      mismatched_certificate_key = Map.put(public_ec_jwk(), "x5c", certificate_key["x5c"])
+
+      for key_source <- [
+            %{},
+            %{"jwks" => %{"keys" => []}},
+            %{"jwks" => %{"keys" => [public_ec_jwk()]}},
+            %{"jwks" => %{"keys" => [mismatched_certificate_key]}},
+            %{"jwks_uri" => "file:///etc/passwd"}
+          ] do
+        conn = post_register(auth_config, Map.merge(base, key_source))
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
     end
   end
 

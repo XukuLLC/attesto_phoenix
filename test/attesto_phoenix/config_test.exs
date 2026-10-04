@@ -81,6 +81,8 @@ defmodule AttestoPhoenix.ConfigTest do
     def load_principal(_subject_id), do: {:ok, :store_principal}
     @impl AttestoPhoenix.PrincipalStore
     def build_principal(_client, subject, _scope), do: %{subject: subject}
+    @impl AttestoPhoenix.PrincipalStore
+    def build_refresh_principal(_client, context), do: %{subject: context.subject}
 
     @impl AttestoPhoenix.ScopePolicy
     def authorize_scope(_client, scope), do: {:ok, scope}
@@ -582,6 +584,14 @@ defmodule AttestoPhoenix.ConfigTest do
         end
       end
     end
+
+    test "rejects authentication methods the endpoint cannot implement" do
+      for method <- ["client_secret_jwt", "unimplemented_extension"] do
+        assert_raise ArgumentError, ~r/unsupported client authentication methods.*#{method}/, fn ->
+          config(token_endpoint_auth_methods_supported: [method])
+        end
+      end
+    end
   end
 
   describe "OID4VCI key-attestation configuration" do
@@ -762,6 +772,7 @@ defmodule AttestoPhoenix.ConfigTest do
         )
 
       assert Config.build_principal_fun(cfg) == {FullStore, :build_principal}
+      assert Config.build_refresh_principal_fun(cfg) == {FullStore, :build_refresh_principal}
       assert Config.authorize_scope_fun(cfg) == {FullStore, :authorize_scope}
       assert Config.consent_fun(cfg) == {FullStore, :consent}
 

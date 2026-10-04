@@ -49,9 +49,10 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
        and is **never** cached.
     6. **Cache + return.** Only after validation succeeds is the document stored
        via `Cache.put/3`, with an `expires_at` derived from the response's
-       `Cache-Control: max-age` / `Expires` freshness directives clamped to the
-       configured `:cache_ttl_bounds` (RFC 9111). The normalized client map is
-       returned.
+       shared-cache `Cache-Control: s-maxage` / `max-age` / `Expires`
+       freshness directives clamped to the configured `:cache_ttl_bounds`
+       (RFC 9111). `private`, `no-store`, and `no-cache` responses are not
+       stored. The normalized client map is returned.
 
   The returned client is shaped identically to a host `:load_client` result, so
   downstream resolution (scopes, redirect-URI match, JARM, DPoP) needs no
@@ -252,11 +253,16 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
     cond do
       Keyword.get(cache_control, :no_store, false) -> 0
       Keyword.get(cache_control, :no_cache, false) -> 0
+      Keyword.get(cache_control, :private, false) -> 0
+      Keyword.has_key?(cache_control, :s_maxage) -> delta_seconds_ms(cache_control[:s_maxage])
       is_integer(cache_control[:max_age]) -> cache_control[:max_age] * 1000
       is_binary(cache_control[:expires]) -> expires_ttl_ms(cache_control, received_at)
       true -> minimum * 1000
     end
   end
+
+  defp delta_seconds_ms(value) when is_integer(value) and value >= 0, do: value * 1000
+  defp delta_seconds_ms(_value), do: 0
 
   defp expires_ttl_ms(cache_control, received_at) do
     case parse_http_date(cache_control[:expires]) do

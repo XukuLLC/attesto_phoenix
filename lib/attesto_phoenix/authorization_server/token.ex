@@ -89,6 +89,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # becoming an access-token claim or requiring store/schema changes.
   @refresh_grant_type_claim "attesto_phoenix.authorization_grant_type"
   @refresh_grant_family_claim "attesto_phoenix.authorization_grant_family_id"
+  @refresh_session_id_claim "attesto_phoenix.session_id"
   @credential_details_ids_claim "attesto_phoenix.credential_authorization_details_ids"
   @credential_scope_bindings_claim "attesto_phoenix.credential_scope_bindings"
 
@@ -302,9 +303,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
          credential_claims = refresh_credential_claims(config, rotated.context, scope, requested_credentials),
          {:ok, response} <-
-           mint(
+           mint_refresh(
              request,
-             rotated.context.subject,
+             rotated,
              scope,
              token_type,
              binding,
@@ -1552,7 +1553,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp rotate_refresh(%Request{config: config} = request, presented, requested, resource, jkt) do
     opts =
-      [client_id: token_client_id(request)]
+      [client_id: token_client_id(request), issuer: config.issuer]
       |> put_optional_kw(:scope, requested)
       # RFC 8707: a present `resource` narrows the bound set (subset-only); absent
       # (`nil`) keeps the full granted set so the refreshed token stays audienced
@@ -1697,12 +1698,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     %{config: config} = request
     {_token_type, binding} = sender
 
-    %{subject: grant.subject, scope: scope, resource: resource}
+    %{subject: grant.subject, scope: scope, resource: resource, issuer: config.issuer}
     |> put_optional(:client_id, token_client_id(request))
     |> put_optional(:acr, valid_acr(Map.get(grant.claims, "acr")))
     |> put_optional(:auth_time, valid_auth_time(Map.get(grant.claims, "auth_time")))
     |> put_optional(:dpop_jkt, refresh_context_dpop_jkt(request, grant, binding))
     |> put_optional(:attestation_jkt, refresh_attestation_jkt(request))
+    |> put_refresh_session_id(grant)
     |> put_refresh_credential_authorization(config, grant, scope)
     |> put_refresh_grant_provenance(config, grant_type, Map.get(grant, :family_id))
   end
@@ -2059,9 +2061,22 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          extra_claims,
          mint_extra_opts
        ) do
-    with {:ok, principal} <- build_principal(config, client, subject, scope),
-         principal = merge_principal_claims(config, principal, extra_claims),
-         {:ok, principal} <- put_access_token_client_id(principal, token_client_id(request)),
+    case build_principal(config, client, subject, scope) do
+      {:ok, principal} ->
+        mint_principal(request, principal, token_type, binding, extra_claims, mint_extra_opts)
+
+      {:error, reason} ->
+        # A mint failure here is a server/config fault, not a client error;
+        # surface it as RFC 6749 §5.2 invalid_request rather than leak detail.
+        Logger.error("token mint failed: #{inspect(reason)}")
+        {:error, error(@error_invalid_request, "unable to issue token")}
+    end
+  end
+
+  defp mint_principal(%Request{config: config} = request, principal, token_type, binding, extra_claims, mint_extra_opts) do
+    principal = merge_principal_claims(config, principal, extra_claims)
+
+    with {:ok, principal} <- put_access_token_client_id(principal, token_client_id(request)),
          {:ok, minted} <-
            Attesto.Token.mint(
              attesto_config(config),
@@ -2081,6 +2096,90 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         # surface it as RFC 6749 §5.2 invalid_request rather than leak detail.
         Logger.error("token mint failed: #{inspect(reason)}")
         {:error, error(@error_invalid_request, "unable to issue token")}
+    end
+  end
+
+  # A refresh-specific principal callback can re-read live host state using the
+  # stable grant identifiers. Its successful return is minted directly, so a
+  # check cannot authorize one tenant/session and then have `build_principal/3`
+  # reconstruct claims from different mutable state. The core rotation comes
+  # first because it alone validates every credential binding atomically.
+  defp mint_refresh(
+         %Request{config: config, client: client} = request,
+         rotated,
+         scope,
+         token_type,
+         binding,
+         extra_claims,
+         mint_extra_opts
+       ) do
+    case Config.build_refresh_principal_fun(config) do
+      nil ->
+        mint(
+          request,
+          rotated.context.subject,
+          scope,
+          token_type,
+          binding,
+          extra_claims,
+          mint_extra_opts
+        )
+
+      callback ->
+        context = refresh_principal_context(request, rotated, scope)
+
+        case Callback.invoke(callback, [host_client(client), context]) do
+          %{} = principal ->
+            mint_principal(request, principal, token_type, binding, extra_claims, mint_extra_opts)
+
+          {:error, :invalid_grant} ->
+            revoke_denied_refresh_family!(config, rotated.family_id)
+            {:error, grant_error(:invalid_grant)}
+
+          _unexpected ->
+            raise RuntimeError,
+                  "AttestoPhoenix.Config :build_refresh_principal callback violated its return contract"
+        end
+    end
+  end
+
+  defp refresh_principal_context(request, rotated, scope) do
+    persisted = rotated.context
+
+    %{
+      subject: persisted.subject,
+      client_id: token_client_id(request),
+      issuer: persisted.issuer,
+      scope: scope,
+      resource: persisted.resource,
+      family_id: rotated.family_id,
+      generation: rotated.generation,
+      acr: Map.get(persisted, :acr),
+      auth_time: Map.get(persisted, :auth_time),
+      session_id: refresh_session_id(persisted)
+    }
+  end
+
+  defp refresh_session_id(context) do
+    context
+    |> Map.get(:claims, %{})
+    |> Map.get(@refresh_session_id_claim)
+    |> case do
+      session_id when is_binary(session_id) and session_id != "" -> session_id
+      _absent_or_invalid -> nil
+    end
+  end
+
+  defp revoke_denied_refresh_family!(config, family_id) do
+    store = grant_store(config, :refresh_store)
+
+    if function_exported?(store, :revoke_family, 1) do
+      case store.revoke_family(family_id) do
+        :ok -> :ok
+        _unexpected -> raise RuntimeError, "refresh store revoke_family/1 violated its return contract"
+      end
+    else
+      raise RuntimeError, "refresh store does not support family revocation"
     end
   end
 
@@ -2386,7 +2485,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # Preserve only rights still authorized by token-endpoint scope policy.
       effective = refresh_credential_ids(config, %{claims: claims}, scope)
       claims = Map.put(claims, "credential_configuration_ids", effective)
-      Map.put(context, :claims, claims)
+      Map.update(context, :claims, claims, &Map.merge(&1, claims))
     end
   end
 
@@ -2594,7 +2693,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   # Host *policy* callbacks (`:authorize_scope`, `:build_principal`,
-  # `:build_id_token_claims`, `:issue_refresh_token?`, `:client_grant_types`) are
+  # `:build_refresh_principal`, `:build_id_token_claims`,
+  # `:issue_refresh_token?`, `:client_grant_types`) are
   # written for the host's own client shape. A CIMD client is handed to them as
   # its bare, string-keyed metadata map (shaped like a `:load_client` result,
   # `draft-ietf-oauth-client-id-metadata-document-01` §7), with the internal
@@ -2748,6 +2848,27 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       Map.update(context, :claims, provenance, &Map.merge(&1, provenance))
     else
       context
+    end
+  end
+
+  # Preserve the host-authenticated browser/session identifier inside the
+  # refresh grant so a later refresh can check that exact session instead of a
+  # current browser session or a subject-wide approximation. The reserved key
+  # stays internal and is never copied into an access token.
+  defp put_refresh_session_id(context, grant) do
+    claims = Callback.map_value(grant, :claims)
+
+    case if(is_map(claims), do: Map.get(claims, "sid")) do
+      session_id when is_binary(session_id) and session_id != "" ->
+        Map.update(
+          context,
+          :claims,
+          %{@refresh_session_id_claim => session_id},
+          &Map.put(&1, @refresh_session_id_claim, session_id)
+        )
+
+      _absent_or_invalid ->
+        context
     end
   end
 

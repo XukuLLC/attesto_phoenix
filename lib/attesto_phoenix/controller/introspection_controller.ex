@@ -89,6 +89,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     response =
       Introspection.introspect(protocol_config, token,
         refresh_store: refresh_store(config),
+        issuer: config.issuer,
         token_type_hint: token_type_hint(params),
         trusted_audiences: ResourceAudiencePolicy.resolver(config),
         authorize: caller_authorize(config, client_id)

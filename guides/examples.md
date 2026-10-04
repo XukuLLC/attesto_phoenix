@@ -71,6 +71,7 @@ AttestoPhoenix.Config.new(
   # Subject (AttestoPhoenix.PrincipalStore).
   load_principal: &MyApp.AuthZ.load_principal/1,
   build_principal: &MyApp.AuthZ.build_principal/3,
+  build_refresh_principal: &MyApp.AuthZ.build_refresh_principal/2,
 
   # Login + consent (AttestoPhoenix.ConsentPolicy).
   authenticate_resource_owner: &MyApp.AuthZ.authenticate_resource_owner/3,
@@ -115,6 +116,7 @@ AttestoPhoenix.Config.new(
 
   load_principal: &MyApp.AuthZ.load_principal/1,
   build_principal: &MyApp.AuthZ.build_principal/3,
+  build_refresh_principal: &MyApp.AuthZ.build_refresh_principal/2,
   authenticate_resource_owner: &MyApp.AuthZ.authenticate_resource_owner/3,
 
   # require_pkce defaults to true; PKCE is enforced for the code grant.
@@ -170,6 +172,7 @@ AttestoPhoenix.Config.new(
 
   load_principal: &MyApp.AuthZ.load_principal/1,
   build_principal: &MyApp.AuthZ.build_principal/3,
+  build_refresh_principal: &MyApp.AuthZ.build_refresh_principal/2,
   authenticate_resource_owner: &MyApp.AuthZ.authenticate_resource_owner/3,
 
   openid_provider: true,

@@ -23,6 +23,8 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
   alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag :ecto
+  @issuer "https://issuer.example/tenant-a"
+  @issuer_claim_key "urn:attesto:refresh-token:issuer"
 
   defmodule Keystore do
     @behaviour Attesto.Keystore
@@ -423,6 +425,66 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
       assert {:ok, persisted} = EctoRefreshStore.get(Attesto.Secret.hash(issued.token))
       assert persisted.generation == 0
       assert persisted.data == context
+    end
+
+    test "issuer binding survives Ecto rotation and encrypted lost-response retry" do
+      now = 1_900_000_000
+      host_claims = %{"tenant" => "tenant-a"}
+
+      context = %{
+        subject: "sub-1",
+        scope: ["read"],
+        resource: [],
+        client_id: "client-1",
+        issuer: @issuer,
+        claims: host_claims
+      }
+
+      assert {:ok, initial} =
+               CoreRefreshToken.issue(EctoRefreshStore, context, now: now, ttl: 100)
+
+      assert {:ok, persisted_parent} =
+               EctoRefreshStore.get(Attesto.Secret.hash(initial.token))
+
+      assert persisted_parent.data.claims[@issuer_claim_key] == @issuer
+      assert persisted_parent.data.claims["tenant"] == "tenant-a"
+      refute Map.has_key?(persisted_parent.data, :issuer)
+
+      assert {:ok, first} =
+               CoreRefreshToken.rotate(EctoRefreshStore, initial.token,
+                 issuer: @issuer,
+                 client_id: "client-1",
+                 now: now + 1
+               )
+
+      assert first.context.issuer == @issuer
+      assert first.context.claims == host_claims
+      refute Map.has_key?(first.context.claims, @issuer_claim_key)
+
+      assert {:ok, persisted_child} =
+               EctoRefreshStore.get(Attesto.Secret.hash(first.token))
+
+      assert persisted_child.data.claims[@issuer_claim_key] == @issuer
+      assert persisted_child.data.claims["tenant"] == "tenant-a"
+      refute Map.has_key?(persisted_child.data, :issuer)
+
+      assert {:ok, retry} =
+               CoreRefreshToken.rotate(EctoRefreshStore, initial.token,
+                 issuer: @issuer,
+                 client_id: "client-1",
+                 now: now + 2
+               )
+
+      assert retry == first
+      assert retry.context.issuer == @issuer
+      assert retry.context.claims == host_claims
+      refute Map.has_key?(retry.context.claims, @issuer_claim_key)
+
+      assert {:ok, persisted_consumed_parent} =
+               EctoRefreshStore.get(Attesto.Secret.hash(initial.token))
+
+      assert persisted_consumed_parent.successor.context.claims[@issuer_claim_key] == @issuer
+      refute Map.has_key?(persisted_consumed_parent.successor.context, :issuer)
     end
 
     test "round-trips nested portable claims exactly through JSONB" do

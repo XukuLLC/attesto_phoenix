@@ -340,7 +340,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # an unknown client from a wrong secret.
   @client_auth_failed "client authentication failed"
 
-  @registered_auth_methods ~w(client_secret_basic client_secret_post client_secret_jwt
+  @registered_auth_methods ~w(client_secret_basic client_secret_post
                               private_key_jwt attest_jwt_client_auth tls_client_auth
                               self_signed_tls_client_auth none)
 
@@ -741,24 +741,48 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp verify_confidential_client(config, client_id, secret, method) do
     verify_client_secret = Config.verify_client_secret_fun(config)
 
-    case resolve_client(config, client_id) do
-      {:ok, client} ->
-        with :ok <- require_registered_client_auth_method(config, client, method),
-             true <- Callback.invoke_boolean(verify_client_secret, [client, secret], false, :verify_client_secret) do
-          result(config, client, client_id, method)
-        else
-          _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
-        end
+    # A CIMD URL can never use a symmetric secret. Refuse it before resolving
+    # the remote document so one invalid Basic/post request cannot trigger
+    # network work, but retain the same dummy-secret path as an unknown client.
+    if ClientIdMetadata.cimd_client_id?(client_id, config) do
+      reject_confidential_client(verify_client_secret, secret)
+    else
+      case resolve_client(config, client_id) do
+        {:ok, client} ->
+          verify_resolved_confidential_client(config, client, client_id, secret, method, verify_client_secret)
+
+        {:error, _reason} ->
+          reject_confidential_client(verify_client_secret, secret)
+      end
+    end
+  end
+
+  defp verify_resolved_confidential_client(config, client, client_id, secret, method, verify_client_secret) do
+    case require_registered_client_auth_method(config, client, method) do
+      :ok ->
+        verify_confidential_client_secret(config, client, client_id, secret, method, verify_client_secret)
 
       {:error, _reason} ->
-        # RFC 6749 §2.3 / OWASP: do not leak whether the client exists or is
-        # revoked. Run a dummy verification so the lookup-failure path matches
-        # the wrong-secret path in observable timing, and return one message.
-        # The same resolved callback is used for the real and dummy verify so
-        # the two paths stay timing-matched.
-        _ = invoke(verify_client_secret, [:unknown_client, secret])
-        {:error, error(@error_invalid_client, @client_auth_failed)}
+        # A known client using the wrong registered method must take the same
+        # password-work path as an unknown identifier.
+        reject_confidential_client(verify_client_secret, secret)
     end
+  end
+
+  defp verify_confidential_client_secret(config, client, client_id, secret, method, verify_client_secret) do
+    if Callback.invoke_boolean(verify_client_secret, [client, secret], false, :verify_client_secret) do
+      result(config, client, client_id, method)
+    else
+      {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
+  # RFC 6749 §2.3 / OWASP: do not leak whether the client exists, is revoked,
+  # uses another registered method, or is a CIMD URL. The host callback should
+  # perform its fixed dummy password verification for `:unknown_client`.
+  defp reject_confidential_client(verify_client_secret, secret) do
+    _ = invoke(verify_client_secret, [:unknown_client, secret])
+    {:error, error(@error_invalid_client, @client_auth_failed)}
   end
 
   defp verify_private_key_jwt_client(config, policy, assertion) do

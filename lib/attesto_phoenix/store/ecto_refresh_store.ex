@@ -661,7 +661,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   defp valid_child_identity?(child, token, family_id, generation, expires_at) do
     is_binary(family_id) and is_integer(generation) and is_integer(expires_at) and
-      token_hash(token) == Map.get(child, :token_hash)
+      Attesto.SecureCompare.equal?(token_hash(token), Map.get(child, :token_hash))
   end
 
   defp valid_successor_contexts?(child, context) do

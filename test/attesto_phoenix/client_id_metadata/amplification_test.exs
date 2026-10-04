@@ -22,14 +22,54 @@ defmodule AttestoPhoenix.ClientIdMetadata.AmplificationTest do
     @moduledoc false
 
     def preflight(uri, opts) do
-      send(Keyword.fetch!(opts, :test_pid), {:dns, uri})
+      send(Keyword.fetch!(opts, :test_pid), {:preflight, uri})
       :ok
     end
 
     def fetch(uri, opts) do
+      send(Keyword.fetch!(opts, :test_pid), {:dns, uri})
       send(Keyword.fetch!(opts, :test_pid), {:http, uri})
-      {:ok, %{body: JSON.encode!(Keyword.fetch!(opts, :test_keys)), cache_control: [max_age: 300]}}
+
+      {:ok,
+       %{
+         body: JSON.encode!(Keyword.fetch!(opts, :test_keys)),
+         cache_control: Keyword.get(opts, :test_cache_control, max_age: 300)
+       }}
     end
+  end
+
+  defmodule RecheckCache do
+    @moduledoc false
+    @behaviour AttestoPhoenix.ClientIdMetadata.Cache
+
+    def script(stored, expiry) do
+      Process.put({__MODULE__, :stored}, stored)
+      Process.put({__MODULE__, :expiry}, expiry)
+      Process.put({__MODULE__, :reads}, 0)
+    end
+
+    def reads, do: Process.get({__MODULE__, :reads}, 0)
+
+    @impl true
+    def get(_url), do: :miss
+
+    @impl true
+    def put(_url, _metadata, _expiry), do: :ok
+
+    @impl true
+    def get_entry(_url) do
+      reads = reads()
+      Process.put({__MODULE__, :reads}, reads + 1)
+
+      if reads == 0 do
+        :miss
+      else
+        {:ok, Process.get({__MODULE__, :stored}), Process.get({__MODULE__, :expiry})}
+      end
+    end
+
+    @impl true
+    def put_jwks(_url, _metadata, _expiry, _resolved), do: raise("unexpected JWKS write")
   end
 
   setup do
@@ -312,7 +352,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.AmplificationTest do
     end)
   end
 
-  test "cached key DNS preflight is admitted and consumes the same host budget", %{opts: opts} do
+  test "a cached JWKS hit bypasses DNS, HTTP, preflight, and the exhausted host budget", %{opts: opts} do
     id = "https://dns.example/client.json"
     uri = "https://dns.example/keys.json"
 
@@ -330,18 +370,110 @@ defmodule AttestoPhoenix.ClientIdMetadata.AmplificationTest do
 
     host =
       config(
-        Keyword.merge(opts, fetcher: DNSFetcher, test_pid: self(), test_keys: keys, max_fetches_per_host_per_window: 2)
+        Keyword.merge(opts,
+          fetcher: DNSFetcher,
+          test_pid: self(),
+          test_keys: keys,
+          max_fetches_per_host_per_window: 1
+        )
       )
 
     assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, host)
     assert_receive {:dns, ^uri}
     assert_receive {:http, ^uri}
+    refute_receive {:preflight, _}
+
     assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, host)
-    assert_receive {:dns, ^uri}
-    refute_receive {:http, _}
-    assert {:error, :missing_client_jwks} = ClientIdMetadata.resolve_jwks(metadata, host)
     refute_receive {:dns, _}
     refute_receive {:http, _}
+    refute_receive {:preflight, _}
+
+    assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, host)
+    refute_receive {:dns, _}
+    refute_receive {:http, _}
+    refute_receive {:preflight, _}
+  end
+
+  test "JWKS cache is rechecked inside admission before outbound work", %{opts: opts} do
+    id = "https://recheck.example/client.json"
+    uri = "https://recheck.example/keys.json"
+
+    {:ok, metadata} =
+      Attesto.ClientIdMetadata.validate_document(id, %{
+        "client_id" => id,
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "private_key_jwt",
+        "jwks_uri" => uri
+      })
+
+    {_, public} = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_public_map()
+    keys = %{"keys" => [public]}
+    expiry = DateTime.add(DateTime.utc_now(), 300, :second)
+
+    stored =
+      Cache.with_resolved_jwks(metadata, %{
+        "uri" => uri,
+        "keys" => keys,
+        "expires_at" => DateTime.to_unix(expiry)
+      })
+
+    RecheckCache.script(stored, expiry)
+
+    host =
+      config(
+        Keyword.merge(opts,
+          fetcher: DNSFetcher,
+          cache: RecheckCache,
+          test_pid: self(),
+          test_keys: keys
+        )
+      )
+
+    assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, host)
+    assert RecheckCache.reads() == 2
+    refute_receive {:dns, _}
+    refute_receive {:http, _}
+    refute_receive {:preflight, _}
+  end
+
+  test "private and zero s-maxage responses do not enter the shared JWKS cache", %{opts: opts} do
+    for {suffix, directives} <- [
+          {"private", [private: true, max_age: 300]},
+          {"s-maxage", [s_maxage: 0, max_age: 300]}
+        ] do
+      id = "https://shared-cache.example/#{suffix}/client.json"
+      uri = "https://shared-cache.example/#{suffix}/keys.json"
+
+      {:ok, metadata} =
+        Attesto.ClientIdMetadata.validate_document(id, %{
+          "client_id" => id,
+          "redirect_uris" => ["https://app.example/cb"],
+          "token_endpoint_auth_method" => "private_key_jwt",
+          "jwks_uri" => uri
+        })
+
+      {_, public} = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_public_map()
+      keys = %{"keys" => [public]}
+      :ok = ETS.put(id, metadata, DateTime.add(DateTime.utc_now(), 300, :second))
+
+      host =
+        config(
+          Keyword.merge(opts,
+            fetcher: DNSFetcher,
+            test_pid: self(),
+            test_keys: keys,
+            test_cache_control: directives
+          )
+        )
+
+      assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, host)
+      assert_receive {:dns, ^uri}
+      assert_receive {:http, ^uri}
+      assert {:ok, ^keys} = ClientIdMetadata.resolve_jwks(metadata, host)
+      assert_receive {:dns, ^uri}
+      assert_receive {:http, ^uri}
+      refute_receive {:preflight, _}
+    end
   end
 
   test "singleflight keeps repositories and schema prefixes isolated", %{server: server, opts: opts} do

@@ -493,6 +493,53 @@ responses carrying a refresh token also report its actual remaining
 not establish authorization expiry, so this option does not emit
 `authorization_expires_in`.
 
+### Live principal and session checks on refresh
+
+Refresh credentials can outlive the login session and principal state that
+created them. Configure `:build_refresh_principal` when a locked or deactivated
+subject, terminated session, or removed tenant membership must stop the next
+refresh immediately:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  build_refresh_principal: &MyApp.OAuth.PrincipalStore.build_refresh_principal/2
+```
+
+The callback receives the authenticated client and a map containing
+`:subject`, `:client_id`, persisted `:issuer`, effective `:scope`, persisted
+`:resource`, refresh `:family_id` and `:generation`, original `:acr` and
+`:auth_time`, and the authorization-time `:session_id` when one was established.
+Return the complete principal map to mint, or `{:error, :invalid_grant}` to
+deny. A denial revokes the entire refresh family before Attesto Phoenix returns
+a generic `invalid_grant`. The returned principal is used without a second
+`:build_principal` lookup; protocol-owned claims and the authenticated
+`client_id` are reconciled before minting. A family whose original
+authorization established no session ID reports `session_id: nil`. Immediate
+lost-response retries can invoke the hook again for the same family and
+generation, so keep it side-effect-free or idempotent. Enable the hook on every
+token-endpoint node before relying on it as policy.
+
+Refresh families issued before Attesto Phoenix 3.4.1 have no persisted issuer
+binding. Token rotation, introspection, and revocation now fail closed for those
+legacy families; users must authorize again. This prevents one configured
+issuer from accepting or mutating a family created by another issuer when both
+share a refresh store.
+
+Use the persisted subject, resource, and session ID to resolve the original
+tenant or account in host storage. If tenant identity is absent from all three,
+the token layer cannot reconstruct it later; encode tenant identity into a
+stable subject/resource or retain the mapping under the session ID. The hook
+runs after atomic credential rotation, because only the refresh core can safely
+validate the client and sender bindings and expose the resulting context. No
+access or successor refresh token is returned on denial.
+
+This is an issuance-time check. Continue applying `:load_principal`, token
+introspection, or equivalent resource policy to access tokens that were issued
+before a later lock, deactivation, membership change, or session termination.
+Host identity state and the refresh store cannot be made one transaction by the
+library, so applications that require strict serialization must enforce a host
+security epoch or coordinate both stores themselves.
+
 ### Browser applications
 
 [RFC 10017](https://www.rfc-editor.org/rfc/rfc10017.html) recommends a backend
@@ -895,7 +942,7 @@ The preferred install surface groups host-owned callbacks by concern:
 - **client registry** -> `:client_store`
   (`load_client`, `verify_client_secret`, `client_auth_method`, `client_jwks`, client metadata)
 - **principals** -> `:principal_store`
-  (`load_principal`, `build_principal`, principal kinds)
+  (`load_principal`, `build_principal`, `build_refresh_principal`, principal kinds)
 - **scope policy** -> `:scope_policy`
   (`authorize_scope`, supported scopes)
 - **login / consent** -> `:consent_policy`
@@ -914,8 +961,50 @@ From 3.4.1, each presented authentication method must match the client's
 registered `token_endpoint_auth_method`. Hosts with confidential clients must expose that
 trusted value with `ClientStore.client_auth_method/1` or the flat
 `:client_auth_method` callback. Missing or invalid method data fails closed;
-Basic and POST are distinct methods. Read the
-[3.4.1 security upgrade guide](guides/upgrade_3_4_1_security.md) before upgrading.
+Basic and POST are distinct methods.
+
+Version 3.4.1 also binds refresh families to the configured issuer, requires raw
+request-body preservation for duplicate-parameter detection, and changes the
+default consent behavior for public clients. Existing unbound refresh families
+require reauthorization, and every token-endpoint node must be upgraded in one
+rollout. Read the
+[3.4.1 security upgrade guide](guides/upgrade_3_4_1_security.md) before deploying.
+
+### Dynamic registration security contract
+
+The bundled RFC 7591 endpoint is disabled by default and accepts unauthenticated
+requests when enabled. Put deployment admission controls such as an initial
+access token, rate limits, or an allowlist in the host pipeline before the
+controller.
+
+Registration validation does not make client metadata trusted. Display values
+such as `client_name`, `software_id`, `software_version`, and `contacts` are
+bounded and checked for valid UTF-8 and control characters, but markup is
+preserved. HTML-escape each value for its output context in consent,
+administration, and audit interfaces; never mark a registered value as safe
+HTML. Unknown members are discarded rather than passed to the client store.
+The `software_statement` member is passed through as an opaque value and gains
+no trust from registration; a host that relies on it must verify its signature,
+issuer, claims, and policy in `register_client/1`.
+
+An accepted `jwks_uri` has only passed bounded absolute-HTTPS URI validation.
+The registration action does not fetch it. If `ClientStore.client_jwks/1` (or
+the flat `:client_jwks` callback) resolves the URI later, the host owns that
+outbound security boundary: reject redirects, check every DNS result and the
+connected address against the deployment's network policy, pin the approved
+address for the connection, and bound response bytes, time, and media type.
+The SSRF-guarded Client ID Metadata Document fetcher is not automatically used
+for an ordinary registered client.
+
+The bundled endpoint applies an HTTPS-only profile to
+`backchannel_logout_uri`, `frontchannel_logout_uri`, and every
+`post_logout_redirect_uris` entry. This is stricter than the OpenID logout
+specifications, which permit HTTP for a confidential client when the provider
+allows it, and RP-Initiated Logout also permits alternate native-app schemes.
+Clients using either compatibility option must migrate their registered logout
+callbacks to HTTPS before using this endpoint. Front-channel logout also
+requires the same scheme, host, and effective port as a registered redirect
+URI.
 
 Other deployment callbacks remain flat because they are endpoint mechanics, not
 domain policy: `:send_error`, `:www_authenticate`, `:no_store`, `:cert_der`,
@@ -939,6 +1028,32 @@ defmodule MyAppWeb.Router do
   end
 end
 ```
+
+OAuth request and response parameters are single-valued unless their defining
+extension explicitly permits repetition. Attesto controllers inspect the raw
+query string and reject repeated scalar names before dispatch. Phoenix's normal
+URL-encoded and JSON parsers convert a request body to a map earlier in the
+endpoint and lose that evidence, so configure the endpoint's existing
+`Plug.Parsers` entry to use Attesto's body reader:
+
+```elixir
+plug Plug.Parsers,
+  parsers: [:urlencoded, :multipart, :json],
+  pass: ["*/*"],
+  json_decoder: Phoenix.json_library(),
+  body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+```
+
+This option belongs on the endpoint's `Plug.Parsers`, before the router. Adding
+a router-pipeline plug after parsing cannot recover repeated form names. The
+reader inspects the original bytes without retaining the body. It keeps only
+decoded form names and allowed `resource` values until controller dispatch.
+Repeated RFC 8707 `resource` form values are preserved as a list so every
+requested audience is validated; other repeated top-level query or URL-encoded
+form names, and repeated JSON object names at any level, receive a generic HTTP
+400 response. See
+`AttestoPhoenix.DuplicateParameterGuard` when composing it with an existing
+custom body reader.
 
 The macro's `:prefix` is the path before its fixed `/oauth/*` tails. For the
 usual `/mcp/oauth/*` mount, use `attesto_routes(prefix: "/mcp", ...)` and set
