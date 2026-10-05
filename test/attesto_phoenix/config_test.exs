@@ -110,6 +110,17 @@ defmodule AttestoPhoenix.ConfigTest do
   # under a behaviour-module key it makes the resolver fall through to `nil`
   # (for optional callbacks); used to drive the boot-validation failure path
   # for required callbacks.
+  defmodule RegisteredMethodStore do
+    @behaviour AttestoPhoenix.ClientStore
+
+    @impl true
+    def load_client(_client_id), do: {:error, :not_found}
+    @impl true
+    def verify_client_secret(_client, _secret), do: false
+    @impl true
+    def client_auth_method(_client), do: "client_secret_post"
+  end
+
   defmodule EmptyModule do
   end
 
@@ -201,6 +212,92 @@ defmodule AttestoPhoenix.ConfigTest do
     ]
 
     Config.new(Keyword.merge(base, overrides))
+  end
+
+  describe "upgrade policies" do
+    test "defaults retain strict issuer and authentication enforcement" do
+      cfg = config()
+
+      assert Config.registration_default_application_type(cfg) == "web"
+      assert Config.bind_unbound_refresh_families(cfg) == :reject
+      assert Config.client_auth_method_validation(cfg) == :runtime
+      assert Config.client_secret_auth_method_policy(cfg) == :strict
+      assert Config.oauth_body_guard(cfg) == :observe
+    end
+
+    test "validates explicit registration and diagnostic policies" do
+      cfg =
+        config(
+          registration_default_application_type: "native",
+          oauth_body_guard: :required,
+          client_secret_auth_method_policy: :observe
+        )
+
+      assert Config.registration_default_application_type(cfg) == "native"
+      assert Config.oauth_body_guard(cfg) == :required
+      assert Config.client_secret_auth_method_policy(cfg) == :observe
+
+      for {key, value} <- [
+            registration_default_application_type: :native,
+            registration_default_application_type: nil,
+            bind_unbound_refresh_families: :accept,
+            client_auth_method_validation: :ignored,
+            client_secret_auth_method_policy: :disabled,
+            oauth_body_guard: nil
+          ] do
+        assert_raise ArgumentError, ~r/#{key}/, fn -> config([{key, value}]) end
+      end
+    end
+
+    test "boot validation rejects advertised secret methods without a trusted source" do
+      for method <- ["client_secret_basic", "client_secret_post"] do
+        assert_raise ArgumentError, ~r/advertised secret authentication requires/, fn ->
+          config(
+            client_auth_method_validation: :boot,
+            token_endpoint_auth_methods_supported: [method]
+          )
+        end
+      end
+    end
+
+    test "boot validation accepts a flat or ClientStore registered-method source" do
+      assert %Config{} =
+               config(
+                 client_auth_method_validation: :boot,
+                 client_auth_method: fn _ -> "client_secret_basic" end
+               )
+
+      assert %Config{} =
+               config(
+                 client_auth_method_validation: :boot,
+                 client_store: RegisteredMethodStore
+               )
+    end
+
+    test "boot validation permits a public-only catalog without a method source" do
+      assert %Config{} =
+               config(
+                 client_auth_method_validation: :boot,
+                 token_endpoint_auth_methods_supported: ["none"]
+               )
+    end
+
+    test "configured-issuer migration requires the bundled Ecto refresh store" do
+      for store <- [nil, Attesto.RefreshStore.ETS] do
+        assert_raise ArgumentError, ~r/configured_issuer refresh migration requires/, fn ->
+          config(bind_unbound_refresh_families: :configured_issuer, refresh_store: store)
+        end
+      end
+
+      cfg =
+        config(
+          bind_unbound_refresh_families: :configured_issuer,
+          refresh_store: EctoRefreshStore,
+          refresh_token_rotation_grace_seconds: 0
+        )
+
+      assert Config.bind_unbound_refresh_families(cfg) == :configured_issuer
+    end
   end
 
   describe "credential-signing keystore" do

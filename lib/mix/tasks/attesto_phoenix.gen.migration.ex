@@ -177,7 +177,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   guarded rollback that refuses to discard revocations which 2.x cannot
   represent. An application downgrade also requires stopped writers and a
   drain of active 3.x refresh-retry deadlines because 2.x cannot recover 3.x
-  successor envelopes.
+  successor envelopes. The 3.4 rollback locks the refresh table and removes
+  its new columns only when every row has NULL values in both columns. Any
+  stored deadline or instance binding, including on expired or revoked rows,
+  blocks rollback. Remove those rows only after a reviewed revocation and
+  retention decision; clearing their security fields is not a safe rollback.
+  The widened CIBA text column is retained to avoid truncating stored tokens.
   """
 
   use Mix.Task
@@ -2042,25 +2047,71 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     use Ecto.Migration
 
     def up do
-      alter table(:attesto_refresh_tokens, prefix: <%= inspect @prefix %>) do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+
+      alter table(:attesto_refresh_tokens, prefix: prefix) do
         add :family_expires_at, :bigint
         add :attestation_jkt, :string, size: 43
       end
 
       # Historical host migrations may have used varchar(255), which rejects
       # valid CIBA §7.1 notification tokens. CIBA persistence is optional.
-      prefix = <%= inspect @prefix %> || Ecto.Migration.prefix() || repo().config()[:migration_default_prefix]
       table = qualify_table("attesto_ciba_requests", prefix)
       execute("ALTER TABLE IF EXISTS " <> table <> " ALTER COLUMN client_notification_token TYPE text")
     end
 
     def down do
-      raise "Revoke bound refresh families before manually removing family_expires_at or attestation_jkt; dropping security state would widen their authority."
+      prefix = effective_prefix(<%= inspect @prefix %>)
+      table = qualify_table("attesto_refresh_tokens", prefix)
+
+      # These queries run immediately in Ecto's DDL transaction. The lock
+      # prevents a concurrent writer from adding security state after the
+      # check; disabling row-security filtering makes hidden rows fail closed.
+      repo().query!("LOCK TABLE " <> table <> " IN ACCESS EXCLUSIVE MODE", [], log: false)
+      repo().query!("SET LOCAL row_security = off", [], log: false)
+
+      %{rows: rows} = repo().query!(
+        "SELECT 1 FROM " <> table <>
+          " WHERE family_expires_at IS NOT NULL OR attestation_jkt IS NOT NULL LIMIT 1",
+        [],
+        log: false
+      )
+
+      if rows != [] do
+        raise "Cannot safely rollback 3.4 migration: refresh rows retain a family deadline " <>
+                "or client-instance binding. Removing either column would discard security state. " <>
+                "Revoke affected families and review retention before deleting their rows; " <>
+                "do not clear their binding fields to force a rollback."
+      end
+
+      alter table(:attesto_refresh_tokens, prefix: prefix) do
+        remove :family_expires_at
+        remove :attestation_jkt
+      end
+
+      # Keep client_notification_token as text: stored tokens may exceed the
+      # historical varchar limit, and its original type may already be text.
     end
 
-    defp qualify_table(table, nil), do: quote_identifier(table)
-    defp qualify_table(table, ""), do: quote_identifier(table)
-    defp qualify_table(table, prefix), do: quote_identifier(prefix) <> "." <> quote_identifier(table)
+    defp effective_prefix(explicit_prefix) do
+      cond do
+        is_binary(explicit_prefix) and byte_size(explicit_prefix) > 0 ->
+          explicit_prefix
+
+        migrator_prefix = Ecto.Migration.prefix() ->
+          migrator_prefix
+
+        true ->
+          repo().config()[:migration_default_prefix]
+      end
+    end
+
+    defp qualify_table(table, prefix) do
+      [prefix, table]
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.map(&quote_identifier/1)
+      |> Enum.join(".")
+    end
 
     defp quote_identifier(identifier) do
       "\\\"" <> String.replace(to_string(identifier), "\\\"", "\\\"\\\"") <> "\\\""

@@ -24,6 +24,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   import Ecto.Query
 
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.RefreshIssuerMigration
   alias AttestoPhoenix.RefreshSuccessorCipher
   alias AttestoPhoenix.Schema.RefreshFamilyRevocation
   alias AttestoPhoenix.Schema.RefreshToken
@@ -31,6 +32,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   @app :attesto_phoenix
   @advisory_lock_namespace 0x4154_5246
+  @max_migration_family_rows 10_000
   @valid_deadline_sql "jsonb_typeof(?->'retry_until') = 'number' AND " <>
                         "(?->>'retry_until') ~ '^-{0,1}(0|[1-9][0-9]*)$' AND " <>
                         "(?->'retry_until') >= to_jsonb(0::numeric) AND " <>
@@ -104,6 +106,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   @impl Attesto.RefreshStore
   @spec insert(Attesto.RefreshStore.entry()) :: :ok | {:error, :family_revoked | :conflict}
   def insert(%{} = record) do
+    record = normalize_migration_insert!(record)
     validate_new_record!(record)
     prefix = table_prefix()
     repo = repo()
@@ -146,13 +149,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
     case repo().one(query, prefix: table_prefix(), log: false, telemetry_event: nil) do
       %RefreshToken{} = row ->
-        record = to_store_record(row)
-
-        if valid_recovered_successor?(row, record.successor, table_prefix()) do
-          {:ok, record}
-        else
-          {:ok, %{record | successor: nil}}
-        end
+        read_migrated_record(row, query)
 
       nil ->
         :error
@@ -183,6 +180,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
     now = Keyword.get(opts, :now)
 
     with {:ok, now} <- valid_now(now),
+         {:ok, child, successor} <- normalize_migration_rotation(child, successor),
          {:ok, protected} <- protect_successor(parent_hash, child, successor, now) do
       repo = repo()
       prefix = table_prefix()
@@ -193,6 +191,48 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       {:error, :retry_state_unavailable} -> {:error, :retry_state_unavailable}
       {:error, :invalid_rotation} -> {:error, :invalid_rotation}
     end
+  end
+
+  @doc """
+  Administratively binds existing families to an operator-asserted single issuer.
+
+  Requires `assert_single_issuer: true`. The default `dry_run: true` audits
+  without changing rows; `dry_run: false` applies the binding. Each family is
+  serialized with rotation and updated atomically, including authenticated
+  retry bundles. Existing different bindings fail closed and are never replaced.
+  Expiry, generation, revocation, and client-instance bindings are unchanged.
+  Reads family identifiers in bounded batches (`batch_size: 100`, maximum 1,000).
+  A failed family leaves that family untouched; previously committed families
+  remain safely bound, so the operation can be repeated after resolving errors.
+
+  The configured repo and schema prefix identify the complete trusted store
+  whose provenance the operator asserts. This API does not establish historical
+  client-instance keys for pre-upgrade attested families.
+  """
+  @spec backfill_issuer(String.t(), keyword()) :: {:ok, map()} | {:error, atom(), map()}
+  def backfill_issuer(issuer, opts \\ []) do
+    validate_migration_options!(issuer, opts)
+    stats = %{families_scanned: 0, families_changed: 0, rows_changed: 0, families_skipped: 0}
+    backfill_batches(issuer, opts, nil, stats)
+  end
+
+  @doc false
+  @spec backfill_family_issuer(String.t(), String.t(), keyword()) :: {:ok, map()} | {:error, atom()}
+  def backfill_family_issuer(family_id, issuer, opts) when is_binary(family_id) do
+    validate_migration_options!(issuer, opts)
+
+    result =
+      repo().transaction(
+        fn ->
+          lock_family!(family_id)
+          backfill_family_locked!(family_id, issuer, Keyword.get(opts, :dry_run, true))
+        end,
+        log: false,
+        telemetry_event: nil
+      )
+
+    emit_migration_result(result, opts)
+    result
   end
 
   @doc """
@@ -380,6 +420,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
             # input create lock-order inversions with a concurrent rotation or
             # revocation of the real parent family.
             lock_family!(family_id)
+            migrate_locked_family!(family_id)
 
             locked_parent_query =
               from(r in RefreshToken,
@@ -584,10 +625,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       not child_unconsumed?(child) ->
         {:error, :invalid_rotation}
 
-      child_family_deadline(child) != stored_family_deadline(row) ->
-        {:error, :invalid_rotation}
-
-      child_attestation_binding(child) != stored_attestation_binding(row) ->
+      not child_family_bindings_match?(row, child) ->
         {:error, :invalid_rotation}
 
       true ->
@@ -597,6 +635,12 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   defp child_unconsumed?(child) do
     Map.get(child, :consumed) == false and is_nil(Map.get(child, :consumed_at))
+  end
+
+  defp child_family_bindings_match?(row, child) do
+    child_family_deadline(child) == stored_family_deadline(row) and
+      child_attestation_binding(child) == stored_attestation_binding(row) and
+      child_issuer_binding(child) == RefreshIssuerMigration.issuer_binding(row.claims)
   end
 
   defp validate_expiry(row, child, now) do
@@ -626,6 +670,9 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   defp stored_attestation_binding(%RefreshToken{attestation_jkt: thumbprint}), do: {:ok, thumbprint}
   defp child_attestation_binding(%{data: data}) when is_map(data), do: Map.fetch(data, :attestation_jkt)
   defp child_attestation_binding(_child), do: :invalid
+
+  defp child_issuer_binding(%{data: %{claims: claims}}), do: RefreshIssuerMigration.issuer_binding(claims)
+  defp child_issuer_binding(_child), do: :invalid
 
   defp validate_token_hash(child, prefix) do
     if token_hash_taken?(Map.get(child, :token_hash), prefix),
@@ -721,6 +768,10 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   defp unwrap_transaction({:ok, result}), do: result
   defp unwrap_transaction({:error, :not_found}), do: :error
+
+  defp unwrap_transaction({:error, reason})
+       when reason in [:issuer_mismatch, :invalid_record, :invalid_retry_state, :family_capacity],
+       do: {:error, :invalid_rotation}
 
   defp unwrap_transaction({:error, reason})
        when reason in [
@@ -907,6 +958,232 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
             0
         end
     end
+  end
+
+  defp read_migrated_record(row, query) do
+    case migration_issuer() do
+      nil ->
+        read_record(row)
+
+      issuer ->
+        read_after_migration(row.family_id, query, issuer)
+    end
+  end
+
+  defp read_after_migration(family_id, query, issuer) do
+    opts = [assert_single_issuer: true, dry_run: false, source: :configured_single_issuer]
+
+    case backfill_family_issuer(family_id, issuer, opts) do
+      {:ok, _counts} -> reload_record(query)
+      {:error, _reason} -> :error
+    end
+  end
+
+  defp reload_record(query) do
+    case repo().one(query, prefix: table_prefix(), log: false, telemetry_event: nil) do
+      nil -> :error
+      migrated -> read_record(migrated)
+    end
+  end
+
+  defp read_record(row) do
+    record = to_store_record(row)
+
+    if valid_recovered_successor?(row, record.successor, table_prefix()),
+      do: {:ok, record},
+      else: {:ok, %{record | successor: nil}}
+  end
+
+  defp normalize_migration_insert!(record) do
+    case migration_issuer() do
+      nil ->
+        record
+
+      issuer ->
+        bind_migration_insert!(record, issuer)
+    end
+  end
+
+  defp bind_migration_insert!(record, issuer) do
+    case RefreshIssuerMigration.bind_record(record, issuer) do
+      {:ok, bound} -> bound
+      {:error, _reason} -> invalid_record!()
+    end
+  end
+
+  defp normalize_migration_rotation(child, successor) do
+    case migration_issuer() do
+      nil ->
+        {:ok, child, successor}
+
+      issuer ->
+        with {:ok, bound_child} <- RefreshIssuerMigration.bind_record(child, issuer),
+             {:ok, bound_successor} <- RefreshIssuerMigration.bind_successor(successor, issuer) do
+          {:ok, bound_child, bound_successor}
+        else
+          {:error, _reason} -> {:error, :invalid_rotation}
+        end
+    end
+  end
+
+  defp migrate_locked_family!(family_id) do
+    case migration_issuer() do
+      nil -> :ok
+      issuer -> backfill_family_locked!(family_id, issuer, false)
+    end
+  end
+
+  defp migration_issuer do
+    case migration_config() do
+      %Config{} = config ->
+        if Config.bind_unbound_refresh_families(config) == :configured_issuer, do: config.issuer
+
+      nil ->
+        nil
+    end
+  end
+
+  defp migration_config do
+    case Config.request_config() do
+      %Config{} = config ->
+        config
+
+      nil ->
+        host_migration_config()
+    end
+  end
+
+  defp host_migration_config do
+    case Application.get_env(@app, :otp_app) do
+      app when is_atom(app) and not is_nil(app) -> Config.from_otp_app(app)
+      _other -> nil
+    end
+  end
+
+  defp validate_migration_options!(issuer, opts) do
+    RefreshIssuerMigration.validate_issuer!(issuer)
+
+    if Keyword.get(opts, :assert_single_issuer) != true do
+      raise ArgumentError, "refresh issuer migration requires assert_single_issuer: true"
+    end
+
+    if !is_boolean(Keyword.get(opts, :dry_run, true)) do
+      raise ArgumentError, ":dry_run must be a boolean"
+    end
+
+    batch_size = Keyword.get(opts, :batch_size, 100)
+
+    if !(is_integer(batch_size) and batch_size in 1..1000) do
+      raise ArgumentError, ":batch_size must be an integer between 1 and 1000"
+    end
+  end
+
+  defp backfill_batches(issuer, opts, cursor, stats) do
+    families = migration_batch(cursor, Keyword.get(opts, :batch_size, 100))
+
+    case backfill_batch(families, issuer, opts, stats) do
+      {:ok, stats} when families == [] -> {:ok, stats}
+      {:ok, stats} -> backfill_batches(issuer, opts, List.last(families), stats)
+      error -> error
+    end
+  end
+
+  defp migration_batch(cursor, batch_size) do
+    query =
+      from(r in RefreshToken, distinct: r.family_id, order_by: r.family_id, select: r.family_id, limit: ^batch_size)
+
+    query = if is_nil(cursor), do: query, else: where(query, [r], r.family_id > ^cursor)
+    repo().all(query, prefix: table_prefix(), log: false, telemetry_event: nil)
+  end
+
+  defp backfill_batch(families, issuer, opts, stats) do
+    Enum.reduce_while(families, {:ok, stats}, fn family, {:ok, counts} ->
+      case backfill_family_issuer(family, issuer, opts) do
+        {:ok, result} -> {:cont, {:ok, add_migration_counts(counts, result)}}
+        {:error, reason} -> {:halt, {:error, reason, counts}}
+      end
+    end)
+  end
+
+  defp add_migration_counts(stats, result) do
+    %{
+      stats
+      | families_scanned: stats.families_scanned + 1,
+        families_changed: stats.families_changed + if(result.rows_changed > 0, do: 1, else: 0),
+        rows_changed: stats.rows_changed + result.rows_changed,
+        families_skipped: stats.families_skipped + if(result.skipped, do: 1, else: 0)
+    }
+  end
+
+  defp backfill_family_locked!(family_id, issuer, dry_run) do
+    if family_revoked?(family_id, table_prefix()) do
+      %{rows_changed: 0, skipped: true}
+    else
+      prepare_migration_updates!(family_id, issuer)
+      |> apply_migration_updates(dry_run)
+    end
+  end
+
+  defp prepare_migration_updates!(family_id, issuer) do
+    query =
+      from(r in RefreshToken,
+        where: r.family_id == ^family_id,
+        order_by: r.generation,
+        lock: "FOR UPDATE",
+        limit: ^(@max_migration_family_rows + 1)
+      )
+
+    rows = repo().all(query, prefix: table_prefix(), log: false, telemetry_event: nil)
+
+    if length(rows) > @max_migration_family_rows, do: repo().rollback(:family_capacity)
+
+    case RefreshIssuerMigration.prepare_rows(rows, issuer, refresh_rotation_grace_seconds()) do
+      {:ok, updates} -> updates
+      {:error, reason} -> repo().rollback(reason)
+    end
+  end
+
+  defp apply_migration_updates(updates, dry_run) do
+    changed =
+      Enum.reject(updates, fn {row, attrs} -> row.claims == attrs.claims and row.successor == attrs.successor end)
+
+    if !dry_run, do: Enum.each(changed, &write_migration_update!/1)
+    %{rows_changed: length(changed), skipped: false}
+  end
+
+  defp write_migration_update!({row, attrs}) do
+    row
+    |> Ecto.Changeset.change(attrs)
+    |> repo().update!(prefix: table_prefix(), log: false, telemetry_event: nil)
+  end
+
+  defp emit_migration_result({:ok, %{rows_changed: count}}, opts) when count > 0 do
+    outcome = if Keyword.get(opts, :dry_run, true), do: :audited, else: :bound
+
+    reason =
+      if opts[:source] == :configured_single_issuer, do: :configured_single_issuer, else: :administrative_single_issuer
+
+    emit_migration_count(count, outcome, reason)
+  end
+
+  defp emit_migration_result({:error, reason}, _opts) do
+    reason =
+      if reason in [:issuer_mismatch, :invalid_record, :invalid_retry_state, :family_capacity],
+        do: reason,
+        else: :transaction_failed
+
+    emit_migration_count(1, :rejected, reason)
+  end
+
+  defp emit_migration_result(_unchanged, _opts), do: :ok
+
+  defp emit_migration_count(count, outcome, reason) do
+    :telemetry.execute([:attesto_phoenix, :refresh_token, :issuer_migration], %{count: count}, %{
+      outcome: outcome,
+      reason: reason
+    })
+  catch
+    _kind, _failure -> :ok
   end
 
   defp table_prefix, do: Config.table_prefix()

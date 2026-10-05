@@ -520,10 +520,11 @@ generation, so keep it side-effect-free or idempotent. Enable the hook on every
 token-endpoint node before relying on it as policy.
 
 Refresh families issued before Attesto Phoenix 3.4.1 have no persisted issuer
-binding. Token rotation, introspection, and revocation now fail closed for those
-legacy families; users must authorize again. This prevents one configured
-issuer from accepting or mutating a family created by another issuer when both
-share a refresh store.
+binding. Token rotation, introspection, and revocation fail closed for those
+legacy families by default. Hosts with an asserted single-issuer Ecto store
+can use the explicit [3.5 issuer migration](guides/upgrade_3_5.md#migrating-a-single-issuer-refresh-store);
+other legacy families require reauthorization. Existing different issuer
+bindings remain enforced when issuers share a refresh store.
 
 Use the persisted subject, resource, and session ID to resolve the original
 tenant or account in host storage. If tenant identity is absent from all three,
@@ -966,9 +967,12 @@ Basic and POST are distinct methods.
 Version 3.4.1 also binds refresh families to the configured issuer, requires raw
 request-body preservation for duplicate-parameter detection, and changes the
 default consent behavior for public clients. Existing unbound refresh families
-require reauthorization, and every token-endpoint node must be upgraded in one
-rollout. Read the
-[3.4.1 security upgrade guide](guides/upgrade_3_4_1_security.md) before deploying.
+require reauthorization under the default policy. Read the
+[3.4.1 security upgrade guide](guides/upgrade_3_4_1_security.md) and
+[3.5 migration policies](guides/upgrade_3_5.md) before deploying. Version 3.5 adds
+an explicit single-issuer rolling migration, registration profiles, missing
+body-reader diagnostics, and registered-method observation options; it retains
+strict issuer and authentication defaults.
 
 ### Dynamic registration security contract
 

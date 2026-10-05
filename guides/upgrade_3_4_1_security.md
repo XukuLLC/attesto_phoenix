@@ -1,5 +1,9 @@
 # Upgrading to 3.4.1
 
+For upgrades to 3.5 or later, also read the
+[3.5 migration guide](upgrade_3_5.md). It adds explicit single-issuer migration
+and diagnostic policies while retaining the strict defaults described here.
+
 Version 3.4.1 coordinates protocol-boundary hardening with Attesto 2.2.2,
 closes an authentication downgrade, and bounds outbound CIMD work. Upgrade
 the core package first, then deploy Attesto Phoenix 3.4.1 to every

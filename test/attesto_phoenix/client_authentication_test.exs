@@ -66,6 +66,24 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     def valid?(challenge), do: challenge in Process.get(__MODULE__, [])
   end
 
+  def capture_method_event(_event, measurements, metadata, owner) do
+    send(owner, {:method_mismatch, measurements, metadata})
+  end
+
+  defp capture_method_mismatches do
+    id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:attesto_phoenix, :client_authentication, :method_mismatch],
+        &__MODULE__.capture_method_event/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
   setup do
     clients =
       Map.new(
@@ -103,6 +121,94 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "registered authentication method enforcement" do
+    test "strict secret transport mismatch emits bounded diagnostics", %{config: config} do
+      capture_method_mismatches()
+
+      assert_generic_invalid_client(
+        authenticate([], %{"client_id" => @confidential.id, "client_secret" => @confidential.secret}, config,
+          allow_public: true
+        )
+      )
+
+      assert_receive {:method_mismatch, %{count: 1}, metadata}
+
+      assert metadata == %{
+               registered_method: "client_secret_basic",
+               presented_method: "client_secret_post",
+               reason: :method_mismatch,
+               outcome: :rejected
+             }
+    end
+
+    test "observation permits both secret transport directions", %{config: config} do
+      capture_method_mismatches()
+      config = %{config | client_secret_auth_method_policy: :observe}
+
+      assert {:ok, %Result{method: :client_secret_post}} =
+               authenticate([], %{"client_id" => @confidential.id, "client_secret" => @confidential.secret}, config,
+                 allow_public: true
+               )
+
+      assert_receive {:method_mismatch, %{count: 1}, %{outcome: :observed}}
+
+      config = %{config | client_auth_method: fn _ -> "client_secret_post" end}
+
+      assert {:ok, %Result{method: :client_secret_basic}} =
+               authenticate(basic(@confidential.id, @confidential.secret), %{}, config, allow_public: true)
+
+      assert_receive {:method_mismatch, %{count: 1}, %{outcome: :observed}}
+    end
+
+    test "secret observation still rejects invalid secrets and native public clients", %{config: config} do
+      config = %{config | client_secret_auth_method_policy: :observe}
+
+      assert_generic_invalid_client(
+        authenticate([], %{"client_id" => @confidential.id, "client_secret" => "incorrect"}, config, allow_public: true)
+      )
+
+      config = %{config | client_auth_method: fn _ -> "client_secret_basic" end}
+
+      assert_generic_invalid_client(
+        authenticate([], %{"client_id" => @native_public.id, "client_secret" => @native_public.secret}, config,
+          allow_public: true
+        )
+      )
+    end
+
+    test "secret observation never downgrades other registered methods", %{config: config} do
+      for method <- ["private_key_jwt", "tls_client_auth", "attest_jwt_client_auth", "none"] do
+        config = %{
+          config
+          | client_secret_auth_method_policy: :observe,
+            client_auth_method: fn _ -> method end
+        }
+
+        assert_generic_invalid_client(
+          authenticate(basic(@confidential.id, @confidential.secret), %{}, config, allow_public: true)
+        )
+      end
+    end
+
+    test "secret observation still requires trusted registration and server method support", %{config: config} do
+      missing = %{config | client_secret_auth_method_policy: :observe, client_auth_method: nil}
+
+      assert_generic_invalid_client(
+        authenticate(basic(@confidential.id, @confidential.secret), %{}, missing, allow_public: true)
+      )
+
+      basic_only = %{
+        config
+        | client_secret_auth_method_policy: :observe,
+          token_endpoint_auth_methods_supported: ["client_secret_basic"]
+      }
+
+      assert_generic_invalid_client(
+        authenticate([], %{"client_id" => @confidential.id, "client_secret" => @confidential.secret}, basic_only,
+          allow_public: true
+        )
+      )
+    end
+
     @authentication_endpoints [
       :token,
       :par,

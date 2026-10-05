@@ -48,6 +48,10 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     @moduledoc false
   end
 
+  defmodule RestrictedRepo do
+    use Ecto.Repo, otp_app: :attesto_phoenix, adapter: Ecto.Adapters.Postgres
+  end
+
   defp migrations_dir(tmp_dir), do: Path.join(tmp_dir, "migrations")
 
   defp next_migration_version do
@@ -181,7 +185,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
 
     [file] = Path.wildcard(Path.join(migration_dir, "*_upgrade_attesto_phoenix_to_3_4.exs"))
     migration = compile_migration(file, UpgradeAttestoPhoenixTo34)
-    assert :ok = Ecto.Migrator.up(TestRepo, next_migration_version(), migration, [log: false] ++ migrator_opts)
+    version = next_migration_version()
+    assert :ok = Ecto.Migrator.up(TestRepo, version, migration, [log: false] ++ migrator_opts)
 
     assert %{rows: [["text"]]} =
              TestRepo.query!(
@@ -192,6 +197,55 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     assert %{rows: [["attestation_jkt"], ["family_expires_at"]]} =
              TestRepo.query!(
                "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'attesto_refresh_tokens' AND column_name IN ('attestation_jkt', 'family_expires_at') ORDER BY column_name",
+               [prefix]
+             )
+
+    assert :ok = Ecto.Migrator.down(TestRepo, version, migration, [log: false] ++ migrator_opts)
+    assert_refresh_34_columns(prefix, 0)
+
+    assert %{rows: [["text"]]} =
+             TestRepo.query!(
+               "SELECT data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'attesto_ciba_requests' AND column_name = 'client_notification_token'",
+               [prefix]
+             )
+  end
+
+  defp refresh_upgrade_34(tmp_dir, runtime_prefix? \\ false) do
+    prefix = "attesto_rollback_34_#{System.unique_integer([:positive])}"
+    Sandbox.mode(TestRepo, :auto)
+
+    on_exit(fn ->
+      Sandbox.mode(TestRepo, :auto)
+      TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{prefix}" CASCADE|)
+      Sandbox.mode(TestRepo, :manual)
+    end)
+
+    TestRepo.query!(~s|CREATE SCHEMA "#{prefix}"|)
+    create_legacy_refresh_table(prefix)
+    migration = compile_generated_upgrade(tmp_dir, prefix, "3.4", UpgradeAttestoPhoenixTo34)
+    version = next_migration_version()
+    migrator_opts = if runtime_prefix?, do: [prefix: prefix], else: []
+    assert :ok = Ecto.Migrator.up(TestRepo, version, migration, [log: false] ++ migrator_opts)
+    {prefix, migration, version}
+  end
+
+  defp insert_refresh_34(prefix, hash, deadline, instance_key, revoked \\ false) do
+    TestRepo.query!(
+      """
+      INSERT INTO "#{prefix}"."attesto_refresh_tokens"
+        (token_hash, family_id, generation, client_id, subject, scope, resource, claims,
+         family_revoked, expires_at, family_expires_at, attestation_jkt)
+      VALUES ($1, $1, 0, 'client', 'subject', ARRAY['openid'], ARRAY[]::varchar[], '{}', $2,
+              TIMESTAMP '2000-01-01', $3, $4)
+      """,
+      [hash, revoked, deadline, instance_key]
+    )
+  end
+
+  defp assert_refresh_34_columns(prefix, count) do
+    assert %{rows: [[^count]]} =
+             TestRepo.query!(
+               "SELECT count(*) FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'attesto_refresh_tokens' AND column_name IN ('attestation_jkt', 'family_expires_at')",
                [prefix]
              )
   end
@@ -1325,6 +1379,133 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     assert_raise RuntimeError, ~r/table_partitioned_or_inherited/, fn ->
       Ecto.Migrator.up(TestRepo, next_migration_version(), inherited_migration, log: false)
     end
+  end
+
+  test "3.4 rollback preserves unused legacy rows and leaves long CIBA tokens intact", %{tmp_dir: tmp_dir} do
+    {prefix, migration, version} = refresh_upgrade_34(tmp_dir)
+    insert_refresh_34(prefix, "legacy", nil, nil)
+    token = String.duplicate("n", 1024)
+    TestRepo.query!(~s|CREATE TABLE "#{prefix}"."attesto_ciba_requests" (client_notification_token text)|)
+    TestRepo.query!(~s|INSERT INTO "#{prefix}"."attesto_ciba_requests" VALUES ($1)|, [token])
+
+    assert :ok = Ecto.Migrator.down(TestRepo, version, migration, log: false)
+    assert_refresh_34_columns(prefix, 0)
+    assert %{rows: [["legacy"]]} = TestRepo.query!(~s|SELECT token_hash FROM "#{prefix}"."attesto_refresh_tokens"|)
+
+    assert %{rows: [[^token]]} =
+             TestRepo.query!(~s|SELECT client_notification_token FROM "#{prefix}"."attesto_ciba_requests"|)
+  end
+
+  test "3.4 rollback refuses any stored security state and succeeds after reviewed row removal", %{tmp_dir: tmp_dir} do
+    for {deadline, instance_key} <- [{123, nil}, {nil, String.duplicate("k", 43)}, {123, ""}, {nil, ""}] do
+      {prefix, migration, version} = refresh_upgrade_34(tmp_dir)
+      insert_refresh_34(prefix, "legacy", nil, nil)
+      insert_refresh_34(prefix, "bound", deadline, instance_key, true)
+
+      # Even an expired, revoked row hidden by a host RLS policy retains state.
+      # A privileged migration sees it; an RLS-constrained migration must error
+      # rather than treating the filtered table as empty.
+      TestRepo.query!(~s|ALTER TABLE "#{prefix}"."attesto_refresh_tokens" ENABLE ROW LEVEL SECURITY|)
+      TestRepo.query!(~s|ALTER TABLE "#{prefix}"."attesto_refresh_tokens" FORCE ROW LEVEL SECURITY|)
+      TestRepo.query!(~s|CREATE POLICY hide_rows ON "#{prefix}"."attesto_refresh_tokens" USING (false)|)
+
+      assert_raise RuntimeError, ~r/Cannot safely rollback 3.4 migration/, fn ->
+        Ecto.Migrator.down(TestRepo, version, migration, log: false)
+      end
+
+      assert_refresh_34_columns(prefix, 2)
+
+      assert %{rows: [[^deadline, ^instance_key]]} =
+               TestRepo.query!(
+                 ~s|SELECT family_expires_at, attestation_jkt FROM "#{prefix}"."attesto_refresh_tokens" WHERE token_hash = 'bound'|
+               )
+
+      TestRepo.query!(~s|DELETE FROM "#{prefix}"."attesto_refresh_tokens" WHERE token_hash = 'bound'|)
+      assert :ok = Ecto.Migrator.down(TestRepo, version, migration, log: false)
+      assert_refresh_34_columns(prefix, 0)
+    end
+  end
+
+  test "3.4 rollback waits for a concurrent writer before checking security state", %{tmp_dir: tmp_dir} do
+    {prefix, migration, version} = refresh_upgrade_34(tmp_dir)
+    insert_refresh_34(prefix, "concurrent", nil, nil)
+    test_pid = self()
+
+    writer =
+      Task.async(fn ->
+        TestRepo.transaction(fn ->
+          TestRepo.query!(
+            ~s|UPDATE "#{prefix}"."attesto_refresh_tokens" SET family_expires_at = 123 WHERE token_hash = 'concurrent'|
+          )
+
+          send(test_pid, :writer_locked)
+
+          receive do
+            :commit -> :ok
+          after
+            5_000 -> raise "writer release timed out"
+          end
+        end)
+      end)
+
+    assert_receive :writer_locked
+
+    rollback =
+      Task.async(fn ->
+        try do
+          Ecto.Migrator.down(TestRepo, version, migration, log: false)
+        rescue
+          error in RuntimeError -> {:refused, Exception.message(error)}
+        end
+      end)
+
+    assert Task.yield(rollback, 100) == nil
+    send(writer.pid, :commit)
+    assert {:ok, :ok} = Task.await(writer)
+    assert {:refused, message} = Task.await(rollback)
+    assert message =~ "Cannot safely rollback 3.4 migration"
+    assert_refresh_34_columns(prefix, 2)
+  end
+
+  test "3.4 rollback errors instead of losing state hidden from a restricted RLS role", %{tmp_dir: tmp_dir} do
+    {prefix, migration, version} = refresh_upgrade_34(tmp_dir, true)
+    role = "attesto_migration_role_#{System.unique_integer([:positive])}"
+    table = ~s|"#{prefix}"."attesto_refresh_tokens"|
+    insert_refresh_34(prefix, "hidden", 123, nil)
+    TestRepo.query!(~s|CREATE ROLE "#{role}" NOSUPERUSER NOBYPASSRLS|)
+
+    on_exit(fn ->
+      Sandbox.mode(TestRepo, :auto)
+      TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{prefix}" CASCADE|)
+      TestRepo.query!(~s|DROP ROLE "#{role}"|)
+      Sandbox.mode(TestRepo, :manual)
+    end)
+
+    TestRepo.query!(~s|GRANT USAGE, CREATE ON SCHEMA "#{prefix}" TO "#{role}"|)
+    TestRepo.query!(~s|ALTER TABLE "#{prefix}"."schema_migrations" OWNER TO "#{role}"|)
+    TestRepo.query!(~s|ALTER TABLE #{table} OWNER TO "#{role}"|)
+    TestRepo.query!(~s|ALTER TABLE #{table} ENABLE ROW LEVEL SECURITY|)
+    TestRepo.query!(~s|ALTER TABLE #{table} FORCE ROW LEVEL SECURITY|)
+    TestRepo.query!(~s|CREATE POLICY hide_rows ON #{table} USING (false)|)
+
+    config =
+      TestRepo.config()
+      |> Keyword.drop([:pool, :name])
+      |> Keyword.put(:pool_size, 2)
+      |> Keyword.put(:after_connect, fn connection ->
+        Postgrex.query!(connection, ~s|SET ROLE "#{role}"|, [])
+      end)
+
+    start_supervised!({RestrictedRepo, config})
+
+    # A restricted role cannot mistake an RLS-filtered table for a table
+    # without security state when executing the real DDL transaction.
+    assert_raise Postgrex.Error, ~r/row-level security/, fn ->
+      Ecto.Migrator.down(RestrictedRepo, version, migration, prefix: prefix, log: false)
+    end
+
+    assert_refresh_34_columns(prefix, 2)
+    assert %{rows: [[123]]} = TestRepo.query!(~s|SELECT family_expires_at FROM #{table}|)
   end
 
   test "upgrade migration with generated nil prefix uses Ecto.Migrator runtime prefix", %{

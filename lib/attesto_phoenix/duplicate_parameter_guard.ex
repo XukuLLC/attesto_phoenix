@@ -36,10 +36,20 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
         :read_body,
         [{MyApp.BodyReader, :read_body, []}]
       }
+
+  Protocol form or JSON requests without the reader emit
+  `[:attesto_phoenix, :oauth_body_guard, :missing_analysis]` telemetry with a
+  count and the HTTP method/body format. Configure `oauth_body_guard: :required`
+  to reject missing analysis after installing the reader on every endpoint.
+  Multipart requests also emit this event and are rejected under the required
+  policy: Plug's multipart parser bypasses the body reader, so it cannot
+  establish duplicate analysis. Host upload routes can retain multipart parsing.
   """
 
   alias Plug.Conn
   alias Plug.Conn.Unfetched
+
+  @missing_analysis_event [:attesto_phoenix, :oauth_body_guard, :missing_analysis]
 
   @body_analysis_key :attesto_phoenix_duplicate_parameter_analysis
   @body_chunks_key :attesto_phoenix_duplicate_parameter_chunks
@@ -50,6 +60,15 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
           {:duplicate_parameter, String.t()}
           | :body_too_large
           | :invalid_parameter_encoding
+
+  @doc false
+  @spec body_analysis_missing?(Conn.t()) :: boolean()
+  def body_analysis_missing?(%Conn{} = conn) do
+    format = body_format(conn)
+
+    conn.method in ["POST", "PUT", "PATCH"] and format in [:urlencoded, :json, :multipart] and
+      (format == :multipart or not Map.has_key?(conn.private, @body_analysis_key))
+  end
 
   @doc """
   A `Plug.Parsers` body reader that checks ambiguity before map conversion.
@@ -73,6 +92,13 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
   @doc false
   @spec validate_and_forget(Conn.t()) :: {:ok, Conn.t()} | {:error, reason(), Conn.t()}
   def validate_and_forget(%Conn{} = conn) do
+    if body_analysis_missing?(conn) do
+      :telemetry.execute(@missing_analysis_event, %{count: 1}, %{
+        format: body_format(conn),
+        method: conn.method
+      })
+    end
+
     {body_analysis, private} = Map.pop(conn.private, @body_analysis_key)
     private = Map.delete(private, @body_chunks_key)
     conn = %{conn | private: private}
@@ -186,6 +212,7 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
 
   defp inspect_body(:urlencoded, body), do: inspect_urlencoded_body(body)
   defp inspect_body(:json, body), do: reject_json_duplicates(body)
+  defp inspect_body(:multipart, _body), do: {:ok, nil}
   defp inspect_body(nil, _body), do: {:ok, nil}
 
   defp inspect_urlencoded_body(body) do
@@ -423,6 +450,8 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
     |> case do
       "application/x-www-form-urlencoded" -> :urlencoded
       "application/json" -> :json
+      "multipart/form-data" -> :multipart
+      "multipart/mixed" -> :multipart
       value when is_binary(value) -> if String.ends_with?(value, "+json"), do: :json
       nil -> nil
     end

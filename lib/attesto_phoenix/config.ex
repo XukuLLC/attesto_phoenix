@@ -66,6 +66,24 @@ defmodule AttestoPhoenix.Config do
       Without this callback, confidential clients fail authentication;
       explicitly public clients may use `none`. CIMD clients use their
       validated metadata document's declared method.
+    * `:client_auth_method_validation` - `:runtime` (default) or `:boot`.
+      The boot policy rejects configuration advertising Basic or POST secret
+      authentication without a trusted registered-method callback.
+    * `:client_secret_auth_method_policy` - `:strict` (default) or `:observe`.
+      Observation permits only Basic/POST transport differences for a client
+      registered for one of those secret methods, while emitting mismatch
+      telemetry. Key, certificate, attestation, and public-client differences
+      remain rejected. Use this temporary policy to measure a migration.
+    * `:oauth_body_guard` - `:observe` (default) or `:required`. Missing raw-body
+      analysis emits telemetry for protocol requests with form or JSON bodies.
+      The required policy also rejects those requests; configure the endpoint
+      body reader before enabling it.
+    * `:bind_unbound_refresh_families` - `:reject` (default) or
+      `:configured_issuer`. The compatibility policy is an operator assertion
+      that the store belongs to exactly one issuer. It uses the configured
+      issuer, never a presented token, to migrate legacy unbound families
+      during a rolling upgrade. Existing bindings and attestation keys remain
+      enforced. Return to `:reject` after legacy token writers are retired.
     * `:authorize_scope` - `(client, requested_scope -> {:ok, granted_scope} |
       {:error, :invalid_scope})`. Validates or narrows requested scope. Defaults
       to requiring every requested scope to appear in the effective
@@ -717,6 +735,11 @@ defmodule AttestoPhoenix.Config do
       a listener that requests client certificates separately from conventional
       endpoints. Omitted by default.
     * `:registration_enabled` - enable `/oauth/register`. Default `false`.
+    * `:registration_default_application_type` - `"web"` (default) or
+      `"native"`, used only when registration omits `application_type`.
+      An explicit client value is never overridden. The native host profile
+      applies the configured native-app redirect policy; it does not permit
+      arbitrary HTTP redirects.
     * `:registration_default_scope` - the scope assigned to a dynamically
       registered client (RFC 7591 §2) when its request omits `scope`, echoed
       back in the §3.2.1 response. `:scopes_supported` assigns the full catalog;
@@ -1054,6 +1077,7 @@ defmodule AttestoPhoenix.Config do
     scopes_supported: [],
     protected_resource_scopes_supported: nil,
     registration_default_scope: nil,
+    registration_default_application_type: "web",
     bearer_methods_supported: ["header"],
     claims_supported: [],
     acr_values_supported: [],
@@ -1070,6 +1094,10 @@ defmodule AttestoPhoenix.Config do
     refresh_token_max_lifetime: nil,
     refresh_token_expiration_metadata: false,
     refresh_token_rotation_grace_seconds: 60,
+    bind_unbound_refresh_families: :reject,
+    client_auth_method_validation: :runtime,
+    client_secret_auth_method_policy: :strict,
+    oauth_body_guard: :observe,
     authorization_code_ttl: 60,
     par_ttl: 90,
     dpop_enabled: true,
@@ -1187,6 +1215,7 @@ defmodule AttestoPhoenix.Config do
           scopes_supported: [String.t()],
           protected_resource_scopes_supported: [String.t()] | nil,
           registration_default_scope: [String.t()] | :scopes_supported | nil,
+          registration_default_application_type: String.t(),
           bearer_methods_supported: [String.t()],
           claims_supported: [String.t()],
           acr_values_supported: [String.t()],
@@ -1201,6 +1230,10 @@ defmodule AttestoPhoenix.Config do
           refresh_token_max_lifetime: pos_integer() | nil,
           refresh_token_expiration_metadata: boolean(),
           refresh_token_rotation_grace_seconds: non_neg_integer(),
+          bind_unbound_refresh_families: :reject | :configured_issuer,
+          client_auth_method_validation: :runtime | :boot,
+          client_secret_auth_method_policy: :strict | :observe,
+          oauth_body_guard: :observe | :required,
           authorization_code_ttl: pos_integer(),
           par_ttl: pos_integer(),
           dpop_enabled: boolean(),
@@ -1906,6 +1939,36 @@ defmodule AttestoPhoenix.Config do
   """
   @spec native_apps(t()) :: keyword()
   def native_apps(%__MODULE__{native_apps: opts}), do: opts
+
+  @doc """
+  Application type used only for registration requests that omit the member.
+  """
+  @spec registration_default_application_type(t()) :: String.t()
+  def registration_default_application_type(%__MODULE__{registration_default_application_type: type}), do: type
+
+  @doc """
+  Legacy refresh-family issuer migration policy. Strict rejection is the default.
+  """
+  @spec bind_unbound_refresh_families(t()) :: :reject | :configured_issuer
+  def bind_unbound_refresh_families(%__MODULE__{bind_unbound_refresh_families: policy}), do: policy
+
+  @doc """
+  Whether missing registered-method configuration is rejected at boot.
+  """
+  @spec client_auth_method_validation(t()) :: :runtime | :boot
+  def client_auth_method_validation(%__MODULE__{client_auth_method_validation: policy}), do: policy
+
+  @doc """
+  Whether Basic/POST transport mismatches are enforced or observed during migration.
+  """
+  @spec client_secret_auth_method_policy(t()) :: :strict | :observe
+  def client_secret_auth_method_policy(%__MODULE__{client_secret_auth_method_policy: policy}), do: policy
+
+  @doc """
+  Whether a protocol request missing raw-body analysis is observed or rejected.
+  """
+  @spec oauth_body_guard(t()) :: :observe | :required
+  def oauth_body_guard(%__MODULE__{oauth_body_guard: policy}), do: policy
 
   @doc """
   Returns `true` unless the host has forbidden RFC 8252 §7.3 loopback interface
@@ -3945,6 +4008,7 @@ defmodule AttestoPhoenix.Config do
     validate_authorization_grant_id_claim!(config)
     validate_authorization_code_private_context!(config)
     validate_supported_value_lists!(config)
+    validate_upgrade_policies!(config)
     validate_optional_https_endpoint!(:authorization_endpoint, config.authorization_endpoint)
     validate_userinfo_endpoint!(config)
     validate_bearer_methods_supported!(config)
@@ -3998,6 +4062,44 @@ defmodule AttestoPhoenix.Config do
     validate_advertised_paths_consistent!(config)
     validate_native_apps!(config)
     config
+  end
+
+  defp validate_upgrade_policies!(config) do
+    Enum.each(
+      [
+        registration_default_application_type: ["web", "native"],
+        bind_unbound_refresh_families: [:reject, :configured_issuer],
+        client_auth_method_validation: [:runtime, :boot],
+        client_secret_auth_method_policy: [:strict, :observe],
+        oauth_body_guard: [:observe, :required]
+      ],
+      fn {key, choices} ->
+        if Map.fetch!(config, key) not in choices do
+          raise ArgumentError,
+                "AttestoPhoenix.Config: #{inspect(key)} must be one of #{inspect(choices)}"
+        end
+      end
+    )
+
+    secret_methods? =
+      Enum.any?(token_endpoint_auth_methods_supported(config), fn method ->
+        method in ["client_secret_basic", "client_secret_post"]
+      end)
+
+    if client_auth_method_validation(config) == :boot and secret_methods? and
+         is_nil(client_auth_method_fun(config)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: advertised secret authentication requires " <>
+              ":client_auth_method or ClientStore.client_auth_method/1 when " <>
+              ":client_auth_method_validation is :boot"
+    end
+
+    if bind_unbound_refresh_families(config) == :configured_issuer and
+         config.refresh_store != EctoRefreshStore do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :configured_issuer refresh migration requires " <>
+              "AttestoPhoenix.Store.EctoRefreshStore"
+    end
   end
 
   # RFC 9068 §2.2 access-token claims, including its referenced OIDC identity

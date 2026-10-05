@@ -696,9 +696,36 @@ defmodule AttestoPhoenix.ClientAuthentication do
     expected = Atom.to_string(method)
 
     case registered_client_auth_method(config, client) do
-      {:ok, ^expected} -> :ok
-      _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
+      {:ok, ^expected} ->
+        :ok
+
+      {:ok, registered} ->
+        observed? =
+          Config.client_secret_auth_method_policy(config) == :observe and
+            registered in ["client_secret_basic", "client_secret_post"] and
+            expected in ["client_secret_basic", "client_secret_post"]
+
+        emit_method_mismatch(registered, expected, :method_mismatch, observed?)
+
+        if observed?, do: :ok, else: {:error, error(@error_invalid_client, @client_auth_failed)}
+
+      {:error, reason} ->
+        emit_method_mismatch(nil, expected, reason, false)
+        {:error, error(@error_invalid_client, @client_auth_failed)}
     end
+  end
+
+  defp emit_method_mismatch(registered, presented, reason, observed?) do
+    :telemetry.execute(
+      [:attesto_phoenix, :client_authentication, :method_mismatch],
+      %{count: 1},
+      %{
+        registered_method: registered,
+        presented_method: presented,
+        reason: reason,
+        outcome: if(observed?, do: :observed, else: :rejected)
+      }
+    )
   end
 
   defp registered_client_auth_method(_config, %CIMDClient{metadata: metadata}) do

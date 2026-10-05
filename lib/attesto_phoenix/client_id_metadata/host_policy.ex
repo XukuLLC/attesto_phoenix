@@ -29,6 +29,18 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicy do
   def canonicalize(_host), do: {:error, :invalid_host}
 
   defp canonicalize_dns(host) do
+    labels =
+      host
+      |> String.replace(~r/[。．｡]/u, ".")
+      |> String.replace_suffix(".", "")
+      |> String.split(".")
+
+    if Enum.any?(labels, &(&1 == "")),
+      do: {:error, :invalid_host},
+      else: encode_dns(host, length(labels))
+  end
+
+  defp encode_dns(host, label_count) do
     canonical =
       host
       |> String.to_charlist()
@@ -39,7 +51,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicy do
 
     labels = String.split(canonical, ".")
 
-    if byte_size(canonical) <= 253 and Enum.all?(labels, &(byte_size(&1) in 1..63)),
+    if byte_size(canonical) <= 253 and length(labels) == label_count and Enum.all?(labels, &(byte_size(&1) in 1..63)),
       do: {:ok, canonical},
       else: {:error, :invalid_host}
   end

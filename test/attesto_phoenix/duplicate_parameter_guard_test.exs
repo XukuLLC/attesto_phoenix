@@ -3,6 +3,7 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
 
   import Plug.Conn
 
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.DuplicateParameterGuard
   alias Plug.Conn.WrapperError
   alias Plug.Parsers.RequestTooLargeError
@@ -30,6 +31,37 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
     end
   end
 
+  def capture_missing_analysis(_event, measurements, metadata, owner) do
+    if self() == owner, do: send(owner, {:missing_analysis, measurements, metadata})
+  end
+
+  defp capture_missing_analysis do
+    id = {__MODULE__, make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        id,
+        [:attesto_phoenix, :oauth_body_guard, :missing_analysis],
+        &__MODULE__.capture_missing_analysis/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(id) end)
+  end
+
+  defp controller_config(policy) do
+    Config.new(
+      issuer: "https://issuer.example",
+      keystore: __MODULE__.Keystore,
+      repo: __MODULE__.Repo,
+      audience: "https://api.example",
+      load_client: fn _ -> {:error, :not_found} end,
+      verify_client_secret: fn _, _ -> false end,
+      load_principal: fn _ -> {:error, :not_found} end,
+      oauth_body_guard: policy
+    )
+  end
+
   defp parse_form(conn, body_reader \\ {DuplicateParameterGuard, :read_body, []}) do
     opts =
       Plug.Parsers.init(
@@ -51,6 +83,140 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
       )
 
     Plug.Parsers.call(conn, opts)
+  end
+
+  test "missing form analysis emits only bounded diagnostic metadata" do
+    capture_missing_analysis()
+
+    conn =
+      Plug.Test.conn(:post, "/oauth/token?client_id=private-id", "client_secret=private-secret")
+      |> put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> parse_form({Plug.Conn, :read_body, []})
+
+    assert DuplicateParameterGuard.body_analysis_missing?(conn)
+    assert {:ok, _} = DuplicateParameterGuard.validate_and_forget(conn)
+    assert_receive {:missing_analysis, %{count: 1}, metadata}
+    assert metadata == %{format: :urlencoded, method: "POST"}
+  end
+
+  test "missing JSON analysis emits bounded diagnostics" do
+    capture_missing_analysis()
+
+    conn =
+      Plug.Test.conn(:post, "/oauth/register", ~s({"client_name":"private-name"}))
+      |> put_req_header("content-type", "application/json")
+      |> parse_json({Plug.Conn, :read_body, []})
+
+    assert {:ok, _} = DuplicateParameterGuard.validate_and_forget(conn)
+    assert_receive {:missing_analysis, %{count: 1}, %{format: :json, method: "POST"}}
+  end
+
+  test "complete analysis and requests without analyzable bodies do not emit missing diagnostics" do
+    capture_missing_analysis()
+
+    parsed =
+      Plug.Test.conn(:post, "/oauth/token", "grant_type=client_credentials")
+      |> put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> parse_form()
+
+    for conn <- [
+          parsed,
+          Plug.Test.conn(:get, "/oauth/authorize"),
+          Plug.Test.conn(:post, "/oauth/token", "")
+        ] do
+      refute DuplicateParameterGuard.body_analysis_missing?(conn)
+      assert {:ok, _} = DuplicateParameterGuard.validate_and_forget(conn)
+    end
+
+    refute_received {:missing_analysis, _, _}
+  end
+
+  test "required controller policy rejects parsed bodies without the configured reader" do
+    for {content_type, body, parser} <- [
+          {"application/x-www-form-urlencoded", "grant_type=client_credentials", &parse_form/2},
+          {"application/json", ~s({"client_name":"example"}), &parse_json/2}
+        ] do
+      conn =
+        Plug.Test.conn(:post, "/oauth/token", body)
+        |> put_req_header("content-type", content_type)
+        |> parser.({Plug.Conn, :read_body, []})
+        |> put_private(:attesto_phoenix_config, controller_config(:required))
+
+      error = assert_raise WrapperError, fn -> ProbeController.call(conn, :show) end
+      assert %Plug.BadRequestError{message: "request body validation is unavailable"} = error.reason
+    end
+  end
+
+  test "controller observation allows benign missing analysis and required policy accepts the reader" do
+    for {policy, reader} <- [
+          {:observe, {Plug.Conn, :read_body, []}},
+          {:required, {DuplicateParameterGuard, :read_body, []}}
+        ] do
+      conn =
+        Plug.Test.conn(:post, "/oauth/token", "grant_type=client_credentials")
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> parse_form(reader)
+        |> put_private(:attesto_phoenix_config, controller_config(policy))
+
+      assert %{status: 204} = ProbeController.call(conn, :show)
+    end
+  end
+
+  test "required policy refuses collapsed multipart fields even with the configured body reader" do
+    capture_missing_analysis()
+
+    body =
+      [
+        "--request-boundary\r\n",
+        "Content-Disposition: form-data; name=\"client_id\"\r\n\r\n",
+        "first\r\n",
+        "--request-boundary\r\n",
+        "Content-Disposition: form-data; name=\"client_id\"\r\n\r\n",
+        "second\r\n",
+        "--request-boundary--\r\n"
+      ]
+      |> IO.iodata_to_binary()
+
+    parser =
+      Plug.Parsers.init(
+        parsers: [:multipart],
+        pass: ["*/*"],
+        body_reader: {DuplicateParameterGuard, :read_body, []}
+      )
+
+    conn =
+      Plug.Test.conn(:post, "/oauth/token", body)
+      |> put_req_header("content-type", "multipart/form-data; boundary=request-boundary")
+      |> Plug.Parsers.call(parser)
+      |> put_private(:attesto_phoenix_config, controller_config(:required))
+
+    assert conn.body_params == %{"client_id" => "second"}
+    refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_analysis)
+    error = assert_raise WrapperError, fn -> ProbeController.call(conn, :show) end
+    assert %Plug.BadRequestError{message: "request body validation is unavailable"} = error.reason
+    assert_receive {:missing_analysis, %{count: 1}, %{format: :multipart, method: "POST"}}
+  end
+
+  test "reading multipart directly does not claim duplicate analysis or retain its bytes" do
+    conn =
+      Plug.Test.conn(:post, "/oauth/token", "unparsed-body")
+      |> put_req_header("content-type", "multipart/form-data; boundary=request-boundary")
+
+    assert {:ok, "unparsed-body", conn} = DuplicateParameterGuard.read_body(conn, [])
+    assert DuplicateParameterGuard.body_analysis_missing?(conn)
+    refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_analysis)
+    refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_chunks)
+  end
+
+  test "duplicate rejection precedes missing-reader configuration enforcement" do
+    conn =
+      Plug.Test.conn(:post, "/oauth/token?client_id=first&client_id=second", "grant_type=client_credentials")
+      |> put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> parse_form({Plug.Conn, :read_body, []})
+      |> put_private(:attesto_phoenix_config, controller_config(:required))
+
+    error = assert_raise WrapperError, fn -> ProbeController.call(conn, :show) end
+    assert %Plug.BadRequestError{message: "request contains an ambiguous parameter"} = error.reason
   end
 
   test "controller dispatch rejects duplicate query parameters before map collapse" do

@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-10-04
+
+### Added
+
+- Add an explicit single-issuer migration policy for legacy refresh families
+  and a dry-run administrative backfill task. Bind family rows and authenticated
+  retry contexts atomically without replacing existing issuers, extending
+  expiry, or inferring Client Instance Keys. Strict rejection remains the default.
+- Diagnose missing raw-body duplicate analysis through bounded telemetry;
+  `oauth_body_guard: :required` also rejects protocol form/JSON requests without
+  the configured reader.
+- Add optional boot validation of the trusted registered-method callback and
+  authentication-method mismatch telemetry. A temporary observation policy can
+  permit only Basic/POST transport differences for secret-registered clients;
+  key, certificate, attestation, and public-client differences remain rejected.
+- Add `registration_default_application_type` for hosts explicitly selecting a
+  native registration profile. The default remains `"web"`; explicit client
+  metadata is never overridden. See the [3.5 upgrade guide](guides/upgrade_3_5.md).
+
+### Fixed
+
+- Respect the configured native loopback-disable and localhost policies during
+  registration, and reject loopback ports outside the valid range.
+- Allow rollback of an unused 3.4 migration under a table lock. Any persisted
+  deadline or Client Instance Key prevents dropping those columns, including on
+  expired or revoked rows. Retain the widened CIBA text column during rollback.
+- Resolve generated migration prefixes without a literal `nil ||` expression.
+
+### Changed
+
+- Support IDNA 6.1.x alongside 7.x while rejecting empty DNS labels and label
+  loss during mapping, with the same hostname policy and pinned-fetch tests.
+
 ## [3.4.1] - 2026-10-04
 
 ### Security

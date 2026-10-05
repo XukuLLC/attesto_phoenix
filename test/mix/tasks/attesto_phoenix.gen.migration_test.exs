@@ -50,14 +50,28 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       run!(["--upgrade", "3.4", "--schema-prefix", "auth"], tmp_dir)
       assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_4.exs"))
       source = File.read!(file)
-      assert source =~ ~s|alter table(:attesto_refresh_tokens, prefix: "auth")|
+      assert source =~ ~s|prefix = effective_prefix("auth")|
+      assert source =~ ~s|alter table(:attesto_refresh_tokens, prefix: prefix)|
       assert source =~ ~s|add :family_expires_at, :bigint|
       assert source =~ ~s|add :attestation_jkt, :string, size: 43|
       assert source =~ ~s|ALTER TABLE IF EXISTS |
       assert source =~ ~s|ALTER COLUMN client_notification_token TYPE text|
 
-      assert source =~ "prefix = \"auth\" || Ecto.Migration.prefix() || repo().config()[:migration_default_prefix]"
-      assert source =~ "Revoke bound refresh families"
+      assert source =~ "LOCK TABLE "
+      assert source =~ "SET LOCAL row_security = off"
+      assert source =~ "family_expires_at IS NOT NULL OR attestation_jkt IS NOT NULL"
+      assert source =~ "Cannot safely rollback 3.4 migration"
+      assert source =~ "Keep client_notification_token as text"
+    end
+
+    test "renders an omitted 3.4 prefix without a redundant nil expression", %{tmp_dir: tmp_dir} do
+      run!(["--upgrade", "3.4"], tmp_dir)
+      assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_4.exs"))
+      source = File.read!(file)
+      assert source =~ "prefix = effective_prefix(nil)"
+      assert source =~ "migrator_prefix = Ecto.Migration.prefix()"
+      assert source =~ "repo().config()[:migration_default_prefix]"
+      refute source =~ "nil ||"
     end
 
     setup do

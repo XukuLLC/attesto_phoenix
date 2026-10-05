@@ -39,6 +39,11 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   the supported grant types, and the supported token-endpoint auth methods -
   and the first failure is returned.
 
+  An omitted `application_type` uses the host's
+  `:registration_default_application_type` profile, which defaults to `"web"`.
+  Explicit client values are preserved. Native HTTP loopback registrations
+  honor the configured `:native_apps` loopback and `localhost` policies.
+
   Human-readable client metadata remains untrusted after registration. It is
   stored verbatim after size, UTF-8, and control-character checks; a host
   consent or administration UI must HTML-escape it at the rendering sink.
@@ -289,9 +294,9 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # was rejected.
   defp validate_metadata(metadata, config) do
     with {:ok, auth_method} <- validate_auth_method(metadata, config),
-         {:ok, application_type} <- validate_application_type(metadata),
+         {:ok, application_type} <- validate_application_type(metadata, config),
          {:ok, grant_types} <- validate_grant_types(metadata, config),
-         {:ok, redirect_uris} <- validate_redirect_uris(metadata, grant_types, application_type),
+         {:ok, redirect_uris} <- validate_redirect_uris(metadata, grant_types, application_type, config),
          {:ok, scope} <- validate_scope(metadata, config),
          {:ok, passthrough} <- validate_passthrough_metadata(metadata),
          :ok <- validate_key_source_metadata(passthrough),
@@ -1000,15 +1005,14 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # not itself classify the client: the registered value is a claim by the
   # client, and whether to honour it is the host's decision.
   @application_types ~w(web native)
-  @default_application_type "web"
 
-  defp validate_application_type(metadata) do
-    # `Map.fetch/2`, not `Map.get/2`: an ABSENT member defaults to `"web"`, but
-    # a present JSON `null` is a malformed value and must be rejected, not
-    # silently read as the default.
+  defp validate_application_type(metadata, config) do
+    # The host may choose a native registration profile for clients that omit
+    # this member. Its default remains the standard `"web"`; explicit values
+    # and a present JSON `null` must not be replaced by the host default.
     case Map.fetch(metadata, "application_type") do
       :error ->
-        {:ok, @default_application_type}
+        {:ok, Config.registration_default_application_type(config)}
 
       {:ok, type} when type in @application_types ->
         {:ok, type}
@@ -1095,7 +1099,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # RFC 7591 §2 / RFC 6749 §3.1.2: a grant type that redirects the resource
   # owner back to the client requires at least one absolute redirect URI; a
   # malformed or relative URI is rejected as invalid_redirect_uri.
-  defp validate_redirect_uris(metadata, grant_types, application_type) do
+  defp validate_redirect_uris(metadata, grant_types, application_type, config) do
     needs_redirect? = Enum.any?(grant_types, &(&1 in @redirect_requiring_grant_types))
 
     case Map.fetch(metadata, "redirect_uris") do
@@ -1110,14 +1114,14 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
         {:ok, []}
 
       {:ok, redirect_uris} when is_list(redirect_uris) ->
-        validate_redirect_uri_list(redirect_uris, needs_redirect?, application_type)
+        validate_redirect_uri_list(redirect_uris, needs_redirect?, application_type, config)
 
       {:ok, _other} ->
         {:error, error(@error_invalid_redirect_uri, "redirect_uris must be an array")}
     end
   end
 
-  defp validate_redirect_uri_list([], true, _application_type) do
+  defp validate_redirect_uri_list([], true, _application_type, _config) do
     {:error,
      error(
        @error_invalid_redirect_uri,
@@ -1125,12 +1129,12 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
      )}
   end
 
-  defp validate_redirect_uri_list(redirect_uris, _needs_redirect?, application_type) do
+  defp validate_redirect_uri_list(redirect_uris, _needs_redirect?, application_type, config) do
     valid_collection? =
       list_within_limit?(redirect_uris, @max_metadata_collection_entries) and
         Enum.uniq(redirect_uris) == redirect_uris
 
-    case valid_collection? and Enum.all?(redirect_uris, &valid_redirect_uri?(&1, application_type)) do
+    case valid_collection? and Enum.all?(redirect_uris, &valid_redirect_uri?(&1, application_type, config)) do
       true ->
         {:ok, redirect_uris}
 
@@ -1164,24 +1168,24 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # that must never be a redirect target (`javascript:`, `data:`, `mailto:`)
   # out of it. Ownership, if a deployment needs it enforced, is host policy in
   # front of this endpoint.
-  defp valid_redirect_uri?(value, application_type)
+  defp valid_redirect_uri?(value, application_type, config)
        when is_binary(value) and value != "" and byte_size(value) <= @max_uri_metadata_bytes do
     with true <- bounded_text?(value, @max_uri_metadata_bytes),
          true <- RedirectURI.unambiguous?(value),
          false <- invalid_percent_encoding?(value),
          {:ok, uri} <- URI.new(value) do
-      acceptable_redirect_uri?(uri, application_type, value)
+      acceptable_redirect_uri?(uri, application_type, value, config)
     else
       _other -> false
     end
   end
 
-  defp valid_redirect_uri?(_value, _application_type), do: false
+  defp valid_redirect_uri?(_value, _application_type, _config), do: false
 
   # RFC 6749 §3.1.2: "The redirection endpoint URI MUST NOT include a fragment
   # component." True of every client type, checked before anything else.
-  defp acceptable_redirect_uri?(%URI{fragment: fragment}, _application_type, _original) when not is_nil(fragment),
-    do: false
+  defp acceptable_redirect_uri?(%URI{fragment: fragment}, _application_type, _original, _config)
+       when not is_nil(fragment), do: false
 
   # The ordinary form: scheme + authority. The scheme MUST be http/https. A
   # non-http(s) scheme WITH an authority - `javascript://x/%0aalert(document.domain)//`
@@ -1191,23 +1195,28 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # the logout continue-link / meta-refresh) as stored XSS in the AS origin.
   # Restricting the authority form to http/https closes that; native private-use
   # and loopback forms are handled by the clauses below.
-  defp acceptable_redirect_uri?(%URI{scheme: "https", host: host} = uri, _application_type, _original)
+  defp acceptable_redirect_uri?(%URI{scheme: "https", host: host} = uri, _application_type, _original, _config)
        when is_binary(host) and host != "" do
     valid_uri_port?(uri.port) and match?({:ok, _canonical_host}, HostPolicy.canonicalize(host))
   end
 
-  # RFC 9700 §2.1 permits plain HTTP only for native loopback redirects as
+  # RFC 9700 §2.6 permits plain HTTP only for native loopback redirects as
   # defined by RFC 8252 §7.3. External HTTP redirects are rejected for both web
   # and native registrations.
-  defp acceptable_redirect_uri?(%URI{scheme: "http"}, "native", original),
-    do: ClientIdMetadata.loopback_redirect_uri?(original)
+  # Port zero remains a permitted registration placeholder; authorization
+  # requests must supply a usable port. Ports beyond the TCP range are invalid
+  # even though loopback matching intentionally ignores the registered port.
+  defp acceptable_redirect_uri?(%URI{scheme: "http", port: port}, "native", original, config) when port in 0..65_535 do
+    Config.native_app_loopback_redirect?(config) and
+      ClientIdMetadata.loopback_redirect_uri?(original, Config.native_app_loopback_matching(config))
+  end
 
   # RFC 8252 §7.1 private-use scheme: no authority, reverse-DNS scheme, and a
   # real path to call back to.
-  defp acceptable_redirect_uri?(%URI{scheme: scheme, host: nil, path: path}, "native", _original)
+  defp acceptable_redirect_uri?(%URI{scheme: scheme, host: nil, path: path}, "native", _original, _config)
        when is_binary(scheme) and scheme != "" and is_binary(path) and path != "", do: String.contains?(scheme, ".")
 
-  defp acceptable_redirect_uri?(%URI{}, _application_type, _original), do: false
+  defp acceptable_redirect_uri?(%URI{}, _application_type, _original, _config), do: false
 
   # RFC 7591 §2 / RFC 6749 §3.3: the requested scope is a space-delimited
   # string; every requested scope must be in the server's effective

@@ -136,6 +136,86 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert body(conn)["application_type"] == "web"
     end
 
+    test "the web default does not infer native clients from loopback redirects" do
+      test_pid = self()
+
+      cfg =
+        config(
+          native_apps: [loopback_include_localhost: true],
+          register_client: fn attrs ->
+            send(test_pid, {:persisted, attrs})
+            {:ok, attrs}
+          end
+        )
+
+      for uri <- ["http://127.0.0.1:43127/cb", "http://[::1]:43127/cb", "http://localhost:43127/cb"] do
+        conn = post_register(cfg, %{"redirect_uris" => [uri]})
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+
+      refute_receive {:persisted, _attrs}
+    end
+
+    test "an explicit native host profile defaults and persists an omitted application_type" do
+      test_pid = self()
+      redirects = ["http://127.0.0.1:43127/cb", "http://[::1]:43127/cb"]
+
+      conn =
+        post_register(
+          config(
+            registration_default_application_type: "native",
+            register_client: fn attrs ->
+              send(test_pid, {:persisted, attrs})
+              {:ok, attrs}
+            end
+          ),
+          %{"redirect_uris" => redirects}
+        )
+
+      assert conn.status == 201
+      assert body(conn)["application_type"] == "native"
+      assert body(conn)["redirect_uris"] == redirects
+      assert_receive {:persisted, attrs}
+      assert attrs["application_type"] == "native"
+      assert attrs["redirect_uris"] == redirects
+    end
+
+    test "the native host default preserves explicit web metadata and its redirect restrictions" do
+      cfg = config(registration_default_application_type: "native", native_apps: [loopback_include_localhost: true])
+
+      conn =
+        post_register(cfg, %{
+          "application_type" => "web",
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 201
+      assert body(conn)["application_type"] == "web"
+
+      for uri <- ["http://127.0.0.1:43127/cb", "http://localhost:43127/cb"] do
+        conn = post_register(cfg, %{"application_type" => "web", "redirect_uris" => [uri]})
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+    end
+
+    test "the native host default does not permit external HTTP or mixed redirect sets" do
+      cfg = config(registration_default_application_type: "native")
+
+      for redirects <- [
+            ["http://client.example/cb"],
+            ["http://127.0.0.1:43127/cb", "http://client.example/cb"]
+          ] do
+        conn = post_register(cfg, %{"redirect_uris" => redirects})
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+    end
+
     # Asserted against what reaches `:register_client`, not just the echoed
     # response body. The response is rendered from the issued attrs, so a body
     # assertion alone would still pass if the member were dropped on the way to
@@ -169,15 +249,17 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     # An ABSENT member defaults to "web"; a present JSON null is a malformed
     # value and must not be read as the default.
     test "rejects an explicit null application_type" do
-      conn =
-        post_register(config([]), %{
-          "grant_types" => ["authorization_code"],
-          "application_type" => nil,
-          "redirect_uris" => ["https://client.example/callback"]
-        })
+      for default <- ["web", "native"] do
+        conn =
+          post_register(config(registration_default_application_type: default), %{
+            "grant_types" => ["authorization_code"],
+            "application_type" => nil,
+            "redirect_uris" => ["https://client.example/callback"]
+          })
 
-      assert conn.status == 400
-      assert body(conn)["error"] == "invalid_client_metadata"
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
     end
 
     test "rejects an application_type outside the defined set" do
@@ -278,6 +360,76 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
         })
 
       assert conn.status == 201
+    end
+
+    test "accepts native localhost redirects only with the existing host opt-in" do
+      uri = "http://localhost:43127/cb"
+
+      for {default, metadata} <- [
+            {"web", %{"application_type" => "native", "redirect_uris" => [uri]}},
+            {"native", %{"application_type" => "native", "redirect_uris" => [uri]}},
+            {"native", %{"redirect_uris" => [uri]}}
+          ] do
+        conn =
+          post_register(
+            config(
+              registration_default_application_type: default,
+              native_apps: [loopback_include_localhost: true]
+            ),
+            metadata
+          )
+
+        assert conn.status == 201
+        assert body(conn)["application_type"] == "native"
+        assert body(conn)["redirect_uris"] == [uri]
+      end
+    end
+
+    test "the localhost opt-in does not allow external hosts or ambiguous loopback URIs" do
+      cfg = config(native_apps: [loopback_include_localhost: true])
+
+      for uri <- [
+            "http://localhost.example:43127/cb",
+            "http://example.localhost:43127/cb",
+            "http://client.example:43127/cb",
+            "http://localhost:43127/cb#fragment",
+            "http://user@localhost:43127/cb",
+            "http://localhost:65536/cb",
+            "http://127.0.0.1:65536/cb",
+            "http://[::1]:65536/cb"
+          ] do
+        conn = post_register(cfg, %{"application_type" => "native", "redirect_uris" => [uri]})
+
+        assert conn.status == 400, "expected #{uri} to be rejected, got status #{conn.status}"
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+    end
+
+    test "disabling native loopback redirects overrides the localhost and native-default opt-ins" do
+      cfg =
+        config(
+          registration_default_application_type: "native",
+          native_apps: [loopback_redirect: false, loopback_include_localhost: true]
+        )
+
+      for uri <- ["http://127.0.0.1:43127/cb", "http://[::1]:43127/cb", "http://localhost:43127/cb"],
+          metadata <- [%{"application_type" => "native", "redirect_uris" => [uri]}, %{"redirect_uris" => [uri]}] do
+        conn = post_register(cfg, metadata)
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_redirect_uri"
+      end
+    end
+
+    test "disabling loopback preserves native private-use and HTTPS redirects" do
+      cfg = config(native_apps: [loopback_redirect: false])
+
+      for uri <- ["com.example.app:/cb", "https://client.example/cb"] do
+        conn = post_register(cfg, %{"application_type" => "native", "redirect_uris" => [uri]})
+
+        assert conn.status == 201
+        assert body(conn)["redirect_uris"] == [uri]
+      end
     end
 
     test "rejects plain HTTP redirects except native loopback literals" do
