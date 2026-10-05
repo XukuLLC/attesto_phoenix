@@ -121,7 +121,27 @@ defmodule AttestoPhoenix.ConfigTest do
     def client_auth_method(_client), do: "client_secret_post"
   end
 
+  defmodule WrappingRefreshStore do
+    @behaviour Attesto.RefreshStore
+
+    @impl true
+    defdelegate insert(record), to: EctoRefreshStore
+    @impl true
+    defdelegate get(hash), to: EctoRefreshStore
+    @impl true
+    defdelegate rotate(hash, child, successor, opts), to: EctoRefreshStore
+    @impl true
+    defdelegate revoke_family(family), to: EctoRefreshStore
+  end
+
   defmodule EmptyModule do
+  end
+
+  defmodule WrongRotateArityStore do
+    defdelegate insert(record), to: EctoRefreshStore
+    defdelegate get(hash), to: EctoRefreshStore
+    defdelegate revoke_family(family), to: EctoRefreshStore
+    def rotate(_hash, _child, _successor), do: :error
   end
 
   # A ClientStore exporting only the two required callbacks; its optional
@@ -220,6 +240,7 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.registration_default_application_type(cfg) == "web"
       assert Config.bind_unbound_refresh_families(cfg) == :reject
+      assert Config.refresh_store_backend(cfg) == nil
       assert Config.client_auth_method_validation(cfg) == :runtime
       assert Config.client_secret_auth_method_policy(cfg) == :strict
       assert Config.oauth_body_guard(cfg) == :observe
@@ -283,7 +304,7 @@ defmodule AttestoPhoenix.ConfigTest do
     end
 
     test "configured-issuer migration requires the bundled Ecto refresh store" do
-      for store <- [nil, Attesto.RefreshStore.ETS] do
+      for store <- [nil, Attesto.RefreshStore.ETS, WrappingRefreshStore] do
         assert_raise ArgumentError, ~r/configured_issuer refresh migration requires/, fn ->
           config(bind_unbound_refresh_families: :configured_issuer, refresh_store: store)
         end
@@ -297,6 +318,83 @@ defmodule AttestoPhoenix.ConfigTest do
         )
 
       assert Config.bind_unbound_refresh_families(cfg) == :configured_issuer
+      assert Config.refresh_store_backend(cfg) == EctoRefreshStore
+    end
+
+    test "a declared Ecto backend enables issuer migration without replacing the wrapper" do
+      cfg =
+        config(
+          bind_unbound_refresh_families: :configured_issuer,
+          refresh_store: WrappingRefreshStore,
+          refresh_store_backend: EctoRefreshStore,
+          refresh_token_rotation_grace_seconds: 0
+        )
+
+      assert cfg.refresh_store == WrappingRefreshStore
+      assert Config.refresh_store_backend(cfg) == EctoRefreshStore
+      assert Config.bind_unbound_refresh_families(cfg) == :configured_issuer
+    end
+
+    test "rejects unsupported backend declarations and stores without the required callbacks" do
+      for backend <- [Attesto.RefreshStore.ETS, "EctoRefreshStore", false] do
+        assert_raise ArgumentError, ~r/:refresh_store_backend must be nil or/, fn ->
+          config(
+            refresh_store: WrappingRefreshStore,
+            refresh_store_backend: backend,
+            refresh_token_rotation_grace_seconds: 0
+          )
+        end
+      end
+
+      invalid_stores = [
+        nil,
+        Attesto.RefreshStore.ETS,
+        EmptyModule,
+        WrongRotateArityStore,
+        __MODULE__.MissingRefreshStore
+      ]
+
+      for store <- invalid_stores do
+        assert_raise ArgumentError, ~r/:refresh_store_backend requires a loadable Ecto-backed/, fn ->
+          config(
+            refresh_store: store,
+            refresh_store_backend: EctoRefreshStore,
+            refresh_token_rotation_grace_seconds: 0
+          )
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:refresh_store_backend must be nil or/, fn ->
+        config(
+          refresh_store: EctoRefreshStore,
+          refresh_store_backend: Attesto.RefreshStore.ETS,
+          refresh_token_rotation_grace_seconds: 0
+        )
+      end
+    end
+
+    test "a declared wrapper requires the same positive-grace secret and cleanup configuration" do
+      previous = Application.fetch_env(:attesto_phoenix, :refresh_successor_secret)
+
+      on_exit(fn ->
+        case previous do
+          {:ok, secret} -> Application.put_env(:attesto_phoenix, :refresh_successor_secret, secret)
+          :error -> Application.delete_env(:attesto_phoenix, :refresh_successor_secret)
+        end
+      end)
+
+      opts = [refresh_store: WrappingRefreshStore, refresh_store_backend: EctoRefreshStore]
+      Application.delete_env(:attesto_phoenix, :refresh_successor_secret)
+
+      assert_raise ArgumentError, ~r/:refresh_successor_secret.*at least 32 bytes/, fn ->
+        config(opts)
+      end
+
+      assert %Config{} = config(Keyword.put(opts, :refresh_token_rotation_grace_seconds, 0))
+      Application.put_env(:attesto_phoenix, :refresh_successor_secret, String.duplicate("stable-secret-", 3))
+
+      assert_raise ArgumentError, ~r/requires a positive :sweep_interval_ms/, fn -> config(opts) end
+      assert %Config{} = config(Keyword.put(opts, :sweep_interval_ms, 60_000))
     end
   end
 

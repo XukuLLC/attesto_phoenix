@@ -74,6 +74,30 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       refute source =~ "nil ||"
     end
 
+    test "the generated 3.4 upgrade passes strict lint unchanged", %{tmp_dir: tmp_dir} do
+      tmp_dir = Path.expand(tmp_dir)
+      project_dir = File.cwd!()
+      # A host may use only Elixir's formatter, without refactoring plugins.
+      File.write!(Path.join(tmp_dir, ".formatter.exs"), "[inputs: [\"**/*.exs\"]]\n")
+
+      File.cd!(tmp_dir, fn ->
+        run!(["--upgrade", "3.4", "--schema-prefix", "auth"], tmp_dir)
+        assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_4.exs"))
+        assert :ok = Format.run(["--check-formatted", file])
+
+        # precommit can already have started Credo outside application tracking.
+        # A fresh CLI process keeps its supervision and caches isolated.
+        {output, status} =
+          System.cmd("mix", ["credo", "--strict", "--format", "json", file],
+            cd: project_dir,
+            stderr_to_stdout: true
+          )
+
+        assert status == 0, output
+        assert %{"issues" => []} = Jason.decode!(output)
+      end)
+    end
+
     setup do
       AppEnvSnapshot.ensure_unset!([
         {:attesto_phoenix, :otp_app},

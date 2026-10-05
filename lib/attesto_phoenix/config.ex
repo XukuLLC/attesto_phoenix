@@ -526,6 +526,13 @@ defmodule AttestoPhoenix.Config do
       also requires `config :attesto_phoenix, :refresh_successor_secret` to be
       a stable secret of at least 32 bytes. The config builder rejects that
       combination when the secret is missing or invalid.
+    * `:refresh_store_backend` - optional trusted declaration that a wrapping
+      refresh store persists through `AttestoPhoenix.Store.EctoRefreshStore`.
+      The direct Ecto store is recognized automatically. A declared wrapper
+      must implement every `Attesto.RefreshStore` callback and delegate Ecto
+      operations under the same request configuration. This declaration enables
+      issuer migration and the Ecto retry-secret/cleanup checks; it never
+      replaces `:refresh_store` or bypasses its policy callbacks.
     * `:par_store` - module implementing `AttestoPhoenix.PARStore`. Defaults to
       the single-node `AttestoPhoenix.Store.PAR.ETS`; use
       `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
@@ -1028,6 +1035,7 @@ defmodule AttestoPhoenix.Config do
     :resolve_jwt_bearer_subject,
     :code_store,
     :refresh_store,
+    :refresh_store_backend,
     :par_store,
     :consent_grant_store,
     :grant_types_supported,
@@ -1191,6 +1199,7 @@ defmodule AttestoPhoenix.Config do
           resolve_jwt_bearer_subject: callback() | nil,
           code_store: module() | nil,
           refresh_store: module() | nil,
+          refresh_store_backend: module() | nil,
           par_store: module() | nil,
           consent_grant_store: module() | nil,
           grant_types_supported: [String.t()] | nil,
@@ -1951,6 +1960,17 @@ defmodule AttestoPhoenix.Config do
   """
   @spec bind_unbound_refresh_families(t()) :: :reject | :configured_issuer
   def bind_unbound_refresh_families(%__MODULE__{bind_unbound_refresh_families: policy}), do: policy
+
+  @doc """
+  Declared persistence backend for refresh migration and Ecto configuration checks.
+
+  The direct Ecto store resolves automatically. Wrappers declare
+  `refresh_store_backend: AttestoPhoenix.Store.EctoRefreshStore`; token
+  operations continue to use the configured `:refresh_store` wrapper.
+  """
+  @spec refresh_store_backend(t()) :: module() | nil
+  def refresh_store_backend(%__MODULE__{refresh_store: EctoRefreshStore}), do: EctoRefreshStore
+  def refresh_store_backend(%__MODULE__{refresh_store_backend: backend}), do: backend
 
   @doc """
   Whether missing registered-method configuration is rejected at boot.
@@ -4001,6 +4021,7 @@ defmodule AttestoPhoenix.Config do
     validate_nested_boolean_flags!(config)
     validate_client_id_metadata_limits!(config)
     validate_required_par_store!(config)
+    validate_refresh_store_backend!(config)
     validate_refresh_rotation!(config)
     validate_dpop_nonce!(config)
     validate_wallet_attestation_challenge_store!(config.wallet_attestation_challenge_store)
@@ -4095,11 +4116,34 @@ defmodule AttestoPhoenix.Config do
     end
 
     if bind_unbound_refresh_families(config) == :configured_issuer and
-         config.refresh_store != EctoRefreshStore do
+         refresh_store_backend(config) != EctoRefreshStore do
       raise ArgumentError,
             "AttestoPhoenix.Config: :configured_issuer refresh migration requires " <>
-              "AttestoPhoenix.Store.EctoRefreshStore"
+              "AttestoPhoenix.Store.EctoRefreshStore or a declared Ecto-backed wrapper"
     end
+  end
+
+  defp validate_refresh_store_backend!(%{refresh_store_backend: nil}), do: :ok
+
+  defp validate_refresh_store_backend!(%{refresh_store_backend: EctoRefreshStore, refresh_store: store}) do
+    if store in [nil, Attesto.RefreshStore.ETS] or not capable_refresh_store?(store) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :refresh_store_backend requires a loadable Ecto-backed " <>
+              ":refresh_store implementing insert/1, get/1, rotate/4, and revoke_family/1"
+    end
+  end
+
+  defp validate_refresh_store_backend!(_config) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :refresh_store_backend must be nil or " <>
+            "AttestoPhoenix.Store.EctoRefreshStore"
+  end
+
+  defp capable_refresh_store?(store) do
+    is_atom(store) and not is_nil(store) and Code.ensure_loaded?(store) and
+      Enum.all?(Attesto.RefreshStore.behaviour_info(:callbacks), fn {name, arity} ->
+        function_exported?(store, name, arity)
+      end)
   end
 
   # RFC 9068 §2.2 access-token claims, including its referenced OIDC identity
@@ -4508,8 +4552,9 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  defp validate_refresh_successor_secret!(%{refresh_store: EctoRefreshStore}, grace) when grace > 0 do
-    if not AttestoPhoenix.RefreshSuccessorCipher.configured?() do
+  defp validate_refresh_successor_secret!(config, grace) when grace > 0 do
+    if refresh_store_backend(config) == EctoRefreshStore and
+         not AttestoPhoenix.RefreshSuccessorCipher.configured?() do
       raise ArgumentError,
             "AttestoPhoenix.Config: AttestoPhoenix.Store.EctoRefreshStore with a non-zero " <>
               ":refresh_token_rotation_grace_seconds requires " <>
@@ -4522,11 +4567,13 @@ defmodule AttestoPhoenix.Config do
 
   defp validate_refresh_successor_secret!(_config, _grace), do: :ok
 
-  defp validate_refresh_sweeper!(%{refresh_store: EctoRefreshStore}, grace, nil) when grace > 0 do
-    raise ArgumentError,
-          "AttestoPhoenix.Config: AttestoPhoenix.Store.EctoRefreshStore with a non-zero " <>
-            ":refresh_token_rotation_grace_seconds requires a positive :sweep_interval_ms " <>
-            "and supervision of AttestoPhoenix.Store.Sweeper (or an equivalent cleanup job)."
+  defp validate_refresh_sweeper!(config, grace, nil) when grace > 0 do
+    if refresh_store_backend(config) == EctoRefreshStore do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: AttestoPhoenix.Store.EctoRefreshStore with a non-zero " <>
+              ":refresh_token_rotation_grace_seconds requires a positive :sweep_interval_ms " <>
+              "and supervision of AttestoPhoenix.Store.Sweeper (or an equivalent cleanup job)."
+    end
   end
 
   defp validate_refresh_sweeper!(_config, _grace, _sweep_interval_ms), do: :ok

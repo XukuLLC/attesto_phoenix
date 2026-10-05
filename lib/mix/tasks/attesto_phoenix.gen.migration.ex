@@ -2109,8 +2109,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     defp qualify_table(table, prefix) do
       [prefix, table]
       |> Enum.reject(&(&1 in [nil, ""]))
-      |> Enum.map(&quote_identifier/1)
-      |> Enum.join(".")
+      |> Enum.map_join(".", &quote_identifier/1)
     end
 
     defp quote_identifier(identifier) do

@@ -23,6 +23,11 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
   prefix, and application are used. The host application and repos are started
   using their existing configuration, including the stable successor secret.
 
+  A wrapping refresh store must explicitly declare
+  `refresh_store_backend: AttestoPhoenix.Store.EctoRefreshStore`. The task
+  updates that backing store; protocol operations continue through the
+  configured wrapper and its policy checks.
+
   A one-time backfill requires quiescent token writers. For a rolling deployment,
   explicitly enable `bind_unbound_refresh_families: :configured_issuer` on the
   new nodes for the single-issuer migration window; backfill before and after
@@ -67,7 +72,11 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
 
   defp validate_store!(config, issuer) do
     if config.issuer != issuer, do: Mix.raise("--issuer must exactly match the configured issuer")
-    if config.refresh_store != EctoRefreshStore, do: Mix.raise("the configured refresh store must be EctoRefreshStore")
+
+    if Config.refresh_store_backend(config) != EctoRefreshStore do
+      Mix.raise("the configured refresh store must declare EctoRefreshStore as its backend")
+    end
+
     if !(is_atom(config.repo) and not is_nil(config.repo)), do: Mix.raise("a configured Ecto repo is required")
   end
 

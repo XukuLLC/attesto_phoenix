@@ -23,6 +23,13 @@ remain invalid. `loopback_redirect: false` disables that exception at
 registration too. The localhost option is separate and defaults to false.
 An IP loopback redirect remains preferable under RFC 8252.
 
+The loopback matching mode changes only the port comparison for a registered
+loopback HTTP URI. Private-use callbacks and other non-loopback URIs still
+match exactly, including their scheme, authority, path, and query. Enabling
+loopback registration therefore does not relax matching for a native client
+whose registered callbacks contain no loopback URI. A request cannot substitute
+a loopback URI for that client's private-use callback.
+
 The standards registration default is `"web"`. Select that default for OIDC
 conformance and ordinary web registration. Use a separate configuration profile
 when a host deliberately provides native defaults.
@@ -33,7 +40,33 @@ By default, a refresh family without its persisted issuer binding is refused.
 A store that has always belonged to exactly one issuer can be migrated through
 an explicit administrative assertion. Do not use this procedure for shared or
 uncertain historical issuer provenance. It supports the bundled
-`AttestoPhoenix.Store.EctoRefreshStore` only.
+`AttestoPhoenix.Store.EctoRefreshStore` and explicitly declared wrappers backed
+by that store.
+
+Starting in 3.5.1, a wrapper implementing `Attesto.RefreshStore` can declare its
+persistence backend:
+
+```elixir
+config :my_app, AttestoPhoenix,
+  refresh_store: MyApp.RefreshStore,
+  refresh_store_backend: AttestoPhoenix.Store.EctoRefreshStore,
+  bind_unbound_refresh_families: :configured_issuer
+```
+
+The direct Ecto store is recognized without the declaration. Undeclared custom
+stores cannot enable this migration. The declaration is a trusted operator
+assertion: callback validation cannot prove delegation. The wrapper must
+delegate Ecto operations under the same request configuration, repository, and
+schema prefix. Token operations retain the configured wrapper. Positive retry
+grace still requires the stable successor secret and configured cleanup used
+by the direct Ecto store.
+
+A cached retry can recover a successor through the wrapper's `get/1` without
+calling `rotate/4` again. Policies that must apply to recovered successors
+therefore need enforcement on reads or through `:build_refresh_principal`;
+a rotation-only policy does not cover that existing retry path. Administrative
+backfill changes issuer bindings directly in the trusted Ecto persistence
+scope and does not issue tokens or evaluate per-request wrapper policy.
 
 Audit with the configured application, repository, prefix, and stable
 refresh-successor encryption secret:
@@ -50,6 +83,30 @@ Each family is locked and updated atomically, including authenticated retry
 contexts. A conflicting issuer, unreadable retry state, or oversized family
 stops that family without partial writes. Previously committed families remain
 bound; the operation is idempotent. Output contains aggregate counts only.
+
+Production releases can use the same API from a release console without Mix.
+Load the application's trusted configuration and audit first:
+
+```elixir
+alias AttestoPhoenix.Config
+alias AttestoPhoenix.Store.EctoRefreshStore
+
+config = Config.from_otp_app(:my_app)
+
+Config.with_request_config(config, fn ->
+  EctoRefreshStore.backfill_issuer(config.issuer,
+    assert_single_issuer: true,
+    dry_run: true,
+    batch_size: 100
+  )
+end)
+```
+
+Review the aggregate counts, then use `dry_run: false` in that same trusted
+context to apply the backfill. The explicit single-issuer assertion is required
+for both audit and apply. Keep strict rejection unless the temporary rolling
+migration policy is deliberately enabled; this administrative operation does
+not enable it automatically.
 
 Migration emits `[:attesto_phoenix, :refresh_token, :issuer_migration]` with
 `%{count: n}` and bounded outcome/reason metadata only. Outcomes are `:audited`,
@@ -121,6 +178,21 @@ Host upload routes can keep their existing multipart parsing.
 Duplicate query/header checks remain automatic, and completed
 body analysis is enforced under either policy. Custom readers can be wrapped
 as described in `AttestoPhoenix.DuplicateParameterGuard`.
+
+Protocol tests must exercise the encoded body when testing the reader or using
+`:required`. Passing a params map directly to `Phoenix.ConnTest.post/3` bypasses
+body reading. Encode JSON and set its content type instead:
+
+```elixir
+conn
+|> Plug.Conn.put_req_header("content-type", "application/json")
+|> Phoenix.ConnTest.post("/register", Jason.encode!(registration))
+```
+
+Use `URI.encode_query/1` with `application/x-www-form-urlencoded` for form
+requests. In 3.5.1, clean JSON bodies record completed analysis; malformed JSON
+also records that the reader ran and remains subject to the parser's normal
+JSON decoding error.
 
 ## Dependencies and generated rollback
 

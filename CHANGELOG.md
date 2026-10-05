@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.1] - 2026-10-04
+
+### Fixed
+
+- Accept clean JSON protocol requests under `oauth_body_guard: :required` and
+  avoid missing-analysis telemetry after the configured reader has checked a
+  JSON body. Duplicate JSON members remain rejected.
+- Support Ecto-backed refresh-store wrappers through an explicit
+  `refresh_store_backend` declaration for rolling issuer migration and the
+  administrative backfill task. Token operations continue through the wrapper;
+  Ecto retry-secret and cleanup requirements still apply.
+- Generate 3.4 migration identifier quoting with `Enum.map_join/3`, so the
+  generated migration passes strict Credo without manual editing.
+
+### Documentation
+
+- Document refresh issuer backfill from a release console, wrapper policy
+  coverage during retry recovery, exact matching of non-loopback native
+  callbacks, and encoded request bodies in protocol tests. See the
+  [3.5 upgrade guide](guides/upgrade_3_5.md).
+
 ## [3.5.0] - 2026-10-04
 
 ### Added

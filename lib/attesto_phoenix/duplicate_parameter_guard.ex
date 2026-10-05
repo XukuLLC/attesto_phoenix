@@ -346,19 +346,19 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
         {:error, reason}
 
       {_decoded, nil, ""} ->
-        {:ok, nil}
+        {:ok, %{format: :json}}
 
       # Leave ordinary JSON syntax errors to the configured Plug decoder. This
       # reader is responsible only for ambiguity, and a host may use a decoder
       # with options that differ from Elixir's built-in JSON module.
       {:error, _reason} ->
-        {:ok, nil}
+        {:ok, %{format: :json}}
 
       _other ->
-        {:ok, nil}
+        {:ok, %{format: :json}}
     end
   rescue
-    ArgumentError -> {:ok, nil}
+    ArgumentError -> {:ok, %{format: :json}}
   end
 
   defp inspect_json_object_member(_key, _value, {keys, duplicate}) when not is_nil(duplicate) do

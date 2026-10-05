@@ -97,6 +97,45 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     %{"keys" => [Map.put(public, "x5c", [Base.encode64(der)])]}
   end
 
+  test "required body analysis accepts clean encoded JSON through the parser and controller dispatch" do
+    owner = self()
+    metadata = %{"redirect_uris" => ["https://client.example/callback"], "token_endpoint_auth_method" => "none"}
+
+    cfg =
+      config(
+        oauth_body_guard: :required,
+        register_client: fn attrs ->
+          send(owner, {:registered, attrs})
+          {:ok, attrs}
+        end
+      )
+
+    parser =
+      Plug.Parsers.init(
+        parsers: [:json],
+        pass: ["*/*"],
+        json_decoder: JSON,
+        body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+      )
+
+    conn =
+      :post
+      |> conn(@endpoint_path, JSON.encode!(metadata))
+      |> Map.put(:scheme, :https)
+      |> put_req_header("content-type", "application/json")
+      |> Plug.Parsers.call(parser)
+      |> put_private(:attesto_phoenix_config, cfg)
+      |> RegistrationController.call(:create)
+
+    assert conn.status == 201
+    assert body(conn)["redirect_uris"] == metadata["redirect_uris"]
+    assert body(conn)["token_endpoint_auth_method"] == "none"
+    assert_receive {:registered, attrs}
+    assert attrs["redirect_uris"] == metadata["redirect_uris"]
+    refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_analysis)
+    refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_chunks)
+  end
+
   test "draft 11 client capabilities survive registration and reject forbidden algorithms" do
     capabilities = %{
       "client_attestation_signing_alg_values_supported" => ["ES256"],

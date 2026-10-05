@@ -14,10 +14,72 @@ defmodule AttestoPhoenix.Store.RefreshIssuerMigrationTest do
   @issuer_claim "urn:attesto:refresh-token:issuer"
   @now 1_900_000_000
   @instance_key Base.url_encode64(:crypto.hash(:sha256, "verified-instance-key"), padding: false)
+  @dpop_key Base.url_encode64(:crypto.hash(:sha256, "verified-dpop-key"), padding: false)
 
   defmodule Keystore do
     def signing_pem, do: "unused-store-test-key"
     def verification_pems, do: [signing_pem()]
+  end
+
+  defmodule PolicyRefreshStore do
+    @behaviour Attesto.RefreshStore
+
+    alias AttestoPhoenix.TestRepo
+
+    def set_policy(opts), do: Process.put({__MODULE__, :policy}, opts)
+
+    @impl Attesto.RefreshStore
+    defdelegate insert(record), to: EctoRefreshStore
+
+    @impl Attesto.RefreshStore
+    def get(token_hash) do
+      if policy(:reads) == :deny, do: :error, else: EctoRefreshStore.get(token_hash)
+    end
+
+    @impl Attesto.RefreshStore
+    def rotate(parent_hash, child, successor, opts) do
+      {:ok, result} =
+        TestRepo.transaction(
+          fn ->
+            TestRepo.query!(
+              "SELECT pg_advisory_xact_lock($1::integer, hashtext($2::text))",
+              [0x5752_4150, child.data.subject],
+              log: false,
+              telemetry_event: nil
+            )
+
+            rotate_under_policy(parent_hash, child, successor, opts)
+          end,
+          log: false,
+          telemetry_event: nil
+        )
+
+      result
+    end
+
+    @impl Attesto.RefreshStore
+    def revoke_family(family_id) do
+      send(self(), :wrapper_revoked_family)
+      EctoRefreshStore.revoke_family(family_id)
+    end
+
+    defp rotate_under_policy(parent_hash, child, successor, opts) do
+      case policy(:rotation) do
+        :allow ->
+          send(self(), :wrapper_allowed_rotation)
+          EctoRefreshStore.rotate(parent_hash, child, successor, opts)
+
+        :deny ->
+          send(self(), :wrapper_denied_rotation)
+          :error
+
+        :revoke ->
+          revoke_family(child.family_id)
+          {:error, :family_revoked}
+      end
+    end
+
+    defp policy(key), do: Keyword.get(Process.get({__MODULE__, :policy}, []), key, :allow)
   end
 
   setup do
@@ -311,6 +373,144 @@ defmodule AttestoPhoenix.Store.RefreshIssuerMigrationTest do
     end)
   end
 
+  test "declared wrapping store binds an old family and preserves rotation and grace recovery", %{config: config} do
+    initial = Config.with_request_config(config, &issue_legacy/0)
+    wrapped = wrapping_config(config)
+    assert wrapped.refresh_store == PolicyRefreshStore
+
+    Config.with_request_config(wrapped, fn ->
+      assert {:error, :attestation_proof_unexpected} =
+               rotate_with_wrapper(initial.token, attestation_jkt: @instance_key)
+
+      assert row(initial.token).attestation_jkt == nil
+      refute row(initial.token).consumed
+      assert {:ok, first} = rotate_with_wrapper(initial.token)
+      assert_receive :wrapper_allowed_rotation
+      assert first.context.issuer == @issuer
+      assert row(initial.token).claims[@issuer_claim] == @issuer
+      assert row(first.token).claims[@issuer_claim] == @issuer
+
+      assert {:ok, retry} = rotate_with_wrapper(initial.token, now: @now + 2)
+      assert retry.token == first.token
+      assert retry.context == first.context
+      refute_receive :wrapper_allowed_rotation
+
+      assert {:ok, next} = rotate_with_wrapper(first.token, now: @now + 3)
+      assert_receive :wrapper_allowed_rotation
+      assert next.context.issuer == @issuer
+      assert next.generation == first.generation + 1
+    end)
+  end
+
+  test "declared backend never bypasses the wrapper's rotation denial", %{config: config} do
+    initial = Config.with_request_config(config, &issue_legacy/0)
+    PolicyRefreshStore.set_policy(rotation: :deny)
+
+    Config.with_request_config(wrapping_config(config), fn ->
+      assert {:error, :invalid_grant} = rotate_with_wrapper(initial.token)
+      assert_receive :wrapper_denied_rotation
+      parent = row(initial.token)
+      assert parent.claims[@issuer_claim] == @issuer
+      refute parent.consumed
+      refute parent.family_revoked
+      assert TestRepo.aggregate(RefreshToken, :count) == 1
+
+      PolicyRefreshStore.set_policy(rotation: :allow)
+      assert {:ok, _next} = rotate_with_wrapper(initial.token)
+      assert_receive :wrapper_allowed_rotation
+    end)
+  end
+
+  test "wrapper revocation remains sticky through issuer migration and later issuance", %{config: config} do
+    initial = Config.with_request_config(config, &issue_legacy/0)
+
+    {:ok, record} =
+      Config.with_request_config(config, fn -> EctoRefreshStore.get(Attesto.Secret.hash(initial.token)) end)
+
+    PolicyRefreshStore.set_policy(rotation: :revoke)
+
+    Config.with_request_config(wrapping_config(config), fn ->
+      assert {:error, :grant_revoked} = rotate_with_wrapper(initial.token)
+      assert_receive :wrapper_revoked_family
+      assert TestRepo.aggregate(RefreshToken, :count) == 0
+      assert {:ok, %{rows_changed: 0}} = apply_backfill()
+      assert {:error, :invalid_grant} = rotate_with_wrapper(initial.token)
+      assert {:error, :family_revoked} = PolicyRefreshStore.insert(record)
+      assert TestRepo.aggregate(RefreshToken, :count) == 0
+    end)
+  end
+
+  test "wrapper read policy governs a recovered successor without invoking rotation", %{config: config} do
+    initial = Config.with_request_config(config, &issue_legacy/0)
+
+    Config.with_request_config(wrapping_config(config), fn ->
+      assert {:ok, first} = rotate_with_wrapper(initial.token)
+      assert_receive :wrapper_allowed_rotation
+      PolicyRefreshStore.set_policy(reads: :deny)
+      assert {:error, :invalid_grant} = rotate_with_wrapper(initial.token, now: @now + 2)
+      refute_receive :wrapper_allowed_rotation
+      refute row(first.token).consumed
+
+      PolicyRefreshStore.set_policy(reads: :allow)
+      assert {:ok, retry} = rotate_with_wrapper(initial.token, now: @now + 2)
+      assert retry.token == first.token
+    end)
+  end
+
+  test "wrapping migration preserves issuer isolation, instance binding, and the family deadline", %{config: config} do
+    {foreign, bound} =
+      Config.with_request_config(config, fn ->
+        {:ok, foreign} =
+          CoreRefreshToken.issue(EctoRefreshStore, Map.put(context(), :issuer, @other_issuer), now: @now, ttl: 100)
+
+        {:ok, bound} =
+          CoreRefreshToken.issue(
+            EctoRefreshStore,
+            Map.merge(context(), %{attestation_jkt: @instance_key, dpop_jkt: @dpop_key}),
+            now: @now,
+            ttl: 100,
+            family_ttl: 50
+          )
+
+        {foreign, bound}
+      end)
+
+    Config.with_request_config(wrapping_config(config), fn ->
+      assert {:error, :invalid_grant} = rotate_with_wrapper(foreign.token)
+      assert row(foreign.token).claims[@issuer_claim] == @other_issuer
+      refute row(foreign.token).consumed
+
+      assert {:error, :issuer_mismatch} =
+               rotate_with_wrapper(bound.token,
+                 issuer: @other_issuer,
+                 attestation_jkt: @instance_key,
+                 dpop_jkt: @dpop_key
+               )
+
+      assert {:error, :attestation_binding_mismatch} =
+               rotate_with_wrapper(bound.token, attestation_jkt: "wrong-key", dpop_jkt: @dpop_key)
+
+      assert {:error, :dpop_binding_mismatch} =
+               rotate_with_wrapper(bound.token, attestation_jkt: @instance_key, dpop_jkt: "wrong-key")
+
+      refute row(bound.token).consumed
+      assert row(bound.token).attestation_jkt == @instance_key
+      assert row(bound.token).cnf["jkt"] == @dpop_key
+      assert row(bound.token).family_expires_at == @now + 50
+      refute_receive :wrapper_allowed_rotation
+
+      assert {:ok, next} = rotate_with_wrapper(bound.token, attestation_jkt: @instance_key, dpop_jkt: @dpop_key)
+      assert_receive :wrapper_allowed_rotation
+      assert next.context.issuer == @issuer
+      assert next.context.attestation_jkt == @instance_key
+      assert next.context.dpop_jkt == @dpop_key
+      assert next.context.family_expires_at == @now + 50
+      assert row(next.token).attestation_jkt == @instance_key
+      assert row(next.token).cnf["jkt"] == @dpop_key
+      assert DateTime.to_unix(row(next.token).expires_at) == @now + 50
+    end)
+  end
+
   test "revoked family rows are skipped and never made usable", %{config: config} do
     Config.with_request_config(config, fn ->
       initial = issue_legacy()
@@ -339,12 +539,23 @@ defmodule AttestoPhoenix.Store.RefreshIssuerMigrationTest do
 
     try do
       public = Config.with_request_config(config, &issue_legacy/0)
-      scoped = %{config | schema_prefix: "issuer_migration_scope"}
+
+      scoped =
+        wrapping_config(%{config | schema_prefix: "issuer_migration_scope"}, bind_unbound_refresh_families: :reject)
 
       Config.with_request_config(scoped, fn ->
         initial = issue_legacy()
+
+        assert {:ok, %{rows_changed: 1}} =
+                 EctoRefreshStore.backfill_issuer(@issuer, assert_single_issuer: true, dry_run: true)
+
+        audited =
+          TestRepo.get_by!(RefreshToken, [token_hash: Attesto.Secret.hash(initial.token)], prefix: scoped.schema_prefix)
+
+        refute Map.has_key?(audited.claims, @issuer_claim)
         assert {:ok, %{rows_changed: 1}} = apply_backfill()
-        assert {:ok, next} = rotate(initial.token)
+        assert {:ok, next} = rotate_with_wrapper(initial.token)
+        assert_receive :wrapper_allowed_rotation
         assert next.context.issuer == @issuer
       end)
 
@@ -386,6 +597,39 @@ defmodule AttestoPhoenix.Store.RefreshIssuerMigrationTest do
     end)
   end
 
+  test "task accepts a declared wrapping backend and refuses an undeclared wrapper", %{config: config} do
+    initial = Config.with_request_config(config, &issue_legacy/0)
+    previous = Application.fetch_env(__MODULE__, Config)
+    shell = Mix.shell()
+    Mix.shell(Mix.Shell.Process)
+    args = ["--issuer", @issuer, "--assert-single-issuer", "--otp-app", Atom.to_string(__MODULE__)]
+
+    try do
+      Application.put_env(__MODULE__, Config, wrapping_config(config, bind_unbound_refresh_families: :reject))
+      BackfillRefreshIssuer.run(args)
+      assert_receive {:mix_shell, :info, ["Dry run:" <> _counts]}
+      refute Map.has_key?(row(initial.token).claims, @issuer_claim)
+
+      BackfillRefreshIssuer.run(args ++ ["--apply"])
+      assert_receive {:mix_shell, :info, ["Applied:" <> _counts]}
+      assert row(initial.token).claims[@issuer_claim] == @issuer
+
+      undeclared = wrapping_config(config, bind_unbound_refresh_families: :reject, refresh_store_backend: nil)
+      Application.put_env(__MODULE__, Config, undeclared)
+
+      assert_raise Mix.Error, ~r/declare EctoRefreshStore/, fn ->
+        BackfillRefreshIssuer.run(args ++ ["--apply"])
+      end
+    after
+      Mix.shell(shell)
+
+      case previous do
+        {:ok, value} -> Application.put_env(__MODULE__, Config, value)
+        :error -> Application.delete_env(__MODULE__, Config)
+      end
+    end
+  end
+
   defp context do
     %{
       subject: "subject-1",
@@ -412,6 +656,28 @@ defmodule AttestoPhoenix.Store.RefreshIssuerMigrationTest do
       token,
       Keyword.merge([issuer: @issuer, client_id: "client-1", now: @now + 1, ttl: 100, rotation_grace_seconds: 5], opts)
     )
+  end
+
+  defp rotate_with_wrapper(token, opts \\ []) do
+    %Config{refresh_store: store} = Config.request_config()
+
+    CoreRefreshToken.rotate(
+      store,
+      token,
+      Keyword.merge([issuer: @issuer, client_id: "client-1", now: @now + 1, ttl: 100, rotation_grace_seconds: 5], opts)
+    )
+  end
+
+  defp wrapping_config(config, opts \\ []) do
+    config
+    |> Map.from_struct()
+    |> Map.merge(%{
+      refresh_store: PolicyRefreshStore,
+      refresh_store_backend: EctoRefreshStore,
+      bind_unbound_refresh_families: :configured_issuer
+    })
+    |> Map.merge(Map.new(opts))
+    |> Config.new()
   end
 
   defp apply_backfill(opts \\ []) do

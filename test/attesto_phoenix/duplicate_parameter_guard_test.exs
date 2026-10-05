@@ -6,6 +6,7 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.DuplicateParameterGuard
   alias Plug.Conn.WrapperError
+  alias Plug.Parsers.ParseError
   alias Plug.Parsers.RequestTooLargeError
 
   defmodule ProbeController do
@@ -109,6 +110,49 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
 
     assert {:ok, _} = DuplicateParameterGuard.validate_and_forget(conn)
     assert_receive {:missing_analysis, %{count: 1}, %{format: :json, method: "POST"}}
+  end
+
+  test "configured JSON reader records analysis for observation and required controller policies" do
+    capture_missing_analysis()
+    metadata = %{"client_name" => "example", "metadata" => %{"labels" => ["first", "second"]}}
+
+    for policy <- [:observe, :required] do
+      conn =
+        Plug.Test.conn(:post, "/oauth/register", JSON.encode!(metadata))
+        |> put_req_header("content-type", "application/json")
+        |> parse_json()
+        |> put_private(:attesto_phoenix_config, controller_config(policy))
+
+      assert conn.body_params == metadata
+      assert conn.private[:attesto_phoenix_duplicate_parameter_analysis] == %{format: :json}
+      refute DuplicateParameterGuard.body_analysis_missing?(conn)
+      refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_chunks)
+
+      assert %{status: 204} = cleaned = ProbeController.call(conn, :show)
+      refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_analysis)
+      refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_chunks)
+    end
+
+    refute_received {:missing_analysis, _, _}
+  end
+
+  test "malformed JSON records that the reader ran and retains Plug decoder rejection" do
+    capture_missing_analysis()
+    body = ~s({"client_name":)
+
+    conn =
+      Plug.Test.conn(:post, "/oauth/register", body)
+      |> put_req_header("content-type", "application/json")
+
+    assert {:ok, ^body, analyzed} = DuplicateParameterGuard.read_body(conn, [])
+    assert analyzed.private[:attesto_phoenix_duplicate_parameter_analysis] == %{format: :json}
+    refute DuplicateParameterGuard.body_analysis_missing?(analyzed)
+    assert {:ok, cleaned} = DuplicateParameterGuard.validate_and_forget(analyzed)
+    refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_analysis)
+    refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_chunks)
+    refute_received {:missing_analysis, _, _}
+
+    assert_raise ParseError, fn -> parse_json(conn) end
   end
 
   test "complete analysis and requests without analyzable bodies do not emit missing diagnostics" do
@@ -309,6 +353,30 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
              DuplicateParameterGuard.validate_and_forget(conn)
 
     refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_chunks)
+  end
+
+  test "clean JSON completed across reads discards raw chunks and records analysis" do
+    capture_missing_analysis()
+    reader = {ChunkedReader, :read_body, []}
+    body = ~s({"client_name":"example"})
+
+    conn =
+      Plug.Test.conn(:post, "/oauth/register", "")
+      |> put_req_header("content-type", "application/json")
+      |> ChunkedReader.put_chunks([~s({"client_name":), ~s("example"})])
+
+    assert {:more, ~s({"client_name":), conn} = DuplicateParameterGuard.read_body(conn, [], reader)
+    assert Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_chunks)
+    assert {:ok, ~s("example"}), conn} = DuplicateParameterGuard.read_body(conn, [], reader)
+    conn = %{conn | body_params: JSON.decode!(body)}
+
+    refute DuplicateParameterGuard.body_analysis_missing?(conn)
+    refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_chunks)
+    assert {:ok, cleaned} = DuplicateParameterGuard.validate_and_forget(conn)
+    assert cleaned.body_params == %{"client_name" => "example"}
+    refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_analysis)
+    refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_chunks)
+    refute_received {:missing_analysis, _, _}
   end
 
   test "preserves :more so Plug.Parsers enforces its request length" do
