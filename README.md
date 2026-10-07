@@ -37,6 +37,15 @@ FAPI 2.0 certification.
 [![OpenID Connect Certified](https://img.shields.io/badge/OpenID_Connect-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-profiles/)
 [![Logout Profiles Certified](https://img.shields.io/badge/Logout_Profiles-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
 [![Session Management Certified](https://img.shields.io/badge/Session_Management-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
+[![OpenID4VCI 1.0 + HAIP 1.0 Issuer Certified](https://img.shields.io/badge/OpenID4VCI_1.0_%2B_HAIP_1.0-Issuer_Certified-F78C40)](https://openid.net/certification/certified-oid4vci-haip-final/)
+[![OpenID4VP 1.0 + HAIP 1.0 Verifier Certified](https://img.shields.io/badge/OpenID4VP_1.0_%2B_HAIP_1.0-Verifier_Certified-F78C40)](https://openid.net/certification/certified-oid4vp-haip-final/)
+
+The certified credential deployment uses `attesto` **2.2.2**,
+`attesto_phoenix` **3.5.1**, and `attesto_client` **2.6.1**. Its
+**OpenID4VCI 1.0 + HAIP 1.0 issuer** coverage includes **SD-JWT VC** and
+**ISO mdoc**, with both wallet-initiated and issuer-initiated authorization code
+flows. Its **OpenID4VP 1.0 + HAIP 1.0 verifier** coverage includes both formats
+with **`direct_post.jwt`** responses.
 
 **attesto brings the protocol, attesto_phoenix brings transport + persistence;
 you bring principals, keys, and policy.**
@@ -91,7 +100,7 @@ callbacks.
   OpenID4VCI issuer and OpenID4VP verifier endpoints for SD-JWT VC and ISO mdoc
   credentials — credential offers, the credential/nonce endpoints, DCQL
   presentation requests, `direct_post` responses, and Token Status List
-  revocation — targeting the HAIP profile. See
+  revocation — with support for the HAIP 1.0 profile. See
   [OpenID for Verifiable Credentials](#openid-for-verifiable-credentials-oid4vc--eu-wallet).
 
 The standards each use case rests on are catalogued below and in
@@ -1297,8 +1306,8 @@ authorization, PAR, discovery, DPoP, and mTLS implementations.
 ### OpenID for Verifiable Credentials (OID4VC / EU wallet)
 
 `attesto_phoenix` mounts the HTTP surface for the OpenID4VCI **issuer** and
-OpenID4VP **verifier** roles behind an EUDI-wallet-facing service, targeting the
-[HAIP](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html)
+OpenID4VP **verifier** roles behind an EUDI-wallet-facing service, supporting the
+[HAIP 1.0](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0.html)
 profile. The protocol logic and cryptography live in
 [`attesto`](https://hexdocs.pm/attesto) (SD-JWT VC + mdoc + jwt_vc_json
 issue/verify, DCQL, Token Status List, SIOPv2, OpenID Federation); these routes
