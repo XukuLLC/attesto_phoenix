@@ -4,11 +4,11 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "Attesto and test-only Postgrex reject their affected predecessors" do
     case dependency!(:attesto) do
       {:attesto, requirement} when is_binary(requirement) ->
-        # Phoenix 3.4.1 needs Attesto 2.2.2's refresh issuer binding and strict
-        # JOSE parsing in addition to the 2.2 grant/storage contracts.
-        assert Version.match?("2.2.2", requirement)
-        refute Version.match?("2.2.1", requirement)
-        refute Version.match?("2.1.0", requirement)
+        # Phoenix 4.0 needs Attesto 2.4.0's authorization-code replay deadline,
+        # CIBA resource, and signed-JAR authorization-details APIs.
+        assert Version.match?("2.4.0", requirement)
+        refute Version.match?("2.3.1", requirement)
+        refute Version.match?("2.2.2", requirement)
         refute Version.match?("1.15.0", requirement)
 
       {:attesto, opts} when is_list(opts) ->
@@ -51,9 +51,9 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "an empty source path selects the released requirement" do
     with_environment(%{"ATTESTO_SOURCE_PATH" => "", "ATTESTO_PATH" => nil}, fn ->
       assert {:attesto, requirement} = dependency!(:attesto)
-      assert Version.match?("2.2.2", requirement)
-      refute Version.match?("2.2.1", requirement)
-      refute Version.match?("2.1.0", requirement)
+      assert Version.match?("2.4.0", requirement)
+      refute Version.match?("2.3.1", requirement)
+      refute Version.match?("2.2.2", requirement)
       refute Version.match?("1.15.0", requirement)
     end)
   end
@@ -79,8 +79,10 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     assert exit_code == 0, output
 
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
+    assert metadata =~ ~s(<<"version">>,<<"4.0.0">>)
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
-    assert metadata =~ ~s(<<"requirement">>,<<">= 2.2.2 and < 3.0.0">>)
+    assert metadata =~ ~s(<<"requirement">>,<<">= 2.4.0 and < 3.0.0">>)
+    assert File.regular?(Path.join(output_path, "guides/upgrade_4_0.md"))
   end
 
   defp with_environment(values, fun) do

@@ -18,7 +18,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   alias Attesto.AuthorizationRequest
   alias Attesto.RedirectURI
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
-  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config}
+  alias AttestoPhoenix.{Callback, ClientClassification, ClientIdMetadata, Config}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
   @doc """
@@ -197,17 +197,19 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   @doc """
   Classify the client as public via the host's `:client_public?` callback.
 
-  Absent the callback, fail closed by treating the client as public, so PKCE
+  A Client ID Metadata Document client follows its validated
+  `token_endpoint_auth_method`. For a registered client with no callback, this
+  policy treats the shared classifier's `:unknown` result as public so PKCE
   stays required (a confidential exemption demands a deliberate host
   classification).
   """
   @spec client_public?(Config.t(), term()) :: boolean()
-  # A CIMD client holds no symmetric secret (document validation strips it), so
-  # it is public by construction.
-  def client_public?(_config, %CIMDClient{metadata: _metadata}), do: true
-
   def client_public?(config, client) do
-    Callback.invoke_boolean(Config.client_public_fun(config), [client], true, :client_public?)
+    case ClientClassification.classify(config, client) do
+      :public -> true
+      :confidential -> false
+      :unknown -> true
+    end
   end
 
   @doc """

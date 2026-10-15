@@ -32,6 +32,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateAuthorizationCodes do
       add(:expires_at, :utc_datetime, null: false)
       add(:consumed_at, :utc_datetime)
       add(:consumed_success, :boolean, null: false, default: false)
+      add(:replay_retain_until, :utc_datetime)
       add(:inserted_at, :utc_datetime, null: false)
     end
 

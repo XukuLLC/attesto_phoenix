@@ -36,10 +36,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         documented stub callbacks the host fills in,
       * points the host at `mix attesto_phoenix.gen.migration` for the Ecto
         tables the bundled stores read, including the durable refresh-family
-        revocation tombstones. Existing 2.x installations use the generated
-        `--upgrade 3.0` and `--upgrade 3.1` migrations, in that order, while
-        writers remain stopped. Each validates canonical pre-existing objects
-        before adoption; custom layouts need a reviewed migration.
+        revocation tombstones. Existing installations generate each migration
+        milestone they have not already applied: `--upgrade 3.0`, `3.1`,
+        `3.4`, `3.6`, and `3.7`, in that order, while writers remain stopped.
+        Each validates canonical pre-existing objects before adoption; custom
+        layouts need a reviewed migration.
 
     Every step is idempotent: re-running the task does not duplicate the config,
     the route, or the scaffolded modules. The task never decides authorization
@@ -124,6 +125,7 @@ if Code.ensure_loaded?(Igniter) do
     @default_oauth_path_prefix "/oauth"
     @config_pipeline :attesto_phoenix_config
     @refresh_successor_secret_bytes 32
+    @upgrade_migration_versions ~w(3.0 3.1 3.4 3.6 3.7)
 
     # The recommended production behaviours and the callbacks each scaffolded
     # module implements. Each tuple is `{submodule, behaviour, [{function,
@@ -2069,18 +2071,12 @@ if Code.ensure_loaded?(Igniter) do
           prefix -> "mix attesto_phoenix.gen.migration --repo #{inspect(repo)} --schema-prefix #{prefix}"
         end
 
-      upgrade_migration_commands =
-        case schema_prefix do
-          nil ->
-            "mix attesto_phoenix.gen.migration --upgrade 3.0 --repo #{inspect(repo)}\n" <>
-              "         mix attesto_phoenix.gen.migration --upgrade 3.1 --repo #{inspect(repo)}"
+      schema_option = if schema_prefix, do: " --schema-prefix #{schema_prefix}", else: ""
 
-          prefix ->
-            "mix attesto_phoenix.gen.migration --upgrade 3.0 --repo #{inspect(repo)} " <>
-              "--schema-prefix #{prefix}\n" <>
-              "         mix attesto_phoenix.gen.migration --upgrade 3.1 --repo #{inspect(repo)} " <>
-              "--schema-prefix #{prefix}"
-        end
+      upgrade_migration_commands =
+        Enum.map_join(@upgrade_migration_versions, "\n         ", fn version ->
+          "mix attesto_phoenix.gen.migration --upgrade #{version} --repo #{inspect(repo)}#{schema_option}"
+        end)
 
       schema_notice =
         case schema_prefix do
@@ -2132,20 +2128,26 @@ if Code.ensure_loaded?(Igniter) do
            `{repo, schema_prefix}` pair; do not run multiple sweepers against
            one pair or share one sweeper across independent profiles.
 
-           If this is an upgrade of an existing 2.x database, do not run the
-           fresh create-table command above. After inventorying the existing
-           layout, generate the supported forward migration instead:
+           If this is an upgrade of an existing database, do not run the fresh
+           create-table command above. After inventorying the existing layout,
+           generate each forward migration milestone that the deployment has
+           not already applied. A 2.x database needs all five, in this order:
 
                #{upgrade_migration_commands}
 
-           Review and apply both files, in that order, while writers remain
+           Review and apply the generated files, in that order, while writers remain
            stopped. The 3.0 file adds the unique `(family_id, generation)`
            index, creates the durable refresh-family revocation table, and
            backfills revoked families. The 3.1 file promotes the exact
            historical `attesto_authorization_codes_code_hash_index` to the
-           current primary key.
+           current primary key. The 3.4 file adds refresh-family deadlines and
+           independent Client Instance Key bindings, and widens the CIBA
+           notification token. The 3.6 file widens Client ID Metadata cache
+           keys to `text`. The 3.7 file adds the authorization-code
+           `replay_retain_until` deadline used to preserve replay evidence for
+           the lifetime of the refresh family.
            Existing canonical objects are validated before adoption. Stop and
-           investigate if either migration rejects the database layout.
+           investigate if any migration rejects the database layout.
 
            Stop and drain every 2.x token writer before that 3.0
            tombstone/backfill and schema-prefix cutover, and before starting

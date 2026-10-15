@@ -45,7 +45,18 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
 
   alias Attesto.Introspection
   alias Attesto.SignedIntrospection
-  alias AttestoPhoenix.{Callback, ClientAuthentication, Config, OAuthError, RequestContext, ResourceAudiencePolicy}
+
+  alias AttestoPhoenix.{
+    Callback,
+    ClientAuthentication,
+    Config,
+    HTTPAccept,
+    OAuthError,
+    RequestContext,
+    ResourceAudiencePolicy
+  }
+
+  alias AttestoPhoenix.Controller.QueryParameterGuard
   alias AttestoPhoenix.Store.EctoRefreshStore
 
   require Logger
@@ -73,12 +84,14 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- check_https(conn, config),
+    with :ok <- QueryParameterGuard.reject(conn),
+         :ok <- check_https(conn, config),
          {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
            authenticate_client(config, conn, params),
          {:ok, token} <- fetch_token(params) do
       respond(conn, config, client_id, token, params)
     else
+      {:error, :query_parameters_not_allowed} -> render_error(conn, config, QueryParameterGuard.error())
       {:error, %OAuthError{} = err} -> render_error(conn, config, err)
     end
   end
@@ -116,40 +129,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   defp signed_response_requested?(conn) do
     conn
     |> get_req_header("accept")
-    |> Enum.flat_map(&parse_accept/1)
-    |> Enum.any?(fn {media_type, q} -> media_type == @signed_media_type and q > 0.0 end)
-  end
-
-  # Parse an Accept header value into `{media_type, quality}` pairs (RFC 9110
-  # §12.5.1). Only the media type and its `q` parameter matter here; other
-  # parameters are ignored, and a missing `q` defaults to 1.0.
-  defp parse_accept(header) do
-    header
-    |> String.split(",", trim: true)
-    |> Enum.map(fn range ->
-      [media_type | params] = range |> String.trim() |> String.split(";", trim: true)
-      {String.downcase(String.trim(media_type)), quality(params)}
-    end)
-  end
-
-  defp quality(params) do
-    Enum.find_value(params, 1.0, fn param ->
-      param
-      |> String.trim()
-      |> String.downcase()
-      |> String.split("=", parts: 2)
-      |> case do
-        ["q", value] -> parse_q(value)
-        _ -> nil
-      end
-    end)
-  end
-
-  defp parse_q(value) do
-    case Float.parse(String.trim(value)) do
-      {q, _rest} -> q
-      :error -> 1.0
-    end
+    |> HTTPAccept.accepts?(@signed_media_type)
   end
 
   defp fetch_token(%{"token" => token}) when is_binary(token) and token != "", do: {:ok, token}

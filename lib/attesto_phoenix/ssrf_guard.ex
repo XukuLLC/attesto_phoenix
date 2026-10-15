@@ -29,7 +29,7 @@ if Code.ensure_loaded?(Req) do
     alone for that path - restrict egress at the network layer.
     """
 
-    alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req, as: CIMDFetcher
+    alias AttestoPhoenix.ClientIdMetadata.HostPolicy
 
     @typedoc """
     A screened target. `url` dials the checked IP; `host` is the bare hostname
@@ -94,14 +94,8 @@ if Code.ensure_loaded?(Req) do
     # IPv6 bracketed (RFC 7230). Dropping the port misroutes an RP that routes on
     # the full authority.
     defp authority(%URI{host: host, port: port, scheme: scheme}) do
-      host_part = if String.contains?(host, ":"), do: "[" <> host <> "]", else: host
-
-      if default_port?(scheme, port), do: host_part, else: host_part <> ":" <> Integer.to_string(port)
+      HostPolicy.authority(%URI{host: host, port: port, scheme: scheme})
     end
-
-    defp default_port?("https", 443), do: true
-    defp default_port?("http", 80), do: true
-    defp default_port?(_scheme, _port), do: false
 
     defp validate(url, allow_loopback) do
       case URI.new(url) do
@@ -146,8 +140,8 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    defp blocked?(ip, true), do: not loopback?(ip) and CIMDFetcher.special_use_ip?(ip)
-    defp blocked?(ip, false), do: CIMDFetcher.special_use_ip?(ip)
+    defp blocked?(ip, true), do: not loopback?(ip) and HostPolicy.special_use_ip?(ip)
+    defp blocked?(ip, false), do: HostPolicy.special_use_ip?(ip)
 
     defp loopback?({127, _b, _c, _d}), do: true
     defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true

@@ -1070,7 +1070,7 @@ defmodule AttestoPhoenix.RouterTest do
     end
 
     test "endpoint opt-outs validate at macro expansion" do
-      assert_raise ArgumentError, ~r/route-mount control :userinfo must be a literal boolean/, fn ->
+      assert_raise ArgumentError, ~r/route-mount control :userinfo must expand at compile time to true or false/, fn ->
         defmodule MalformedUserInfoCapabilityRouter do
           use Phoenix.Router
           use AttestoPhoenix.Router
@@ -1082,7 +1082,7 @@ defmodule AttestoPhoenix.RouterTest do
       end
 
       assert_raise ArgumentError,
-                   ~r/route-mount control :openid_configuration must be a literal boolean/,
+                   ~r/route-mount control :openid_configuration must expand at compile time to true or false/,
                    fn ->
                      defmodule MalformedOpenIDConfigurationCapabilityRouter do
                        use Phoenix.Router
@@ -1113,6 +1113,42 @@ defmodule AttestoPhoenix.RouterTest do
           scope "/" do
             attesto_routes(openid_configuration: false, openid_configuration: true)
           end
+        end
+      end
+    end
+
+    test "all route-mount controls reject non-boolean compile-time values" do
+      controls = [
+        :registration,
+        :device,
+        :credential_issuance,
+        :federation,
+        :status_list,
+        :presentation,
+        :ciba,
+        :logout,
+        :session_management,
+        :userinfo,
+        :openid_configuration,
+        :protected_resource_root
+      ]
+
+      for control <- controls do
+        module = "MalformedRouteControl#{System.unique_integer([:positive])}"
+
+        source = """
+        defmodule #{module} do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+
+          scope "/" do
+            attesto_routes(#{control}: :invalid)
+          end
+        end
+        """
+
+        assert_raise ArgumentError, ~r/route-mount control #{inspect(control)} must expand/, fn ->
+          Code.compile_string(source)
         end
       end
     end

@@ -13,7 +13,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
     only: [get_req_header: 2, put_resp_content_type: 2, put_resp_header: 3, send_resp: 3]
 
   alias Attesto.CredentialIssuerMetadata
-  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.{Config, HTTPAccept}
 
   @cache_max_age_seconds 3600
   @signed_metadata_content_type "application/jwt"
@@ -38,7 +38,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
         credential_configurations_supported: Config.credential_configurations_supported(config)
       )
 
-    conn = put_cache_control(conn)
+    conn = conn |> put_cache_control() |> put_resp_header("vary", "Accept")
 
     if wants_signed_metadata?(conn) do
       signed = CredentialIssuerMetadata.signed(metadata, keystore: Config.vc_keystore(config))
@@ -56,7 +56,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   defp wants_signed_metadata?(conn) do
     conn
     |> get_req_header("accept")
-    |> Enum.any?(&String.contains?(&1, @signed_metadata_content_type))
+    |> HTTPAccept.accepts?(@signed_metadata_content_type)
   end
 
   # Advertised only once the host has actually wired deferred-issuance

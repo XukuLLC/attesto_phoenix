@@ -22,8 +22,15 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
   defmodule StubKeystore do
     @moduledoc false
 
-    def signing_pem, do: "test-only"
-    def verification_pems, do: ["test-only"]
+    @behaviour Attesto.Keystore
+
+    @pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
+
+    @impl true
+    def signing_pem, do: @pem
+
+    @impl true
+    def verification_pems, do: [@pem]
   end
 
   defmodule CredentialRouter do
@@ -80,6 +87,27 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
            }
 
     assert get_resp_header(response, "cache-control") == ["public, max-age=3600"]
+    assert get_resp_header(response, "vary") == ["Accept"]
+  end
+
+  test "negotiates signed metadata by an exact positive-quality media range" do
+    signed =
+      conn(:get, @metadata_path)
+      |> put_req_header("accept", "text/plain, application/jwt;q=0.5")
+      |> CredentialRouter.call([])
+
+    assert signed.status == 200
+    assert get_resp_header(signed, "content-type") == ["application/jwt; charset=utf-8"]
+    assert get_resp_header(signed, "vary") == ["Accept"]
+    assert length(String.split(signed.resp_body, ".")) == 3
+
+    for accept <- ["application/jwt;q=0", "application/jwtish", "application/jwt;q=bogus", ";"] do
+      response =
+        conn(:get, @metadata_path) |> put_req_header("accept", accept) |> CredentialRouter.call([])
+
+      assert response.status == 200
+      assert get_resp_header(response, "content-type") |> List.first() =~ "application/json"
+    end
   end
 
   test "derives wallet endpoint URLs from a custom OAuth path prefix" do

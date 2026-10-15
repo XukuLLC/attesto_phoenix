@@ -51,6 +51,12 @@ defmodule AttestoPhoenix.Config do
     * `:verify_client_secret` - `(client, presented_secret -> boolean)`.
       Constant-time client-secret verification (e.g. via
       `Attesto.SecureCompare`). The host owns secret hashing.
+    * `:verify_dummy_client_secret` - optional `(presented_secret -> boolean)`
+      callback that performs the same fixed password-hash work for an unknown,
+      revoked, or wrong-method client. Its return value is ignored. Configure
+      this when `:verify_client_secret` accepts only the host client type. The
+      legacy `:unknown_client` argument remains as a compatibility fallback for
+      3.x and will be removed in the next major release.
     * `:load_principal` - `(subject_id -> {:ok, principal} | {:error,
       :not_found})`. Resolves the subject/principal during protected-resource
       authentication.
@@ -289,11 +295,16 @@ defmodule AttestoPhoenix.Config do
       The library signs the resulting credential. Required when credential
       issuance is mounted.
     * `:build_deferred_credential` - `(subject, transaction_id -> {:ok,
-      credential} | {:error, :issuance_pending} | {:error, reason})`.
+      deferred_credential} | {:error, :issuance_pending} | {:error, reason})`.
       Completes a previously deferred credential (OID4VCI §9) for the
-      Deferred Credential endpoint. The returned credential type and claim
-      values are signed into an SD-JWT VC the same way `:build_credential`'s
-      are, minus holder-key binding (the endpoint carries no fresh proof).
+      Deferred Credential endpoint. `deferred_credential` must be
+      `%{credential_configuration_id: id, holder_jwk: public_jwk,
+      credential: credential_result}`. Persist `holder_jwk` and `id` when the
+      original Credential request proves possession; the deferred endpoint has
+      no fresh proof from which it could recover either value. The library
+      validates the public key and issues the configured SD-JWT VC, JWT VC, or
+      mdoc through the same holder-binding and signing path as immediate
+      issuance.
       `{:error, :issuance_pending}` reports the OID4VCI `issuance_pending`
       error so the wallet retries later; any other error maps to
       `invalid_credential_request`. Required only when the Deferred
@@ -512,7 +523,12 @@ defmodule AttestoPhoenix.Config do
       already been claimed before this callback runs, so refusal, malformed
       persisted private context, a missing callback for a context-bearing code,
       or any callback failure before the continuation succeeds leaves it spent
-      but unfinalized. Audit events follow the final returned
+      but unfinalized. The bundled Ecto store gives that claimed row a
+      five-minute finalization reservation. After a successful refresh
+      exchange, the bundled sweeper retains the replay marker while the refresh
+      table contains an unexpired member of the issued family. This also gives
+      legacy markers with a NULL family deadline a finite cleanup boundary.
+      Audit events follow the final returned
       result: a substituted error does not emit the continuation's success
       events, and `issue/2` returns the normal `:token_denied` event for that
       error. Persisted or external side effects from a committed continuation
@@ -537,7 +553,11 @@ defmodule AttestoPhoenix.Config do
       the single-node `AttestoPhoenix.Store.PAR.ETS`; use
       `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
       deployment so a `request_uri` resolves on every node (FAPI 2.0 requires
-      PAR).
+      PAR). The default ETS store retains at most `:par_max_entries` live rows
+      (default 1,024), and each serialized row must fit
+      `:par_max_record_bytes` (default 256 KiB). It prunes expired rows before
+      rejecting admission with `temporarily_unavailable`; it never evicts a
+      live authorization request.
     * `:consent_grant_store` - module implementing
       `AttestoPhoenix.ConsentGrantStore`, the single-use request-bound consent
       primitive (RFC 6749 §4.1.1). The host consent screen mints a grant when
@@ -594,7 +614,9 @@ defmodule AttestoPhoenix.Config do
 
   ### Optional values (with defaults)
 
-    * `:audience` - default access-token audience (string or list).
+    * `:audience` - default access-token audience. This must be one absolute
+      HTTPS resource identifier. Use RFC 8707 `resource` parameters and
+      `:resource_indicators` when a grant may target other resources.
     * `:client_auth_signing_algs` - the JOSE algorithms accepted for
       `private_key_jwt` client-assertion signatures, and the set advertised as
       `token_endpoint_auth_signing_alg_values_supported` in discovery. Defaults
@@ -718,6 +740,9 @@ defmodule AttestoPhoenix.Config do
       an entire refresh family. New families persist a fixed deadline and
       every rotation is capped by it (RFC 10017 §6.3.2.3). Default `nil`;
       existing families without a deadline retain their inactivity policy.
+      The bundled Ecto code store retains a successful authorization-code
+      replay marker while the refresh table contains an unexpired member of the
+      issued family, including when this setting is `nil`.
     * `:refresh_token_expiration_metadata` - opt into the experimental
       `draft-ietf-oauth-refresh-token-expiration-03` token-timeout response and
       discovery fields. Default `false`. This advertises credential expiry;
@@ -942,6 +967,7 @@ defmodule AttestoPhoenix.Config do
   alias Attesto.ResourceIndicator
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
+  alias AttestoPhoenix.ClientIdMetadata.HostPolicy
   alias AttestoPhoenix.Store.EctoRefreshStore
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.URLComparison
@@ -970,6 +996,7 @@ defmodule AttestoPhoenix.Config do
     :repo,
     :load_client,
     :verify_client_secret,
+    :verify_dummy_client_secret,
     :client_auth_method,
     :load_principal,
     :client_store,
@@ -1108,6 +1135,8 @@ defmodule AttestoPhoenix.Config do
     oauth_body_guard: :observe,
     authorization_code_ttl: 60,
     par_ttl: 90,
+    par_max_entries: 1_024,
+    par_max_record_bytes: 262_144,
     dpop_enabled: true,
     dpop_nonce_required: false,
     mtls_enabled: false,
@@ -1140,6 +1169,7 @@ defmodule AttestoPhoenix.Config do
           repo: module(),
           load_client: callback(),
           verify_client_secret: callback(),
+          verify_dummy_client_secret: callback() | nil,
           client_auth_method: callback() | nil,
           load_principal: callback(),
           client_store: module() | nil,
@@ -1157,7 +1187,7 @@ defmodule AttestoPhoenix.Config do
           key_attestation_trusted_jwks: map() | [map()] | nil,
           require_key_attestation: boolean() | nil,
           request_object_policy: Policy.t() | nil,
-          audience: String.t() | [String.t()] | nil,
+          audience: String.t() | nil,
           authorize_scope: callback() | nil,
           on_event: callback() | nil,
           send_error: callback() | nil,
@@ -1245,6 +1275,8 @@ defmodule AttestoPhoenix.Config do
           oauth_body_guard: :observe | :required,
           authorization_code_ttl: pos_integer(),
           par_ttl: pos_integer(),
+          par_max_entries: pos_integer(),
+          par_max_record_bytes: pos_integer(),
           dpop_enabled: boolean(),
           dpop_nonce_required: boolean(),
           mtls_enabled: boolean(),
@@ -1638,7 +1670,10 @@ defmodule AttestoPhoenix.Config do
   # the host and remain isolated through `resolve!/1`/`with_request_config/2`.
   defp validate_existing_config!(%__MODULE__{} = config) do
     validate_request_config!(config)
-    validate!(config)
+
+    config
+    |> apply_defaults()
+    |> validate!()
   end
 
   # Request-local configs are often assembled from a profile's partial options
@@ -2364,40 +2399,15 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp blocked_logout_host?(host) do
-    down = String.downcase(host)
+    case HostPolicy.canonicalize(host) do
+      {:ok, canonical} ->
+        canonical == "localhost" or String.ends_with?(canonical, ".localhost") or
+          HostPolicy.special_use_literal?(canonical)
 
-    if Enum.any?([down == "localhost", String.ends_with?(down, ".localhost")]) do
-      true
-    else
-      blocked_literal_ip?(host)
+      {:error, :invalid_host} ->
+        true
     end
   end
-
-  defp blocked_literal_ip?(host) do
-    host
-    |> String.trim_leading("[")
-    |> String.trim_trailing("]")
-    |> String.to_charlist()
-    |> :inet.parse_address()
-    |> blocked_parsed_ip?()
-  end
-
-  defp blocked_parsed_ip?({:ok, ip}), do: internal_ip?(ip)
-  defp blocked_parsed_ip?(_other), do: false
-
-  # IPv4 loopback / RFC 1918 private / link-local (incl. 169.254.169.254) / 0.0.0.0.
-  defp internal_ip?({127, _, _, _}), do: true
-  defp internal_ip?({10, _, _, _}), do: true
-  defp internal_ip?({192, 168, _, _}), do: true
-  defp internal_ip?({169, 254, _, _}), do: true
-  defp internal_ip?({172, b, _, _}) when b in 16..31, do: true
-  defp internal_ip?({0, _, _, _}), do: true
-  # IPv6 loopback / unspecified / unique-local (fc00::/7) / link-local (fe80::/10).
-  defp internal_ip?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-  defp internal_ip?({0, 0, 0, 0, 0, 0, 0, 0}), do: true
-  defp internal_ip?({a, _, _, _, _, _, _, _}) when a >= 0xFC00 and a <= 0xFDFF, do: true
-  defp internal_ip?({a, _, _, _, _, _, _, _}) when a >= 0xFE80 and a <= 0xFEBF, do: true
-  defp internal_ip?(_ip), do: false
 
   @doc """
   The Relying Party's `backchannel_logout_session_required` (Back-Channel Logout
@@ -2607,7 +2617,7 @@ defmodule AttestoPhoenix.Config do
   # not pass principal_kinds explicitly (e.g. the authorization endpoint
   # signing JARM responses). An explicit `extra` still wins. Omitted when
   # unresolved so Attesto.Config.new/1 surfaces the missing required value.
-  defp resolved_principal_kinds(%__MODULE__{principal_kinds: principal_kinds}) do
+  defp resolved_principal_kinds(%__MODULE__{principal_kinds: principal_kinds} = config) do
     # Read the field directly: it is declared `[PrincipalKind.t()] | callback() |
     # nil`, so the list branch is reachable. (`config_callback/2` narrows its
     # return to `callback() | nil`, under which the `is_list` guard cannot hold.)
@@ -2616,7 +2626,7 @@ defmodule AttestoPhoenix.Config do
         [principal_kinds: kinds]
 
       nil ->
-        []
+        resolve_principal_kinds_from_store(config)
 
       callback ->
         case Callback.invoke(callback, []) do
@@ -2625,6 +2635,20 @@ defmodule AttestoPhoenix.Config do
         end
     end
   end
+
+  defp resolve_principal_kinds_from_store(%__MODULE__{principal_store: module})
+       when is_atom(module) and not is_nil(module) do
+    if callback_exported?(module, :principal_kinds, 0) do
+      case Callback.invoke({module, :principal_kinds}, []) do
+        kinds when is_list(kinds) and kinds != [] -> [principal_kinds: kinds]
+        _ -> []
+      end
+    else
+      []
+    end
+  end
+
+  defp resolve_principal_kinds_from_store(%__MODULE__{}), do: []
 
   # The default OAuth endpoint tails appended to the resolved
   # `:oauth_path_prefix` when no explicit per-endpoint override is set. These
@@ -2923,11 +2947,14 @@ defmodule AttestoPhoenix.Config do
   """
   @spec client_assertion_audiences(t()) :: [String.t()]
   def client_assertion_audiences(%__MODULE__{} = config) do
-    case config.client_assertion_audiences do
-      nil -> [config.issuer, token_endpoint_url(config)]
-      fun when is_function(fun, 1) -> fun.(config)
-      audiences when is_list(audiences) and audiences != [] -> audiences
-    end
+    audiences =
+      case config.client_assertion_audiences do
+        nil -> [config.issuer, token_endpoint_url(config)]
+        fun when is_function(fun, 1) -> fun.(config)
+        audiences when is_list(audiences) -> audiences
+      end
+
+    validate_assertion_audience_list!(audiences, ":client_assertion_audiences callback")
   end
 
   @doc """
@@ -3204,6 +3231,7 @@ defmodule AttestoPhoenix.Config do
   @resolution %{
     load_client: {:client_store, :load_client, 1},
     verify_client_secret: {:client_store, :verify_client_secret, 2},
+    verify_dummy_client_secret: {:client_store, :verify_dummy_client_secret, 1},
     client_auth_method: {:client_store, :client_auth_method, 1},
     client_id: {:client_store, :client_id, 1},
     client_jwks: {:client_store, :client_jwks, 1},
@@ -3341,24 +3369,6 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  defp validate_function_callback!(_key, nil, _arity), do: :ok
-
-  defp validate_function_callback!(key, callback, arity) when is_function(callback) do
-    if is_function(callback, arity) do
-      :ok
-    else
-      raise ArgumentError,
-            "AttestoPhoenix.Config: #{callback_label(key)} must be a " <>
-              "#{callback_arity_description(arity)} function."
-    end
-  end
-
-  defp validate_function_callback!(key, _callback, arity) do
-    raise ArgumentError,
-          "AttestoPhoenix.Config: #{callback_label(key)} must be a " <>
-            "#{callback_arity_description(arity)} function."
-  end
-
   defp validate_flat_callbacks!(%__MODULE__{} = config) do
     Enum.each(@resolution, fn {key, {_store_key, _fun, arity}} ->
       validate_configured_callback!(key, Map.get(config, key), arity)
@@ -3369,9 +3379,9 @@ defmodule AttestoPhoenix.Config do
     end)
 
     # These two options intentionally have narrower contracts than the general
-    # callback type: audiences is invoked with `fun.(config)`, while a list of
-    # principal kinds is also a valid static value.
-    validate_function_callback!(:client_assertion_audiences, config.client_assertion_audiences, 1)
+    # callback type: audiences may be a static list or a one-argument function,
+    # while a list of principal kinds is also a valid static value.
+    validate_client_assertion_audiences!(config.client_assertion_audiences)
 
     case config.principal_kinds do
       nil -> :ok
@@ -3395,6 +3405,44 @@ defmodule AttestoPhoenix.Config do
       2
     )
   end
+
+  defp validate_client_assertion_audiences!(nil), do: :ok
+
+  defp validate_client_assertion_audiences!(audiences) when is_list(audiences) do
+    _ = validate_assertion_audience_list!(audiences, ":client_assertion_audiences")
+    :ok
+  end
+
+  defp validate_client_assertion_audiences!(callback) when is_function(callback, 1), do: :ok
+
+  defp validate_client_assertion_audiences!(_invalid) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :client_assertion_audiences must be a non-empty list of " <>
+            "distinct absolute URI strings or a one-argument function returning such a list."
+  end
+
+  defp validate_assertion_audience_list!(audiences, source) when is_list(audiences) and audiences != [] do
+    if Enum.all?(audiences, &absolute_uri?/1) and Enum.uniq(audiences) == audiences do
+      audiences
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: #{source} must return a non-empty list of distinct, " <>
+              "non-empty absolute URI strings; got #{inspect(audiences)}."
+    end
+  end
+
+  defp validate_assertion_audience_list!(audiences, source) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: #{source} must return a non-empty list of distinct, " <>
+            "non-empty absolute URI strings; got #{inspect(audiences)}."
+  end
+
+  defp absolute_uri?(value) when is_binary(value) and value != "" do
+    String.valid?(value) and not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value) and
+      match?({:ok, %URI{scheme: scheme}} when is_binary(scheme) and scheme != "", URI.new(value))
+  end
+
+  defp absolute_uri?(_value), do: false
 
   # The behaviour-module Config keys, each paired with the behaviour module it
   # is expected to implement. Used for boot-time conformance validation.
@@ -4010,7 +4058,10 @@ defmodule AttestoPhoenix.Config do
               "protected-resource verifier requires (a mismatch is rejected " <>
               ":invalid_audience), and the RFC 9728 resource identifier served at " <>
               "/.well-known/oauth-protected-resource — a blank/non-URL value boots but then " <>
-              "500s that endpoint. Set `audience: \"https://api.example.com\"`. " <>
+              "500s that endpoint. Version 4.0 no longer accepts the list form advertised by " <>
+              "the 3.x typespec; configure one default here and put additional targets in " <>
+              ":resource_indicators. " <>
+              "Set `audience: \"https://api.example.com\"`. " <>
               "Got: #{inspect(config.audience)}."
     end
 
@@ -4021,6 +4072,7 @@ defmodule AttestoPhoenix.Config do
     validate_nested_boolean_flags!(config)
     validate_client_id_metadata_limits!(config)
     validate_required_par_store!(config)
+    validate_par_limits!(config)
     validate_refresh_store_backend!(config)
     validate_refresh_rotation!(config)
     validate_dpop_nonce!(config)
@@ -4066,6 +4118,7 @@ defmodule AttestoPhoenix.Config do
     validate_optional_path!(:token_path, config.token_path)
     validate_optional_path!(:par_path, config.par_path)
     validate_optional_path!(:revocation_path, config.revocation_path)
+    validate_optional_path!(:introspection_path, config.introspection_path)
     validate_optional_path!(:registration_path, config.registration_path)
     validate_optional_path!(:userinfo_path, config.userinfo_path)
     validate_optional_path!(:device_authorization_path, config.device_authorization_path)
@@ -4666,6 +4719,19 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp validate_required_par_store!(_config), do: :ok
+
+  defp validate_par_limits!(%__MODULE__{} = config) do
+    Enum.each([:par_max_entries, :par_max_record_bytes], fn key ->
+      value = Map.fetch!(config, key)
+
+      if !(is_integer(value) and value > 0) do
+        raise ArgumentError,
+              "AttestoPhoenix.Config: #{key} must be a positive integer; got #{inspect(value)}."
+      end
+    end)
+
+    :ok
+  end
 
   defp valid_required_par_store?(module) when is_atom(module) do
     case Code.ensure_loaded(module) do
@@ -5279,12 +5345,35 @@ defmodule AttestoPhoenix.Config do
   # `:oauth_path_prefix` is always present (defaulted); it must be an absolute
   # path reference so it merges cleanly onto the issuer.
   defp validate_path!(key, value) do
-    if not (is_binary(value) and String.starts_with?(value, "/")) do
+    if not valid_endpoint_path?(value) do
       raise ArgumentError,
-            "AttestoPhoenix.Config: #{inspect(key)} must be an absolute path " <>
-              "beginning with \"/\" (e.g. \"/oauth\" or \"/mcp/oauth\"); got #{inspect(value)}"
+            "AttestoPhoenix.Config: #{inspect(key)} must be an absolute path beginning with " <>
+              "exactly one \"/\", with no scheme, authority, query, fragment, backslash, " <>
+              "control character, or invalid percent escape; got #{inspect(value)}"
     end
   end
+
+  defp valid_endpoint_path?(value) when is_binary(value) and value != "" do
+    String.valid?(value) and String.starts_with?(value, "/") and
+      not String.starts_with?(value, "//") and not String.contains?(value, "\\") and
+      not Regex.match?(~r/[\x00-\x1F\x7F]/, value) and
+      not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value) and
+      match?(
+        {:ok,
+         %URI{
+           scheme: nil,
+           authority: nil,
+           userinfo: nil,
+           host: nil,
+           query: nil,
+           fragment: nil,
+           path: ^value
+         }},
+        URI.new(value)
+      )
+  end
+
+  defp valid_endpoint_path?(_value), do: false
 
   # A per-endpoint override is optional (nil = derive from the prefix); when
   # set it must be an absolute path reference.

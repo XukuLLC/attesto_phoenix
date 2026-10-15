@@ -260,7 +260,13 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       rsa_jwk = @rsa_signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
       assert Config.resolve!() |> Config.vc_keystore() == Keystore
-      assert {:ok, verified} = SdJwtVc.verify(credential, rsa_jwk, accepted_algs: ["RS256"])
+
+      assert {:ok, verified} =
+               SdJwtVc.verify(credential, rsa_jwk,
+                 accepted_algs: ["RS256"],
+                 enforce_fapi_alg_policy: false
+               )
+
       assert verified.vct == @vct
       assert verified.cnf == %{"jwk" => public_map(@holder_key)}
     end
@@ -529,6 +535,17 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       # OID4VCI §8.3: an invalid/expired proof nonce is `invalid_nonce`.
       assert response.status == 400
       assert body(response)["error"] == "invalid_nonce"
+    end
+
+    test "treats an explicitly nil c_nonce store as unavailable" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(config, :c_nonce_store, nil))
+
+      response = post_credential(mint_token(), credential_request("candidate-nonce"))
+
+      assert response.status == 400
+      assert body(response)["error"] == "invalid_nonce"
+      refute_received {:credential_requested, _, _, _}
     end
 
     test "fails loudly when the c_nonce store violates its boolean contract" do

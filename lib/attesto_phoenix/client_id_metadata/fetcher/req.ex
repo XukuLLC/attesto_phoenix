@@ -62,69 +62,15 @@ if Code.ensure_loaded?(Req) do
 
     @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
 
-    import Bitwise, only: [&&&: 2, >>>: 2, <<<: 2]
-
     alias AttestoPhoenix.ClientIdMetadata.Fetcher
     alias AttestoPhoenix.ClientIdMetadata.HostPolicy
 
     @default_max_document_bytes 5_120
     @default_request_timeout_ms 5_000
+    @max_client_id_bytes 2_048
 
     @typedoc "A resolved IP address, as returned by `:inet.getaddrs/2`."
     @type ip :: :inet.ip_address()
-
-    # RFC 6890 special-use IPv4 blocks (and the operationally-equivalent CGNAT
-    # RFC 6598 100.64/10). Each entry is `{network_tuple, prefix_len}`; an address
-    # matches when its leading `prefix_len` bits equal the network's. Multicast
-    # (224/4) and the reserved/benchmarking/documentation ranges that an SSRF
-    # guard must also refuse are included so the table is the single source of
-    # truth - `special_use_ip?/1` consults nothing else.
-    @ipv4_special_use [
-      {{0, 0, 0, 0}, 8},
-      {{10, 0, 0, 0}, 8},
-      {{100, 64, 0, 0}, 10},
-      {{127, 0, 0, 0}, 8},
-      {{169, 254, 0, 0}, 16},
-      {{172, 16, 0, 0}, 12},
-      {{192, 0, 0, 0}, 24},
-      {{192, 0, 2, 0}, 24},
-      {{192, 88, 99, 0}, 24},
-      {{192, 168, 0, 0}, 16},
-      {{198, 18, 0, 0}, 15},
-      {{198, 51, 100, 0}, 24},
-      {{203, 0, 113, 0}, 24},
-      {{224, 0, 0, 0}, 4},
-      {{240, 0, 0, 0}, 4}
-    ]
-
-    # RFC 6890 special-use IPv6 blocks, as `{network_tuple, prefix_len}` over the
-    # eight 16-bit words. `::/8` (which covers the unspecified `::`, loopback
-    # `::1`, and the IPv4-mapped `::ffff:0:0/96` space) is intentionally excluded
-    # here: loopback is handled separately so `:allow_loopback` can permit it, and
-    # IPv4-mapped addresses are unwrapped to their embedded IPv4 and re-checked
-    # against the IPv4 table by `special_use_ip?/1`.
-    @ipv6_special_use [
-      {{0xFC00, 0, 0, 0, 0, 0, 0, 0}, 7},
-      {{0xFE80, 0, 0, 0, 0, 0, 0, 0}, 10},
-      {{0xFF00, 0, 0, 0, 0, 0, 0, 0}, 8},
-      # Teredo 2001:0000::/32 (RFC 4380) and ORCHIDv2 2001:20::/28 (RFC 7343), both
-      # in the RFC 6890 special-purpose registry. Teredo embeds a client IPv4 in
-      # its low bits, but the fetch dials the FULL IPv6 address (Teredo is not
-      # routed to the embedded IPv4), so blocking the prefix outright is the right
-      # guard - it never reaches a destination the IPv4 table would screen.
-      {{0x2001, 0x0000, 0, 0, 0, 0, 0, 0}, 32},
-      {{0x2001, 0x0020, 0, 0, 0, 0, 0, 0}, 28},
-      {{0x2001, 0xDB8, 0, 0, 0, 0, 0, 0}, 32},
-      # Remaining IANA IPv6 special-purpose ranges (RFC 6890 registry): discard-
-      # only 100::/64 (RFC 6666), benchmarking 2001:2::/48 (RFC 5180),
-      # documentation 3fff::/20 (RFC 9637), and SRv6 SIDs 5f00::/16 (RFC 9602).
-      # Internal services are occasionally routed on these, so an AS must not
-      # dereference them.
-      {{0x0100, 0, 0, 0, 0, 0, 0, 0}, 64},
-      {{0x2001, 0x0002, 0, 0, 0, 0, 0, 0}, 48},
-      {{0x3FFF, 0, 0, 0, 0, 0, 0, 0}, 20},
-      {{0x5F00, 0, 0, 0, 0, 0, 0, 0}, 16}
-    ]
 
     @doc """
     Fetch a validated CIMD `client_id` URL under the SSRF algorithm documented on
@@ -163,9 +109,13 @@ if Code.ensure_loaded?(Req) do
 
     # Step 1: re-validate https + draft §2 grammar; never trust the caller.
     defp revalidate(url) do
-      case Attesto.ClientIdMetadata.validate_client_id(url) do
-        {:ok, uri} -> canonicalize_host(uri)
-        {:error, reason} -> {:error, {:invalid_url, reason}}
+      if byte_size(url) > @max_client_id_bytes do
+        {:error, {:invalid_url, :too_long}}
+      else
+        case Attesto.ClientIdMetadata.validate_client_id(url) do
+          {:ok, uri} -> canonicalize_host(uri)
+          {:error, reason} -> {:error, {:invalid_url, reason}}
+        end
       end
     end
 
@@ -222,113 +172,14 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    @doc """
-    Returns `true` iff `ip` is a special-use address (RFC 6890) an authorization
-    server MUST NOT dereference for CIMD: loopback, private, link-local, CGNAT,
-    `0.0.0.0/8`, multicast, the reserved/documentation ranges, the IPv6
-    equivalents (`fc00::/7`, `fe80::/10`, `ff00::/8`, `::1`, `::`), and every IPv6
-    form that embeds an IPv4 - IPv4-mapped (`::ffff:0:0/96`), NAT64
-    (`64:ff9b::/96`), 6to4 (`2002::/16`), and IPv4-compatible (`::/96`) - which is
-    unwrapped to its embedded IPv4 and re-checked, so an internal IPv4 cannot be
-    smuggled past the guard through any of them.
-
-    This is the single source of truth for the guard's CIDR table; the
-    `:allow_loopback` exception is applied by the caller (`fetch/2`), not here, so
-    this predicate always reports loopback as special-use.
-    """
+    @doc "Delegates to the always-available hostname and address policy."
     @spec special_use_ip?(ip()) :: boolean()
-    def special_use_ip?({_a, _b, _c, _d} = ip) do
-      in_any?(ip, @ipv4_special_use)
-    end
-
-    def special_use_ip?({0, 0, 0, 0, 0, 0xFFFF, w7, w8}) do
-      # IPv4-mapped IPv6 (::ffff:0:0/96): unwrap to the embedded IPv4 and re-check
-      # so a mapped private/loopback address cannot bypass the IPv4 table.
-      special_use_ip?(embedded_v4(w7, w8))
-    end
-
-    def special_use_ip?({0x0064, 0xFF9B, 0, 0, 0, 0, w7, w8}) do
-      # NAT64 well-known prefix 64:ff9b::/96 (RFC 6052): embeds an IPv4 in the low
-      # 32 bits. On a network with a NAT64 gateway this reaches the embedded IPv4 -
-      # e.g. 64:ff9b::a9fe:a9fe -> 169.254.169.254 cloud metadata - so unwrap the
-      # embedded IPv4 and re-check it against the IPv4 table.
-      special_use_ip?(embedded_v4(w7, w8))
-    end
-
-    def special_use_ip?({0x0064, 0xFF9B, 0x0001, w4, w5, w6, _w7, _w8}) do
-      # NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215) with the RFC 6052 §2.2 /48
-      # embedding: the IPv4 sits in bits 48-63 and 72-87 (the u-octet at 64-71 is
-      # skipped). Unwrap that IPv4 and re-check, so this local NAT64 prefix cannot
-      # smuggle an internal IPv4 (e.g. 169.254.169.254) past the guard either.
-      special_use_ip?({w4 >>> 8, w4 &&& 0xFF, w5 &&& 0xFF, w6 >>> 8})
-    end
-
-    def special_use_ip?({0x2002, w2, w3, _w4, _w5, _w6, _w7, _w8}) do
-      # 6to4 2002::/16 (RFC 3056): embeds an IPv4 in bits 16..48. Unwrap that IPv4
-      # and re-check so a 6to4 address cannot smuggle an internal IPv4 past the
-      # guard.
-      special_use_ip?(embedded_v4(w2, w3))
-    end
-
-    def special_use_ip?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-
-    def special_use_ip?({0, 0, 0, 0, 0, 0, 0, 0}), do: true
-
-    def special_use_ip?({0, 0, 0, 0, 0, 0, w7, w8}) do
-      # IPv4-compatible IPv6 (::/96, the deprecated ::a.b.c.d form, RFC 4291):
-      # unwrap the embedded IPv4 and re-check. (::1 and :: are matched above.)
-      special_use_ip?(embedded_v4(w7, w8))
-    end
-
-    def special_use_ip?({_a, _b, _c, _d, _e, _f, _g, _h} = ip) do
-      in_any?(ip, @ipv6_special_use)
-    end
-
-    # Unwrap the IPv4 embedded in two 16-bit IPv6 words (high word, low word) into
-    # an `:inet` IPv4 tuple, for the IPv6 forms that carry an IPv4 (mapped, NAT64,
-    # 6to4, IPv4-compatible).
-    defp embedded_v4(hi, lo), do: {hi >>> 8, hi &&& 0xFF, lo >>> 8, lo &&& 0xFF}
+    defdelegate special_use_ip?(ip), to: HostPolicy
 
     defp loopback?({127, _b, _c, _d}), do: true
     defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-    defp loopback?({0, 0, 0, 0, 0, 0xFFFF, w7, _w8}) when w7 >>> 8 == 127, do: true
+    defp loopback?({0, 0, 0, 0, 0, 0xFFFF, w7, _w8}) when div(w7, 256) == 127, do: true
     defp loopback?(_ip), do: false
-
-    defp in_any?(ip, table) do
-      Enum.any?(table, fn {network, prefix_len} -> in_cidr?(ip, network, prefix_len) end)
-    end
-
-    # Bit-width per element: IPv4 is four 8-bit octets, IPv6 is eight 16-bit words.
-    defp in_cidr?(ip, network, prefix_len) when tuple_size(ip) == 4 do
-      cidr_match?(Tuple.to_list(ip), Tuple.to_list(network), prefix_len, 8)
-    end
-
-    defp in_cidr?(ip, network, prefix_len) when tuple_size(ip) == 8 do
-      cidr_match?(Tuple.to_list(ip), Tuple.to_list(network), prefix_len, 16)
-    end
-
-    # Compare the leading `remaining` bits of the address against the network,
-    # element by element. A fully-covered element must match exactly; the element
-    # straddling the prefix boundary is masked to its high bits; elements past the
-    # prefix are unconstrained.
-    defp cidr_match?(_ip, _net, remaining, _width) when remaining <= 0, do: true
-
-    defp cidr_match?([ip_el | ip_rest], [net_el | net_rest], remaining, width) do
-      take = min(remaining, width)
-      mask = element_mask(width, take)
-
-      if (ip_el &&& mask) == (net_el &&& mask) do
-        cidr_match?(ip_rest, net_rest, remaining - width, width)
-      else
-        false
-      end
-    end
-
-    # A mask of the high `take` bits within a `width`-bit element.
-    defp element_mask(width, take) do
-      full = (1 <<< width) - 1
-      full - ((1 <<< (width - take)) - 1)
-    end
 
     # Step 4-8: dial the pinned IP while keeping SNI / cert hostname / Host header
     # on the original host, refuse redirects, require 200 + JSON, cap the body.
@@ -355,7 +206,7 @@ if Code.ensure_loaded?(Req) do
         # request still presents as the real hostname.
         url: %{uri | host: ip_to_string(pinned_ip)},
         method: :get,
-        headers: [{"accept", "application/json"}, {"host", uri.host}],
+        headers: [{"accept", "application/json"}, {"host", HostPolicy.authority(uri)}],
         redirect: false,
         retry: false,
         receive_timeout: timeout,

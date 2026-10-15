@@ -39,6 +39,7 @@ if Code.ensure_loaded?(Req) do
           retry: false,
           receive_timeout: @timeout_ms,
           decode_body: false,
+          into: AttestoPhoenix.HTTPResponse.discard_body_collector(),
           connect_options: [hostname: host]
         ]
         |> Req.new()

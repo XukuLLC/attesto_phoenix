@@ -73,6 +73,12 @@ defmodule AttestoPhoenix.Schema.Authorization do
       an unknown code.
     * `:consumed_success` - whether the first presentation completed all
       redemption checks. Only successful redemption is replayed as reuse.
+    * `:replay_retain_until` - a temporary finalization reservation while a
+      claimed code is being exchanged, then the immutable refresh-family
+      deadline after successful refresh issuance. Cleanup of a successful row
+      also checks the refresh-token table and retains the marker while that
+      family has an unexpired member. This lets legacy rows with a NULL deadline
+      retire once their family has ended.
     * `:inserted_at` - insertion timestamp.
 
   ## Record bridge
@@ -142,6 +148,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
           expires_at: DateTime.t() | nil,
           consumed_at: DateTime.t() | nil,
           consumed_success: boolean(),
+          replay_retain_until: DateTime.t() | nil,
           inserted_at: DateTime.t() | nil
         }
 
@@ -185,6 +192,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
     field :expires_at, :utc_datetime
     field :consumed_at, :utc_datetime
     field :consumed_success, :boolean, default: false
+    field :replay_retain_until, :utc_datetime
     field :inserted_at, :utc_datetime
   end
 
@@ -212,6 +220,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
     :access_token_revoked_at,
     :consumed_at,
     :consumed_success,
+    :replay_retain_until,
     :code_challenge,
     :code_challenge_method
   ]

@@ -90,6 +90,30 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
                CIBA.redeem(Store, ack.auth_req_id, %{client_id: "cli-1"}, [])
     end
 
+    test "authorizes and persists a direct RFC 8707 resource request for the client" do
+      first = "https://api.example.com/accounts"
+      second = "https://api.example.com/payments"
+      client = poll_client(%{resources: [first, second]})
+
+      config =
+        config(
+          resource_indicators: [
+            allowed_resources_for: fn registered_client -> Map.get(registered_client, :resources, []) end
+          ]
+        )
+
+      params = %{
+        "scope" => "openid",
+        "login_hint" => "alice@example.test",
+        "resource" => [first, second]
+      }
+
+      assert {:ok, ack} = BackchannelAuthentication.request(config, request(client, params))
+
+      assert {:ok, %{data: %{resource: [^first, ^second]}}} =
+               Store.lookup(Attesto.Secret.hash(ack.auth_req_id))
+    end
+
     test "ping mode carries the client_notification_token and fires notify_ciba_user" do
       pid = self()
       client = poll_client(%{ciba: %{token_delivery_mode: :ping}})
@@ -261,6 +285,19 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
                  request(client, %{"scope" => "openid", "login_hint" => "alice@example.test"})
                )
     end
+
+    test "a syntactically valid resource outside client policy is invalid_target and is not stored" do
+      params = %{
+        "scope" => "openid",
+        "login_hint" => "alice@example.test",
+        "resource" => "https://unserved.example/api"
+      }
+
+      assert {:error, %OAuthError{error: :invalid_target, status: 400}} =
+               BackchannelAuthentication.request(config(), request(poll_client(), params))
+
+      assert :ets.info(Store, :size) == 0
+    end
   end
 
   describe "request/2 hint resolution (host callback)" do
@@ -340,6 +377,50 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
                  config,
                  request(client, %{"scope" => "openid", "login_hint" => "alice@example.test"})
                )
+    end
+
+    test "authorizes and persists resources from a signed authentication request" do
+      resource = "https://api.example.com/ciba"
+      {jwk, pub_map} = es256_key()
+
+      client = %{
+        id: "cli-1",
+        jwks: %{"keys" => [pub_map]},
+        ciba: %{token_delivery_mode: :poll, request_signing_alg: "ES256"}
+      }
+
+      jwt = signed_request(jwk, Map.put(signed_claims(), "resource", [resource]))
+
+      config =
+        config(
+          ciba: [enabled: true, require_signed_request: true],
+          resource_indicators: [allowed_resources: [resource]]
+        )
+
+      assert {:ok, ack} =
+               BackchannelAuthentication.request(config, request(client, %{"request" => jwt}))
+
+      assert {:ok, %{data: %{resource: [^resource]}}} =
+               Store.lookup(Attesto.Secret.hash(ack.auth_req_id))
+    end
+
+    test "a signed request cannot bypass per-client resource policy" do
+      resource = "https://unserved.example/ciba"
+      {jwk, pub_map} = es256_key()
+
+      client = %{
+        id: "cli-1",
+        jwks: %{"keys" => [pub_map]},
+        ciba: %{token_delivery_mode: :poll, request_signing_alg: "ES256"}
+      }
+
+      jwt = signed_request(jwk, Map.put(signed_claims(), "resource", resource))
+      config = config(ciba: [enabled: true, require_signed_request: true])
+
+      assert {:error, %OAuthError{error: :invalid_target}} =
+               BackchannelAuthentication.request(config, request(client, %{"request" => jwt}))
+
+      assert :ets.info(Store, :size) == 0
     end
 
     test "accepts the request-object media type with randomized casing" do

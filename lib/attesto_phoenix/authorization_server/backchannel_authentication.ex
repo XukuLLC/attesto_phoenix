@@ -32,7 +32,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   calls `request/2`. Every grant decision lives here or in the core.
   """
 
-  alias Attesto.CIBA
+  alias Attesto.{CIBA, ResourceIndicator}
   alias AttestoPhoenix.{Callback, Config, OAuthError}
 
   require Logger
@@ -75,6 +75,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
          :ok <- require_registered_delivery_mode(config, client_map),
          params = strip_client_auth(request.params),
          {:ok, validated} <- validate(config, client_map, params),
+         :ok <- authorize_resource(config, request.client, validated),
          :ok <- guard_replay(config, validated),
          {:ok, subject} <- resolve_user(config, validated),
          {:ok, issued} <- issue(config, store, validated, subject) do
@@ -165,6 +166,20 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
     end
   end
 
+  # RFC 8707 §2.2: syntax is validated in the conn-free CIBA request parser;
+  # issuance policy belongs to the host because it may include a per-client
+  # callback. Bind only resources this authorization server serves for the
+  # authenticated client.
+  defp authorize_resource(config, client, %CIBA.Request{resource: resources}) do
+    case ResourceIndicator.authorize(resources, Config.allowed_resources(config, client)) do
+      {:ok, _resources} ->
+        :ok
+
+      {:error, :invalid_target} ->
+        {:error, error(:invalid_target, "the requested resource is not served by this authorization server")}
+    end
+  end
+
   # FAPI-CIBA §5.2.2 replay defense: the core verifies a signed request's `jti`
   # / `exp` but is stateless by design, so the host MUST reject a repeated
   # `jti` within the request's lifetime. Record a fixed-length digest of the
@@ -239,7 +254,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   defp issue(config, store, %CIBA.Request{} = request, subject) do
     opts = Config.ciba(config)
 
-    case CIBA.issue(store, request, %{subject: subject},
+    case CIBA.issue(store, request, %{subject: subject, resource: request.resource},
            expires_in: Keyword.get(opts, :expires_in_seconds, 120),
            max_expires_in: Keyword.get(opts, :max_expires_in_seconds, 600),
            interval: Keyword.get(opts, :interval_seconds, 5)

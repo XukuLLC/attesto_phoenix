@@ -47,6 +47,9 @@ defmodule AttestoPhoenix.ConsentGrantTest do
                client_id: "client-1",
                redirect_uri: "https://rp.example/cb",
                scope: ["openid", "profile"],
+               resource: [],
+               claims: %{},
+               dpop_jkt: nil,
                code_challenge: "challenge-xyz",
                code_challenge_method: "S256"
              }
@@ -115,6 +118,52 @@ defmodule AttestoPhoenix.ConsentGrantTest do
 
       assert ConsentGrant.binding_hash(base) == ConsentGrant.binding_hash(extra)
     end
+
+    test "resource, claims, and dpop_jkt match the equivalent validated request" do
+      dpop_jkt = Base.url_encode64(:crypto.strong_rand_bytes(32), padding: false)
+
+      raw =
+        params(%{
+          "resource" => ["https://b.example", "https://a.example", "https://a.example"],
+          "claims" => ~s({"userinfo":{"email":{"essential":true}}}),
+          "dpop_jkt" => dpop_jkt
+        })
+
+      request =
+        request(
+          resource: ["https://a.example", "https://b.example"],
+          claims: %{"userinfo" => %{"email" => %{"essential" => true}}},
+          dpop_jkt: dpop_jkt
+        )
+
+      assert {:ok, from_params} = ConsentGrant.safe_binding_from_params(raw, @subject)
+      from_request = ConsentGrant.binding(request, @subject)
+
+      assert from_params == from_request
+      assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
+    end
+
+    test "malformed raw values return a controlled error" do
+      invalid = [
+        %{"client_id" => %{}},
+        %{"redirect_uri" => []},
+        %{"scope" => %{}},
+        %{"resource" => ["https://a.example", 1]},
+        %{"claims" => "[]"},
+        %{"claims" => %{"userinfo" => {:not, :json}}},
+        %{"dpop_jkt" => %{}},
+        %{"code_challenge" => []}
+      ]
+
+      for override <- invalid do
+        raw = params(override)
+        assert {:error, :invalid_binding} = ConsentGrant.safe_binding_from_params(raw, @subject)
+
+        assert_raise ArgumentError, "invalid consent binding parameters", fn ->
+          ConsentGrant.binding_from_params(raw, @subject)
+        end
+      end
+    end
   end
 
   describe "binding_hash/1" do
@@ -132,6 +181,41 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       reordered = ConsentGrant.binding(request(scope: ["email", "openid", "profile"]), @subject)
 
       assert ConsentGrant.binding_hash(forward) == ConsentGrant.binding_hash(reordered)
+    end
+
+    test "resource order and duplicate entries are insignificant" do
+      forward = ConsentGrant.binding(request(resource: ["https://a.example", "https://b.example"]), @subject)
+
+      reordered =
+        ConsentGrant.binding(
+          request(resource: ["https://b.example", "https://a.example", "https://a.example"]),
+          @subject
+        )
+
+      assert ConsentGrant.binding_hash(forward) == ConsentGrant.binding_hash(reordered)
+    end
+
+    test "claims object key order is insignificant at every nesting level" do
+      left =
+        ConsentGrant.binding(
+          request(claims: %{"userinfo" => %{"name" => nil, "email" => %{"essential" => true}}}),
+          @subject
+        )
+
+      right =
+        ConsentGrant.binding(
+          request(claims: %{"userinfo" => %{"email" => %{"essential" => true}, "name" => nil}}),
+          @subject
+        )
+
+      assert ConsentGrant.binding_hash(left) == ConsentGrant.binding_hash(right)
+    end
+
+    test "length framing prevents cross-field delimiter collisions" do
+      left = ConsentGrant.binding(request(client_id: "client\nredirect"), "subject")
+      right = ConsentGrant.binding(request(client_id: "redirect"), "subject\nclient")
+
+      refute ConsentGrant.binding_hash(left) == ConsentGrant.binding_hash(right)
     end
 
     test "a space-joined scope string and the parsed scope list hash identically" do
@@ -185,14 +269,26 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       refute ConsentGrant.binding_hash(base) == ConsentGrant.binding_hash(other)
     end
 
+    test "different resource, claims, or dpop_jkt values change the hash" do
+      base = ConsentGrant.binding(request(), @subject)
+
+      changed = [
+        ConsentGrant.binding(request(resource: ["https://resource.example"]), @subject),
+        ConsentGrant.binding(request(claims: %{"userinfo" => %{"email" => nil}}), @subject),
+        ConsentGrant.binding(request(dpop_jkt: "thumbprint"), @subject)
+      ]
+
+      for binding <- changed do
+        refute ConsentGrant.binding_hash(base) == ConsentGrant.binding_hash(binding)
+      end
+    end
+
     test "an absent code_challenge hashes as the empty string, distinct from any present one" do
       absent = ConsentGrant.binding(request(code_challenge: nil), @subject)
       empty = ConsentGrant.binding(request(code_challenge: ""), @subject)
       present = ConsentGrant.binding(request(code_challenge: "x"), @subject)
 
-      # nil and "" both canonicalise to "", so they collide by design...
-      assert ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(empty)
-      # ...but a real challenge is distinct.
+      refute ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(empty)
       refute ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(present)
     end
 
@@ -201,7 +297,7 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       empty = ConsentGrant.binding(request(code_challenge_method: ""), @subject)
       present = ConsentGrant.binding(request(code_challenge_method: "S256"), @subject)
 
-      assert ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(empty)
+      refute ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(empty)
       refute ConsentGrant.binding_hash(absent) == ConsentGrant.binding_hash(present)
     end
   end

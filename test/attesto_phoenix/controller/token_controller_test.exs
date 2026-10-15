@@ -1113,19 +1113,19 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   end
 
   describe "query-string credential hardening" do
-    test "rejects token request credential fields in the query before client authentication" do
-      put_config(load_client: fn _id -> flunk("client lookup must not run for query credentials") end)
+    test "rejects every token protocol parameter in the query before client authentication" do
+      put_config(load_client: fn _id -> flunk("client lookup must not run for query parameters") end)
 
       params = client_credentials_params()
 
-      for key <- ~w(grant_type client_id client_secret scope) do
+      for key <- ~w(grant_type client_id client_secret scope code redirect_uri refresh_token resource client_assertion) do
         conn = post_token_with_query("#{key}=from-query", params)
 
         assert conn.status == 400
         assert body(conn)["error"] == "invalid_request"
 
         assert body(conn)["error_description"] ==
-                 "#{key} must be sent in the request body, not the query string"
+                 "request parameters must be sent in the request body, not the query string"
       end
     end
 

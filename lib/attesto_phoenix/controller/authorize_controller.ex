@@ -167,7 +167,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          {:ok, request} <- validate_request(config, client, params, par_resolved?) do
       conn
       |> stash_par_request_uri(par_request_uri, par_resolved?)
-      |> stash_credential_configuration_ids(credential_configuration_ids(config, params))
+      |> stash_credential_configuration_ids(credential_configuration_ids(config, request))
       |> run_flow(config, client, request, authorize_dpop_jkt(request, params, par_resolved?))
     else
       {:error, :insecure_transport} ->
@@ -306,11 +306,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
           {:ok, request}
         end
 
-      {:error, {:redirect, _error}} = redirectable ->
-        # The URI this error would travel to is the request's own, which reached
-        # a redirectable outcome only by exact-matching the document's set.
-        with :ok <-
-               require_same_origin_redirect_uri(config, client, Map.get(params, "redirect_uri")) do
+      {:error, {:redirect, error}} = redirectable ->
+        # Request-object processing can replace the outer redirect_uri. Apply
+        # the origin gate to the validated destination carried by the error,
+        # which is the URI the response would actually use.
+        with :ok <- require_same_origin_redirect_uri(config, client, error.redirect_uri) do
           redirectable
         end
 
@@ -846,34 +846,28 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # entries (draft-ietf-oauth-openid4vci §5) naming a
   # `credential_configuration_id` this issuer actually offers
   # (`:credential_configurations_supported`). Unconfigured credential
-  # issuance, an absent/malformed parameter, or a named id this issuer does
-  # not offer all resolve to `[]` — none of these fails the (otherwise valid)
-  # authorization request; the wallet simply gets an ordinary access token
-  # with no credential entitlement, exactly as if it had not asked. This is
-  # the SAME entitlement claim the pre-authorized_code grant binds, so the
+  # issuance, an absent parameter, or a named id this issuer does not offer
+  # resolve to `[]`. Structural validation is owned by
+  # `Attesto.AuthorizationRequest`, so malformed details fail before this
+  # policy filter. This is the SAME entitlement claim the pre-authorized_code grant binds, so the
   # credential endpoint's entitlement check
   # (`AttestoPhoenix.Controller.CredentialController.entitled?/2`) works
   # unchanged regardless of which grant produced the token.
   #
-  # Read off the (possibly PAR-resolved) `params` map rather than the
-  # validated `%Attesto.AuthorizationRequest{}` struct, which carries no
-  # `authorization_details` field. A request carried as a signed request
-  # object (JAR) is out of scope for this reading: `validate/2` re-merges the
-  # signed object's parameters into the struct, not back onto `params`, so an
-  # `authorization_details` inside a JAR payload is not seen here.
-  defp credential_configuration_ids(config, params) do
+  # Consume only the normalized AuthorizationRequest. Direct, JAR, and PAR
+  # requests therefore share one source of truth, and a verified Request
+  # Object's signed value remains authoritative over unsigned outer input.
+  defp credential_configuration_ids(config, %AuthorizationRequest{} = request) do
     supported = Config.credential_configurations_supported(config) || %{}
 
     from_authorization_details =
-      params
-      |> Map.get("authorization_details")
-      |> parse_authorization_details()
+      request.authorization_details
       |> Enum.filter(&openid_credential_entry?/1)
       |> Enum.flat_map(&entry_credential_configuration_ids/1)
       |> Enum.filter(&Map.has_key?(supported, &1))
 
     %{
-      ids: Enum.uniq(from_authorization_details ++ credential_configuration_ids_from_scope(supported, params)),
+      ids: Enum.uniq(from_authorization_details ++ credential_configuration_ids_from_scope(supported, request.scope)),
       authorization_details_ids: Enum.uniq(from_authorization_details)
     }
   end
@@ -882,31 +876,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # configuration's advertised `scope` authorizes that configuration - the
   # scope-based alternative to naming it in `authorization_details`. Both feed
   # the SAME `credential_configuration_ids` entitlement claim.
-  defp credential_configuration_ids_from_scope(supported, params) do
-    requested = params |> Map.get("scope") |> parse_scope_list()
-
+  defp credential_configuration_ids_from_scope(supported, requested) when is_list(requested) do
     for {id, configuration} <- supported,
         scope = configuration_scope(configuration),
         scope in requested,
         do: id
   end
 
-  defp parse_scope_list(scope) when is_binary(scope), do: String.split(scope, " ", trim: true)
-  defp parse_scope_list(_scope), do: []
-
   defp configuration_scope(configuration) when is_map(configuration),
     do: Map.get(configuration, :scope) || Map.get(configuration, "scope")
 
   defp configuration_scope(_configuration), do: nil
-
-  defp parse_authorization_details(value) when is_binary(value) and value != "" do
-    case JSON.decode(value) do
-      {:ok, list} when is_list(list) -> list
-      _ -> []
-    end
-  end
-
-  defp parse_authorization_details(_value), do: []
 
   defp openid_credential_entry?(%{"type" => "openid_credential"}), do: true
   defp openid_credential_entry?(_entry), do: false

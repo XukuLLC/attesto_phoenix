@@ -119,9 +119,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   ## Security details preserved
 
-    * On an unknown/revoked client, a dummy `verify_client_secret/2` call
-      against `:unknown_client` runs so the lookup-failure path matches the
-      wrong-secret path in observable timing (RFC 6749 §2.3 / OWASP).
+    * On an unknown/revoked client, the optional
+      `verify_dummy_client_secret/1` callback runs so the lookup-failure path
+      matches the wrong-secret path in observable timing (RFC 6749 §2.3 /
+      OWASP). The deprecated 3.x fallback invokes `verify_client_secret/2`
+      with `:unknown_client` and contains callback failures.
     * Every client-authentication failure returns the single generic
       `invalid_client` "client authentication failed" message, so an attacker
       cannot tell an unknown client from a wrong secret.
@@ -134,7 +136,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   """
 
   alias Attesto.{ClientAssertion, JWS, MTLS, WalletAttestation}
-  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientClassification, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Store.NonceStore
 
@@ -772,14 +774,14 @@ defmodule AttestoPhoenix.ClientAuthentication do
     # the remote document so one invalid Basic/post request cannot trigger
     # network work, but retain the same dummy-secret path as an unknown client.
     if ClientIdMetadata.cimd_client_id?(client_id, config) do
-      reject_confidential_client(verify_client_secret, secret)
+      reject_confidential_client(config, verify_client_secret, secret)
     else
       case resolve_client(config, client_id) do
         {:ok, client} ->
           verify_resolved_confidential_client(config, client, client_id, secret, method, verify_client_secret)
 
         {:error, _reason} ->
-          reject_confidential_client(verify_client_secret, secret)
+          reject_confidential_client(config, verify_client_secret, secret)
       end
     end
   end
@@ -792,7 +794,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
       {:error, _reason} ->
         # A known client using the wrong registered method must take the same
         # password-work path as an unknown identifier.
-        reject_confidential_client(verify_client_secret, secret)
+        reject_confidential_client(config, verify_client_secret, secret)
     end
   end
 
@@ -805,11 +807,23 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   # RFC 6749 §2.3 / OWASP: do not leak whether the client exists, is revoked,
-  # uses another registered method, or is a CIMD URL. The host callback should
-  # perform its fixed dummy password verification for `:unknown_client`.
-  defp reject_confidential_client(verify_client_secret, secret) do
-    _ = invoke(verify_client_secret, [:unknown_client, secret])
+  # uses another registered method, or is a CIMD URL. Prefer the explicit
+  # one-argument dummy-work callback. Retain the `:unknown_client` call only as
+  # a contained 3.x compatibility fallback.
+  defp reject_confidential_client(config, verify_client_secret, secret) do
+    _ = safely_run_dummy_secret_work(config, verify_client_secret, secret)
     {:error, error(@error_invalid_client, @client_auth_failed)}
+  end
+
+  defp safely_run_dummy_secret_work(config, verify_client_secret, secret) do
+    case Config.verify_dummy_client_secret_fun(config) do
+      nil -> invoke(verify_client_secret, [:unknown_client, secret])
+      callback -> invoke(callback, [secret])
+    end
+  rescue
+    _error -> false
+  catch
+    _kind, _reason -> false
   end
 
   defp verify_private_key_jwt_client(config, policy, assertion) do
@@ -1133,10 +1147,6 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # requires authentication when the document declares private_key_jwt; only
   # the none method is public and relies on PKCE downstream. A registered
   # client defers to the host's :client_public? discriminator.
-  defp client_public?(_config, %CIMDClient{metadata: metadata}) do
-    Map.get(metadata, "token_endpoint_auth_method", "none") == "none"
-  end
-
   # Absent the host's `:client_public?` callback the answer normally fails
   # closed to `false`: an unclassified client must not be admitted on the
   # secretless path, because doing so would let anyone who knows a confidential
@@ -1156,9 +1166,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `:client_public?` callback refused on both paths and therefore unable to
   # authenticate at all.
   defp client_public?(config, client) do
-    case Config.client_public_fun(config) do
-      nil -> client_native?(config, client)
-      callback -> Callback.invoke_boolean(callback, [client], false, :client_public?)
+    case ClientClassification.classify(config, client) do
+      :public -> true
+      :confidential -> false
+      :unknown -> client_native?(config, client)
     end
   end
 

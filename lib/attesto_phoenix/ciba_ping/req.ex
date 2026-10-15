@@ -54,6 +54,7 @@ if Code.ensure_loaded?(Req) do
           retry: false,
           receive_timeout: @timeout_ms,
           decode_body: false,
+          into: AttestoPhoenix.HTTPResponse.discard_body_collector(),
           # Pin to the checked IP (`:hostname` keeps SNI/cert/Host on the real
           # host). FAPI transport: offer TLS 1.3 (FAPI 1.0 Advanced §8.5 /
           # FAPI-CIBA), preferring it while still allowing 1.2.

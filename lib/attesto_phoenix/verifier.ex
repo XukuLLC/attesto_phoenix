@@ -13,12 +13,13 @@ defmodule AttestoPhoenix.Verifier do
   changes request-object signing policy.
   """
 
-  alias Attesto.{JWS, PresentationRequest, PresentationSession, VpToken}
+  alias Attesto.{JWS, Key, PresentationRequest, PresentationSession, Secret, SigningAlg, VpToken}
   alias AttestoPhoenix.Config
 
   @presentation_ttl_seconds 300
   @self_issued_audience "https://self-issued.me/v2"
   @request_object_type "oauth-authz-req+jwt"
+  @response_code_type "oid4vp-response-code+jwt"
   @encrypted_response_alg "ECDH-ES"
   # HAIP §5 requires the verifier to advertise both A128GCM and A256GCM content
   # encryption.
@@ -64,20 +65,32 @@ defmodule AttestoPhoenix.Verifier do
     scheme = Map.get(attrs, :client_id_scheme) || Config.verifier_client_id_scheme(config)
 
     with {:ok, store} <- presentation_session_store(config),
+         :ok <- validate_response_mode(response_mode),
          {:ok, client_id} <- verifier_client_id(config, scheme),
          {:ok, session} <-
-           create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query),
-         {:ok, response_options} <- response_options(store, session, response_mode),
-         {:ok, jar} <-
-           sign_request_object(config, client_id, session, dcql_query, response_options, scheme),
-         :ok <- PresentationSession.attach_request_object(store, session.id, jar) do
-      {:ok,
-       %{
-         id: session.id,
-         nonce: session.nonce,
-         client_id: client_id,
-         request_uri: request_uri(config, session.id)
-       }}
+           create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query) do
+      finish_presentation_request(store, config, client_id, session, dcql_query, response_mode, scheme)
+    end
+  end
+
+  defp finish_presentation_request(store, config, client_id, session, dcql_query, response_mode, scheme) do
+    result =
+      with {:ok, response_options} <- response_options(store, session, response_mode),
+           {:ok, jar} <-
+             sign_request_object(config, client_id, session, dcql_query, response_options, scheme),
+           :ok <- PresentationSession.attach_request_object(store, session.id, jar) do
+        {:ok,
+         %{
+           id: session.id,
+           nonce: session.nonce,
+           client_id: client_id,
+           request_uri: request_uri(config, session.id)
+         }}
+      end
+
+    case result do
+      {:ok, _presentation} = ok -> ok
+      error -> discard_session(store, session.id, error)
     end
   end
 
@@ -90,18 +103,112 @@ defmodule AttestoPhoenix.Verifier do
   or expired session.
   """
   @spec presentation_result(Config.t(), String.t()) :: {:ok, map()} | :error
-  def presentation_result(%Config{} = config, id) when is_binary(id) do
-    Config.with_request_config(config, fn -> do_presentation_result(config, id) end)
+  def presentation_result(%Config{} = config, response_code) when is_binary(response_code) do
+    Config.with_request_config(config, fn -> do_presentation_result(config, response_code) end)
   end
 
   def presentation_result(%Config{}, _id), do: :error
 
-  defp do_presentation_result(config, id) do
-    case Config.presentation_session_store(config) do
-      store when is_atom(store) and not is_nil(store) -> PresentationSession.result(store, id)
+  defp do_presentation_result(config, response_code) do
+    with {:ok, session_id} <- verify_response_code(config, response_code),
+         store when is_atom(store) and not is_nil(store) <- Config.presentation_session_store(config) do
+      PresentationSession.result(store, session_id)
+    else
       _ -> :error
     end
+  rescue
+    _error -> :error
+  catch
+    _kind, _reason -> :error
   end
+
+  @doc false
+  @spec issue_presentation_response_code(Config.t(), String.t()) ::
+          {:ok, String.t()} | {:error, :invalid_response_code}
+  def issue_presentation_response_code(%Config{} = config, session_id)
+      when is_binary(session_id) and session_id != "" do
+    now = System.system_time(:second)
+
+    claims = %{
+      "iss" => config.issuer,
+      "aud" => config.issuer,
+      "iat" => now,
+      "exp" => now + @presentation_ttl_seconds,
+      "jti" => Secret.generate(),
+      "sid" => session_id
+    }
+
+    {:ok, JWS.sign_current(config.keystore, claims, typ: @response_code_type)}
+  rescue
+    _error -> {:error, :invalid_response_code}
+  catch
+    _kind, _reason -> {:error, :invalid_response_code}
+  end
+
+  def issue_presentation_response_code(%Config{}, _session_id), do: {:error, :invalid_response_code}
+
+  defp verify_response_code(config, response_code) do
+    now = System.system_time(:second)
+
+    with {:ok, %{"typ" => @response_code_type} = header} <- JWS.peek_json(response_code, :protected),
+         :ok <- JWS.reject_unsupported_crit(header, supported: []),
+         candidates when candidates != [] <- response_code_candidates(config, header["kid"]),
+         {:ok, claims} <-
+           JWS.verify_strict(response_code, candidates,
+             claims_map?: true,
+             terminal_error: :invalid_response_code,
+             malformed_result: :halt,
+             malformed_error: :invalid_response_code
+           ),
+         :ok <- validate_response_code_claims(claims, config.issuer, now) do
+      {:ok, claims["sid"]}
+    else
+      _ -> {:error, :invalid_response_code}
+    end
+  end
+
+  defp response_code_candidates(config, header_kid) do
+    JWS.verification_candidates(config.keystore.verification_pems(),
+      kid: header_kid,
+      malformed_key: :raise,
+      candidate_builder: fn pem ->
+        {Key.kid(pem), SigningAlg.for_key(config.keystore, pem), Key.jwk(pem)}
+      end
+    )
+  end
+
+  defp validate_response_code_claims(
+         %{
+           "iss" => issuer,
+           "aud" => audience,
+           "iat" => issued_at,
+           "exp" => expires_at,
+           "jti" => jti,
+           "sid" => session_id
+         },
+         issuer,
+         now
+       ) do
+    with :ok <- validate_response_code_issuer(audience, issuer),
+         :ok <- validate_response_code_identifier(jti),
+         :ok <- validate_response_code_identifier(session_id) do
+      validate_response_code_times(issued_at, expires_at, now)
+    end
+  end
+
+  defp validate_response_code_claims(_claims, _issuer, _now), do: {:error, :invalid_response_code}
+
+  defp validate_response_code_issuer(issuer, issuer), do: :ok
+  defp validate_response_code_issuer(_audience, _issuer), do: {:error, :invalid_response_code}
+
+  defp validate_response_code_identifier(value) when is_binary(value) and value != "", do: :ok
+  defp validate_response_code_identifier(_value), do: {:error, :invalid_response_code}
+
+  defp validate_response_code_times(issued_at, expires_at, now)
+       when is_integer(issued_at) and is_integer(expires_at) and issued_at <= now + 60 and expires_at > now and
+              expires_at >= issued_at and expires_at - issued_at <= @presentation_ttl_seconds, do: :ok
+
+  defp validate_response_code_times(_issued_at, _expires_at, _now), do: {:error, :invalid_response_code}
 
   defp create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query) do
     PresentationSession.create(
@@ -171,8 +278,14 @@ defmodule AttestoPhoenix.Verifier do
              client_metadata: Map.merge(base_client_metadata(), metadata)
            ]}
         end
+
+      _unsupported ->
+        {:error, :invalid_attrs}
     end
   end
+
+  defp validate_response_mode(mode) when mode in ["direct_post", "direct_post.jwt"], do: :ok
+  defp validate_response_mode(_mode), do: {:error, :invalid_attrs}
 
   # OID4VP 1.0 final §5.1: the request's `client_metadata` MUST advertise the
   # verifier's supported presentation formats via `vp_formats_supported`. The
@@ -235,7 +348,24 @@ defmodule AttestoPhoenix.Verifier do
       s when s in [nil, "redirect_uri"] -> configured_verifier_client_id(config)
       "x509_san_dns" -> x509_verifier_client_id(config)
       "x509_hash" -> x509_hash_verifier_client_id(config)
+      _unsupported -> {:error, :invalid_attrs}
     end
+  end
+
+  defp discard_session(store, id, error) do
+    # The store contract intentionally permits `take/1` only for completed
+    # entries. Move this failed, still-pending construction through a private
+    # terminal result and immediately consume it so signing/attachment failures
+    # cannot leave a usable orphan behind.
+    with :ok <- store.complete(id, %{cancelled: true}) do
+      _ = store.take(id)
+    end
+
+    error
+  rescue
+    _error -> error
+  catch
+    _kind, _reason -> error
   end
 
   # OID4VP `x509_hash` client-id scheme: the identifier is the base64url SHA-256

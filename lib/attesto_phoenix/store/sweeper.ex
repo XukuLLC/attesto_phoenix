@@ -42,7 +42,13 @@ defmodule AttestoPhoenix.Store.Sweeper do
   fresh `jti`. Those deletes only bound table growth by reclaiming rows that can
   no longer affect any decision. A consumed code's expired row can still carry
   the replay-revocation link for a live access token, so that row is retained
-  until the linked token expires.
+  until the linked token expires. A successful code that issued a refresh
+  family is retained while any unexpired refresh token remains in that family.
+  This lookup also gives legacy rows with a NULL family deadline a finite
+  retention boundary once their last descendant expires or is revoked.
+  A newly claimed code also carries a short finalization reservation so a
+  concurrent sweep cannot erase it between the atomic claim and the successful
+  reuse-marker update.
 
   The process also irreversibly redacts refresh-successor ciphertext whose
   short retry deadline has passed, on the next scheduled sweep. When the Ecto
@@ -55,7 +61,8 @@ defmodule AttestoPhoenix.Store.Sweeper do
   The remaining work is TTL housekeeping: it issues one delete per swept table
   using `expires_at < $now`. Authorization-code cleanup additionally keeps a
   row while its non-empty access-token link has a future
-  `access_token_expires_at`, preserving replay revocation until that token dies.
+  `access_token_expires_at`, while finalization is reserved, or while its
+  refresh family has an unexpired member.
 
   ## Comparison boundary (fail-closed)
 
@@ -129,7 +136,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
 
   use GenServer
 
-  import Ecto.Query, only: [from: 2]
+  import Ecto.Query, only: [dynamic: 2, from: 2]
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Store.EctoRefreshStore
@@ -325,14 +332,30 @@ defmodule AttestoPhoenix.Store.Sweeper do
   # `from/2` requires a literal string source, so each generated table gets its
   # own clause keyed off the compile-time module attribute. Authorization-code
   # rows carry replay-revocation provenance after successful redemption. Keep a
-  # code row until its linked access token is no longer live; otherwise a replay
-  # can no longer find the row and revoke the issued token.
+  # code row until its linked access token and refresh family are no longer
+  # live; otherwise a replay can no longer find the row and revoke descendants.
+  # A successful family marker is retained while the refresh-token table still
+  # contains an unexpired member of that family. This mirrors the core ETS
+  # store's live-descendant rule and lets legacy successful rows whose
+  # `replay_retain_until` is NULL retire once their family has ended. An
+  # unsuccessful claimed row is retained only through its short finalization
+  # reservation, preventing a sweep between `take/1` and `mark_consumed/2`.
   defp expired_query(@authorization_codes, now) do
+    expired = authorization_code_expired(now)
+
     from(r in @authorization_codes,
+      as: :authorization_code,
+      where: ^expired,
       where:
-        r.expires_at < ^now and
-          (is_nil(r.access_token_jti) or r.access_token_jti == "" or
-             is_nil(r.access_token_expires_at) or r.access_token_expires_at <= ^now)
+        r.consumed_success != true or is_nil(r.family_id) or r.family_id == "" or
+          not exists(
+            from(t in @refresh_tokens,
+              where:
+                t.family_id == parent_as(:authorization_code).family_id and
+                  t.expires_at > ^now,
+              select: 1
+            )
+          )
     )
   end
 
@@ -358,6 +381,45 @@ defmodule AttestoPhoenix.Store.Sweeper do
   # Parent expiry is authoritative. A consumed parent cannot recover after its
   # own expiry, even when a successor retry deadline is later.
   defp refresh_expired_query(now), do: from(r in @refresh_tokens, where: r.expires_at < ^now)
+
+  defp authorization_code_expired(now) do
+    code_expired = dynamic([r], r.expires_at < ^now)
+    access_token_expired = authorization_code_access_token_expired(now)
+    replay_retention_expired = authorization_code_replay_retention_expired(now)
+
+    dynamic([r], ^code_expired and ^access_token_expired and ^replay_retention_expired)
+  end
+
+  defp authorization_code_access_token_expired(now) do
+    dynamic(
+      [r],
+      is_nil(r.access_token_jti) or r.access_token_jti == "" or is_nil(r.access_token_expires_at) or
+        r.access_token_expires_at <= ^now
+    )
+  end
+
+  defp authorization_code_replay_retention_expired(now) do
+    unconsumed = dynamic([r], is_nil(r.consumed_at))
+    unsuccessful = authorization_code_unsuccessful_retention_expired(now)
+    no_family = authorization_code_without_family()
+
+    dynamic([r], ^unconsumed or ^unsuccessful or ^no_family or r.consumed_success == true)
+  end
+
+  defp authorization_code_unsuccessful_retention_expired(now) do
+    dynamic(
+      [r],
+      r.consumed_success == false and
+        (is_nil(r.replay_retain_until) or r.replay_retain_until <= ^now)
+    )
+  end
+
+  defp authorization_code_without_family do
+    dynamic(
+      [r],
+      r.consumed_success == true and (is_nil(r.family_id) or r.family_id == "")
+    )
+  end
 
   defp delete_expired(repo, query, prefix) do
     {deleted, _} =

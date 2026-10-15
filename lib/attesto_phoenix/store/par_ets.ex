@@ -4,22 +4,41 @@ defmodule AttestoPhoenix.Store.PAR.ETS do
 
   This is a development/default store. Clustered deployments should provide a
   `AttestoPhoenix.PARStore` backed by shared storage.
+
+  The table is bounded by `:par_max_entries` and `:par_max_record_bytes` from
+  `AttestoPhoenix.Config`. Admission is serialized in the table owner: expired
+  rows are pruned first, a live random-reference collision is rejected, and a
+  new live row is never evicted to make room.
   """
 
   @behaviour AttestoPhoenix.PARStore
 
   alias AttestoPhoenix.Store.ETSOwner
+  alias AttestoPhoenix.Store.PAR.Capacity
 
   @table :attesto_phoenix_par_requests
 
   @table_options [:set, :public, :named_table, read_concurrency: true]
 
   @impl true
-  def put(request_uri, params, ttl_seconds) when is_binary(request_uri) and is_map(params) do
-    ensure_table()
-    expires_at = System.system_time(:second) + ttl_seconds
-    true = :ets.insert(@table, {request_uri, params, expires_at})
-    :ok
+  def put(request_uri, params, ttl_seconds)
+      when is_binary(request_uri) and is_map(params) and is_integer(ttl_seconds) and ttl_seconds > 0 do
+    now = System.system_time(:second)
+    expires_at = now + ttl_seconds
+
+    if Capacity.fits?(request_uri, params, expires_at) do
+      ETSOwner.insert_bounded_expiring(
+        @table,
+        @table_options,
+        request_uri,
+        params,
+        expires_at,
+        now,
+        Capacity.max_entries()
+      )
+    else
+      {:error, :record_too_large}
+    end
   end
 
   @impl true

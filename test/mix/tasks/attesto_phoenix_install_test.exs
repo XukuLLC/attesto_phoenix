@@ -1237,16 +1237,27 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
         project()
         |> Igniter.compose_task(@task, ["--schema-prefix", "tenant_auth"])
 
-      assert Enum.any?(composed.notices, fn notice ->
-               notice =~ "--schema-prefix tenant_auth" and
-                 notice =~ "gen.migration --upgrade 3.0 --repo Test.Repo" and
-                 notice =~ "gen.migration --upgrade 3.1 --repo Test.Repo" and
-                 notice =~ "PostgreSQL schema `tenant_auth`" and
-                 notice =~ "{repo, schema_prefix}" and
-                 notice =~ "attesto_authorization_codes_code_hash_index" and
-                 notice =~ "subscriber" and
-                 notice =~ "publisher second"
-             end)
+      notice =
+        Enum.find(composed.notices, fn notice ->
+          notice =~ "PostgreSQL schema `tenant_auth`" and
+            notice =~ "{repo, schema_prefix}" and
+            notice =~ "attesto_authorization_codes_code_hash_index" and
+            notice =~ "subscriber" and
+            notice =~ "publisher second"
+        end)
+
+      assert notice
+
+      positions =
+        Enum.map(~w(3.0 3.1 3.4 3.6 3.7), fn version ->
+          command =
+            "gen.migration --upgrade #{version} --repo Test.Repo --schema-prefix tenant_auth"
+
+          assert {position, _length} = :binary.match(notice, command)
+          position
+        end)
+
+      assert positions == Enum.sort(positions)
 
       applied =
         composed
@@ -1807,7 +1818,13 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                notice =~
                  "gen.migration --upgrade 3.0 --repo Test.Repo --schema-prefix tenant_prod" and
                  notice =~
-                   "gen.migration --upgrade 3.1 --repo Test.Repo --schema-prefix tenant_prod"
+                   "gen.migration --upgrade 3.1 --repo Test.Repo --schema-prefix tenant_prod" and
+                 notice =~
+                   "gen.migration --upgrade 3.4 --repo Test.Repo --schema-prefix tenant_prod" and
+                 notice =~
+                   "gen.migration --upgrade 3.6 --repo Test.Repo --schema-prefix tenant_prod" and
+                 notice =~
+                   "gen.migration --upgrade 3.7 --repo Test.Repo --schema-prefix tenant_prod"
              end)
 
       applied = apply_igniter!(composed)

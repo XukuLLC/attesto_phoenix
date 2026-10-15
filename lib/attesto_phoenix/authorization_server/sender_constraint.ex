@@ -290,18 +290,6 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   def binding_jkt(_binding), do: nil
 
   @doc """
-  The DPoP thumbprint to bind a refresh token to (RFC 9449 §5).
-
-  Public clients get DPoP-bound refresh tokens; for confidential clients the
-  refresh token stays bound to the authenticated `client_id` (RFC 6749 §6 /
-  §10.4) rather than one DPoP proof key, so no DPoP thumbprint is threaded.
-  """
-  @spec refresh_binding_jkt(Config.t(), term(), binding()) :: String.t() | nil
-  def refresh_binding_jkt(%Config{} = config, client, binding) do
-    if client_public?(config, client), do: binding_jkt(binding)
-  end
-
-  @doc """
   Whether the client requires DPoP-bound token issuance (RFC 9449).
 
   Returns `false` when the host supplies no `:client_requires_dpop?` callback.
@@ -433,15 +421,6 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   end
 
   defp issue_nonce(_config), do: ""
-
-  # A CIMD client holds no symmetric secret, so it is public by construction
-  # (it leans on PKCE / DPoP downstream); a registered client defers to the
-  # host's `:client_public?` discriminator.
-  defp client_public?(_config, %CIMDClient{metadata: _metadata}), do: true
-
-  defp client_public?(config, client) do
-    Callback.invoke_boolean(Config.client_public_fun(config), [client], false, :client_public?)
-  end
 
   defp dpop_proof(input), do: Map.get(input, :dpop_proof)
   defp mtls_cert_der(input), do: Map.get(input, :mtls_cert_der)

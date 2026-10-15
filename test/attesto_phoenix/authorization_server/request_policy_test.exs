@@ -77,6 +77,13 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
       assert RequestPolicy.require_pkce?(config(require_pkce: true), @confidential)
     end
 
+    test "an unclassified client still requires PKCE when the host callback is absent" do
+      assert RequestPolicy.require_pkce?(
+               config(require_pkce: false, client_public?: nil),
+               @confidential
+             )
+    end
+
     # RFC 8252 §8.1: a native app MUST use PKCE. The requirement follows from
     # the client being native, not from any config flag.
     test "a native client requires PKCE regardless of the global flag" do

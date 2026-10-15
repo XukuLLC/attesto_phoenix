@@ -130,9 +130,11 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     Process.put({StubRefreshStore, token_hash}, {:ok, record})
   end
 
-  defp call(params, headers \\ []) do
+  defp call(params, headers \\ [], query \\ "") do
+    path = if query == "", do: "/oauth/introspect", else: "/oauth/introspect?" <> query
+
     base =
-      conn(:post, "/oauth/introspect", params)
+      conn(:post, path, params)
       |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
       |> put_req_header("authorization", basic_auth())
 
@@ -166,6 +168,26 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
   end
 
   describe "create/2 (RFC 7662)" do
+    test "rejects query parameters before client authentication" do
+      opts =
+        Keyword.put(config_opts(), :load_client, fn _client_id ->
+          flunk("client lookup must not run for query parameters")
+        end)
+
+      Application.put_env(:attesto_phoenix, AttestoPhoenix.Config, opts)
+
+      for query <- ["token=leaked", "token_type_hint=refresh_token", "client_assertion=leaked"] do
+        conn = call(%{"token" => "body-token"}, [], query)
+
+        assert conn.status == 400
+
+        assert JSON.decode!(conn.resp_body) == %{
+                 "error" => "invalid_request",
+                 "error_description" => "request parameters must be sent in the request body, not the query string"
+               }
+      end
+    end
+
     test "an active access token returns the JSON introspection response", %{config: config} do
       conn = call(%{"token" => access_token(config)})
 
@@ -520,6 +542,22 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       assert conn.status == 200
       assert get_resp_header(conn, "content-type") |> List.first() =~ "application/json"
       assert JSON.decode!(conn.resp_body)["active"] == true
+    end
+
+    test "malformed or inexact Accept ranges stay on the JSON response", %{config: config} do
+      for accept <- [
+            ";",
+            "#{@signed_media_type};q=2",
+            "#{@signed_media_type};q=bogus",
+            "#{@signed_media_type};q=0.5junk",
+            "#{@signed_media_type}ish"
+          ] do
+        conn = call(%{"token" => access_token(config)}, [{"accept", accept}])
+
+        assert conn.status == 200
+        assert get_resp_header(conn, "content-type") |> List.first() =~ "application/json"
+        assert JSON.decode!(conn.resp_body)["active"] == true
+      end
     end
   end
 

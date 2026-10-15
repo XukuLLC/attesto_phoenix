@@ -65,6 +65,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
 
   require Logger
 
+  @max_client_id_bytes 2_048
+
   @cache_read_warning "AttestoPhoenix CIMD cache failed; fetching fresh client metadata"
   @cache_write_warning "AttestoPhoenix CIMD cache failed; fresh client metadata was not cached"
 
@@ -76,6 +78,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   """
   @type error ::
           {:invalid_client_id, ClientIdMetadata.url_error()}
+          | {:invalid_client_id, :too_long}
           | {:blocked_host, String.t()}
           | {:fetch, term()}
           | :invalid_json
@@ -105,9 +108,13 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   end
 
   defp validate_client_id(client_id) do
-    case ClientIdMetadata.validate_client_id(client_id) do
-      {:ok, uri} -> {:ok, uri}
-      {:error, reason} -> {:error, {:invalid_client_id, reason}}
+    if byte_size(client_id) > @max_client_id_bytes do
+      {:error, {:invalid_client_id, :too_long}}
+    else
+      case ClientIdMetadata.validate_client_id(client_id) do
+        {:ok, uri} -> {:ok, uri}
+        {:error, reason} -> {:error, {:invalid_client_id, reason}}
+      end
     end
   end
 

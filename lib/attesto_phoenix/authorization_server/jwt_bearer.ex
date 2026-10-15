@@ -306,6 +306,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     cond do
       Keyword.get(cache_control, :no_store, false) -> 0
       Keyword.get(cache_control, :no_cache, false) -> 0
+      cache_control[:max_age] == 0 -> 0
       is_integer(cache_control[:max_age]) -> clamp(cache_control[:max_age], min, max)
       true -> min
     end

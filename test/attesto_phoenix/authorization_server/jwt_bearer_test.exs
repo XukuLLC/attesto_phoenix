@@ -634,6 +634,31 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       def fetch(_url, _opts), do: {:error, {:transport, "private_fetch_reason"}}
     end
 
+    defmodule ZeroAgeFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      @impl true
+      def fetch(url, opts) do
+        {:ok, result} = JwtBearerTest.StubFetcher.fetch(url, opts)
+        {:ok, %{result | cache_control: [max_age: 0]}}
+      end
+    end
+
+    defmodule RecordingCache do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Cache
+
+      @impl true
+      def get(_url), do: :miss
+
+      @impl true
+      def put(url, _metadata, expires_at) do
+        send(Process.get({__MODULE__, :owner}), {:cache_put, url, expires_at})
+        :ok
+      end
+    end
+
     defmodule FaultCache do
       @moduledoc false
       @behaviour AttestoPhoenix.ClientIdMetadata.Cache
@@ -759,6 +784,15 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert log =~ "AttestoPhoenix JWT-bearer JWKS cache failed; fresh keys were not cached"
       refute log =~ "private backend exception"
       refute log =~ "private write exception"
+    end
+
+    test "an explicit max-age=0 response is not raised to the minimum cache TTL" do
+      Process.put({RecordingCache, :owner}, self())
+      config = remote_jwks_config(RecordingCache, ZeroAgeFetcher)
+
+      assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+      assert is_binary(response.access_token)
+      refute_received {:cache_put, _url, _expires_at}
     end
   end
 

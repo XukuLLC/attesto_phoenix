@@ -82,24 +82,37 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   end
 
   defp approve(conn, config, store, subject, user_code) do
-    case pending_scope(config, store, user_code) do
-      {:ok, pending_scope} ->
-        approval = %{
-          subject: Map.get(subject, :subject) || Map.get(subject, :sub),
-          # The granted scope is the subject's narrowed scope when the host
-          # login/consent layer supplied one, otherwise the originally requested
-          # scope bound to the device code — never broader than what was requested.
-          scope: Map.get(subject, :scope) || pending_scope,
-          claims: Map.get(subject, :claims, %{})
-        }
+    with {:ok, pending_scope} <- pending_scope(config, store, user_code),
+         {:ok, scope} <- approved_scope(subject, pending_scope),
+         approval = device_approval(subject, scope),
+         :ok <- approve_device_code(config, store, user_code, approval) do
+      render_stage(conn, config, :approved, user_code, nil)
+    else
+      {:error, _domain_reason} -> render_stage(conn, config, :invalid, user_code, nil)
+    end
+  end
 
-        case approve_device_code(config, store, user_code, approval) do
-          :ok -> render_stage(conn, config, :approved, user_code, nil)
-          {:error, _domain_reason} -> render_stage(conn, config, :invalid, user_code, nil)
-        end
+  defp device_approval(subject, scope) do
+    %{
+      subject: Map.get(subject, :subject) || Map.get(subject, :sub),
+      scope: scope,
+      claims: Map.get(subject, :claims, %{})
+    }
+  end
 
-      {:error, _domain_reason} ->
-        render_stage(conn, config, :invalid, user_code, nil)
+  defp approved_scope(subject, pending_scope) do
+    scope =
+      case Map.fetch(subject, :scope) do
+        :error -> pending_scope
+        {:ok, value} when is_binary(value) -> String.split(value, " ", trim: true)
+        {:ok, value} -> value
+      end
+
+    if is_list(scope) and Enum.all?(scope, &(is_binary(&1) and &1 != "")) and
+         Enum.all?(scope, &(&1 in pending_scope)) do
+      {:ok, Enum.uniq(scope)}
+    else
+      {:error, :invalid_scope}
     end
   end
 

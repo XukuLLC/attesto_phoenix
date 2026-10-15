@@ -16,6 +16,7 @@ defmodule AttestoPhoenix.ClientStore do
 
     * `load_client/1` (`:load_client`, required)
     * `verify_client_secret/2` (`:verify_client_secret`, required)
+    * `verify_dummy_client_secret/1` (`:verify_dummy_client_secret`, optional)
     * `client_id/1` (`:client_id`)
     * `client_jwks/1` (`:client_jwks`)
     * `client_auth_method/1` (`:client_auth_method`)
@@ -52,6 +53,21 @@ defmodule AttestoPhoenix.ClientStore do
   leaks.
   """
   @callback verify_client_secret(client(), presented_secret :: String.t()) :: boolean()
+
+  @doc """
+  Perform the same fixed password-hash work used by `verify_client_secret/2`
+  when the presented client identifier is unknown, revoked, or registered for
+  another authentication method. The result is ignored; return `false` after
+  completing the work.
+
+  This optional callback lets `verify_client_secret/2` accept only the host's
+  client type. When absent, AttestoPhoenix retains its 3.x compatibility call
+  to `verify_client_secret(:unknown_client, presented_secret)`, catches callback
+  failures, and returns the same generic `invalid_client` response. That
+  sentinel fallback is deprecated and will be removed in the next major
+  release.
+  """
+  @callback verify_dummy_client_secret(presented_secret :: String.t()) :: boolean()
 
   @doc """
   The client's OAuth identifier (RFC 6749 §2.2), extracted from the host's
@@ -252,7 +268,8 @@ defmodule AttestoPhoenix.ClientStore do
   """
   @callback client_ciba_registration(client()) :: map() | nil
 
-  @optional_callbacks client_id: 1,
+  @optional_callbacks verify_dummy_client_secret: 1,
+                      client_id: 1,
                       client_jwks: 1,
                       client_auth_method: 1,
                       client_mtls_metadata: 1,

@@ -66,6 +66,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   alias Attesto.Revocation
   alias AttestoPhoenix.ClientAuthentication
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.QueryParameterGuard
   alias AttestoPhoenix.Event
   alias AttestoPhoenix.OAuthError
   alias AttestoPhoenix.RequestContext
@@ -109,12 +110,16 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     # RFC 6749 §5.1: success and error responses alike carry no-store.
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- RequestContext.check_https(conn, config),
+    with :ok <- QueryParameterGuard.reject(conn),
+         :ok <- RequestContext.check_https(conn, config),
          {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
            authenticate_client(config, conn, params),
          {:ok, token} <- fetch_token(params) do
       revoke_token(conn, config, client_id, token, params)
     else
+      {:error, :query_parameters_not_allowed} ->
+        OAuthError.render(conn, QueryParameterGuard.error(), auth_scheme: :none, config: config)
+
       {:error, :insecure_transport} ->
         # RFC 6749 §3.1 / §10.1: the client secret and refresh token in this
         # request must never cross a plain-HTTP hop; a credential that did is
@@ -162,27 +167,16 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   defp revoke_token(conn, config, client_id, token, params) do
     # RFC 7009 §2.1: bind the revocation to the authenticated client so a
     # client cannot revoke another client's tokens. `Attesto.Revocation`
-    # returns `:ok` for an unknown, expired, or already-revoked token
-    # (no-existence oracle, RFC 7009 §2.2), and `{:error,
-    # :unauthorized_client}` when the token is bound to a different client.
-    case Revocation.revoke(refresh_store(config, conn), token,
-           client_id: client_id,
-           issuer: config.issuer
-         ) do
-      :ok ->
-        # The token was unknown to this client OR was revoked; either way the
-        # response is an indistinguishable empty 200 (no-existence oracle).
-        # The audit event is emitted only on this authenticated, accepted
-        # revocation request.
-        emit_revoked(config, client_id, params)
+    # returns `:ok` for every accepted revocation request, whether the token
+    # was unknown, expired, already revoked, or owned by another client. This
+    # prevents the endpoint from becoming a token-existence oracle.
+    :ok =
+      Revocation.revoke(refresh_store(config, conn), token,
+        client_id: client_id,
+        issuer: config.issuer
+      )
 
-      {:error, :unauthorized_client} ->
-        # RFC 7009 §2.2: the authenticated client does not own this token, so
-        # nothing is revoked. The endpoint must NOT reveal that the token
-        # exists under another client, so it still answers an empty 200
-        # rather than an error, and emits no revocation event.
-        :ok
-    end
+    emit_revoked(config, client_id, params)
 
     conn
     |> send_resp(@http_ok, "")

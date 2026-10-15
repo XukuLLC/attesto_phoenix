@@ -1565,8 +1565,12 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
       assert missing.status == 401
       assert body(missing)["error"] == "invalid_token"
+      assert ["Bearer " <> missing_challenge] = get_resp_header(missing, "www-authenticate")
+      assert missing_challenge =~ ~s(error="invalid_token")
       assert invalid.status == 401
       assert body(invalid)["error"] == "invalid_token"
+      assert ["Bearer " <> invalid_challenge] = get_resp_header(invalid, "www-authenticate")
+      assert invalid_challenge =~ ~s(error="invalid_token")
     end
 
     test "an unexpected client-store result is a sanitized integration failure" do

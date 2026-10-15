@@ -6,7 +6,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Attesto.{SdJwtVc, Token}
+  alias Attesto.{JwtVc, Mdoc, SdJwtVc, Token}
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.DeferredCredentialController
   alias AttestoPhoenix.Plug.PutConfig
@@ -15,6 +15,13 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
   @issuer "https://issuer.example"
   @subject "ou_user-123"
   @vct "https://credentials.example/UniversityDegreeCredential"
+  @configuration_id "UniversityDegreeCredential"
+  @jwt_vc_configuration_id "UniversityDegreeJwtVc"
+  @mdoc_configuration_id "org.iso.18013.5.1.mDL"
+  @mdoc_doc_type "org.iso.18013.5.1.mDL"
+  @mdoc_namespace "org.iso.18013.5.1"
+  @holder_key JOSE.JWK.generate_key({:ec, "P-256"})
+  @holder_jwk @holder_key |> JOSE.JWK.to_public_map() |> elem(1)
   @signing_pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
   @vc_signing_pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
 
@@ -83,10 +90,19 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
       load_principal: fn _ -> {:error, :not_found} end,
       principal_kinds: [@user_kind],
       require_https: false,
+      credential_configurations_supported: %{
+        @configuration_id => %{format: "dc+sd-jwt", vct: @vct},
+        @jwt_vc_configuration_id => %{format: "jwt_vc_json"},
+        @mdoc_configuration_id => %{format: "mso_mdoc", doctype: @mdoc_doc_type}
+      },
       build_deferred_credential: fn subject, transaction_id ->
         send(self(), {:deferred_credential_requested, subject, transaction_id})
 
-        {:ok, %{vct: @vct, claims: %{"degree" => "Bachelor", "student_id" => "student-123"}}}
+        {:ok,
+         deferred_result(
+           @configuration_id,
+           %{vct: @vct, claims: %{"degree" => "Bachelor", "student_id" => "student-123"}}
+         )}
       end
     )
 
@@ -114,6 +130,10 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
       assert verified.vct == @vct
       assert verified.claims["degree"] == "Bachelor"
       assert verified.claims["student_id"] == "student-123"
+      assert verified.cnf == %{"jwk" => @holder_jwk}
+
+      [issuer_jwt | _disclosures] = String.split(credential, "~", trim: true)
+      assert {:ok, %{"typ" => "dc+sd-jwt"}} = Attesto.JWS.peek_json(issuer_jwt, :protected)
 
       assert_receive {:deferred_credential_requested, @subject, "txn-123"}
     end
@@ -174,7 +194,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
       refute log =~ "deferred credential builder returned an invalid result"
     end
 
-    test "maps a non-SD-JWT host result to invalid_credential_request" do
+    test "rejects a legacy result that omits the persisted holder binding" do
       config = Application.fetch_env!(:attesto_phoenix, Config)
 
       callback = fn _subject, _txn ->
@@ -191,6 +211,114 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
                "error" => "invalid_credential_request",
                "error_description" => "credential unavailable"
              }
+    end
+
+    test "issues a holder-bound JWT VC through the shared issuance path" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      callback = fn _subject, _txn ->
+        {:ok,
+         deferred_result(
+           @jwt_vc_configuration_id,
+           %{
+             credential_type: "UniversityDegreeCredential",
+             claims: %{"degree" => "Bachelor"},
+             valid_until: System.system_time(:second) + 3600
+           }
+         )}
+      end
+
+      put_config(Keyword.put(config, :build_deferred_credential, callback))
+
+      response = post_deferred(mint_token(), %{"transaction_id" => "txn-jwt"})
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+
+      issuer_jwk =
+        @signing_pem
+        |> Attesto.Key.jwk()
+        |> JOSE.JWK.to_public_map()
+        |> elem(1)
+        |> Map.merge(%{"alg" => "ES256", "kid" => Attesto.Key.kid(@signing_pem), "use" => "sig"})
+
+      assert {:ok, verified} = JwtVc.verify(credential, issuer_jwk)
+      assert verified.cnf == %{"jwk" => @holder_jwk}
+      assert verified.claims["degree"] == "Bachelor"
+    end
+
+    test "issues a holder-bound mdoc and rejects a missing validity period" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      now = System.system_time(:second)
+
+      credential = %{
+        namespaces: %{@mdoc_namespace => %{"family_name" => "Doe"}},
+        valid_until: now + 3600
+      }
+
+      callback = fn _subject, _txn ->
+        {:ok, deferred_result(@mdoc_configuration_id, credential)}
+      end
+
+      put_config(Keyword.put(config, :build_deferred_credential, callback))
+
+      response = post_deferred(mint_token(), %{"transaction_id" => "txn-mdoc"})
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => encoded}]} = body(response)
+
+      issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+      assert {:ok, verified} = Mdoc.verify(encoded, issuer_jwk)
+      assert verified.device_key == @holder_jwk
+      assert verified.doc_type == @mdoc_doc_type
+
+      missing_validity = fn _subject, _txn ->
+        {:ok, deferred_result(@mdoc_configuration_id, Map.delete(credential, :valid_until))}
+      end
+
+      put_config(Keyword.put(config, :build_deferred_credential, missing_validity))
+      invalid = post_deferred(mint_token(), %{"transaction_id" => "txn-mdoc-invalid"})
+      assert invalid.status == 400
+      assert body(invalid)["error"] == "invalid_credential_request"
+    end
+
+    test "rejects a deferred credential configuration outside the access-token entitlement" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      callback = fn _subject, _txn ->
+        {:ok,
+         deferred_result(
+           @jwt_vc_configuration_id,
+           %{credential_type: "UniversityDegreeCredential", claims: %{}}
+         )}
+      end
+
+      put_config(Keyword.put(config, :build_deferred_credential, callback))
+
+      response =
+        post_deferred(mint_token([@configuration_id]), %{"transaction_id" => "txn-not-entitled"})
+
+      assert response.status == 400
+      assert body(response)["error"] == "invalid_credential_request"
+    end
+
+    test "rejects malformed and private persisted holder keys" do
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+
+      for holder_jwk <- [%{"kty" => "EC", "crv" => "P-256"}, private_map(@holder_key)] do
+        callback = fn _subject, _txn ->
+          {:ok,
+           %{
+             credential_configuration_id: @configuration_id,
+             holder_jwk: holder_jwk,
+             credential: %{vct: @vct, claims: %{"degree" => "Bachelor"}}
+           }}
+        end
+
+        put_config(Keyword.put(config, :build_deferred_credential, callback))
+
+        response = post_deferred(mint_token(), %{"transaction_id" => "txn-invalid-holder"})
+        assert response.status == 400
+        assert body(response)["error"] == "invalid_credential_request"
+      end
     end
 
     test "reports a malformed deferred-builder result without logging its value" do
@@ -265,7 +393,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
     end
   end
 
-  defp mint_token do
+  defp mint_token(credential_configuration_ids \\ [@configuration_id, @jwt_vc_configuration_id, @mdoc_configuration_id]) do
     config =
       Attesto.Config.new(
         issuer: @issuer,
@@ -278,7 +406,10 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
       kind: "user",
       sub: @subject,
       scopes: ["credential"],
-      claims: %{"client_id" => "test-client"}
+      claims: %{
+        "client_id" => "test-client",
+        "credential_configuration_ids" => credential_configuration_ids
+      }
     }
 
     {:ok, %{access_token: token}} = Token.mint(config, principal)
@@ -301,6 +432,16 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
   defp fail_builder(:raise), do: raise("sensitive-builder-failure")
   defp fail_builder(:throw), do: throw("sensitive-builder-failure")
   defp fail_builder(:exit), do: exit("sensitive-builder-failure")
+
+  defp deferred_result(credential_configuration_id, credential) do
+    %{
+      credential_configuration_id: credential_configuration_id,
+      holder_jwk: @holder_jwk,
+      credential: credential
+    }
+  end
+
+  defp private_map(jwk), do: jwk |> JOSE.JWK.to_map() |> elem(1)
 
   defp put_config(opts) do
     Application.put_env(:attesto_phoenix, :otp_app, :attesto_phoenix)

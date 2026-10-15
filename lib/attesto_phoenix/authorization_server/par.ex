@@ -140,6 +140,14 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
         :ok ->
           {:ok, %{request_uri: request_uri, expires_in: ttl}}
 
+        {:error, :capacity} ->
+          Logger.warning("AttestoPhoenix PAR store capacity is exhausted; pushed request was not stored")
+          {:error, OAuthError.new(:temporarily_unavailable, "PAR storage is temporarily unavailable", status: 503)}
+
+        {:error, :record_too_large} ->
+          Logger.warning("AttestoPhoenix PAR store rejected an oversized record; pushed request was not stored")
+          {:error, error(@error_invalid_request, "pushed authorization request is too large")}
+
         _error ->
           Logger.warning("AttestoPhoenix PAR store reported an error; pushed request was not stored")
           {:error, error(@error_invalid_request, "could not store pushed authorization request")}
@@ -196,6 +204,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # An unrecognised code falls back to `invalid_request` (the §5.2 catch-all).
   defp validation_code_atom("invalid_request"), do: :invalid_request
   defp validation_code_atom("invalid_request_object"), do: :invalid_request_object
+  defp validation_code_atom("invalid_authorization_details"), do: :invalid_authorization_details
   defp validation_code_atom("invalid_scope"), do: :invalid_scope
   # RFC 8707 §2: a malformed `resource` indicator pushed via PAR.
   defp validation_code_atom("invalid_target"), do: :invalid_target

@@ -70,6 +70,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   # not select the private-context column, so all of them suppress application
   # logging and telemetry.
   @claims_query_opts [log: false, telemetry_event: nil]
+  @finalization_grace_seconds 300
 
   @doc """
   Persists an authorization-code record keyed by its `:code_hash`.
@@ -122,7 +123,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   `AttestoPhoenix.Schema.Authorization.to_record/1`. Expiry is not checked
   here: `Attesto.AuthorizationCode` re-checks `:expires_at` after `take/1`,
   and consuming the row regardless of freshness preserves single use, since
-  an expired-but-present code is still spent on first presentation.
+  an expired-but-present code is still spent on first presentation. The same
+  atomic update reserves the row for five minutes so the sweeper cannot erase
+  the claimed row while downstream token issuance is still finalizing it.
   """
   @impl Attesto.CodeStore
   @spec take(Attesto.CodeStore.code_hash()) ::
@@ -132,13 +135,18 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     repo = repo()
     Sweeper.check_running_for_store(repo, prefix)
     consumed_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    replay_retain_until = DateTime.add(consumed_at, @finalization_grace_seconds, :second)
 
     query =
       from a in Authorization,
         where: a.code_hash == ^code_hash and is_nil(a.consumed_at),
         select: a
 
-    case repo.update_all(query, [set: [consumed_at: consumed_at]], [prefix: prefix] ++ @claims_query_opts) do
+    case repo.update_all(
+           query,
+           [set: [consumed_at: consumed_at, replay_retain_until: replay_retain_until]],
+           [prefix: prefix] ++ @claims_query_opts
+         ) do
       {1, [row]} -> {:ok, Authorization.to_record(row)}
       {0, _} -> consumed_or_missing(repo, code_hash, prefix)
     end
@@ -183,20 +191,24 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   """
   @impl Attesto.CodeStore
   @spec mark_consumed(Attesto.CodeStore.code_hash(), Attesto.CodeStore.consumed_meta()) :: :ok
-  def mark_consumed(code_hash, %{family_id: family_id})
+  def mark_consumed(code_hash, %{family_id: family_id} = meta)
       when is_binary(code_hash) and is_binary(family_id) and family_id != "" do
-    mark_consumed_row(code_hash, family_id: family_id)
+    mark_consumed_row(code_hash,
+      family_id: family_id,
+      replay_retain_until: replay_retain_until!(meta)
+    )
   end
 
-  def mark_consumed(code_hash, %{family_id: nil}) when is_binary(code_hash) do
+  def mark_consumed(code_hash, %{family_id: nil} = meta) when is_binary(code_hash) do
     # `nil` is an explicit no-refresh marker. Clear any authorization-code
     # provenance family so replay containment cannot mistake it for a refresh
     # family during a later redemption.
-    mark_consumed_row(code_hash, family_id: nil)
+    require_nil_replay_retain_until!(meta)
+    mark_consumed_row(code_hash, family_id: nil, replay_retain_until: nil)
   end
 
   def mark_consumed(code_hash, %{}) when is_binary(code_hash) do
-    mark_consumed_row(code_hash, family_id: nil)
+    mark_consumed_row(code_hash, family_id: nil, replay_retain_until: nil)
   end
 
   def mark_consumed(_code_hash, _invalid_meta) do
@@ -213,6 +225,33 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
     query
     |> repo.update_all([set: updates], prefix: prefix, log: false, telemetry_event: nil)
     |> expect_one_updated!(:mark_consumed)
+  end
+
+  defp replay_retain_until!(meta) do
+    case Map.get(meta, :replay_retain_until) do
+      nil ->
+        nil
+
+      unix when is_integer(unix) and unix >= 0 ->
+        case DateTime.from_unix(unix) do
+          {:ok, datetime} -> DateTime.truncate(datetime, :second)
+          {:error, _reason} -> invalid_consumed_meta!()
+        end
+
+      _invalid ->
+        invalid_consumed_meta!()
+    end
+  end
+
+  defp require_nil_replay_retain_until!(meta) do
+    case replay_retain_until!(meta) do
+      nil -> :ok
+      _deadline -> invalid_consumed_meta!()
+    end
+  end
+
+  defp invalid_consumed_meta! do
+    raise ArgumentError, "#{inspect(__MODULE__)}.mark_consumed/2 received invalid consumed metadata"
   end
 
   @doc false

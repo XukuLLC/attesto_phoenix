@@ -42,6 +42,17 @@ defmodule AttestoPhoenix.VerifierTest do
     def verification_pems, do: [signing_pem()]
   end
 
+  defmodule InvalidSigningKeystore do
+    @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem, do: "not a PEM"
+
+    @impl true
+    def verification_pems, do: [signing_pem()]
+  end
+
   setup do
     start_supervised!(Store)
 
@@ -210,6 +221,36 @@ defmodule AttestoPhoenix.VerifierTest do
 
     assert {:error, :invalid_attrs} = Verifier.create_presentation_request(ctx.config, %{})
     assert :error = Verifier.presentation_result(missing_store, "id")
+  end
+
+  test "rejects unsupported response modes and client-id schemes before storing a session", ctx do
+    initial_size = :ets.info(Store, :size)
+
+    assert {:error, :invalid_attrs} =
+             Verifier.create_presentation_request(
+               ctx.config,
+               Map.put(request_attrs(ctx), :response_mode, "fragment")
+             )
+
+    assert :ets.info(Store, :size) == initial_size
+
+    assert {:error, :invalid_attrs} =
+             Verifier.create_presentation_request(
+               ctx.config,
+               Map.put(request_attrs(ctx), :client_id_scheme, "did")
+             )
+
+    assert :ets.info(Store, :size) == initial_size
+  end
+
+  test "removes a pending session when request-object signing fails", ctx do
+    initial_size = :ets.info(Store, :size)
+    config = %{ctx.config | keystore: InvalidSigningKeystore}
+
+    assert {:error, :invalid_attrs} =
+             Verifier.create_presentation_request(config, request_attrs(ctx))
+
+    assert :ets.info(Store, :size) == initial_size
   end
 
   test "x509_san_dns requires both verifier_dns and a non-empty verifier_x5c", ctx do

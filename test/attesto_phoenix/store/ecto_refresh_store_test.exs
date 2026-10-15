@@ -739,6 +739,40 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
       assert :error = EctoRefreshStore.get(loser_child.token_hash)
     end
 
+    test "a replay validates durable successor lineage before returning retry credentials" do
+      parent = entry()
+      winner_token = "lineage-winner-#{System.unique_integer([:positive])}"
+      winner_child = child(parent, winner_token)
+      winner_successor = successor(winner_child, winner_token, 1_900_000_010)
+      assert :ok = EctoRefreshStore.insert(parent)
+
+      assert {:ok, _, _} =
+               EctoRefreshStore.rotate(parent.token_hash, winner_child, winner_successor, now: 1_900_000_001)
+
+      # Simulate corrupted/tampered persistence: the authenticated successor
+      # bundle remains on the consumed parent, but its durable child lineage is
+      # gone. A direct retry must not return the credential-equivalent token.
+      TestRepo.delete_all(from(r in RefreshToken, where: r.token_hash == ^winner_child.token_hash))
+
+      candidate_token = "lineage-candidate-#{System.unique_integer([:positive])}"
+      candidate = child(parent, candidate_token)
+
+      assert {:error, :family_integrity_error} =
+               EctoRefreshStore.rotate(
+                 parent.token_hash,
+                 candidate,
+                 successor(candidate, candidate_token, 1_900_000_020),
+                 now: 1_900_000_002
+               )
+
+      assert :error = EctoRefreshStore.get(parent.token_hash)
+
+      family_id = parent.family_id
+
+      assert %RefreshFamilyRevocation{family_id: ^family_id} =
+               TestRepo.get(RefreshFamilyRevocation, family_id)
+    end
+
     test "strict mode persists an exact tombstone without a secret" do
       parent = entry()
       token = "strict-#{System.unique_integer([:positive])}"

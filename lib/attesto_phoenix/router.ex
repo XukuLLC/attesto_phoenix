@@ -447,20 +447,25 @@ defmodule AttestoPhoenix.Router do
     pipelines = opts |> Keyword.get(:pipeline, []) |> List.wrap()
     route_pipelines = normalize_route_pipeline_option!(opts, pipelines)
 
-    registration? = Keyword.get(opts, :registration, false)
-    device? = Keyword.get(opts, :device, false)
-    credential_issuance? = Keyword.get(opts, :credential_issuance, false) == true
-    federation? = Keyword.get(opts, :federation, false) == true
-    status_list? = Keyword.get(opts, :status_list, false) == true
-    presentation? = Keyword.get(opts, :presentation, false) == true
-    ciba? = Keyword.get(opts, :ciba, false)
-    logout? = Keyword.get(opts, :logout, false)
-    session_management? = Keyword.get(opts, :session_management, false)
-    userinfo? = normalize_route_mount_control!(opts, :userinfo, true)
-    openid_configuration? = normalize_route_mount_control!(opts, :openid_configuration, true)
+    registration? = normalize_route_mount_control!(opts, :registration, false, __CALLER__)
+    device? = normalize_route_mount_control!(opts, :device, false, __CALLER__)
+    credential_issuance? = normalize_route_mount_control!(opts, :credential_issuance, false, __CALLER__)
+    federation? = normalize_route_mount_control!(opts, :federation, false, __CALLER__)
+    status_list? = normalize_route_mount_control!(opts, :status_list, false, __CALLER__)
+    presentation? = normalize_route_mount_control!(opts, :presentation, false, __CALLER__)
+    ciba? = normalize_route_mount_control!(opts, :ciba, false, __CALLER__)
+    logout? = normalize_route_mount_control!(opts, :logout, false, __CALLER__)
+    session_management? = normalize_route_mount_control!(opts, :session_management, false, __CALLER__)
+    userinfo? = normalize_route_mount_control!(opts, :userinfo, true, __CALLER__)
+
+    openid_configuration? =
+      normalize_route_mount_control!(opts, :openid_configuration, true, __CALLER__)
+
     warn_if_oidc_capability_is_implicit!(userinfo?, openid_configuration?, __CALLER__)
     validate_userinfo_suppression_prefix!(prefix, userinfo?, openid_configuration?)
-    protected_resource_root? = Keyword.get(opts, :protected_resource_root, true)
+
+    protected_resource_root? =
+      normalize_route_mount_control!(opts, :protected_resource_root, true, __CALLER__)
 
     inserted_resource_paths =
       opts
@@ -865,18 +870,21 @@ defmodule AttestoPhoenix.Router do
   # literal booleans so a typo cannot silently expose a route, and reject
   # duplicate declarations rather than choosing one by keyword-list position.
   # Existing options retain their exact legacy expansion semantics.
-  defp normalize_route_mount_control!(opts, control, default) do
+  defp normalize_route_mount_control!(opts, control, default, caller) do
     case Keyword.get_values(opts, control) do
       [] ->
         default
 
-      [configured] when is_boolean(configured) ->
-        configured
-
       [configured] ->
-        raise ArgumentError,
-              "attesto_routes/1 route-mount control #{inspect(control)} must be a " <>
-                "literal boolean, got: #{inspect(configured)}"
+        case Macro.expand(configured, caller) do
+          expanded when is_boolean(expanded) ->
+            expanded
+
+          expanded ->
+            raise ArgumentError,
+                  "attesto_routes/1 route-mount control #{inspect(control)} must expand " <>
+                    "at compile time to true or false, got: #{inspect(expanded)}"
+        end
 
       conflicting ->
         raise ArgumentError,

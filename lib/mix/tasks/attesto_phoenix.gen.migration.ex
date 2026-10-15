@@ -112,17 +112,31 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Add refresh-family deadlines and independent client-instance bindings:
       mix attesto_phoenix.gen.migration --upgrade 3.4 --repo MyApp.Repo
 
+      # Widen cached CIMD client_id URLs to text:
+      mix attesto_phoenix.gen.migration --upgrade 3.6 --repo MyApp.Repo
+
+      # Retain authorization-code replay markers through refresh-family life:
+      mix attesto_phoenix.gen.migration --upgrade 3.7 --repo MyApp.Repo
+
   ## Options
 
     * `--upgrade` - generate a migration to upgrade an existing database rather
       than creating fresh tables. Supported values: `3.0`/`3.0.0` and
-      `3.1`/`3.1.0` and `3.4`/`3.4.0`. The 3.4 migration adds the nullable
+      `3.1`/`3.1.0`, `3.4`/`3.4.0`, `3.6`/`3.6.0`, and `3.7`/`3.7.0`. The 3.4 migration adds the nullable
       immutable `family_expires_at` and `attestation_jkt` columns without
       changing existing families. Pre-upgrade attested families require
       revocation and re-authorization because their original instance key was
       not persisted. The migration also widens an existing CIBA
       `client_notification_token` column to `text` for the full 1,024-character
       protocol limit. Installations without a CIBA table skip that change.
+      The 3.6 migration widens the Client ID Metadata cache's URL primary key
+      from `varchar(255)` to `text`; request admission still caps the URL at
+      2,048 bytes before cache or network access.
+      The 3.7 migration adds the nullable authorization-code
+      `replay_retain_until` deadline. Existing successful rows linked to a
+      refresh family remain NULL; the runtime sweeper retains them while an
+      unexpired refresh-token descendant exists and retires them after the
+      family ends.
       The 3.0 migration adopts or creates the exact unique index
       on `attesto_refresh_tokens(family_id, generation)`, creates or adopts the
       `attesto_refresh_family_revocations` table, and safely backfills every
@@ -507,9 +521,15 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       {:ok, version} when version in ["3.4", "3.4.0"] ->
         "3.4"
 
+      {:ok, version} when version in ["3.6", "3.6.0"] ->
+        "3.6"
+
+      {:ok, version} when version in ["3.7", "3.7.0"] ->
+        "3.7"
+
       {:ok, version} ->
         Mix.raise(
-          ~s|unsupported --upgrade version #{inspect(version)}; currently supported upgrade versions: "3.0", "3.1", "3.4"|
+          ~s|unsupported --upgrade version #{inspect(version)}; currently supported upgrade versions: "3.0", "3.1", "3.4", "3.6", "3.7"|
         )
 
       :error ->
@@ -564,6 +584,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       "3.0" -> generate_upgrade_3_0_for_repo(repo, opts, prefix)
       "3.1" -> generate_upgrade_3_1_for_repo(repo, opts, prefix)
       "3.4" -> generate_upgrade_3_4_for_repo(repo, opts, prefix)
+      "3.6" -> generate_upgrade_3_6_for_repo(repo, opts, prefix)
+      "3.7" -> generate_upgrade_3_7_for_repo(repo, opts, prefix)
       nil -> generate_fresh_for_repo(repo, opts, prefix)
     end
   end
@@ -666,6 +688,30 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     base_name = "upgrade_attesto_phoenix_to_3_4"
     assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
     create_migration_file(path, base_name, refresh_family_upgrade_migration_template(assigns), :upgrade_3_4)
+  end
+
+  defp generate_upgrade_3_6_for_repo(repo, opts, prefix) do
+    ensure_repo(repo, [])
+    path = migrations_path(repo, opts)
+    create_directory(path)
+    base_name = "upgrade_attesto_phoenix_to_3_6"
+    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+    create_migration_file(path, base_name, cimd_url_upgrade_migration_template(assigns), :upgrade_3_6)
+  end
+
+  defp generate_upgrade_3_7_for_repo(repo, opts, prefix) do
+    ensure_repo(repo, [])
+    path = migrations_path(repo, opts)
+    create_directory(path)
+    base_name = "upgrade_attesto_phoenix_to_3_7"
+    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    create_migration_file(
+      path,
+      base_name,
+      authorization_code_replay_upgrade_migration_template(assigns),
+      :upgrade_3_7
+    )
   end
 
   defp migrations_path(repo, opts) do
@@ -879,7 +925,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     upgrade_files =
       migration_kind_files(path, "upgrade_attesto_phoenix_to_3_0") ++
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_1") ++
-        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_4")
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_4") ++
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_6") ++
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_7")
 
     if upgrade_files != [] do
       file_names =
@@ -936,6 +984,18 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   end
 
   defp ensure_migration_kind_available!(path, base_name, :upgrade_3_4) do
+    if migration_kind_files(path, base_name) != [] do
+      Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
+    end
+  end
+
+  defp ensure_migration_kind_available!(path, base_name, :upgrade_3_6) do
+    if migration_kind_files(path, base_name) != [] do
+      Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
+    end
+  end
+
+  defp ensure_migration_kind_available!(path, base_name, :upgrade_3_7) do
     if migration_kind_files(path, base_name) != [] do
       Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
     end
@@ -1144,6 +1204,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         # descendants while a failed first presentation remains plain invalid_grant.
         add :consumed_at, :utc_datetime
         add :consumed_success, :boolean, null: false, default: false
+        # Temporary claim-finalization reservation, replaced with the immutable
+        # refresh-family deadline after successful refresh issuance. Cleanup
+        # also correlates successful family rows with the refresh-token table,
+        # retaining the replay marker while an unexpired family member exists;
+        # NULL is used when no immutable deadline is available.
+        add :replay_retain_until, :utc_datetime
         # The schema carries an explicit :inserted_at (no :updated_at).
         add :inserted_at, :utc_datetime, null: false
       end
@@ -1411,7 +1477,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Cache-Control/Expires (RFC 9111), re-checked on read and indexed for
       # sweeps. Only validated documents are ever written here.
       create table(:<%= @client_id_metadata %>, primary_key: false, prefix: prefix) do
-        add :url, :string, size: <%= @identifier_size %>, primary_key: true, null: false
+        add :url, :text, primary_key: true, null: false
         add :metadata, :map, null: false
         add :expires_at, :utc_datetime, null: false
         add :inserted_at, :utc_datetime, null: false
@@ -2038,6 +2104,107 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
     defp quote_identifier(identifier) do
       "\\"" <> String.replace(to_string(identifier), "\\"", "\\"\\"") <> "\\""
+    end
+  end
+  """)
+
+  embed_template(:cimd_url_upgrade_migration, """
+  defmodule <%= inspect @module %> do
+    use Ecto.Migration
+
+    def change do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+
+      alter table(:attesto_client_id_metadata, prefix: prefix) do
+        modify :url, :text, from: {:string, size: 255}, null: false
+      end
+    end
+
+    defp effective_prefix(explicit_prefix) do
+      cond do
+        is_binary(explicit_prefix) and byte_size(explicit_prefix) > 0 ->
+          explicit_prefix
+
+        migrator_prefix = Ecto.Migration.prefix() ->
+          migrator_prefix
+
+        true ->
+          repo().config()[:migration_default_prefix]
+      end
+    end
+  end
+  """)
+
+  embed_template(:authorization_code_replay_upgrade_migration, """
+  defmodule <%= inspect @module %> do
+    use Ecto.Migration
+
+    def up do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+
+      alter table(:attesto_authorization_codes, prefix: prefix) do
+        # Existing successful family rows intentionally remain NULL. Runtime
+        # correlates them with the refresh-token table, retaining the replay
+        # marker while an unexpired family member exists and retiring it after
+        # the family ends.
+        add :replay_retain_until, :utc_datetime
+      end
+    end
+
+    def down do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+      table = qualify_table("attesto_authorization_codes", prefix)
+
+      # A downgrade would restore cleanup based only on code/access-token
+      # expiry. Lock out writers and reject it while any pending reservation or
+      # refresh-family replay marker still depends on the new retention rule.
+      repo().query!("LOCK TABLE " <> table <> " IN ACCESS EXCLUSIVE MODE", [], log: false)
+      repo().query!("SET LOCAL row_security = off", [], log: false)
+
+      %{rows: rows} =
+        repo().query!(
+          "SELECT 1 FROM " <>
+            table <>
+            " WHERE replay_retain_until IS NOT NULL" <>
+            " OR (consumed_success = TRUE AND family_id IS NOT NULL AND family_id <> '') LIMIT 1",
+          [],
+          log: false
+        )
+
+      if rows != [] do
+        raise "Cannot safely rollback 3.7 migration: authorization-code rows still retain " <>
+                "claim-finalization or refresh-family replay state. Wait for bounded rows to " <>
+                "expire and be swept, and explicitly revoke/retire unbounded families before " <>
+                "deleting their markers; do not clear the deadline to force a rollback."
+      end
+
+      alter table(:attesto_authorization_codes, prefix: prefix) do
+        remove :replay_retain_until
+      end
+    end
+
+    defp effective_prefix(explicit_prefix) do
+      cond do
+        is_binary(explicit_prefix) and byte_size(explicit_prefix) > 0 ->
+          explicit_prefix
+
+        migrator_prefix = Ecto.Migration.prefix() ->
+          to_string(migrator_prefix)
+
+        repo_default = repo().config()[:migration_default_prefix] ->
+          to_string(repo_default)
+
+        true ->
+          nil
+      end
+    end
+
+    defp qualify_table(table, nil), do: quote_identifier(table)
+    defp qualify_table(table, ""), do: quote_identifier(table)
+    defp qualify_table(table, prefix), do: quote_identifier(prefix) <> "." <> quote_identifier(table)
+
+    defp quote_identifier(identifier) do
+      "\\\"" <> String.replace(to_string(identifier), "\\\"", "\\\"\\\"") <> "\\\""
     end
   end
   """)

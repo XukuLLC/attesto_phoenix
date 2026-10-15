@@ -126,6 +126,7 @@ authorization server, use `attesto_phoenix`.
 ## Contents
 
 - [Installation](#installation)
+- [Upgrading to 4.0](#upgrading-to-40)
 - [Quick start](#quick-start)
 - [Upgrading from 2.x](#upgrading-from-2x)
 - [3.0 schema-prefix cutover guide](guides/upgrade_3_0_schema_prefix.md)
@@ -145,7 +146,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 3.4"}
+    {:attesto_phoenix, "~> 4.0"}
   ]
 end
 ```
@@ -156,11 +157,20 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 3.4"},
+    {:attesto_phoenix, "~> 4.0"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
 ```
+
+## Upgrading to 4.0
+
+Version 4.0 changes the successful `:build_deferred_credential` callback result
+so completed credentials always retain the holder binding proven by the
+original request. It also requires Attesto 2.4.0 and the 3.7 replay-retention
+migration. Read the [4.0 upgrade guide](guides/upgrade_4_0.md) before deploying;
+it includes the callback example and the complete ordered 3.0, 3.1, 3.4, 3.6,
+and 3.7 migration commands.
 
 ## Quick start
 
@@ -736,8 +746,13 @@ The authorization code is atomically claimed before the callback runs. A host
 refusal, malformed private context, missing callback for a context-bearing code,
 or callback failure before the continuation succeeds therefore leaves it spent
 but unfinalized: `consumed_at` is set, `consumed_success` remains false, and no
-refresh family is recorded. A failure after successful continuation has the
-commit-dependent hazard described above.
+refresh family is recorded. The Ecto store retains that claimed row for a
+five-minute finalization window so the sweeper cannot erase it while token
+issuance is still running. After successful refresh issuance, the replay marker
+is retained while the refresh-token table contains an unexpired member of that
+family. The correlated check also gives legacy markers with no recorded family
+deadline a finite cleanup boundary after the family ends. A failure after
+successful continuation has the commit-dependent hazard described above.
 
 #### Host-private authorization state
 
@@ -1068,6 +1083,10 @@ form names, and repeated JSON object names at any level, receive a generic HTTP
 `AttestoPhoenix.DuplicateParameterGuard` when composing it with an existing
 custom body reader.
 
+The POST token, introspection, revocation, and PAR endpoints reject every
+non-empty query string. Put all protocol parameters in the request body and do
+not append tracing, tenant, or routing parameters to those endpoint URLs.
+
 The macro's `:prefix` is the path before its fixed `/oauth/*` tails. For the
 usual `/mcp/oauth/*` mount, use `attesto_routes(prefix: "/mcp", ...)` and set
 `oauth_path_prefix: "/mcp/oauth"`. Per-endpoint path overrides are supported
@@ -1126,7 +1145,9 @@ config :my_app, AttestoPhoenix.Config,
 ```
 
 These flags are compile-time route-mount controls; metadata is built later from
-runtime `AttestoPhoenix.Config`. They do not enable OIDC. `userinfo: false` removes both local UserInfo
+runtime `AttestoPhoenix.Config`. Every route-mount option must expand at compile
+time to `true` or `false`; runtime expressions and truthy non-booleans are
+rejected. They do not enable OIDC. `userinfo: false` removes both local UserInfo
 verbs. `openid_configuration: false` removes only the OIDC Provider Metadata
 route; the RFC 8414 authorization-server document remains mounted and its
 contents are unchanged. When both bundled OIDC routes are disabled, compilation
@@ -1337,7 +1358,13 @@ attesto_routes(
   (the `credential_offer_uri` a wallet dereferences).
 - `POST /oauth/deferred_credential` — deferred issuance (OID4VCI §9);
   token-protected, driven by the `:build_deferred_credential` callback, which
-  returns `issuance_pending` until the credential is ready.
+  returns `issuance_pending` until the credential is ready. Once ready, the
+  callback returns `%{credential_configuration_id: id, holder_jwk: public_jwk,
+  credential: credential_result}`. The host must persist `id` and the verified
+  holder public key with the transaction when the original Credential request
+  is deferred. The library validates that state and issues an SD-JWT VC, JWT VC,
+  or mdoc through the same holder-binding path as immediate issuance. Legacy
+  callback results containing only credential claims are rejected.
 - Grants on `POST /oauth/token`: the **pre-authorized_code** grant is added
   automatically when a `:pre_authorized_code_store` is configured and
   `:grant_types_supported` is `nil`; an explicit catalog must include
@@ -1354,6 +1381,11 @@ rotation. Internal permission provenance stays in grant storage.
 Requires: `:build_credential`, `:credential_configurations_supported`, a
 `:pre_authorized_code_store` and `:c_nonce_store`, the `:credential_offer_store`
 (for by-reference offers), and the `:keystore` (issuer signing key).
+
+For `mso_mdoc`, the result from `:build_credential` or
+`:build_deferred_credential` must include an integer `:valid_until` strictly
+after `:valid_from`. A missing value is rejected rather than producing an mdoc
+that expires at issuance.
 
 A wallet may also authenticate to the token endpoint with a **Client Attestation
 JWT + PoP** (`attest_jwt_client_auth`, the `OAuth-Client-Attestation` /
@@ -1603,14 +1635,24 @@ For a fresh database, generate the complete schema:
 mix attesto_phoenix.gen.migration --repo MyApp.Repo
 ```
 
-Existing 2.x databases must not use that command. Generate the 3.0, 3.1, and 3.4
-upgrade migrations, in that order, and follow the stopped-cutover guide above:
+Existing 2.x databases must not use that command. Generate the 3.0, 3.1, 3.4,
+3.6, and 3.7 upgrade migrations, in that order, and follow the stopped-cutover
+guide above. Existing 3.x installations generate only the later migrations
+they have not already applied:
 
 ```bash
 mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 3.4 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 3.6 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 3.7 --repo MyApp.Repo
 ```
+
+The 3.6 migration widens cached Client ID Metadata URLs to `TEXT`. The 3.7
+migration adds authorization-code replay retention. Historical successful code
+rows linked to refresh families receive a NULL deadline. The sweeper retains
+them while an unexpired refresh-token descendant exists and deletes them after
+the family ends.
 
 When the host configures a non-default `schema_prefix`, the generator picks it
 up automatically from `config :attesto_phoenix, otp_app: ...` (or the current
@@ -1735,6 +1777,8 @@ full walkthrough and the tunnel-vs-mkcert tradeoff.
 
 ## Guides and examples
 
+- [Upgrading to 4.0](guides/upgrade_4_0.md) - update the deferred-credential
+  callback, coordinate Attesto 2.4.0, and apply missing migration milestones.
 - [Example configurations](guides/examples.md) - confidential and public-client
   configuration sketches.
 - [3.0 schema-prefix cutover](guides/upgrade_3_0_schema_prefix.md) - inventory

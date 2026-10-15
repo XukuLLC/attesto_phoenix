@@ -80,6 +80,8 @@ defmodule AttestoPhoenix.ConfigTest do
     @impl AttestoPhoenix.PrincipalStore
     def load_principal(_subject_id), do: {:ok, :store_principal}
     @impl AttestoPhoenix.PrincipalStore
+    def principal_kinds, do: [Attesto.PrincipalKind.new("store", "store_")]
+    @impl AttestoPhoenix.PrincipalStore
     def build_principal(_client, subject, _scope), do: %{subject: subject}
     @impl AttestoPhoenix.PrincipalStore
     def build_refresh_principal(_client, context), do: %{subject: context.subject}
@@ -575,6 +577,38 @@ defmodule AttestoPhoenix.ConfigTest do
       end
     end
 
+    test "normalizes constructor defaults for prebuilt configs loaded from application environment" do
+      previous = Application.get_env(:attesto_phoenix, Config, :missing)
+
+      direct = %{
+        config()
+        | client_id_metadata: [enabled: false],
+          jwt_bearer: [enabled: false],
+          native_apps: [],
+          resource_indicators: [],
+          device_authorization: [],
+          ciba: [],
+          logout: [],
+          session_management: []
+      }
+
+      Application.put_env(:attesto_phoenix, Config, direct)
+
+      on_exit(fn ->
+        case previous do
+          :missing -> Application.delete_env(:attesto_phoenix, Config)
+          value -> Application.put_env(:attesto_phoenix, Config, value)
+        end
+      end)
+
+      loaded = Config.from_otp_app(:attesto_phoenix)
+
+      assert Keyword.fetch!(loaded.client_id_metadata, :fetcher) == Req
+      assert Keyword.fetch!(loaded.jwt_bearer, :jwks_fetcher) == Req
+      assert Keyword.fetch!(loaded.native_apps, :loopback_redirect)
+      refute Keyword.fetch!(loaded.ciba, :enabled)
+    end
+
     test "strict zero grace and custom stores do not depend on a usable Ecto cipher secret" do
       Application.delete_env(:attesto_phoenix, :refresh_successor_secret)
 
@@ -981,6 +1015,16 @@ defmodule AttestoPhoenix.ConfigTest do
                {FullStore, :client_registration_access_token_hash}
 
       assert Config.build_userinfo_claims_fun(cfg) == {FullStore, :build_userinfo_claims}
+
+      assert Config.to_attesto_config(cfg).principal_kinds ==
+               [Attesto.PrincipalKind.new("store", "store_")]
+    end
+
+    test "an explicit principal-kinds list wins over PrincipalStore.principal_kinds/0" do
+      explicit = [Attesto.PrincipalKind.new("explicit", "explicit_")]
+      cfg = config(principal_store: FullStore, principal_kinds: explicit)
+
+      assert Config.to_attesto_config(cfg).principal_kinds == explicit
     end
   end
 
@@ -1510,6 +1554,14 @@ defmodule AttestoPhoenix.ConfigTest do
       assert message =~ ":invalid_audience"
     end
 
+    test "the list diagnostic identifies the 4.0 contract change" do
+      opts = Keyword.put(audience_required_opts(), :audience, ["https://api.example.com"])
+      message = assert_raise(ArgumentError, fn -> Config.new(opts) end).message
+
+      assert message =~ "Version 4.0 no longer accepts the list form advertised by the 3.x typespec"
+      refute message =~ "never accepted"
+    end
+
     test "succeeds with a string :audience and carries it into to_attesto_config/1" do
       cfg = Config.new(Keyword.put(audience_required_opts(), :audience, "https://api.example.com"))
 
@@ -1517,6 +1569,31 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.to_attesto_config(cfg, principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")]).audience ==
                "https://api.example.com"
+    end
+  end
+
+  describe ":client_assertion_audiences" do
+    test "accepts a static non-empty absolute URI list" do
+      audiences = ["https://issuer.example", "urn:example:token-endpoint"]
+      built = config(client_assertion_audiences: audiences)
+
+      assert Config.client_assertion_audiences(built) == audiences
+    end
+
+    test "rejects malformed, empty, and duplicate static lists at boot" do
+      for invalid <- [[], ["relative"], [""], [123], ["https://issuer.example", "https://issuer.example"]] do
+        assert_raise ArgumentError, ~r/:client_assertion_audiences/, fn ->
+          config(client_assertion_audiences: invalid)
+        end
+      end
+    end
+
+    test "validates callback output when it is used" do
+      built = config(client_assertion_audiences: fn _config -> [] end)
+
+      assert_raise ArgumentError, ~r/:client_assertion_audiences callback/, fn ->
+        Config.client_assertion_audiences(built)
+      end
     end
   end
 
@@ -2085,14 +2162,12 @@ defmodule AttestoPhoenix.ConfigTest do
         )
       end
 
-      same_origin =
+      assert_raise ArgumentError, ~r/:userinfo_path must be an absolute path beginning with exactly one/, fn ->
         config(
           userinfo_endpoint: :derived,
           userinfo_path: "//%69SSUER.EXAMPLE:443/oauth/userinfo"
         )
-
-      assert Config.userinfo_endpoint_url(same_origin) ==
-               "https://%69SSUER.EXAMPLE/oauth/userinfo"
+      end
     end
 
     test "the raised message names the offending member and the issuer" do
@@ -2162,6 +2237,30 @@ defmodule AttestoPhoenix.ConfigTest do
       built = config(token_path: "/custom/token")
 
       assert Config.token_path(built) == "/custom/token"
+    end
+
+    test "every endpoint path rejects network references and malformed URI syntax" do
+      path_keys = [
+        :authorize_path,
+        :token_path,
+        :par_path,
+        :revocation_path,
+        :introspection_path,
+        :registration_path,
+        :userinfo_path,
+        :device_authorization_path,
+        :device_verification_path,
+        :backchannel_authentication_path,
+        :end_session_path,
+        :check_session_path
+      ]
+
+      for key <- path_keys,
+          invalid <- ["//evil.example/x", "/x?query=1", "/x#fragment", "/x\\y", "/x/%ZZ", "/x\n"] do
+        assert_raise ArgumentError, ~r/must be an absolute path beginning with exactly one/, fn ->
+          config([{key, invalid}])
+        end
+      end
     end
   end
 
@@ -2307,6 +2406,32 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.frontchannel_logout_supported?(with_store)
       assert Config.frontchannel_logout_session_supported?(with_store)
+    end
+  end
+
+  describe "back-channel logout URI screening" do
+    test "returns an external HTTPS URI" do
+      built = config(client_backchannel_logout_uri: fn client -> client.bc end)
+
+      assert Config.client_backchannel_logout_uri(built, %{bc: "https://rp.example/logout"}) ==
+               "https://rp.example/logout"
+    end
+
+    test "rejects canonical localhost aliases and special-use IP literals" do
+      built = config(client_backchannel_logout_uri: fn client -> client.bc end)
+
+      for uri <- [
+            "https://localhost./logout",
+            "https://LOCALHOST/logout",
+            "https://service.localhost./logout",
+            "https://127.0.0.1/logout",
+            "https://[::ffff:127.0.0.1]/logout",
+            "https://[64:ff9b:1::1]/logout",
+            "https://169.254.169.254/latest/meta-data"
+          ] do
+        assert Config.client_backchannel_logout_uri(built, %{bc: uri}) == nil,
+               "expected #{uri} to be rejected"
+      end
     end
   end
 

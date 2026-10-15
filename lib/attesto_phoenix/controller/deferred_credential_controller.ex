@@ -6,8 +6,8 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   endpoint. The wallet polls this endpoint with the same access token and the
   `transaction_id` it was given at deferral. The library owns access-token
   verification (RFC 6750 bearer / RFC 9449 DPoP via
-  `AttestoPhoenix.ProtectedResource`) and SD-JWT VC signing/response framing,
-  and passes the token's verified `subject` to the host callback.
+  `AttestoPhoenix.ProtectedResource`) and format-specific signing/response
+  framing, and passes the token's verified `subject` to the host callback.
 
   Issuance completion is host policy through `:build_deferred_credential`.
   Bearer auth alone is NOT sufficient authorization here: it proves the caller
@@ -16,15 +16,18 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   mismatch — otherwise any authenticated wallet can poll another's
   `transaction_id` and receive its credential (IDOR). See
   `t:AttestoPhoenix.Config`'s `:build_deferred_credential` for the contract.
+  The callback must also return the credential configuration ID and public
+  holder JWK persisted from the original proof. Results without that binding
+  state fail closed; the deferred request carries no new holder proof from
+  which the library could reconstruct it.
   """
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import AttestoPhoenix.Controller.OID4VCIHelpers,
-    only: [body_params: 2, invalid_request: 4, maybe_put_option: 3]
+  import AttestoPhoenix.Controller.OID4VCIHelpers, only: [body_params: 2, invalid_request: 4]
 
-  alias Attesto.{CredentialResponse, SdJwtVc}
-  alias AttestoPhoenix.{Config, ProtectedResource}
+  alias Attesto.CredentialResponse
+  alias AttestoPhoenix.{Config, CredentialIssuer, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
   require Logger
@@ -58,8 +61,16 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   defp issue(conn, config, request, claims) do
     with {:ok, transaction_id} <- transaction_id(request),
-         {:ok, result} <- build_deferred_credential(config, claims["sub"], transaction_id),
-         {:ok, credential} <- issue_credential(config, result) do
+         {:ok, deferred} <- build_deferred_credential(config, claims["sub"], transaction_id),
+         :ok <- entitled?(claims, deferred.credential_configuration_id),
+         {:ok, credential} <-
+           CredentialIssuer.issue(
+             config,
+             claims["sub"],
+             deferred.credential_configuration_id,
+             deferred.holder_jwk,
+             deferred.credential
+           ) do
       conn
       |> PhoenixOAuthError.no_store(config)
       |> json(CredentialResponse.build(credential))
@@ -93,27 +104,29 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   defp validate_deferred_builder_result(result) do
     case result do
-      {:ok, _credential} = success -> success
-      {:error, _reason} = error -> error
-      _unexpected -> invalid_builder_result()
+      {:ok,
+       %{
+         credential_configuration_id: credential_configuration_id,
+         holder_jwk: holder_jwk,
+         credential: credential
+       } = deferred}
+      when is_binary(credential_configuration_id) and credential_configuration_id != "" and
+             is_map(holder_jwk) and is_map(credential) ->
+        {:ok, deferred}
+
+      {:error, _reason} = error ->
+        error
+
+      _unexpected ->
+        invalid_builder_result()
     end
   end
 
-  defp issue_credential(config, %{vct: vct, claims: claims} = result) do
-    {:ok,
-     SdJwtVc.issue(
-       [
-         iss: config.issuer,
-         vct: vct,
-         keystore: Config.vc_keystore(config)
-       ],
-       [claims: claims]
-       |> maybe_put_option(:exp, Map.get(result, :valid_until))
-       |> maybe_put_option(:nbf, Map.get(result, :valid_from))
-     )}
+  defp entitled?(%{"credential_configuration_ids" => ids}, credential_configuration_id) when is_list(ids) do
+    if credential_configuration_id in ids, do: :ok, else: {:error, :not_entitled}
   end
 
-  defp issue_credential(_config, _result), do: invalid_builder_result()
+  defp entitled?(_claims, _credential_configuration_id), do: {:error, :not_entitled}
 
   defp invalid_builder_result do
     Logger.warning(@invalid_builder_result_warning)

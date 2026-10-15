@@ -179,6 +179,32 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     )
   end
 
+  defp signed_request_object(overrides) do
+    request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+    {_kty, public_jwk} = JOSE.JWK.to_public_map(request_key)
+    client_jwk = Map.merge(public_jwk, %{"kid" => "authorization-request-key", "alg" => "ES256"})
+    now = System.system_time(:second)
+
+    claims =
+      valid_params()
+      |> Map.merge(%{
+        "iss" => @client_id,
+        "aud" => "https://issuer.example.com",
+        "nbf" => now,
+        "exp" => now + 300
+      })
+      |> Map.merge(overrides)
+
+    header = %{
+      "alg" => "ES256",
+      "kid" => "authorization-request-key",
+      "typ" => "oauth-authz-req+jwt"
+    }
+
+    {_header, request} = request_key |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+    {request, client_jwk}
+  end
+
   defp call(params, opts \\ []) do
     conn = build_conn() |> Map.put(:scheme, :https) |> with_config()
 
@@ -638,6 +664,49 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert location(conn) == nil,
              "an error must not be redirected to a URI the origin check refuses"
+    end
+
+    test "a signed request object's error destination is checked instead of the outer redirect URI" do
+      client_id = unique_cimd_client_id()
+      same_origin = "https://#{URI.parse(client_id).host}/cb"
+      cross_origin = "https://elsewhere.example/cb"
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_kty, public_jwk} = JOSE.JWK.to_public_map(request_key)
+      public_jwk = Map.merge(public_jwk, %{"kid" => "request-key", "alg" => "ES256"})
+
+      script_doc(
+        client_id,
+        cimd_doc(%{
+          "redirect_uris" => [same_origin, cross_origin],
+          "jwks" => %{"keys" => [public_jwk]}
+        })
+      )
+
+      put_config(client_id_metadata: cimd_config())
+
+      claims = %{
+        "iss" => client_id,
+        "aud" => "https://issuer.example.com",
+        "client_id" => client_id,
+        "redirect_uri" => cross_origin,
+        "response_type" => "code",
+        "scope" => "openid",
+        "state" => "signed-state",
+        "nonce" => "signed-nonce"
+      }
+
+      header = %{"alg" => "ES256", "kid" => "request-key", "typ" => "oauth-authz-req+jwt"}
+      {_header, request} = request_key |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
+
+      conn =
+        call(%{
+          "client_id" => client_id,
+          "redirect_uri" => same_origin,
+          "request" => request
+        })
+
+      assert conn.status == 400
+      assert location(conn) == nil
     end
 
     # The converse: when the origin check passes, an ordinary validation failure
@@ -1103,7 +1172,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
 
     test "uses the bound client and ignores other front-channel params when the client_id matches" do
-      request_uri = "urn:ietf:params:oauth:request_uri:bound-client"
+      request_uri = "urn:ietf:params:oauth:request_uri:bound-client-mismatch"
 
       put_config(
         require_pushed_authorization_requests: true,
@@ -1927,6 +1996,110 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert record.data.claims["attesto_phoenix.credential_authorization_details_ids"] == [
                "UniversityDegreeCredential"
              ]
+    end
+
+    test "direct, signed request object, and PAR requests grant the same credential entitlement" do
+      details = [
+        %{
+          "type" => "openid_credential",
+          "credential_configuration_id" => "UniversityDegreeCredential"
+        }
+      ]
+
+      {request, client_jwk} = signed_request_object(%{"authorization_details" => details})
+
+      put_config(
+        credential_configurations_supported: @credential_configurations_supported,
+        client_jwks: fn _client -> %{"keys" => [client_jwk]} end,
+        par_store: PARStore
+      )
+
+      direct = call(valid_params(%{"authorization_details" => authorization_details_json(details)}))
+
+      jar =
+        call(%{
+          "client_id" => @client_id,
+          "redirect_uri" => @redirect_uri,
+          "request" => request
+        })
+
+      request_uri = "urn:ietf:params:oauth:request_uri:authorization-details-parity"
+
+      :ok =
+        PARStore.put(
+          request_uri,
+          valid_params(%{"authorization_details" => authorization_details_json(details)}),
+          60
+        )
+
+      put_config(
+        credential_configurations_supported: @credential_configurations_supported,
+        client_jwks: fn _client -> %{"keys" => [client_jwk]} end,
+        par_store: PARStore,
+        require_pushed_authorization_requests: true
+      )
+
+      par = call(%{"client_id" => @client_id, "request_uri" => request_uri})
+
+      for response <- [direct, jar, par] do
+        assert response.status == 302
+        record = TestStore.peek(location_query(response)["code"])
+        assert record.data.claims["credential_configuration_ids"] == ["UniversityDegreeCredential"]
+
+        assert record.data.claims["attesto_phoenix.credential_authorization_details_ids"] == [
+                 "UniversityDegreeCredential"
+               ]
+      end
+    end
+
+    test "signed authorization_details takes precedence over unsigned outer details" do
+      supported = %{
+        "SignedCredential" => %{format: "dc+sd-jwt"},
+        "OuterCredential" => %{format: "dc+sd-jwt"}
+      }
+
+      signed_details = [
+        %{"type" => "openid_credential", "credential_configuration_id" => "SignedCredential"}
+      ]
+
+      outer_details = [
+        %{"type" => "openid_credential", "credential_configuration_id" => "OuterCredential"}
+      ]
+
+      {request, client_jwk} = signed_request_object(%{"authorization_details" => signed_details})
+
+      put_config(
+        credential_configurations_supported: supported,
+        client_jwks: fn _client -> %{"keys" => [client_jwk]} end
+      )
+
+      response =
+        call(%{
+          "client_id" => @client_id,
+          "redirect_uri" => @redirect_uri,
+          "request" => request,
+          "authorization_details" => authorization_details_json(outer_details)
+        })
+
+      record = TestStore.peek(location_query(response)["code"])
+      assert record.data.claims["credential_configuration_ids"] == ["SignedCredential"]
+
+      assert record.data.claims["attesto_phoenix.credential_authorization_details_ids"] == [
+               "SignedCredential"
+             ]
+    end
+
+    test "malformed authorization_details is rejected before a code is issued" do
+      for invalid <- [
+            "{not json",
+            authorization_details_json([]),
+            authorization_details_json([%{"credential_configuration_id" => "UniversityDegreeCredential"}])
+          ] do
+        response = call(valid_params(%{"authorization_details" => invalid}))
+        assert response.status == 302
+        assert location_query(response)["error"] == "invalid_authorization_details"
+        refute Map.has_key?(location_query(response), "code")
+      end
     end
 
     test "RAR provenance remains separate from matching scope-based credential rights" do

@@ -470,8 +470,6 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     targets
     |> Enum.filter(&is_binary(&1.backchannel_logout_uri))
     |> Enum.each(&deliver(attesto_config, http, session, &1))
-  rescue
-    _exception -> Logger.warning("back-channel logout fan-out failed")
   end
 
   defp deliver(attesto_config, http, session, target) do
@@ -488,6 +486,14 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
         Logger.warning("back-channel logout delivery failed")
         :error
     end
+  rescue
+    _exception ->
+      Logger.warning("back-channel logout delivery failed")
+      :error
+  catch
+    _kind, _reason ->
+      Logger.warning("back-channel logout delivery failed")
+      :error
   end
 
   # The exact iframe URIs the logout page renders: each front-channel-capable

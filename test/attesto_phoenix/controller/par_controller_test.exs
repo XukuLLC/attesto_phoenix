@@ -134,6 +134,28 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     refute Map.has_key?(stored, "client_secret")
   end
 
+  test "rejects query parameters before client authentication" do
+    put_config(load_client: fn _client_id -> flunk("client lookup must not run for query parameters") end)
+
+    params = auth_params()
+    credentials = Base.encode64("confidential-1:s3cr3t")
+
+    for query <- ["request=leaked", "redirect_uri=https%3A%2F%2Fevil.example", "client_secret=leaked"] do
+      conn =
+        :post
+        |> conn(@endpoint_path <> "?" <> query, params)
+        |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+        |> PARController.create(params)
+
+      assert conn.status == 400
+
+      assert JSON.decode!(conn.resp_body) == %{
+               "error" => "invalid_request",
+               "error_description" => "request parameters must be sent in the request body, not the query string"
+             }
+    end
+  end
+
   test "stores the authenticated client_id when a redundant matching client_id is in the body" do
     # RFC 6749 §2.3.1: the Basic userid is the authoritative client_id; a body
     # client_id is mere identification and is honoured only when it agrees.

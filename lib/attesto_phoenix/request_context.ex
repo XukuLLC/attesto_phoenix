@@ -61,11 +61,6 @@ defmodule AttestoPhoenix.RequestContext do
   @forwarded_port_header "x-forwarded-port"
   @forwarded_for_header "x-forwarded-for"
 
-  # IANA default ports per scheme; omitted from the canonical authority so the
-  # `htu` matches what a client built from a bare `https://host/path` URL.
-  @https_default_port 443
-  @http_default_port 80
-
   @user_agent_header "user-agent"
 
   # RFC 8252 §8.12: substrings that identify a request as coming from an
@@ -319,17 +314,17 @@ defmodule AttestoPhoenix.RequestContext do
     trusted? = from_trusted_proxy?(conn, config)
     scheme = effective_scheme(conn, config)
     {direct_host, direct_port} = direct_authority(conn, scheme)
-    host = (trusted? && forwarded_host(conn)) || direct_host
-    port = (trusted? && forwarded_port(conn)) || direct_port
 
-    authority =
-      if default_port?(scheme, port) do
-        host
-      else
-        "#{host}:#{port}"
+    {host, host_port} =
+      case trusted? && forwarded_authority(conn, scheme) do
+        {host, port} -> {host, port}
+        _other -> {direct_host, direct_port}
       end
 
-    "#{scheme}://#{authority}#{conn.request_path}"
+    port = (trusted? && forwarded_port(conn)) || host_port
+
+    %URI{scheme: scheme, host: host, port: port, path: conn.request_path}
+    |> URI.to_string()
   end
 
   @doc """
@@ -403,7 +398,8 @@ defmodule AttestoPhoenix.RequestContext do
   end
 
   defp forwarded_client_certificate(conn, config) do
-    case forwarded_client_certificate_der(conn, config) do
+    case forwarded_client_certificate_der(conn, config) ||
+           legacy_forwarded_certificate_der(conn, config) do
       der when is_binary(der) -> certificate_context(conn, config, der, :trusted_terminator)
       nil -> nil
     end
@@ -558,7 +554,11 @@ defmodule AttestoPhoenix.RequestContext do
     end
   end
 
-  defp forwarded_host(conn), do: first_forwarded_token(conn, @forwarded_host_header)
+  defp forwarded_authority(conn, scheme) do
+    conn
+    |> first_forwarded_token(@forwarded_host_header)
+    |> parse_authority(scheme)
+  end
 
   defp forwarded_port(conn) do
     conn
@@ -612,23 +612,34 @@ defmodule AttestoPhoenix.RequestContext do
   defp direct_authority(conn, scheme) do
     case first_header(conn, "host") do
       host_header when is_binary(host_header) and host_header != "" ->
-        case URI.parse("#{scheme}://#{host_header}") do
-          %URI{host: host, port: port, userinfo: nil, path: nil, query: nil, fragment: nil}
-          when is_binary(host) and is_integer(port) ->
-            {host, port}
-
-          _other ->
-            {conn.host, conn.port}
-        end
+        parse_authority(host_header, scheme) || {conn.host, conn.port}
 
       _other ->
         {conn.host, conn.port}
     end
   end
 
-  defp default_port?("https", @https_default_port), do: true
-  defp default_port?("http", @http_default_port), do: true
-  defp default_port?(_scheme, _port), do: false
+  defp parse_authority(nil, _scheme), do: nil
+
+  defp parse_authority(authority, scheme) when is_binary(authority) do
+    case URI.new("#{scheme}://#{authority}") do
+      {:ok,
+       %URI{
+         scheme: ^scheme,
+         host: host,
+         port: port,
+         userinfo: nil,
+         path: nil,
+         query: nil,
+         fragment: nil
+       }}
+      when is_binary(host) and host != "" and is_integer(port) and port > 0 and port <= @max_port ->
+        {host, port}
+
+      _other ->
+        nil
+    end
+  end
 
   defp socket_peer_ip_string(%Plug.Conn{} = conn) do
     case socket_peer_ip(conn) do

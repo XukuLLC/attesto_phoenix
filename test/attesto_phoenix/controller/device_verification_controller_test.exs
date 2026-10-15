@@ -128,6 +128,16 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationControllerTest do
     Application.put_env(:attesto_phoenix, @config_key, Keyword.put(config, :device_authorization, device_opts))
   end
 
+  defp set_authenticated_subject(subject) do
+    config = Application.fetch_env!(:attesto_phoenix, @config_key)
+
+    Application.put_env(
+      :attesto_phoenix,
+      @config_key,
+      Keyword.put(config, :authenticate_device_user, fn _conn -> {:ok, subject} end)
+    )
+  end
+
   test "GET with a user_code shows the confirm prompt (no approval)", %{user_code: uc, device_code: dc} do
     conn = call(:get, %{"user_code" => uc})
     assert conn.status == 200
@@ -145,6 +155,32 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationControllerTest do
     assert grant.subject == "user-1"
     assert grant.scope == ["read"]
     assert grant.claims == %{"acr" => "phr"}
+  end
+
+  test "approval rejects a host scope that exceeds the pending device request", %{
+    user_code: user_code,
+    device_code: device_code
+  } do
+    set_authenticated_subject(%{subject: "user-1", scope: ["read", "admin"], claims: %{}})
+
+    conn = call(:post, %{"user_code" => user_code, "decision" => "approve"})
+
+    assert body(conn)["stage"] == "invalid"
+
+    assert {:error, :authorization_pending} =
+             DeviceCode.redeem(Store, device_code, %{client_id: "cli-1"}, interval: 0)
+  end
+
+  test "approval accepts a space-delimited narrowed host scope" do
+    set_authenticated_subject(%{subject: "user-1", scope: "read", claims: %{}})
+
+    {:ok, %{device_code: device_code, user_code: user_code}} =
+      DeviceCode.issue(Store, %{client_id: "cli-1", scope: ["read", "write"]})
+
+    assert body(call(:post, %{"user_code" => user_code, "decision" => "approve"}))["stage"] == "approved"
+
+    assert {:ok, %{scope: ["read"]}} =
+             DeviceCode.redeem(Store, device_code, %{client_id: "cli-1"}, interval: 0)
   end
 
   test "a lookup integration failure cannot reach the approval transition", %{

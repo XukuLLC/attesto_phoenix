@@ -49,6 +49,41 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
     def post(_uri, _logout_token), do: {:error, {:transport, "logout-http-private-sentinel"}}
   end
 
+  defmodule RaisingFirstHTTP do
+    @moduledoc false
+    @behaviour AttestoPhoenix.BackChannelLogout
+
+    @impl true
+    def post("https://rp-raise.example/bc", _logout_token), do: raise("delivery-private-sentinel")
+
+    def post(uri, logout_token) do
+      pid = Application.fetch_env!(:attesto_phoenix, :test_bc_pid)
+      send(pid, {:bc_post, uri, logout_token})
+      :ok
+    end
+  end
+
+  defmodule OrderedTargetsStore do
+    @moduledoc false
+
+    def take_targets(_criteria) do
+      [
+        %{
+          sid: "sess-raise",
+          client_id: "rp-raise",
+          backchannel_logout_uri: "https://rp-raise.example/bc",
+          frontchannel_logout_uri: nil
+        },
+        %{
+          sid: "sess-after",
+          client_id: "rp-after",
+          backchannel_logout_uri: "https://rp-after.example/bc",
+          frontchannel_logout_uri: nil
+        }
+      ]
+    end
+  end
+
   defmodule ErrorStore do
     @moduledoc false
 
@@ -291,6 +326,26 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
 
       assert log =~ "back-channel logout delivery failed"
       refute log =~ "logout-http-private-sentinel"
+    end
+
+    test "an exception delivering to one RP does not skip later RPs", %{hint: hint} do
+      log =
+        with_app_config(
+          [
+            logout_session_store: OrderedTargetsStore,
+            logout: [enabled: true, http_client: RaisingFirstHTTP]
+          ],
+          fn ->
+            capture_log(fn ->
+              conn = call(:get, %{"id_token_hint" => hint})
+              assert conn.status == 200
+            end)
+          end
+        )
+
+      assert_received {:bc_post, "https://rp-after.example/bc", _token}
+      assert log =~ "back-channel logout delivery failed"
+      refute log =~ "delivery-private-sentinel"
     end
 
     test "logout enabled without :terminate_session fails config validation (no fail-open)", %{

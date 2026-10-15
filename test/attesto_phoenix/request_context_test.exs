@@ -356,6 +356,12 @@ defmodule AttestoPhoenix.RequestContextTest do
       assert RequestContext.canonical_url(conn, cfg) == "https://h:8443/x"
     end
 
+    test "brackets an IPv6 literal in the direct authority" do
+      cfg = config()
+      conn = build_conn(:get, "/x", scheme: :https, host: "2001:db8::1", port: 443)
+      assert RequestContext.canonical_url(conn, cfg) == "https://[2001:db8::1]/x"
+    end
+
     test "honors forwarded scheme/host/port from a trusted proxy" do
       cfg = config(trusted_proxies: [:loopback])
 
@@ -373,6 +379,72 @@ defmodule AttestoPhoenix.RequestContextTest do
         )
 
       assert RequestContext.canonical_url(conn, cfg) == "https://issuer.example/oauth/token"
+    end
+
+    test "uses a port carried by the trusted forwarded host" do
+      cfg = config(trusted_proxies: [:loopback])
+
+      conn =
+        build_conn(:get, "/x",
+          scheme: :http,
+          host: "internal.app",
+          port: 4000,
+          headers: [
+            {"x-forwarded-proto", "https"},
+            {"x-forwarded-host", "issuer.example:8443"}
+          ]
+        )
+
+      assert RequestContext.canonical_url(conn, cfg) == "https://issuer.example:8443/x"
+    end
+
+    test "x-forwarded-port overrides a port carried by x-forwarded-host" do
+      cfg = config(trusted_proxies: [:loopback])
+
+      conn =
+        build_conn(:get, "/x",
+          scheme: :http,
+          host: "internal.app",
+          port: 4000,
+          headers: [
+            {"x-forwarded-proto", "https"},
+            {"x-forwarded-host", "issuer.example:8443"},
+            {"x-forwarded-port", "443"}
+          ]
+        )
+
+      assert RequestContext.canonical_url(conn, cfg) == "https://issuer.example/x"
+    end
+
+    test "does not leak the internal port when a forwarded host omits its port" do
+      cfg = config(trusted_proxies: [:loopback])
+
+      conn =
+        build_conn(:get, "/x",
+          scheme: :http,
+          host: "internal.app",
+          port: 4000,
+          headers: [
+            {"x-forwarded-proto", "https"},
+            {"x-forwarded-host", "issuer.example"}
+          ]
+        )
+
+      assert RequestContext.canonical_url(conn, cfg) == "https://issuer.example/x"
+    end
+
+    test "brackets a trusted forwarded IPv6 host" do
+      cfg = config(trusted_proxies: [:loopback])
+
+      conn =
+        build_conn(:get, "/x",
+          headers: [
+            {"x-forwarded-proto", "https"},
+            {"x-forwarded-host", "[2001:db8::1]:8443"}
+          ]
+        )
+
+      assert RequestContext.canonical_url(conn, cfg) == "https://[2001:db8::1]:8443/x"
     end
 
     test "ignores forwarded authority from an untrusted peer" do
@@ -474,6 +546,22 @@ defmodule AttestoPhoenix.RequestContextTest do
 
       assert RequestContext.client_certificate(conn, cfg) == %{
                der: "CLIENT-DER",
+               source: :trusted_terminator,
+               proof_of_possession: true,
+               chain_validated: true
+             }
+    end
+
+    test "accepts the legacy certificate callback through the same trusted-terminator context" do
+      cfg =
+        config(
+          trusted_proxies: [:loopback],
+          cert_der: fn _conn -> "LEGACY-DER" end,
+          client_certificate_chain_validated?: fn _conn, der -> der == "LEGACY-DER" end
+        )
+
+      assert RequestContext.client_certificate(build_conn(:post, "/oauth/token"), cfg) == %{
+               der: "LEGACY-DER",
                source: :trusted_terminator,
                proof_of_possession: true,
                chain_validated: true

@@ -425,6 +425,13 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "client_credentials grant (RFC 6749 §4.4)" do
+    test "scope policy cannot add scopes omitted from an explicit request" do
+      config = config(authorize_scope: fn _client, _requested -> {:ok, ["read", "admin"]} end)
+      request = request(config, params: %{"scope" => "read"})
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} = Token.issue(config, request)
+    end
+
     test "direct attested requests require the verified Client Instance Key" do
       config = config()
 
@@ -619,6 +626,19 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "authorization_code grant (RFC 6749 §4.1)" do
+    test "scope policy cannot exceed the authorization code's stored grant" do
+      code_store = start_code_store("oc_user-1", ["read"])
+
+      config =
+        config(
+          code_store: code_store,
+          authorize_scope: fn _client, _requested -> {:ok, ["read", "admin"]} end
+        )
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} =
+               Token.issue(config, grant_id_code_request(config))
+    end
+
     test "a deferred DPoP lookup fault cannot bypass replay claiming and consume a code" do
       start_code_store("oc_user-1", ["read"])
       OneShotLookupFailureCodeStore.fail_next_lookup()
@@ -959,6 +979,54 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "refresh_token grant (RFC 6749 §6)" do
+    test "scope policy cannot exceed the rotated refresh context" do
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          resource: [],
+          client_id: "client-1",
+          issuer: @issuer
+        })
+
+      config =
+        config(
+          refresh_store: refresh_store,
+          authorize_scope: fn _client, _requested -> {:ok, ["read", "admin"]} end
+        )
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} =
+               Token.issue(config, grant_id_refresh_request(config, refresh_token))
+    end
+
+    test "a refresh preserves the validated OIDC requested-claims selection" do
+      requested_claims = %{"userinfo" => %{"email" => nil}}
+
+      start_code_store_with_claims(
+        "oc_user-1",
+        ["openid", "offline_access"],
+        %{"claims" => requested_claims},
+        []
+      )
+
+      config =
+        config(
+          code_store: ETS,
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end
+        )
+
+      assert {:ok, initial, _events} = Token.issue(config, grant_id_code_request(config))
+      assert claim!(initial.access_token, "claims") == requested_claims
+
+      assert {:ok, refreshed, _events} =
+               Token.issue(config, grant_id_refresh_request(config, initial.refresh_token))
+
+      assert claim!(refreshed.access_token, "claims") == requested_claims
+    end
+
     test "the refresh principal hook receives persisted session context and builds the minted principal" do
       auth_time = 1_700_000_000
       resource = ["https://tenant-a.example/api"]
@@ -1627,6 +1695,17 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.access_token, "sub") == "oc_user-1"
     end
 
+    test "scope policy cannot exceed the approved device grant" do
+      config =
+        device_config(authorize_scope: fn _client, _requested -> {:ok, ["read", "admin"]} end)
+
+      %{device_code: dc, user_code: uc} = issue_device_code(["read"])
+      :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} =
+               Token.issue(config, device_request(config, dc))
+    end
+
     test "initial and refreshed access tokens omit the configured authorization grant ID claim" do
       claim = "https://api.example.com/claims/oauth_grant_id"
 
@@ -1727,6 +1806,47 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert response.scope == "credential"
       assert claim!(response.access_token, "sub") == "oc_user-1"
       assert claim!(response.access_token, "credential_configuration_ids") == ["UniversityDegreeCredential"]
+    end
+
+    test "scope policy cannot exceed the credential offer's authorized scopes" do
+      config =
+        pre_authorized_config(authorize_scope: fn _client, _requested -> {:ok, ["credential", "admin"]} end)
+
+      code = issue_pre_authorized_code()
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} =
+               Token.issue(config, pre_authorized_request(config, code))
+    end
+
+    test "an invalid code does not consume a deferred DPoP replay claim" do
+      test_pid = self()
+
+      config =
+        pre_authorized_config(
+          dpop_enabled: true,
+          replay_check: fn _key, _ttl ->
+            send(test_pid, :dpop_replay_claimed)
+            :ok
+          end
+        )
+
+      {proof, _jkt} = dpop_proof_and_jkt()
+      public_client = Map.put(@client, :public?, true)
+
+      request =
+        pre_authorized_request(config, "unknown", %{},
+          client: public_client,
+          client_auth_method: :none,
+          sender_constraint_input: %{
+            dpop_proof: proof,
+            mtls_cert_der: nil,
+            http_uri: "https://issuer.example/oauth/token",
+            http_method: "POST"
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _events} = Token.issue(config, request)
+      refute_received :dpop_replay_claimed
     end
 
     test "a public client with no client authentication may redeem the grant" do
@@ -1833,6 +1953,26 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       issued
     end
 
+    defp issue_ciba_with_resource(resource, scope \\ ["openid"], opts \\ []) do
+      req = %Attesto.CIBA.Request{
+        client_id: "client-1",
+        delivery_mode: :poll,
+        hint: {:login_hint, "alice@example.test"},
+        resource: resource,
+        scope: scope
+      }
+
+      {:ok, issued} =
+        Attesto.CIBA.issue(
+          Attesto.CIBAStore.ETS,
+          req,
+          %{subject: "user-1", resource: resource},
+          opts
+        )
+
+      issued
+    end
+
     defp ciba_request(config, auth_req_id) do
       request(config,
         grant_type: "urn:openid:params:grant-type:ciba",
@@ -1845,6 +1985,65 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       %{auth_req_id: arid} = issue_ciba()
 
       assert {:error, %OAuthError{error: :authorization_pending}, _} = Token.issue(config, ciba_request(config, arid))
+    end
+
+    test "scope policy cannot exceed the approved CIBA grant" do
+      config = ciba_config(authorize_scope: fn _client, _requested -> {:ok, ["openid", "admin"]} end)
+      %{auth_req_id: auth_req_id} = issue_ciba(["openid"])
+      {:ok, _grant} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, auth_req_id, %{subject: "user-1"})
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} =
+               Token.issue(config, ciba_request(config, auth_req_id))
+    end
+
+    test "token-time resource selection may narrow the CIBA grant and remains narrowed on refresh" do
+      accounts = "https://api.example.com/accounts"
+      payments = "https://api.example.com/payments"
+
+      config =
+        ciba_config(
+          resource_indicators: [allowed_resources: [accounts, payments]],
+          refresh_store: start_refresh_store(),
+          issue_refresh_token?: fn _client, _scope -> true end
+        )
+
+      %{auth_req_id: auth_req_id} = issue_ciba_with_resource([accounts, payments])
+      {:ok, _grant} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, auth_req_id, %{subject: "user-1"})
+
+      token_request =
+        %{ciba_request(config, auth_req_id) | params: %{"auth_req_id" => auth_req_id, "resource" => accounts}}
+
+      assert {:ok, initial, _events} = Token.issue(config, token_request)
+      assert aud!(initial.access_token) == accounts
+      assert refresh_record!(initial.refresh_token).data.resource == [accounts]
+
+      assert {:ok, refreshed, _events} =
+               Token.issue(config, grant_id_refresh_request(config, initial.refresh_token))
+
+      assert aud!(refreshed.access_token) == accounts
+
+      widening_refresh =
+        %{
+          grant_id_refresh_request(config, refreshed.refresh_token)
+          | params: %{"refresh_token" => refreshed.refresh_token, "resource" => payments}
+        }
+
+      assert {:error, %OAuthError{error: :invalid_target}, _events} =
+               Token.issue(config, widening_refresh)
+    end
+
+    test "token-time resource selection cannot widen the CIBA grant" do
+      bound = "https://api.example.com/accounts"
+      outside = "https://api.example.com/payments"
+      config = ciba_config(resource_indicators: [allowed_resources: [bound, outside]])
+
+      %{auth_req_id: auth_req_id} = issue_ciba_with_resource([bound])
+      {:ok, _grant} = Attesto.CIBA.approve(Attesto.CIBAStore.ETS, auth_req_id, %{subject: "user-1"})
+
+      token_request =
+        %{ciba_request(config, auth_req_id) | params: %{"auth_req_id" => auth_req_id, "resource" => outside}}
+
+      assert {:error, %OAuthError{error: :invalid_target}, _events} = Token.issue(config, token_request)
     end
 
     test "denied → access_denied" do

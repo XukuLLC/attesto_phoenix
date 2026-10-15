@@ -267,6 +267,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
            ),
          {:ok, grant, private_context} <- take_private_context(config, grant),
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
+         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params) do
       complete_authorization_code(
         request,
@@ -301,7 +302,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              SenderConstraint.binding_jkt(binding)
            ),
          {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
+         :ok <- require_granted_scope_within_ceiling(scope, rotated.context.scope),
          credential_claims = refresh_credential_claims(config, rotated.context, scope, requested_credentials),
+         requested_claims = refresh_requested_claims(rotated.context),
          {:ok, response} <-
            mint_refresh(
              request,
@@ -309,7 +312,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              scope,
              token_type,
              binding,
-             Map.merge(credential_claims, refresh_authorization_grant_id_claims(config, rotated)),
+             requested_claims
+             |> Map.merge(credential_claims)
+             |> Map.merge(refresh_authorization_grant_id_claims(config, rotated)),
              # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
              # (never re-stamped on rotation), so the refreshed access token
              # reports the real authentication event.
@@ -329,10 +334,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # no refresh token is issued (RFC 6749 §4.4.3).
   defp dispatch(%Request{grant_type: "client_credentials"} = request) do
     %{config: config, client: client, params: params} = request
+    requested_scope = parse_requested_scope(params)
 
     with {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          subject = token_client_id(request),
-         {:ok, scope} <- authorize_scope(config, client, parse_requested_scope(params)),
+         {:ok, scope} <- authorize_scope(config, client, requested_scope),
+         :ok <- require_granted_scope_within_request(scope, requested_scope),
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, audience} <- request_resource_audience(config, client, params),
          {:ok, response} <-
@@ -356,6 +363,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          :ok <- commit_claim_for_polling_grant(config, redemption, pending_claim),
          {:ok, grant} <- redemption,
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
+         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
            mint(
@@ -385,9 +393,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with {:ok, code} <- require_param(params, "pre-authorized_code"),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          redemption = redeem_pre_authorized_code(request, code, params),
-         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, grant} <- redemption,
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          {:ok, scope} <- authorize_scope(config, client, Enum.join(grant.authorized_scopes, " ")),
+         :ok <- require_granted_scope_within_ceiling(scope, grant.authorized_scopes),
          {:ok, response} <-
            mint(
              request,
@@ -420,6 +429,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          :ok <- commit_claim_for_polling_grant(config, redemption, pending_claim),
          {:ok, grant} <- redemption,
          {:ok, scope} <- authorize_scope(config, client, grant.scope),
+         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
          {:ok, response} <-
            mint(
@@ -442,7 +452,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # seeds the refresh family with the real authentication event.
       maybe_issue_refresh_token(
         request,
-        ciba_refresh_grant(grant),
+        ciba_refresh_grant(grant, audience),
         scope,
         token_type,
         binding,
@@ -1051,6 +1061,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
+  # Persisted authorization grants are ceilings even when their stored scope is
+  # empty. Host scope policy may narrow those grants, but it must never create a
+  # scope the resource owner (or credential offer) did not authorize.
+  defp require_granted_scope_within_ceiling(granted, ceiling) when is_list(ceiling) do
+    case granted -- ceiling do
+      [] -> :ok
+      _added -> {:error, error(@error_invalid_scope, "scope policy exceeded the authorized scope")}
+    end
+  end
+
   # draft §6.1 / RFC 9449: an ID-JAG carrying `cnf.jkt` is proof-of-possession
   # authority, not a bearer assertion. The token request must demonstrate the
   # same DPoP key; a missing, mTLS, or different-key binding is invalid_grant.
@@ -1412,13 +1432,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # so the shared refresh-issuance path (`issue_initial_refresh_token`, which
   # reads them from `claims`) seeds the refresh family with the real
   # authentication event, exactly as the authorization-code grant does.
-  defp ciba_refresh_grant(grant) do
+  defp ciba_refresh_grant(grant, resource) do
     claims =
       grant.claims
       |> put_optional("acr", valid_acr(grant.acr))
       |> put_optional("auth_time", valid_auth_time(grant.auth_time))
 
-    %{grant | claims: claims}
+    %{grant | claims: claims, resource: resource}
   end
 
   # RFC 9470 / OIDC Core §2: the CIBA Grant carries the satisfied `acr` and the
@@ -1705,6 +1725,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     |> put_optional(:dpop_jkt, refresh_context_dpop_jkt(request, grant, binding))
     |> put_optional(:attestation_jkt, refresh_attestation_jkt(request))
     |> put_refresh_session_id(grant)
+    |> put_refresh_requested_claims(grant)
     |> put_refresh_credential_authorization(config, grant, scope)
     |> put_refresh_grant_provenance(config, grant_type, Map.get(grant, :family_id))
   end
@@ -2409,6 +2430,29 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case id_token_claim(claims, "claims") do
       requested when is_map(requested) -> requested
       _ -> nil
+    end
+  end
+
+  defp put_refresh_requested_claims(context, grant) do
+    case Callback.map_value(grant, :claims) do
+      claims when is_map(claims) ->
+        case requested_userinfo_claims(claims) do
+          requested when is_map(requested) ->
+            Map.update(context, :claims, %{"claims" => requested}, &Map.put(&1, "claims", requested))
+
+          _absent ->
+            context
+        end
+
+      _malformed ->
+        context
+    end
+  end
+
+  defp refresh_requested_claims(context) do
+    case get_in(context, [:claims, "claims"]) do
+      requested when is_map(requested) -> %{"claims" => requested}
+      _absent -> %{}
     end
   end
 

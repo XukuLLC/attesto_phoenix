@@ -172,9 +172,16 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
   describe "take/1" do
     test "returns the record and claims it so a code is redeemable once" do
+      before_take = DateTime.utc_now() |> DateTime.truncate(:second)
       assert :ok = EctoCodeStore.put(entry("hash-once"))
 
       assert {:ok, %{code_hash: "hash-once"}} = EctoCodeStore.take("hash-once")
+
+      assert %Authorization{consumed_at: %DateTime{}, replay_retain_until: reserved_until} =
+               TestRepo.get_by!(Authorization, code_hash: "hash-once")
+
+      assert DateTime.compare(reserved_until, DateTime.add(before_take, 300, :second)) in [:eq, :gt]
+
       # The first presentation has only claimed the row. Until the protocol
       # layer reports successful redemption, a second presentation is not
       # replay evidence and fails closed as an unknown/invalid grant.
@@ -205,10 +212,62 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert :ok = EctoCodeStore.put(entry("hash-finalized", grant_data(%{family_id: "fam-origin"})))
 
       assert {:ok, %{code_hash: "hash-finalized"}} = EctoCodeStore.take("hash-finalized")
-      assert :ok = EctoCodeStore.mark_consumed("hash-finalized", %{family_id: "fam-issued"})
+      deadline = System.system_time(:second) + 3_600
+
+      assert :ok =
+               EctoCodeStore.mark_consumed("hash-finalized", %{
+                 family_id: "fam-issued",
+                 replay_retain_until: deadline
+               })
 
       assert {:error, :consumed, %{family_id: "fam-issued", subject: "subject-1"}} =
                EctoCodeStore.take("hash-finalized")
+
+      assert %Authorization{
+               family_id: "fam-issued",
+               replay_retain_until: %DateTime{} = retained_until
+             } = TestRepo.get_by!(Authorization, code_hash: "hash-finalized")
+
+      assert DateTime.to_unix(retained_until) == deadline
+    end
+
+    test "an unbounded refresh family replaces the temporary reservation with a NULL deadline" do
+      assert :ok = EctoCodeStore.put(entry("hash-unbounded", grant_data(%{family_id: nil})))
+      assert {:ok, _record} = EctoCodeStore.take("hash-unbounded")
+
+      assert %Authorization{replay_retain_until: %DateTime{}} =
+               TestRepo.get_by!(Authorization, code_hash: "hash-unbounded")
+
+      assert :ok =
+               EctoCodeStore.mark_consumed("hash-unbounded", %{
+                 family_id: "fam-unbounded",
+                 replay_retain_until: nil
+               })
+
+      assert %Authorization{
+               family_id: "fam-unbounded",
+               consumed_success: true,
+               replay_retain_until: nil
+             } = TestRepo.get_by!(Authorization, code_hash: "hash-unbounded")
+    end
+
+    test "rejects malformed replay retention metadata" do
+      assert :ok = EctoCodeStore.put(entry("hash-invalid-retention"))
+      assert {:ok, _record} = EctoCodeStore.take("hash-invalid-retention")
+
+      assert_raise ArgumentError, ~r/received invalid consumed metadata/, fn ->
+        EctoCodeStore.mark_consumed("hash-invalid-retention", %{
+          family_id: "fam",
+          replay_retain_until: "tomorrow"
+        })
+      end
+
+      assert_raise ArgumentError, ~r/received invalid consumed metadata/, fn ->
+        EctoCodeStore.mark_consumed("hash-invalid-retention", %{
+          family_id: nil,
+          replay_retain_until: System.system_time(:second) + 60
+        })
+      end
     end
 
     test "records an access token by code hash before family rebinding" do

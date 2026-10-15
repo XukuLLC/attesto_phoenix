@@ -495,9 +495,20 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
          _successor,
          _protected,
          _now,
-         _prefix
+         prefix
        ) do
-    {:reuse, to_store_record(row)}
+    record = to_store_record(row)
+
+    if valid_recovered_successor?(row, record.successor, prefix) do
+      {:reuse, record}
+    else
+      # A retry token is credential-equivalent state. Never return it unless
+      # the persisted child still proves the same family, generation, parent,
+      # token hash, and context relation used by strong reads. Treat a broken
+      # lineage as family compromise/corruption and make the failure sticky.
+      revoke_rows!(row.family_id, prefix)
+      {:error, :family_integrity_error}
+    end
   end
 
   defp rotate_loaded_parent(%RefreshToken{} = row, parent_hash, child, successor, protected, now, prefix) do

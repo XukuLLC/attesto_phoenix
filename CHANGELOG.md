@@ -4,6 +4,84 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.0] - 2026-10-15
+
+### Breaking
+
+- Change the successful `:build_deferred_credential` callback result to
+  `{:ok, %{credential_configuration_id: id, holder_jwk: public_jwk,
+  credential: credential_result}}`. Results containing only credential claims
+  are rejected because the deferred request has no new proof from which to
+  recover the holder binding. Persist the configuration ID and verified public
+  holder JWK with the transaction when the original request is deferred. See
+  the [4.0 upgrade guide](guides/upgrade_4_0.md).
+- Require Attesto `>= 2.4.0 and < 3.0.0`. Phoenix now depends on the core
+  authorization-code replay deadline, CIBA resource, and effective signed-JAR
+  `authorization_details` APIs. The callback contract change makes this a
+  major release under Semantic Versioning; the core additions remain a minor
+  2.4 release. Attesto 2.4.0 must be published first; only then can this
+  repository replace its 2.2.2 lock entry and build the Phoenix Hex release.
+- Change consent-grant hashing to a type-tagged, length-framed encoding and bind
+  the grant to `resource`, `claims`, and `dpop_jkt` in addition to the existing
+  request fields. In-flight grants minted by 3.x cannot be consumed after the
+  upgrade. `binding_from_params/2` now raises on malformed input; consent
+  controllers that pass untrusted raw parameters should use
+  `safe_binding_from_params/2` and handle `{:error, :invalid_binding}`.
+- Require every `attesto_routes/1` route-mount option (`registration`, `device`,
+  `credential_issuance`, `federation`, `status_list`, `presentation`, `ciba`,
+  `logout`, `session_management`, `userinfo`, `openid_configuration`, and
+  `protected_resource_root`) to expand at compile time to `true` or `false`.
+- Narrow `Config`'s default `:audience` from the 3.x-advertised string-or-list
+  contract to one absolute HTTPS resource identifier. Configure additional
+  token targets with RFC 8707 `resource` parameters and
+  `:resource_indicators`.
+- Require an integer `:valid_until` in every `mso_mdoc` result returned by
+  `:build_credential` or `:build_deferred_credential`. The former default
+  produced a credential that was already expired.
+
+### Security
+
+- Issue completed deferred SD-JWT VC, JWT VC, and mdoc credentials through the
+  same holder-binding, entitlement, validity, and signing path as immediate
+  issuance. The callback must resolve each transaction within the authenticated
+  subject.
+- Retain consumed authorization-code records while the issued refresh family
+  has an unexpired member, then delete the marker after that family ends. The
+  correlated cleanup also gives legacy successful rows with a NULL family
+  deadline a finite lifetime.
+- Reject every non-empty query string on POST token, introspection, revocation,
+  and PAR endpoints, and fail closed when required host callbacks or stores are
+  absent. Move non-protocol tracing or routing parameters off these endpoint
+  URLs before upgrading.
+- Verify an OID4VP `vp_token` before signing its browser response-code JWT, so
+  invalid public submissions do not consume signing work.
+- Enforce CIBA resource audiences from request through approval and token
+  exchange, and preserve OID4VCI credential entitlements supplied inside a
+  signed Request Object.
+- Harden client classification, Client ID Metadata fetching, outbound request
+  bounds, refresh-family issuer and instance-key binding, and public-client
+  authentication decisions.
+
+### Changed
+
+- Generate and document the complete ordered database upgrade path: 3.0, 3.1,
+  3.4, 3.6, and 3.7. Existing installations apply only milestones they have
+  not already applied; a 2.x database needs all five while writers are stopped.
+- Add the 3.7 authorization-code `replay_retain_until` migration. Legacy
+  successful rows linked to a refresh family retain NULL when the original
+  deadline is unavailable; runtime cleanup uses live refresh descendants.
+- Pin the test-only Bandit dependency to the exact upstream fix for
+  CVE-2026-105659. This does not enter published package requirements; replace
+  the git pin with the first patched Hex release once one is available.
+
+### Fixed
+
+- Preserve refresh-token claims and credential configuration entitlements
+  across rotation, and use stable family metadata for retry and revocation.
+- Normalize malformed controller input, callback failures, content negotiation,
+  and nil store results to protocol errors rather than exceptions or successful
+  empty responses.
+
 ## [3.5.1] - 2026-10-04
 
 ### Fixed

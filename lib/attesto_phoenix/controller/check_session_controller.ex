@@ -121,9 +121,11 @@ defmodule AttestoPhoenix.Controller.CheckSessionController do
               }
 
               var salt = sessionState.substring(dot + 1);
-              var text = clientId + " " + event.origin + " " + browserState() + " " + salt;
 
-              sha256Hex(text).then(function (hash) {
+              Promise.resolve().then(function () {
+                var text = clientId + " " + event.origin + " " + browserState() + " " + salt;
+                return sha256Hex(text);
+              }).then(function (hash) {
                 reply(event, (hash + "." + salt) === sessionState ? "unchanged" : "changed");
               }).catch(function () {
                 reply(event, "error");

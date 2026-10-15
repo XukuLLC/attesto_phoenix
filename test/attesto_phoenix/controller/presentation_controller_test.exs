@@ -64,6 +64,24 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     def verification_pems, do: [signing_pem()]
   end
 
+  defmodule ObservableKeystore do
+    @moduledoc false
+    @behaviour Attesto.Keystore
+
+    @impl true
+    def signing_pem do
+      opts = Application.fetch_env!(:attesto_phoenix, __MODULE__)
+      send(Keyword.fetch!(opts, :observer), :presentation_signing_key_requested)
+      Keyword.fetch!(opts, :signing_pem)
+    end
+
+    @impl true
+    def verification_pems do
+      opts = Application.fetch_env!(:attesto_phoenix, __MODULE__)
+      [Keyword.fetch!(opts, :signing_pem)]
+    end
+  end
+
   setup do
     start_supervised!(Store)
 
@@ -106,6 +124,7 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     on_exit(fn ->
       Application.delete_env(:attesto_phoenix, Keystore)
       Application.delete_env(:attesto_phoenix, EncryptionKeystore)
+      Application.delete_env(:attesto_phoenix, ObservableKeystore)
       Application.delete_env(:attesto_phoenix, Config)
       Application.delete_env(:attesto_phoenix, :otp_app)
     end)
@@ -154,15 +173,14 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     response = post_response(conn, ctx.config, session.id, JSON.encode!(vp_token))
 
     assert response.status == 200
-
-    assert json_response(response, 200) == %{
-             "redirect_uri" => @issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(session.id)
-           }
+    response_code = response_code(response)
+    refute response_code == session.id
 
     assert get_resp_header(response, "cache-control") == ["no-store"]
+    assert :error = Verifier.presentation_result(ctx.config, session.id)
 
-    assert {:ok, %{@query_id => result}} =
-             Verifier.presentation_result(ctx.config, session.id)
+    assert {:ok, %{@query_id => [result]}} =
+             Verifier.presentation_result(ctx.config, response_code)
 
     assert result.vct == "identity"
     assert result.iss == @issuer
@@ -181,8 +199,8 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
     assert response.status == 200
 
-    assert {:ok, %{@query_id => result}} =
-             Verifier.presentation_result(config, session.id)
+    assert {:ok, %{@query_id => [result]}} =
+             Verifier.presentation_result(config, response_code(response))
 
     assert result.claims["given_name"] == "Alice"
   end
@@ -194,7 +212,9 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     response = post_json_response(conn, ctx.config, session.id, vp_token)
 
     assert response.status == 200
-    assert {:ok, %{@query_id => _result}} = Verifier.presentation_result(ctx.config, session.id)
+
+    assert {:ok, %{@query_id => [_result]}} =
+             Verifier.presentation_result(ctx.config, response_code(response))
   end
 
   test "direct_post.jwt round-trips with an RSA main keystore and dedicated EC encryption key",
@@ -226,13 +246,34 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     response = post_encrypted_response(conn, config, encrypted_response)
 
     assert response.status == 200
+    response_code = response_code(response)
+    refute response_code == session.id
 
-    assert json_response(response, 200) == %{
-             "redirect_uri" => @issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(session.id)
-           }
-
-    assert {:ok, %{@query_id => result}} = Verifier.presentation_result(config, session.id)
+    assert {:ok, %{@query_id => [result]}} = Verifier.presentation_result(config, response_code)
     assert result.claims["given_name"] == "Alice"
+  end
+
+  test "direct_post.jwt rejects a protected kid that differs from the inner state", %{conn: conn} = ctx do
+    config = configure_response_mode(ctx.config, "direct_post.jwt")
+    ctx = %{ctx | config: config}
+    keyed_session = create_request(ctx)
+    other_session = create_request(ctx)
+    encryption_jwk = advertised_encryption_jwk(keyed_session.id, ctx.request_jwk)
+
+    encrypted_response =
+      encrypt_response(
+        encryption_jwk,
+        JSON.encode!(%{
+          "vp_token" => valid_vp_token(ctx, other_session.nonce),
+          "state" => other_session.id
+        })
+      )
+
+    response = post_encrypted_response(conn, config, encrypted_response)
+
+    assert_invalid_request(response)
+    assert_pending(keyed_session.id)
+    assert_pending(other_session.id)
   end
 
   test "direct_post.jwt rejects a compressed (zip) JWE before decrypting - decompression-bomb guard",
@@ -357,7 +398,9 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     response = post_response(conn, ctx.config, session.id, JSON.encode!(vp_token))
 
     assert response.status == 200
-    assert {:ok, %{@query_id => _result}} = Verifier.presentation_result(ctx.config, session.id)
+
+    assert {:ok, %{@query_id => [_result]}} =
+             Verifier.presentation_result(ctx.config, response_code(response))
   end
 
   test "wrong nonce and audience return the same public error without completion", %{conn: conn} = ctx do
@@ -388,6 +431,38 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     assert_invalid_request(audience_response)
     assert_pending(wrong_audience.id)
     assert :error = Verifier.presentation_result(ctx.config, wrong_audience.id)
+  end
+
+  test "an invalid presentation is rejected before a response code is signed", %{conn: conn} = ctx do
+    opts =
+      :attesto_phoenix
+      |> Application.fetch_env!(Config)
+      |> Keyword.put(:keystore, ObservableKeystore)
+
+    Application.put_env(:attesto_phoenix, ObservableKeystore,
+      signing_pem: Keystore.signing_pem(),
+      observer: self()
+    )
+
+    Application.put_env(:attesto_phoenix, Config, opts)
+    config = Config.new(opts)
+    ctx = %{ctx | config: config}
+    session = create_request(ctx)
+
+    assert_receive :presentation_signing_key_requested
+    refute_receive :presentation_signing_key_requested
+
+    response =
+      post_response(
+        conn,
+        config,
+        session.id,
+        JSON.encode!(valid_vp_token(ctx, "wrong-nonce"))
+      )
+
+    assert_invalid_request(response)
+    assert_pending(session.id)
+    refute_receive :presentation_signing_key_requested
   end
 
   test "unknown and expired state return the same public error", %{conn: conn} = ctx do
@@ -421,7 +496,9 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     session = create_request(ctx)
     encoded = session |> valid_vp_token_for_session(ctx) |> JSON.encode!()
 
-    assert post_response(conn, ctx.config, session.id, encoded).status == 200
+    first = post_response(conn, ctx.config, session.id, encoded)
+    assert first.status == 200
+    response_code = response_code(first)
 
     # Replay of the direct-post is rejected while the completed session is still
     # unread (the pending -> completed guard, not merely a missing session).
@@ -431,8 +508,22 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     # The verified result is readable exactly once: the read consumes the
     # session, so a `response_code` captured from the browser channel cannot be
     # replayed to re-read the presented claims.
-    assert {:ok, _first_result} = Verifier.presentation_result(ctx.config, session.id)
     assert :error = Verifier.presentation_result(ctx.config, session.id)
+    assert {:ok, _first_result} = Verifier.presentation_result(ctx.config, response_code)
+    assert :error = Verifier.presentation_result(ctx.config, response_code)
+  end
+
+  test "a forged response code cannot consume the completed result", %{conn: conn} = ctx do
+    session = create_request(ctx)
+    encoded = session |> valid_vp_token_for_session(ctx) |> JSON.encode!()
+    response = post_response(conn, ctx.config, session.id, encoded)
+    response_code = response_code(response)
+    last = binary_part(response_code, byte_size(response_code) - 1, 1)
+    replacement = if last == "A", do: "B", else: "A"
+    forged = binary_part(response_code, 0, byte_size(response_code) - 1) <> replacement
+
+    assert :error = Verifier.presentation_result(ctx.config, forged)
+    assert {:ok, _result} = Verifier.presentation_result(ctx.config, response_code)
   end
 
   test "malformed vp_token returns invalid_request without verification details", %{conn: conn} = ctx do
@@ -462,7 +553,7 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
   defp valid_vp_token(ctx, nonce, audience \\ @verifier_client_id) do
     presentation = ctx.vc <> key_binding_jwt(ctx.holder_pem, ctx.vc, nonce, audience, ctx.now)
-    %{@query_id => presentation}
+    %{@query_id => [presentation]}
   end
 
   defp valid_vp_token_for_session(session, ctx), do: valid_vp_token(ctx, session.nonce)
@@ -495,6 +586,13 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
   defp post_encrypted_response(conn, config, encrypted_response) do
     post(conn, Config.presentation_response_path(config), %{"response" => encrypted_response})
+  end
+
+  defp response_code(response) do
+    %{"redirect_uri" => redirect_uri} = json_response(response, 200)
+    %URI{path: "/presentation/complete", query: query} = URI.parse(redirect_uri)
+    %{"response_code" => response_code} = URI.decode_query(query)
+    response_code
   end
 
   defp advertised_encryption_jwk(id, request_jwk) do

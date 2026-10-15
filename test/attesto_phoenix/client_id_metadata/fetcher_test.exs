@@ -96,6 +96,9 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       # NAT64 local-use 64:ff9b:1::/48 (RFC 8215, RFC 6052 §2.2 /48 embedding) of
       # 169.254.169.254: a=169 b=254 -> w4=0xA9FE; c=169 -> w5=0x00A9; d=254 -> w6=0xFE00.
       assert Fetcher.special_use_ip?({0x0064, 0xFF9B, 0x0001, 0xA9FE, 0x00A9, 0xFE00, 0, 0})
+      # The entire RFC 8215 local-use /48 is blocked because deployments may use
+      # any RFC 6052 embedding layout beneath it.
+      assert Fetcher.special_use_ip?({0x0064, 0xFF9B, 0x0001, 0, 0, 0, 0, 1})
       # NAT64 wrapping loopback / private.
       assert Fetcher.special_use_ip?({0x0064, 0xFF9B, 0, 0, 0, 0, 0x7F00, 0x0001})
       # 6to4 2002:a9fe:a9fe::/48 embeds 169.254.169.254.
@@ -117,6 +120,20 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
   end
 
   describe "fetch/2 SSRF rejections via injected resolver" do
+    test "rejects an overlong URL before invoking the resolver" do
+      owner = self()
+
+      resolver = fn _host, _family ->
+        send(owner, :resolver_called)
+        {:ok, [{93, 184, 216, 34}]}
+      end
+
+      url = "https://app.example/" <> String.duplicate("a", 2_048)
+
+      assert {:error, {:invalid_url, :too_long}} = Fetcher.fetch(url, resolver: resolver)
+      refute_received :resolver_called
+    end
+
     test "IDNA DNS canonicalization keeps the special-use IP screen authoritative" do
       test_pid = self()
 
@@ -329,6 +346,26 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       assert cache_control[:no_cache] == true
       assert cache_control[:age] == 120
       assert cache_control[:date] == "Sun, 04 Oct 2026 12:00:00 GMT"
+    end
+
+    test "sends a non-default port in the Host header" do
+      owner = self()
+
+      capture_plug = fn conn ->
+        send(owner, {:request_host, Plug.Conn.get_req_header(conn, "host")})
+
+        conn
+        |> Plug.Conn.put_resp_content_type("application/json")
+        |> Plug.Conn.resp(200, ~s({"client_id":"https://app.example:8443/client.json"}))
+      end
+
+      assert {:ok, _result} =
+               Fetcher.fetch("https://app.example:8443/client.json",
+                 resolver: resolver([{93, 184, 216, 34}]),
+                 req_options: [plug: capture_plug]
+               )
+
+      assert_received {:request_host, ["app.example:8443"]}
     end
 
     test "parses shared-cache s-maxage and private directives", %{server: server} do

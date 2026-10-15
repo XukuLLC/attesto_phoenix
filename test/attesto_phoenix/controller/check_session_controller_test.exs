@@ -69,6 +69,13 @@ defmodule AttestoPhoenix.Controller.CheckSessionControllerTest do
     assert conn.resp_body =~ ~s("unchanged")
     assert conn.resp_body =~ ~s("changed")
     assert conn.resp_body =~ ~s("error")
+    assert conn.resp_body =~ "Promise.resolve().then"
+
+    promise_pos = :binary.match(conn.resp_body, "Promise.resolve().then") |> elem(0)
+    state_pos = :binary.match(conn.resp_body, "browserState() +") |> elem(0)
+    hash_pos = :binary.match(conn.resp_body, "return sha256Hex(text)") |> elem(0)
+    assert promise_pos < state_pos
+    assert state_pos < hash_pos
 
     # The default (__Host- prefixed) browser-state cookie name is embedded.
     assert conn.resp_body =~ ~s("__Host-attesto_op_browser_state")

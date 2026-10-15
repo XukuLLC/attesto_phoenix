@@ -64,6 +64,32 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ "Keep client_notification_token as text"
     end
 
+    test "generates the CIMD URL text upgrade for an existing installation", %{tmp_dir: tmp_dir} do
+      run!(["--upgrade", "3.6", "--schema-prefix", "auth"], tmp_dir)
+      assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_6.exs"))
+      source = File.read!(file)
+
+      assert source =~ ~s|prefix = effective_prefix("auth")|
+      assert source =~ ~s|alter table(:attesto_client_id_metadata, prefix: prefix)|
+      assert source =~ ~s|modify :url, :text, from: {:string, size: 255}, null: false|
+    end
+
+    test "generates the authorization-code replay retention upgrade", %{tmp_dir: tmp_dir} do
+      run!(["--upgrade", "3.7", "--schema-prefix", "auth"], tmp_dir)
+
+      assert [file] =
+               Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_7.exs"))
+
+      source = File.read!(file)
+      assert source =~ ~s|prefix = effective_prefix("auth")|
+      assert source =~ ~s|alter table(:attesto_authorization_codes, prefix: prefix)|
+      assert source =~ ~s|add :replay_retain_until, :utc_datetime|
+      assert source =~ "LOCK TABLE "
+      assert source =~ "SET LOCAL row_security = off"
+      assert source =~ "consumed_success = TRUE AND family_id IS NOT NULL"
+      assert source =~ "Cannot safely rollback 3.7 migration"
+    end
+
     test "renders an omitted 3.4 prefix without a redundant nil expression", %{tmp_dir: tmp_dir} do
       run!(["--upgrade", "3.4"], tmp_dir)
       assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_4.exs"))
@@ -127,6 +153,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       #   * AttestoPhoenix.Schema.ConsentGrant                -> attesto_consent_grants
       assert source =~ ~s|use Ecto.Migration|
       assert source =~ ~s|create table(:attesto_authorization_codes|
+      assert source =~ ~s|add :replay_retain_until, :utc_datetime|
       assert source =~ ~s|create table(:attesto_refresh_tokens|
       assert source =~ ~s|create table(:attesto_refresh_family_revocations|
       assert source =~ ~s|create table(:attesto_device_codes|
@@ -143,9 +170,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       run!([], tmp_dir)
       source = generated_migration(tmp_dir)
 
-      # ClientIdMetadata declares @primary_key {:url, :string}, so url is the
-      # PRIMARY KEY; metadata is jsonb (:map); expires_at is indexed for sweeps.
-      assert source =~ ~s|add :url, :string, size: 255, primary_key: true, null: false|
+      # The URL is bounded before admission but stored as text so validated
+      # client identifiers above 255 bytes remain cacheable.
+      assert source =~ ~s|add :url, :text, primary_key: true, null: false|
       assert source =~ ~s|add :metadata, :map, null: false|
 
       assert source =~

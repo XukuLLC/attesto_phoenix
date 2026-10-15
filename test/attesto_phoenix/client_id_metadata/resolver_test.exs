@@ -155,6 +155,16 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
   end
 
   describe "resolve/2" do
+    test "rejects an overlong client_id before cache or network access" do
+      client_id = "https://app.example/" <> String.duplicate("a", 2_048)
+      FaultCache.script({:raise, "cache must not run"})
+
+      assert {:error, {:invalid_client_id, :too_long}} =
+               Resolver.resolve(client_id, resolver_config(cache: FaultCache))
+
+      assert FaultCache.put_calls() == 0
+    end
+
     test "returns the normalized client for a valid document", %{agent: agent} do
       url = unique_url()
       StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: []}})

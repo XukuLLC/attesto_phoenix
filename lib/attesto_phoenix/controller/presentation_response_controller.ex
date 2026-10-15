@@ -11,7 +11,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   use AttestoPhoenix.Controller, formats: [:json]
 
   alias Attesto.PresentationSession
-  alias AttestoPhoenix.{Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Config, OAuthError, RequestContext, Verifier}
   alias Plug.Conn.Unfetched
 
   # `response` is attacker-controlled input at a public endpoint. Bound it and
@@ -31,21 +31,23 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     with :ok <- check_https(conn, config),
          {:ok, store} <- presentation_session_store(config),
          {:ok, state, vp_token} <- response(Map.get(conn, :body_params), config, store),
-         {:ok, _results} <- verify_response(store, state, vp_token) do
+         {:ok, _request_object} <- PresentationSession.request_object(store, state),
+         {:ok, _results} <- verify_response(store, state, vp_token),
+         {:ok, response_code} <- Verifier.issue_presentation_response_code(config, state) do
       # OID4VP §8.2 permits, and HAIP §5.1 requires, a `redirect_uri` carrying a
       # `response_code` so the wallet returns the user to the verifier front-end,
       # which then retrieves the completed presentation result. That read is
       # single-use (`AttestoPhoenix.Verifier.presentation_result/2` consumes the
       # session), so this browser-borne `response_code` cannot be replayed from
       # history/logs to re-read the presented claims.
-      json(conn, %{"redirect_uri" => redirect_uri(config, state)})
+      json(conn, %{"redirect_uri" => redirect_uri(config, response_code)})
     else
       _error -> invalid_request(conn, config)
     end
   end
 
-  defp redirect_uri(config, state) do
-    config.issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(state)
+  defp redirect_uri(config, response_code) do
+    config.issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(response_code)
   end
 
   defp response(%Unfetched{}, _config, _store), do: {:error, :malformed}
@@ -90,7 +92,8 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
          %JOSE.JWK{} = private_jwk <- JOSE.JWK.from_map(jwk_map),
          {plaintext, %JOSE.JWE{}} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
          {:ok, params} <- decode_json_map(plaintext),
-         {:ok, state, vp_token} <- decoded_response(params) do
+         {:ok, state, vp_token} <- decoded_response(params),
+         true <- state == kid do
       {:ok, state, vp_token}
     else
       _ -> {:error, :malformed}

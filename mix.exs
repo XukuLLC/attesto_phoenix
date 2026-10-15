@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "3.5.1"
+  @version "4.0.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.2.2 and < 3.0.0"
+  @attesto_requirement ">= 2.4.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,10 +76,10 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # The 2.2.2 floor is load-bearing: Phoenix supplies the configured issuer to
-  # the refresh issuance, rotation, introspection, and revocation APIs added in
-  # that release. Resolving an older core would silently omit the cross-issuer
-  # family boundary.
+  # The 2.4.0 floor is load-bearing: Phoenix persists authorization-code replay
+  # deadlines introduced in that core release and consumes its CIBA resource
+  # and signed-JAR authorization-details APIs. Resolving an older core would
+  # either lose replay evidence too early or omit signed authorization policy.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 
@@ -124,6 +124,10 @@ defmodule AttestoPhoenix.MixProject do
       # Ecto-backed CodeStore/RefreshStore/NonceStore/ReplayCheck + the migration
       # generator.
       {:ecto_sql, "~> 3.10"},
+      # Security floor for Ecto's Decimal dependency. Decimal < 3.1.2 permits
+      # unbounded allocation through attacker-controlled `round/3` places
+      # (CVE-2026-97853).
+      {:decimal, ">= 3.1.2 and < 4.0.0"},
       # Runtime events emitted by the sweeper-liveness monitor.
       {:telemetry, "~> 1.0"},
       # Controllers + the attesto_routes/1 router macro.
@@ -161,7 +165,13 @@ defmodule AttestoPhoenix.MixProject do
       {:req_dpop, "~> 0.5", only: :test, runtime: false},
       # test-only HTTP origin server for outbound delivery/fetch tests. Bandit
       # avoids pulling the advisory-affected Cowboy/Cowlib stack into the lock.
-      {:bandit, "~> 1.12.1", only: :test},
+      # No patched Hex release exists yet for CVE-2026-105659, so pin the
+      # upstream fix exactly until the next Bandit release is published.
+      {:bandit,
+       git: "https://github.com/mtrudel/bandit.git",
+       ref: "d88b21953c65061f21136ea76a89a4f95a2ac7a1",
+       only: :test,
+       override: true},
 
       # dev / quality
       {:ex_doc, "~> 0.40", only: :dev, runtime: false},
@@ -191,6 +201,7 @@ defmodule AttestoPhoenix.MixProject do
       source_url: @url,
       extras: [
         "README.md",
+        "guides/upgrade_4_0.md",
         "guides/upgrade_3_0_schema_prefix.md",
         "guides/upgrade_3_4_1_security.md",
         "guides/upgrade_3_5.md",

@@ -641,8 +641,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       for userinfo_path <- [
             "/oauth/userinfo/",
             "/oauth//userinfo",
-            "/oauth/%75serinfo",
-            "/oauth/userinfo?aud=api"
+            "/oauth/%75serinfo"
           ] do
         body =
           call_show(
@@ -653,6 +652,10 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
           |> decode_body()
 
         refute Map.has_key?(body, "userinfo_endpoint")
+      end
+
+      assert_raise ArgumentError, ~r/:userinfo_path must be an absolute path/, fn ->
+        host_config(userinfo_endpoint: :derived, userinfo_path: "/oauth/userinfo?aud=api")
       end
     end
 

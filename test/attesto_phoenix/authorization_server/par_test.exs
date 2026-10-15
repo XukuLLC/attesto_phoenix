@@ -72,6 +72,28 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
     def fetch(_request_uri), do: :error
   end
 
+  defmodule FullStore do
+    @moduledoc false
+    @behaviour AttestoPhoenix.PARStore
+
+    @impl true
+    def put(_request_uri, _params, _ttl), do: {:error, :capacity}
+
+    @impl true
+    def fetch(_request_uri), do: :error
+  end
+
+  defmodule OversizeStore do
+    @moduledoc false
+    @behaviour AttestoPhoenix.PARStore
+
+    @impl true
+    def put(_request_uri, _params, _ttl), do: {:error, :record_too_large}
+
+    @impl true
+    def fetch(_request_uri), do: :error
+  end
+
   defp required_fields do
     [
       issuer: "https://issuer.example",
@@ -227,6 +249,52 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
       assert stored["client_id"] == "confidential-1"
     end
 
+    test "preserves signed authorization_details and ignores an unsigned outer value" do
+      jwk = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_, public_map} = JOSE.JWK.to_public_map(jwk)
+
+      signed_details = [
+        %{"type" => "openid_credential", "credential_configuration_id" => "SignedCredential"}
+      ]
+
+      outer_details = [
+        %{"type" => "openid_credential", "credential_configuration_id" => "OuterCredential"}
+      ]
+
+      claims =
+        base_params()
+        |> Map.merge(%{
+          "iss" => "confidential-1",
+          "aud" => "https://issuer.example",
+          "authorization_details" => signed_details
+        })
+
+      {_, signed_request} =
+        jwk
+        |> JOSE.JWT.sign(%{"alg" => "ES256", "kid" => "par-key-1"}, claims)
+        |> JOSE.JWS.compact()
+
+      config =
+        config(client_jwks: fn _client -> %{"keys" => [Map.put(public_map, "kid", "par-key-1")]} end)
+
+      params = %{
+        "request" => signed_request,
+        "authorization_details" => JSON.encode!(outer_details)
+      }
+
+      assert {:ok, %{request_uri: request_uri}} = PAR.store(config, request(params: params))
+      assert {:ok, stored, 45} = Store.lookup(request_uri)
+      assert stored["authorization_details"] == signed_details
+      assert stored["request"] == signed_request
+    end
+
+    test "rejects malformed direct authorization_details with the RFC 9396 error" do
+      params = Map.put(base_params(), "authorization_details", "[]")
+
+      assert {:error, %OAuthError{error: :invalid_authorization_details}} =
+               PAR.store(config(), request(params: params))
+    end
+
     # A `client_id` smuggled inside a signed request object cannot reach the
     # store either. Two independent rules close it, so this pins both rather
     # than assuming `require_matching_client_id/2` is the one doing the work:
@@ -330,6 +398,30 @@ defmodule AttestoPhoenix.AuthorizationServer.PARTest do
 
       assert log =~ "AttestoPhoenix PAR store reported an error; pushed request was not stored"
       refute log =~ "boom"
+    end
+
+    test "a full bounded store returns a stable temporarily_unavailable error" do
+      config = config(par_store: FullStore)
+
+      log =
+        capture_log(fn ->
+          assert {:error, %OAuthError{error: :temporarily_unavailable, status: 503}} =
+                   PAR.store(config, request(params: base_params()))
+        end)
+
+      assert log =~ "PAR store capacity is exhausted"
+    end
+
+    test "an oversized retained record is a controlled invalid_request" do
+      config = config(par_store: OversizeStore)
+
+      log =
+        capture_log(fn ->
+          assert {:error, %OAuthError{error: :invalid_request, status: 400}} =
+                   PAR.store(config, request(params: base_params()))
+        end)
+
+      assert log =~ "PAR store rejected an oversized record"
     end
 
     test "rejects a request_uri parameter at the PAR endpoint (RFC 9126 §2.1)" do

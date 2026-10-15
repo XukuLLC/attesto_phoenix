@@ -82,6 +82,20 @@ defmodule AttestoPhoenix.Controller.NonceControllerTest do
     assert get_resp_header(response, "pragma") == ["no-cache"]
   end
 
+  test "treats an explicitly nil c_nonce store as missing" do
+    config = Application.fetch_env!(:attesto_phoenix, Config)
+    put_config(Keyword.put(config, :c_nonce_store, nil))
+
+    response = CredentialRouter.call(conn(:post, @nonce_path), [])
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => "invalid_request",
+             "error_description" => "c_nonce_store is required"
+           }
+  end
+
   test "fails loudly when the c_nonce store returns an invalid nonce" do
     config = Application.fetch_env!(:attesto_phoenix, Config)
     put_config(Keyword.put(config, :c_nonce_store, InvalidIssueStore))

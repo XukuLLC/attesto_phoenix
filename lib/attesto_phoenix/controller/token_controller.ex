@@ -55,6 +55,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.{Callback, ClientAuthentication, Config, Event, OAuthError, RequestContext}
   alias AttestoPhoenix.ClientAuthentication.ErrorContext
+  alias AttestoPhoenix.Controller.QueryParameterGuard
   alias Plug.Conn.Unfetched
 
   require Logger
@@ -64,10 +65,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
   @error_invalid_request :invalid_request
   @error_invalid_dpop_proof :invalid_dpop_proof
 
-  # RFC 6749 §2.3.1 / §4.4.2 place token request credentials and requested
-  # scope in the form body. Query-string credentials leak through access logs
-  # and caches, so reject them before client authentication or grant dispatch.
-  @query_credential_params ~w(grant_type client_id client_secret scope)
   @accepted_content_types ~w(application/x-www-form-urlencoded application/json)
 
   # RFC 9449 §4.1: the DPoP proof request header read off the conn and passed
@@ -92,10 +89,13 @@ defmodule AttestoPhoenix.Controller.TokenController do
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_token_content_type(conn),
-         :ok <- reject_query_credentials(conn),
+         :ok <- QueryParameterGuard.reject(conn),
          :ok <- reject_multiple_dpop_proofs(conn) do
       create_transport_checked(config, conn, params)
     else
+      {:error, :query_parameters_not_allowed} ->
+        deny(config, conn, request_body_params(conn, params), nil, QueryParameterGuard.error())
+
       {:error, %OAuthError{} = err} ->
         deny(config, conn, request_body_params(conn, params), nil, err)
     end
@@ -128,16 +128,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
     end
   end
 
-  defp reject_query_credentials(conn) do
-    case Enum.find(@query_credential_params, &Map.has_key?(query_params(conn), &1)) do
-      nil ->
-        :ok
-
-      key ->
-        {:error, error(@error_invalid_request, "#{key} must be sent in the request body, not the query string")}
-    end
-  end
-
   # RFC 9449 §4.3: a token request carries at most one DPoP proof JWT. More than
   # one `DPoP` header field is rejected outright rather than processed - the
   # server must not silently pick one proof when several are presented (a header
@@ -162,14 +152,6 @@ defmodule AttestoPhoenix.Controller.TokenController do
         deny(config, conn, params, nil, error(@error_invalid_request, "TLS required"))
     end
   end
-
-  defp query_params(%Plug.Conn{query_params: %Unfetched{}} = conn) do
-    conn
-    |> fetch_query_params()
-    |> Map.fetch!(:query_params)
-  end
-
-  defp query_params(%Plug.Conn{query_params: params}) when is_map(params), do: params
 
   # An unparsed body (e.g. a denied unsupported Content-Type) leaves
   # `body_params` an `%Unfetched{}` struct. A struct IS a map, so the

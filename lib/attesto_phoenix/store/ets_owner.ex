@@ -24,18 +24,69 @@ defmodule AttestoPhoenix.Store.ETSOwner do
     GenServer.call(__MODULE__, {:ensure, table, options})
   end
 
+  @doc false
+  @spec insert_bounded_expiring(
+          atom(),
+          [term()],
+          term(),
+          term(),
+          integer(),
+          integer(),
+          pos_integer()
+        ) :: :ok | {:error, :conflict | :capacity}
+  def insert_bounded_expiring(table, options, key, value, expires_at, now, max_entries)
+      when is_atom(table) and is_list(options) and is_integer(expires_at) and is_integer(now) and
+             is_integer(max_entries) and max_entries > 0 do
+    ensure_owner()
+
+    GenServer.call(
+      __MODULE__,
+      {:insert_bounded_expiring, table, options, key, value, expires_at, now, max_entries}
+    )
+  end
+
   @impl true
   def init(state), do: {:ok, state}
 
   @impl true
   def handle_call({:ensure, table, options}, _from, state) do
-    table =
-      case :ets.whereis(table) do
-        :undefined -> :ets.new(table, options)
-        _tid -> table
-      end
+    table = ensure_table(table, options)
 
     {:reply, table, state}
+  end
+
+  def handle_call({:insert_bounded_expiring, table, options, key, value, expires_at, now, max_entries}, _from, state) do
+    table = ensure_table(table, options)
+
+    # Every admission runs in the table owner, so concurrent writers cannot
+    # all observe a spare slot and overfill the table. Reads/takes may only
+    # remove entries and therefore cannot invalidate the capacity decision.
+    _deleted =
+      :ets.select_delete(table, [
+        {{:"$1", :"$2", :"$3"}, [{:"=<", :"$3", now}], [true]}
+      ])
+
+    result =
+      cond do
+        :ets.member(table, key) ->
+          {:error, :conflict}
+
+        :ets.info(table, :size) >= max_entries ->
+          {:error, :capacity}
+
+        true ->
+          true = :ets.insert(table, {key, value, expires_at})
+          :ok
+      end
+
+    {:reply, result, state}
+  end
+
+  defp ensure_table(table, options) do
+    case :ets.whereis(table) do
+      :undefined -> :ets.new(table, options)
+      _tid -> table
+    end
   end
 
   # `GenServer.start/3`, NOT `start_link/3`: the owner holds the ETS tables,

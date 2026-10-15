@@ -290,6 +290,37 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       refute_received {:cimd_fetch, _uri}
     end
 
+    test "unknown clients use the explicit dummy-work callback without entering a typed verifier", %{config: config} do
+      test_process = self()
+
+      config = %{
+        config
+        | verify_client_secret: fn %{secret: expected}, supplied -> expected == supplied end,
+          verify_dummy_client_secret: fn supplied ->
+            send(test_process, {:dummy_secret_checked, supplied})
+            false
+          end
+      }
+
+      assert_generic_invalid_client(
+        authenticate(basic("missing-client", "presented-secret"), %{}, config, allow_public: false)
+      )
+
+      assert_receive {:dummy_secret_checked, "presented-secret"}
+    end
+
+    test "legacy typed secret callbacks cannot turn an unknown client into a 500", %{config: config} do
+      config = %{
+        config
+        | verify_client_secret: fn %{secret: expected}, supplied -> expected == supplied end,
+          verify_dummy_client_secret: nil
+      }
+
+      assert_generic_invalid_client(
+        authenticate(basic("missing-client", "presented-secret"), %{}, config, allow_public: false)
+      )
+    end
+
     test "Basic and post registrations are distinct even when both methods are supported", %{config: config} do
       for registered <- [:client_secret_basic, :client_secret_post], endpoint <- @authentication_endpoints do
         configured = registered_method_config(config, registered)
@@ -1068,7 +1099,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       assert {:ok, %Result{method: :private_key_jwt}} =
                authenticate([], params, config,
                  allow_public: false,
-                 assertion_signing_algs: ["PS256"]
+                 assertion_signing_algs: ["PS256"],
+                 assertion_enforce_fapi_alg_policy: false
                )
     end
 
@@ -1106,7 +1138,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       assert {:ok, %Result{method: :private_key_jwt}} =
                authenticate([], params, config,
                  allow_public: false,
-                 assertion_signing_algs: ["EdDSA"]
+                 assertion_signing_algs: ["EdDSA"],
+                 assertion_enforce_fapi_alg_policy: false
                )
     end
   end

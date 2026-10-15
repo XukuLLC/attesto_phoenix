@@ -20,21 +20,18 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import AttestoPhoenix.Controller.OID4VCIHelpers,
-    only: [body_params: 2, invalid_request: 4, maybe_put_option: 3]
-
+  import AttestoPhoenix.Controller.OID4VCIHelpers, only: [body_params: 2, invalid_request: 4]
   import Plug.Conn
 
-  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS, Key, MapParams, Mdoc, SdJwtVc, SigningAlg}
+  alias Attesto.{CredentialProof, CredentialRequest, CredentialResponse, JWS}
   alias AttestoPhoenix.Callback
-  alias AttestoPhoenix.{Config, ProtectedResource}
+  alias AttestoPhoenix.{Config, CredentialIssuer, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
   require Logger
 
   @credential_configuration_ids_claim "credential_configuration_ids"
   @mdoc_signing_key_error "mso_mdoc issuance requires an EC P-256 (ES256) VC signing key."
-  @sd_jwt_vc_formats ~w(vc+sd-jwt dc+sd-jwt)
   @invalid_builder_result_warning "AttestoPhoenix credential builder returned an invalid result; credential issuance denied"
   @builder_failure "AttestoPhoenix credential builder callback failed"
   @nonce_consume_failure "c_nonce_store consume/1 must return :ok or {:error, reason}"
@@ -266,7 +263,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   defp nonce_valid?(config, nonce) do
     case Callback.config_callback(config, :c_nonce_store) do
-      store when is_atom(store) ->
+      store when is_atom(store) and not is_nil(store) ->
         if function_exported?(store, :valid?, 1) do
           nonce_valid_from_store!(store, nonce)
         else
@@ -337,130 +334,30 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   end
 
   defp build_credentials(config, subject, credential_configuration_id, holder_jwks) do
-    with {:ok, credential_configuration} <-
-           credential_configuration(config, credential_configuration_id) do
-      build_credentials(
-        config,
-        subject,
-        credential_configuration_id,
-        holder_jwks,
-        credential_configuration
+    with :ok <- CredentialIssuer.validate_configuration(config, credential_configuration_id) do
+      holder_jwks
+      |> Enum.reduce_while(
+        {:ok, []},
+        &reduce_credential(&1, &2, config, subject, credential_configuration_id)
       )
+      |> reverse_credentials()
     end
   end
 
-  defp build_credentials(config, subject, credential_configuration_id, holder_jwks, credential_configuration) do
-    format = configuration_value(credential_configuration, :format)
-
-    holder_jwks
-    |> Enum.reduce_while({:ok, []}, fn holder_jwk, {:ok, acc} ->
-      case build_credential(
-             config,
-             subject,
-             credential_configuration_id,
-             holder_jwk,
-             format,
-             credential_configuration
-           ) do
-        {:ok, credential} -> {:cont, {:ok, [credential | acc]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, credentials} -> {:ok, Enum.reverse(credentials)}
-      error -> error
+  defp reduce_credential(holder_jwk, {:ok, acc}, config, subject, credential_configuration_id) do
+    case build_credential(config, subject, credential_configuration_id, holder_jwk) do
+      {:ok, credential} -> {:cont, {:ok, [credential | acc]}}
+      {:error, reason} -> {:halt, {:error, reason}}
     end
   end
 
-  defp build_credential(config, subject, credential_configuration_id, holder_jwk, format, _configuration)
-       when format in @sd_jwt_vc_formats do
-    build_credential(config, subject, credential_configuration_id, holder_jwk, format)
-  end
+  defp reverse_credentials({:ok, credentials}), do: {:ok, Enum.reverse(credentials)}
+  defp reverse_credentials(error), do: error
 
-  defp build_credential(config, subject, credential_configuration_id, holder_jwk, "jwt_vc_json", _configuration) do
-    build_jwt_vc_credential(config, subject, credential_configuration_id, holder_jwk)
-  end
-
-  defp build_credential(config, subject, credential_configuration_id, holder_jwk, "mso_mdoc", credential_configuration) do
-    build_mdoc_credential(config, subject, credential_configuration_id, holder_jwk, credential_configuration)
-  end
-
-  defp build_credential(_config, _subject, _credential_configuration_id, _holder_jwk, _format, _configuration),
-    do: {:error, :unsupported_credential_format}
-
-  defp build_credential(config, subject, credential_configuration_id, holder_jwk, format) do
+  defp build_credential(config, subject, credential_configuration_id, holder_jwk) do
     case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
-      {:ok, %{vct: vct, claims: claims} = result}
-      when is_binary(vct) and is_map(claims) ->
-        if valid_issued_at?(result),
-          do: {:ok, issue_credential(config, result, holder_jwk, format)},
-          else: normalize_build_result(:invalid_issued_at)
-
-      other ->
-        normalize_build_result(other)
-    end
-  end
-
-  defp issue_credential(config, %{vct: vct, claims: claims} = result, holder_jwk, format) do
-    SdJwtVc.issue(
-      [
-        iss: config.issuer,
-        vct: vct,
-        keystore: Config.vc_keystore(config)
-      ],
-      [
-        claims: claims,
-        cnf: %{"jwk" => holder_jwk},
-        typ: format
-      ]
-      |> maybe_put_option(:x5c, Config.vc_signing_x5c(config))
-      |> maybe_put_option(:iat, Map.get(result, :issued_at))
-      |> maybe_put_option(:exp, Map.get(result, :valid_until))
-      |> maybe_put_option(:nbf, Map.get(result, :valid_from))
-    )
-  end
-
-  defp valid_issued_at?(result) do
-    case Map.fetch(result, :issued_at) do
-      :error -> true
-      {:ok, value} -> is_integer(value)
-    end
-  end
-
-  defp build_jwt_vc_credential(config, subject, credential_configuration_id, holder_jwk) do
-    case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
-      {:ok, %{credential_type: credential_type, claims: claims} = result}
-      when is_binary(credential_type) and is_map(claims) ->
-        {:ok, issue_jwt_vc_credential(config, subject, result, holder_jwk)}
-
-      other ->
-        normalize_build_result(other)
-    end
-  end
-
-  defp issue_jwt_vc_credential(config, subject, result, holder_jwk) do
-    Attesto.JwtVc.issue(
-      [
-        iss: config.issuer,
-        sub: subject,
-        keystore: Config.vc_keystore(config)
-      ],
-      [
-        type: ["VerifiableCredential", result.credential_type],
-        claims: result.claims,
-        cnf: %{"jwk" => holder_jwk}
-      ]
-      |> maybe_put_option(:exp, Map.get(result, :valid_until))
-      |> maybe_put_option(:nbf, Map.get(result, :valid_from))
-    )
-  end
-
-  defp build_mdoc_credential(config, subject, credential_configuration_id, holder_jwk, credential_configuration) do
-    case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
-      {:ok, %{namespaces: namespaces} = result} when is_map(namespaces) ->
-        if valid_issued_at?(result),
-          do: issue_mdoc_credential(config, result, holder_jwk, credential_configuration),
-          else: normalize_build_result(:invalid_issued_at)
+      {:ok, result} when is_map(result) ->
+        CredentialIssuer.issue(config, subject, credential_configuration_id, holder_jwk, result)
 
       other ->
         normalize_build_result(other)
@@ -481,84 +378,6 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     Logger.warning(@invalid_builder_result_warning)
     {:error, :invalid_credential}
   end
-
-  defp issue_mdoc_credential(config, result, holder_jwk, credential_configuration) do
-    now = System.system_time(:second)
-    doc_type = Map.get(result, :doc_type) || configuration_doc_type(credential_configuration)
-
-    with {:ok, issuer_pem} <- mdoc_signing_pem(config),
-         {:ok, x5chain} <- mdoc_signing_chain(Config.vc_signing_x5c(config)) do
-      Mdoc.issue(
-        doc_type: doc_type,
-        namespaces: result.namespaces,
-        device_key: holder_jwk,
-        issuer_pem: issuer_pem,
-        x5chain: x5chain,
-        validity: %{
-          signed: Map.get(result, :issued_at, now),
-          valid_from: Map.get(result, :valid_from, now),
-          valid_until: Map.get(result, :valid_until, now)
-        }
-      )
-    end
-  end
-
-  defp mdoc_signing_chain(nil), do: {:ok, nil}
-  defp mdoc_signing_chain([]), do: {:ok, nil}
-
-  defp mdoc_signing_chain(chain) when is_list(chain) do
-    Enum.reduce_while(chain, {:ok, []}, fn
-      certificate, {:ok, certificates} when is_binary(certificate) ->
-        case Base.decode64(certificate) do
-          {:ok, der} when byte_size(der) > 0 -> {:cont, {:ok, [der | certificates]}}
-          _other -> {:halt, {:error, :invalid_credential}}
-        end
-
-      _certificate, _acc ->
-        {:halt, {:error, :invalid_credential}}
-    end)
-    |> case do
-      {:ok, certificates} -> {:ok, Enum.reverse(certificates)}
-      error -> error
-    end
-  end
-
-  defp mdoc_signing_chain(_chain), do: {:error, :invalid_credential}
-
-  defp mdoc_signing_pem(config) do
-    pem = Config.vc_signing_pem(config)
-
-    pem
-    |> Key.signing_jwk()
-    |> SigningAlg.infer()
-    |> case do
-      "ES256" -> {:ok, pem}
-      _other -> {:error, :invalid_mdoc_signing_key}
-    end
-  rescue
-    _error -> {:error, :invalid_mdoc_signing_key}
-  catch
-    _kind, _reason -> {:error, :invalid_mdoc_signing_key}
-  end
-
-  defp credential_configuration(config, credential_configuration_id) do
-    case Config.credential_configurations_supported(config) do
-      configurations when is_map(configurations) ->
-        case Map.fetch(configurations, credential_configuration_id) do
-          {:ok, configuration} when is_map(configuration) -> {:ok, configuration}
-          _other -> {:error, :unsupported_credential_configuration}
-        end
-
-      _other ->
-        {:error, :unsupported_credential_configuration}
-    end
-  end
-
-  defp configuration_doc_type(configuration) do
-    configuration_value(configuration, :doctype) || configuration_value(configuration, :doc_type)
-  end
-
-  defp configuration_value(configuration, key), do: MapParams.fetch(configuration, key)
 
   defp not_entitled(conn, config, claims, resource_metadata) do
     description = "The access token does not authorize this credential."

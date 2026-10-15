@@ -313,10 +313,12 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
   defp build_conn(params, opts) do
     config = Keyword.get(opts, :config) || build_config([])
+    query = Keyword.get(opts, :query, "")
+    path = if query == "", do: "/oauth/revoke", else: "/oauth/revoke?" <> query
 
     # The endpoint requires TLS (config.require_https defaults true): a client
     # secret + refresh token must never cross a plain-HTTP hop.
-    %{conn(:post, "/oauth/revoke", params) | scheme: :https}
+    %{conn(:post, path, params) | scheme: :https}
     |> put_private(:attesto_phoenix_config, config)
     |> put_private(:attesto_phoenix_refresh_store, StubStore)
     |> maybe_basic_auth(opts)
@@ -704,6 +706,28 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   describe "malformed request (RFC 7009 §2.1)" do
+    test "rejects query parameters before client authentication" do
+      config =
+        build_config(load_client: fn _client_id -> flunk("client lookup must not run for query parameters") end)
+
+      params = %{
+        "token" => @live_token,
+        "client_id" => @client_id,
+        "client_secret" => @client_secret
+      }
+
+      for query <- ["token=leaked", "token_type_hint=refresh_token", "client_secret=leaked"] do
+        conn = RevocationController.create(build_conn(params, config: config, query: query), params)
+
+        assert conn.status == 400
+
+        assert JSON.decode!(conn.resp_body) == %{
+                 "error" => "invalid_request",
+                 "error_description" => "request parameters must be sent in the request body, not the query string"
+               }
+      end
+    end
+
     test "missing token parameter is invalid_request (400)" do
       params = %{
         "client_id" => @client_id,

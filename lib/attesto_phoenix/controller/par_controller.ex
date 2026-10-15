@@ -20,6 +20,7 @@ defmodule AttestoPhoenix.Controller.PARController do
 
   alias AttestoPhoenix.AuthorizationServer.PAR
   alias AttestoPhoenix.{ClientAuthentication, Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.Controller.QueryParameterGuard
 
   @dpop_request_header "dpop"
 
@@ -28,13 +29,17 @@ defmodule AttestoPhoenix.Controller.PARController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- RequestContext.check_https(conn, config),
+    with :ok <- QueryParameterGuard.reject(conn),
+         :ok <- RequestContext.check_https(conn, config),
          {:ok, auth} <- authenticate_client(config, conn, params),
          {:ok, stored} <- PAR.store(config, par_request(config, conn, auth, params)) do
       conn
       |> put_status(:created)
       |> json(stored)
     else
+      {:error, :query_parameters_not_allowed} ->
+        render_error(conn, config, QueryParameterGuard.error())
+
       {:error, :insecure_transport} ->
         render_error(conn, config, OAuthError.new(:invalid_request, "TLS required", status: 400))
 

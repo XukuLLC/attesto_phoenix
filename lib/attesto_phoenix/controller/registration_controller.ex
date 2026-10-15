@@ -231,10 +231,10 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
       send_resp(conn, :no_content, "")
     else
       {:error, %{} = error} ->
-        render_error(conn, error)
+        render_delete_error(conn, error)
 
       {:error, reason} when reason in [:not_found, :revoked] ->
-        render_error(conn, invalid_registration_token_error())
+        render_delete_error(conn, invalid_registration_token_error())
     end
   end
 
@@ -1446,6 +1446,12 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   defp render_error(conn, %OAuthError{} = err) do
     OAuthError.render(conn, err, auth_scheme: :none, config: Config.resolve!(conn))
   end
+
+  defp render_delete_error(conn, %OAuthError{error: @error_invalid_token} = err) do
+    OAuthError.render(conn, err, auth_scheme: :bearer, config: Config.resolve!(conn))
+  end
+
+  defp render_delete_error(conn, %OAuthError{} = err), do: render_error(conn, err)
 
   defp error(code, description), do: OAuthError.new(code, description, status: 400)
 

@@ -29,6 +29,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo30
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo31
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo34
+  alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo37
   alias Ecto.Adapters.SQL.Sandbox
   alias Mix.Tasks.AttestoPhoenix.Gen.Migration
 
@@ -167,6 +168,64 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     version_number = next_migration_version()
     assert :ok = Ecto.Migrator.up(TestRepo, version_number, module, log: false)
     {module, version_number}
+  end
+
+  test "3.7 upgrade preserves legacy family markers and refuses a lossy rollback", %{
+    tmp_dir: tmp_dir
+  } do
+    prefix = "attesto_replay_37_#{System.unique_integer([:positive])}"
+    table = ~s|"#{prefix}"."attesto_authorization_codes"|
+
+    Sandbox.mode(TestRepo, :auto)
+    on_exit(fn -> Sandbox.mode(TestRepo, :manual) end)
+    on_exit(fn -> TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{prefix}" CASCADE|) end)
+
+    TestRepo.query!(~s|CREATE SCHEMA "#{prefix}"|)
+
+    TestRepo.query!("""
+    CREATE TABLE #{table} (
+      code_hash varchar(88) PRIMARY KEY,
+      family_id varchar(255),
+      consumed_success boolean NOT NULL DEFAULT false
+    )
+    """)
+
+    TestRepo.query!(
+      "INSERT INTO #{table} (code_hash, family_id, consumed_success) VALUES ('legacy-code', 'live-family', true)"
+    )
+
+    {migration, version} =
+      generated_upgrade(tmp_dir, prefix, "3.7", UpgradeAttestoPhoenixTo37)
+
+    assert %{rows: [[nil]]} =
+             TestRepo.query!("SELECT replay_retain_until FROM #{table} WHERE code_hash = 'legacy-code'")
+
+    # NULL on an existing successful family is the conservative unbounded
+    # marker. Removing the column would restore the old premature cleanup rule.
+    assert_raise RuntimeError, ~r/Cannot safely rollback 3.7 migration/, fn ->
+      Ecto.Migrator.down(TestRepo, version, migration, log: false)
+    end
+
+    assert %{rows: [["replay_retain_until"]]} =
+             TestRepo.query!("""
+             SELECT column_name
+             FROM information_schema.columns
+             WHERE table_schema = '#{prefix}'
+               AND table_name = 'attesto_authorization_codes'
+               AND column_name = 'replay_retain_until'
+             """)
+
+    TestRepo.query!("DELETE FROM #{table}")
+    assert :ok = Ecto.Migrator.down(TestRepo, version, migration, log: false)
+
+    assert %{rows: []} =
+             TestRepo.query!("""
+             SELECT column_name
+             FROM information_schema.columns
+             WHERE table_schema = '#{prefix}'
+               AND table_name = 'attesto_authorization_codes'
+               AND column_name = 'replay_retain_until'
+             """)
   end
 
   defp assert_upgrade_34_ciba_prefix(tmp_dir, prefix, column_type, migrator_opts) do

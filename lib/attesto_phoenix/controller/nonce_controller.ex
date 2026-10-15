@@ -39,7 +39,7 @@ defmodule AttestoPhoenix.Controller.NonceController do
 
   defp c_nonce_store(config) do
     case Callback.config_callback(config, :c_nonce_store) do
-      store when is_atom(store) -> {:ok, store}
+      store when is_atom(store) and not is_nil(store) -> {:ok, store}
       _ -> {:error, OAuthError.new(:invalid_request, "c_nonce_store is required", status: 400)}
     end
   end

@@ -460,32 +460,6 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintTest do
     end
   end
 
-  describe "refresh_binding_jkt/3" do
-    test "only public clients carry the DPoP thumbprint onto the refresh token (RFC 9449 §5)" do
-      config = base_config()
-      public = %{id: "p", public?: true}
-      confidential = %{id: "c", public?: false}
-
-      assert SenderConstraint.refresh_binding_jkt(config, public, {:dpop, "jkt-abc"}) == "jkt-abc"
-      assert SenderConstraint.refresh_binding_jkt(config, confidential, {:dpop, "jkt-abc"}) == nil
-    end
-
-    test "an mTLS binding never threads a DPoP thumbprint, even for a public client" do
-      config = base_config()
-      public = %{id: "p", public?: true}
-
-      assert SenderConstraint.refresh_binding_jkt(config, public, {:mtls, "x5t-abc"}) == nil
-    end
-
-    test "malformed public-client classification is rejected" do
-      config = base_config(client_public?: fn _client -> :malformed end)
-
-      assert_raise ArgumentError, ~r/:client_public\? callback must return true or false/, fn ->
-        SenderConstraint.refresh_binding_jkt(config, %{id: "client"}, {:dpop, "jkt-abc"})
-      end
-    end
-  end
-
   describe "client_requires_dpop?/2 and client_requires_mtls?/2" do
     test "read the config callbacks and default to not required only when absent" do
       config = base_config()
