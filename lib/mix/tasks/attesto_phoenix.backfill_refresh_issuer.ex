@@ -18,10 +18,11 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
   No client-instance key is inferred and no expiry or revocation is reset.
   The operation is idempotent and emits aggregate counts, never credentials.
 
-  Options: `--repo` (repeatable), `--schema-prefix`, `--otp-app`, and
-  `--batch-size` (1..1,000, default 100). Otherwise the host's configured repo,
-  prefix, and application are used. The host application and repos are started
-  using their existing configuration, including the stable successor secret.
+  Options: `--help`, `--repo` (repeatable), `--schema-prefix`, `--otp-app`,
+  `--batch-size` (1..1,000, default 100), and `--apply`. Otherwise the host's
+  configured repo, prefix, and application are used. The host application and
+  repos are started using their existing configuration, including the stable
+  successor secret.
 
   A wrapping refresh store must explicitly declare
   `refresh_store_backend: AttestoPhoenix.Store.EctoRefreshStore`. The task
@@ -41,7 +42,19 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
   alias AttestoPhoenix.RefreshIssuerMigration
   alias AttestoPhoenix.Store.EctoRefreshStore
 
+  @accepted_option_labels [
+    "--help",
+    "--issuer",
+    "--assert-single-issuer",
+    "--apply",
+    "--repo",
+    "--schema-prefix",
+    "--otp-app",
+    "--batch-size"
+  ]
+
   @switches [
+    help: :boolean,
     issuer: :string,
     assert_single_issuer: :boolean,
     apply: :boolean,
@@ -51,10 +64,38 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
     batch_size: :integer
   ]
 
+  @help """
+  Usage:
+    mix attesto_phoenix.backfill_refresh_issuer \\
+      --issuer URL --assert-single-issuer [options]
+
+  The task performs a dry run unless --apply is present.
+
+  Options:
+    --help                    Print this help and exit
+    --issuer URL              Issuer to bind; must match configured issuer
+    --assert-single-issuer    Required acknowledgement for this migration
+    --apply                   Persist changes instead of performing a dry run
+    --repo MODULE             Ecto repo; may be repeated
+    --schema-prefix PREFIX    PostgreSQL schema prefix
+    --otp-app APP             Application containing AttestoPhoenix config
+    --batch-size N            Families per batch, 1..1,000 (default: 100)
+  """
+
   @impl Mix.Task
   def run(args) do
     {opts, positional, invalid} = OptionParser.parse(args, strict: @switches)
-    validate_arguments!(opts, positional, invalid)
+    reject_invalid_args!(positional, invalid)
+
+    if Keyword.get(opts, :help, false) do
+      Mix.shell().info(@help)
+    else
+      run_backfill(args, opts)
+    end
+  end
+
+  defp run_backfill(args, opts) do
+    validate_arguments!(opts)
     Mix.Task.run("app.start")
     config = Config.from_otp_app(otp_app(opts))
     validate_store!(config, opts[:issuer])
@@ -63,8 +104,18 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
     Enum.each(repos, fn repo -> run_for_repo(repo, config, opts) end)
   end
 
-  defp validate_arguments!(opts, positional, invalid) do
-    if !(positional == [] and invalid == []), do: Mix.raise("invalid refresh issuer migration arguments")
+  defp reject_invalid_args!([], []), do: :ok
+
+  defp reject_invalid_args!(positional, invalid) do
+    Mix.raise(
+      "invalid refresh issuer migration arguments. Accepted options: " <>
+        Enum.join(@accepted_option_labels, ", ") <>
+        ". Unexpected positional arguments: #{inspect(positional)}; " <>
+        "invalid options: #{inspect(invalid)}"
+    )
+  end
+
+  defp validate_arguments!(opts) do
     if opts[:assert_single_issuer] != true, do: Mix.raise("--assert-single-issuer is required")
     if !is_binary(opts[:issuer]), do: Mix.raise("--issuer is required")
     RefreshIssuerMigration.validate_issuer!(opts[:issuer])

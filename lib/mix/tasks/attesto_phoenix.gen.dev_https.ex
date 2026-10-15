@@ -38,6 +38,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.DevHttps do
 
   ## Options
 
+    * `--help` - print usage and accepted options, then exit.
     * `--host` - the space-separated host list the certificate is valid for.
       Defaults to `localhost 127.0.0.1 ::1`.
     * `--dir` - the directory the cert/key are written to. Defaults to
@@ -58,12 +59,33 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.DevHttps do
   @key_basename "localhost-key.pem"
   @default_port 4443
 
-  @switches [host: :string, dir: :string]
+  @accepted_option_labels ["--help", "--host", "--dir"]
+  @switches [help: :boolean, host: :string, dir: :string]
+
+  @help """
+  Usage:
+    mix attesto_phoenix.gen.dev_https [options]
+
+  Options:
+    --help          Print this help and exit
+    --host HOSTS    Space-separated certificate hosts
+                    (default: localhost 127.0.0.1 ::1)
+    --dir PATH      Certificate output directory (default: priv/cert)
+  """
 
   @impl Mix.Task
   def run(args) do
-    {opts, _argv, _invalid} = OptionParser.parse(args, switches: @switches)
+    {opts, positional, invalid} = OptionParser.parse(args, strict: @switches)
+    reject_invalid_args!(positional, invalid)
 
+    if Keyword.get(opts, :help, false) do
+      Mix.shell().info(@help)
+    else
+      run_generation(opts)
+    end
+  end
+
+  defp run_generation(opts) do
     dir = Keyword.get(opts, :dir, @default_dir)
     hosts = Keyword.get(opts, :host, @default_hosts)
 
@@ -74,6 +96,17 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.DevHttps do
     else
       Mix.shell().error(mkcert_install_guidance())
     end
+  end
+
+  defp reject_invalid_args!([], []), do: :ok
+
+  defp reject_invalid_args!(positional, invalid) do
+    Mix.raise(
+      "invalid development HTTPS generator arguments. Accepted options: " <>
+        Enum.join(@accepted_option_labels, ", ") <>
+        ". Unexpected positional arguments: #{inspect(positional)}; " <>
+        "invalid options: #{inspect(invalid)}"
+    )
   end
 
   # --- generation (guarded behind the mkcert-availability seam above) ---

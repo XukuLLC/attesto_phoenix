@@ -120,6 +120,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
   ## Options
 
+    * `--help` - print concise usage, accepted options, and supported upgrade
+      milestones, then exit without generating a migration.
+
     * `--upgrade` - generate a migration to upgrade an existing database rather
       than creating fresh tables. Supported values: `3.0`/`3.0.0` and
       `3.1`/`3.1.0`, `3.4`/`3.4.0`, `3.6`/`3.6.0`, and `3.7`/`3.7.0`. The 3.4 migration adds the nullable
@@ -218,7 +221,18 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   @identifier_column_size 255
   @max_schema_prefix_bytes 63
   @max_migration_version 99_999_999_999_999
+  @upgrade_milestones ~w(3.0 3.1 3.4 3.6 3.7)
+  @accepted_option_labels [
+    "--help",
+    "--repo (-r)",
+    "--schema-prefix",
+    "--migrations-path",
+    "--otp-app",
+    "--config-key",
+    "--upgrade"
+  ]
   @switches [
+    help: :boolean,
     repo: [:keep],
     schema_prefix: :string,
     migrations_path: :string,
@@ -231,19 +245,47 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     r: :repo
   ]
 
+  @help """
+  Usage:
+    mix attesto_phoenix.gen.migration [options]
+    mix attesto_phoenix.gen.migration --upgrade MILESTONE [options]
+
+  Upgrade milestones:
+    #{Enum.join(@upgrade_milestones, ", ")}
+
+  Options:
+    --help                    Print this help and exit
+    --repo, -r MODULE         Target Ecto repo; may be repeated
+    --schema-prefix PREFIX    PostgreSQL schema prefix
+    --migrations-path PATH    Migration output directory
+    --otp-app APP             Application containing generator configuration
+    --config-key MODULE       Application environment configuration key
+    --upgrade MILESTONE       Generate an upgrade migration
+  """
+
   # The application environment key the host stores its AttestoPhoenix.Config
   # keyword under, mirroring AttestoPhoenix.Config.from_otp_app/2's default.
   @default_config_key AttestoPhoenix.Config
 
   @impl Mix.Task
   def run(args) do
+    {opts, positional, invalid} = OptionParser.parse(args, strict: @switches, aliases: @aliases)
+
+    if Keyword.get(opts, :help, false) do
+      reject_invalid_args!(positional, invalid)
+      Mix.shell().info(@help)
+    else
+      run_generator(args, opts, positional, invalid)
+    end
+  end
+
+  defp run_generator(args, opts, positional, invalid) do
     reject_legacy_table_prefix_arg!(args)
     reject_legacy_global_table_prefix!()
 
     # Reading any host configuration (schema prefix, the repo set) goes through
     # AttestoPhoenix.Config rather than being hardcoded here: the task is policy
     # free and only renders what the host has declared.
-    {opts, positional, invalid} = OptionParser.parse(args, strict: @switches, aliases: @aliases)
     reject_invalid_args!(positional, invalid)
 
     upgrade_version = parse_upgrade_version!(opts)
@@ -512,25 +554,14 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
   defp parse_upgrade_version!(opts) do
     case Keyword.fetch(opts, :upgrade) do
-      {:ok, version} when version in ["3.0", "3.0.0"] ->
-        "3.0"
-
-      {:ok, version} when version in ["3.1", "3.1.0"] ->
-        "3.1"
-
-      {:ok, version} when version in ["3.4", "3.4.0"] ->
-        "3.4"
-
-      {:ok, version} when version in ["3.6", "3.6.0"] ->
-        "3.6"
-
-      {:ok, version} when version in ["3.7", "3.7.0"] ->
-        "3.7"
-
       {:ok, version} ->
-        Mix.raise(
-          ~s|unsupported --upgrade version #{inspect(version)}; currently supported upgrade versions: "3.0", "3.1", "3.4", "3.6", "3.7"|
-        )
+        Enum.find(@upgrade_milestones, fn milestone ->
+          version == milestone or version == milestone <> ".0"
+        end) ||
+          Mix.raise(
+            "unsupported --upgrade version #{inspect(version)}; currently supported " <>
+              "upgrade versions: " <> Enum.map_join(@upgrade_milestones, ", ", &inspect/1)
+          )
 
       :error ->
         nil
@@ -541,8 +572,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
   defp reject_invalid_args!(positional, invalid) do
     Mix.raise(
-      "invalid migration-generator arguments; use --schema-prefix for a " <>
-        "PostgreSQL schema and --repo RepoModule. " <>
+      "invalid migration-generator arguments. Accepted options: " <>
+        Enum.join(@accepted_option_labels, ", ") <>
+        ". " <>
         "Unexpected positional arguments: #{inspect(positional)}; invalid options: #{inspect(invalid)}"
     )
   end

@@ -1,9 +1,49 @@
 defmodule Mix.Tasks.AttestoPhoenix.Gen.DevHttpsTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureIO
+
   alias Mix.Tasks.AttestoPhoenix.Gen.DevHttps
 
   @moduletag :tmp_dir
+
+  describe "command-line arguments" do
+    test "--help prints usage and exits before certificate generation", %{tmp_dir: tmp_dir} do
+      cert_dir = Path.join(tmp_dir, "cert")
+
+      output =
+        capture_io(fn ->
+          assert :ok = DevHttps.run(["--help", "--dir", cert_dir])
+        end)
+
+      assert output =~ "mix attesto_phoenix.gen.dev_https [options]"
+
+      for option <- ~w(--help --host --dir) do
+        assert output =~ option
+      end
+
+      refute File.exists?(cert_dir)
+    end
+
+    test "rejects unknown options and positional arguments before generating files", %{
+      tmp_dir: tmp_dir
+    } do
+      cert_dir = Path.join(tmp_dir, "cert")
+
+      for args <- [["--dir", cert_dir, "--bogus"], ["--dir", cert_dir, "unexpected"]] do
+        error =
+          assert_raise Mix.Error, ~r/invalid development HTTPS generator arguments/, fn ->
+            DevHttps.run(args)
+          end
+
+        for option <- ~w(--help --host --dir) do
+          assert error.message =~ option
+        end
+      end
+
+      refute File.exists?(cert_dir)
+    end
+  end
 
   describe "gitignore_pattern/1" do
     test "renders a leading/trailing-slash directory pattern" do

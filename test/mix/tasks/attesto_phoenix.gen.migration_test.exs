@@ -606,13 +606,42 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
     end
 
     test "rejects unknown options and positional arguments", %{tmp_dir: tmp_dir} do
-      assert_raise Mix.Error, ~r/invalid migration-generator arguments/, fn ->
-        run!(["--schema-prefix", "oauth", "--bogus"], tmp_dir)
+      error =
+        assert_raise Mix.Error, ~r/invalid migration-generator arguments/, fn ->
+          run!(["--schema-prefix", "oauth", "--bogus"], tmp_dir)
+        end
+
+      for option <-
+            ~w(--help --repo --schema-prefix --migrations-path --otp-app --config-key --upgrade) do
+        assert error.message =~ option
       end
 
       assert_raise Mix.Error, ~r/invalid migration-generator arguments/, fn ->
         run!(["unexpected"], tmp_dir)
       end
+    end
+
+    test "--help prints usage and every upgrade milestone without generating files", %{
+      tmp_dir: tmp_dir
+    } do
+      output =
+        capture_io(fn ->
+          assert :ok = Migration.run(["--help"])
+        end)
+
+      assert output =~ "mix attesto_phoenix.gen.migration [options]"
+      assert output =~ "mix attesto_phoenix.gen.migration --upgrade MILESTONE [options]"
+
+      for milestone <- ~w(3.0 3.1 3.4 3.6 3.7) do
+        assert output =~ milestone
+      end
+
+      for option <-
+            ~w(--help --repo --schema-prefix --migrations-path --otp-app --config-key --upgrade) do
+        assert output =~ option
+      end
+
+      assert Path.wildcard(Path.join(migrations_dir(tmp_dir), "*.exs")) == []
     end
 
     test "refuses to regenerate over an existing migration", %{tmp_dir: tmp_dir} do

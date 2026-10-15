@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.1] - 2026-10-15
+
+### Fixed
+
+- Make the migration generator's `--help` option print its complete usage,
+  including every supported upgrade milestone, and make invalid-argument
+  errors enumerate all accepted options.
+- Handle `--help` before configuration checks, database access, certificate
+  setup, or filesystem writes in the custom migration, refresh-issuer
+  backfill, and development HTTPS tasks. The development HTTPS task now also
+  rejects unknown options and positional arguments instead of ignoring them.
+
 ## [4.0.0] - 2026-10-15
 
 ### Breaking
