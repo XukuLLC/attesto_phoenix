@@ -4114,8 +4114,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       )
 
     header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
-    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
-    compact
+    Attesto.JWS.sign_compact_jwk(jwk, header, claims)
   end
 
   defp wallet_attestation_pair(wallet_provider_key, instance_key, client_id) do

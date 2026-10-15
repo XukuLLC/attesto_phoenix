@@ -1756,8 +1756,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     }
 
     header = %{"alg" => alg, "kid" => JOSE.JWK.thumbprint(jwk)}
-    {_header, compact} = jwk |> JOSE.JWT.sign(header, claims) |> JOSE.JWS.compact()
-    compact
+    Attesto.JWS.sign_compact_jwk(jwk, header, claims)
   end
 
   defp trust_wallet_provider(config, wallet_provider_key) do

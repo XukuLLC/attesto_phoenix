@@ -690,8 +690,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       )
 
     header = Map.put(protected, "alg", alg)
-    {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(jwk, header, payload))
-    compact
+    Attesto.JWS.sign_compact_jwk(jwk, header, payload)
   end
 
   defp enable_ed448_support do
