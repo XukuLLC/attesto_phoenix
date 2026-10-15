@@ -79,6 +79,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   @client_id "client-123"
+  @public_client_id "public-client-123"
   @client_secret "s3cr3t"
   @issuer "https://issuer.test"
   @refresh_issuer_claim "urn:attesto:refresh-token:issuer"
@@ -97,9 +98,13 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       audience: "https://api.example.com",
       keystore: __MODULE__.Keystore,
       repo: __MODULE__.Repo,
-      client_auth_method: fn _client -> "client_secret_post" end,
+      client_auth_method: fn
+        %{id: @public_client_id} -> "none"
+        _client -> "client_secret_post"
+      end,
       load_client: fn
         @client_id -> {:ok, %{id: @client_id}}
+        @public_client_id -> {:ok, %{id: @public_client_id}}
         _other -> {:error, :not_found}
       end,
       verify_client_secret: fn
@@ -112,6 +117,15 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     ]
 
     Config.new(Keyword.merge(base, overrides))
+  end
+
+  defp public_config(overrides \\ []) do
+    build_config(
+      Keyword.merge(
+        [client_public?: fn client -> client.id == @public_client_id end],
+        overrides
+      )
+    )
   end
 
   defp put_record(token, record, opts \\ []) do
@@ -286,6 +300,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       result = RevocationController.create(conn, params)
 
       assert result.status == 401
+      assert get_resp_header(result, "www-authenticate") == [~s(Basic realm="OAuth")]
       refute_received {:revoked, _family}
       assert_received :secret_verification_called
       refute_received :secret_verification_called
@@ -301,7 +316,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       })
 
       params = assertion_params(key, "https://another-issuer.example")
-      assert RevocationController.create(build_conn(params, config: config), params).status == 401
+      assert RevocationController.create(build_conn(params, config: config), params).status == 400
       refute_received {:revoked, _family}
 
       params = assertion_params(key)
@@ -467,8 +482,8 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
             {:client_secret_basic, 200},
             {:client_secret_post, 200},
             {:client_secret_basic_with_body_credentials, 200},
-            {:none, 401},
-            {:private_key_jwt, 401}
+            {:none, 200},
+            {:private_key_jwt, 400}
           ] do
         base_params = %{"token" => @unknown_token}
 
@@ -489,7 +504,8 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
               {build_conn(params, config: config, basic: {@client_id, @client_secret}), params}
 
             :none ->
-              {build_conn(base_params, []), base_params}
+              params = Map.put(base_params, "client_id", @public_client_id)
+              {build_conn(params, config: public_config()), params}
 
             :private_key_jwt ->
               params = Map.put(base_params, "client_assertion", "not-used-by-revocation")
@@ -508,9 +524,50 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
                    "error_description" => "client authentication failed"
                  }
 
-          assert get_resp_header(conn, "www-authenticate") == ["Basic"]
+          assert get_resp_header(conn, "www-authenticate") == []
         end
       end
+    end
+
+    test "a registered public client revokes its own token family with client_id" do
+      put_record(@live_token, %{
+        family_id: @live_family,
+        data: %{client_id: @public_client_id},
+        expires_at: System.system_time(:second) + 1_000
+      })
+
+      test_pid = self()
+
+      config =
+        public_config(
+          on_event: fn event ->
+            send(test_pid, {:event, event})
+            :ok
+          end
+        )
+
+      params = %{"token" => @live_token, "client_id" => @public_client_id}
+      conn = RevocationController.create(build_conn(params, config: config), params)
+
+      assert conn.status == 200
+      assert conn.resp_body == ""
+      assert_received {:revoked, @live_family}
+      assert_received {:event, %AttestoPhoenix.Event{client_id: @public_client_id}}
+    end
+
+    test "a registered public client cannot revoke another client's token family" do
+      put_record(@live_token, %{
+        family_id: @live_family,
+        data: %{client_id: @client_id},
+        expires_at: System.system_time(:second) + 1_000
+      })
+
+      params = %{"token" => @live_token, "client_id" => @public_client_id}
+      conn = RevocationController.create(build_conn(params, config: public_config()), params)
+
+      assert conn.status == 200
+      assert conn.resp_body == ""
+      refute_received {:revoked, _family}
     end
 
     test "revokes the family of a live refresh token and returns 200, no body" do
@@ -652,7 +709,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
   end
 
   describe "client authentication failures (RFC 6749 §5.2)" do
-    test "wrong client secret is invalid_client (401)" do
+    test "wrong body client secret is invalid_client without an authentication challenge" do
       params = %{
         "token" => @live_token,
         "client_id" => @client_id,
@@ -661,12 +718,12 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
       conn = RevocationController.create(build_conn(params, []), params)
 
-      assert conn.status == 401
+      assert conn.status == 400
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
-      assert get_resp_header(conn, "www-authenticate") == ["Basic"]
+      assert get_resp_header(conn, "www-authenticate") == []
     end
 
-    test "unknown client is invalid_client (401)" do
+    test "unknown client is invalid_client without an authentication challenge" do
       params = %{
         "token" => @live_token,
         "client_id" => "ghost",
@@ -675,17 +732,40 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
       conn = RevocationController.create(build_conn(params, []), params)
 
-      assert conn.status == 401
+      assert conn.status == 400
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+      assert get_resp_header(conn, "www-authenticate") == []
     end
 
-    test "no client credentials at all is invalid_client (401)" do
+    test "a confidential client cannot use the public-client path" do
+      params = %{"token" => @live_token, "client_id" => @client_id}
+      conn = RevocationController.create(build_conn(params, []), params)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+      assert get_resp_header(conn, "www-authenticate") == []
+      refute_received {:revoked, _family}
+    end
+
+    test "a public client is rejected when none is excluded from the server method catalog" do
+      config = public_config(token_endpoint_auth_methods_supported: ["client_secret_post"])
+      params = %{"token" => @live_token, "client_id" => @public_client_id}
+      conn = RevocationController.create(build_conn(params, config: config), params)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+      assert get_resp_header(conn, "www-authenticate") == []
+      refute_received {:revoked, _family}
+    end
+
+    test "no client credentials at all is invalid_client without an authentication challenge" do
       params = %{"token" => @live_token}
 
       conn = RevocationController.create(build_conn(params, []), params)
 
-      assert conn.status == 401
+      assert conn.status == 400
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+      assert get_resp_header(conn, "www-authenticate") == []
     end
 
     test "malformed Basic credential is invalid_client (401), no body fallback" do
@@ -702,6 +782,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
       assert conn.status == 401
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+      assert get_resp_header(conn, "www-authenticate") == [~s(Basic realm="OAuth")]
     end
   end
 
@@ -824,7 +905,7 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
 
       conn = RevocationController.create(build_conn(params, config: cfg), params)
 
-      assert conn.status == 401
+      assert conn.status == 400
       refute_received {:event, _event}
     end
   end
@@ -851,13 +932,25 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
     end
 
     test "refuses a correct secret from a native public client" do
-      assert revoke_as_native(client_public?: fn _client -> true end).status == 401
+      assert revoke_as_native(client_public?: fn _client -> true end).status == 400
+    end
+
+    test "accepts a secretless native public client using none" do
+      cfg =
+        build_config(
+          client_native?: fn _client -> true end,
+          client_public?: fn _client -> true end,
+          client_auth_method: fn _client -> "none" end
+        )
+
+      params = %{"token" => @unknown_token, "client_id" => @client_id}
+      assert RevocationController.create(build_conn(params, config: cfg), params).status == 200
     end
 
     test "refuses a correct secret from a native client with no :client_public? callback" do
       # Same default flip as `ClientAuthentication`: an unclassified native
       # client is public, so its shipped secret is not proof of identity.
-      assert revoke_as_native([]).status == 401
+      assert revoke_as_native([]).status == 400
     end
 
     test "still accepts a native client the host EXPLICITLY marks confidential" do

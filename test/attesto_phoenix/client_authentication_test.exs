@@ -11,8 +11,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   authentication method, so the only newly-accepted case (Basic + redundant
   matching body `client_id`) still authenticates via the Basic secret, while
   every genuine two-credential combination is rejected. Each classification
-  row is covered under both `allow_public: true` (token-endpoint policy) and
-  `allow_public: false` (PAR-endpoint policy).
+  row is covered under policies that admit registered public clients and
+  policies reserved for confidential clients.
   """
   use ExUnit.Case, async: false
 
@@ -701,7 +701,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
     test "a certificate cannot make a public client eligible when the endpoint forbids public clients", %{
       config: config
     } do
-      for endpoint <- [:par, :introspection, :backchannel_authentication] do
+      for endpoint <- [:introspection, :backchannel_authentication] do
         assert_generic_invalid_client(
           ClientAuthentication.authenticate(
             mtls_headers(mtls_certificate_der()),
@@ -1168,23 +1168,35 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                authenticate([], %{"client_id" => "native-public-1"}, config, allow_public: true)
     end
 
-    test "a native public client cannot use PAR at all", %{config: config} do
-      config = %{config | client_auth_method: fn _client -> "client_secret_basic" end}
+    test "a native public client uses none at PAR and cannot substitute a shipped secret", %{config: config} do
+      config = %{
+        config
+        | client_auth_method: fn
+            %{id: "native-public-1"} -> "none"
+            _client -> "client_secret_basic"
+          end
+      }
 
-      # Under the PAR policy `allow_public: false` already rejects the
-      # secretless path. The load-bearing half is the SECRET path: without the
-      # §8.4 check that would authenticate, since the secret verifies.
-      assert {:error, %OAuthError{error: :invalid_client}} =
-               authenticate([], %{"client_id" => "native-public-1"}, config, allow_public: false)
+      policy = Policy.for_endpoint(config, :par)
+
+      assert policy.allow_public
+
+      assert {:ok, %Result{client_id: "native-public-1", method: :none}} =
+               ClientAuthentication.authenticate([], %{"client_id" => "native-public-1"}, config, policy)
 
       assert_generic_invalid_client(
-        authenticate(basic("native-public-1", "shipped-in-the-binary"), %{}, config, allow_public: false)
+        ClientAuthentication.authenticate(
+          basic("native-public-1", "shipped-in-the-binary"),
+          %{},
+          config,
+          policy
+        )
       )
 
-      # Control: the same PAR policy accepts an ordinary confidential client's
-      # secret, so the rejection above is the native rule and not the policy.
+      # The same PAR policy still accepts an ordinary confidential client's
+      # registered secret.
       assert {:ok, %Result{method: :client_secret_basic}} =
-               authenticate(basic("confidential-1", "s3cr3t"), %{}, config, allow_public: false)
+               ClientAuthentication.authenticate(basic("confidential-1", "s3cr3t"), %{}, config, policy)
     end
 
     # RFC 8252 §8.4 carves out per-instance credentials provisioned by dynamic
@@ -1272,11 +1284,11 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   describe "current endpoint client-authentication policy matrix" do
     @endpoint_matrix [
       {:token, true},
-      {:par, false},
+      {:par, true},
       {:introspection, false},
       {:device_authorization, true},
       {:backchannel_authentication, false},
-      {:revocation, false}
+      {:revocation, true}
     ]
 
     @all_methods [
@@ -1622,12 +1634,12 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
   end
 
   describe "revocation endpoint client-authentication policy" do
-    test "allows registered confidential methods and gives Basic precedence over body credentials", %{
+    test "allows public and registered confidential methods and gives Basic precedence over body credentials", %{
       config: config
     } do
       policy = Policy.for_endpoint(config, :revocation)
 
-      assert policy.allow_public == false
+      assert policy.allow_public == true
       assert policy.assertion_audiences == [config.issuer]
 
       assert policy.allowed_methods == [
@@ -1636,11 +1648,20 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
                :private_key_jwt,
                :attest_jwt_client_auth,
                :tls_client_auth,
-               :self_signed_tls_client_auth
+               :self_signed_tls_client_auth,
+               :none
              ]
 
       assert policy.basic_precedence == true
       assert policy.honor_configured_methods == true
+
+      assert {:ok, %Result{client_id: "public-1", method: :none}} =
+               ClientAuthentication.authenticate(
+                 [],
+                 %{"client_id" => "public-1"},
+                 %{config | token_endpoint_auth_methods_supported: ["none"]},
+                 policy
+               )
 
       assert {:ok, %Result{method: :client_secret_basic}} =
                ClientAuthentication.authenticate(

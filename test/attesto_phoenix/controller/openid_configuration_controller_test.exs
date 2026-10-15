@@ -286,6 +286,18 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
         "pushed_authorization_request_endpoint" => "https://issuer.example/oauth/par",
         "registration_endpoint" => "https://issuer.example/oauth/register",
         "revocation_endpoint" => "https://issuer.example/oauth/revoke",
+        "revocation_endpoint_auth_methods_supported" => [
+          "client_secret_basic",
+          "client_secret_post",
+          "private_key_jwt",
+          "none"
+        ],
+        "revocation_endpoint_auth_signing_alg_values_supported" => [
+          "PS256",
+          "ES256",
+          "EdDSA",
+          "Ed25519"
+        ],
         "request_object_signing_alg_values_supported" => [
           "PS256",
           "ES256",
@@ -432,6 +444,9 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
 
       assert body["token_endpoint_auth_methods_supported"] ==
                ["client_secret_basic", "client_secret_post", "private_key_jwt", "none"]
+
+      assert body["revocation_endpoint_auth_methods_supported"] ==
+               body["token_endpoint_auth_methods_supported"]
     end
 
     test "advertises the query and JARM response modes (JARM §2.3 / §5.4)" do
@@ -470,6 +485,8 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       body = call_show(host, protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+      assert body["revocation_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+      assert body["revocation_endpoint_auth_signing_alg_values_supported"] == host.client_auth_signing_algs
     end
 
     test "advertises legacy and exact Ed25519 client-assertion identifiers by default" do

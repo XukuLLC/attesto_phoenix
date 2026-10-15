@@ -190,10 +190,10 @@ defmodule AttestoPhoenix.ClientStore do
       credential carve-out must say so with an explicit `client_public?/1`
       returning `false`.
 
-  Note that a native public client cannot use the Pushed Authorization Request
-  endpoint: PAR refuses secretless clients, and §8.4 refuses this one a secret.
-  A deployment that sets `require_pushed_authorization_requests: true` therefore
-  cannot also serve native public clients.
+  A native public client uses its registered `none` authentication method at
+  the Pushed Authorization Request endpoint and identifies itself with
+  `client_id`. PAR continues to enforce PKCE, redirect URI, and stored-request
+  binding checks.
   """
   @callback client_native?(client()) :: boolean()
 

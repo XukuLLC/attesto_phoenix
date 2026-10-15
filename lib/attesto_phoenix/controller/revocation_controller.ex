@@ -12,15 +12,17 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   ## Client authentication (RFC 7009 §2.1, RFC 6749 §2.3)
 
-  The revocation endpoint requires the same client authentication as the
+  The revocation endpoint applies the same client-authentication rules as the
   token endpoint. A confidential client authenticates with its exact registered
   method, using the configured secret, private-key JWT, mTLS, or attestation
-  verification policy. Authentication is fail-closed: a request that names a
-  client but does not prove its registered credentials is rejected `invalid_client`
-  (HTTP 401, RFC 6749 §5.2), and a request that names no client at all is
-  likewise rejected, since this endpoint serves confidential clients. The
-  authenticated `client_id` is then threaded into revocation so one client
-  cannot revoke another client's tokens (RFC 7009 §2.1).
+  verification policy. A registered public client uses `none` and supplies its
+  `client_id`, as required by RFC 7009. Resolution is fail-closed: unknown,
+  revoked, or confidential clients cannot use the public path, and a request
+  that names no client is rejected `invalid_client`. Per RFC 6749 §5.2, a failed
+  `Authorization` header attempt returns HTTP 401 with the matching challenge;
+  body-only and absent credentials return HTTP 400 without a challenge.
+  The resolved `client_id` is then threaded into revocation so one client cannot
+  revoke another client's tokens (RFC 7009 §2.1).
 
   Client authentication is delegated to the shared
   `AttestoPhoenix.ClientAuthentication` service, which resolves clients and
@@ -65,6 +67,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   alias Attesto.Revocation
   alias AttestoPhoenix.ClientAuthentication
+  alias AttestoPhoenix.ClientAuthentication.ErrorContext
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.QueryParameterGuard
   alias AttestoPhoenix.Event
@@ -76,14 +79,13 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   # empty body.
   @http_ok 200
 
-  # RFC 6749 §5.2: a malformed request is `400 invalid_request`; failed
-  # client authentication is `401 invalid_client`.
+  # RFC 6749 §5.2: malformed requests and body-authentication failures use 400;
+  # a failed Authorization-header attempt uses 401.
   @http_bad_request 400
   @http_unauthorized 401
 
   # RFC 6749 §5.2 error codes.
   @error_invalid_request :invalid_request
-  @error_invalid_client :invalid_client
 
   # RFC 7009 §2.1: the form parameter carrying the credential to revoke, and
   # the optional hint about its type (RFC 7009 §2.1).
@@ -148,19 +150,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
       when method_error in [:use_attestation_challenge, :use_fresh_attestation] ->
         OAuthError.render(conn, error, config: config, auth_scheme: :none)
 
-      {:error, %OAuthError{}} ->
-        # RFC 6749 §5.2: client authentication failed. This endpoint serves
-        # confidential clients authenticating with HTTP Basic, so the 401
-        # carries a Basic `WWW-Authenticate` challenge.
-        send_oauth_error(
-          conn,
-          config,
-          @http_unauthorized,
-          @error_invalid_client,
-          "client authentication failed",
-          auth_scheme: :basic,
-          challenge_params: []
-        )
+      {:error, %OAuthError{} = error} ->
+        OAuthError.render(conn, error, auth_scheme: :from_error_context, config: config)
     end
   end
 
@@ -183,18 +174,49 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     |> halt()
   end
 
-  # RFC 7009 §2.1: use the client's registered authentication method. The shared
-  # policy applies the server allowlist and preserves established Basic-first
-  # precedence over redundant body credentials.
+  # RFC 7009 §2.1: confidential clients use their registered authentication
+  # method, while public clients identify themselves with client_id. The shared
+  # policy applies the server allowlist, verifies the registered method, and
+  # preserves established Basic-first precedence over redundant body
+  # credentials.
   defp authenticate_client(config, conn, params) do
     policy = ClientAuthentication.Policy.for_endpoint(config, :revocation)
 
-    ClientAuthentication.authenticate(
-      AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
-      params,
-      config,
-      policy
-    )
+    case ClientAuthentication.authenticate_with_context(
+           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
+           params,
+           config,
+           policy
+         ) do
+      {:ok, %ClientAuthentication.Result{} = result} ->
+        {:ok, result}
+
+      {:error, %OAuthError{} = error, %ErrorContext{} = context} ->
+        {:error, revocation_client_auth_error(config, error, context)}
+    end
+  end
+
+  # RFC 7009 §2.1 delegates authentication failures to RFC 6749 §5.2. A failed
+  # Authorization-header attempt receives 401 and a challenge for the attempted
+  # scheme. Body credentials, a public client_id, and absent credentials remain
+  # 400 responses and do not advertise an unrelated authentication method.
+  defp revocation_client_auth_error(config, %OAuthError{error: :invalid_client} = error, %ErrorContext{
+         authorization_scheme: scheme
+       })
+       when is_binary(scheme) do
+    %{
+      error
+      | status: @http_unauthorized,
+        headers: put_www_authenticate(error.headers, OAuthError.format_challenge(scheme, realm: config.basic_realm))
+    }
+  end
+
+  defp revocation_client_auth_error(_config, %OAuthError{} = error, _context), do: error
+
+  defp put_www_authenticate(headers, challenge) do
+    headers
+    |> Enum.reject(fn {key, _value} -> String.downcase(key) == "www-authenticate" end)
+    |> Kernel.++([{"www-authenticate", challenge}])
   end
 
   defp fetch_token(params) do
@@ -220,9 +242,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     )
   end
 
-  # RFC 6749 §5.2: all revocation errors use the shared JSON envelope. The
-  # invalid-client branch passes `auth_scheme: :basic` explicitly because this
-  # endpoint's established challenge is the bare `Basic` scheme.
+  # RFC 6749 §5.2: non-authentication revocation errors use the shared JSON
+  # envelope without adding a challenge.
   defp send_oauth_error(conn, config, status, error, description, opts \\ []) do
     OAuthError.render(
       conn,

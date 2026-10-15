@@ -898,10 +898,9 @@ Marking a client native applies three rules to it:
 > 1. Where no `:client_public?` callback is configured at all, a native client
 >    counts as public — so marking it native both refuses its secret and admits
 >    it on `none` + PKCE.
-> 2. A native *public* client cannot use PAR: that endpoint refuses secretless
->    clients and §8.4 refuses this one a secret, so a deployment running
->    `require_pushed_authorization_requests: true` cannot also serve native
->    public clients.
+> 2. A native public client uses its registered `none` authentication method at
+>    PAR and supplies its `client_id`. PAR still requires PKCE and exact redirect
+>    URI validation, and confidential clients must use their registered method.
 > 3. §7.3 is the only rule here that *widens* a check, and exact redirect-URI
 >    matching is assumed by the OpenID Connect and FAPI profiles. A deployment
 >    certifying against those normally has no native clients, so the answer is
@@ -1241,9 +1240,12 @@ endpoints sit under its path.
 - `GET  /oauth/end_session` and `POST /oauth/end_session` (RP-Initiated Logout, only with `logout: true`)
 - `GET  /oauth/check_session` (Session Management `check_session_iframe`, only with `session_management: true`)
 
-Discovery and JWKS are public; the token and revocation endpoints authenticate
-the client via your `:load_client` / `:verify_client_secret` callbacks.
-The token endpoint also accepts `private_key_jwt` when `:client_jwks` is wired,
+Discovery and JWKS are public. The token, PAR, and revocation endpoints resolve
+clients through `:load_client`, enforce each client's registered method through
+`:client_auth_method`, and verify secrets through `:verify_client_secret` when
+that method uses one. Registered public clients use `none` and identify
+themselves with `client_id`; confidential clients must present their registered
+method. The endpoints also accept `private_key_jwt` when `:client_jwks` is wired,
 and RFC 8705 `tls_client_auth` / `self_signed_tls_client_auth` when
 `:client_mtls_metadata` is wired and the method is included in
 `:token_endpoint_auth_methods_supported` (the self-signed method also uses
@@ -1265,9 +1267,10 @@ should be network-isolated so only the configured trusted terminators can
 reach it. TLS passthrough/direct peer certificates avoid this header boundary
 and are preferred when the deployment permits them. The
 token endpoint supports authorization-code, refresh-token, client-credentials,
-OAuth token-exchange, and JWT-assertion (`jwt-bearer`) grants. The PAR endpoint accepts the same confidential-client
-secret methods plus `private_key_jwt`, then stores the authorization request
-behind a one-time `request_uri`.
+OAuth token-exchange, and JWT-assertion (`jwt-bearer`) grants. The PAR endpoint
+applies the token endpoint's client-authentication rules, then stores the
+authorization request behind a one-time `request_uri`. Public-client requests
+remain subject to PKCE, redirect URI, and stored-request binding checks.
 
 When `:client_auth_signing_algs` is omitted, client assertions use Attesto's
 FAPI allowlist and enforce its key policy: RSA signatures require a modulus of

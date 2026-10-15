@@ -180,6 +180,18 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         "pushed_authorization_request_endpoint" => "https://issuer.example/oauth/par",
         "registration_endpoint" => "https://issuer.example/oauth/register",
         "revocation_endpoint" => "https://issuer.example/oauth/revoke",
+        "revocation_endpoint_auth_methods_supported" => [
+          "client_secret_basic",
+          "client_secret_post",
+          "private_key_jwt",
+          "none"
+        ],
+        "revocation_endpoint_auth_signing_alg_values_supported" => [
+          "PS256",
+          "ES256",
+          "EdDSA",
+          "Ed25519"
+        ],
         "request_object_signing_alg_values_supported" => [
           "PS256",
           "ES256",
@@ -332,6 +344,9 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       # (none).
       assert body["token_endpoint_auth_methods_supported"] ==
                ["client_secret_basic", "client_secret_post", "private_key_jwt", "none"]
+
+      assert body["revocation_endpoint_auth_methods_supported"] ==
+               body["token_endpoint_auth_methods_supported"]
     end
 
     test "advertises configured token endpoint auth methods" do
@@ -340,6 +355,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       body = call_show(host, protocol_config()) |> decode_body()
 
       assert body["token_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+      assert body["revocation_endpoint_auth_methods_supported"] == ["private_key_jwt"]
+      assert body["revocation_endpoint_auth_signing_alg_values_supported"] == host.client_auth_signing_algs
     end
 
     test "advertises an explicitly empty auth-method catalog without restoring defaults" do
@@ -348,6 +365,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         |> decode_body()
 
       assert body["token_endpoint_auth_methods_supported"] == []
+      assert body["revocation_endpoint_auth_methods_supported"] == []
+      refute Map.has_key?(body, "revocation_endpoint_auth_signing_alg_values_supported")
     end
 
     test "advertises both RFC 8705 methods, certificate-bound tokens, and mTLS endpoint aliases" do
@@ -408,14 +427,16 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
 
       assert body["token_endpoint_auth_signing_alg_values_supported"] == algs
       assert body["introspection_endpoint_auth_signing_alg_values_supported"] == algs
+      assert body["revocation_endpoint_auth_signing_alg_values_supported"] == algs
     end
 
-    test "omits introspection auth signing algorithms without private_key_jwt" do
+    test "omits endpoint auth signing algorithms without private_key_jwt" do
       host = host_config(token_endpoint_auth_methods_supported: ["client_secret_basic"])
 
       body = call_show(host, protocol_config()) |> decode_body()
 
       refute Map.has_key?(body, "introspection_endpoint_auth_signing_alg_values_supported")
+      refute Map.has_key?(body, "revocation_endpoint_auth_signing_alg_values_supported")
     end
 
     test "advertises RFC 9207 authorization response iss support when enabled" do

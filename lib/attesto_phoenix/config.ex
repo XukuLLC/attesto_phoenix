@@ -3071,10 +3071,12 @@ defmodule AttestoPhoenix.Config do
   end
 
   @doc """
-  The client-authentication methods accepted at the token endpoint.
+  The client-authentication methods accepted at the token, PAR, and revocation
+  endpoints. Endpoint-specific policies may narrow this catalog.
 
   This is the single catalog used by endpoint enforcement, discovery, and
-  dynamic registration. When no explicit catalog is configured, wallet
+  dynamic registration. Revocation advertises this effective catalog through
+  `revocation_endpoint_auth_methods_supported`. When no explicit catalog is configured, wallet
   attestation is added only when trusted Wallet Provider keys are available.
   An explicitly configured catalog is never widened. The wallet-attestation
   method is omitted whenever its trusted verification keys are absent, including

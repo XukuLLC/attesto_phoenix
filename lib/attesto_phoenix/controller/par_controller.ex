@@ -2,10 +2,11 @@ defmodule AttestoPhoenix.Controller.PARController do
   @moduledoc """
   Pushed Authorization Request endpoint (RFC 9126).
 
-  The endpoint authenticates the client, stores the submitted authorization
-  request parameters behind a `request_uri`, and returns that reference to be
-  used at `/oauth/authorize`. The authorization endpoint still performs the
-  normal client/redirect/scope/PKCE validation when the reference is resolved.
+  The endpoint authenticates confidential clients and identifies registered
+  public clients by `client_id`, stores the submitted authorization request
+  parameters behind a `request_uri`, and returns that reference to be used at
+  `/oauth/authorize`. The authorization endpoint still performs the normal
+  client/redirect/scope/PKCE validation when the reference is resolved.
 
   This controller is a thin adapter: it parses the request off the `Plug.Conn`,
   authenticates the client via `AttestoPhoenix.ClientAuthentication`
@@ -48,14 +49,13 @@ defmodule AttestoPhoenix.Controller.PARController do
     end
   end
 
-  # RFC 6749 §2.3: client authentication is delegated to the conn-free core
-  # `AttestoPhoenix.ClientAuthentication`, shared with the token endpoint. The
-  # PAR endpoint's policy: a request reference established without proof of
-  # possession of the client secret would let anyone who knows a confidential
-  # client's `client_id` push requests in its name, so the secretless
-  # public-client path is refused here (`allow_public: false`); the client
-  # assertion MUST be audienced to the issuer identifier (FAPI 2.0 Security
-  # Profile §5.3.2.1 / RFC 9126), derived from trusted `Config` (never the
+  # RFC 9126 §2.1: PAR applies the token endpoint's client-authentication rules.
+  # Confidential clients authenticate with their registered method; registered
+  # public clients use `none` and identify themselves with `client_id`. The
+  # shared service resolves that client and enforces its registered method, so
+  # a confidential client cannot be downgraded onto the public path. A client
+  # assertion MUST be audienced to the issuer identifier under the FAPI 2.0
+  # Security Profile §5.3.2.1, derived from trusted `Config` (never the
   # request `Host`) - the concrete endpoint URL is NOT accepted as `aud`, so a
   # confused-deputy assertion minted for a different endpoint is rejected. The
   # shared endpoint policy limits the assertion to 300 seconds (RFC 7523 §3).
@@ -69,8 +69,9 @@ defmodule AttestoPhoenix.Controller.PARController do
            policy
          ) do
       # The whole Result is carried onward, not just the client: the identifier
-      # the caller AUTHENTICATED as is what binds the stored request to its
-      # pusher, and the opaque client term alone cannot supply it.
+      # the service resolved and authenticated where applicable is what binds
+      # the stored request to its pusher, and the opaque client term alone
+      # cannot supply it.
       {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}
       {:error, %OAuthError{}} = err -> err
     end

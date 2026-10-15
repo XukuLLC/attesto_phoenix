@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.0.2] - 2026-10-15
+
+### Security
+
+- Allow registered public clients to revoke their own tokens using `client_id`,
+  while retaining exact client and issuer ownership checks. Confidential,
+  unknown, revoked, and method-switched clients still fail authentication, and
+  cross-client revocation remains an indistinguishable successful no-op.
+
+### Fixed
+
+- Apply the token endpoint's registered public-client authentication rules at
+  PAR, as required by RFC 9126. Public clients registered for `none` may push a
+  PKCE-bound authorization request using `client_id`; confidential clients must
+  continue using their registered authentication method.
+- Advertise `revocation_endpoint_auth_methods_supported` in OAuth and OpenID
+  discovery metadata. Advertise
+  `revocation_endpoint_auth_signing_alg_values_supported` when
+  `private_key_jwt` is available.
+- Apply RFC 6749 error semantics at revocation: failed Authorization-header
+  authentication returns 401 with its matching challenge, while body-only or
+  missing credentials return 400 without an unrelated Basic challenge.
+
 ## [4.0.1] - 2026-10-15
 
 ### Fixed

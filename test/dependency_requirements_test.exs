@@ -79,7 +79,7 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     assert exit_code == 0, output
 
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
-    assert metadata =~ ~s(<<"version">>,<<"4.0.1">>)
+    assert metadata =~ ~s(<<"version">>,<<"4.0.2">>)
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
     assert metadata =~ ~s(<<"requirement">>,<<">= 2.4.0 and < 3.0.0">>)
     assert File.regular?(Path.join(output_path, "guides/upgrade_4_0.md"))

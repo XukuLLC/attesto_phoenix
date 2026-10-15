@@ -5,7 +5,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   The core `Attesto.Discovery` and `Attesto.OpenIDDiscovery` builders remain
   separate because their required fields differ. This module owns the
   Phoenix-side capability and endpoint values that both documents advertise,
-  so those values have one source of truth.
+  so those values have one source of truth. Endpoint authentication metadata
+  is derived from the same configured method and algorithm catalogs used by
+  the corresponding endpoint policies.
   """
 
   alias Attesto.AuthorizationRequest
@@ -44,6 +46,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       "introspection_endpoint" => Config.introspection_endpoint_url(config),
       "introspection_endpoint_auth_methods_supported" => introspection_auth_methods(config),
       "revocation_endpoint" => Config.revocation_endpoint_url(config),
+      "revocation_endpoint_auth_methods_supported" => revocation_auth_methods(config),
       "pushed_authorization_request_endpoint" => Config.par_endpoint_url(config)
     })
     |> put_if_present("require_pushed_authorization_requests", require_pushed_authorization_requests(config))
@@ -86,6 +89,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     |> put_if_present("mtls_endpoint_aliases", config.mtls_endpoint_aliases)
     |> put_signing_alg_metadata(signing_alg_values)
     |> put_introspection_auth_signing_alg_values_supported(config)
+    |> put_revocation_auth_signing_alg_values_supported(config)
   end
 
   defp signing_alg_values(metadata, config, opts) do
@@ -117,6 +121,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     end
   end
 
+  defp put_revocation_auth_signing_alg_values_supported(metadata, %Config{} = config) do
+    if "private_key_jwt" in revocation_auth_methods(config) do
+      Map.put(
+        metadata,
+        "revocation_endpoint_auth_signing_alg_values_supported",
+        config.client_auth_signing_algs
+      )
+    else
+      metadata
+    end
+  end
+
   defp put_if_present(metadata, _key, nil), do: metadata
   defp put_if_present(metadata, key, value), do: Map.put(metadata, key, value)
 
@@ -126,6 +142,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       &(&1 in ["none", @wallet_attestation_auth_method])
     )
   end
+
+  defp revocation_auth_methods(config), do: Config.token_endpoint_auth_methods_supported(config)
 
   defp require_pushed_authorization_requests(%Config{require_pushed_authorization_requests: true}), do: true
   defp require_pushed_authorization_requests(%Config{}), do: nil

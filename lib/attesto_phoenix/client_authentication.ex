@@ -81,12 +81,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
   `AttestoPhoenix.ClientAuthentication.Policy`:
 
     * `:allow_public` - whether a client identified without a secret/assertion
-      may authenticate as a public client (RFC 6749 §2.1), relying on PKCE
-      (RFC 7636) downstream. The token endpoint allows this; the PAR endpoint
-      does not, because a request reference established without proof of
-      possession of the client secret would let anyone who knows a
-      confidential client's `client_id` push requests in its name. When
-      `false`, a body `client_id` without a secret is rejected with
+      may be resolved as a registered public client (RFC 6749 §2.1). The caller
+      remains responsible for endpoint controls such as PKCE on authorization
+      grants or exact token-owner binding at revocation. Registered-method and
+      public-client checks prevent a confidential client from using this path.
+      When `false`, a body `client_id` without a secret is rejected with
       `invalid_client` "client authentication required".
     * `:assertion_audiences` - the acceptable `aud` values for a
       `private_key_jwt` assertion (RFC 7523 §3: the authorization server
@@ -214,10 +213,11 @@ defmodule AttestoPhoenix.ClientAuthentication do
     Build the client-authentication policy for an endpoint.
 
     This is the authoritative endpoint matrix. The client-authentication
-    methods themselves remain the configured confidential methods;
-    `allow_public` controls whether the `none` method is admitted. Revocation
-    requires the registered confidential method and retains Basic precedence
-    over body credentials.
+    methods themselves remain constrained by the server catalog and each
+    client's registered method; `allow_public` controls whether a registered
+    public client may use `none`. PAR and revocation follow the token endpoint's
+    public-client rules. Revocation retains Basic precedence over redundant
+    body credentials.
     """
     @spec for_endpoint(Config.t(), endpoint()) :: t()
     def for_endpoint(%Config{} = config, endpoint) do
@@ -227,7 +227,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
             {true, Config.client_assertion_audiences(config)}
 
           :par ->
-            {false, [config.issuer]}
+            {true, [config.issuer]}
 
           :introspection ->
             {false, [config.issuer]}
@@ -239,13 +239,13 @@ defmodule AttestoPhoenix.ClientAuthentication do
             {false, backchannel_assertion_audiences(config)}
 
           :revocation ->
-            {false, [config.issuer]}
+            {true, [config.issuer]}
         end
 
       {allowed_methods, basic_precedence, honor_configured_methods} =
         case endpoint do
           :revocation ->
-            {@all_methods -- [:none], true, true}
+            {@all_methods, true, true}
 
           _other ->
             {@all_methods, false, true}
@@ -381,8 +381,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   The successful return matches `authenticate/4`. Error returns add an
   `%ErrorContext{}` naming the `Authorization` scheme when the request attempted
-  header authentication; token-endpoint callers use it to apply RFC 6749 §5.2
-  401 challenge rules without re-reading the conn.
+  header authentication; endpoint callers use it to apply RFC 6749 §5.2 401
+  challenge rules without re-reading the conn.
   """
   @spec authenticate_with_context(request_headers(), map(), Config.t(), Policy.t()) ::
           {:ok, Result.t()} | {:error, OAuthError.t(), ErrorContext.t()}
@@ -401,7 +401,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
     case fetch_client_credentials(request_headers, params, policy) do
       {:ok, :none, client_id} ->
         # RFC 6749 §2.1: identified but unauthenticated. Permitted only for
-        # public clients, which must compensate with PKCE (RFC 7636).
+        # registered public clients; the caller applies endpoint-specific
+        # controls such as PKCE or exact token-owner binding.
         with :ok <- require_client_auth_method(config, policy, :none) do
           load_public_client(config, client_id)
         end
@@ -1090,16 +1091,14 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   # RFC 6749 §2.1: a client identified without a secret may proceed only if
-  # it is a public client. A successful `:load_client` is sufficient
-  # identification, but a confidential client MUST authenticate with a
-  # secret (RFC 6749 §2.3.1): accepting it secretless would let anyone who
-  # knows its `client_id` impersonate it, with no PKCE backstop on
-  # client_credentials. The host's `:client_public?` callback is the
-  # public/confidential discriminator; it MUST return `true` for the
-  # secretless path to be allowed. A public client's security then rests on
-  # PKCE (RFC 7636), enforced by `Attesto.AuthorizationCode` when the code
-  # is redeemed. A revoked or unknown client - and a confidential client
-  # presenting no secret - fails closed with the single generic message.
+  # it is a public client. A successful `:load_client` identifies the record,
+  # but a confidential client MUST authenticate with a secret or other
+  # registered method (RFC 6749 §2.3.1). The host's `:client_public?` callback
+  # is the public/confidential discriminator; it MUST return `true` for the
+  # secretless path to be allowed. Callers then apply endpoint controls: PKCE
+  # and authorization-request binding for grants, or exact token-owner binding
+  # for revocation. A revoked or unknown client, and a confidential client
+  # presenting no credential, fails closed with the single generic message.
   defp load_public_client(config, client_id) do
     with {:ok, client} <- resolve_client(config, client_id),
          :ok <- require_registered_client_auth_method(config, client, :none),

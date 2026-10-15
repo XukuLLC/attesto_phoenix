@@ -12,6 +12,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
 
   @endpoint_path "/oauth/par"
   @client %{id: "confidential-1", secret: "s3cr3t"}
+  @public_client %{id: "public-1", public?: true}
 
   # A stub CIMD fetcher serving canned documents keyed by URL (no socket / no
   # SSRF), used by the CIMD private_key_jwt PAR test.
@@ -91,6 +92,7 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       repo: StubRepo,
       load_client: fn
         "confidential-1" -> {:ok, @client}
+        "public-1" -> {:ok, @public_client}
         _ -> {:error, :not_found}
       end,
       verify_client_secret: fn
@@ -99,7 +101,11 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       end,
       load_principal: fn _ -> {:error, :not_found} end,
       client_id: fn client -> client.id end,
-      client_auth_method: fn _client -> registered_auth_method end,
+      client_auth_method: fn
+        @public_client -> "none"
+        _client -> registered_auth_method
+      end,
+      client_public?: fn client -> Map.get(client, :public?, false) end,
       # RFC 9126 §2.1 step 3: the PAR endpoint validates the pushed request as
       # the authorization endpoint would, so the client's registered redirect
       # URIs must resolve for the exact-match check (RFC 6749 §3.1.2.3).
@@ -132,6 +138,37 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["client_id"] == "confidential-1"
     assert stored["redirect_uri"] == "https://client.example/cb"
     refute Map.has_key?(stored, "client_secret")
+  end
+
+  test "stores a pushed authorization request from a registered public client" do
+    params = Map.put(auth_params(), "client_id", "public-1")
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+    assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
+    assert stored["client_id"] == "public-1"
+    assert stored["redirect_uri"] == "https://client.example/cb"
+  end
+
+  test "does not let a confidential client use the public-client path" do
+    params = auth_params()
+    conn = :post |> conn(@endpoint_path, params) |> PARController.create(params)
+
+    assert conn.status == 400
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
+  end
+
+  test "rejects an unknown client on the public-client path" do
+    params = Map.put(auth_params(), "client_id", "unknown-public")
+    conn = :post |> conn(@endpoint_path, params) |> PARController.create(params)
+
+    assert conn.status == 400
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
   end
 
   test "rejects query parameters before client authentication" do
@@ -295,10 +332,9 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
   end
 
   # CIMD (draft-ietf-oauth-client-id-metadata-document-01): a CIMD client may
-  # push an authorization request, but only via private_key_jwt - the PAR
-  # endpoint refuses the public-client (`none`) path (`allow_public: false`), and
-  # a CIMD client carries no symmetric secret. The pushed request is validated
-  # against the document's own `redirect_uris` (RFC 9700), not the host
+  # push an authorization request using the method declared by its metadata.
+  # This case uses private_key_jwt. The pushed request is validated against the
+  # document's own `redirect_uris` (RFC 9700), not the host
   # `:client_redirect_uris` callback.
   test "stores a pushed request from a CIMD client authenticated with private_key_jwt" do
     cimd_client_id = "https://app.example/clients/par.json"
