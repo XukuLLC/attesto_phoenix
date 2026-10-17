@@ -83,6 +83,7 @@ defmodule AttestoPhoenix.Callback do
   a closure that routes through `invoke/2`, so the core plug always receives the
   bare function it demands.
   """
+  @deprecated "Use a closure around invoke/2; to_fun1/1 will be removed in AttestoPhoenix 5.0"
   @spec to_fun1(callback()) :: (any() -> any())
   def to_fun1(callback), do: fn a -> invoke(callback, [a]) end
 

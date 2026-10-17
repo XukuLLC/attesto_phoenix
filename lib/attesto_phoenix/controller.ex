@@ -1,10 +1,23 @@
 defmodule AttestoPhoenix.Controller do
   @moduledoc false
 
+  alias AttestoPhoenix.RequestContext
+
+  @doc false
+  @spec require_https(Plug.Conn.t(), AttestoPhoenix.Config.t(), term()) :: :ok | term()
+  def require_https(conn, config, insecure_result) do
+    case RequestContext.check_https(conn, config) do
+      :ok -> :ok
+      {:error, :insecure_transport} -> insecure_result
+    end
+  end
+
   @doc false
   defmacro __using__(opts) do
     quote do
       use Phoenix.Controller, unquote(opts)
+
+      import AttestoPhoenix.Controller, only: [require_https: 3]
 
       alias AttestoPhoenix.{Config, DuplicateParameterGuard}
 

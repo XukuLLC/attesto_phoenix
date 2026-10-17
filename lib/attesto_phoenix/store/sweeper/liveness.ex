@@ -1,6 +1,7 @@
 defmodule AttestoPhoenix.Store.Sweeper.Liveness do
   @moduledoc false
 
+  alias AttestoPhoenix.Store.Sweeper.LocalProcess
   alias AttestoPhoenix.Store.Sweeper.Registration
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
@@ -34,7 +35,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Liveness do
 
     Enum.find_value(entries, :error, fn
       {pid, :sweeper} ->
-        if local_alive?(pid), do: {:ok, pid}, else: false
+        if LocalProcess.alive?(pid), do: {:ok, pid}, else: false
 
       _other ->
         false
@@ -60,7 +61,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Liveness do
 
   @spec registered_worker?(term()) :: boolean()
   def registered_worker?(pid) when is_pid(pid) do
-    if local_alive?(pid) do
+    if LocalProcess.alive?(pid) do
       registry_worker?(pid) or Map.has_key?(Registration.live_registrations(), pid)
     else
       false
@@ -71,7 +72,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Liveness do
 
   @spec registered_worker_for_target?(term(), term()) :: boolean()
   def registered_worker_for_target?(pid, target) when is_pid(pid) do
-    if local_alive?(pid) do
+    if LocalProcess.alive?(pid) do
       registry_worker_for_target?(pid, target) or cleanup_worker_for_target?(pid, target)
     else
       false
@@ -109,7 +110,4 @@ defmodule AttestoPhoenix.Store.Sweeper.Liveness do
       :error -> false
     end
   end
-
-  defp local_alive?(pid) when is_pid(pid), do: node(pid) == node() and Process.alive?(pid)
-  defp local_alive?(_other), do: false
 end

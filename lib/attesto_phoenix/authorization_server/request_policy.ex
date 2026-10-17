@@ -18,8 +18,10 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   alias Attesto.AuthorizationRequest
   alias Attesto.RedirectURI
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
-  alias AttestoPhoenix.{Callback, ClientClassification, ClientIdMetadata, Config}
+  alias AttestoPhoenix.{Callback, ClientClassification, ClientIdMetadata, Config, RedirectURIRegistration}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
+
+  require Logger
 
   @doc """
   Validate `params` as an authorization request for `client`, resolving the
@@ -45,7 +47,9 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
         require_nonce: require_nonce?(config)
       ] ++ extra_opts
 
-    AuthorizationRequest.validate(params, opts)
+    params
+    |> AuthorizationRequest.validate(opts)
+    |> enforce_cimd_redirect_origin(config, client)
   end
 
   @doc """
@@ -61,14 +65,93 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   URI (fail closed).
   """
   @spec registered_redirect_uris(Config.t(), term()) :: [String.t()]
-  def registered_redirect_uris(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.redirect_uris(metadata)
+  def registered_redirect_uris(config, %CIMDClient{metadata: metadata}) do
+    filter_registered_redirect_uris(ClientIdMetadata.redirect_uris(metadata),
+      allow_private_use: true,
+      # Disabling RFC 8252's variable-port match keeps exact IP-literal
+      # loopback redirects valid; it only removes the port relaxation. The
+      # narrower mode also keeps localhost disabled unless explicitly opted in.
+      loopback_mode: native_loopback_mode(config) || :exact_allow_loopback_port
+    )
+  end
 
   def registered_redirect_uris(config, client) do
     case Callback.invoke(Config.client_redirect_uris_fun(config), [client], []) do
-      uris when is_list(uris) -> uris
-      _ -> []
+      uris when is_list(uris) ->
+        native? = client_native?(config, client)
+
+        filter_registered_redirect_uris(uris,
+          allow_private_use: native?,
+          loopback_mode: if(native?, do: native_loopback_mode(config))
+        )
+
+      _ ->
+        []
     end
   end
+
+  @doc false
+  @spec safe_redirect_uri?(term()) :: boolean()
+  def safe_redirect_uri?(uri) do
+    RedirectURIRegistration.valid?(uri,
+      allow_private_use: true,
+      loopback_mode: :exact_allow_loopback_port
+    )
+  end
+
+  defp filter_registered_redirect_uris(uris, opts) do
+    Enum.filter(uris, fn uri ->
+      if RedirectURIRegistration.valid?(uri, opts) do
+        true
+      else
+        Logger.warning("unsafe registered redirect URI ignored")
+        false
+      end
+    end)
+  end
+
+  defp native_loopback_mode(config) do
+    if Config.native_app_loopback_redirect?(config),
+      do: Config.native_app_loopback_matching(config)
+  end
+
+  defp enforce_cimd_redirect_origin({:ok, request} = result, config, client) do
+    case require_cimd_redirect_origin(config, client, request.redirect_uri) do
+      :ok -> result
+      error -> error
+    end
+  end
+
+  defp enforce_cimd_redirect_origin({:error, {:redirect, error}} = result, config, client) do
+    case require_cimd_redirect_origin(config, client, error.redirect_uri) do
+      :ok -> result
+      origin_error -> origin_error
+    end
+  end
+
+  defp enforce_cimd_redirect_origin(result, _config, _client), do: result
+
+  defp require_cimd_redirect_origin(config, %CIMDClient{metadata: metadata}, redirect_uri) do
+    require_same_origin? =
+      config
+      |> Config.client_id_metadata()
+      |> Keyword.get(:require_same_origin_redirect_uri, true)
+
+    loopback_mode =
+      if Config.native_app_loopback_redirect?(config),
+        do: Config.native_app_loopback_matching(config),
+        else: :exact_allow_loopback_port
+
+    if not require_same_origin? or
+         ClientIdMetadata.loopback_redirect_uri?(redirect_uri, loopback_mode) or
+         ClientIdMetadata.same_origin_redirect_uri?(ClientIdMetadata.client_id(metadata), redirect_uri) do
+      :ok
+    else
+      {:error, {:direct, :redirect_uri_not_registered}}
+    end
+  end
+
+  defp require_cimd_redirect_origin(_config, _client, _redirect_uri), do: :ok
 
   @doc """
   How the request `redirect_uri` is matched against the registered set
@@ -186,13 +269,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   classified its clients must get the unmodified RFC 6749 behavior.
   """
   @spec client_native?(Config.t(), term()) :: boolean()
-  # A CIMD client is identified by an `https` URL that resolves to a document
-  # served over the network; it is not an installed native app.
-  def client_native?(_config, %CIMDClient{metadata: _metadata}), do: false
-
-  def client_native?(config, client) do
-    Callback.invoke_boolean(Config.client_native_fun(config), [client], false, :client_native?)
-  end
+  def client_native?(%Config{} = config, client), do: ClientIdMetadata.client_native?(config, client)
 
   @doc """
   Classify the client as public via the host's `:client_public?` callback.

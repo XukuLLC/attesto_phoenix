@@ -52,7 +52,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     Config,
     HTTPAccept,
     OAuthError,
-    RequestContext,
+    ProtectedResource,
     ResourceAudiencePolicy
   }
 
@@ -85,7 +85,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- QueryParameterGuard.reject(conn),
-         :ok <- check_https(conn, config),
+         :ok <- require_https(conn, config, {:error, error(@error_invalid_request, "TLS required")}),
          {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
            authenticate_client(config, conn, params),
          {:ok, token} <- fetch_token(params) do
@@ -107,6 +107,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
         trusted_audiences: ResourceAudiencePolicy.resolver(config),
         authorize: caller_authorize(config, client_id)
       )
+      |> suppress_contained_access_token(config)
 
     if signed_response_requested?(conn) do
       # The audience is the authenticated client_id, always present for a
@@ -121,6 +122,14 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
       json(conn, response)
     end
   end
+
+  defp suppress_contained_access_token(%{"active" => true} = response, config) do
+    if ProtectedResource.access_token_revoked?(config, response),
+      do: %{"active" => false},
+      else: response
+  end
+
+  defp suppress_contained_access_token(response, _config), do: response
 
   # RFC 9701 §4: the signed response is returned only when the caller explicitly
   # asks for `#{@signed_media_type}` in Accept with a non-zero quality (RFC 9110
@@ -175,29 +184,15 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     false
   end
 
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, error(@error_invalid_request, "TLS required")}
-    end
-  end
-
   # RFC 6749 §2.3 / RFC 7662 §2.1: authenticate the caller through the shared
   # ClientAuthentication core, the same policy as the token endpoint. The client
   # assertion MUST be audienced to the issuer identifier (FAPI 2.0 §5.3.2.1),
   # derived from trusted Config (never the request Host) - the concrete endpoint
   # URL is not accepted as `aud`.
   defp authenticate_client(config, conn, params) do
-    policy = ClientAuthentication.Policy.for_endpoint(config, :introspection)
-
     # Return the full Result; the caller reads the authenticated client_id (the
     # RFC 9701 audience) from it.
-    ClientAuthentication.authenticate(
-      AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
-      params,
-      config,
-      policy
-    )
+    ClientAuthentication.authenticate_request(conn, params, config, :introspection)
   end
 
   defp render_error(conn, config, %OAuthError{} = err) do

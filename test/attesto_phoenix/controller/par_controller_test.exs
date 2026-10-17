@@ -79,6 +79,8 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
         [] -> :error
       end
     end
+
+    def count, do: :ets.info(@table, :size)
   end
 
   setup context do
@@ -373,6 +375,43 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
     assert stored["client_id"] == cimd_client_id
     assert stored["redirect_uri"] == "https://app.example/cb"
+  end
+
+  test "rejects a cross-origin CIMD redirect at PAR before storing the request" do
+    cimd_client_id = "https://cross-origin-app.example/clients/par.json"
+    client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+    doc = %{
+      "client_id" => cimd_client_id,
+      "redirect_uris" => ["https://other.example/cb"],
+      "token_endpoint_auth_method" => "private_key_jwt",
+      "jwks" => %{"keys" => [public_jwk(client_key)]}
+    }
+
+    {:ok, _} =
+      start_supervised(%{
+        id: CimdFetcher,
+        start: {Agent, :start_link, [fn -> %{cimd_client_id => JSON.encode!(doc)} end, [name: CimdFetcher]]}
+      })
+
+    put_config(client_id_metadata: [enabled: true, fetcher: CimdFetcher, cache: CimdCache])
+
+    params =
+      Map.merge(auth_params(), %{
+        "client_id" => cimd_client_id,
+        "redirect_uri" => "https://other.example/cb",
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(client_key, cimd_client_id)
+      })
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert conn.status == 400
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_request"
+    assert PARStore.count() == 0
   end
 
   test "stores the verified DPoP proof thumbprint for sender-constrained PAR" do

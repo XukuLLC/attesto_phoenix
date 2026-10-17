@@ -13,7 +13,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateDPoPNonces do
   def change do
     create table(:dpop_nonces, primary_key: false) do
       add(:id, :binary_id, primary_key: true)
-      add(:nonce, :string, null: false)
+      add(:nonce, :string, size: 255, null: false)
       add(:issued_at, :utc_datetime, null: false)
       add(:expires_at, :utc_datetime, null: false)
       add(:used_at, :utc_datetime)

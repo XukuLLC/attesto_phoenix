@@ -14,20 +14,27 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateLogoutSessions do
   def change do
     create table(:attesto_logout_sessions, primary_key: false) do
       add(:id, :binary_id, primary_key: true)
-      add(:sid, :string, null: false)
-      add(:subject, :string, null: false)
-      add(:client_id, :string, null: false)
+      add(:sid, :string, size: 255, null: false)
+      add(:subject, :string, size: 255, null: false)
+      add(:client_id, :string, size: 255, null: false)
       add(:backchannel_logout_uri, :text)
       add(:session_required, :boolean, null: false, default: false)
       add(:frontchannel_logout_uri, :text)
       add(:frontchannel_session_required, :boolean, null: false, default: false)
+      add(:delivery_id, :string, size: 255, null: false)
+      add(:lease_id, :string, size: 255)
+      add(:lease_expires_at, :utc_datetime)
+      add(:delivery_attempts, :integer, null: false, default: 0)
       add(:expires_at, :utc_datetime, null: false)
 
       timestamps(updated_at: false, type: :utc_datetime)
     end
 
     create(unique_index(:attesto_logout_sessions, [:sid, :client_id]))
+    create(unique_index(:attesto_logout_sessions, [:delivery_id]))
     create(index(:attesto_logout_sessions, [:subject]))
+    create(index(:attesto_logout_sessions, [:lease_expires_at]))
+    create(index(:attesto_logout_sessions, [:lease_id, :delivery_id]))
     create(index(:attesto_logout_sessions, [:expires_at]))
   end
 end

@@ -10,6 +10,7 @@ defmodule AttestoPhoenix.Application do
   def start(_type, _args) do
     children = [
       {FlowControl, name: FlowControl},
+      {Task.Supervisor, name: AttestoPhoenix.DeliverySupervisor},
       # Liveness lookups for the public API come from this registry so
       # a diagnostics outage cannot change their answers.
       Liveness,

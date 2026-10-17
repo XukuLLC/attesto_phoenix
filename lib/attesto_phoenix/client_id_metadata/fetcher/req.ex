@@ -6,7 +6,9 @@ if Code.ensure_loaded?(Req) do
 
     This is the only component of the CIMD feature that makes an outbound request,
     so it is where the draft's Security Considerations are enforced. Implements
-    `AttestoPhoenix.ClientIdMetadata.Fetcher` over `Req` -> `Finch` -> `Mint`.
+    `AttestoPhoenix.ClientIdMetadata.Fetcher` with a one-shot Mint connection.
+    `Req` remains the optional dependency gate and injectable test transport,
+    but production requests do not create hostname-keyed Finch pools.
 
     ## SSRF algorithm (draft Security Considerations)
 
@@ -30,9 +32,10 @@ if Code.ensure_loaded?(Req) do
          socket targets the pinned IP), closing the DNS-rebinding TOCTOU between
          the check in step 3 and the connect: the name cannot be re-resolved to an
          internal address after it was validated.
-      5. **GET** with `Accept: application/json`, connect and receive timeouts
-         (`:request_timeout_ms`, default `5_000`), and **redirects disabled**
-         (draft MUST). Any redirect is surfaced as its 3xx status.
+      5. **GET** with `Accept: application/json`, one total deadline covering
+         DNS resolution, connect, send, and receive (`:request_timeout_ms`,
+         default `5_000`), and **redirects disabled** (draft MUST). Any redirect
+         is surfaced as its 3xx status.
       6. **Status** must be `200`; any other status -> `{:error, {:status, n}}`.
       7. **Content-Type** must be `application/json` or `application/<x>+json`;
          otherwise `{:error, :bad_content_type}`.
@@ -52,9 +55,10 @@ if Code.ensure_loaded?(Req) do
       * `:allow_loopback` - when `true`, loopback addresses (`127.0.0.0/8`, `::1`)
         are permitted (the draft's "AS runs on loopback" exception). Default
         `false`.
-      * `:max_document_bytes` - body size cap. Default `5_120` (draft's
-        recommended 5 KB).
-      * `:request_timeout_ms` - connect and receive timeout. Default `5_000`.
+      * `:max_document_bytes` - positive body size cap. Default `5_120`
+        (draft's recommended 5 KB).
+      * `:request_timeout_ms` - positive total DNS and HTTP request timeout.
+        Default `5_000`.
       * `:req_options` - extra options merged into the underlying `Req` request
         (e.g. test transport overrides). Escape hatch; not part of the public
         contract.
@@ -80,23 +84,96 @@ if Code.ensure_loaded?(Req) do
     @spec fetch(String.t(), keyword()) ::
             {:ok, Fetcher.result()} | {:error, term()}
     def fetch(url, opts \\ []) when is_binary(url) and is_list(opts) do
-      allow_loopback = allow_loopback!(opts)
+      validate_options!(opts, :fetch)
+      run_with_deadline(fn -> do_fetch(url, opts) end, request_timeout!(opts))
+    end
 
+    defp do_fetch(url, opts) do
       with {:ok, uri} <- revalidate(url),
-           {:ok, ips} <- resolve(uri.host, opts),
-           {:ok, pinned} <- screen(ips, allow_loopback) do
-        request(uri, pinned, opts)
+           {:ok, screened} <- screen_target(uri, opts) do
+        request(uri, screened.url, opts)
       end
     end
 
     @impl Fetcher
     def preflight(url, opts \\ []) when is_binary(url) and is_list(opts) do
-      allow_loopback = allow_loopback!(opts)
+      validate_options!(opts, :preflight)
+      run_with_deadline(fn -> do_preflight(url, opts) end, request_timeout!(opts))
+    end
 
+    defp do_preflight(url, opts) do
       with {:ok, uri} <- revalidate(url),
-           {:ok, ips} <- resolve(uri.host, opts),
-           {:ok, _pinned} <- screen(ips, allow_loopback) do
+           {:ok, _screened} <- screen_target(uri, opts) do
         :ok
+      end
+    end
+
+    defp request_timeout!(opts) do
+      case Keyword.get(opts, :request_timeout_ms, @default_request_timeout_ms) do
+        timeout when is_integer(timeout) and timeout > 0 -> timeout
+        _invalid -> raise ArgumentError, ":request_timeout_ms must be a positive integer"
+      end
+    end
+
+    defp max_document_bytes!(opts) do
+      case Keyword.get(opts, :max_document_bytes, @default_max_document_bytes) do
+        max_bytes when is_integer(max_bytes) and max_bytes > 0 -> max_bytes
+        _invalid -> raise ArgumentError, ":max_document_bytes must be a positive integer"
+      end
+    end
+
+    defp resolver!(opts) do
+      case Keyword.get(opts, :resolver, &:inet.getaddrs/2) do
+        resolver when is_function(resolver, 2) -> resolver
+        _invalid -> raise ArgumentError, ":resolver must be a two-argument function"
+      end
+    end
+
+    # Validate deterministic caller configuration before starting the deadline
+    # task. Exceptions raised while resolving or making the request are transport
+    # failures; malformed options are immediate programmer errors.
+    defp validate_options!(opts, :fetch) do
+      validate_common_options!(opts)
+      max_document_bytes!(opts)
+      :ok
+    end
+
+    defp validate_options!(opts, :preflight) do
+      validate_common_options!(opts)
+    end
+
+    defp validate_common_options!(opts) do
+      allow_loopback!(opts)
+      request_timeout!(opts)
+      resolver!(opts)
+      :ok
+    end
+
+    # DNS resolution is attacker-influenced work and happens before a socket is
+    # opened. Keep it inside the same wall-clock budget as connect/send/receive
+    # so a slow resolver cannot retain a FlowControl admission indefinitely.
+    defp run_with_deadline(fun, timeout_ms) do
+      task =
+        Task.async(fn ->
+          try do
+            fun.()
+          rescue
+            exception -> {:error, {:transport, exception}}
+          catch
+            kind, reason -> {:error, {:transport, {kind, reason}}}
+          end
+        end)
+
+      case Task.yield(task, timeout_ms) do
+        {:ok, result} ->
+          result
+
+        {:exit, reason} ->
+          {:error, {:transport, reason}}
+
+        nil ->
+          _ = Task.shutdown(task, :brutal_kill)
+          {:error, {:transport, :request_timeout}}
       end
     end
 
@@ -126,90 +203,72 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    # Step 2: resolve A and AAAA records through the injectable resolver. Both
-    # families are queried; either yielding records is enough, but every returned
-    # address is screened in step 3.
-    defp resolve(host, opts) do
-      resolver = Keyword.get(opts, :resolver, &default_resolver/2)
-      host_charlist = String.to_charlist(host)
-
-      v4 = lookup(resolver, host_charlist, :inet)
-      v6 = lookup(resolver, host_charlist, :inet6)
-
-      case v4 ++ v6 do
-        [] -> {:error, :unresolvable}
-        ips -> {:ok, ips}
-      end
-    end
-
-    defp lookup(resolver, host_charlist, family) do
-      case resolver.(host_charlist, family) do
-        {:ok, ips} when is_list(ips) -> ips
-        _other -> []
-      end
-    end
-
-    defp default_resolver(host_charlist, family) do
-      :inet.getaddrs(host_charlist, family)
-    end
-
-    # Step 3: reject if ANY resolved address is special-use; otherwise pin to the
-    # first address (the connect in step 4 targets exactly this checked IP). The
-    # whole resolved set is screened so a mixed A/AAAA answer cannot smuggle an
-    # internal address past the guard via the unused family.
-    defp screen(ips, allow_loopback) do
-      case Enum.find(ips, &blocked?(&1, allow_loopback)) do
-        nil -> {:ok, hd(ips)}
-        blocked -> {:error, {:blocked_ip, blocked}}
-      end
-    end
-
-    defp blocked?(ip, allow_loopback) do
-      if allow_loopback and loopback?(ip) do
-        false
-      else
-        special_use_ip?(ip)
-      end
+    defp screen_target(uri, opts) do
+      AttestoPhoenix.SSRFGuard.screen(URI.to_string(uri),
+        resolver: resolver!(opts),
+        allow_loopback: allow_loopback!(opts)
+      )
     end
 
     @doc "Delegates to the always-available hostname and address policy."
     @spec special_use_ip?(ip()) :: boolean()
     defdelegate special_use_ip?(ip), to: HostPolicy
 
-    defp loopback?({127, _b, _c, _d}), do: true
-    defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-    defp loopback?({0, 0, 0, 0, 0, 0xFFFF, w7, _w8}) when div(w7, 256) == 127, do: true
-    defp loopback?(_ip), do: false
-
     # Step 4-8: dial the pinned IP while keeping SNI / cert hostname / Host header
     # on the original host, refuse redirects, require 200 + JSON, cap the body.
-    defp request(uri, pinned_ip, opts) do
-      timeout = Keyword.get(opts, :request_timeout_ms, @default_request_timeout_ms)
-      max_bytes = Keyword.get(opts, :max_document_bytes, @default_max_document_bytes)
-
-      req = build_req(uri, pinned_ip, timeout, max_bytes, opts)
+    defp request(uri, pinned_url, opts) do
+      timeout = request_timeout!(opts)
+      max_bytes = max_document_bytes!(opts)
       started_at = System.monotonic_time(:millisecond)
 
-      case Req.request(req) do
+      case perform_request(uri, pinned_url, timeout, max_bytes, opts) do
         {:ok, %Req.Response{status: 200} = resp} -> on_ok(resp, max_bytes, started_at)
         {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
+        {:error, :too_large} -> {:error, :too_large}
         {:error, %{__exception__: true} = exception} -> {:error, {:transport, exception}}
         {:error, reason} -> {:error, {:transport, reason}}
       end
     end
 
-    defp build_req(%URI{} = uri, pinned_ip, timeout, max_bytes, opts) do
+    # Test transports are intentionally kept on Req. Production requests use a
+    # one-shot Mint connection so attacker-selected hostnames cannot create
+    # permanent dynamically named Finch pools.
+    defp perform_request(uri, pinned_url, timeout, max_bytes, opts) do
+      case Keyword.get(opts, :req_options, []) do
+        [] ->
+          case AttestoPhoenix.PinnedHTTP.request(
+                 :get,
+                 pinned_url,
+                 uri.host,
+                 [{"accept", "application/json"}, {"host", HostPolicy.authority(uri)}],
+                 "",
+                 timeout,
+                 max_bytes
+               ) do
+            {:ok, response} -> {:ok, Req.Response.new(response)}
+            error -> error
+          end
+
+        _test_override ->
+          uri
+          |> build_req(URI.parse(pinned_url).host, timeout, max_bytes, opts)
+          |> Req.request()
+      end
+    end
+
+    defp build_req(%URI{} = uri, pinned_host, timeout, max_bytes, opts) do
       [
         # Connect to the pinned IP; `connect_options[:hostname]` keeps TLS SNI,
         # certificate verification, and the derived Host header on the original
         # host - so the socket cannot be rebound to an internal address, but the
         # request still presents as the real hostname.
-        url: %{uri | host: ip_to_string(pinned_ip)},
+        url: %{uri | host: pinned_host},
         method: :get,
         headers: [{"accept", "application/json"}, {"host", HostPolicy.authority(uri)}],
         redirect: false,
         retry: false,
         receive_timeout: timeout,
+        request_timeout: timeout,
         connect_options: [hostname: uri.host, timeout: timeout],
         # Stream the body so the size cap can abort an oversize response instead
         # of buffering it whole; the collector halts once `max_bytes` is exceeded.
@@ -420,10 +479,6 @@ if Code.ensure_loaded?(Req) do
         [value | _rest] -> Keyword.put(acc, :date, value)
         _ -> acc
       end
-    end
-
-    defp ip_to_string(ip) do
-      ip |> :inet.ntoa() |> List.to_string()
     end
   end
 end

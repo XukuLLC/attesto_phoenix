@@ -33,8 +33,8 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   RFC 8693 token-exchange grant (which runs at the IdP).
   """
 
-  alias Attesto.IdentityAssertion
-  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter}
+  alias Attesto.{IdentityAssertion, Scope}
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, ReplayClaim}
   alias AttestoPhoenix.ClientIdMetadata.Resolver
 
   require Logger
@@ -158,17 +158,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   end
 
   defp do_commit_replay_claim(config, key, ttl) do
-    case Callback.invoke(Adapter.replay_check(config), [key, ttl]) do
-      :ok ->
-        :ok
-
-      {:error, :replay} ->
-        {:error, :replay}
-
-      _other ->
-        raise ArgumentError,
-              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}"
-    end
+    ReplayClaim.commit(Adapter.replay_check(config), key, ttl)
   end
 
   defp require_assertion(params) do
@@ -348,7 +338,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   # the issued token may carry (the token core narrows further via the host
   # `:authorize_scope` policy). An absent scope claim places no ceiling.
   defp scope_ceiling(%{"scope" => scope}) when is_binary(scope) do
-    String.split(scope, " ", trim: true)
+    Scope.parse(scope)
   end
 
   defp scope_ceiling(_claims), do: nil

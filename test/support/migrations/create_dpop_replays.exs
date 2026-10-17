@@ -13,7 +13,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateDPoPReplays do
 
   def change do
     create table(:dpop_replays, primary_key: false) do
-      add(:jti, :string, primary_key: true, null: false)
+      add(:jti, :string, size: 255, primary_key: true, null: false)
       add(:expires_at, :utc_datetime_usec, null: false)
       add(:inserted_at, :utc_datetime_usec, null: false)
     end

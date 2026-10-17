@@ -25,7 +25,8 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
     "response_type" => "code",
     "scope" => "openid profile",
     "redirect_uri" => "https://rp.example/cb",
-    "dpop_jkt" => "request-parameter-secret"
+    "dpop_jkt" => "request-parameter-secret",
+    "authorization_details" => [%{"amount" => 1.25}]
   }
 
   test "put then fetch round-trips the params verbatim (string-keyed jsonb)" do
@@ -87,6 +88,13 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
     assert {:error, _changeset} = EctoPARStore.put(@request_uri, %{"client_id" => "other"}, 90)
     # The original reference is intact.
     assert {:ok, %{"client_id" => "client-1"}} = EctoPARStore.fetch(@request_uri)
+  end
+
+  test "put rejects NUL bytes before PostgreSQL encoding" do
+    params = Map.put(@params, "claims", %{"userinfo" => %{"name" => "before\0after"}})
+
+    assert {:error, :invalid_text} = EctoPARStore.put(@request_uri, params, 90)
+    refute TestRepo.get(PushedAuthorizationRequest, @request_uri)
   end
 
   test "query telemetry is suppressed for request_uri writes, reads, and deletes" do

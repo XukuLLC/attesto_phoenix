@@ -53,6 +53,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.DevHttps do
 
   use Mix.Task
 
+  alias AttestoPhoenix.MixTaskSupport, as: TaskSupport
+
   @default_hosts "localhost 127.0.0.1 ::1"
   @default_dir "priv/cert"
   @cert_basename "localhost.pem"
@@ -75,13 +77,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.DevHttps do
 
   @impl Mix.Task
   def run(args) do
-    {opts, positional, invalid} = OptionParser.parse(args, strict: @switches)
-    reject_invalid_args!(positional, invalid)
-
-    if Keyword.get(opts, :help, false) do
-      Mix.shell().info(@help)
-    else
-      run_generation(opts)
+    case TaskSupport.parse_options!(args, @switches,
+           error_subject: "development HTTPS generator",
+           accepted_options: @accepted_option_labels,
+           help: @help
+         ) do
+      {:help, _opts} -> :ok
+      {:ok, opts} -> run_generation(opts)
     end
   end
 
@@ -96,17 +98,6 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.DevHttps do
     else
       Mix.shell().error(mkcert_install_guidance())
     end
-  end
-
-  defp reject_invalid_args!([], []), do: :ok
-
-  defp reject_invalid_args!(positional, invalid) do
-    Mix.raise(
-      "invalid development HTTPS generator arguments. Accepted options: " <>
-        Enum.join(@accepted_option_labels, ", ") <>
-        ". Unexpected positional arguments: #{inspect(positional)}; " <>
-        "invalid options: #{inspect(invalid)}"
-    )
   end
 
   # --- generation (guarded behind the mkcert-availability seam above) ---

@@ -11,7 +11,6 @@ defmodule AttestoPhoenix.Controller.NonceController do
 
   alias AttestoPhoenix.{Callback, Config}
   alias AttestoPhoenix.OAuthError
-  alias AttestoPhoenix.RequestContext
 
   @default_nonce_ttl_seconds 300
 
@@ -21,19 +20,17 @@ defmodule AttestoPhoenix.Controller.NonceController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- check_https(conn, config),
+    with :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
+           ),
          {:ok, store} <- c_nonce_store(config),
          {:ok, nonce} <- issue_nonce(store) do
       json(conn, %{"c_nonce" => nonce})
     else
       {:error, %OAuthError{} = error} -> OAuthError.render(conn, error, config: config)
-    end
-  end
-
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
     end
   end
 

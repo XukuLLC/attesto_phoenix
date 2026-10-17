@@ -39,6 +39,7 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
   use Mix.Task
 
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.MixTaskSupport, as: TaskSupport
   alias AttestoPhoenix.RefreshIssuerMigration
   alias AttestoPhoenix.Store.EctoRefreshStore
 
@@ -84,13 +85,13 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
 
   @impl Mix.Task
   def run(args) do
-    {opts, positional, invalid} = OptionParser.parse(args, strict: @switches)
-    reject_invalid_args!(positional, invalid)
-
-    if Keyword.get(opts, :help, false) do
-      Mix.shell().info(@help)
-    else
-      run_backfill(args, opts)
+    case TaskSupport.parse_options!(args, @switches,
+           error_subject: "refresh issuer migration",
+           accepted_options: @accepted_option_labels,
+           help: @help
+         ) do
+      {:help, _opts} -> :ok
+      {:ok, opts} -> run_backfill(args, opts)
     end
   end
 
@@ -104,20 +105,10 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuer do
     Enum.each(repos, fn repo -> run_for_repo(repo, config, opts) end)
   end
 
-  defp reject_invalid_args!([], []), do: :ok
-
-  defp reject_invalid_args!(positional, invalid) do
-    Mix.raise(
-      "invalid refresh issuer migration arguments. Accepted options: " <>
-        Enum.join(@accepted_option_labels, ", ") <>
-        ". Unexpected positional arguments: #{inspect(positional)}; " <>
-        "invalid options: #{inspect(invalid)}"
-    )
-  end
-
   defp validate_arguments!(opts) do
     if opts[:assert_single_issuer] != true, do: Mix.raise("--assert-single-issuer is required")
     if !is_binary(opts[:issuer]), do: Mix.raise("--issuer is required")
+    TaskSupport.validate_schema_prefix!(opts[:schema_prefix])
     RefreshIssuerMigration.validate_issuer!(opts[:issuer])
   end
 

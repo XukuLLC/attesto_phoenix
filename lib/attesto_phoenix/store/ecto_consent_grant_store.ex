@@ -31,10 +31,9 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
 
   import Ecto.Query, only: [from: 2]
 
-  alias AttestoPhoenix.Config
   alias AttestoPhoenix.ConsentGrant
   alias AttestoPhoenix.Schema.ConsentGrant, as: Grant
-  alias AttestoPhoenix.Store.Sweeper
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
 
   # The grant token is the only secret in the consent hop and is short-lived, so
   # 32 bytes of CSPRNG output (256 bits) url-base64 encoded is an unguessable,
@@ -51,9 +50,7 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   @impl AttestoPhoenix.ConsentGrantStore
   @spec mint(ConsentGrant.binding(), pos_integer()) :: {:ok, String.t()} | {:error, Ecto.Changeset.t()}
   def mint(%{} = binding, ttl_seconds) when is_integer(ttl_seconds) and ttl_seconds > 0 do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     token = :crypto.strong_rand_bytes(@token_bytes) |> Base.url_encode64(padding: false)
     now = DateTime.utc_now()
 
@@ -85,9 +82,7 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   @spec consume(String.t() | nil, ConsentGrant.binding()) ::
           :ok | {:error, AttestoPhoenix.ConsentGrantStore.consume_error()}
   def consume(token, %{} = binding) when is_binary(token) and token != "" do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now()
     hash = ConsentGrant.binding_hash(binding)
 
@@ -136,6 +131,4 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
         end
     end
   end
-
-  defp repo, do: Config.ecto_repo!()
 end

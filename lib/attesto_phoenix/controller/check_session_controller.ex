@@ -34,6 +34,7 @@ defmodule AttestoPhoenix.Controller.CheckSessionController do
   import Plug.Conn
 
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.MetadataSupport
 
   # The page is static for a given configuration; cache like the discovery
   # document (the login-state answer is computed in the browser per message,
@@ -46,7 +47,7 @@ defmodule AttestoPhoenix.Controller.CheckSessionController do
 
     if Config.session_management_enabled?(config) do
       conn
-      |> put_resp_header("cache-control", "public, max-age=#{@cache_max_age_seconds}")
+      |> MetadataSupport.put_public_cache(@cache_max_age_seconds)
       |> put_resp_content_type("text/html")
       |> send_resp(200, page_html(Config.browser_state_cookie(config)))
     else

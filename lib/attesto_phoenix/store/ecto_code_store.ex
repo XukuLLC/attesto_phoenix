@@ -62,7 +62,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
-  alias AttestoPhoenix.Store.Sweeper
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
 
   # Ecto SQL query telemetry includes params/cast_params and decoded results.
   # Every authorization-row query carries at least one security-sensitive value
@@ -95,9 +95,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec put(Attesto.CodeStore.entry()) :: :ok
   def put(%{code_hash: code_hash, data: data, expires_at: expires_at} = record)
       when is_binary(code_hash) and is_map(data) and is_integer(expires_at) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
 
     record
     |> Authorization.from_record(prefix: prefix)
@@ -131,9 +129,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec take(Attesto.CodeStore.code_hash()) ::
           {:ok, Attesto.CodeStore.entry()} | :error | {:error, :consumed, Attesto.CodeStore.consumed_meta()}
   def take(code_hash) when is_binary(code_hash) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     consumed_at = DateTime.utc_now() |> DateTime.truncate(:second)
     replay_retain_until = DateTime.add(consumed_at, @finalization_grace_seconds, :second)
 
@@ -216,15 +212,40 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   end
 
   defp mark_consumed_row(code_hash, family_updates) when is_binary(code_hash) and is_list(family_updates) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
-    query = from a in Authorization, where: a.code_hash == ^code_hash
+    {repo, prefix} = StoreEcto.mutation_context()
+
+    query =
+      from a in Authorization,
+        where: a.code_hash == ^code_hash,
+        select: [:access_token_revoked_at]
+
     updates = [consumed_success: true] ++ family_updates
 
-    query
-    |> repo.update_all([set: updates], prefix: prefix, log: false, telemetry_event: nil)
-    |> expect_one_updated!(:mark_consumed)
+    case repo.update_all(query, [set: updates], prefix: prefix, log: false, telemetry_event: nil) do
+      {1, [%Authorization{access_token_revoked_at: nil}]} ->
+        :ok
+
+      {1, [%Authorization{}]} ->
+        contain_overlapping_reuse!(Keyword.get(family_updates, :family_id))
+
+      result ->
+        expect_one_updated!(result, :mark_consumed)
+    end
+  end
+
+  defp contain_overlapping_reuse!(nil), do: :ok
+
+  defp contain_overlapping_reuse!(family_id) when is_binary(family_id) and family_id != "" do
+    case Config.request_config() do
+      %Config{refresh_store: store} when is_atom(store) and not is_nil(store) ->
+        case store.revoke_family(family_id) do
+          :ok -> revoke_family_access_tokens(family_id)
+          _unexpected -> raise RuntimeError, "refresh store failed authorization-code reuse containment"
+        end
+
+      _ ->
+        raise RuntimeError, "authorization-code reuse containment could not resolve its refresh store"
+    end
   end
 
   defp replay_retain_until!(meta) do
@@ -258,9 +279,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec record_access_token(String.t(), String.t(), integer()) :: :ok
   def record_access_token(family_id, jti, expires_at)
       when is_binary(family_id) and is_binary(jti) and is_integer(expires_at) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     query = from a in Authorization, where: a.family_id == ^family_id
 
     record_access_token_row(query, jti, expires_at, prefix, repo)
@@ -274,9 +293,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @spec record_access_token_for_code(String.t(), String.t(), integer()) :: :ok
   def record_access_token_for_code(code_hash, jti, expires_at)
       when is_binary(code_hash) and code_hash != "" and is_binary(jti) and is_integer(expires_at) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     query = from a in Authorization, where: a.code_hash == ^code_hash
 
     record_access_token_row(query, jti, expires_at, prefix, repo)
@@ -303,9 +320,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @doc false
   @spec revoke_family_access_tokens(String.t()) :: :ok
   def revoke_family_access_tokens(family_id) when is_binary(family_id) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -324,9 +339,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   @doc false
   @spec revoke_access_token_for_code(String.t()) :: :ok
   def revoke_access_token_for_code(code_hash) when is_binary(code_hash) and code_hash != "" do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     # 2.14.x consumed-code rows can predate access-token linkage. Replay
@@ -408,6 +421,23 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   # could not leak it. `redact: true` would not help; telemetry carries the raw
   # row, not the struct.
   defp consumed_or_missing(repo, code_hash, prefix) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    pending_query =
+      from a in Authorization,
+        where: a.code_hash == ^code_hash and not is_nil(a.consumed_at) and a.consumed_success == false
+
+    # A replay may arrive after atomic take but before token issuance records
+    # the family. Persist the signal on the row. Successful finalization sees
+    # this marker and revokes the family it just created; if finalization wins
+    # the race first, the ordinary consumed-code path below carries that family
+    # to the token layer for the same containment action.
+    repo.update_all(pending_query, [set: [access_token_revoked_at: now]],
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
+    )
+
     query =
       from a in Authorization,
         where: a.code_hash == ^code_hash,

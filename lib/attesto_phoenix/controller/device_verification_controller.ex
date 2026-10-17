@@ -43,27 +43,25 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   use AttestoPhoenix.Controller, formats: [:html, :json]
 
   alias Attesto.DeviceCode
-  alias AttestoPhoenix.{Callback, Config, RequestContext}
+  alias AttestoPhoenix.{Callback, Config}
 
   @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def verify(conn, params) do
     config = Config.resolve!(conn)
 
     with :ok <- require_enabled(config),
-         :ok <- check_https(conn, config),
+         :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, 400, %{error: "invalid_request", error_description: "TLS required"}}
+           ),
          {:ok, store} <- require_store(config),
          {:ok, conn, subject} <- authenticate(conn, config) do
       handle(conn, config, store, subject, params)
     else
       {:halt, conn} -> conn
       {:error, status, body} -> conn |> put_status(status) |> json(body)
-    end
-  end
-
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, 400, %{error: "invalid_request", error_description: "TLS required"}}
     end
   end
 

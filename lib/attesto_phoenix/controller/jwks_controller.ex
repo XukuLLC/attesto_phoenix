@@ -37,6 +37,7 @@ defmodule AttestoPhoenix.Controller.JWKSController do
 
   alias Attesto.JWKS
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.MetadataSupport
 
   # RFC 7517 §8.5.1 registers `application/jwk-set+json` for a JWK Set document.
   @jwk_set_media_type "application/jwk-set+json"
@@ -61,15 +62,9 @@ defmodule AttestoPhoenix.Controller.JWKSController do
     jwk_set = JWKS.from_config(attesto_config(config))
 
     conn
-    |> put_public_cache()
+    |> MetadataSupport.put_public_cache(@cache_max_age_seconds)
     |> put_resp_content_type(@jwk_set_media_type)
     |> json(jwk_set)
-  end
-
-  # RFC 9111 §5.2.2.5 / §5.2.2.1: the set is identical for every caller and may
-  # be shared by intermediary caches for `max-age` seconds.
-  defp put_public_cache(conn) do
-    put_resp_header(conn, "cache-control", "public, max-age=#{@cache_max_age_seconds}")
   end
 
   defp attesto_config(config), do: Config.to_attesto_config(config)

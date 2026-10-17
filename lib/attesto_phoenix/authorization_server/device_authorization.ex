@@ -22,9 +22,9 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   matching proof at redemption. Confidential clients may opt out.
   """
 
-  alias Attesto.{DeviceCode, ResourceIndicator, Scope}
+  alias Attesto.{DeviceCode, MapParams, ResourceIndicator, Scope}
   alias Attesto.DPoP
-  alias AttestoPhoenix.{Config, DPoP.Adapter, OAuthError}
+  alias AttestoPhoenix.{ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
 
   @error_invalid_request :invalid_request
   @error_invalid_scope :invalid_scope
@@ -116,7 +116,10 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   # endpoint binds them to an authorization code.
   defp resolve_resource(config, client, params) do
     with {:ok, resources} <- validate_resource(params) do
-      case ResourceIndicator.authorize(resources, Config.allowed_resources(config, client)) do
+      case ResourceIndicator.authorize(
+             resources,
+             Config.allowed_resources(config, ClientIdMetadata.host_client(client))
+           ) do
         {:ok, resources} -> {:ok, resources}
         {:error, :invalid_target} -> {:error, error(@error_invalid_target, "the requested resource is not served")}
       end
@@ -167,7 +170,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
 
     attrs =
       %{client_id: client_id, scope: scope, resource: resource}
-      |> put_optional(:dpop_jkt, dpop_jkt)
+      |> MapParams.put_optional(:dpop_jkt, dpop_jkt)
 
     case DeviceCode.issue(store, attrs,
            ttl: Keyword.get(opts, :code_ttl_seconds),
@@ -190,14 +193,24 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
       user_code: user_code,
       verification_uri: verification_uri,
       # RFC 8628 §3.3.1: the URI with the user_code embedded for QR/deep-link UX.
-      verification_uri_complete: verification_uri <> "?user_code=" <> user_code,
+      verification_uri_complete: append_user_code(verification_uri, user_code),
       expires_in: Keyword.get(opts, :code_ttl_seconds),
       interval: Keyword.get(opts, :poll_interval_seconds)
     }
   end
 
-  defp put_optional(map, _key, nil), do: map
-  defp put_optional(map, key, value), do: Map.put(map, key, value)
+  defp append_user_code(verification_uri, user_code) do
+    uri = URI.parse(verification_uri)
+    encoded_user_code = URI.encode_query(%{"user_code" => user_code})
+
+    query =
+      case uri.query do
+        value when is_binary(value) and value != "" -> value <> "&" <> encoded_user_code
+        _ -> encoded_user_code
+      end
+
+    %{uri | query: query} |> URI.to_string()
+  end
 
   defp error(code, description), do: OAuthError.new(code, description, status: 400)
 end

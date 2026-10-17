@@ -34,7 +34,7 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.PushedAuthorizationRequest, as: PushedRequest
-  alias AttestoPhoenix.Store.Sweeper
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
 
   @doc """
   Persists a pushed authorization request under `request_uri` for
@@ -50,9 +50,15 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   @spec put(String.t(), map(), pos_integer()) :: :ok | {:error, term()}
   def put(request_uri, params, ttl_seconds)
       when is_binary(request_uri) and is_map(params) and is_integer(ttl_seconds) and ttl_seconds > 0 do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    if nul_free?(params) do
+      put_validated(request_uri, params, ttl_seconds)
+    else
+      {:error, :invalid_text}
+    end
+  end
+
+  defp put_validated(request_uri, params, ttl_seconds) do
+    {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.add(now, ttl_seconds, :second)
 
@@ -65,6 +71,18 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
       {:error, changeset} -> {:error, changeset}
     end
   end
+
+  defp nul_free?(value) when is_binary(value), do: not String.contains?(value, <<0>>)
+  defp nul_free?(value) when is_list(value), do: Enum.all?(value, &nul_free?/1)
+
+  defp nul_free?(value) when is_map(value) and not is_struct(value) do
+    Enum.all?(value, fn {key, nested} -> nul_free?(key) and nul_free?(nested) end)
+  end
+
+  defp nul_free?(value)
+       when is_atom(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: true
+
+  defp nul_free?(_value), do: false
 
   @doc """
   Resolves a live `request_uri` without consuming it.
@@ -102,9 +120,7 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   @impl AttestoPhoenix.PARStore
   @spec take(String.t()) :: {:ok, map()} | :error
   def take(request_uri) when is_binary(request_uri) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =

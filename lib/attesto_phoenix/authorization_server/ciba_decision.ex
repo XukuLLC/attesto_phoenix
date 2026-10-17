@@ -23,7 +23,7 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecision do
   """
 
   alias Attesto.CIBA
-  alias AttestoPhoenix.{Callback, Config}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config}
 
   require Logger
 
@@ -139,7 +139,7 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecision do
   end
 
   defp registration_for_ping(config, client) do
-    {:ok, Config.client_ciba_registration(config, client)}
+    {:ok, Config.client_ciba_registration(config, ClientIdMetadata.host_client(client))}
   rescue
     _exception -> {:error, :registration_failed}
   catch
@@ -151,7 +151,11 @@ defmodule AttestoPhoenix.AuthorizationServer.CIBADecision do
   # committed decision into a misleading failure response. Keep the diagnostic
   # bounded: callback returns/exceptions may contain storage or credential data.
   defp load_client_for_ping(config, client_id) do
-    Config.client_store_load(config, client_id)
+    case ClientIdMetadata.load_host_client(config, client_id) do
+      {:ok, client} -> {:ok, client}
+      {:error, reason} when reason in [:not_found, :revoked] -> {:error, reason}
+      _failure -> {:error, :client_lookup_failed}
+    end
   rescue
     _exception -> {:error, :client_lookup_failed}
   catch

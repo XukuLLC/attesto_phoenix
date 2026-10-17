@@ -205,6 +205,14 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert response.scope == "mcp:read mcp:write"
     end
 
+    test "the assertion scope ceiling ignores repeated ASCII-space separators" do
+      config = config()
+      params = %{"assertion" => assertion(%{"scope" => "  mcp:read   mcp:write  "})}
+
+      assert {:ok, response, _} = issue(config, params)
+      assert response.scope == "mcp:read mcp:write"
+    end
+
     test "a requested scope within the assertion ceiling is honoured" do
       config = config()
       params = %{"assertion" => assertion(%{"scope" => "mcp:read mcp:write"}), "scope" => "mcp:read"}

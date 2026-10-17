@@ -11,22 +11,22 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateAuthorizationCodes do
 
   def change do
     create table(:attesto_authorization_codes, primary_key: false) do
-      add(:code_hash, :string, primary_key: true, null: false)
-      add(:client_id, :string, null: false)
-      add(:subject, :string, null: false)
+      add(:code_hash, :string, size: 88, primary_key: true, null: false)
+      add(:client_id, :string, size: 255, null: false)
+      add(:subject, :string, size: 255, null: false)
       add(:scope, {:array, :string}, null: false, default: [])
       add(:resource, {:array, :string}, null: false, default: [])
-      add(:redirect_uri, :string, null: false)
+      add(:redirect_uri, :text, null: false)
       # PKCE optional at persistence: a confidential client the host exempted
       # from PKCE (Attesto.AuthorizationRequest's :require_pkce) issues a code
       # with no challenge, so both columns are nullable (mirrors the gen task).
-      add(:code_challenge, :string)
-      add(:code_challenge_method, :string)
+      add(:code_challenge, :string, size: 255)
+      add(:code_challenge_method, :string, size: 16)
       add(:cnf, :map)
-      add(:nonce, :string)
+      add(:nonce, :string, size: 255)
       add(:claims, :map, null: false, default: %{})
-      add(:family_id, :string)
-      add(:access_token_jti, :string)
+      add(:family_id, :string, size: 255)
+      add(:access_token_jti, :string, size: 255)
       add(:access_token_expires_at, :utc_datetime)
       add(:access_token_revoked_at, :utc_datetime)
       add(:expires_at, :utc_datetime, null: false)
@@ -36,6 +36,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateAuthorizationCodes do
       add(:inserted_at, :utc_datetime, null: false)
     end
 
+    create(index(:attesto_authorization_codes, [:expires_at]))
     create(index(:attesto_authorization_codes, [:family_id]))
     create(index(:attesto_authorization_codes, [:access_token_jti]))
   end

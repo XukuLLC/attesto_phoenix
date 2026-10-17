@@ -8,6 +8,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorizationTest do
   alias Attesto.DeviceCodeStore.ETS, as: Store
   alias AttestoPhoenix.AuthorizationServer.DeviceAuthorization
   alias AttestoPhoenix.AuthorizationServer.DeviceAuthorization.Request
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.OAuthError
 
@@ -67,6 +68,23 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorizationTest do
              DeviceCode.redeem(Store, response.device_code, %{client_id: "cli-1"}, interval: 0)
   end
 
+  test "verification_uri_complete preserves an existing verification URI query" do
+    config =
+      config(
+        device_authorization: [
+          enabled: true,
+          code_ttl_seconds: 600,
+          poll_interval_seconds: 5,
+          verification_uri: "https://verify.example/device?flow=login&flow=reauth"
+        ]
+      )
+
+    assert {:ok, response} = DeviceAuthorization.request(config, request(%{id: "cli-1"}, %{}))
+
+    assert URI.parse(response.verification_uri_complete).query ==
+             "flow=login&flow=reauth&user_code=#{response.user_code}"
+  end
+
   test "a configured client_id callback cannot fall through to the presented identifier" do
     config = config(client_id: fn _client -> nil end)
     request = request(%{id: "cli-1"}, %{"scope" => "read"}, request_client_id: "cli-1")
@@ -103,6 +121,34 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorizationTest do
     assert {:ok, response} = DeviceAuthorization.request(config, request(%{id: "cli-1"}, params))
     assert {:ok, view} = DeviceCode.lookup(Store, response.user_code)
     assert view.resource == ["https://api.example.com/a"]
+  end
+
+  test "resource callbacks receive CIMD metadata rather than the internal wrapper" do
+    resource = "https://api.example.com/cimd"
+    client_id = "https://client.example/metadata.json"
+    client = %CIMDClient{metadata: %{"client_id" => client_id, "resources" => [resource]}}
+
+    config =
+      config(
+        resource_indicators: [
+          allowed_resources_for: fn metadata ->
+            assert is_map(metadata)
+            refute match?(%CIMDClient{}, metadata)
+            Map.fetch!(metadata, "resources")
+          end
+        ]
+      )
+
+    req = %Request{
+      client: client,
+      client_auth_method: :private_key_jwt,
+      request_client_id: client_id,
+      params: %{"resource" => resource},
+      dpop_input: %{}
+    }
+
+    assert {:ok, response} = DeviceAuthorization.request(config, req)
+    assert {:ok, %{resource: [^resource]}} = DeviceCode.lookup(Store, response.user_code)
   end
 
   test "a public client without a DPoP proof is rejected (security)" do

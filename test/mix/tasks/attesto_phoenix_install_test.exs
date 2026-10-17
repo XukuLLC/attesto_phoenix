@@ -1249,7 +1249,7 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert notice
 
       positions =
-        Enum.map(~w(3.0 3.1 3.4 3.6 3.7), fn version ->
+        Enum.map(~w(3.0 3.1 3.4 3.6 3.7 4.2), fn version ->
           command =
             "gen.migration --upgrade #{version} --repo Test.Repo --schema-prefix tenant_auth"
 
@@ -1824,7 +1824,9 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                  notice =~
                    "gen.migration --upgrade 3.6 --repo Test.Repo --schema-prefix tenant_prod" and
                  notice =~
-                   "gen.migration --upgrade 3.7 --repo Test.Repo --schema-prefix tenant_prod"
+                   "gen.migration --upgrade 3.7 --repo Test.Repo --schema-prefix tenant_prod" and
+                 notice =~
+                   "gen.migration --upgrade 4.2 --repo Test.Repo --schema-prefix tenant_prod"
              end)
 
       applied = apply_igniter!(composed)

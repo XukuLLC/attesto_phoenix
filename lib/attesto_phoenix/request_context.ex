@@ -327,6 +327,50 @@ defmodule AttestoPhoenix.RequestContext do
     |> URI.to_string()
   end
 
+  @doc false
+  @spec canonical_url(Plug.Conn.t(), Config.t(), String.t()) :: String.t()
+  def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu}, configured_url)
+      when not is_nil(htu) and is_binary(configured_url) do
+    Callback.invoke(htu, [conn]) || configured_url
+  end
+
+  def canonical_url(%Plug.Conn{}, %Config{}, configured_url) when is_binary(configured_url) do
+    strip_query_and_fragment(configured_url)
+  end
+
+  @doc false
+  @spec canonical_url(Plug.Conn.t(), Config.t(), String.t(), String.t()) :: String.t()
+  def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu} = config, configured_url, endpoint_name)
+      when not is_nil(htu) and is_binary(configured_url) and is_binary(endpoint_name) do
+    Callback.invoke(htu, [conn]) ||
+      canonical_url(conn, %{config | htu: nil}, configured_url, endpoint_name)
+  end
+
+  def canonical_url(%Plug.Conn{} = conn, %Config{} = config, configured_url, endpoint_name)
+      when is_binary(configured_url) and is_binary(endpoint_name) do
+    primary_url = strip_query_and_fragment(configured_url)
+    observed_url = canonical_url(conn, %{config | htu: nil})
+
+    mtls_url =
+      case config.mtls_endpoint_aliases do
+        aliases when is_map(aliases) -> Map.get(aliases, endpoint_name)
+        _other -> nil
+      end
+
+    case mtls_url && strip_query_and_fragment(mtls_url) do
+      ^observed_url -> observed_url
+      _other -> primary_url
+    end
+  end
+
+  defp strip_query_and_fragment(url) do
+    url
+    |> URI.parse()
+    |> Map.put(:query, nil)
+    |> Map.put(:fragment, nil)
+    |> URI.to_string()
+  end
+
   @doc """
   Returns the peer certificate DER for the RFC 8705 §3 mutual-TLS `cnf` binding,
   or `nil` when no client certificate was presented.
@@ -527,27 +571,13 @@ defmodule AttestoPhoenix.RequestContext do
 
   # ----- forwarded-header parsing -----
 
-  # `X-Forwarded-For` is a comma-separated chain of proxied-through IPs; the
-  # left-most entry is the original client. Only consulted for trusted peers.
-  defp first_forwarded_for(conn) do
-    conn
-    |> first_header(@forwarded_for_header)
-    |> case do
-      value when is_binary(value) ->
-        value
-        |> String.split(",", parts: 2)
-        |> List.first()
-        |> String.trim()
-        |> nil_if_empty()
-
-      _ ->
-        nil
-    end
-  end
+  # Read the value appended by the immediate trusted peer. Tokens farther left
+  # may have been supplied by the client before that peer appended its value.
+  defp first_forwarded_for(conn), do: nearest_forwarded_token(conn, @forwarded_for_header)
 
   defp forwarded_scheme(conn) do
     conn
-    |> first_forwarded_token(@forwarded_proto_header)
+    |> nearest_forwarded_token(@forwarded_proto_header)
     |> case do
       value when is_binary(value) -> String.downcase(value)
       _ -> nil
@@ -556,13 +586,13 @@ defmodule AttestoPhoenix.RequestContext do
 
   defp forwarded_authority(conn, scheme) do
     conn
-    |> first_forwarded_token(@forwarded_host_header)
+    |> nearest_forwarded_token(@forwarded_host_header)
     |> parse_authority(scheme)
   end
 
   defp forwarded_port(conn) do
     conn
-    |> first_forwarded_token(@forwarded_port_header)
+    |> nearest_forwarded_token(@forwarded_port_header)
     |> case do
       value when is_binary(value) ->
         case Integer.parse(value) do
@@ -576,20 +606,16 @@ defmodule AttestoPhoenix.RequestContext do
   end
 
   # A forwarded header may itself be a comma-separated chain when multiple
-  # proxies appended values; take the left-most (closest to the client) token.
-  defp first_forwarded_token(conn, header) do
+  # proxies appended values. The immediate trusted peer owns the right-most
+  # token; values farther left may have been supplied by the client.
+  defp nearest_forwarded_token(conn, header) do
     conn
-    |> first_header(header)
+    |> Plug.Conn.get_req_header(header)
+    |> Enum.flat_map(&String.split(&1, ","))
+    |> List.last()
     |> case do
-      value when is_binary(value) ->
-        value
-        |> String.split(",", parts: 2)
-        |> List.first()
-        |> String.trim()
-        |> nil_if_empty()
-
-      _ ->
-        nil
+      value when is_binary(value) -> value |> String.trim() |> nil_if_empty()
+      _ -> nil
     end
   end
 

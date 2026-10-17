@@ -1,7 +1,8 @@
 if Code.ensure_loaded?(Req) do
   defmodule AttestoPhoenix.BackChannelLogout.Req do
     @moduledoc """
-    Default `AttestoPhoenix.BackChannelLogout` deliverer, built on `Req`.
+    Default `AttestoPhoenix.BackChannelLogout` deliverer, using a one-shot Mint
+    connection to the SSRF-screened address.
 
     POSTs the `logout_token` to the Relying Party's `backchannel_logout_uri` as
     `application/x-www-form-urlencoded` (OpenID Connect Back-Channel Logout 1.0
@@ -30,23 +31,24 @@ if Code.ensure_loaded?(Req) do
 
       with {:ok, %{url: url, host: host, authority: authority}} <-
              AttestoPhoenix.SSRFGuard.screen(backchannel_logout_uri, screen_opts) do
-        [
-          url: url,
-          method: :post,
-          form: [logout_token: logout_token],
-          headers: [{"accept", "application/json"}, {"host", authority}],
-          redirect: false,
-          retry: false,
-          receive_timeout: @timeout_ms,
-          decode_body: false,
-          into: AttestoPhoenix.HTTPResponse.discard_body_collector(),
-          connect_options: [hostname: host]
-        ]
-        |> Req.new()
-        |> Req.request()
+        body = URI.encode_query(%{"logout_token" => logout_token})
+
+        AttestoPhoenix.PinnedHTTP.request(
+          :post,
+          url,
+          host,
+          [
+            {"accept", "application/json"},
+            {"content-type", "application/x-www-form-urlencoded"},
+            {"host", authority}
+          ],
+          body,
+          @timeout_ms,
+          :discard
+        )
         |> case do
-          {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
-          {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
+          {:ok, %{status: status}} when status in 200..299 -> :ok
+          {:ok, %{status: status}} -> {:error, {:status, status}}
           {:error, reason} -> {:error, reason}
         end
       end

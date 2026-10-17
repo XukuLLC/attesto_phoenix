@@ -365,6 +365,19 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       assert claims["phone_number_verified"] == false
     end
 
+    test "parses access-token scopes with the resource-server whitespace policy" do
+      token =
+        [scope: "openid profile email"]
+        |> mint()
+        |> replace_scope_claim("openid\tprofile\nemail")
+
+      claims = body(get_userinfo(token))
+
+      assert claims["sub"] == @subject
+      assert claims["name"] == "Ada Lovelace"
+      assert claims["email"] == "ada@example.com"
+    end
+
     test "never releases a claim with no authorizing scope" do
       token = mint(scope: "openid profile email address phone")
       claims = body(get_userinfo(token))
@@ -520,6 +533,16 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
 
     {:ok, claims} = Token.peek_signed_claims(config, token)
     claims
+  end
+
+  defp replace_scope_claim(token, scope) do
+    claims = token |> peek_claims() |> Map.put("scope", scope)
+
+    Attesto.JWS.sign_compact(
+      @signing_pem,
+      %{"alg" => Token.signing_alg(), "kid" => Attesto.Key.kid(@signing_pem), "typ" => "at+jwt"},
+      claims
+    )
   end
 
   defp maybe_authorization(conn, nil), do: conn

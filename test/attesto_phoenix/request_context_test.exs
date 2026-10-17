@@ -254,7 +254,7 @@ defmodule AttestoPhoenix.RequestContextTest do
       refute RequestContext.https?(conn, cfg)
     end
 
-    test "left-most forwarded-proto token wins" do
+    test "right-most forwarded-proto token from the trusted hop wins" do
       cfg = config(trusted_proxies: [:loopback])
 
       conn =
@@ -262,6 +262,15 @@ defmodule AttestoPhoenix.RequestContextTest do
           scheme: :http,
           remote_ip: {127, 0, 0, 1},
           headers: [{"x-forwarded-proto", "https, http"}]
+        )
+
+      refute RequestContext.https?(conn, cfg)
+
+      conn =
+        build_conn(:get, "/",
+          scheme: :http,
+          remote_ip: {127, 0, 0, 1},
+          headers: [{"x-forwarded-proto", "http, https"}]
         )
 
       assert RequestContext.https?(conn, cfg)
@@ -293,16 +302,16 @@ defmodule AttestoPhoenix.RequestContextTest do
                "127.0.0.1"
     end
 
-    test "uses left-most forwarded-for from a trusted proxy" do
+    test "uses the nearest forwarded-for value from a trusted proxy" do
       cfg = config(trusted_proxies: [:loopback])
 
       conn =
         build_conn(:get, "/",
           remote_ip: {127, 0, 0, 1},
-          headers: [{"x-forwarded-for", "198.51.100.7, 127.0.0.1"}]
+          headers: [{"x-forwarded-for", "198.51.100.7, 203.0.113.9"}]
         )
 
-      assert RequestContext.client_ip(conn, cfg) == "198.51.100.7"
+      assert RequestContext.client_ip(conn, cfg) == "203.0.113.9"
     end
 
     test "ignores forwarded-for from an untrusted peer" do
@@ -337,7 +346,62 @@ defmodule AttestoPhoenix.RequestContextTest do
     end
   end
 
-  describe "canonical_url/2" do
+  describe "canonical_url/2 and configured endpoint URLs" do
+    test "a configured endpoint pins DPoP htu independently of the request Host" do
+      cfg = config()
+      conn = build_conn(:post, "/oauth/token", scheme: :https, host: "attacker.example", port: 443)
+
+      assert RequestContext.canonical_url(conn, cfg, "https://issuer.example/oauth/token?ignored=1") ==
+               "https://issuer.example/oauth/token"
+    end
+
+    test "an exact configured mTLS endpoint alias is used for DPoP htu" do
+      alias_url = "https://mtls.issuer.example/oauth/token"
+      cfg = config(mtls_endpoint_aliases: %{"token_endpoint" => alias_url})
+      conn = build_conn(:post, "/oauth/token", scheme: :https, host: "mtls.issuer.example", port: 443)
+
+      assert RequestContext.canonical_url(
+               conn,
+               cfg,
+               "https://issuer.example/oauth/token",
+               "token_endpoint"
+             ) == alias_url
+    end
+
+    test "an arbitrary Host cannot replace the configured endpoint or mTLS alias" do
+      cfg =
+        config(
+          mtls_endpoint_aliases: %{
+            "token_endpoint" => "https://mtls.issuer.example/oauth/token"
+          }
+        )
+
+      conn = build_conn(:post, "/oauth/token", scheme: :https, host: "attacker.example", port: 443)
+
+      assert RequestContext.canonical_url(
+               conn,
+               cfg,
+               "https://issuer.example/oauth/token",
+               "token_endpoint"
+             ) == "https://issuer.example/oauth/token"
+    end
+
+    test "trusted forwarding uses the right-most host and port supplied by the trusted hop" do
+      cfg = config(trusted_proxies: [:loopback])
+
+      conn =
+        build_conn(:post, "/oauth/token",
+          remote_ip: {127, 0, 0, 1},
+          headers: [
+            {"x-forwarded-proto", "http, https"},
+            {"x-forwarded-host", "attacker.example, issuer.example"},
+            {"x-forwarded-port", "80, 443"}
+          ]
+        )
+
+      assert RequestContext.canonical_url(conn, cfg) == "https://issuer.example/oauth/token"
+    end
+
     test "builds htu from the direct connection authority" do
       cfg = config()
       conn = build_conn(:post, "/oauth/token", scheme: :https, host: "issuer.example", port: 443)

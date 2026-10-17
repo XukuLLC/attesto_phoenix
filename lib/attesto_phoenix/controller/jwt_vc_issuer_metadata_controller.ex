@@ -10,10 +10,9 @@ defmodule AttestoPhoenix.Controller.JwtVcIssuerMetadataController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import Plug.Conn, only: [put_resp_header: 3]
-
   alias Attesto.JWKS
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.MetadataSupport
 
   @cache_max_age_seconds 3600
 
@@ -28,11 +27,7 @@ defmodule AttestoPhoenix.Controller.JwtVcIssuerMetadataController do
     }
 
     conn
-    |> put_cache_control()
+    |> MetadataSupport.put_public_cache(@cache_max_age_seconds)
     |> json(metadata)
-  end
-
-  defp put_cache_control(conn) do
-    put_resp_header(conn, "cache-control", "public, max-age=#{@cache_max_age_seconds}")
   end
 end

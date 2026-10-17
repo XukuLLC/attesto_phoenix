@@ -86,8 +86,9 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   import Plug.Conn
 
   alias Attesto.{Key, RedirectURI, Secret, SecureCompare, SigningAlg}
-  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Event, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Callback, Config, Event, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.HostPolicy
+  alias AttestoPhoenix.RedirectURIRegistration
 
   # RFC 7234 §5.2: a credential-bearing response must never be cached.
   # RFC 7591 §3.1: the registration request body is a JSON object.
@@ -192,7 +193,12 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- check_https(conn, config),
+    with :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, error(:invalid_request, "the request must be made over TLS")}
+           ),
          :ok <- check_registration_enabled(config),
          :ok <- check_content_type(conn),
          {:ok, metadata} <- registration_metadata(conn),
@@ -222,7 +228,12 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- check_https(conn, config),
+    with :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, error(:invalid_request, "the request must be made over TLS")}
+           ),
          :ok <- check_registration_enabled(config),
          {:ok, token} <- registration_bearer_token(conn),
          {:ok, client} <- Config.client_store_load(config, client_id),
@@ -546,7 +557,6 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   defp valid_uri_port?(nil), do: true
   defp valid_uri_port?(port) when is_integer(port), do: port in 1..65_535
-  defp valid_uri_port?(_port), do: false
 
   defp valid_tls_identity?(key, value) do
     bounded_text?(value, @max_tls_identity_bytes) and
@@ -1170,53 +1180,18 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # front of this endpoint.
   defp valid_redirect_uri?(value, application_type, config)
        when is_binary(value) and value != "" and byte_size(value) <= @max_uri_metadata_bytes do
-    with true <- bounded_text?(value, @max_uri_metadata_bytes),
-         true <- RedirectURI.unambiguous?(value),
-         false <- invalid_percent_encoding?(value),
-         {:ok, uri} <- URI.new(value) do
-      acceptable_redirect_uri?(uri, application_type, value, config)
-    else
-      _other -> false
-    end
+    native? = application_type == "native"
+
+    RedirectURIRegistration.valid?(value,
+      allow_private_use: native?,
+      loopback_mode:
+        if(native? and Config.native_app_loopback_redirect?(config),
+          do: Config.native_app_loopback_matching(config)
+        )
+    )
   end
 
   defp valid_redirect_uri?(_value, _application_type, _config), do: false
-
-  # RFC 6749 §3.1.2: "The redirection endpoint URI MUST NOT include a fragment
-  # component." True of every client type, checked before anything else.
-  defp acceptable_redirect_uri?(%URI{fragment: fragment}, _application_type, _original, _config)
-       when not is_nil(fragment), do: false
-
-  # The ordinary form: scheme + authority. The scheme MUST be http/https. A
-  # non-http(s) scheme WITH an authority - `javascript://x/%0aalert(document.domain)//`
-  # parses to scheme "javascript", host "x", no fragment - would otherwise
-  # register as a "trusted" redirect target and later be rendered into an
-  # auto-executing sink (the `form_post`/`form_post.jwt` self-submitting form,
-  # the logout continue-link / meta-refresh) as stored XSS in the AS origin.
-  # Restricting the authority form to http/https closes that; native private-use
-  # and loopback forms are handled by the clauses below.
-  defp acceptable_redirect_uri?(%URI{scheme: "https", host: host} = uri, _application_type, _original, _config)
-       when is_binary(host) and host != "" do
-    valid_uri_port?(uri.port) and match?({:ok, _canonical_host}, HostPolicy.canonicalize(host))
-  end
-
-  # RFC 9700 §2.6 permits plain HTTP only for native loopback redirects as
-  # defined by RFC 8252 §7.3. External HTTP redirects are rejected for both web
-  # and native registrations.
-  # Port zero remains a permitted registration placeholder; authorization
-  # requests must supply a usable port. Ports beyond the TCP range are invalid
-  # even though loopback matching intentionally ignores the registered port.
-  defp acceptable_redirect_uri?(%URI{scheme: "http", port: port}, "native", original, config) when port in 0..65_535 do
-    Config.native_app_loopback_redirect?(config) and
-      ClientIdMetadata.loopback_redirect_uri?(original, Config.native_app_loopback_matching(config))
-  end
-
-  # RFC 8252 §7.1 private-use scheme: no authority, reverse-DNS scheme, and a
-  # real path to call back to.
-  defp acceptable_redirect_uri?(%URI{scheme: scheme, host: nil, path: path}, "native", _original, _config)
-       when is_binary(scheme) and scheme != "" and is_binary(path) and path != "", do: String.contains?(scheme, ".")
-
-  defp acceptable_redirect_uri?(%URI{}, _application_type, _original, _config), do: false
 
   # RFC 7591 §2 / RFC 6749 §3.3: the requested scope is a space-delimited
   # string; every requested scope must be in the server's effective
@@ -1420,13 +1395,6 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # client_secret (create) and reads a registration-access-token bearer
   # credential (delete); neither may cross a plain-HTTP hop, so refuse cleartext
   # under `require_https`, exactly as the token/PAR/revocation endpoints do.
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, error(:invalid_request, "the request must be made over TLS")}
-    end
-  end
-
   # The router option controls whether these routes exist, while the runtime
   # config controls whether this deployment actually offers registration. A
   # route left mounted during a rollout or configuration mistake must return a

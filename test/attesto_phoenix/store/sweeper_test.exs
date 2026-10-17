@@ -873,6 +873,31 @@ defmodule AttestoPhoenix.Store.SweeperTest do
   describe "store check and runtime signal" do
     import ExUnit.CaptureLog
 
+    test "the deprecated single-target signal delegates to the batched path" do
+      prefix = "compat_signal_#{System.unique_integer([:positive])}"
+      handler_id = {__MODULE__, :compat_signal, make_ref()}
+
+      :telemetry.attach(
+        handler_id,
+        [:attesto_phoenix, :store, :sweeper_unsupervised],
+        &__MODULE__.handle_telemetry/4,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      unsupervised = Function.capture(Signal, :unsupervised, 1)
+
+      capture_log(fn ->
+        assert :ok = unsupervised.({RecordingRepo, prefix})
+
+        assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], %{count: 1},
+                        %{repo: RecordingRepo, schema_prefix: ^prefix}},
+                       1_000
+
+        await_signal_idle()
+      end)
+    end
+
     test "emits loud warning and telemetry with safe scalars and conventional count" do
       prefix = "signal_test_#{System.unique_integer([:positive])}"
       ref = make_ref()

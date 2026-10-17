@@ -76,7 +76,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   """
 
   alias Attesto.MTLS
-  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, OAuthError}
+  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, OAuthError, ReplayClaim}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
 
   @typedoc "The sender-constraint facts the controller derives from the request."
@@ -225,7 +225,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   end
 
   defp do_commit_replay_claim(config, replay_key, jti, ttl) do
-    case Adapter.replay_check(config).(replay_key, ttl) do
+    case ReplayClaim.commit(Adapter.replay_check(config), replay_key, ttl) do
       :ok ->
         :ok
 
@@ -234,10 +234,6 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
         # for correlation with the client's proof.
         Attesto.Telemetry.dpop_replay_detected(jti)
         {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: :replay")}
-
-      _other ->
-        raise ArgumentError,
-              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}"
     end
   end
 

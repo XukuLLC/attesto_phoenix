@@ -9,6 +9,7 @@ defmodule AttestoPhoenix.VerifierEncryption do
           | :invalid_verifier_encryption_key
 
   @doc false
+  @deprecated "retained for 4.x compatibility; AttestoPhoenix.Verifier now uses per-session ephemeral encryption keys"
   @spec private_jwk(Config.t()) :: {:ok, JOSE.JWK.t()} | {:error, key_error()}
   def private_jwk(%Config{} = config) do
     case Config.verifier_encryption_keystore(config) do
@@ -21,6 +22,7 @@ defmodule AttestoPhoenix.VerifierEncryption do
   end
 
   @doc false
+  @deprecated "retained for 4.x compatibility; AttestoPhoenix.Verifier now uses per-session ephemeral encryption keys"
   @spec public_jwk(Config.t()) :: {:ok, map()} | {:error, key_error()}
   def public_jwk(%Config{} = config) do
     with {:ok, private_jwk} <- private_jwk(config) do

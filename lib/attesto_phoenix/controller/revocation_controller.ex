@@ -180,14 +180,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   # preserves established Basic-first precedence over redundant body
   # credentials.
   defp authenticate_client(config, conn, params) do
-    policy = ClientAuthentication.Policy.for_endpoint(config, :revocation)
-
-    case ClientAuthentication.authenticate_with_context(
-           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
-           params,
-           config,
-           policy
-         ) do
+    case ClientAuthentication.authenticate_request_with_context(conn, params, config, :revocation) do
       {:ok, %ClientAuthentication.Result{} = result} ->
         {:ok, result}
 

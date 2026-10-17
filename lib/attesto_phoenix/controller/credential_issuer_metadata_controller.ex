@@ -14,6 +14,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
 
   alias Attesto.CredentialIssuerMetadata
   alias AttestoPhoenix.{Config, HTTPAccept}
+  alias AttestoPhoenix.Controller.MetadataSupport
 
   @cache_max_age_seconds 3600
   @signed_metadata_content_type "application/jwt"
@@ -38,7 +39,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
         credential_configurations_supported: Config.credential_configurations_supported(config)
       )
 
-    conn = conn |> put_cache_control() |> put_resp_header("vary", "Accept")
+    conn = conn |> MetadataSupport.put_public_cache(@cache_max_age_seconds) |> put_resp_header("vary", "Accept")
 
     if wants_signed_metadata?(conn) do
       signed = CredentialIssuerMetadata.signed(metadata, keystore: Config.vc_keystore(config))
@@ -64,9 +65,5 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   # wallets at an endpoint whose host callback is unconfigured.
   defp deferred_credential_endpoint(config) do
     if Config.build_deferred_credential_fun(config), do: Config.deferred_credential_endpoint_url(config)
-  end
-
-  defp put_cache_control(conn) do
-    put_resp_header(conn, "cache-control", "public, max-age=#{@cache_max_age_seconds}")
   end
 end

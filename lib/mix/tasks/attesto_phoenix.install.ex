@@ -38,7 +38,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         tables the bundled stores read, including the durable refresh-family
         revocation tombstones. Existing installations generate each migration
         milestone they have not already applied: `--upgrade 3.0`, `3.1`,
-        `3.4`, `3.6`, and `3.7`, in that order, while writers remain stopped.
+        `3.4`, `3.6`, `3.7`, and `4.2`, in that order, while writers remain
+        stopped.
         Each validates canonical pre-existing objects before adoption; custom
         layouts need a reviewed migration.
 
@@ -100,6 +101,7 @@ if Code.ensure_loaded?(Igniter) do
 
     use Igniter.Mix.Task
 
+    alias AttestoPhoenix.MixTaskSupport, as: TaskSupport
     alias AttestoPhoenix.Plug.PutConfig
     # `AttestoPhoenix.Config` is referenced only as a config-path module name (a
     # plain atom Igniter writes into the host config), never as a struct, so it
@@ -125,7 +127,7 @@ if Code.ensure_loaded?(Igniter) do
     @default_oauth_path_prefix "/oauth"
     @config_pipeline :attesto_phoenix_config
     @refresh_successor_secret_bytes 32
-    @upgrade_migration_versions ~w(3.0 3.1 3.4 3.6 3.7)
+    @upgrade_migration_versions ~w(3.0 3.1 3.4 3.6 3.7 4.2)
 
     # The recommended production behaviours and the callbacks each scaffolded
     # module implements. Each tuple is `{submodule, behaviour, [{function,
@@ -1577,32 +1579,7 @@ if Code.ensure_loaded?(Igniter) do
             "and configure matching advertised paths; the installer made no changes."
     end
 
-    defp validate_schema_prefix!(prefix) do
-      cond do
-        is_nil(prefix) ->
-          nil
-
-        prefix == "" ->
-          raise Mix.Error,
-            message: "invalid --schema-prefix: expected a non-empty lowercase PostgreSQL schema identifier"
-
-        byte_size(prefix) > 63 ->
-          raise Mix.Error,
-            message: "invalid --schema-prefix: expected at most 63 bytes"
-
-        prefix == "information_schema" or String.starts_with?(prefix, "pg_") ->
-          raise Mix.Error,
-            message:
-              "invalid --schema-prefix: #{inspect(prefix)} is a reserved PostgreSQL system schema; choose an application-owned schema"
-
-        Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, prefix) ->
-          prefix
-
-        true ->
-          raise Mix.Error,
-            message: "invalid --schema-prefix: expected a lowercase PostgreSQL schema identifier"
-      end
-    end
+    defp validate_schema_prefix!(prefix), do: TaskSupport.validate_schema_prefix!(prefix)
 
     defp reject_legacy_table_prefix_args!(argv) do
       if Enum.any?(argv, &legacy_table_prefix_arg?/1) do
@@ -2131,7 +2108,7 @@ if Code.ensure_loaded?(Igniter) do
            If this is an upgrade of an existing database, do not run the fresh
            create-table command above. After inventorying the existing layout,
            generate each forward migration milestone that the deployment has
-           not already applied. A 2.x database needs all five, in this order:
+           not already applied. A 2.x database needs all six, in this order:
 
                #{upgrade_migration_commands}
 
@@ -2145,7 +2122,9 @@ if Code.ensure_loaded?(Igniter) do
            notification token. The 3.6 file widens Client ID Metadata cache
            keys to `text`. The 3.7 file adds the authorization-code
            `replay_retain_until` deadline used to preserve replay evidence for
-           the lifetime of the refresh family.
+           the lifetime of the refresh family. The 4.2 file adds stable logout
+           delivery identifiers and renewable leases, backfilling legacy rows
+           from their UUID primary keys.
            Existing canonical objects are validated before adoption. Stop and
            investigate if any migration rejects the database layout.
 

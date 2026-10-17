@@ -90,6 +90,27 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ "Cannot safely rollback 3.7 migration"
     end
 
+    test "generates the durable logout-delivery lease upgrade", %{tmp_dir: tmp_dir} do
+      run!(["--upgrade", "4.2", "--schema-prefix", "auth"], tmp_dir)
+
+      assert [file] =
+               Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_4_2.exs"))
+
+      source = File.read!(file)
+      assert source =~ ~s|prefix = effective_prefix("auth")|
+      assert source =~ ~s|alter table(:attesto_logout_sessions, prefix: prefix)|
+      assert source =~ ~s|add :delivery_id, :string, size: 255|
+      assert source =~ ~s|add :lease_id, :string, size: 255|
+      assert source =~ ~s|add :lease_expires_at, :utc_datetime|
+      assert source =~ ~s|add :delivery_attempts, :integer, null: false, default: 0|
+      assert source =~ ~s|SET delivery_id = id::text WHERE delivery_id IS NULL|
+      assert source =~ ~s|modify :delivery_id, :string, size: 255, null: false|
+      assert source =~ ~s|create unique_index(:attesto_logout_sessions, [:delivery_id], prefix: prefix)|
+      assert source =~ ~s|create index(:attesto_logout_sessions, [:lease_expires_at], prefix: prefix)|
+      assert source =~ ~s|create index(:attesto_logout_sessions, [:lease_id, :delivery_id], prefix: prefix)|
+      assert source =~ "Cannot safely rollback 4.2 migration"
+    end
+
     test "renders an omitted 3.4 prefix without a redundant nil expression", %{tmp_dir: tmp_dir} do
       run!(["--upgrade", "3.4"], tmp_dir)
       assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_4.exs"))
@@ -285,6 +306,19 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
     test "CIBA notification tokens use a column that accepts the full protocol limit", %{tmp_dir: tmp_dir} do
       run!([], tmp_dir)
       assert generated_migration(tmp_dir) =~ ~s|add :client_notification_token, :text|
+    end
+
+    test "logout sessions carry durable delivery identifiers and leases", %{tmp_dir: tmp_dir} do
+      run!([], tmp_dir)
+      source = generated_migration(tmp_dir)
+
+      assert source =~ ~s|add :delivery_id, :string, size: 255, null: false|
+      assert source =~ ~s|add :lease_id, :string, size: 255|
+      assert source =~ ~s|add :lease_expires_at, :utc_datetime|
+      assert source =~ ~s|add :delivery_attempts, :integer, null: false, default: 0|
+      assert source =~ ~s|create unique_index(:attesto_logout_sessions, [:delivery_id], prefix: prefix)|
+      assert source =~ ~s|create index(:attesto_logout_sessions, [:lease_expires_at], prefix: prefix)|
+      assert source =~ ~s|create index(:attesto_logout_sessions, [:lease_id, :delivery_id], prefix: prefix)|
     end
 
     test "dpop_nonces carries issued_at/used_at", %{tmp_dir: tmp_dir} do
@@ -637,7 +671,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert output =~ "mix attesto_phoenix.gen.migration [options]"
       assert output =~ "mix attesto_phoenix.gen.migration --upgrade MILESTONE [options]"
 
-      for milestone <- ~w(3.0 3.1 3.4 3.6 3.7) do
+      for milestone <- ~w(3.0 3.1 3.4 3.6 3.7 4.2) do
         assert output =~ milestone
       end
 

@@ -54,6 +54,13 @@ defmodule AttestoPhoenix.Store.Sweeper do
   short retry deadline has passed, on the next scheduled sweep. When the Ecto
   refresh store uses a positive retry grace, this bounded credential cleanup
   requires the packaged sweeper or an acknowledged equivalent cleanup worker.
+  When the bundled Ecto logout-session store is enabled, each sweep also leases
+  a bounded batch of due or expired back-channel delivery work and starts
+  supervised retries. Failed delivery uses the bundled store's configured,
+  bounded exponential backoff; a due row is retried on the next sweep. A custom
+  logout-session store must provide its own persistent retry scheduler and
+  backoff policy because the store contract does not enumerate pending work
+  globally.
   The installer adds the packaged worker to the host supervision tree
   automatically; manually wired applications MUST either supervise it with a
   positive `:sweep_interval_ms` or register an equivalent worker.
@@ -138,7 +145,9 @@ defmodule AttestoPhoenix.Store.Sweeper do
 
   import Ecto.Query, only: [dynamic: 2, from: 2]
 
+  alias AttestoPhoenix.BackChannelLogout.Delivery, as: LogoutDelivery
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Store.EctoLogoutSessionStore
   alias AttestoPhoenix.Store.EctoRefreshStore
   alias AttestoPhoenix.Store.Sweeper.Lifecycle
   alias AttestoPhoenix.Store.Sweeper.Liveness
@@ -147,6 +156,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
 
   @lifecycle_retry_ms 50
   @lifecycle_retry_max_ms 5_000
+  @logout_retry_batch_size 100
 
   # The Ecto-backed stores the migration generator installs. Each table has an
   # `expires_at` column; the set is exhaustive over the generated stores and is
@@ -217,6 +227,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
   def init(%Config{} = config) do
     interval_ms = sweep_interval_ms!(config)
     target = {config.repo, Config.table_prefix(config)}
+    validate_logout_retry_schema!(config, target)
     schedule_sweep(interval_ms)
 
     state = %{
@@ -225,6 +236,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
       # public configuration field is `:schema_prefix`.
       table_prefix: Config.table_prefix(config),
       refresh_rotation_grace_seconds: config.refresh_token_rotation_grace_seconds,
+      logout_retry_config: logout_retry_config(config),
       interval_ms: interval_ms,
       lifecycle_target: target,
       lifecycle_pid: nil,
@@ -277,6 +289,21 @@ defmodule AttestoPhoenix.Store.Sweeper do
     end
   end
 
+  defp logout_retry_config(%Config{} = config) do
+    if Config.logout_enabled?(config) and
+         Config.logout_session_store(config) == EctoLogoutSessionStore do
+      config
+    end
+  end
+
+  defp validate_logout_retry_schema!(config, {repo, prefix}) do
+    if logout_retry_config(config) do
+      EctoLogoutSessionStore.validate_retry_schema!(repo, prefix)
+    end
+
+    :ok
+  end
+
   @doc """
   Runs a single sweep synchronously and returns the number of rows deleted per
   table. Test- and diagnostic-facing; the supervised process drives sweeps via
@@ -305,8 +332,15 @@ defmodule AttestoPhoenix.Store.Sweeper do
   # count. A `DELETE` that raises (e.g. a missing table) propagates: silently
   # swallowing a failed sweep would let a table grow unbounded with no signal,
   # so this fails loud rather than fails quiet.
-  defp sweep(%{repo: repo, table_prefix: prefix, refresh_rotation_grace_seconds: grace}) do
+  defp sweep(%{
+         repo: repo,
+         table_prefix: prefix,
+         refresh_rotation_grace_seconds: grace,
+         logout_retry_config: logout_retry_config
+       }) do
     now = DateTime.utc_now()
+
+    retry_logout_deliveries(logout_retry_config, repo, prefix, now)
 
     _redacted =
       EctoRefreshStore.redact_expired_successors(repo, now,
@@ -327,6 +361,25 @@ defmodule AttestoPhoenix.Store.Sweeper do
       @client_id_metadata => delete_expired(repo, expired_query(@client_id_metadata, now), prefix),
       @consent_grants => delete_expired(repo, expired_query(@consent_grants, now), prefix)
     }
+  end
+
+  defp retry_logout_deliveries(nil, _repo, _prefix, _now), do: :ok
+
+  defp retry_logout_deliveries(%Config{} = config, repo, prefix, now) do
+    now_unix = DateTime.to_unix(now)
+    lease_id = Attesto.Secret.generate(24)
+
+    targets =
+      EctoLogoutSessionStore.lease_retry_targets(
+        repo,
+        prefix,
+        lease_id,
+        now_unix,
+        now_unix + LogoutDelivery.lease_seconds(),
+        @logout_retry_batch_size
+      )
+
+    LogoutDelivery.start(config, %{}, lease_id, targets)
   end
 
   # `from/2` requires a literal string source, so each generated table gets its
@@ -358,8 +411,6 @@ defmodule AttestoPhoenix.Store.Sweeper do
           )
     )
   end
-
-  defp expired_query(@refresh_tokens, now), do: from(r in @refresh_tokens, where: r.expires_at < ^now)
 
   defp expired_query(@device_codes, now), do: from(r in @device_codes, where: r.expires_at < ^now)
 
@@ -676,7 +727,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
   def check_running_for_store(repo, prefix) do
     with true <- is_atom(repo) and not is_nil(repo),
          true <- is_binary(prefix) or is_nil(prefix),
-         {:ok, target} <- safe_normalize_target({repo, prefix}) do
+         {:ok, target} <- Lifecycle.normalize_target({repo, prefix}) do
       signal_if_missing(target)
       :ok
     else
@@ -734,7 +785,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
 
   defp verification_subject({repo, prefix} = target)
        when is_atom(repo) and not is_nil(repo) and (is_binary(prefix) or is_nil(prefix)) do
-    case safe_normalize_target(target) do
+    case Lifecycle.normalize_target(target) do
       {:ok, target} -> {:target, target}
       {:error, _reason} -> :invalid
     end
@@ -774,31 +825,11 @@ defmodule AttestoPhoenix.Store.Sweeper do
   defp verification_subject(_other), do: :invalid
 
   defp valid_target?(target) do
-    case safe_normalize_target(target) do
+    case Lifecycle.normalize_target(target) do
       {:ok, _} -> true
       {:error, _} -> false
     end
   end
-
-  defp safe_normalize_target({repo, prefix} = target) when is_atom(repo) and not is_nil(repo) do
-    case prefix do
-      nil ->
-        {:ok, target}
-
-      prefix when is_binary(prefix) ->
-        try do
-          Config.validate_schema_prefix!(prefix)
-          {:ok, target}
-        rescue
-          ArgumentError -> {:error, :invalid_prefix}
-        end
-
-      _other ->
-        {:error, :invalid_prefix}
-    end
-  end
-
-  defp safe_normalize_target(_), do: {:error, :invalid_target}
 
   defp parse_cleanup_target!(%Config{} = config) do
     config
@@ -808,7 +839,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
 
   defp parse_cleanup_target!({repo, prefix}) do
     {repo, prefix}
-    |> safe_normalize_target()
+    |> Lifecycle.normalize_target()
     |> normalize_parsed_target!()
   end
 
@@ -823,10 +854,10 @@ defmodule AttestoPhoenix.Store.Sweeper do
               config_target(opts[:config])
 
             keys == MapSet.new([:repo]) ->
-              safe_normalize_target({opts[:repo], nil})
+              Lifecycle.normalize_target({opts[:repo], nil})
 
             keys == MapSet.new([:repo, :schema_prefix]) ->
-              safe_normalize_target({opts[:repo], opts[:schema_prefix]})
+              Lifecycle.normalize_target({opts[:repo], opts[:schema_prefix]})
 
             true ->
               {:error, :invalid_options}
@@ -901,7 +932,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
   end
 
   defp config_target(%Config{} = config) do
-    safe_normalize_target({config.repo, Config.table_prefix(config)})
+    Lifecycle.normalize_target({config.repo, Config.table_prefix(config)})
   rescue
     _error -> {:error, :invalid_config}
   catch

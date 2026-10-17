@@ -34,7 +34,12 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
 
     with :ok <- QueryParameterGuard.reject(conn),
          :ok <- require_enabled(config),
-         :ok <- check_https(conn, config),
+         :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
+           ),
          {:ok, result} <- authenticate_client(config, conn, params),
          {:ok, response} <- BackchannelAuthentication.request(config, build_request(config, conn, result, params)) do
       json(conn, response)
@@ -50,13 +55,6 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
       else: {:error, OAuthError.new(:invalid_request, "CIBA is not enabled", status: 400)}
   end
 
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
-    end
-  end
-
   # FAPI-CIBA §5.2.2: the backchannel authentication endpoint accepts confidential
   # clients only (`private_key_jwt` / mTLS), so `allow_public: false`. The client
   # assertion `aud` may be the issuer identifier, the token endpoint URL, or this
@@ -64,14 +62,7 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationController do
   # AS — the conformance suite exercises all three), all derived from trusted
   # `Config` (never the request `Host`).
   defp authenticate_client(config, conn, params) do
-    policy = ClientAuthentication.Policy.for_endpoint(config, :backchannel_authentication)
-
-    case ClientAuthentication.authenticate_with_context(
-           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
-           params,
-           config,
-           policy
-         ) do
+    case ClientAuthentication.authenticate_request_with_context(conn, params, config, :backchannel_authentication) do
       {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}
       {:error, %OAuthError{} = err, _context} -> {:error, err}
     end

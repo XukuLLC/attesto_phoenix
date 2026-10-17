@@ -33,7 +33,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   """
 
   alias Attesto.{CIBA, ResourceIndicator}
-  alias AttestoPhoenix.{Callback, Config, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, OAuthError, ReplayClaim}
 
   require Logger
 
@@ -98,7 +98,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   defp build_client_map(config, %Request{client: client, request_client_id: presented}) do
     case Config.client_identifier(config, client, presented) do
       client_id when is_binary(client_id) and client_id != "" ->
-        registration = Config.client_ciba_registration(config, client)
+        registration = Config.client_ciba_registration(config, ClientIdMetadata.host_client(client))
 
         {:ok,
          %{
@@ -114,19 +114,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
     end
   end
 
-  defp client_jwks(config, client) do
-    case Config.client_jwks_fun(config) do
-      nil ->
-        nil
-
-      callback ->
-        case Callback.invoke(callback, [client]) do
-          {:ok, jwks} -> jwks
-          jwks when is_map(jwks) or is_list(jwks) -> jwks
-          _other -> nil
-        end
-    end
-  end
+  defp client_jwks(config, client), do: ClientIdMetadata.client_jwks_value(config, client)
 
   # CIBA Core §4 / FAPI-CIBA §5.2.1: a client may redeem only through a delivery
   # mode this OP advertises (`ciba: [delivery_modes: ...]`, which FAPI-CIBA
@@ -171,7 +159,9 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   # callback. Bind only resources this authorization server serves for the
   # authenticated client.
   defp authorize_resource(config, client, %CIBA.Request{resource: resources}) do
-    case ResourceIndicator.authorize(resources, Config.allowed_resources(config, client)) do
+    allowed_resources = Config.allowed_resources(config, ClientIdMetadata.host_client(client))
+
+    case ResourceIndicator.authorize(resources, allowed_resources) do
       {:ok, _resources} ->
         :ok
 
@@ -201,17 +191,12 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
        when is_binary(client_id) and is_binary(jti) and is_integer(exp) do
     ttl = max(exp - System.system_time(:second), 1)
 
-    case Callback.to_fun2(config.replay_check).(ciba_replay_key(client_id, jti), ttl) do
+    case ReplayClaim.commit(config.replay_check, ciba_replay_key(client_id, jti), ttl) do
       :ok ->
         :ok
 
       {:error, :replay} ->
         {:error, error(:invalid_request, "the signed authentication request was replayed")}
-
-      _other ->
-        raise ArgumentError,
-              "#{inspect(__MODULE__)}: :replay_check must return :ok or " <>
-                "{:error, :replay}"
     end
   end
 

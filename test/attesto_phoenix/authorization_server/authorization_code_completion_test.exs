@@ -1189,6 +1189,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
           logout: [enabled: true],
           terminate_session: fn conn, _context -> {:ok, conn} end,
           logout_session_store: EctoLogoutSessionStore,
+          sweep_interval_ms: 60_000,
           client_backchannel_logout_uri: fn _client -> "https://client.example/logout" end,
           client_frontchannel_logout_uri: fn _client -> "https://client.example/logout" end
         )
@@ -1247,6 +1248,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         logout: [enabled: true],
         terminate_session: fn conn, _context -> {:ok, conn} end,
         logout_session_store: EctoLogoutSessionStore,
+        sweep_interval_ms: 60_000,
         client_backchannel_logout_uri: fn _client -> "https://client.example/logout" end,
         client_frontchannel_logout_uri: fn _client -> "https://client.example/logout" end
       )
@@ -1591,6 +1593,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       logout: [enabled: true],
       terminate_session: fn conn, _context -> {:ok, conn} end,
       logout_session_store: EctoLogoutSessionStore,
+      sweep_interval_ms: 60_000,
       client_frontchannel_logout_uri: fn _client -> "https://client.example/logout" end
     )
   end

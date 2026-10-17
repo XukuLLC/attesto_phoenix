@@ -28,19 +28,17 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
 
   import Ecto.Query, only: [from: 2]
 
-  alias Attesto.Claims
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.CIBARequest
-  alias AttestoPhoenix.Store.Sweeper
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
+  alias AttestoPhoenix.Store.PendingDecision
 
   @invalid_approval_claims "CIBA approval has invalid granted claims"
 
   @impl Attesto.CIBAStore
   @spec put(Attesto.CIBAStore.entry()) :: :ok
   def put(%{auth_req_id_hash: hash} = record) when is_binary(hash) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
 
     record
     |> CIBARequest.from_record(prefix: prefix)
@@ -69,10 +67,10 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
           {:ok, Attesto.CIBAStore.entry()} | {:error, :not_found | :already_decided | :expired}
   def approve(hash, approval, opts) when is_binary(hash) and is_map(approval) and is_map(opts) do
     granted_claims = Map.get(approval, :granted_claims, %{})
-    validate_granted_claims!(granted_claims)
+    PendingDecision.validate_granted_claims!(granted_claims, @invalid_approval_claims)
     now = decision_now(opts)
 
-    decide(hash, now,
+    PendingDecision.decide(CIBARequest, :auth_req_id_hash, hash, now,
       status: :approved,
       subject: Map.get(approval, :subject),
       acr: Map.get(approval, :acr),
@@ -86,16 +84,14 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   @spec deny(Attesto.CIBAStore.auth_req_id_hash(), map()) ::
           {:ok, Attesto.CIBAStore.entry()} | {:error, :not_found | :already_decided | :expired}
   def deny(hash, opts) when is_binary(hash) and is_map(opts) do
-    decide(hash, decision_now(opts), status: :denied)
+    PendingDecision.decide(CIBARequest, :auth_req_id_hash, hash, decision_now(opts), status: :denied)
   end
 
   @impl Attesto.CIBAStore
   @spec poll(Attesto.CIBAStore.auth_req_id_hash(), map()) ::
           {:ok, Attesto.CIBAStore.entry()} | {:error, :slow_down} | :error
   def poll(hash, %{now: now}) when is_binary(hash) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     now_dt = now |> DateTime.from_unix!() |> DateTime.truncate(:second)
 
     # The §7.3 throttle: accept the first poll (last_polled_at NULL) or a poll
@@ -122,96 +118,24 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
            telemetry_event: nil
          ) do
       {1, [row]} -> {:ok, CIBARequest.to_entry(%{row | last_polled_at: now_dt})}
-      {0, _} -> slow_down_or_missing(repo, hash, prefix)
+      {0, _} -> PendingDecision.slow_down_or_missing(CIBARequest, :auth_req_id_hash, hash, repo, prefix)
     end
   end
 
   @impl Attesto.CIBAStore
   @spec consume(Attesto.CIBAStore.auth_req_id_hash(), map()) :: {:ok, Attesto.CIBAStore.entry()} | :error
   def consume(hash, opts) when is_binary(hash) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
-    now = opts |> Map.get(:now, System.system_time(:second)) |> DateTime.from_unix!() |> DateTime.truncate(:second)
-
-    # Guard on approval AND unexpiry, so a request that expires between the
-    # core's poll-time check and this transition cannot mint.
-    query =
-      from c in CIBARequest,
-        where: c.auth_req_id_hash == ^hash and c.status == :approved and c.expires_at > ^now,
-        select: c
-
-    case repo.update_all(query, [set: [status: :consumed]],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
-      {1, [row]} -> {:ok, CIBARequest.to_entry(%{row | status: :consumed})}
-      {0, _} -> :error
-    end
+    PendingDecision.consume(
+      CIBARequest,
+      :auth_req_id_hash,
+      hash,
+      Map.get(opts, :now, System.system_time(:second))
+    )
   end
 
   # ----- internal -----
 
-  # The shared guarded transition for approve/deny: flip a `pending`, unexpired
-  # row to the target status in one statement. Zero rows means the row is gone
-  # (not_found), already past pending (already_decided), or pending-but-expired
-  # (expired) — distinguished by a follow-up read (none of the three mints, so
-  # this is not a race).
-  defp decide(hash, now, set) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
-    now_dt = now |> DateTime.from_unix!() |> DateTime.truncate(:second)
-
-    query =
-      from c in CIBARequest,
-        where: c.auth_req_id_hash == ^hash and c.status == :pending and c.expires_at > ^now_dt,
-        select: c
-
-    case repo.update_all(query, [set: set],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
-      {1, [row]} -> {:ok, CIBARequest.to_entry(Map.merge(row, Map.new(set)))}
-      {0, _} -> decide_miss(repo, hash, now_dt, prefix)
-    end
-  end
-
-  defp decide_miss(repo, hash, now_dt, prefix) do
-    query = from c in CIBARequest, where: c.auth_req_id_hash == ^hash, select: {c.status, c.expires_at}
-
-    case repo.one(query, prefix: prefix, log: false, telemetry_event: nil) do
-      nil -> {:error, :not_found}
-      {:pending, expires_at} when not is_nil(expires_at) -> classify_pending(expires_at, now_dt)
-      _decided -> {:error, :already_decided}
-    end
-  end
-
-  defp classify_pending(expires_at, now_dt) do
-    if DateTime.after?(expires_at, now_dt), do: {:error, :already_decided}, else: {:error, :expired}
-  end
-
-  defp slow_down_or_missing(repo, hash, prefix) do
-    if repo.exists?(from(c in CIBARequest, where: c.auth_req_id_hash == ^hash),
-         prefix: prefix,
-         log: false,
-         telemetry_event: nil
-       ),
-       do: {:error, :slow_down},
-       else: :error
-  end
-
   defp decision_now(opts), do: Map.get(opts, :now, System.system_time(:second))
-
-  defp validate_granted_claims!(granted_claims) do
-    if Claims.portable_json_object?(granted_claims) do
-      :ok
-    else
-      raise ArgumentError, @invalid_approval_claims
-    end
-  end
 
   defp unix_to_datetime(nil), do: nil
   defp unix_to_datetime(unix) when is_integer(unix), do: unix |> DateTime.from_unix!() |> DateTime.truncate(:second)

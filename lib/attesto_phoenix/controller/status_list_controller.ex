@@ -15,7 +15,8 @@ defmodule AttestoPhoenix.Controller.StatusListController do
   import Plug.Conn, only: [put_resp_header: 3, send_resp: 3]
 
   alias Attesto.StatusList
-  alias AttestoPhoenix.{Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Config, OAuthError}
+  alias AttestoPhoenix.Controller.MetadataSupport
 
   @content_type "application/statuslist+jwt"
 
@@ -29,14 +30,19 @@ defmodule AttestoPhoenix.Controller.StatusListController do
     config = Config.resolve!(conn)
     uri = Config.status_list_endpoint_url(config) <> "/" <> id
 
-    with :ok <- check_https(conn, config),
+    with :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
+           ),
          {:ok, store} <- status_list_store(config),
          [_ | _] = statuses <- store.statuses(uri) do
       token = StatusList.issue(config.keystore, uri, statuses, ttl: @cache_ttl_seconds)
 
       conn
       |> put_resp_header("content-type", @content_type)
-      |> put_cache_control()
+      |> MetadataSupport.put_public_cache(@cache_ttl_seconds)
       |> send_resp(200, token)
     else
       :error -> send_resp(conn, 404, "")
@@ -45,21 +51,10 @@ defmodule AttestoPhoenix.Controller.StatusListController do
     end
   end
 
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
-    end
-  end
-
   defp status_list_store(config) do
     case Config.status_list_store(config) do
       store when is_atom(store) and not is_nil(store) -> {:ok, store}
       _ -> :error
     end
-  end
-
-  defp put_cache_control(conn) do
-    put_resp_header(conn, "cache-control", "public, max-age=#{@cache_ttl_seconds}")
   end
 end

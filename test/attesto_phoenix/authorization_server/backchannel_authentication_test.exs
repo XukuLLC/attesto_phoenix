@@ -14,6 +14,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
   alias Attesto.CIBAStore.ETS, as: Store
   alias AttestoPhoenix.AuthorizationServer.BackchannelAuthentication
   alias AttestoPhoenix.AuthorizationServer.BackchannelAuthentication.Request
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.OAuthError
 
@@ -111,6 +112,47 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       assert {:ok, ack} = BackchannelAuthentication.request(config, request(client, params))
 
       assert {:ok, %{data: %{resource: [^first, ^second]}}} =
+               Store.lookup(Attesto.Secret.hash(ack.auth_req_id))
+    end
+
+    test "CIMD policy callbacks receive document metadata rather than the internal wrapper" do
+      resource = "https://api.example.com/cimd"
+      client_id = "https://client.example/metadata.json"
+      client = %CIMDClient{metadata: %{"client_id" => client_id, "resources" => [resource]}}
+
+      assert_metadata = fn metadata ->
+        assert is_map(metadata)
+        refute match?(%CIMDClient{}, metadata)
+        metadata
+      end
+
+      config =
+        config(
+          client_ciba_registration: fn client_metadata ->
+            assert_metadata.(client_metadata)
+            %{token_delivery_mode: :poll}
+          end,
+          resource_indicators: [
+            allowed_resources_for: fn client_metadata ->
+              client_metadata |> assert_metadata.() |> Map.fetch!("resources")
+            end
+          ]
+        )
+
+      req = %Request{
+        client: client,
+        client_auth_method: :private_key_jwt,
+        request_client_id: client_id,
+        params: %{
+          "scope" => "openid",
+          "login_hint" => "alice@example.test",
+          "resource" => resource
+        }
+      }
+
+      assert {:ok, ack} = BackchannelAuthentication.request(config, req)
+
+      assert {:ok, %{data: %{resource: [^resource]}}} =
                Store.lookup(Attesto.Secret.hash(ack.auth_req_id))
     end
 

@@ -119,7 +119,10 @@ defmodule AttestoPhoenix.Schema.DeviceCode do
   @doc """
   The non-consuming `Attesto.DeviceCodeStore.pending_view()` for the verification
   page.
+
+  Deprecated because the Ecto store now builds this view directly.
   """
+  @deprecated "Remove in AttestoPhoenix 5.0"
   @spec to_pending_view(t()) :: Attesto.DeviceCodeStore.pending_view()
   def to_pending_view(%__MODULE__{} = row) do
     %{

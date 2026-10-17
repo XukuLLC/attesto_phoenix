@@ -13,6 +13,28 @@ defmodule AttestoPhoenix.ConsumerWithoutReq do
   end
 
   defmodule Store do
+    @behaviour Attesto.LogoutSessionStore
+
+    @impl true
+    def record(_entry), do: :ok
+
+    @impl true
+    def targets(_criteria), do: []
+
+    @impl true
+    def delete(_criteria), do: :ok
+
+    @impl true
+    def take_targets(_criteria), do: []
+
+    @impl true
+    def lease_targets(_criteria, _lease_id, _now, _lease_expires_at), do: []
+
+    @impl true
+    def acknowledge_targets(_lease_id, _delivery_ids), do: :ok
+
+    @impl true
+    def release_targets(_lease_id, _delivery_ids), do: :ok
   end
 
   # This script constructs configurations only. If a request ever reaches this

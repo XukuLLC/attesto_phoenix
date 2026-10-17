@@ -17,7 +17,7 @@ defmodule AttestoPhoenix.Controller.CredentialOfferController do
 
   import Plug.Conn, only: [send_resp: 3]
 
-  alias AttestoPhoenix.{Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Config, OAuthError}
 
   @doc "Serve the stored Credential Offer object for `:id`."
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
@@ -25,20 +25,18 @@ defmodule AttestoPhoenix.Controller.CredentialOfferController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- check_https(conn, config),
+    with :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
+           ),
          {:ok, store} <- credential_offer_store(config),
          {:ok, offer} <- store.fetch(id) do
       json(conn, offer)
     else
       :error -> send_resp(conn, 404, "")
       {:error, %OAuthError{} = error} -> OAuthError.render(conn, error, config: config)
-    end
-  end
-
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
     end
   end
 

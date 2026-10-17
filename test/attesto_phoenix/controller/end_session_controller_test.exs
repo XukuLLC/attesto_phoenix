@@ -11,6 +11,7 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
 
   use AttestoPhoenix.DataCase, async: false
 
+  import Ecto.Query, only: [from: 2]
   import ExUnit.CaptureLog
   import Plug.Conn
   import Plug.Test
@@ -19,7 +20,9 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
   alias Attesto.Keystore.Static
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.EndSessionController, as: Controller
+  alias AttestoPhoenix.Schema.LogoutSession
   alias AttestoPhoenix.Store.EctoLogoutSessionStore, as: Store
+  alias AttestoPhoenix.Store.Sweeper
 
   @moduletag :ecto
 
@@ -46,7 +49,10 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
     @behaviour AttestoPhoenix.BackChannelLogout
 
     @impl true
-    def post(_uri, _logout_token), do: {:error, {:transport, "logout-http-private-sentinel"}}
+    def post(_uri, _logout_token) do
+      send(Application.fetch_env!(:attesto_phoenix, :test_bc_pid), :bc_error_attempted)
+      {:error, {:transport, "logout-http-private-sentinel"}}
+    end
   end
 
   defmodule RaisingFirstHTTP do
@@ -63,18 +69,65 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
     end
   end
 
+  defmodule ConcurrentHTTP do
+    @moduledoc false
+    @behaviour AttestoPhoenix.BackChannelLogout
+
+    @impl true
+    def post(uri, _logout_token) do
+      owner = Application.fetch_env!(:attesto_phoenix, :test_bc_pid)
+      send(owner, {:bc_delivery_started, uri, self()})
+
+      receive do
+        {:continue_bc_delivery, ^owner} -> :ok
+      after
+        1_000 -> :ok
+      end
+    end
+  end
+
+  defmodule SelectiveHTTP do
+    @moduledoc false
+    @behaviour AttestoPhoenix.BackChannelLogout
+
+    @impl true
+    def post(uri, _logout_token) do
+      send(Application.fetch_env!(:attesto_phoenix, :test_bc_pid), {:bc_selective_attempt, uri})
+
+      if String.contains?(uri, "failed"),
+        do: {:error, :unavailable},
+        else: :ok
+    end
+  end
+
   defmodule OrderedTargetsStore do
     @moduledoc false
+    @behaviour Attesto.LogoutSessionStore
 
-    def take_targets(_criteria) do
+    @impl true
+    def record(_entry), do: :ok
+
+    @impl true
+    def targets(_criteria), do: []
+
+    @impl true
+    def delete(_criteria), do: :ok
+
+    @impl true
+    def take_targets(_criteria), do: []
+
+    @impl true
+    def lease_targets(_criteria, _lease_id, _now, _lease_expires_at) do
       [
         %{
+          delivery_id: "delivery-raise",
           sid: "sess-raise",
           client_id: "rp-raise",
           backchannel_logout_uri: "https://rp-raise.example/bc",
           frontchannel_logout_uri: nil
         },
         %{
+          delivery_id: "delivery-after",
           sid: "sess-after",
           client_id: "rp-after",
           backchannel_logout_uri: "https://rp-after.example/bc",
@@ -82,12 +135,38 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
         }
       ]
     end
+
+    @impl true
+    def acknowledge_targets(_lease_id, _delivery_ids), do: :ok
+
+    @impl true
+    def release_targets(_lease_id, _delivery_ids), do: :ok
   end
 
   defmodule ErrorStore do
     @moduledoc false
+    @behaviour Attesto.LogoutSessionStore
 
-    def take_targets(_criteria), do: raise("logout-store-private-sentinel")
+    @impl true
+    def record(_entry), do: :ok
+
+    @impl true
+    def targets(_criteria), do: []
+
+    @impl true
+    def delete(_criteria), do: :ok
+
+    @impl true
+    def take_targets(_criteria), do: []
+
+    @impl true
+    def lease_targets(_criteria, _lease_id, _now, _lease_expires_at), do: raise("logout-store-private-sentinel")
+
+    @impl true
+    def acknowledge_targets(_lease_id, _delivery_ids), do: :ok
+
+    @impl true
+    def release_targets(_lease_id, _delivery_ids), do: :ok
   end
 
   setup do
@@ -112,6 +191,7 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       load_principal: fn _ -> {:error, :not_found} end,
       client_post_logout_redirect_uris: fn client -> client.post_logout end,
       logout_session_store: Store,
+      sweep_interval_ms: 60_000,
       logout: [enabled: true, http_client: StubHTTP],
       require_https: false,
       # The host is the session authority: it validates the request against the
@@ -168,6 +248,26 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
   end
 
   defp body(conn), do: JSON.decode!(conn.resp_body)
+
+  defp persisted_targets(sid) do
+    from(l in LogoutSession, where: l.sid == ^sid)
+    |> AttestoPhoenix.TestRepo.all()
+    |> Enum.map(&LogoutSession.to_target/1)
+  end
+
+  defp eventually(fun, attempts \\ 50)
+  defp eventually(fun, 0), do: fun.()
+
+  defp eventually(fun, attempts) do
+    case fun.() do
+      true ->
+        true
+
+      _other ->
+        Process.sleep(10)
+        eventually(fun, attempts - 1)
+    end
+  end
 
   defp with_app_config(overrides, fun) do
     original = Application.fetch_env!(:attesto_phoenix, @config_key)
@@ -235,6 +335,25 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       assert conn.resp_body =~ "invalid post_logout_redirect_uri"
     end
 
+    test "an explicit text/html q=0 preference keeps errors in JSON", %{hint: hint} do
+      conn =
+        :get
+        |> conn("/oauth/end_session", %{})
+        |> put_private(
+          :attesto_phoenix_config,
+          Config.new(Application.fetch_env!(:attesto_phoenix, @config_key))
+        )
+        |> put_req_header("accept", "text/html;q=0, application/json")
+        |> Controller.end_session(%{
+          "id_token_hint" => hint,
+          "post_logout_redirect_uri" => "https://evil.example/steal"
+        })
+
+      assert conn.status == 400
+      assert conn |> get_resp_header("content-type") |> List.first() =~ "application/json"
+      assert body(conn)["error"] == "invalid_request"
+    end
+
     test "a tampered hint is a 400", %{hint: hint} do
       conn = call(:get, %{"id_token_hint" => hint <> "tamper"})
       assert conn.status == 400
@@ -258,7 +377,7 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       conn = call(:get, %{"id_token_hint" => hint})
       assert conn.status == 200
 
-      assert_received {:bc_post, "https://rp-b.example/bc", token}
+      assert_receive {:bc_post, "https://rp-b.example/bc", token}, 1_000
       claims = logout_payload(token)
       assert claims["aud"] == "rp-b"
       assert claims["sid"] == @sid
@@ -266,8 +385,32 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       assert claims["events"] == %{"http://schemas.openid.net/event/backchannel-logout" => %{}}
       refute Map.has_key?(claims, "nonce")
 
-      # the session row is gone after the fan-out
-      assert [] = Store.targets(%{sid: @sid})
+      # the session row is acknowledged after the successful handoff
+      assert eventually(fn ->
+               not AttestoPhoenix.TestRepo.exists?(from(l in LogoutSession, where: l.sid == ^@sid))
+             end)
+    end
+
+    test "a slow RP cannot serialize another RP's back-channel notification", %{hint: hint} do
+      with_app_config(
+        [
+          logout_session_store: OrderedTargetsStore,
+          logout: [enabled: true, http_client: ConcurrentHTTP]
+        ],
+        fn ->
+          conn = call(:get, %{"id_token_hint" => hint})
+          assert conn.status == 200
+
+          assert_receive {:bc_delivery_started, first_uri, first_pid}
+          assert_receive {:bc_delivery_started, second_uri, second_pid}
+
+          assert MapSet.new([first_uri, second_uri]) ==
+                   MapSet.new(["https://rp-raise.example/bc", "https://rp-after.example/bc"])
+
+          send(first_pid, {:continue_bc_delivery, self()})
+          send(second_pid, {:continue_bc_delivery, self()})
+        end
+      )
     end
 
     test "a row recorded for a front-channel-only RP produces no back-channel POST", %{hint: hint} do
@@ -286,20 +429,22 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       assert conn.status == 200
 
       refute_received {:bc_post, _uri, _token}
-      # the row is still consumed exactly once
-      assert [] = Store.targets(%{sid: @sid})
+      # A non-browser cannot perform the front-channel handoff, so the target
+      # is released for a later browser-driven retry.
+      assert [_] = persisted_targets(@sid)
     end
 
-    test "a logout-session store exception is logged without exception data", %{hint: hint} do
+    test "a logout-session store exception fails visibly without leaking exception data", %{hint: hint} do
       log =
         with_app_config([logout_session_store: ErrorStore], fn ->
           capture_log(fn ->
             conn = call(:get, %{"id_token_hint" => hint})
-            assert conn.status == 200
+            assert conn.status == 503
+            assert body(conn)["error"] == "server_error"
           end)
         end)
 
-      assert log =~ "logout session store failed; back-channel targets were not loaded"
+      assert log =~ "logout session store lease failed; verify the Attesto Phoenix 4.2 migration is applied"
       refute log =~ "logout-store-private-sentinel"
     end
 
@@ -321,6 +466,8 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
           capture_log(fn ->
             conn = call(:get, %{"id_token_hint" => hint})
             assert conn.status == 200
+            assert_receive :bc_error_attempted, 1_000
+            assert eventually(fn -> length(persisted_targets(@sid)) == 1 end)
           end)
         end)
 
@@ -328,24 +475,100 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       refute log =~ "logout-http-private-sentinel"
     end
 
-    test "an exception delivering to one RP does not skip later RPs", %{hint: hint} do
-      log =
-        with_app_config(
-          [
-            logout_session_store: OrderedTargetsStore,
-            logout: [enabled: true, http_client: RaisingFirstHTTP]
-          ],
-          fn ->
-            capture_log(fn ->
-              conn = call(:get, %{"id_token_hint" => hint})
-              assert conn.status == 200
-            end)
-          end
-        )
+    test "a partial fan-out acknowledges successes and releases failures", %{hint: hint} do
+      now = System.system_time(:second)
 
-      assert_received {:bc_post, "https://rp-after.example/bc", _token}
-      assert log =~ "back-channel logout delivery failed"
-      refute log =~ "delivery-private-sentinel"
+      Enum.each([{"rp-ok", "https://rp.example/ok"}, {"rp-failed", "https://rp.example/failed"}], fn
+        {client_id, uri} ->
+          :ok =
+            Store.record(%{
+              sid: @sid,
+              subject: @subject,
+              client_id: client_id,
+              backchannel_logout_uri: uri,
+              expires_at: now + 3_600
+            })
+      end)
+
+      with_app_config([logout: [enabled: true, http_client: SelectiveHTTP]], fn ->
+        assert call(:get, %{"id_token_hint" => hint}).status == 200
+        assert_receive {:bc_selective_attempt, "https://rp.example/ok"}, 1_000
+        assert_receive {:bc_selective_attempt, "https://rp.example/failed"}, 1_000
+      end)
+
+      assert eventually(fn ->
+               case persisted_targets(@sid) do
+                 [%{client_id: "rp-failed"}] -> true
+                 _other -> false
+               end
+             end)
+    end
+
+    test "the sweeper retries released work without touching an unrelated live session", %{hint: hint} do
+      now = System.system_time(:second)
+
+      :ok =
+        Store.record(%{
+          sid: @sid,
+          subject: @subject,
+          client_id: "rp-retry",
+          backchannel_logout_uri: "https://rp.example/retry",
+          expires_at: now + 3_600
+        })
+
+      :ok =
+        Store.record(%{
+          sid: "untouched-session",
+          subject: "untouched-user",
+          client_id: "rp-untouched",
+          backchannel_logout_uri: "https://rp.example/untouched",
+          expires_at: now + 3_600
+        })
+
+      with_app_config(
+        [
+          logout: [
+            enabled: true,
+            http_client: ErrorHTTP,
+            retry_initial_delay_seconds: 1,
+            retry_max_delay_seconds: 1
+          ]
+        ],
+        fn ->
+          assert call(:get, %{"id_token_hint" => hint}).status == 200
+          assert_receive :bc_error_attempted, 1_000
+        end
+      )
+
+      assert eventually(fn -> length(persisted_targets(@sid)) == 1 end)
+      Process.sleep(1_100)
+
+      with_app_config([logout: [enabled: true, http_client: StubHTTP]], fn ->
+        config = Config.new(Application.fetch_env!(:attesto_phoenix, @config_key))
+        {:ok, sweeper} = Sweeper.start_link(config: config, name: nil)
+        on_exit(fn -> if Process.alive?(sweeper), do: GenServer.stop(sweeper) end)
+
+        assert is_map(Sweeper.sweep_now(sweeper))
+        assert_receive {:bc_post, "https://rp.example/retry", _token}, 1_000
+        refute_receive {:bc_post, "https://rp.example/untouched", _token}, 100
+      end)
+
+      assert eventually(fn -> Store.targets(%{sid: @sid}) == [] end)
+      assert [%{client_id: "rp-untouched"}] = Store.targets(%{sid: "untouched-session"})
+    end
+
+    test "an exception delivering to one RP does not skip later RPs", %{hint: hint} do
+      with_app_config(
+        [
+          logout_session_store: OrderedTargetsStore,
+          logout: [enabled: true, http_client: RaisingFirstHTTP]
+        ],
+        fn ->
+          conn = call(:get, %{"id_token_hint" => hint})
+          assert conn.status == 200
+          assert_receive {:bc_post, "https://rp-after.example/bc", _token}, 1_000
+        end
+      )
     end
 
     test "logout enabled without :terminate_session fails config validation (no fail-open)", %{
@@ -472,7 +695,7 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       conn = call_html(:get, %{"id_token_hint" => hint})
 
       assert conn.status == 200
-      assert_received {:bc_post, "https://rp-both.example/bc", token}
+      assert_receive {:bc_post, "https://rp-both.example/bc", token}, 1_000
       claims = logout_payload(token)
       assert claims["aud"] == "rp-both"
       assert conn.resp_body =~ ~s(<iframe src="https://rp-both.example/fc?)

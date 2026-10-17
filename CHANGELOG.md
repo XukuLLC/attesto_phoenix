@@ -1,8 +1,103 @@
 # Changelog
 
 All notable changes to this project are documented here. The format is
-based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
-project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Public
+functions and behaviour contracts remain compatible within 4.x where security
+permits; security and correctness fixes may tighten validation or derived
+defaults in a minor release.
+
+## [4.2.0] - 2026-10-17
+
+### Breaking
+
+- Require Attesto `>= 2.6.0 and < 3.0.0`. This pairs the Phoenix code-store
+  compatibility fix and endpoint derivation with the corresponding core
+  release.
+- Preserve a path carried by `:issuer` when deriving authorization-server
+  endpoint and JWKS URLs. For example, `https://id.example/tenant` now produces
+  `https://id.example/tenant/oauth/token`, matching Attesto core's endpoint
+  derivation.
+- Require a positive `:sweep_interval_ms` when logout uses the bundled Ecto
+  session store. The supervised sweeper now drives durable retry as well as
+  expired-row cleanup, so it must be running before logout delivery can be
+  reliable.
+
+### Security
+
+- Treat Client ID Metadata Document clients as self-asserted public clients
+  even when they prove control of a document key with `private_key_jwt`.
+  They can no longer enter confidential-only grants, introspection, or CIBA,
+  and their declared `grant_types` are enforced.
+- Replace attacker-keyed Finch pools for CIMD, CIBA ping, and back-channel
+  logout with bounded one-shot Mint connections. These requests now have a
+  total deadline while retaining DNS pinning, TLS hostname verification, body
+  bounds, and redirect refusal.
+- Reject unsafe registered redirect URI schemes and restrict JARM
+  `form_post.jwt` actions to absolute HTTP(S) URLs under a restrictive CSP.
+- Read forwarded client IP, scheme, host, and port chains from the trusted-proxy
+  end, and derive authorization-server DPoP endpoint URLs for token, PAR, and
+  device authorization from configured endpoint metadata rather than an
+  untrusted request `Host`.
+- Honor authorization-code replay containment during token exchange and
+  introspection. A replay that overlaps first-request finalization now leaves a
+  durable marker that revokes the newly issued refresh family and access token.
+- Redact `session_management[:browser_state_secret]` from `Config` inspection,
+  reject NUL bytes before PAR JSONB persistence, and reject empty Basic
+  passwords before a host client lookup.
+- Authenticate a token-endpoint client before reading an authorization-code
+  record. Requests without client authentication now return `invalid_client`
+  without revealing whether the code requires holder-of-key proof.
+
+### Fixed
+
+- Preserve subject-token expiry and client delegation lineage (`act`) during
+  token exchange.
+- Use one redirect-URI registration policy for dynamic and host-provided
+  clients. Native clients may use the common authority form of a reverse-DNS
+  private scheme, while unsafe or non-native private schemes are rejected and
+  reported through a warning instead of disappearing silently.
+- Pass CIMD metadata rather than the internal wrapper to device and CIBA host
+  callbacks, and apply the CIMD same-origin redirect gate during PAR.
+- Reject invalid CIMD fetcher options immediately. Invalid `:allow_loopback`,
+  `:timeout`, `:max_document_bytes`, and resolver values are configuration
+  errors rather than retryable transport failures.
+- Make Ecto replay detection use `ON CONFLICT DO NOTHING`, so a detected replay
+  does not abort a surrounding host transaction.
+- Build `verification_uri_complete` correctly when the configured device
+  verification URI already has a query string.
+- Dispatch back-channel logout through supervised work and deliver a session's
+  RP notifications concurrently. Each default delivery has a fixed deadline;
+  the supervisor does not reject new logout jobs. Ecto logout-session rows now
+  use durable delivery identifiers and expiring leases: successful handoffs are
+  acknowledged, failed work is deferred with bounded exponential backoff, and
+  a crashed worker's work is reclaimable after lease expiry. The initial and
+  maximum delays are configurable with
+  `logout: [retry_initial_delay_seconds: ..., retry_max_delay_seconds: ...]`
+  and default to 30 and 3,600 seconds. The bundled sweeper claims due and
+  expired leases in bounded batches and retries them automatically. It also
+  verifies the lease columns at startup, while the end-session endpoint returns
+  a visible server error if leasing cannot run. Existing installations must
+  apply the generated `--upgrade 4.2` migration before starting this release.
+- Parse browser `Accept` preferences through the shared quality-aware parser,
+  so `text/html;q=0` receives JSON rather than an HTML authorization or logout
+  response.
+
+### Changed
+
+- Consolidate protected-resource authentication, client-authentication request
+  wiring, replay claims, Ecto mutation setup, device/CIBA state transitions,
+  metadata-controller setup, scope parsing, endpoint derivation, controller TLS
+  error mapping, local sweeper liveness checks, and migration-task argument
+  handling behind shared internal boundaries.
+- Validate generated migrations against the same schema contract used by the
+  Ecto stores, including durable logout leases and upgrade backfills.
+- Cache the derived core configuration for one request and skip repeated
+  validation when nested calls use the same Phoenix configuration.
+- Deprecate `Callback.to_fun1/1`, `Config.schema_prefix/0,1`, and
+  `Schema.DeviceCode.to_pending_view/1` for removal in 5.0. Deprecate the
+  `VerifierEncryption` compatibility module now that verifier response
+  encryption uses per-session ephemeral keys. Retain and deprecate the hidden
+  `Store.Sweeper.Signal.unsupervised/1` compatibility wrapper through 4.x.
 
 ## [4.1.0] - 2026-10-17
 

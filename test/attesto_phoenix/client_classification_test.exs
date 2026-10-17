@@ -20,13 +20,13 @@ defmodule AttestoPhoenix.ClientClassificationTest do
     assert ClientClassification.classify(config(fn _ -> false end), client) == :confidential
   end
 
-  test "classifies metadata-document clients from their registered authentication method" do
+  test "always classifies self-asserted metadata-document clients as public" do
     public = %CIMDClient{metadata: %{}}
     confidential = %CIMDClient{metadata: %{"token_endpoint_auth_method" => "private_key_jwt"}}
 
     assert ClientClassification.classify(config(fn _ -> false end), public) == :public
-    assert ClientClassification.classify(config(fn _ -> true end), confidential) == :confidential
-    assert ClientClassification.classify(config(fn _ -> true end), %CIMDClient{metadata: nil}) == :confidential
+    assert ClientClassification.classify(config(fn _ -> true end), confidential) == :public
+    assert ClientClassification.classify(config(fn _ -> true end), %CIMDClient{metadata: nil}) == :public
   end
 
   test "rejects a malformed host classification" do

@@ -28,7 +28,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- check_https(conn, config),
+    with :ok <- RequestContext.check_https(conn, config),
          {:ok, store} <- presentation_session_store(config),
          {:ok, state, vp_token} <- response(Map.get(conn, :body_params), config, store),
          {:ok, _request_object} <- PresentationSession.request_object(store, state),
@@ -250,8 +250,6 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   rescue
     ArgumentError -> {:error, :malformed}
   end
-
-  defp check_https(conn, config), do: RequestContext.check_https(conn, config)
 
   defp presentation_session_store(config) do
     case Config.presentation_session_store(config) do

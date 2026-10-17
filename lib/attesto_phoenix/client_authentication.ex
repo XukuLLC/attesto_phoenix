@@ -135,8 +135,9 @@ defmodule AttestoPhoenix.ClientAuthentication do
   """
 
   alias Attesto.{ClientAssertion, JWS, MTLS, WalletAttestation}
-  alias AttestoPhoenix.{Callback, ClientClassification, ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
+  alias AttestoPhoenix.{Callback, ClientClassification, ClientIdMetadata, Config, DPoP.Adapter, OAuthError, ReplayClaim}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
+  alias AttestoPhoenix.RequestContext
   alias AttestoPhoenix.Store.NonceStore
 
   require Logger
@@ -158,6 +159,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
             assertion_max_lifetime: pos_integer(),
             assertion_signing_algs: [String.t()],
             assertion_enforce_fapi_alg_policy: boolean() | nil,
+            allow_cimd_clients: boolean(),
             allowed_methods: [method()],
             basic_precedence: boolean(),
             honor_configured_methods: boolean()
@@ -194,6 +196,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
       :assertion_max_lifetime,
       :assertion_signing_algs,
       :assertion_enforce_fapi_alg_policy,
+      allow_cimd_clients: true,
       allowed_methods: @all_methods,
       basic_precedence: false,
       honor_configured_methods: true
@@ -221,35 +224,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
     """
     @spec for_endpoint(Config.t(), endpoint()) :: t()
     def for_endpoint(%Config{} = config, endpoint) do
-      {allow_public, assertion_audiences} =
-        case endpoint do
-          :token ->
-            {true, Config.client_assertion_audiences(config)}
+      {allow_public, assertion_audiences} = public_and_audiences(config, endpoint)
 
-          :par ->
-            {true, [config.issuer]}
-
-          :introspection ->
-            {false, [config.issuer]}
-
-          :device_authorization ->
-            {true, [config.issuer]}
-
-          :backchannel_authentication ->
-            {false, backchannel_assertion_audiences(config)}
-
-          :revocation ->
-            {true, [config.issuer]}
-        end
-
-      {allowed_methods, basic_precedence, honor_configured_methods} =
-        case endpoint do
-          :revocation ->
-            {@all_methods, true, true}
-
-          _other ->
-            {@all_methods, false, true}
-        end
+      {allowed_methods, basic_precedence, honor_configured_methods, allow_cimd_clients} =
+        authentication_controls(endpoint)
 
       %__MODULE__{
         allow_public: allow_public,
@@ -257,11 +235,29 @@ defmodule AttestoPhoenix.ClientAuthentication do
         assertion_max_lifetime: @client_assertion_max_lifetime,
         assertion_signing_algs: config.client_auth_signing_algs,
         assertion_enforce_fapi_alg_policy: config.client_auth_enforce_fapi_alg_policy,
+        allow_cimd_clients: allow_cimd_clients,
         allowed_methods: allowed_methods,
         basic_precedence: basic_precedence,
         honor_configured_methods: honor_configured_methods
       }
     end
+
+    defp public_and_audiences(config, :token), do: {true, Config.client_assertion_audiences(config)}
+
+    defp public_and_audiences(config, :par), do: {true, [config.issuer]}
+    defp public_and_audiences(config, :introspection), do: {false, [config.issuer]}
+    defp public_and_audiences(config, :device_authorization), do: {true, [config.issuer]}
+
+    defp public_and_audiences(config, :backchannel_authentication), do: {false, backchannel_assertion_audiences(config)}
+
+    defp public_and_audiences(config, :revocation), do: {true, [config.issuer]}
+
+    defp authentication_controls(:revocation), do: {@all_methods, true, true, true}
+
+    defp authentication_controls(endpoint) when endpoint in [:introspection, :backchannel_authentication],
+      do: {@all_methods, false, true, false}
+
+    defp authentication_controls(_endpoint), do: {@all_methods, false, true, true}
 
     defp backchannel_assertion_audiences(config) do
       audiences = Config.client_assertion_audiences(config)
@@ -355,6 +351,31 @@ defmodule AttestoPhoenix.ClientAuthentication do
               optional(:client_certificate) => map() | nil
             }
 
+  @doc false
+  @spec authenticate_request(Plug.Conn.t(), map(), Config.t(), Policy.endpoint()) ::
+          {:ok, Result.t()} | {:error, OAuthError.t()}
+  def authenticate_request(%Plug.Conn{} = conn, params, %Config{} = config, endpoint) when is_map(params) do
+    authenticate(
+      RequestContext.client_auth_headers(conn, config),
+      params,
+      config,
+      Policy.for_endpoint(config, endpoint)
+    )
+  end
+
+  @doc false
+  @spec authenticate_request_with_context(Plug.Conn.t(), map(), Config.t(), Policy.endpoint()) ::
+          {:ok, Result.t()} | {:error, OAuthError.t(), ErrorContext.t()}
+  def authenticate_request_with_context(%Plug.Conn{} = conn, params, %Config{} = config, endpoint)
+      when is_map(params) do
+    authenticate_with_context(
+      RequestContext.client_auth_headers(conn, config),
+      params,
+      config,
+      Policy.for_endpoint(config, endpoint)
+    )
+  end
+
   @doc """
   Authenticate the client from the request's `Authorization` header values and
   body params (RFC 6749 §2.3).
@@ -392,10 +413,34 @@ defmodule AttestoPhoenix.ClientAuthentication do
     context = error_context(request_headers.authorization)
 
     case do_authenticate(request_headers, params, config, policy) do
-      {:ok, %Result{} = result} -> {:ok, result}
-      {:error, %OAuthError{} = err} -> {:error, err, context}
+      {:ok, %Result{} = result} ->
+        case require_allowed_client_type(result, policy) do
+          {:ok, %Result{} = allowed} -> {:ok, allowed}
+          {:error, %OAuthError{} = err} -> {:error, err, context}
+        end
+
+      {:error, %OAuthError{} = err} ->
+        {:error, err, context}
     end
   end
+
+  # A Client ID Metadata Document proves control of a URL and its key, but it is
+  # not a host registration. Endpoints that expose arbitrary token state or
+  # initiate confidential-only grants must therefore reject it even when the
+  # document declares private_key_jwt.
+  defp require_allowed_client_type(%Result{client: %CIMDClient{}}, %Policy{allow_cimd_clients: false}) do
+    {:error, error(@error_invalid_client, @client_auth_failed)}
+  end
+
+  defp require_allowed_client_type(%Result{} = result, %Policy{}), do: {:ok, result}
+
+  defp require_allowed_client_id(config, %Policy{allow_cimd_clients: false}, client_id) do
+    if ClientIdMetadata.cimd_client_id?(client_id, config),
+      do: {:error, error(@error_invalid_client, @client_auth_failed)},
+      else: :ok
+  end
+
+  defp require_allowed_client_id(_config, %Policy{}, _client_id), do: :ok
 
   defp do_authenticate(request_headers, params, config, policy) do
     case fetch_client_credentials(request_headers, params, policy) do
@@ -403,7 +448,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
         # RFC 6749 §2.1: identified but unauthenticated. Permitted only for
         # registered public clients; the caller applies endpoint-specific
         # controls such as PKCE or exact token-owner binding.
-        with :ok <- require_client_auth_method(config, policy, :none) do
+        with :ok <- require_client_auth_method(config, policy, :none),
+             :ok <- require_allowed_client_id(config, policy, client_id) do
           load_public_client(config, client_id)
         end
 
@@ -768,6 +814,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `{:error, :not_found}`, or `{:error, :revoked}`. Revocation is therefore
   # checked here without a separate predicate (RFC 7009 semantics for an
   # already-revoked client).
+  defp verify_confidential_client(config, _client_id, "", _method) do
+    reject_confidential_client(config, Config.verify_client_secret_fun(config), "")
+  end
+
   defp verify_confidential_client(config, client_id, secret, method) do
     verify_client_secret = Config.verify_client_secret_fun(config)
 
@@ -829,6 +879,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp verify_private_key_jwt_client(config, policy, assertion) do
     with {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
+         :ok <- require_allowed_client_id(config, policy, client_id),
          {:ok, client} <- resolve_client(config, client_id),
          :ok <- require_registered_client_auth_method(config, client, :private_key_jwt),
          {:ok, jwks} <- client_jwks(config, client),
@@ -858,6 +909,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp verify_attested_client(config, policy, attestation, pop, presented_client_id) do
     with {:ok, client_id} <- attested_client_id(attestation, presented_client_id),
+         :ok <- require_allowed_client_id(config, policy, client_id),
          {:ok, client} <- resolve_client(config, client_id),
          :ok <- require_registered_client_auth_method(config, client, :attest_jwt_client_auth),
          trusted_jwks when not is_nil(trusted_jwks) <- Config.trusted_wallet_provider_jwks(config),
@@ -893,8 +945,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   defp verify_mtls_client(config, policy, client_id, certificate) do
-    case resolve_client(config, client_id) do
-      {:ok, client} -> authenticate_certificate_client(config, policy, client, client_id, certificate)
+    with :ok <- require_allowed_client_id(config, policy, client_id),
+         {:ok, client} <- resolve_client(config, client_id) do
+      authenticate_certificate_client(config, policy, client, client_id, certificate)
+    else
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
@@ -1044,21 +1098,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # `jwks` / `jwks_uri` (RFC 7523 / OIDC Core §9), not the host's `:client_jwks`
   # callback. A document that carried neither has no keys, so `private_key_jwt`
   # is impossible for it and authentication fails closed.
-  defp client_jwks(config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.resolve_jwks(metadata, config)
-
-  defp client_jwks(config, client) do
-    case Config.client_jwks_fun(config) do
-      nil ->
-        {:error, :missing_client_jwks}
-
-      callback ->
-        case invoke(callback, [client]) do
-          {:ok, jwks} -> {:ok, jwks}
-          jwks when is_map(jwks) or is_list(jwks) -> {:ok, jwks}
-          _other -> {:error, :missing_client_jwks}
-        end
-    end
-  end
+  defp client_jwks(config, client), do: ClientIdMetadata.client_jwks(config, client)
 
   defp consume_client_assertion_jti(config, policy, client_id, %{"jti" => jti}) when is_binary(jti) and jti != "" do
     key = client_assertion_replay_key(client_id, jti)
@@ -1072,16 +1112,12 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # replay boundary into a false attack classification: callers render the
   # exact replay result as generic invalid_client, while faults raise loudly.
   defp consume_replay_claim(config, key, ttl, replay_error) do
-    case invoke(Adapter.replay_check(config), [key, ttl]) do
+    case ReplayClaim.commit(Adapter.replay_check(config), key, ttl) do
       :ok ->
         :ok
 
       {:error, :replay} ->
         {:error, replay_error}
-
-      _other ->
-        raise ArgumentError,
-              "#{inspect(__MODULE__)}: :replay_check must return :ok or {:error, :replay}"
     end
   end
 
@@ -1168,7 +1204,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
     case ClientClassification.classify(config, client) do
       :public -> true
       :confidential -> false
-      :unknown -> client_native?(config, client)
+      :unknown -> ClientIdMetadata.client_native?(config, client)
     end
   end
 
@@ -1242,19 +1278,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   @doc false
   @spec native_secret_refused?(Config.t(), term()) :: boolean()
   def native_secret_refused?(%Config{} = config, client) do
-    client_native?(config, client) and client_public?(config, client)
-  end
-
-  # The native-app discriminator (RFC 8252 / BCP 212). A CIMD client is
-  # identified by an `https` URL resolving to a document served over the
-  # network, not an installed app. A registered client defers to the host's
-  # `:client_native?` callback, which defaults to `false`: an unclassified
-  # client is not native, so this check cannot refuse an authentication the
-  # host never opted into.
-  defp client_native?(_config, %CIMDClient{metadata: _metadata}), do: false
-
-  defp client_native?(config, client) do
-    Callback.invoke_boolean(Config.client_native_fun(config), [client], false, :client_native?)
+    ClientIdMetadata.client_native?(config, client) and client_public?(config, client)
   end
 
   # A CIMD client's identifier is the URL its document is bound to; a registered

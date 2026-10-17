@@ -16,6 +16,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   import ExUnit.CaptureLog
 
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
   alias AttestoPhoenix.TestRepo
@@ -25,6 +26,19 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
   # take/1 does not gate on expiry; a future value keeps fixtures realistic.
   @future_seconds System.system_time(:second) + 600
+
+  defmodule ProbeRefreshStore do
+    @behaviour Attesto.RefreshStore
+
+    def insert(_record), do: :ok
+    def get(_hash), do: :error
+    def rotate(_hash, _child, _successor, _opts), do: :error
+
+    def revoke_family(family_id) do
+      send(self(), {:refresh_family_revoked, family_id})
+      :ok
+    end
+  end
 
   # The canonical grant context the protocol layer round-trips. The schema spreads
   # these across columns, so the required authorization-request fields must
@@ -249,6 +263,34 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
                consumed_success: true,
                replay_retain_until: nil
              } = TestRepo.get_by!(Authorization, code_hash: "hash-unbounded")
+    end
+
+    test "a replay racing successful finalization revokes the newly issued family" do
+      expires_at = System.system_time(:second) + 600
+      assert :ok = EctoCodeStore.put(entry("hash-overlap", grant_data(%{family_id: nil})))
+      assert {:ok, _record} = EctoCodeStore.take("hash-overlap")
+      assert :ok = EctoCodeStore.record_access_token_for_code("hash-overlap", "jti-overlap", expires_at)
+
+      # A second presentation lands while the first request is still issuing.
+      assert :error = EctoCodeStore.take("hash-overlap")
+
+      config = %Config{
+        issuer: "https://issuer.example",
+        keystore: __MODULE__,
+        repo: TestRepo,
+        refresh_store: ProbeRefreshStore
+      }
+
+      assert :ok =
+               Config.with_request_config(config, fn ->
+                 EctoCodeStore.mark_consumed("hash-overlap", %{
+                   family_id: "family-overlap",
+                   replay_retain_until: nil
+                 })
+               end)
+
+      assert_received {:refresh_family_revoked, "family-overlap"}
+      assert EctoCodeStore.access_token_revoked?("jti-overlap")
     end
 
     test "rejects malformed replay retention metadata" do

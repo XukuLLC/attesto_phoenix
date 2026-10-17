@@ -1,7 +1,8 @@
 if Code.ensure_loaded?(Req) do
   defmodule AttestoPhoenix.CIBAPing.Req do
     @moduledoc """
-    Default `AttestoPhoenix.CIBAPing` deliverer, built on `Req`.
+    Default `AttestoPhoenix.CIBAPing` deliverer, using a one-shot Mint
+    connection to the SSRF-screened address.
 
     POSTs `{"auth_req_id": ...}` as `application/json` to the client's registered
     `backchannel_client_notification_endpoint` with
@@ -38,33 +39,25 @@ if Code.ensure_loaded?(Req) do
 
       with {:ok, %{url: url, host: host, authority: authority}} <-
              AttestoPhoenix.SSRFGuard.screen(endpoint, screen_opts) do
-        [
-          url: url,
-          method: :post,
-          json: %{auth_req_id: auth_req_id},
-          headers: [
+        body = JSON.encode!(%{auth_req_id: auth_req_id})
+
+        AttestoPhoenix.PinnedHTTP.request(
+          :post,
+          url,
+          host,
+          [
             {"authorization", "Bearer " <> client_notification_token},
             {"accept", "application/json"},
+            {"content-type", "application/json"},
             {"host", authority}
           ],
-          # SSRF posture: a 3xx from the notification endpoint is a failure, never
-          # followed. No retry on any status (including 401/403 - the flow outcome
-          # is unaffected). The body is ignored.
-          redirect: false,
-          retry: false,
-          receive_timeout: @timeout_ms,
-          decode_body: false,
-          into: AttestoPhoenix.HTTPResponse.discard_body_collector(),
-          # Pin to the checked IP (`:hostname` keeps SNI/cert/Host on the real
-          # host). FAPI transport: offer TLS 1.3 (FAPI 1.0 Advanced §8.5 /
-          # FAPI-CIBA), preferring it while still allowing 1.2.
-          connect_options: [hostname: host, transport_opts: [versions: [:"tlsv1.3", :"tlsv1.2"]]]
-        ]
-        |> Req.new()
-        |> Req.request()
+          body,
+          @timeout_ms,
+          :discard
+        )
         |> case do
-          {:ok, %Req.Response{status: status}} when status in 200..299 -> :ok
-          {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
+          {:ok, %{status: status}} when status in 200..299 -> :ok
+          {:ok, %{status: status}} -> {:error, {:status, status}}
           {:error, reason} -> {:error, reason}
         end
       end

@@ -874,9 +874,15 @@ defmodule AttestoPhoenix.Config do
     * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`.
       `start_link/1` rejects an unset or non-positive value. The installer adds
       the supervised process automatically; manual Ecto configurations must
-      add it after the repo when positive refresh retry grace is enabled.
+      add it after the repo when positive refresh retry grace or the bundled
+      Ecto logout-session store is enabled. The sweeper also retries released
+      and expired back-channel logout delivery leases.
       Configuration validates the interval but cannot prove that the host has
       actually supervised the process.
+    * `logout: [retry_initial_delay_seconds: ..., retry_max_delay_seconds: ...]`
+      - bounded exponential backoff for failed deliveries in the bundled Ecto
+      logout-session store. Defaults to 30 seconds initially and 3,600 seconds
+      maximum. A due retry runs on the next configured sweeper interval.
     * `:schema_prefix` - optional PostgreSQL schema selected by Ecto's
       `prefix:` option for every generated table and index. It must be `nil` or
       a non-empty, lowercase ASCII PostgreSQL schema identifier containing only
@@ -970,6 +976,8 @@ defmodule AttestoPhoenix.Config do
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.ClientIdMetadata.HostPolicy
+  alias AttestoPhoenix.Config.Endpoints
+  alias AttestoPhoenix.Store.EctoLogoutSessionStore
   alias AttestoPhoenix.Store.EctoRefreshStore
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.URLComparison
@@ -981,11 +989,13 @@ defmodule AttestoPhoenix.Config do
   # callback. They are validated by resolution in `validate!/1` so the
   # behaviour-module install path actually works.
   @max_refresh_token_ttl_seconds 2_147_483_647
+  @max_logout_retry_delay_seconds 86_400
   # PostgreSQL truncates unquoted identifiers at NAMEDATALEN - 1 bytes. Keep
   # this setting deliberately narrower than the quoted-identifier grammar so
   # it is safe to use as an Ecto schema prefix in every generated query.
   @max_schema_prefix_bytes 63
   @request_config_process_key {__MODULE__, :request_config}
+  @request_protocol_config_process_key {__MODULE__, :request_protocol_config}
   @enforce_keys [
     :issuer,
     :keystore,
@@ -1622,7 +1632,9 @@ defmodule AttestoPhoenix.Config do
   @logout_defaults [
     enabled: false,
     session_ttl_seconds: 86_400,
-    http_client: AttestoPhoenix.BackChannelLogout.Req
+    http_client: AttestoPhoenix.BackChannelLogout.Req,
+    retry_initial_delay_seconds: 30,
+    retry_max_delay_seconds: 3_600
   ]
 
   defp normalize_logout(nil), do: @logout_defaults
@@ -1734,13 +1746,22 @@ defmodule AttestoPhoenix.Config do
   """
   @spec with_request_config(t(), (-> result)) :: result when result: var
   def with_request_config(%__MODULE__{} = config, fun) when is_function(fun, 0) do
-    previous = Process.get(@request_config_process_key, :__attesto_missing_request_config__)
-    install_request_config(config)
+    case Process.get(@request_config_process_key, :__attesto_missing_request_config__) do
+      ^config ->
+        fun.()
 
-    try do
-      fun.()
-    after
-      restore_request_config(previous)
+      previous ->
+        previous_protocol =
+          Process.get(@request_protocol_config_process_key, :__attesto_missing_protocol_config__)
+
+        install_request_config(config)
+
+        try do
+          fun.()
+        after
+          restore_request_config(previous)
+          restore_request_protocol_config(previous_protocol)
+        end
     end
   end
 
@@ -1766,7 +1787,7 @@ defmodule AttestoPhoenix.Config do
 
     case request_config() do
       %__MODULE__{} = config ->
-        validate_request_config!(config).schema_prefix
+        config.schema_prefix
 
       nil ->
         case Application.get_env(:attesto_phoenix, :otp_app) do
@@ -1786,15 +1807,19 @@ defmodule AttestoPhoenix.Config do
   @doc "Resolve the prefix from an explicit config or connection."
   @spec table_prefix(t() | Plug.Conn.t()) :: String.t() | nil
   def table_prefix(%__MODULE__{} = config) do
-    validate_request_config!(config).schema_prefix
+    if request_config() === config,
+      do: config.schema_prefix,
+      else: validate_request_config!(config).schema_prefix
   end
 
   def table_prefix(%Plug.Conn{} = conn), do: conn |> resolve!() |> table_prefix()
 
   @doc "Resolve the public PostgreSQL schema prefix from a validated config."
+  @deprecated "Use table_prefix/0; schema_prefix/0 will be removed in AttestoPhoenix 5.0"
   @spec schema_prefix() :: String.t() | nil
   def schema_prefix, do: table_prefix()
 
+  @deprecated "Use table_prefix/1; schema_prefix/1 will be removed in AttestoPhoenix 5.0"
   @spec schema_prefix(t() | Plug.Conn.t()) :: String.t() | nil
   def schema_prefix(%__MODULE__{} = config), do: table_prefix(config)
 
@@ -1803,6 +1828,11 @@ defmodule AttestoPhoenix.Config do
   defp restore_request_config(:__attesto_missing_request_config__), do: Process.delete(@request_config_process_key)
 
   defp restore_request_config(previous), do: Process.put(@request_config_process_key, previous)
+
+  defp restore_request_protocol_config(:__attesto_missing_protocol_config__),
+    do: Process.delete(@request_protocol_config_process_key)
+
+  defp restore_request_protocol_config(previous), do: Process.put(@request_protocol_config_process_key, previous)
 
   @doc """
   Resolves the validated config installed on a request connection.
@@ -1816,7 +1846,7 @@ defmodule AttestoPhoenix.Config do
   def resolve!(%Plug.Conn{} = conn) do
     case conn.private do
       %{attesto_phoenix_config: %__MODULE__{} = config} ->
-        validate_request_config!(config)
+        if request_config() === config, do: config, else: validate_request_config!(config)
 
       %{attesto_phoenix_config: _other} ->
         raise ArgumentError,
@@ -2101,7 +2131,8 @@ defmodule AttestoPhoenix.Config do
   @spec allowed_resources(t(), term()) :: [String.t()]
   def allowed_resources(%__MODULE__{} = config, client) do
     static = static_allowed_resources(config)
-    per_client = config |> resource_indicators() |> per_client_allowed_resources(client)
+    host_client = ClientIdMetadata.host_client(client)
+    per_client = config |> resource_indicators() |> per_client_allowed_resources(host_client)
 
     (static ++ per_client)
     |> Enum.filter(&ResourceIndicator.valid_indicator?/1)
@@ -2301,6 +2332,17 @@ defmodule AttestoPhoenix.Config do
   @doc "The merged, defaulted OpenID Connect logout (RP-Initiated + Back-Channel) options."
   @spec logout(t()) :: keyword()
   def logout(%__MODULE__{logout: opts}), do: opts
+
+  @doc false
+  @spec logout_retry_delay_seconds(t() | nil, non_neg_integer()) :: pos_integer()
+  def logout_retry_delay_seconds(config, attempts) when is_integer(attempts) and attempts >= 0 do
+    opts = if match?(%__MODULE__{}, config), do: logout(config), else: @logout_defaults
+    initial = Keyword.fetch!(opts, :retry_initial_delay_seconds)
+    maximum = Keyword.fetch!(opts, :retry_max_delay_seconds)
+    doublings = attempts |> max(1) |> Kernel.-(1) |> min(31)
+
+    min(initial * Integer.pow(2, doublings), maximum)
+  end
 
   @doc """
   Returns `true` iff OpenID Connect logout is enabled (`logout: [enabled: true]`).
@@ -2590,13 +2632,35 @@ defmodule AttestoPhoenix.Config do
   this struct by the controllers and plugs, so they are not duplicated into the
   `Attesto.Config`.
 
-  The configured `:principal_kinds` list or callback is resolved once for each
-  call. An explicit `extra` value still wins over the derived values. Any other
-  `Attesto.Config.new/1` option may be supplied as `extra`; those options are
-  merged over the values derived here.
+  During `with_request_config/2`, the configured `:principal_kinds` list or
+  callback and the resulting core config are resolved once and cached for that
+  request process. Outside a request scope, or when `extra` is non-empty, a
+  fresh core config is built. An explicit `extra` value still wins over the
+  derived values. Any other `Attesto.Config.new/1` option may be supplied as
+  `extra`; those options are merged over the values derived here.
   """
   @spec to_attesto_config(t(), keyword()) :: Attesto.Config.t()
   def to_attesto_config(%__MODULE__{} = config, extra \\ []) do
+    if extra == [] and request_config() === config do
+      cached_request_protocol_config(config)
+    else
+      build_attesto_config(config, extra)
+    end
+  end
+
+  defp cached_request_protocol_config(config) do
+    case Process.get(@request_protocol_config_process_key) do
+      {^config, %Attesto.Config{} = protocol_config} ->
+        protocol_config
+
+      _other ->
+        protocol_config = build_attesto_config(config, [])
+        Process.put(@request_protocol_config_process_key, {config, protocol_config})
+        protocol_config
+    end
+  end
+
+  defp build_attesto_config(config, extra) do
     # The resolved token path is passed automatically so the core builder's
     # `token_endpoint` (and the DPoP `htu` it derives) reflect where the host
     # mounted the endpoint, without the consumer hand-passing
@@ -2710,58 +2774,58 @@ defmodule AttestoPhoenix.Config do
 
   @doc "The resolved request path of the OID4VCI credential endpoint."
   @spec credential_path(t()) :: String.t()
-  def credential_path(%__MODULE__{} = config), do: resolve_path(nil, config, @credential_tail)
+  def credential_path(%__MODULE__{} = config), do: Endpoints.path(config, nil, @credential_tail)
 
   @doc "The resolved request path of the OID4VCI nonce endpoint."
   @spec nonce_path(t()) :: String.t()
-  def nonce_path(%__MODULE__{} = config), do: resolve_path(nil, config, @nonce_tail)
+  def nonce_path(%__MODULE__{} = config), do: Endpoints.path(config, nil, @nonce_tail)
 
   @doc "The resolved request path of the Token Status List endpoint."
   @spec status_list_path(t()) :: String.t()
-  def status_list_path(%__MODULE__{} = config), do: resolve_path(nil, config, @status_list_tail)
+  def status_list_path(%__MODULE__{} = config), do: Endpoints.path(config, nil, @status_list_tail)
 
   @doc "The resolved request path of the OID4VCI credential-offer endpoint."
   @spec credential_offer_path(t()) :: String.t()
-  def credential_offer_path(%__MODULE__{} = config), do: resolve_path(nil, config, @credential_offer_tail)
+  def credential_offer_path(%__MODULE__{} = config), do: Endpoints.path(config, nil, @credential_offer_tail)
 
   @doc "The resolved request path of the OID4VCI deferred-credential endpoint."
   @spec deferred_credential_path(t()) :: String.t()
-  def deferred_credential_path(%__MODULE__{} = config), do: resolve_path(nil, config, @deferred_credential_tail)
+  def deferred_credential_path(%__MODULE__{} = config), do: Endpoints.path(config, nil, @deferred_credential_tail)
 
   @doc "Absolute URL of the OID4VCI credential endpoint."
   @spec credential_endpoint_url(t()) :: String.t()
-  def credential_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, credential_path(config))
+  def credential_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, credential_path(config))
 
   @doc "Absolute URL of the OID4VCI nonce endpoint."
   @spec nonce_endpoint_url(t()) :: String.t()
-  def nonce_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, nonce_path(config))
+  def nonce_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, nonce_path(config))
 
   @doc "Absolute URL of the Token Status List endpoint."
   @spec status_list_endpoint_url(t()) :: String.t()
-  def status_list_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, status_list_path(config))
+  def status_list_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, status_list_path(config))
 
   @doc "Absolute URL of the OID4VCI deferred-credential endpoint."
   @spec deferred_credential_endpoint_url(t()) :: String.t()
   def deferred_credential_endpoint_url(%__MODULE__{} = config),
-    do: endpoint_url(config, deferred_credential_path(config))
+    do: Endpoints.url(config, deferred_credential_path(config))
 
   @doc "The resolved request path of the OID4VP request-object endpoint."
   @spec presentation_request_path(t()) :: String.t()
-  def presentation_request_path(%__MODULE__{} = config), do: resolve_path(nil, config, @presentation_request_tail)
+  def presentation_request_path(%__MODULE__{} = config), do: Endpoints.path(config, nil, @presentation_request_tail)
 
   @doc "The resolved request path of the OID4VP direct-post response endpoint."
   @spec presentation_response_path(t()) :: String.t()
-  def presentation_response_path(%__MODULE__{} = config), do: resolve_path(nil, config, @presentation_response_tail)
+  def presentation_response_path(%__MODULE__{} = config), do: Endpoints.path(config, nil, @presentation_response_tail)
 
   @doc "Absolute URL of the OID4VP request-object endpoint."
   @spec presentation_request_endpoint_url(t()) :: String.t()
   def presentation_request_endpoint_url(%__MODULE__{} = config),
-    do: endpoint_url(config, presentation_request_path(config))
+    do: Endpoints.url(config, presentation_request_path(config))
 
   @doc "Absolute URL of the OID4VP direct-post response endpoint."
   @spec presentation_response_endpoint_url(t()) :: String.t()
   def presentation_response_endpoint_url(%__MODULE__{} = config),
-    do: endpoint_url(config, presentation_response_path(config))
+    do: Endpoints.url(config, presentation_response_path(config))
 
   @doc false
   @spec device_authorization_tail() :: String.t()
@@ -2774,22 +2838,22 @@ defmodule AttestoPhoenix.Config do
   @doc "The resolved request path of the device-authorization endpoint (RFC 8628)."
   @spec device_authorization_path(t()) :: String.t()
   def device_authorization_path(%__MODULE__{device_authorization_path: override} = config),
-    do: resolve_path(override, config, @device_authorization_tail)
+    do: Endpoints.path(config, override, @device_authorization_tail)
 
   @doc "The resolved request path of the device-verification page (RFC 8628 §3.3)."
   @spec device_verification_path(t()) :: String.t()
   def device_verification_path(%__MODULE__{device_verification_path: override} = config),
-    do: resolve_path(override, config, @device_verification_tail)
+    do: Endpoints.path(config, override, @device_verification_tail)
 
   @doc "Absolute URL of the device-authorization endpoint (advertised as `device_authorization_endpoint`, RFC 8628 §4)."
   @spec device_authorization_endpoint_url(t()) :: String.t()
   def device_authorization_endpoint_url(%__MODULE__{} = config),
-    do: endpoint_url(config, device_authorization_path(config))
+    do: Endpoints.url(config, device_authorization_path(config))
 
   @doc "Absolute URL of the device-verification page."
   @spec device_verification_endpoint_url(t()) :: String.t()
   def device_verification_endpoint_url(%__MODULE__{} = config),
-    do: endpoint_url(config, device_verification_path(config))
+    do: Endpoints.url(config, device_verification_path(config))
 
   @doc false
   @spec backchannel_authentication_tail() :: String.t()
@@ -2798,12 +2862,12 @@ defmodule AttestoPhoenix.Config do
   @doc "The resolved request path of the CIBA backchannel authentication endpoint (CIBA Core §7)."
   @spec backchannel_authentication_path(t()) :: String.t()
   def backchannel_authentication_path(%__MODULE__{backchannel_authentication_path: override} = config),
-    do: resolve_path(override, config, @backchannel_authentication_tail)
+    do: Endpoints.path(config, override, @backchannel_authentication_tail)
 
   @doc "Absolute URL of the CIBA backchannel authentication endpoint (advertised as `backchannel_authentication_endpoint`, CIBA Core §4)."
   @spec backchannel_authentication_endpoint_url(t()) :: String.t()
   def backchannel_authentication_endpoint_url(%__MODULE__{} = config),
-    do: endpoint_url(config, backchannel_authentication_path(config))
+    do: Endpoints.url(config, backchannel_authentication_path(config))
 
   @doc false
   @spec end_session_tail() :: String.t()
@@ -2812,11 +2876,11 @@ defmodule AttestoPhoenix.Config do
   @doc "The resolved request path of the end-session endpoint (RP-Initiated Logout 1.0)."
   @spec end_session_path(t()) :: String.t()
   def end_session_path(%__MODULE__{end_session_path: override} = config),
-    do: resolve_path(override, config, @end_session_tail)
+    do: Endpoints.path(config, override, @end_session_tail)
 
   @doc "Absolute URL of the end-session endpoint (advertised as `end_session_endpoint`, RP-Initiated Logout 1.0 §2)."
   @spec end_session_endpoint_url(t()) :: String.t()
-  def end_session_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, end_session_path(config))
+  def end_session_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, end_session_path(config))
 
   @doc false
   @spec check_session_tail() :: String.t()
@@ -2825,11 +2889,11 @@ defmodule AttestoPhoenix.Config do
   @doc "The resolved request path of the check-session iframe (Session Management 1.0 §3.3)."
   @spec check_session_path(t()) :: String.t()
   def check_session_path(%__MODULE__{check_session_path: override} = config),
-    do: resolve_path(override, config, @check_session_tail)
+    do: Endpoints.path(config, override, @check_session_tail)
 
   @doc "Absolute URL of the check-session iframe (advertised as `check_session_iframe`, Session Management 1.0 §3.3)."
   @spec check_session_iframe_url(t()) :: String.t()
-  def check_session_iframe_url(%__MODULE__{} = config), do: endpoint_url(config, check_session_path(config))
+  def check_session_iframe_url(%__MODULE__{} = config), do: Endpoints.url(config, check_session_path(config))
 
   @doc false
   @spec token_tail() :: String.t()
@@ -2862,20 +2926,20 @@ defmodule AttestoPhoenix.Config do
   """
   @spec authorize_path(t()) :: String.t()
   def authorize_path(%__MODULE__{authorize_path: override} = config),
-    do: resolve_path(override, config, @authorize_tail)
+    do: Endpoints.path(config, override, @authorize_tail)
 
   @doc """
   The resolved request path of the token endpoint. See `authorize_path/1`.
   """
   @spec token_path(t()) :: String.t()
-  def token_path(%__MODULE__{token_path: override} = config), do: resolve_path(override, config, @token_tail)
+  def token_path(%__MODULE__{token_path: override} = config), do: Endpoints.path(config, override, @token_tail)
 
   @doc """
   The resolved request path of the pushed-authorization-request endpoint
   (RFC 9126). See `authorize_path/1`.
   """
   @spec par_path(t()) :: String.t()
-  def par_path(%__MODULE__{par_path: override} = config), do: resolve_path(override, config, @par_tail)
+  def par_path(%__MODULE__{par_path: override} = config), do: Endpoints.path(config, override, @par_tail)
 
   @doc """
   The resolved request path of the revocation endpoint (RFC 7009). See
@@ -2883,7 +2947,7 @@ defmodule AttestoPhoenix.Config do
   """
   @spec revocation_path(t()) :: String.t()
   def revocation_path(%__MODULE__{revocation_path: override} = config),
-    do: resolve_path(override, config, @revocation_tail)
+    do: Endpoints.path(config, override, @revocation_tail)
 
   @doc """
   The resolved request path of the token introspection endpoint (RFC 7662). See
@@ -2891,7 +2955,7 @@ defmodule AttestoPhoenix.Config do
   """
   @spec introspection_path(t()) :: String.t()
   def introspection_path(%__MODULE__{introspection_path: override} = config),
-    do: resolve_path(override, config, @introspection_tail)
+    do: Endpoints.path(config, override, @introspection_tail)
 
   @doc """
   The resolved request path of the dynamic client registration endpoint
@@ -2899,45 +2963,32 @@ defmodule AttestoPhoenix.Config do
   """
   @spec registration_path(t()) :: String.t()
   def registration_path(%__MODULE__{registration_path: override} = config),
-    do: resolve_path(override, config, @registration_tail)
+    do: Endpoints.path(config, override, @registration_tail)
 
   @doc """
   The resolved request path of the UserInfo endpoint (OpenID Connect Core
   §5.3). See `authorize_path/1`.
   """
   @spec userinfo_path(t()) :: String.t()
-  def userinfo_path(%__MODULE__{userinfo_path: override} = config), do: resolve_path(override, config, @userinfo_tail)
+  def userinfo_path(%__MODULE__{userinfo_path: override} = config), do: Endpoints.path(config, override, @userinfo_tail)
 
   # An explicit per-endpoint override wins over the prefix; otherwise the
   # endpoint path is the prefix joined with the conventional tail. The prefix
   # default `"/oauth"` reproduces the historic surface.
-  defp resolve_path(override, _config, _tail) when is_binary(override) and override != "", do: override
-
-  defp resolve_path(_override, %__MODULE__{oauth_path_prefix: prefix}, tail), do: join_path(prefix, tail)
-
-  # Join a prefix and a tail into a single absolute path, collapsing the seam so
-  # neither a trailing slash on the prefix nor the leading slash on the tail
-  # doubles up.
-  defp join_path(prefix, tail) do
-    prefix = String.trim_trailing(to_string(prefix), "/")
-    tail = "/" <> String.trim_leading(tail, "/")
-    prefix <> tail
-  end
-
   @doc """
   Absolute URL of the authorization endpoint: the issuer merged with
   `authorize_path/1`. Advertised in the OpenID Provider Metadata when the host
   does not supply a separate `:authorization_endpoint`.
   """
   @spec authorize_endpoint_url(t()) :: String.t()
-  def authorize_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, authorize_path(config))
+  def authorize_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, authorize_path(config))
 
   @doc """
   Absolute URL of the token endpoint: the issuer merged with `token_path/1`.
   Advertised as `token_endpoint` (RFC 8414 §2).
   """
   @spec token_endpoint_url(t()) :: String.t()
-  def token_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, token_path(config))
+  def token_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, token_path(config))
 
   @doc """
   The `aud` values a `private_key_jwt` client assertion may carry (RFC 7523 §3).
@@ -2990,7 +3041,7 @@ defmodule AttestoPhoenix.Config do
   (RFC 9126 §5).
   """
   @spec par_endpoint_url(t()) :: String.t()
-  def par_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, par_path(config))
+  def par_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, par_path(config))
 
   @doc """
   Absolute URL of the revocation endpoint: the issuer merged with
@@ -2998,14 +3049,14 @@ defmodule AttestoPhoenix.Config do
   RFC 7009).
   """
   @spec revocation_endpoint_url(t()) :: String.t()
-  def revocation_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, revocation_path(config))
+  def revocation_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, revocation_path(config))
 
   @doc """
   Absolute URL of the token introspection endpoint (RFC 7662): the issuer merged
   with `introspection_path/1`. Advertised as `introspection_endpoint`.
   """
   @spec introspection_endpoint_url(t()) :: String.t()
-  def introspection_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, introspection_path(config))
+  def introspection_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, introspection_path(config))
 
   # Every grant type the token endpoint implements: RFC 6749 authorization_code /
   # refresh_token / client_credentials and RFC 8693 token-exchange. This is the
@@ -3136,7 +3187,7 @@ defmodule AttestoPhoenix.Config do
   §3) only when registration is enabled.
   """
   @spec registration_endpoint_url(t()) :: String.t()
-  def registration_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, registration_path(config))
+  def registration_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, registration_path(config))
 
   @doc """
   Absolute URL of the UserInfo endpoint: the issuer merged with
@@ -3145,7 +3196,7 @@ defmodule AttestoPhoenix.Config do
   authoritative in Provider Metadata.
   """
   @spec userinfo_endpoint_url(t()) :: String.t()
-  def userinfo_endpoint_url(%__MODULE__{} = config), do: endpoint_url(config, userinfo_path(config))
+  def userinfo_endpoint_url(%__MODULE__{} = config), do: Endpoints.url(config, userinfo_path(config))
 
   @doc """
   Absolute URL of an individual registered client's RFC 7592 management
@@ -3156,7 +3207,7 @@ defmodule AttestoPhoenix.Config do
   @spec registration_client_uri(t(), String.t()) :: String.t()
   def registration_client_uri(%__MODULE__{} = config, client_id) when is_binary(client_id) do
     encoded = URI.encode(client_id, &URI.char_unreserved?/1)
-    endpoint_url(config, join_path(registration_path(config), encoded))
+    Endpoints.url(config, Endpoints.join_path(registration_path(config), encoded))
   end
 
   @doc """
@@ -3205,18 +3256,11 @@ defmodule AttestoPhoenix.Config do
 
   @doc """
   Absolute URL of the JWK Set document (RFC 7517 §5; the `jwks_uri` per
-  RFC 8414 §2). This library keeps the JWKS document at its stable root path,
-  so it is not relocated by `:oauth_path_prefix`.
+  RFC 8414 §2). This library keeps the JWKS document outside
+  `:oauth_path_prefix`, but preserves a tenant path carried by `:issuer`.
   """
   @spec jwks_uri(t()) :: String.t()
-  def jwks_uri(%__MODULE__{} = config), do: endpoint_url(config, "/.well-known/jwks.json")
-
-  defp endpoint_url(%__MODULE__{issuer: issuer}, path) do
-    issuer
-    |> URI.parse()
-    |> URI.merge(path)
-    |> URI.to_string()
-  end
+  def jwks_uri(%__MODULE__{} = config), do: Endpoints.url(config, "/.well-known/jwks.json")
 
   # ── Behaviour-module callback resolution ─────────────────────────────────
 
@@ -3745,8 +3789,13 @@ defmodule AttestoPhoenix.Config do
   # `:terminate_session` callback could report "logged out" without clearing the
   # session. Refuse to build such a config.
   defp validate_logout!(%__MODULE__{} = config) do
+    validate_logout_retry_backoff!(config)
+
     case Keyword.get(config.logout, :enabled, false) do
       true ->
+        validate_logout_store!(Map.get(config, :logout_session_store))
+        validate_logout_retry_driver!(config)
+
         case config.terminate_session do
           nil ->
             raise ArgumentError,
@@ -3763,6 +3812,73 @@ defmodule AttestoPhoenix.Config do
         :ok
     end
   end
+
+  defp validate_logout_retry_backoff!(%__MODULE__{} = config) do
+    opts = logout(config)
+    initial = Keyword.get(opts, :retry_initial_delay_seconds)
+    maximum = Keyword.get(opts, :retry_max_delay_seconds)
+
+    cond do
+      not (is_integer(initial) and initial > 0) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: logout :retry_initial_delay_seconds must be a positive integer"
+
+      not (is_integer(maximum) and maximum > 0 and maximum <= @max_logout_retry_delay_seconds) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: logout :retry_max_delay_seconds must be a positive integer " <>
+                "not exceeding #{@max_logout_retry_delay_seconds}"
+
+      initial > maximum ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: logout :retry_initial_delay_seconds must not exceed " <>
+                ":retry_max_delay_seconds"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_logout_store!(nil), do: :ok
+
+  defp validate_logout_store!(store) when is_atom(store) do
+    required = [record: 1, lease_targets: 4, acknowledge_targets: 2, release_targets: 2]
+
+    case Code.ensure_loaded(store) do
+      {:module, ^store} ->
+        missing = Enum.reject(required, fn {function, arity} -> function_exported?(store, function, arity) end)
+
+        if missing != [] do
+          raise ArgumentError,
+                "AttestoPhoenix.Config: :logout_session_store #{inspect(store)} must implement " <>
+                  "Attesto.LogoutSessionStore's lease callbacks; missing #{inspect(missing)}"
+        end
+
+      _other ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :logout_session_store must be a loadable module implementing " <>
+                "Attesto.LogoutSessionStore"
+    end
+  end
+
+  defp validate_logout_store!(_store) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :logout_session_store must be a module implementing " <>
+            "Attesto.LogoutSessionStore"
+  end
+
+  defp validate_logout_retry_driver!(%__MODULE__{
+         logout_session_store: EctoLogoutSessionStore,
+         sweep_interval_ms: interval
+       })
+       when is_integer(interval) and interval > 0, do: :ok
+
+  defp validate_logout_retry_driver!(%__MODULE__{logout_session_store: EctoLogoutSessionStore}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: the bundled Ecto logout-session store requires a positive " <>
+            ":sweep_interval_ms so released or expired delivery leases are retried automatically"
+  end
+
+  defp validate_logout_retry_driver!(%__MODULE__{}), do: :ok
 
   # CIBA is opt-in and cannot function without persistence for the mutable
   # authentication-request record and a way to resolve the request's hint to an
@@ -4606,7 +4722,7 @@ defmodule AttestoPhoenix.Config do
   # including an explicitly configured nil: silently treating that key as the
   # public schema would make a mixed 2.x/3.0 deployment ambiguous.
   defp reject_legacy_global_table_prefix! do
-    if Keyword.has_key?(Application.get_all_env(:attesto_phoenix), :table_prefix) do
+    if match?({:ok, _value}, Application.fetch_env(:attesto_phoenix, :table_prefix)) do
       raise ArgumentError,
             "AttestoPhoenix.Config: config :attesto_phoenix, :table_prefix was " <>
               "removed in 3.0. The 2.x value did not identify one runtime layout: " <>
@@ -4879,22 +4995,7 @@ defmodule AttestoPhoenix.Config do
   # `%HH` triplet (which `URI.new/1` still admits). (The RFC 8707 jwt-bearer
   # request `resource` permits any scheme per §2.1 and is validated separately in
   # `AttestoPhoenix.AuthorizationServer.Token`.)
-  defp absolute_resource_url?(url) when is_binary(url) do
-    if String.valid?(url) do
-      case URI.new(url) do
-        {:ok, %URI{scheme: "https", host: host, fragment: nil}}
-        when is_binary(host) and host != "" ->
-          not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, url)
-
-        _ ->
-          false
-      end
-    else
-      false
-    end
-  end
-
-  defp absolute_resource_url?(_), do: false
+  defp absolute_resource_url?(url), do: Attesto.URI.https_identifier?(url)
 
   # RFC 8414 §2 and OpenID Connect Discovery §3 require an HTTPS issuer and
   # prohibit query and fragment components. A path is valid at the protocol
@@ -4917,17 +5018,11 @@ defmodule AttestoPhoenix.Config do
 
   @spec valid_issuer?(binary()) :: boolean()
   defp valid_issuer?(issuer) when is_binary(issuer) do
-    if String.valid?(issuer) do
-      case URI.new(issuer) do
-        {:ok, %URI{scheme: "https", host: host, query: nil, fragment: nil}}
-        when is_binary(host) and host != "" ->
-          not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, issuer)
-
-        _ ->
-          false
-      end
+    with true <- Attesto.URI.https_identifier?(issuer),
+         {:ok, %URI{query: nil}} <- URI.new(issuer) do
+      true
     else
-      false
+      _ -> false
     end
   end
 
@@ -5005,9 +5100,10 @@ defmodule AttestoPhoenix.Config do
 
   # Check #1: every required discovery endpoint must resolve to a non-nil
   # absolute URL. Because all of them are derived from `:issuer` (directly, or
-  # via `URI.merge/2` with a resolved path), the realistic failure mode is an
+  # via `Attesto.Config.append_endpoint_path/2` with a resolved path), the
+  # realistic failure mode is an
   # `:issuer` that is not an absolute URL with a scheme and host (e.g.
-  # `"issuer.example"` or `"/oauth"`): `URI.merge/2` then yields a path-only,
+  # `"issuer.example"` or `"/oauth"`): endpoint derivation then yields a path-only,
   # host-less endpoint URL, and the discovery document advertises an endpoint a
   # client cannot resolve. Validating the derived URLs (not just `:issuer`) also
   # guards against any future regression where a resolver returns nil/empty.
@@ -5077,7 +5173,7 @@ defmodule AttestoPhoenix.Config do
 
     Enum.each(@mounted_oauth_endpoints, fn {key, resolver, tail} ->
       path = resolver.(config)
-      derived = join_path(config.oauth_path_prefix, tail)
+      derived = Endpoints.join_path(config.oauth_path_prefix, tail)
 
       # Consistent iff the advertised path is the prefix-derived path, or at
       # least sits under the declared prefix (an override that merely renames the
@@ -5266,13 +5362,23 @@ defmodule AttestoPhoenix.Config do
             "or a boolean; got #{inspect(enforcement)}."
   end
 
-  defp validate_request_object_algs!(%Policy{accepted_algs: nil}), do: :ok
-
   defp validate_request_object_algs!(%Policy{} = policy) do
-    validate_signing_algorithm_list!(":request_object_policy.accepted_algs", policy.accepted_algs)
+    # Policy structs are ordinary maps at runtime, so retain a fail-closed
+    # validation path for a hand-built `%Policy{accepted_algs: nil}` even when
+    # the core type declaration describes only valid policies.
+    policy
+    |> Map.from_struct()
+    |> Map.get(:accepted_algs)
+    |> case do
+      nil ->
+        :ok
 
-    if policy.enforce_fapi_alg_policy == true do
-      validate_fapi_algorithm_list!(":request_object_policy.accepted_algs", policy.accepted_algs)
+      accepted_algs ->
+        validate_signing_algorithm_list!(":request_object_policy.accepted_algs", accepted_algs)
+
+        if policy.enforce_fapi_alg_policy == true do
+          validate_fapi_algorithm_list!(":request_object_policy.accepted_algs", accepted_algs)
+        end
     end
   end
 
@@ -5444,5 +5550,42 @@ defmodule AttestoPhoenix.Config do
     raise ArgumentError,
           "AttestoPhoenix.Config: :presentation_response_mode must be \"direct_post\" or " <>
             "\"direct_post.jwt\"; got #{inspect(mode)}"
+  end
+end
+
+defimpl Inspect, for: AttestoPhoenix.Config do
+  import Inspect.Algebra
+
+  def inspect(config, opts) do
+    fields = Map.from_struct(config)
+    session_management = fields |> Map.get(:session_management, []) |> redact_session_management()
+
+    concat([
+      "#AttestoPhoenix.Config<session_management: ",
+      to_doc(session_management, opts),
+      ", fields: ",
+      fields |> Map.delete(:session_management) |> to_doc(opts),
+      ">"
+    ])
+  end
+
+  defp redact_session_management(options) when is_list(options) do
+    if Keyword.has_key?(options, :browser_state_secret) do
+      Keyword.put(options, :browser_state_secret, "[REDACTED]")
+    else
+      options
+    end
+  end
+
+  defp redact_session_management(%{} = options) do
+    options
+    |> maybe_redact(:browser_state_secret)
+    |> maybe_redact("browser_state_secret")
+  end
+
+  defp redact_session_management(other), do: other
+
+  defp maybe_redact(map, key) do
+    if Map.has_key?(map, key), do: Map.put(map, key, "[REDACTED]"), else: map
   end
 end

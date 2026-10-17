@@ -4,6 +4,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Registration do
   use GenServer
 
   alias AttestoPhoenix.Store.Sweeper.Lifecycle
+  alias AttestoPhoenix.Store.Sweeper.LocalProcess
   alias AttestoPhoenix.Store.Sweeper.Signal
 
   @retry_ms 50
@@ -52,7 +53,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Registration do
 
   @impl true
   def handle_call({:register, target, worker}, _from, state) do
-    if local_alive?(worker) do
+    if LocalProcess.alive?(worker) do
       {state, result} = register_with_lifecycle(state, target, worker)
 
       state =
@@ -143,7 +144,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Registration do
   defp retain_live_registrations(registrations) do
     Enum.reduce(registrations, %{}, fn
       {worker, %MapSet{} = targets}, acc when is_pid(worker) ->
-        if local_alive?(worker) do
+        if LocalProcess.alive?(worker) do
           Map.put(acc, worker, targets)
         else
           acc
@@ -211,7 +212,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Registration do
   end
 
   defp restore_worker_registrations(worker, targets, all_ok?) do
-    if local_alive?(worker) do
+    if LocalProcess.alive?(worker) do
       Enum.reduce(targets, all_ok?, fn target, inner_ok? ->
         registration_ok?(Lifecycle.register_cleanup_worker_with_owner(target, worker)) and inner_ok?
       end)
@@ -250,7 +251,4 @@ defmodule AttestoPhoenix.Store.Sweeper.Registration do
   defp schedule_lifecycle_retry(state) do
     %{state | lifecycle_retry_ref: Process.send_after(self(), :register_lifecycle, @retry_ms)}
   end
-
-  defp local_alive?(pid) when is_pid(pid), do: node(pid) == node() and Process.alive?(pid)
-  defp local_alive?(_other), do: false
 end

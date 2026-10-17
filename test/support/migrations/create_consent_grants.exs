@@ -14,9 +14,9 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateConsentGrants do
 
   def change do
     create table(:attesto_consent_grants, primary_key: false) do
-      add(:token, :string, primary_key: true, null: false)
-      add(:binding_hash, :string, null: false)
-      add(:subject, :string, null: false)
+      add(:token, :string, size: 255, primary_key: true, null: false)
+      add(:binding_hash, :string, size: 88, null: false)
+      add(:subject, :string, size: 255, null: false)
       add(:consumed_at, :utc_datetime_usec)
       add(:expires_at, :utc_datetime_usec, null: false)
 

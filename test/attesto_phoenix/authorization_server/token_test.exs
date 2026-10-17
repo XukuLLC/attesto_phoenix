@@ -14,6 +14,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   alias Attesto.CodeStore.ETS
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.{Config, Event, OAuthError}
 
   # A throwaway RSA keypair for the minting paths.
@@ -97,6 +98,12 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
     @impl true
     def revoke_family(family_id), do: ETS.revoke_family(family_id)
+  end
+
+  defmodule RevokedAccessTokenStore do
+    @moduledoc false
+
+    def access_token_revoked?(jti), do: jti == Process.get({__MODULE__, :jti})
   end
 
   # The local Attesto 2.x path reports this operational result when the store
@@ -425,6 +432,28 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "client_credentials grant (RFC 6749 §4.4)" do
+    test "a self-asserted CIMD key never unlocks confidential-only grants" do
+      client = %CIMDClient{
+        metadata: %{
+          "client_id" => "https://attacker.example/client.json",
+          "grant_types" => ["client_credentials"],
+          "token_endpoint_auth_method" => "private_key_jwt"
+        }
+      }
+
+      config = config()
+
+      request =
+        request(config,
+          client: client,
+          client_auth_method: :private_key_jwt,
+          request_client_id: client.metadata["client_id"],
+          params: %{"scope" => "read"}
+        )
+
+      assert {:error, %OAuthError{error: :invalid_client}, _events} = Token.issue(config, request)
+    end
+
     test "scope policy cannot add scopes omitted from an explicit request" do
       config = config(authorize_scope: fn _client, _requested -> {:ok, ["read", "admin"]} end)
       request = request(config, params: %{"scope" => "read"})
@@ -2160,6 +2189,57 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "token exchange grant (RFC 8693)" do
+    test "a token contained after authorization-code reuse cannot be exchanged" do
+      config = config(code_store: RevokedAccessTokenStore)
+      subject_request = request(config, params: %{"scope" => "read"})
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+      Process.put({RevokedAccessTokenStore, :jti}, claim!(subject_response.access_token, "jti"))
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _events} = Token.issue(config, exchange_request)
+    end
+
+    test "an exchanged token cannot outlive a deliberately short-lived subject token" do
+      config = config()
+      now = Attesto.NumericDate.now([])
+
+      assert {:ok, %{access_token: subject_token}} =
+               Attesto.Token.mint(
+                 Config.to_attesto_config(config),
+                 %{
+                   kind: "client",
+                   sub: "oc_client-1",
+                   scopes: ["read"],
+                   claims: %{"client_id" => "client-1"}
+                 },
+                 now: now,
+                 lifetime: 30
+               )
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, exchange_request)
+      assert claim!(response.access_token, "exp") <= claim!(subject_token, "exp")
+      assert response.expires_in <= 30
+    end
+
     test "a token_exchange token_issued event carries bearer sender metadata" do
       config = config()
       subject_request = request(config, params: %{"scope" => "read write"})
@@ -2393,6 +2473,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
       assert claim!(subject_response.access_token, "client_id") == "client-1"
+      subject_exp = claim!(subject_response.access_token, "exp")
 
       exchange_request =
         request(config,
@@ -2409,6 +2490,12 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, response, _events} = Token.issue(config, exchange_request)
       assert claim!(response.access_token, "client_id") == "client-2"
+      assert claim!(response.access_token, "exp") <= subject_exp
+
+      assert claim!(response.access_token, "act") == %{
+               "sub" => "client-2",
+               "act" => %{"sub" => "client-1"}
+             }
 
       assert {:ok, %{"client_id" => "client-2", "aud" => ^resource}} =
                Attesto.Token.verify(Config.to_attesto_config(config), response.access_token,
@@ -2560,6 +2647,27 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "registered grant types (RFC 6749 §4)" do
+    test "a CIMD client is limited by its document grant_types" do
+      client = %CIMDClient{
+        metadata: %{
+          "client_id" => "https://wallet.example/client.json",
+          "grant_types" => ["refresh_token"]
+        }
+      }
+
+      config = config()
+
+      request =
+        request(config,
+          client: client,
+          client_auth_method: :none,
+          request_client_id: client.metadata["client_id"],
+          grant_type: "authorization_code"
+        )
+
+      assert {:error, %OAuthError{error: :unsupported_grant_type}, _events} = Token.issue(config, request)
+    end
+
     test "a grant the client is not registered for is rejected before dispatch" do
       config = config(client_grant_types: fn _client -> ["authorization_code"] end)
       request = request(config, grant_type: "client_credentials")

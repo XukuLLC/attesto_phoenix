@@ -66,14 +66,9 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import Plug.Conn, only: [put_resp_header: 3]
-
   alias Attesto.ProtectedResourceMetadata
   alias AttestoPhoenix.Config
-
-  # The derived Attesto.Config (the protocol configuration the core metadata
-  # builder reads) is installed here, the same key DiscoveryController reads.
-  @protocol_config_key :attesto_protocol_config
+  alias AttestoPhoenix.Controller.MetadataSupport
 
   # RFC 9728 §3.1: the metadata document is static for a given resource
   # configuration, so it may be cached by clients and intermediaries. One hour
@@ -90,13 +85,13 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, _params) do
     config = Config.resolve!(conn)
-    protocol_config = fetch_protocol_config!(conn)
+    protocol_config = MetadataSupport.protocol_config!(conn, __MODULE__)
 
     metadata = ProtectedResourceMetadata.metadata(protocol_config, metadata_opts(config))
     ensure_inserted_path_consistency!(conn, metadata)
 
     conn
-    |> put_cache_control()
+    |> MetadataSupport.put_public_cache(@cache_max_age_seconds)
     |> json(metadata)
   end
 
@@ -153,24 +148,4 @@ defmodule AttestoPhoenix.Controller.ProtectedResourceController do
 
   defp presence([]), do: nil
   defp presence(list) when is_list(list), do: list
-
-  # Fail closed: a missing config is a wiring error, not a runtime condition to
-  # paper over. Raising surfaces the misconfiguration instead of emitting a
-  # document that omits required members.
-  @spec fetch_protocol_config!(Plug.Conn.t()) :: Attesto.Config.t()
-  defp fetch_protocol_config!(conn) do
-    case conn.private do
-      %{@protocol_config_key => %Attesto.Config{} = config} ->
-        config
-
-      _ ->
-        raise "#{inspect(__MODULE__)}: no %Attesto.Config{} found in " <>
-                "conn.private[#{inspect(@protocol_config_key)}]; wire the host pipeline that assigns it"
-    end
-  end
-
-  @spec put_cache_control(Plug.Conn.t()) :: Plug.Conn.t()
-  defp put_cache_control(conn) do
-    put_resp_header(conn, "cache-control", "public, max-age=#{@cache_max_age_seconds}")
-  end
 end

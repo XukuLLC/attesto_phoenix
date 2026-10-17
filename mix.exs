@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.1.0"
+  @version "4.2.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.5.0 and < 3.0.0"
+  @attesto_requirement ">= 2.6.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,10 +76,10 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # The 2.5.0 floor is load-bearing: Phoenix delegates outbound-address policy
-  # to Attesto.IPAddress while retaining the authorization-code replay, CIBA,
-  # and signed-JAR APIs introduced in 2.4. Resolving an older core would leave
-  # the shared fetch policy unavailable or omit required protocol behavior.
+  # The 2.6.0 floor is load-bearing: Phoenix uses Attesto's canonical endpoint
+  # path derivation in addition to the outbound-address, authorization-code
+  # replay, CIBA, and signed-JAR APIs introduced by earlier 2.x releases.
+  # Resolving an older core would leave required runtime functions unavailable.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 

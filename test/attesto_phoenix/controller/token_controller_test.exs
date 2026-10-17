@@ -90,6 +90,15 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     @impl true
     def take_targets(_criteria), do: []
+
+    @impl true
+    def lease_targets(_criteria, _lease_id, _now, _lease_expires_at), do: []
+
+    @impl true
+    def acknowledge_targets(_lease_id, _delivery_ids), do: :ok
+
+    @impl true
+    def release_targets(_lease_id, _delivery_ids), do: :ok
   end
 
   defmodule RefusingLogoutStore do
@@ -107,6 +116,15 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     @impl true
     def take_targets(_criteria), do: []
+
+    @impl true
+    def lease_targets(_criteria, _lease_id, _now, _lease_expires_at), do: []
+
+    @impl true
+    def acknowledge_targets(_lease_id, _delivery_ids), do: :ok
+
+    @impl true
+    def release_targets(_lease_id, _delivery_ids), do: :ok
   end
 
   # Attesto 2.x returns :temporarily_unavailable only when the atomic refresh
@@ -270,10 +288,9 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
   end
 
-  # Legacy reuse-tracking store deliberately lacks the code-hash JTI callback.
-  # The token endpoint must refuse an authorization-code refresh rather than
-  # call its family callback with the code's provenance family, which is not
-  # the family the core creates for the refresh token.
+  # Reuse-tracking store deliberately lacking Phoenix's optional code-hash JTI
+  # callbacks. Core's consumed-code contract remains usable; only access-token
+  # indexing is unavailable.
   defmodule LegacyReuseCodeStore do
     @moduledoc false
     @behaviour Attesto.CodeStore
@@ -1860,11 +1877,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["token_type"] == "DPoP"
     end
 
-    test "a DPoP-bound code with neither client auth nor a proof reports the holder-of-key failure" do
-      # FAPI2 ensure-holder-of-key-required sends a token request for a
-      # sender-constrained code with NO client authentication AND no DPoP proof.
-      # The holder-of-key failure (invalid_request) must take precedence over the
-      # client-auth failure (invalid_client), which would otherwise mask it.
+    test "a DPoP-bound code is not inspected before client authentication" do
       enable_minting()
       {_proof, jkt} = dpop_proof_and_jkt([])
       code_store = start_dpop_code_store("oc_sub-1", ["openid"], jkt)
@@ -1881,16 +1894,14 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         })
 
       assert conn.status == 400
-      assert body(conn)["error"] == "invalid_request"
-      assert body(conn)["error_description"] =~ "DPoP"
+      assert body(conn)["error"] == "invalid_client"
 
-      # The code was only READ, not consumed - still live for a legitimate retry.
+      # Client authentication fails before grant lookup or consumption, so the
+      # same code remains available for a correctly authenticated DPoP retry.
       assert Attesto.AuthorizationCode.dpop_bound?(code_store, code)
     end
 
     test "a plain (non-DPoP) code with no client auth still reports invalid_client" do
-      # The holder-of-key precedence applies ONLY to DPoP-bound codes; a plain
-      # (e.g. OIDC) code redeemed without client auth still surfaces invalid_client.
       enable_minting()
       code_store = start_code_store("oc_sub-1", ["read"])
       put_config(code_store: code_store)
@@ -2882,7 +2893,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert code_store.access_token_revoked?(jti)
     end
 
-    test "refuses refresh issuance when a legacy store cannot bind access JTI by code" do
+    test "a core reuse-tracking store without the Phoenix JTI index remains compatible" do
       enable_minting()
       start_refresh_store()
       start_family_code_store(["offline_access"], "fam-reuse")
@@ -2892,20 +2903,26 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         code_store: LegacyReuseCodeStore
       )
 
-      refused = post_auth_code()
-      assert refused.status == 400
-      assert body(refused)["error"] == "invalid_request"
+      first = post_auth_code()
+      assert first.status == 200
+      refresh_token = body(first)["refresh_token"]
+      assert is_binary(refresh_token)
 
-      # No legacy family callback was invoked with the authorization provenance
-      # ID, and no refresh family was minted before the fail-closed refusal.
+      assert {:ok, %{family_id: refresh_family}} =
+               Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+
+      # The access token was not indexed under the authorization provenance
+      # family merely because the richer callback was unavailable.
       refute ReuseCodeStore.access_token_recorded_for_family?("fam-reuse")
 
-      # The code was claimed by the failed attempt but never finalized, so a
-      # retry remains the ordinary single-use invalid_grant path, not a reuse
-      # marker that could revoke an unrelated family.
-      retry = post_auth_code()
-      assert retry.status == 400
-      assert body(retry)["error"] == "invalid_grant"
+      replay = post_auth_code()
+      assert replay.status == 400
+      assert body(replay)["error"] == "invalid_grant"
+
+      # The core marker still binds the generated refresh family, so the
+      # strongest containment supported by this store remains active.
+      assert :error = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+      refute refresh_family == "fam-reuse"
     end
 
     @tag :ecto

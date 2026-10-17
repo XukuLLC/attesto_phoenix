@@ -60,14 +60,7 @@ defmodule AttestoPhoenix.Controller.PARController do
   # confused-deputy assertion minted for a different endpoint is rejected. The
   # shared endpoint policy limits the assertion to 300 seconds (RFC 7523 §3).
   defp authenticate_client(config, conn, params) do
-    policy = ClientAuthentication.Policy.for_endpoint(config, :par)
-
-    case ClientAuthentication.authenticate(
-           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
-           params,
-           config,
-           policy
-         ) do
+    case ClientAuthentication.authenticate_request(conn, params, config, :par) do
       # The whole Result is carried onward, not just the client: the identifier
       # the service resolved and authenticated where applicable is what binds
       # the stored request to its pusher, and the opaque client term alone
@@ -89,7 +82,13 @@ defmodule AttestoPhoenix.Controller.PARController do
       params: params,
       dpop_input: %{
         proofs: get_req_header(conn, @dpop_request_header),
-        http_uri: RequestContext.canonical_url(conn, config),
+        http_uri:
+          RequestContext.canonical_url(
+            conn,
+            config,
+            Config.par_endpoint_url(config),
+            "pushed_authorization_request_endpoint"
+          ),
         http_method: RequestContext.http_method(conn)
       }
     }

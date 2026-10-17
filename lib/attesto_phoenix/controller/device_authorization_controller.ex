@@ -36,7 +36,12 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
 
     with :ok <- QueryParameterGuard.reject(conn),
          :ok <- require_enabled(config),
-         :ok <- check_https(conn, config),
+         :ok <-
+           require_https(
+             conn,
+             config,
+             {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
+           ),
          {:ok, result} <- authenticate_client(config, conn, params),
          {:ok, response} <- DeviceAuthorization.request(config, build_request(config, conn, result, params)) do
       json(conn, response)
@@ -52,26 +57,12 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
       else: {:error, OAuthError.new(:invalid_request, "device authorization grant is not enabled", status: 400)}
   end
 
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, OAuthError.new(:invalid_request, "TLS required", status: 400)}
-    end
-  end
-
   # RFC 6749 §2.3: client authentication delegated to the shared conn-free core.
   # `allow_public: true` — the device grant exists for browserless clients that
   # may have no secret; the core then REQUIRES such a public client to present a
   # DPoP proof (sender constraint in lieu of a secret).
   defp authenticate_client(config, conn, params) do
-    policy = ClientAuthentication.Policy.for_endpoint(config, :device_authorization)
-
-    case ClientAuthentication.authenticate_with_context(
-           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
-           params,
-           config,
-           policy
-         ) do
+    case ClientAuthentication.authenticate_request_with_context(conn, params, config, :device_authorization) do
       {:ok, %ClientAuthentication.Result{} = result} -> {:ok, result}
       {:error, %OAuthError{} = err, _context} -> {:error, err}
     end
@@ -87,7 +78,13 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
       dpop_input: %{
         dpop_proofs: get_req_header(conn, @dpop_request_header),
         http_method: @http_method_post,
-        http_uri: RequestContext.canonical_url(conn, config)
+        http_uri:
+          RequestContext.canonical_url(
+            conn,
+            config,
+            Config.device_authorization_endpoint_url(config),
+            "device_authorization_endpoint"
+          )
       }
     }
   end

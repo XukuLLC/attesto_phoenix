@@ -474,6 +474,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert conn.resp_body =~ ~s(method="post")
       assert conn.resp_body =~ ~s(action="https://client.example.com/callback")
       assert conn.resp_body =~ ~s(name="response")
+      assert [csp] = get_resp_header(conn, "content-security-policy")
+      assert csp =~ "form-action https: http:"
+      assert csp =~ "base-uri 'none'"
       assert [_, jwt] = Regex.run(~r/name="response" value="([^"]+)"/, conn.resp_body)
       assert decode_jarm(jwt)["code"] |> is_binary()
     end
@@ -1346,6 +1349,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
       assert conn.resp_body =~ "Authorization request error"
       assert conn.resp_body =~ "redirect_uri is not registered for this client"
+    end
+
+    test "an explicit text/html q=0 preference keeps direct errors in JSON" do
+      conn =
+        build_conn()
+        |> Map.put(:scheme, :https)
+        |> with_config()
+        |> put_req_header("accept", "text/html;q=0, application/json")
+        |> AuthorizeController.authorize(valid_params(%{"redirect_uri" => "https://evil.example.com/cb"}))
+
+      assert conn.status == 400
+      assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+      assert %{"error" => "invalid_request"} = JSON.decode!(conn.resp_body)
     end
 
     test "missing redirect_uri renders a direct 400" do

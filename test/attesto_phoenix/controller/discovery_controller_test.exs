@@ -27,6 +27,32 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
     def verification_pems, do: [@pem]
   end
 
+  defmodule StubLogoutStore do
+    @moduledoc false
+    @behaviour Attesto.LogoutSessionStore
+
+    @impl true
+    def record(_entry), do: :ok
+
+    @impl true
+    def targets(_criteria), do: []
+
+    @impl true
+    def delete(_criteria), do: :ok
+
+    @impl true
+    def take_targets(_criteria), do: []
+
+    @impl true
+    def lease_targets(_criteria, _lease_id, _now, _lease_expires_at), do: []
+
+    @impl true
+    def acknowledge_targets(_lease_id, _delivery_ids), do: :ok
+
+    @impl true
+    def release_targets(_lease_id, _delivery_ids), do: :ok
+  end
+
   # Build the host-facing AttestoPhoenix.Config. Only the members the
   # discovery document sources from it are varied by the tests.
   defp host_config(overrides \\ []) do
@@ -113,7 +139,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
           authenticate_ciba_user: fn _ -> {:ok, "user"} end,
           logout: [enabled: true],
           terminate_session: fn conn, _ctx -> {:ok, conn} end,
-          logout_session_store: StubKeystore,
+          logout_session_store: StubLogoutStore,
           registration_enabled: true,
           client_id_metadata: [enabled: true],
           client_jwks: fn _client -> %{"keys" => []} end,

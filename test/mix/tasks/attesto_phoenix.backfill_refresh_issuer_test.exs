@@ -47,4 +47,16 @@ defmodule Mix.Tasks.AttestoPhoenix.BackfillRefreshIssuerTest do
       end
     end
   end
+
+  test "rejects unsafe schema prefixes before application startup" do
+    assert_raise Mix.Error, ~r/invalid --schema-prefix/, fn ->
+      BackfillRefreshIssuer.run([
+        "--issuer",
+        "https://issuer.example",
+        "--assert-single-issuer",
+        "--schema-prefix",
+        "pg_catalog"
+      ])
+    end
+  end
 end

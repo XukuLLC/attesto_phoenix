@@ -52,7 +52,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   alias AttestoPhoenix.ClientIdMetadata.CacheCapacity
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.ClientIdMetadata
-  alias AttestoPhoenix.Store.Sweeper
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
 
   @doc """
   Resolves a live cached document for a CIMD `client_id` URL.
@@ -114,9 +114,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   end
 
   defp bounded_put(url, metadata, expires_at) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.truncate(expires_at, :second)
 
@@ -220,9 +218,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete(String.t()) :: :ok
   def delete(url) when is_binary(url) do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
 
     repo.delete_all(from(c in ClientIdMetadata, where: c.url == ^url),
       prefix: prefix,
@@ -239,9 +235,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @impl Cache
   @spec delete_all() :: :ok
   def delete_all do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
 
     repo.delete_all(ClientIdMetadata,
       prefix: prefix,

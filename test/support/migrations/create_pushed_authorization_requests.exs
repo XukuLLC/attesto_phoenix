@@ -13,7 +13,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreatePushedAuthorizationRequests d
 
   def change do
     create table(:attesto_pushed_authorization_requests, primary_key: false) do
-      add(:request_uri, :string, primary_key: true, null: false)
+      add(:request_uri, :string, size: 255, primary_key: true, null: false)
       add(:params, :map, null: false)
       add(:expires_at, :utc_datetime, null: false)
       add(:inserted_at, :utc_datetime, null: false)

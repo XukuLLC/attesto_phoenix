@@ -712,6 +712,42 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
         )
       end
     end
+
+    test "introspection and backchannel authentication reject self-asserted CIMD clients", %{config: config} do
+      for endpoint <- [:introspection, :backchannel_authentication] do
+        policy = Policy.for_endpoint(config, endpoint)
+        refute policy.allow_cimd_clients
+      end
+
+      assert Policy.for_endpoint(config, :token).allow_cimd_clients
+      assert Policy.for_endpoint(config, :par).allow_cimd_clients
+    end
+
+    test "a CIMD client rejected by endpoint policy is not fetched", %{config: config} do
+      owner = self()
+
+      config = %{
+        config
+        | client_id_metadata: [
+            enabled: true,
+            fetcher: CIMDProbeFetcher,
+            test_pid: owner
+          ]
+      }
+
+      client_id = "https://client.example/client.json"
+
+      assert {:error, %OAuthError{error: :invalid_client}} =
+               ClientAuthentication.authenticate(
+                 [],
+                 %{"client_id" => client_id},
+                 config,
+                 Policy.for_endpoint(config, :introspection)
+               )
+
+      refute_received {:cimd_preflight, _uri}
+      refute_received {:cimd_fetch, _uri}
+    end
   end
 
   describe "classification: Basic header, no body credential (allow_public: true)" do
@@ -952,6 +988,26 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       }
 
       assert_generic_invalid_client(authenticate(basic("", "s3cr3t"), %{}, config, allow_public: true))
+    end
+
+    test "an empty Basic password is rejected without consulting the client store", %{config: config} do
+      owner = self()
+
+      config = %{
+        config
+        | load_client: fn client_id ->
+            send(owner, {:client_loaded, client_id})
+            {:ok, @confidential}
+          end,
+          verify_dummy_client_secret: fn secret ->
+            send(owner, {:dummy_checked, secret})
+            false
+          end
+      }
+
+      assert_generic_invalid_client(authenticate(basic("confidential-1", ""), %{}, config, allow_public: true))
+      assert_received {:dummy_checked, ""}
+      refute_received {:client_loaded, _client_id}
     end
 
     test "public credentials reject a conflicting host client_id", %{config: config} do

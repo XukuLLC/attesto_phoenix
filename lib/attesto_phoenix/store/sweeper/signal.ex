@@ -25,11 +25,12 @@ defmodule AttestoPhoenix.Store.Sweeper.Signal do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def unsupervised(target), do: cast({:enqueue, {:unsupervised, target}})
-
   def unsupervised_many(targets) when is_list(targets) do
     cast({:enqueue_many, Enum.map(targets, &{:unsupervised, &1})})
   end
+
+  @deprecated "Use unsupervised_many/1; unsupervised/1 will be removed in AttestoPhoenix 5.0"
+  def unsupervised(target), do: unsupervised_many([target])
 
   def capacity, do: cast({:enqueue, :capacity})
 

@@ -49,6 +49,12 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     def revoke_family(_family_id), do: :ok
   end
 
+  defmodule RevokedAccessTokenStore do
+    @moduledoc false
+
+    def access_token_revoked?(jti), do: jti == Process.get({__MODULE__, :jti})
+  end
+
   # The raw config opts: from_otp_app/2 reads these from the application env and
   # builds the struct, so the env must hold the keyword list, not a built struct.
   defp config_opts do
@@ -198,6 +204,22 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       assert body["iss"] == "https://issuer.test"
       assert body["token_type"] == "Bearer"
       assert get_resp_header(conn, "cache-control") == ["no-store"]
+    end
+
+    test "an access token contained after authorization-code reuse is inactive", %{config: config} do
+      token = access_token(config)
+      Process.put({RevokedAccessTokenStore, :jti}, token_claim(token, "jti"))
+
+      Application.put_env(
+        :attesto_phoenix,
+        AttestoPhoenix.Config,
+        Keyword.put(config_opts(), :code_store, RevokedAccessTokenStore)
+      )
+
+      conn = call(%{"token" => token})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
     end
 
     test "an invalid token returns active:false", %{config: _config} do
@@ -419,6 +441,12 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       assert conn.status == 400
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
     end
+  end
+
+  defp token_claim(token, name) do
+    [_header, payload, _signature] = String.split(token, ".", parts: 3)
+    {:ok, json} = Base.url_decode64(payload, padding: false)
+    JSON.decode!(json)[name]
   end
 
   describe "create/2 :introspection_authorize caller policy (RFC 7662 §4 / RFC 9701 §5)" do

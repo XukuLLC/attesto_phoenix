@@ -83,7 +83,7 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DPoPReplay
-  alias AttestoPhoenix.Store.Sweeper
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
 
   @app :attesto_phoenix
 
@@ -107,29 +107,28 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
   @spec check_and_record(String.t(), pos_integer()) :: :ok | {:error, :replay}
   def check_and_record(jti, ttl_seconds \\ @default_ttl_seconds)
       when is_binary(jti) and is_integer(ttl_seconds) and ttl_seconds > 0 do
-    prefix = Config.table_prefix()
-    repo = repo()
-    Sweeper.check_running_for_store(repo, prefix)
+    {repo, prefix} = StoreEcto.mutation_context()
     expires_at = DateTime.add(DateTime.utc_now(), ttl_seconds, :second)
 
-    changeset =
-      DPoPReplay.changeset(%DPoPReplay{}, %{jti: jti, expires_at: expires_at}, prefix: prefix)
+    inserted_at = DateTime.utc_now()
 
-    case repo.insert(changeset, prefix: prefix, log: false, telemetry_event: nil) do
-      {:ok, _record} ->
+    case repo.insert_all(
+           DPoPReplay,
+           [%{jti: jti, expires_at: expires_at, inserted_at: inserted_at}],
+           on_conflict: :nothing,
+           conflict_target: [:jti],
+           prefix: prefix,
+           log: false,
+           telemetry_event: nil
+         ) do
+      {1, _rows} ->
         :ok
 
-      {:error, %Ecto.Changeset{errors: errors}} ->
-        # A unique-constraint violation on `jti` is the replay signal. Any
-        # other changeset error is a caller bug or a schema mismatch and
-        # must surface loudly, never be masked as "not a replay" (which
-        # would silently accept a proof that should have been recorded).
-        if Keyword.has_key?(errors, :jti) do
-          {:error, :replay}
-        else
-          raise ArgumentError,
-                "#{inspect(__MODULE__)}: unexpected insert error: #{inspect(errors)}"
-        end
+      {0, _rows} ->
+        {:error, :replay}
+
+      {count, _rows} ->
+        raise RuntimeError, "#{inspect(__MODULE__)} inserted an unexpected row count: #{inspect(count)}"
     end
   end
 

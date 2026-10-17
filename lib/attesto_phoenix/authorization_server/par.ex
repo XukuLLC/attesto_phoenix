@@ -51,9 +51,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   alias Attesto.RequestObject
   alias AttestoPhoenix.AuthorizationServer.PAR.Request
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
-  alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata
-  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
+  alias AttestoPhoenix.{Config, DPoP.Adapter, OAuthError}
   alias AttestoPhoenix.Store.PAR.ETS
 
   require Logger
@@ -120,7 +119,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     %{client: client, client_id: authenticated_client_id, params: params, dpop_input: dpop_input} = request
     ttl = config_field(config, :par_ttl, @default_par_ttl)
     request_uri = @request_uri_prefix <> random()
-    bound_client_id = client_id(config, client) || authenticated_client_id
+    bound_client_id = Config.client_identifier(config, client) || authenticated_client_id
 
     # Verify the request object FIRST so its signed parameters are authoritative
     # (RFC 9101 §6.3) before DPoP reconciliation: a signed `dpop_jkt` must be the
@@ -264,10 +263,6 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-01`) is
   # identified by the URL its document is bound to; a registered client by the
   # host's `:client_id` callback.
-  defp client_id(_config, %CIMDClient{metadata: metadata}), do: ClientIdMetadata.client_id(metadata)
-
-  defp client_id(config, client), do: Config.client_identifier(config, client)
-
   # RFC 9126 §2.1: the pushed request carries a `client_id`, and it must be the
   # client that actually authenticated. A disagreement is not a correctable
   # detail, it is one client pushing a request in another's name: the stored
@@ -368,26 +363,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # A CIMD client's request-object verification keys are the document's
   # `jwks` / `jwks_uri` (RFC 9101 §6.2); a registered client's are the host's
   # `:client_jwks` callback.
-  defp client_jwks(config, %CIMDClient{metadata: metadata}) do
-    case ClientIdMetadata.resolve_jwks(metadata, config) do
-      {:ok, jwks} -> jwks
-      {:error, _} -> nil
-    end
-  end
-
-  defp client_jwks(config, client) do
-    case Config.client_jwks_fun(config) do
-      nil ->
-        nil
-
-      callback ->
-        case Callback.invoke(callback, [client]) do
-          {:ok, jwks} -> jwks
-          jwks when is_map(jwks) or is_list(jwks) -> jwks
-          _other -> nil
-        end
-    end
-  end
+  defp client_jwks(config, client), do: ClientIdMetadata.client_jwks_value(config, client)
 
   defp error(code, description) do
     OAuthError.new(code_atom(code), description, status: 400)

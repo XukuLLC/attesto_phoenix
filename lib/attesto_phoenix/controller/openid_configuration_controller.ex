@@ -79,17 +79,15 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import Plug.Conn, only: [put_resp_header: 3, send_resp: 3]
+  import Plug.Conn, only: [send_resp: 3]
 
   alias Attesto.OpenIDDiscovery
   alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.{Callback, Config}
+  alias AttestoPhoenix.Controller.MetadataSupport
   alias AttestoPhoenix.URLComparison
 
-  # The router pipeline installs the derived Attesto.Config (the protocol
-  # configuration the core metadata builder reads) here.
-  @protocol_config_key :attesto_protocol_config
   @local_userinfo_route_key :attesto_phoenix_local_userinfo_route
 
   # OpenID Connect Discovery §4: the configuration document is static for a
@@ -112,7 +110,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
     config = Config.resolve!(conn)
 
     if Config.openid_provider?(config) do
-      protocol_config = fetch_protocol_config!(conn)
+      protocol_config = MetadataSupport.protocol_config!(conn, __MODULE__)
 
       metadata =
         protocol_config
@@ -120,25 +118,10 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
         |> Metadata.enrich_common(config)
 
       conn
-      |> put_cache_control()
+      |> MetadataSupport.put_public_cache(@cache_max_age_seconds)
       |> json(metadata)
     else
       send_resp(conn, :not_found, "")
-    end
-  end
-
-  # Fail closed: a missing config is a wiring error, not a runtime condition to
-  # paper over. Raising surfaces the misconfiguration instead of emitting a
-  # document that omits required members.
-  @spec fetch_protocol_config!(Plug.Conn.t()) :: Attesto.Config.t()
-  defp fetch_protocol_config!(conn) do
-    case conn.private do
-      %{@protocol_config_key => %Attesto.Config{} = config} ->
-        config
-
-      _ ->
-        raise "#{inspect(__MODULE__)}: no %Attesto.Config{} found in " <>
-                "conn.private[#{inspect(@protocol_config_key)}]; wire the host pipeline that assigns it"
     end
   end
 
@@ -287,13 +270,4 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   @spec presence([term()]) :: [term()] | nil
   defp presence([]), do: nil
   defp presence(list) when is_list(list), do: list
-
-  @spec put_cache_control(Plug.Conn.t()) :: Plug.Conn.t()
-  defp put_cache_control(conn) do
-    put_resp_header(
-      conn,
-      "cache-control",
-      "public, max-age=#{@cache_max_age_seconds}"
-    )
-  end
 end

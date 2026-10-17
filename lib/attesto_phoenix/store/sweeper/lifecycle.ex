@@ -5,6 +5,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Store.Sweeper.Liveness
+  alias AttestoPhoenix.Store.Sweeper.LocalProcess
   alias AttestoPhoenix.Store.Sweeper.Signal
 
   @workers_table :attesto_phoenix_sweeper_workers
@@ -20,6 +21,28 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
   @target_offer_attempts @max_missing_episodes
 
   @type target :: {module(), String.t() | nil}
+
+  @doc false
+  @spec normalize_target(term()) :: {:ok, target()} | {:error, :invalid_prefix | :invalid_target}
+  def normalize_target({repo, prefix} = target) when is_atom(repo) and not is_nil(repo) do
+    case prefix do
+      nil ->
+        {:ok, target}
+
+      prefix when is_binary(prefix) ->
+        try do
+          Config.validate_schema_prefix!(prefix)
+          {:ok, target}
+        rescue
+          ArgumentError -> {:error, :invalid_prefix}
+        end
+
+      _other ->
+        {:error, :invalid_prefix}
+    end
+  end
+
+  def normalize_target(_other), do: {:error, :invalid_target}
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -53,7 +76,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
         try do
           for {target, workers} <- :ets.tab2list(@workers_table),
               {pid, :cleanup_worker} <- workers,
-              local_alive?(pid) do
+              LocalProcess.alive?(pid) do
             {target, pid}
           end
         rescue
@@ -77,7 +100,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
     target
     |> target_workers()
     |> Enum.find_value(:error, fn
-      {pid, :sweeper} -> if local_alive?(pid), do: {:ok, pid}, else: false
+      {pid, :sweeper} -> if LocalProcess.alive?(pid), do: {:ok, pid}, else: false
       {_pid, :cleanup_worker} -> false
     end)
   end
@@ -88,7 +111,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
     if Liveness.available?() do
       Liveness.running_target?(target)
     else
-      Enum.any?(target_workers(target), fn {pid, _kind} -> local_alive?(pid) end)
+      Enum.any?(target_workers(target), fn {pid, _kind} -> LocalProcess.alive?(pid) end)
     end
   end
 
@@ -100,7 +123,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
       Liveness.registered_worker?(pid)
     else
       case lookup_pid(pid) do
-        [{^pid, _ref, targets}] -> map_size(targets) > 0 and local_alive?(pid)
+        [{^pid, _ref, targets}] -> map_size(targets) > 0 and LocalProcess.alive?(pid)
         [] -> false
       end
     end
@@ -114,7 +137,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
       Liveness.registered_worker_for_target?(pid, target)
     else
       case lookup_pid(pid) do
-        [{^pid, _ref, targets}] -> Map.has_key?(targets, target) and local_alive?(pid)
+        [{^pid, _ref, targets}] -> Map.has_key?(targets, target) and LocalProcess.alive?(pid)
         [] -> false
       end
     end
@@ -183,9 +206,9 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
 
   @impl true
   def handle_call({:register, pid, target, kind}, _from, state) do
-    case validate_target(target) do
+    case normalize_target(target) do
       {:ok, target} ->
-        if local_alive?(pid) do
+        if LocalProcess.alive?(pid) do
           {ref, targets, state} = registration_for(pid, state)
           targets = Map.put(targets, target, kind)
           :ets.insert(@pids_table, {pid, ref, targets})
@@ -294,24 +317,6 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
 
     :ok
   end
-
-  defp validate_target({repo, prefix} = target)
-       when is_atom(repo) and not is_nil(repo) and (is_binary(prefix) or is_nil(prefix)) do
-    case prefix do
-      nil ->
-        {:ok, target}
-
-      prefix when is_binary(prefix) ->
-        try do
-          Config.validate_schema_prefix!(prefix)
-          {:ok, target}
-        rescue
-          ArgumentError -> {:error, :invalid_prefix}
-        end
-    end
-  end
-
-  defp validate_target(_other), do: {:error, :invalid_target}
 
   defp offer_current_target(_target, 0), do: :unavailable
 
@@ -671,7 +676,4 @@ defmodule AttestoPhoenix.Store.Sweeper.Lifecycle do
       false
     end
   end
-
-  defp local_alive?(pid) when is_pid(pid), do: node(pid) == node() and Process.alive?(pid)
-  defp local_alive?(_other), do: false
 end

@@ -241,6 +241,27 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       end
     end
 
+    test "raises local option errors before the deadline task" do
+      test_pid = self()
+
+      resolver = fn _host, _family ->
+        send(test_pid, :resolver_called)
+        {:ok, [{93, 184, 216, 34}]}
+      end
+
+      for {operation, opts, message} <- [
+            {:fetch, [resolver: resolver, request_timeout_ms: 0], ~r/:request_timeout_ms/},
+            {:fetch, [resolver: resolver, max_document_bytes: "5120"], ~r/:max_document_bytes/},
+            {:fetch, [resolver: :not_a_function], ~r/:resolver/},
+            {:preflight, [resolver: resolver, allow_loopback: :yes], ~r/:allow_loopback/},
+            {:preflight, [resolver: resolver, request_timeout_ms: -1], ~r/:request_timeout_ms/},
+            {:preflight, [resolver: :not_a_function], ~r/:resolver/}
+          ] do
+        assert_raise ArgumentError, message, fn -> apply(Fetcher, operation, [@url, opts]) end
+        refute_received :resolver_called
+      end
+    end
+
     test "allow_loopback: true permits loopback only" do
       # loopback now allowed...
       server = AttestoPhoenix.TestHTTPServer.open()
@@ -498,6 +519,23 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
   end
 
   describe "fetch/2 DNS-rebinding: pins the first validated IP" do
+    test "the total deadline includes DNS resolution" do
+      slow_resolver = fn _host, _family ->
+        Process.sleep(250)
+        {:ok, [{93, 184, 216, 34}]}
+      end
+
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:error, {:transport, :request_timeout}} =
+               Fetcher.fetch(@url,
+                 resolver: slow_resolver,
+                 request_timeout_ms: 40
+               )
+
+      assert System.monotonic_time(:millisecond) - started_at < 200
+    end
+
     test "dials the resolver-supplied IP, not a re-resolved hostname" do
       test_pid = self()
       pinned = {93, 184, 216, 34}
@@ -563,6 +601,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       [
         resolver: resolver([{127, 0, 0, 1}]),
         allow_loopback: true,
+        request_timeout_ms: 15_000,
         req_options: server_url(server)
       ] ++ extra_opts
 

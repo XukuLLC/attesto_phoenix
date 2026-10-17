@@ -390,6 +390,20 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       end
     end
 
+    test "accepts the commonly deployed authority-form private-use URI for a native client" do
+      uri = "com.example.app://callback"
+
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "application_type" => "native",
+          "redirect_uris" => [uri]
+        })
+
+      assert conn.status == 201
+      assert body(conn)["redirect_uris"] == [uri]
+    end
+
     test "accepts loopback redirect URIs in both address families" do
       conn =
         post_register(config([]), %{

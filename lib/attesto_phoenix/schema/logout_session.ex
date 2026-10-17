@@ -8,8 +8,11 @@ defmodule AttestoPhoenix.Schema.LogoutSession do
   `backchannel_logout_uri` a `logout_token` is POSTed to (Back-Channel Logout
   1.0) and/or the `frontchannel_logout_uri` the logout page renders in an
   iframe (Front-Channel Logout 1.0). A row is written at ID-Token mint and
-  read/deleted by the end-session endpoint; it carries at least one of the two
-  URIs.
+  leased and acknowledged by the end-session endpoint; it carries at least one
+  of the two URIs. Stable delivery identifiers and expiring owner leases make a
+  failed or interrupted notification retryable without letting a stale worker
+  delete another worker's claim. The durable attempt counter drives bounded
+  exponential backoff after failed deliveries.
 
   This is the OP-side delivery map, not the browser login session — see
   `Attesto.LogoutSessionStore`.
@@ -23,6 +26,7 @@ defmodule AttestoPhoenix.Schema.LogoutSession do
 
   @primary_key {:id, :binary_id, autogenerate: true}
   schema "attesto_logout_sessions" do
+    field :delivery_id, :string
     field :sid, :string
     field :subject, :string
     field :client_id, :string
@@ -35,11 +39,14 @@ defmodule AttestoPhoenix.Schema.LogoutSession do
     # logout URI must carry `iss`/`sid` (Front-Channel Logout 1.0 §2).
     field :frontchannel_session_required, :boolean, default: false
     field :expires_at, :utc_datetime
+    field :lease_id, :string
+    field :lease_expires_at, :utc_datetime
+    field :delivery_attempts, :integer, default: 0
 
     timestamps(updated_at: false, type: :utc_datetime)
   end
 
-  @required [:sid, :subject, :client_id, :expires_at]
+  @required [:delivery_id, :sid, :subject, :client_id, :expires_at]
   @optional [
     :backchannel_logout_uri,
     :session_required,
@@ -58,6 +65,7 @@ defmodule AttestoPhoenix.Schema.LogoutSession do
     prefix = Keyword.get(opts, :prefix)
 
     attrs = %{
+      delivery_id: Attesto.Secret.generate(24),
       sid: Map.get(record, :sid),
       subject: Map.get(record, :subject),
       client_id: Map.get(record, :client_id),
@@ -65,14 +73,18 @@ defmodule AttestoPhoenix.Schema.LogoutSession do
       session_required: Map.get(record, :session_required, false),
       frontchannel_logout_uri: Map.get(record, :frontchannel_logout_uri),
       frontchannel_session_required: Map.get(record, :frontchannel_session_required, false),
-      expires_at: unix_to_datetime(Map.get(record, :expires_at))
+      expires_at: unix_to_datetime(Map.get(record, :expires_at)),
+      lease_id: nil,
+      lease_expires_at: nil,
+      delivery_attempts: 0
     }
 
     %__MODULE__{}
     |> Ecto.put_meta(prefix: prefix)
-    |> cast(attrs, @required ++ @optional)
+    |> cast(attrs, @required ++ @optional ++ [:lease_id, :lease_expires_at, :delivery_attempts])
     |> validate_required(@required)
     |> validate_logout_uri_present()
+    |> unique_constraint(:delivery_id, name: :attesto_logout_sessions_delivery_id_index)
     |> unique_constraint([:sid, :client_id], name: :attesto_logout_sessions_sid_client_id_index)
   end
 
@@ -80,6 +92,7 @@ defmodule AttestoPhoenix.Schema.LogoutSession do
   @spec to_target(t()) :: Attesto.LogoutSessionStore.target()
   def to_target(%__MODULE__{} = row) do
     %{
+      delivery_id: row.delivery_id,
       client_id: row.client_id,
       backchannel_logout_uri: row.backchannel_logout_uri,
       sid: row.sid,

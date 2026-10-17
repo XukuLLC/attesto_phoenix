@@ -53,7 +53,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
-  alias AttestoPhoenix.{Callback, ClientAuthentication, Config, Event, OAuthError, RequestContext}
+  alias AttestoPhoenix.{ClientAuthentication, Config, Event, OAuthError, RequestContext}
   alias AttestoPhoenix.ClientAuthentication.ErrorContext
   alias AttestoPhoenix.Controller.QueryParameterGuard
   alias Plug.Conn.Unfetched
@@ -166,32 +166,12 @@ defmodule AttestoPhoenix.Controller.TokenController do
         create_authenticated(config, conn, params, result)
 
       {:error, %OAuthError{} = err} ->
-        # A holder-of-key (DPoP) failure on a sender-constrained code takes
-        # precedence over the client-auth error; otherwise fall back to it.
-        deny(config, conn, params, nil, holder_of_key_error(config, conn, params) || err)
+        # Authenticate before consulting grant state. This preserves the token
+        # endpoint's generic client-authentication failure and avoids exposing
+        # whether an attacker-supplied authorization code is DPoP-bound.
+        deny(config, conn, params, nil, err)
     end
   end
-
-  # RFC 9449 §10 / FAPI2 "ensure holder-of-key required": a sender-constrained
-  # (DPoP-bound) authorization code redeemed WITHOUT a DPoP proof is a
-  # holder-of-key failure. FAPI2 expects it reported as
-  # invalid_request/invalid_grant/invalid_dpop_proof - and it must surface even
-  # when the request ALSO lacks client authentication (the suite's test sends
-  # neither), where the client-auth check would otherwise mask it with
-  # invalid_client. The code is READ (`get/1`), never consumed, so a legitimate
-  # retry is unaffected. Only DPoP-bound codes match; a plain (e.g. OIDC) code
-  # still surfaces the client-auth error. Returns `nil` when it does not apply.
-  defp holder_of_key_error(config, conn, %{"grant_type" => "authorization_code", "code" => code})
-       when is_binary(code) do
-    store = Callback.config_callback(config, :code_store)
-
-    if is_atom(store) and not is_nil(store) and is_nil(first_dpop_proof(conn)) and
-         Attesto.AuthorizationCode.dpop_bound?(store, code) do
-      error(@error_invalid_request, "DPoP proof required for a sender-constrained authorization code")
-    end
-  end
-
-  defp holder_of_key_error(_config, _conn, _params), do: nil
 
   defp create_authenticated(config, conn, params, %ClientAuthentication.Result{} = result) do
     case fetch_grant_type(params) do
@@ -247,7 +227,13 @@ defmodule AttestoPhoenix.Controller.TokenController do
     %{
       dpop_proof: first_dpop_proof(conn),
       mtls_cert_der: RequestContext.cert_der(conn, config),
-      http_uri: RequestContext.canonical_url(conn, config),
+      http_uri:
+        RequestContext.canonical_url(
+          conn,
+          config,
+          Config.token_endpoint_url(config),
+          "token_endpoint"
+        ),
       http_method: @http_method_post
     }
   end
@@ -277,14 +263,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # authorization server — the point of the audience restriction. The assertion
   # lifetime is limited to 300 seconds by the shared endpoint policy.
   defp authenticate_client(config, conn, params) do
-    policy = ClientAuthentication.Policy.for_endpoint(config, :token)
-
-    case ClientAuthentication.authenticate_with_context(
-           AttestoPhoenix.RequestContext.client_auth_headers(conn, config),
-           params,
-           config,
-           policy
-         ) do
+    case ClientAuthentication.authenticate_request_with_context(conn, params, config, :token) do
       {:ok, %ClientAuthentication.Result{} = result} ->
         {:ok, result}
 

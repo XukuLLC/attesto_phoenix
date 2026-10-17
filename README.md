@@ -126,6 +126,7 @@ authorization server, use `attesto_phoenix`.
 ## Contents
 
 - [Installation](#installation)
+- [Upgrading to 4.2](#upgrading-to-42)
 - [Upgrading to 4.0](#upgrading-to-40)
 - [Quick start](#quick-start)
 - [Upgrading from 2.x](#upgrading-from-2x)
@@ -146,7 +147,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.1"}
+    {:attesto_phoenix, "~> 4.2"}
   ]
 end
 ```
@@ -157,7 +158,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.1"},
+    {:attesto_phoenix, "~> 4.2"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -174,6 +175,32 @@ and 3.7 migration commands.
 
 AttestoPhoenix 4.1 requires Attesto 2.5.0 for the shared outbound-address
 policy used by Client ID Metadata retrieval.
+
+## Upgrading to 4.2
+
+AttestoPhoenix 4.2 requires Attesto 2.6.0 and adds durable delivery leases to
+the bundled Ecto logout-session store. Apply the generated migration before
+starting 4.2 writers:
+
+```bash
+mix attesto_phoenix.gen.migration --upgrade 4.2 --repo MyApp.Repo
+mix ecto.migrate
+```
+
+The migration backfills a stable delivery identifier for every existing row
+and adds the lease and attempt columns and indexes used for atomic claim,
+acknowledgement, release, crash recovery, and retry backoff. When the bundled
+Ecto store is configured, `:sweep_interval_ms` must be positive and the
+supervised `AttestoPhoenix.Store.Sweeper` must be running. Failed deliveries
+use bounded exponential backoff, configured with
+`logout: [retry_initial_delay_seconds: 30, retry_max_delay_seconds: 3_600]`.
+The sweeper retries due work on or after its deadline at the next sweep and
+verifies the lease columns when it starts. A custom
+`Attesto.LogoutSessionStore` must implement `lease_targets/4`,
+`acknowledge_targets/2`, and `release_targets/2`; configuration rejects an older
+destructive-take implementation. Because the store contract does not provide
+global pending-work enumeration, a custom store must also run its own
+persistent retry scheduler and backoff policy.
 
 ## Quick start
 
@@ -840,7 +867,9 @@ It works across every grant. A client sends `resource` on the authorization
 request (bound to the code) or the token request (`client_credentials`, token
 exchange, jwt-bearer); the token endpoint mints `aud` from it, refresh carries
 and may narrow it (subset-only), and token exchange cannot widen `aud` beyond
-the subject token's. One or more resources are allowed (a multi-resource grant
+the subject token's or outlive it. Exchanged access tokens identify the
+authenticated exchanging client and carry an RFC 8693 `act` delegation chain.
+One or more resources are allowed (a multi-resource grant
 mints a JWT `aud` array). A requested resource the server does not serve is
 rejected with `invalid_target`.
 
@@ -955,12 +984,20 @@ config :my_app, AttestoPhoenix.Config,
   native_apps: [loopback_include_localhost: true]
 ```
 
-The default CIMD fetcher requires the package's optional `Req` dependency. The
+The default CIMD fetcher requires the package's optional `Req` dependency. Its
+production transport opens a bounded one-shot Mint connection to the screened
+IP, so attacker-selected hostnames do not create persistent Finch pools. The
 resolver validates the HTTPS client ID, applies DNS/IP SSRF controls, bounds the
-document and timeout, validates redirect URIs and keys, and caches only the
-validated result. Keep `allowed_hosts` narrow when the clients are known in
-advance. The `localhost` option affects only redirect matching; it does not
-allow loopback client-metadata URLs or weaken the outbound fetch guard.
+document and total request time, validates redirect URIs and keys, and caches
+only the validated result. Keep `allowed_hosts` narrow when the clients are
+known in advance. The `localhost` option affects only redirect matching; it
+does not allow loopback client-metadata URLs or weaken the outbound fetch guard.
+
+A CIMD key proves control of the metadata URL; it does not register a
+confidential client. Attesto therefore treats every CIMD client as public for
+grant eligibility. A document may still use `private_key_jwt` where CIMD is
+accepted, but it cannot use confidential-only grants, introspection, or CIBA.
+The token endpoint also enforces the document's `grant_types` declaration.
 
 ### Host policy modules
 
@@ -1259,8 +1296,12 @@ authentication closed. A forwarded certificate is read only through
 `:trusted_proxies`; public requests cannot make an XFCC-style header
 authoritative, even if middleware rewrites `conn.remote_ip` from a forwarded
 header. Standard scheme/host/port rewrites are likewise ignored for an
-untrusted socket peer when deriving HTTPS and DPoP `htu`. The deprecated
-`:cert_der` callback is subject to the same gate so
+untrusted socket peer when deriving HTTPS. For a trusted proxy, Attesto reads
+the right-most scheme, host, and port token supplied by the nearest trusted
+hop. DPoP `htu` for bundled endpoints comes from their configured public URL,
+or from an exact configured RFC 8705 mTLS endpoint alias when the request
+arrives on that alias, so an arbitrary request `Host` cannot redefine it. The
+deprecated `:cert_der` callback is subject to the same gate so
 older header-based deployments fail closed until they configure their proxy
 allowlist and migrate. PKI authentication
 also requires `:client_certificate_chain_validated?` to return `true`. The TLS
@@ -1488,9 +1529,18 @@ flow fans out to them:
 - **RP-Initiated Logout** (certified) — `GET`/`POST /oauth/end_session`, mounted
   with `attesto_routes(logout: true)`. An RP redirects the browser here to end
   the OP session and return to a registered `post_logout_redirect_uri`.
-- **Back-Channel Logout** (certified) — the OP delivers a signed logout token
-  server-to-server to every RP that registered a `backchannel_logout_uri`, so
-  sessions end even when the user's browser never returns to those RPs.
+- **Back-Channel Logout** (certified) — the OP normally delivers a signed
+  logout token asynchronously to every RP that registered a
+  `backchannel_logout_uri`, so sessions end even when the user's browser never
+  returns to those RPs. RP notifications for one session run concurrently and
+  the default transport gives each request a fixed deadline. The Ecto store
+  leases notification rows until each handoff is acknowledged, deferring
+  failures with bounded exponential backoff and reclaiming work after a worker
+  crash. The initial and maximum retry delays default to 30 and 3,600 seconds;
+  configure them under `logout:`. The supervised sweeper retries due or expired
+  leases in bounded batches on the next `sweep_interval_ms`. A custom
+  logout-session store must provide its own persistent retry scheduler and
+  backoff policy.
 - **Front-Channel Logout** — the end-session page renders each RP's
   `frontchannel_logout_uri` in an iframe, so browser-reachable RPs clear their
   session within the same logout navigation.
@@ -1734,7 +1784,8 @@ code_store:    AttestoPhoenix.Store.EctoCodeStore,
 refresh_store: AttestoPhoenix.Store.EctoRefreshStore,
 nonce_store:   AttestoPhoenix.Store.EctoNonceStore,
 replay_check:  {AttestoPhoenix.Store.EctoReplayCheck, :check_and_record},
-par_store:     AttestoPhoenix.Store.EctoPARStore
+par_store:     AttestoPhoenix.Store.EctoPARStore,
+logout_session_store: AttestoPhoenix.Store.EctoLogoutSessionStore
 ```
 
 The Ecto refresh store also needs the stable

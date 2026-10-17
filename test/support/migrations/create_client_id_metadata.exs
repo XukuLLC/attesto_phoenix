@@ -14,7 +14,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateClientIdMetadata do
 
   def change do
     create table(:attesto_client_id_metadata, primary_key: false) do
-      add(:url, :string, primary_key: true, null: false)
+      add(:url, :text, primary_key: true, null: false)
       add(:metadata, :map, null: false)
       add(:expires_at, :utc_datetime, null: false)
       add(:inserted_at, :utc_datetime, null: false)

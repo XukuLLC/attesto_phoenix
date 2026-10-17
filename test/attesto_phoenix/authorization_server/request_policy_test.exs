@@ -184,6 +184,33 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
       assert RequestPolicy.registered_redirect_uris(config([]), cimd) == ["http://127.0.0.1/callback"]
       assert RequestPolicy.redirect_uri_matching(config([]), cimd) == :exact_allow_loopback_port
     end
+
+    test "registered redirect URIs exclude active-content and parser-ambiguous schemes" do
+      configured =
+        host_config(
+          client_redirect_uris: fn _client ->
+            [
+              "https://client.example/cb",
+              "com.example.app:/oauth/cb",
+              "javascript:alert(1)",
+              "data:text/html,attack",
+              "https://client.example/cb#fragment",
+              "https://user@client.example/cb"
+            ]
+          end
+        )
+
+      assert RequestPolicy.registered_redirect_uris(configured, @host_tuple) == ["https://client.example/cb"]
+    end
+
+    test "a host-classified native client keeps authority-form private-use redirects" do
+      configured =
+        config(client_redirect_uris: fn _client -> ["com.example.app://callback"] end)
+
+      assert RequestPolicy.registered_redirect_uris(configured, @native_public) == [
+               "com.example.app://callback"
+             ]
+    end
   end
 
   describe "redirect_uri_matching/2 (RFC 8252 §7.3)" do

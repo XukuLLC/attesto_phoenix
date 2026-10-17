@@ -9,6 +9,7 @@ defmodule AttestoPhoenix.ConfigTest do
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Store.EctoLogoutSessionStore
   alias AttestoPhoenix.Store.EctoRefreshStore
 
   defmodule Keystore do
@@ -138,6 +139,31 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   defmodule EmptyModule do
+  end
+
+  defmodule LogoutStore do
+    @behaviour Attesto.LogoutSessionStore
+
+    @impl true
+    def record(_entry), do: :ok
+
+    @impl true
+    def targets(_criteria), do: []
+
+    @impl true
+    def delete(_criteria), do: :ok
+
+    @impl true
+    def take_targets(_criteria), do: []
+
+    @impl true
+    def lease_targets(_criteria, _lease_id, _now, _lease_expires_at), do: []
+
+    @impl true
+    def acknowledge_targets(_lease_id, _delivery_ids), do: :ok
+
+    @impl true
+    def release_targets(_lease_id, _delivery_ids), do: :ok
   end
 
   defmodule WrongRotateArityStore do
@@ -1324,6 +1350,32 @@ defmodule AttestoPhoenix.ConfigTest do
 
       assert Config.allowed_resources(built, :client) == ["https://api.example.com", resource]
     end
+
+    test "dynamic resource callbacks receive CIMD metadata rather than the internal wrapper" do
+      resource = "https://resource.example/cimd"
+
+      built =
+        config(
+          resource_indicators: [
+            allowed_resources_for: fn metadata ->
+              refute match?(%CIMDClient{}, metadata)
+              assert metadata["client_id"] == "https://client.example/metadata.json"
+              assert metadata.scopes == ["read"]
+              [resource]
+            end
+          ]
+        )
+
+      client =
+        %CIMDClient{
+          metadata: %{
+            "client_id" => "https://client.example/metadata.json",
+            "scope" => "read"
+          }
+        }
+
+      assert Config.allowed_resources(built, client) == ["https://api.example.com", resource]
+    end
   end
 
   describe ":authorization_grant_id_claim" do
@@ -1993,7 +2045,7 @@ defmodule AttestoPhoenix.ConfigTest do
       assert_raise ArgumentError, ~r/logout.*does not export post\/2/s, fn ->
         config(
           logout: [enabled: true, http_client: EmptyModule],
-          logout_session_store: EmptyModule,
+          logout_session_store: LogoutStore,
           terminate_session: fn _conn, _params -> :ok end
         )
       end
@@ -2106,6 +2158,16 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.jwks_uri(built) =~ ~r{^https://issuer\.example/\.well-known/jwks\.json$}
     end
 
+    test "endpoint URLs preserve a path carried by the issuer" do
+      built = config(issuer: "https://issuer.example/tenant")
+
+      assert Config.authorize_endpoint_url(built) ==
+               "https://issuer.example/tenant/oauth/authorize"
+
+      assert Config.token_endpoint_url(built) == "https://issuer.example/tenant/oauth/token"
+      assert Config.jwks_uri(built) == "https://issuer.example/tenant/.well-known/jwks.json"
+    end
+
     test "a scheme-less :issuer raises (authorization_endpoint would be host-less)" do
       # `URI.merge/2` on a scheme-less issuer yields a path-only, host-less
       # endpoint URL - the discovery document would advertise an unresolvable
@@ -2176,7 +2238,7 @@ defmodule AttestoPhoenix.ConfigTest do
         end
       end
 
-      assert_raise ArgumentError, ~r/:derived must remain on the :issuer origin/, fn ->
+      assert_raise ArgumentError, ~r/:userinfo_path must be an absolute path beginning with exactly one/, fn ->
         config(
           userinfo_endpoint: :derived,
           userinfo_path: "//claims.example/userinfo"
@@ -2422,11 +2484,66 @@ defmodule AttestoPhoenix.ConfigTest do
         config(
           logout: [enabled: true],
           terminate_session: fn conn, _ctx -> {:ok, conn} end,
-          logout_session_store: EmptyModule
+          logout_session_store: LogoutStore
         )
 
       assert Config.frontchannel_logout_supported?(with_store)
       assert Config.frontchannel_logout_session_supported?(with_store)
+    end
+
+    test "a configured logout store must implement the durable delivery lease contract" do
+      assert_raise ArgumentError, ~r/must implement Attesto.LogoutSessionStore's lease callbacks/, fn ->
+        config(
+          logout: [enabled: true],
+          terminate_session: fn conn, _ctx -> {:ok, conn} end,
+          logout_session_store: EmptyModule
+        )
+      end
+    end
+
+    test "the bundled Ecto logout store requires its automatic retry sweeper" do
+      opts = [
+        logout: [enabled: true],
+        terminate_session: fn conn, _ctx -> {:ok, conn} end,
+        logout_session_store: EctoLogoutSessionStore
+      ]
+
+      assert_raise ArgumentError, ~r/requires a positive :sweep_interval_ms/, fn ->
+        config(opts)
+      end
+
+      assert %Config{} = config([{:sweep_interval_ms, 60_000} | opts])
+    end
+
+    test "logout delivery retry backoff is exponential and capped" do
+      built =
+        config(logout: [retry_initial_delay_seconds: 3, retry_max_delay_seconds: 10])
+
+      assert Config.logout_retry_delay_seconds(built, 0) == 3
+      assert Config.logout_retry_delay_seconds(built, 1) == 3
+      assert Config.logout_retry_delay_seconds(built, 2) == 6
+      assert Config.logout_retry_delay_seconds(built, 3) == 10
+      assert Config.logout_retry_delay_seconds(built, 1_000_000) == 10
+      assert Config.logout_retry_delay_seconds(nil, 1) == 30
+      assert Config.logout_retry_delay_seconds(nil, 20) == 3_600
+    end
+
+    test "logout delivery retry delays are positive, ordered, and bounded" do
+      assert_raise ArgumentError, ~r/retry_initial_delay_seconds must be a positive integer/, fn ->
+        config(logout: [retry_initial_delay_seconds: 0])
+      end
+
+      assert_raise ArgumentError, ~r/retry_max_delay_seconds must be a positive integer/, fn ->
+        config(logout: [retry_max_delay_seconds: "3600"])
+      end
+
+      assert_raise ArgumentError, ~r/retry_max_delay_seconds must be a positive integer/, fn ->
+        config(logout: [retry_max_delay_seconds: 86_401])
+      end
+
+      assert_raise ArgumentError, ~r/retry_initial_delay_seconds must not exceed/, fn ->
+        config(logout: [retry_initial_delay_seconds: 61, retry_max_delay_seconds: 60])
+      end
     end
   end
 
@@ -2475,6 +2592,15 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.browser_state_cookie(built) == "opbs"
       assert Config.browser_state_cookie_max_age(built) == 86_400
       assert Config.browser_state_secret(built) == secret
+    end
+
+    test "Inspect redacts the browser-state signing secret" do
+      secret = String.duplicate("browser-state-secret-sentinel", 2)
+      rendered = inspect(config(session_management: [enabled: true, browser_state_secret: secret]))
+
+      assert rendered =~ "[REDACTED]"
+      refute rendered =~ secret
+      refute rendered =~ Base.encode64(secret)
     end
 
     test "enabling without a browser_state_secret is rejected" do
@@ -2531,6 +2657,67 @@ defmodule AttestoPhoenix.ConfigTest do
 
       refute error.message =~ "bad.example"
       refute error.message =~ "sensitive-value"
+    end
+
+    test "reuses one derived core config throughout nested work for the same request config" do
+      owner = self()
+
+      request_config =
+        config(
+          principal_kinds: fn ->
+            send(owner, :principal_kinds_resolved)
+            [Attesto.PrincipalKind.new("user", "usr_")]
+          end
+        )
+
+      Config.with_request_config(request_config, fn ->
+        first = Config.to_attesto_config(request_config)
+
+        Config.with_request_config(request_config, fn ->
+          assert Config.to_attesto_config(request_config) === first
+        end)
+
+        assert Config.to_attesto_config(request_config) === first
+        assert_received :principal_kinds_resolved
+        refute_received :principal_kinds_resolved
+      end)
+    end
+
+    test "restores an outer request's derived core config after a different nested config" do
+      owner = self()
+
+      outer =
+        config(
+          issuer: "https://outer.example",
+          principal_kinds: fn ->
+            send(owner, :outer_resolved)
+            [Attesto.PrincipalKind.new("user", "usr_")]
+          end
+        )
+
+      inner =
+        config(
+          issuer: "https://inner.example",
+          principal_kinds: fn ->
+            send(owner, :inner_resolved)
+            [Attesto.PrincipalKind.new("service", "svc_")]
+          end
+        )
+
+      Config.with_request_config(outer, fn ->
+        outer_core = Config.to_attesto_config(outer)
+
+        Config.with_request_config(inner, fn ->
+          assert Config.to_attesto_config(inner).issuer == "https://inner.example"
+        end)
+
+        assert Config.to_attesto_config(outer) === outer_core
+      end)
+
+      assert_received :outer_resolved
+      assert_received :inner_resolved
+      refute_received :outer_resolved
+      refute_received :inner_resolved
     end
   end
 

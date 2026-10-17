@@ -29,6 +29,16 @@ defmodule AttestoPhoenix.Store.EctoReplayCheckTest do
       assert EctoReplayCheck.check_and_record("jti-dup", 60) == {:error, :replay}
     end
 
+    test "a replay does not poison the host's enclosing transaction" do
+      assert {:ok, :continued} =
+               TestRepo.transaction(fn ->
+                 assert :ok = EctoReplayCheck.check_and_record("jti-transaction", 60)
+                 assert {:error, :replay} = EctoReplayCheck.check_and_record("jti-transaction", 60)
+                 assert TestRepo.get(DPoPReplay, "jti-transaction")
+                 :continued
+               end)
+    end
+
     test "a still-present expired row rejects a repeat as a replay (fail closed)" do
       # A prior row whose TTL already elapsed is a unique-constraint
       # collision, not an overwrite. Correctness is preserved because DPoP

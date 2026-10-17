@@ -56,17 +56,20 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   ## Back-Channel Logout (Back-Channel Logout 1.0 §2.5)
 
-  When `:terminate_session` returns a confirmed session, the OP atomically takes
-  (enumerates-and-deletes) that session's recorded `(sid|subject)` rows and
-  POSTs a signed `logout_token` to each RP's `backchannel_logout_uri` (recorded
-  at mint time, see `Attesto.LogoutSessionStore`). The take is atomic so
-  concurrent logouts cannot double-deliver. Delivery is best-effort: a slow or
-  failing RP is logged, never allowed to stall the user's logout. Requires a
+  When `:terminate_session` returns a confirmed session, the OP atomically
+  leases that session's recorded `(sid|subject)` rows and POSTs a signed
+  `logout_token` to each RP's `backchannel_logout_uri` (recorded at mint time,
+  see `Attesto.LogoutSessionStore`). Concurrent logouts cannot lease the same
+  row. Successful handoffs acknowledge and delete their rows; failed work is
+  released for retry after bounded exponential backoff, while a worker crash
+  becomes retryable after the bounded lease expires. Delivery runs through a task supervisor and fans out
+  a session's targets concurrently, so a slow or failing RP does not delay the
+  user's logout or another RP's notification. Requires a
   `:logout_session_store`; without one, only RP-Initiated logout runs.
 
   ## Front-Channel Logout (Front-Channel Logout 1.0 §3)
 
-  The same atomically-taken rows also drive front-channel logout: for every RP
+  The same atomically-leased rows also drive front-channel logout: for every RP
   in the session that registered a `frontchannel_logout_uri`, a browser caller
   (`Accept: text/html`) gets a logout page embedding each URI in a hidden
   iframe — with `iss` and `sid` query parameters whenever the session's `sid`
@@ -90,8 +93,8 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   alias Attesto.EndSession
   alias Attesto.FrontChannelLogout
-  alias Attesto.LogoutToken
-  alias AttestoPhoenix.{BrowserState, Callback, Config, RequestContext}
+  alias AttestoPhoenix.BackChannelLogout.Delivery
+  alias AttestoPhoenix.{BrowserState, Callback, Config, HTTPAccept}
 
   require Logger
 
@@ -107,7 +110,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     config = Config.resolve!(conn)
 
     with :ok <- require_enabled(config),
-         :ok <- check_https(conn, config),
+         :ok <- require_https(conn, config, {:error, 400, error_body("TLS required")}),
          {:ok, request} <- parse(config, params),
          {:ok, redirect} <- confirm_redirect(config, request) do
       logout(conn, config, request, redirect)
@@ -120,13 +123,6 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   defp require_enabled(config) do
     if Config.logout_enabled?(config), do: :ok, else: {:error, 404, %{error: "not_found"}}
-  end
-
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> {:error, 400, error_body("TLS required")}
-    end
   end
 
   defp parse(config, params) do
@@ -180,14 +176,30 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       {:ok, conn, session} ->
         # The fan-out scope is the host-confirmed session, NOT the request's
         # id_token_hint — a replayed token cannot force-log-out another session.
-        # The rows are taken once (atomically) and drive BOTH notification
-        # channels: the back-channel POSTs and the front-channel iframes.
-        targets = take_logout_targets(config, session)
-        deliver_back_channel(config, session, targets)
+        # The rows are leased atomically and drive BOTH notification channels.
+        # Successful handoffs acknowledge their rows; failures are released
+        # with bounded backoff, while a worker crash becomes retryable when the
+        # lease expires.
+        case lease_logout_targets(config, session) do
+          {:ok, lease_id, targets} ->
+            Delivery.start(config, session, lease_id, targets)
 
-        conn
-        |> expire_browser_state(config)
-        |> finish(config, redirect, context, front_channel_uris(config, targets))
+            response =
+              conn
+              |> expire_browser_state(config)
+              |> finish(config, redirect, context, front_channel_uris(config, targets))
+
+            settle_front_only(config, lease_id, conn, targets)
+            response
+
+          {:error, :store_unavailable} ->
+            conn
+            |> expire_browser_state(config)
+            |> render_error(503, %{
+              error: "server_error",
+              error_description: "logout notification delivery is temporarily unavailable"
+            })
+        end
     end
   end
 
@@ -242,7 +254,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   # logged, since those RPs will not learn of the logout — and the response is
   # the plain completion.
   defp finish(conn, config, redirect, context, frame_uris) do
-    if accepts_html?(conn) do
+    if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
       render_front_channel_page(conn, redirect, frame_uris)
     else
       Logger.warning("front-channel logout skipped for non-browser caller: #{length(frame_uris)} RP(s) not notified")
@@ -258,7 +270,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   # human-readable page and any other caller keeps the JSON body — mirroring the
   # authorization endpoint's direct-error handling.
   defp render_error(conn, status, %{error_description: description} = body) do
-    if accepts_html?(conn) do
+    if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
       conn |> put_resp_content_type("text/html") |> send_resp(status, error_html(description))
     else
       conn |> put_status(status) |> json(body)
@@ -270,7 +282,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   end
 
   defp render_logged_out_default(conn) do
-    if accepts_html?(conn) do
+    if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
       conn |> put_resp_content_type("text/html") |> send_resp(200, logged_out_html())
     else
       conn |> put_status(200) |> json(%{status: "logged_out"})
@@ -294,7 +306,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   defp front_channel_html(redirect, frame_uris) do
     iframes =
       Enum.map_join(frame_uris, "\n    ", fn uri ->
-        ~s(<iframe src="#{esc(uri)}" aria-hidden="true" tabindex="-1"></iframe>)
+        ~s(<iframe src="#{Plug.HTML.html_escape(uri)}" aria-hidden="true" tabindex="-1"></iframe>)
       end)
 
     {title, message} =
@@ -309,7 +321,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>#{esc(title)}</title>
+        <title>#{Plug.HTML.html_escape(title)}</title>
         #{meta_refresh(redirect)}
         <style>
           body { margin: 0; min-height: 100vh; display: grid; place-items: center;
@@ -325,8 +337,8 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       </head>
       <body#{continue_attribute(redirect)}>
         <main>
-          <h1>#{esc(title)}</h1>
-          <p>#{esc(message)}</p>
+          <h1>#{Plug.HTML.html_escape(title)}</h1>
+          <p>#{Plug.HTML.html_escape(message)}</p>
           #{continue_link(redirect)}
         </main>
         #{iframes}
@@ -339,18 +351,19 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   # The continuation target rides in an HTML-escaped attribute (the browser
   # unescapes it before getAttribute returns), so the URL never lands inside a
   # script string where it could break out.
-  defp continue_attribute(redirect) when is_binary(redirect), do: ~s( data-continue="#{esc(redirect)}")
+  defp continue_attribute(redirect) when is_binary(redirect),
+    do: ~s( data-continue="#{Plug.HTML.html_escape(redirect)}")
 
   defp continue_attribute(:no_redirect), do: ""
 
   defp meta_refresh(redirect) when is_binary(redirect) do
-    ~s(<meta http-equiv="refresh" content="#{@front_channel_meta_refresh_seconds};url=#{esc(redirect)}">)
+    ~s(<meta http-equiv="refresh" content="#{@front_channel_meta_refresh_seconds};url=#{Plug.HTML.html_escape(redirect)}">)
   end
 
   defp meta_refresh(:no_redirect), do: ""
 
   defp continue_link(redirect) when is_binary(redirect) do
-    ~s(<p><a href="#{esc(redirect)}">Continue</a></p>)
+    ~s(<p><a href="#{Plug.HTML.html_escape(redirect)}">Continue</a></p>)
   end
 
   defp continue_link(:no_redirect), do: ""
@@ -384,14 +397,8 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
   defp continue_script(:no_redirect), do: ""
 
-  defp accepts_html?(conn) do
-    conn
-    |> get_req_header("accept")
-    |> Enum.any?(fn value -> String.contains?(String.downcase(value), "text/html") end)
-  end
-
   defp error_html(description) do
-    page("Logout error", ~s(<code>invalid_request</code>), esc(description))
+    page("Logout error", ~s(<code>invalid_request</code>), Plug.HTML.html_escape(description))
   end
 
   defp logged_out_html do
@@ -405,7 +412,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>#{esc(title)}</title>
+        <title>#{Plug.HTML.html_escape(title)}</title>
         <style>
           body { margin: 0; min-height: 100vh; display: grid; place-items: center;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -422,7 +429,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       <body>
         <main>
           #{badge}
-          <h1>#{esc(title)}</h1>
+          <h1>#{Plug.HTML.html_escape(title)}</h1>
           <p>#{body_html}</p>
         </main>
       </body>
@@ -430,70 +437,50 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     """
   end
 
-  defp esc(value) do
-    value
-    |> to_string()
-    |> String.replace("&", "&amp;")
-    |> String.replace("<", "&lt;")
-    |> String.replace(">", "&gt;")
-    |> String.replace("\"", "&quot;")
-    |> String.replace("'", "&#39;")
-  end
-
   # ── Logout fan-out (Back-Channel Logout 1.0 §2.5 + Front-Channel 1.0 §3) ──
 
-  # Atomically take (enumerate-and-delete in one statement) the RP rows of the
-  # host-confirmed session, so a session is logged out exactly once even under
-  # concurrent end-session calls. `session` is the `%{sid|subject}` the host
-  # attested it terminated. Best-effort: a store failure is logged, never
-  # allowed to block the user's logout.
-  defp take_logout_targets(config, session) do
+  # Atomically lease the RP rows of the host-confirmed session. A second logout
+  # cannot receive the same live lease, and an interrupted worker leaves rows
+  # available once the short bounded lease expires.
+  defp lease_logout_targets(config, session) do
     store = Config.logout_session_store(config)
     criteria = logout_criteria(session)
 
     if not is_nil(store) and map_size(criteria) > 0 do
-      store.take_targets(criteria)
+      now = System.system_time(:second)
+      lease_id = Attesto.Secret.generate(24)
+      targets = store.lease_targets(criteria, lease_id, now, now + Delivery.lease_seconds())
+      {:ok, lease_id, targets}
     else
-      []
+      {:ok, nil, []}
     end
   rescue
     _exception ->
-      Logger.warning("logout session store failed; back-channel targets were not loaded")
-      []
-  end
-
-  # POST a signed logout_token to every back-channel-capable RP in the taken set.
-  defp deliver_back_channel(config, session, targets) do
-    http = Config.backchannel_logout_http(config)
-    attesto_config = Config.to_attesto_config(config)
-
-    targets
-    |> Enum.filter(&is_binary(&1.backchannel_logout_uri))
-    |> Enum.each(&deliver(attesto_config, http, session, &1))
-  end
-
-  defp deliver(attesto_config, http, session, target) do
-    opts =
-      []
-      |> put_opt(:sub, Map.get(session, :subject))
-      |> put_opt(:sid, target.sid)
-
-    with {:ok, token} <- LogoutToken.mint(attesto_config, target.client_id, opts),
-         :ok <- http.post(target.backchannel_logout_uri, token) do
-      :ok
-    else
-      {:error, _reason} ->
-        Logger.warning("back-channel logout delivery failed")
-        :error
-    end
-  rescue
-    _exception ->
-      Logger.warning("back-channel logout delivery failed")
-      :error
+      logout_store_unavailable()
   catch
-    _kind, _reason ->
-      Logger.warning("back-channel logout delivery failed")
-      :error
+    _kind, _reason -> logout_store_unavailable()
+  end
+
+  defp logout_store_unavailable do
+    Logger.error("logout session store lease failed; verify the Attesto Phoenix 4.2 migration is applied")
+
+    {:error, :store_unavailable}
+  end
+
+  defp settle_front_only(_config, nil, _conn, _targets), do: :ok
+
+  defp settle_front_only(config, lease_id, conn, targets) do
+    delivery_ids =
+      for target <- targets,
+          is_nil(target.backchannel_logout_uri),
+          is_binary(target.frontchannel_logout_uri),
+          do: target.delivery_id
+
+    if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
+      Delivery.acknowledge(config, lease_id, delivery_ids)
+    else
+      Delivery.release(config, lease_id, delivery_ids)
+    end
   end
 
   # The exact iframe URIs the logout page renders: each front-channel-capable
@@ -512,10 +499,6 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   defp logout_criteria(%{sid: sid}) when is_binary(sid) and sid != "", do: %{sid: sid}
   defp logout_criteria(%{subject: sub}) when is_binary(sub) and sub != "", do: %{subject: sub}
   defp logout_criteria(_session), do: %{}
-
-  defp put_opt(opts, _key, nil), do: opts
-  defp put_opt(opts, _key, ""), do: opts
-  defp put_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
   defp error_body(description), do: %{error: "invalid_request", error_description: description}
 end

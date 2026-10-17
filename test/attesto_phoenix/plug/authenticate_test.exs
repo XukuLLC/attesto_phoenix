@@ -137,6 +137,22 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
   end
 
+  test "parses access-token scopes with the resource-server whitespace policy", %{
+    config: config
+  } do
+    token =
+      config |> mint(scope: "openid read:reports") |> replace_scope_claim(config, "openid\tread:reports\nreports:write")
+
+    conn =
+      :get
+      |> conn("/reports")
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Authenticate.call(Authenticate.init(config: config))
+
+    refute conn.halted
+    assert conn.assigns.attesto_context.scope == ["openid", "read:reports", "reports:write"]
+  end
+
   test "request-private config is authoritative over static plug config", %{config: config} do
     request_config = %{config | audience: "https://request-resource.example"}
     token = mint(request_config, scope: "openid")
@@ -1023,5 +1039,15 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     attesto_config = Config.to_attesto_config(config, principal_kinds: [@user_kind])
     {:ok, claims} = Token.peek_signed_claims(attesto_config, token)
     claims
+  end
+
+  defp replace_scope_claim(token, config, scope) do
+    claims = config |> peek_claims(token) |> Map.put("scope", scope)
+
+    Attesto.JWS.sign_compact(
+      @signing_pem,
+      %{"alg" => Token.signing_alg(), "kid" => Attesto.Key.kid(@signing_pem), "typ" => "at+jwt"},
+      claims
+    )
   end
 end

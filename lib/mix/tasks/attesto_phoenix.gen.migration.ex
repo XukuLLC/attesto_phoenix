@@ -60,7 +60,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       Upserted on `(sid, client_id)`; carries the `subject`, the RP's
       `backchannel_logout_uri`/`session_required` and
       `frontchannel_logout_uri`/`frontchannel_session_required`, and the
-      `expires_at` that bounds an abandoned session.
+      `expires_at` that bounds an abandoned session. `delivery_id` identifies
+      a durable handoff, while `lease_id`/`lease_expires_at` make concurrent
+      delivery claim, acknowledgement, and retry atomic.
 
     * `dpop_nonces` - server-issued DPoP nonces
       (`AttestoPhoenix.Schema.DPoPNonce`, RFC 9449, section 8). Each row is a
@@ -118,6 +120,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Retain authorization-code replay markers through refresh-family life:
       mix attesto_phoenix.gen.migration --upgrade 3.7 --repo MyApp.Repo
 
+      # Add durable logout-delivery leases:
+      mix attesto_phoenix.gen.migration --upgrade 4.2 --repo MyApp.Repo
+
   ## Options
 
     * `--help` - print concise usage, accepted options, and supported upgrade
@@ -125,7 +130,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
     * `--upgrade` - generate a migration to upgrade an existing database rather
       than creating fresh tables. Supported values: `3.0`/`3.0.0` and
-      `3.1`/`3.1.0`, `3.4`/`3.4.0`, `3.6`/`3.6.0`, and `3.7`/`3.7.0`. The 3.4 migration adds the nullable
+      `3.1`/`3.1.0`, `3.4`/`3.4.0`, `3.6`/`3.6.0`, `3.7`/`3.7.0`, and
+      `4.2`/`4.2.0`. The 3.4 migration adds the nullable
       immutable `family_expires_at` and `attestation_jkt` columns without
       changing existing families. Pre-upgrade attested families require
       revocation and re-authorization because their original instance key was
@@ -140,6 +146,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       refresh family remain NULL; the runtime sweeper retains them while an
       unexpired refresh-token descendant exists and retires them after the
       family ends.
+      The 4.2 migration adds durable logout-delivery identifiers and leases.
+      Existing rows derive their stable `delivery_id` from their UUID primary
+      key before the column becomes required.
       The 3.0 migration adopts or creates the exact unique index
       on `attesto_refresh_tokens(family_id, generation)`, creates or adopts the
       `attesto_refresh_family_revocations` table, and safely backfills every
@@ -207,6 +216,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   import Mix.Ecto, only: [parse_repo: 1, ensure_repo: 2]
   import Mix.Generator
 
+  alias AttestoPhoenix.MixTaskSupport, as: TaskSupport
   alias Mix.Tasks.Format
 
   # Column byte-lengths. Hashes are stored, never the secrets themselves: the
@@ -219,9 +229,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   @jti_column_size 255
   @nonce_column_size 255
   @identifier_column_size 255
-  @max_schema_prefix_bytes 63
   @max_migration_version 99_999_999_999_999
-  @upgrade_milestones ~w(3.0 3.1 3.4 3.6 3.7)
+  @upgrade_milestones ~w(3.0 3.1 3.4 3.6 3.7 4.2)
   @accepted_option_labels [
     "--help",
     "--repo (-r)",
@@ -269,25 +278,25 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
   @impl Mix.Task
   def run(args) do
-    {opts, positional, invalid} = OptionParser.parse(args, strict: @switches, aliases: @aliases)
-
-    if Keyword.get(opts, :help, false) do
-      reject_invalid_args!(positional, invalid)
-      Mix.shell().info(@help)
-    else
-      run_generator(args, opts, positional, invalid)
+    case TaskSupport.parse_options!(args, @switches,
+           aliases: @aliases,
+           error_subject: "migration-generator",
+           accepted_options: @accepted_option_labels,
+           help: @help,
+           before_invalid_args: fn ->
+             reject_legacy_table_prefix_arg!(args)
+             reject_legacy_global_table_prefix!()
+           end
+         ) do
+      {:help, _opts} -> :ok
+      {:ok, opts} -> run_generator(args, opts)
     end
   end
 
-  defp run_generator(args, opts, positional, invalid) do
-    reject_legacy_table_prefix_arg!(args)
-    reject_legacy_global_table_prefix!()
-
+  defp run_generator(args, opts) do
     # Reading any host configuration (schema prefix, the repo set) goes through
     # AttestoPhoenix.Config rather than being hardcoded here: the task is policy
     # free and only renders what the host has declared.
-    reject_invalid_args!(positional, invalid)
-
     upgrade_version = parse_upgrade_version!(opts)
 
     repos = parse_repo(args)
@@ -304,7 +313,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       end
 
     prefix = schema_prefix(opts, configured_prefix)
-    validate_prefix!(prefix)
+    TaskSupport.validate_schema_prefix!(prefix)
 
     repos
     |> resolve_repos!()
@@ -539,9 +548,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   defp config_key(key) when is_binary(key), do: Module.concat([key])
 
   defp normalize_configured_prefix(nil), do: nil
-  # Preserve an explicitly configured empty value so `validate_prefix!/1` can
-  # reject it just like `AttestoPhoenix.Config.new/1`; it is not equivalent to
-  # the neutral `nil` prefix.
+  # Preserve an explicitly configured empty value so the shared task validator
+  # can reject it just like `AttestoPhoenix.Config.new/1`; it is not equivalent
+  # to the neutral `nil` prefix.
   defp normalize_configured_prefix(""), do: ""
   defp normalize_configured_prefix(prefix) when is_binary(prefix), do: prefix
 
@@ -568,49 +577,6 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     end
   end
 
-  defp reject_invalid_args!([], []), do: :ok
-
-  defp reject_invalid_args!(positional, invalid) do
-    Mix.raise(
-      "invalid migration-generator arguments. Accepted options: " <>
-        Enum.join(@accepted_option_labels, ", ") <>
-        ". " <>
-        "Unexpected positional arguments: #{inspect(positional)}; invalid options: #{inspect(invalid)}"
-    )
-  end
-
-  # Prefixes are emitted into the migration source as Ecto schema options, so
-  # validate the same conservative
-  # PostgreSQL identifier accepted by AttestoPhoenix.Config. Fail closed (no
-  # silent normalization).
-  defp validate_prefix!(nil), do: :ok
-
-  defp validate_prefix!(prefix) when is_binary(prefix) do
-    cond do
-      prefix == "" ->
-        Mix.raise("invalid --schema-prefix: expected a non-empty lowercase PostgreSQL schema identifier")
-
-      byte_size(prefix) > @max_schema_prefix_bytes ->
-        Mix.raise("invalid --schema-prefix: expected at most 63 bytes")
-
-      prefix == "information_schema" or String.starts_with?(prefix, "pg_") ->
-        Mix.raise(
-          "invalid --schema-prefix: #{inspect(prefix)} is a reserved PostgreSQL " <>
-            "system schema; choose an application-owned schema"
-        )
-
-      Regex.match?(~r/\A[a-z_][a-z0-9_]*\z/, prefix) ->
-        :ok
-
-      true ->
-        Mix.raise("invalid --schema-prefix: expected a lowercase PostgreSQL schema identifier")
-    end
-  end
-
-  defp validate_prefix!(_other) do
-    Mix.raise("invalid --schema-prefix: expected nil or a lowercase PostgreSQL schema identifier")
-  end
-
   defp generate_for_repo(repo, opts, prefix, upgrade_version) do
     case upgrade_version do
       "3.0" -> generate_upgrade_3_0_for_repo(repo, opts, prefix)
@@ -618,6 +584,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       "3.4" -> generate_upgrade_3_4_for_repo(repo, opts, prefix)
       "3.6" -> generate_upgrade_3_6_for_repo(repo, opts, prefix)
       "3.7" -> generate_upgrade_3_7_for_repo(repo, opts, prefix)
+      "4.2" -> generate_upgrade_4_2_for_repo(repo, opts, prefix)
       nil -> generate_fresh_for_repo(repo, opts, prefix)
     end
   end
@@ -743,6 +710,21 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       base_name,
       authorization_code_replay_upgrade_migration_template(assigns),
       :upgrade_3_7
+    )
+  end
+
+  defp generate_upgrade_4_2_for_repo(repo, opts, prefix) do
+    ensure_repo(repo, [])
+    path = migrations_path(repo, opts)
+    create_directory(path)
+    base_name = "upgrade_attesto_phoenix_to_4_2"
+    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    create_migration_file(
+      path,
+      base_name,
+      logout_delivery_lease_upgrade_migration_template(assigns),
+      :upgrade_4_2
     )
   end
 
@@ -959,7 +941,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_1") ++
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_4") ++
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_6") ++
-        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_7")
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_3_7") ++
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_4_2")
 
     if upgrade_files != [] do
       file_names =
@@ -1028,6 +1011,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   end
 
   defp ensure_migration_kind_available!(path, base_name, :upgrade_3_7) do
+    if migration_kind_files(path, base_name) != [] do
+      Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
+    end
+  end
+
+  defp ensure_migration_kind_available!(path, base_name, :upgrade_4_2) do
     if migration_kind_files(path, base_name) != [] do
       Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
     end
@@ -1431,6 +1420,15 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         # The RP's frontchannel_logout_session_required: whether the rendered
         # logout URI must carry iss/sid (Front-Channel Logout 1.0 section 2).
         add :frontchannel_session_required, :boolean, null: false, default: false
+        # Stable delivery identity plus a renewable owner/deadline lease. These
+        # fields let concurrent end-session workers claim, acknowledge, and
+        # release durable logout handoffs without deleting another worker's row.
+        add :delivery_id, :string, size: <%= @identifier_size %>, null: false
+        add :lease_id, :string, size: <%= @identifier_size %>
+        add :lease_expires_at, :utc_datetime
+        # Incremented atomically when a worker claims delivery. Failed work is
+        # deferred with bounded exponential backoff derived from this count.
+        add :delivery_attempts, :integer, null: false, default: 0
         add :expires_at, :utc_datetime, null: false
 
         timestamps(updated_at: false, type: :utc_datetime)
@@ -1441,8 +1439,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # attesto_logout_sessions_sid_client_id_index matches the schema's
       # unique_constraint([:sid, :client_id], name: ...).
       create unique_index(:<%= @logout_sessions %>, [:sid, :client_id], prefix: prefix)
+      create unique_index(:<%= @logout_sessions %>, [:delivery_id], prefix: prefix)
       # Fan-out reads by sid or subject; sweeps scan by expires_at.
       create index(:<%= @logout_sessions %>, [:subject], prefix: prefix)
+      # Lease selection finds abandoned claims by deadline. Acknowledgement and
+      # release match both the lease owner and stable delivery identity.
+      create index(:<%= @logout_sessions %>, [:lease_expires_at], prefix: prefix)
+      create index(:<%= @logout_sessions %>, [:lease_id, :delivery_id], prefix: prefix)
       create index(:<%= @logout_sessions %>, [:expires_at], prefix: prefix)
 
       # Server-issued DPoP nonces (RFC 9449, section 8), backing
@@ -2212,6 +2215,100 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
       alter table(:attesto_authorization_codes, prefix: prefix) do
         remove :replay_retain_until
+      end
+    end
+
+    defp effective_prefix(explicit_prefix) do
+      cond do
+        is_binary(explicit_prefix) and byte_size(explicit_prefix) > 0 ->
+          explicit_prefix
+
+        migrator_prefix = Ecto.Migration.prefix() ->
+          to_string(migrator_prefix)
+
+        repo_default = repo().config()[:migration_default_prefix] ->
+          to_string(repo_default)
+
+        true ->
+          nil
+      end
+    end
+
+    defp qualify_table(table, nil), do: quote_identifier(table)
+    defp qualify_table(table, ""), do: quote_identifier(table)
+    defp qualify_table(table, prefix), do: quote_identifier(prefix) <> "." <> quote_identifier(table)
+
+    defp quote_identifier(identifier) do
+      "\\\"" <> String.replace(to_string(identifier), "\\\"", "\\\"\\\"") <> "\\\""
+    end
+  end
+  """)
+
+  embed_template(:logout_delivery_lease_upgrade_migration, """
+  defmodule <%= inspect @module %> do
+    @moduledoc false
+
+    use Ecto.Migration
+
+    def up do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+
+      alter table(:attesto_logout_sessions, prefix: prefix) do
+        # Add delivery_id as nullable for the deterministic legacy-row backfill;
+        # it becomes required before the migration commits.
+        add :delivery_id, :string, size: 255
+        add :lease_id, :string, size: 255
+        add :lease_expires_at, :utc_datetime
+        add :delivery_attempts, :integer, null: false, default: 0
+      end
+
+      table = qualify_table("attesto_logout_sessions", prefix)
+
+      # The existing UUID primary key is already stable and unique. Reusing its
+      # text representation avoids a database-extension dependency and gives
+      # every pre-upgrade handoff an immutable delivery identifier.
+      execute("UPDATE " <> table <> " SET delivery_id = id::text WHERE delivery_id IS NULL")
+
+      alter table(:attesto_logout_sessions, prefix: prefix) do
+        modify :delivery_id, :string, size: 255, null: false
+      end
+
+      create unique_index(:attesto_logout_sessions, [:delivery_id], prefix: prefix)
+      create index(:attesto_logout_sessions, [:lease_expires_at], prefix: prefix)
+      create index(:attesto_logout_sessions, [:lease_id, :delivery_id], prefix: prefix)
+    end
+
+    def down do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+      table = qualify_table("attesto_logout_sessions", prefix)
+
+      # Do not discard an in-flight worker's ownership marker. A rollback is
+      # safe after workers stop and every claim is acknowledged or released.
+      repo().query!("LOCK TABLE " <> table <> " IN ACCESS EXCLUSIVE MODE", [], log: false)
+      repo().query!("SET LOCAL row_security = off", [], log: false)
+
+      %{rows: rows} =
+        repo().query!(
+          "SELECT 1 FROM " <> table <> " WHERE lease_id IS NOT NULL LIMIT 1",
+          [],
+          log: false
+        )
+
+      if rows != [] do
+        raise "Cannot safely rollback 4.2 migration: logout deliveries still carry " <>
+                "active or unreleased lease ownership. Stop delivery workers and acknowledge " <>
+                "or release every lease before retrying the rollback."
+      end
+
+      drop index(:attesto_logout_sessions, [:lease_id, :delivery_id], prefix: prefix)
+      drop index(:attesto_logout_sessions, [:lease_expires_at], prefix: prefix)
+      drop index(:attesto_logout_sessions, [:delivery_id], prefix: prefix)
+
+      alter table(:attesto_logout_sessions, prefix: prefix) do
+        remove :lease_expires_at
+        remove :lease_id
+        remove :delivery_attempts
+        remove :delivery_id
       end
     end
 

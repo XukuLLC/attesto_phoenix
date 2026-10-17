@@ -7,9 +7,10 @@ defmodule AttestoPhoenix.ClientClassification do
   their own security context: client authentication treats it as confidential,
   while authorization-request validation keeps PKCE required.
 
-  Client ID Metadata Document clients are classified from their validated
-  `token_endpoint_auth_method`: `none` is public and every authenticated method
-  is confidential.
+  Client ID Metadata Document clients are self-asserted clients rather than host
+  registrations. They are therefore classified as public even when they prove
+  control of a document key with `private_key_jwt`; that proof must never unlock
+  grants reserved for registered confidential clients.
   """
 
   alias AttestoPhoenix.{Callback, Config}
@@ -20,13 +21,7 @@ defmodule AttestoPhoenix.ClientClassification do
 
   @doc "Resolve a client's public/confidential classification without choosing a caller-specific default."
   @spec classify(Config.t(), term()) :: t()
-  def classify(%Config{}, %CIMDClient{metadata: metadata}) when is_map(metadata) do
-    if Map.get(metadata, "token_endpoint_auth_method", "none") == "none",
-      do: :public,
-      else: :confidential
-  end
-
-  def classify(%Config{}, %CIMDClient{}), do: :confidential
+  def classify(%Config{}, %CIMDClient{}), do: :public
 
   def classify(%Config{} = config, client) do
     case Config.client_public_fun(config) do

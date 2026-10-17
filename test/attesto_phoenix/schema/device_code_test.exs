@@ -75,4 +75,18 @@ defmodule AttestoPhoenix.Schema.DeviceCodeTest do
     assert entry.data.scope == nil
     assert entry.data.resource == nil
   end
+
+  test "keeps the deprecated pending view compatible through 4.x" do
+    row = DeviceCode.from_record(record()) |> Ecto.Changeset.apply_changes()
+    module = Module.concat(["AttestoPhoenix", "Schema", "DeviceCode"])
+
+    assert module.to_pending_view(row) == %{
+             user_code: "BCDFGHJK",
+             client_id: "client-1",
+             scope: ["read"],
+             resource: [],
+             status: :pending,
+             expires_at: @expires_at
+           }
+  end
 end

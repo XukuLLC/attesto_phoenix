@@ -11,7 +11,7 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
   import Plug.Conn, only: [put_resp_header: 3, send_resp: 3]
 
   alias Attesto.PresentationSession
-  alias AttestoPhoenix.{Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.{Config, OAuthError}
 
   @request_object_content_type "application/oauth-authz-req+jwt"
 
@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- check_https(conn, config),
+    with :ok <- require_https(conn, config, invalid_request()),
          {:ok, store} <- presentation_session_store(config),
          {:ok, request_object} <- PresentationSession.request_object(store, id) do
       conn
@@ -30,13 +30,6 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
     else
       :error -> send_resp(conn, 404, "")
       {:error, %OAuthError{} = error} -> OAuthError.render(conn, error, config: config)
-    end
-  end
-
-  defp check_https(conn, config) do
-    case RequestContext.check_https(conn, config) do
-      :ok -> :ok
-      {:error, :insecure_transport} -> invalid_request()
     end
   end
 

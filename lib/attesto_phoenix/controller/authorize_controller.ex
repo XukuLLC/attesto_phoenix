@@ -106,15 +106,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   import Plug.Conn
 
-  alias Attesto.AuthorizationCode
-  alias Attesto.AuthorizationRequest
+  alias Attesto.{AuthorizationCode, AuthorizationRequest, MapParams}
   alias Attesto.JARM
   alias Attesto.ResourceIndicator
   alias Attesto.Secret
   alias Attesto.SessionState
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
-  alias AttestoPhoenix.{BrowserState, Callback, Config, Event, RequestContext}
+  alias AttestoPhoenix.{BrowserState, Callback, Config, Event, HTTPAccept, RequestContext}
   alias AttestoPhoenix.ClientIdMetadata
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Store.PAR.ETS
@@ -466,26 +465,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # The request-object (JAR) verification keys for the client. For a CIMD client
   # the keys are the document's `jwks` / `jwks_uri` (RFC 9101 §6.2); for a
   # registered client they are the host's `:client_jwks` callback.
-  defp client_jwks(config, %CIMDClient{metadata: metadata}) do
-    case ClientIdMetadata.resolve_jwks(metadata, config) do
-      {:ok, jwks} -> jwks
-      {:error, _} -> nil
-    end
-  end
-
-  defp client_jwks(config, client) do
-    case Config.client_jwks_fun(config) do
-      nil ->
-        nil
-
-      callback ->
-        case Callback.invoke(callback, [client]) do
-          {:ok, jwks} -> jwks
-          jwks when is_map(jwks) or is_list(jwks) -> jwks
-          _other -> nil
-        end
-    end
-  end
+  defp client_jwks(config, client), do: ClientIdMetadata.client_jwks_value(config, client)
 
   # The per-request validation policy (registered redirect URIs, PKCE, nonce) is
   # resolved by the conn-free `AttestoPhoenix.AuthorizationServer.RequestPolicy`,
@@ -696,7 +676,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
             family_id: family_id,
             claims: claims
           }
-          |> put_optional(:dpop_jkt, dpop_jkt)
+          |> MapParams.put_optional(:dpop_jkt, dpop_jkt)
 
         mint_code_and_redirect(conn, config, request, subject, attrs)
 
@@ -814,15 +794,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
 
     %{}
-    |> put_optional("nonce", request.nonce)
-    |> put_optional("claims", request.claims)
-    |> put_optional("auth_time", auth_time)
-    |> put_optional("acr", Map.get(subject, :acr))
-    |> put_optional("amr", Map.get(subject, :amr))
+    |> MapParams.put_optional("nonce", request.nonce)
+    |> MapParams.put_optional("claims", request.claims)
+    |> MapParams.put_optional("auth_time", auth_time)
+    |> MapParams.put_optional("acr", Map.get(subject, :acr))
+    |> MapParams.put_optional("amr", Map.get(subject, :amr))
     # OIDC Back-Channel Logout 1.0 §2.1: the host's session id rides into the
     # code's claims so the token endpoint can stamp `sid` on the ID Token and
     # record a back-channel-logout session for the Relying Party.
-    |> put_optional("sid", Map.get(subject, :sid))
+    |> MapParams.put_optional("sid", Map.get(subject, :sid))
     # OID4VCI (draft-ietf-oauth-openid4vci) §5: the `openid_credential`
     # authorization_details resolved for this request (stashed onto the conn
     # by `authorize/2` via `stash_credential_configuration_ids/2`), so the
@@ -830,11 +810,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # onto the access token that the pre-authorized_code grant uses (see
     # `AttestoPhoenix.AuthorizationServer.Token`'s `@grant_pre_authorized_code`
     # dispatch clause).
-    |> put_optional(
+    |> MapParams.put_optional(
       "credential_configuration_ids",
       Map.get(conn.private, :attesto_credential_configuration_ids)
     )
-    |> put_optional(
+    |> MapParams.put_optional(
       "attesto_phoenix.credential_authorization_details_ids",
       Map.get(conn.private, :attesto_credential_authorization_details_ids)
     )
@@ -1167,9 +1147,29 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp deliver_jarm(conn, redirect_uri, "form_post.jwt", response) do
-    conn
-    |> put_resp_header("content-type", "text/html; charset=utf-8")
-    |> send_resp(:ok, form_post_html(redirect_uri, response))
+    if web_form_action?(redirect_uri) do
+      conn
+      |> put_resp_header(
+        "content-security-policy",
+        "default-src 'none'; script-src 'unsafe-inline'; form-action https: http:; base-uri 'none'; frame-ancestors 'none'"
+      )
+      |> put_resp_header("content-type", "text/html; charset=utf-8")
+      |> send_resp(:ok, form_post_html(redirect_uri, response))
+    else
+      send_resp(conn, :bad_request, "invalid redirect_uri for form_post.jwt")
+    end
+  end
+
+  defp web_form_action?(redirect_uri) do
+    case URI.new(redirect_uri) do
+      {:ok, %URI{scheme: scheme, host: host, userinfo: nil}} when scheme in ["https", "http"] ->
+        is_binary(host) and host != ""
+
+      _ ->
+        false
+    end
+  rescue
+    _ -> false
   end
 
   # OAuth 2.0 Form Post Response Mode: a minimal auto-submitting form that POSTs
@@ -1240,7 +1240,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     description = direct_error_description(Callback.map_value(%{reason: reason}, :reason))
     code = direct_error_code(reason)
 
-    if accepts_html?(conn) do
+    if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
       conn
       |> put_resp_content_type("text/html")
       |> send_resp(:bad_request, direct_error_html(code, description))
@@ -1257,15 +1257,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
   end
 
-  defp accepts_html?(conn) do
-    conn
-    |> get_req_header("accept")
-    |> Enum.any?(fn value -> String.contains?(String.downcase(value), "text/html") end)
-  end
-
   defp direct_error_html(code, description) do
-    escaped_code = html_escape(code)
-    escaped_description = html_escape(description)
+    escaped_code = Plug.HTML.html_escape(code)
+    escaped_description = Plug.HTML.html_escape(description)
 
     """
     <!doctype html>
@@ -1324,16 +1318,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       </body>
     </html>
     """
-  end
-
-  defp html_escape(value) do
-    value
-    |> to_string()
-    |> String.replace("&", "&amp;")
-    |> String.replace("<", "&lt;")
-    |> String.replace(">", "&gt;")
-    |> String.replace("\"", "&quot;")
-    |> String.replace("'", "&#39;")
   end
 
   defp direct_error_description(:insecure_transport), do: "TLS required"
@@ -1396,7 +1380,4 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   # ── Helpers ──────────────────────────────────────────────────────────────
-
-  defp put_optional(map, _key, nil), do: map
-  defp put_optional(map, key, value), do: Map.put(map, key, value)
 end

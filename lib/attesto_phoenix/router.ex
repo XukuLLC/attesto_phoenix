@@ -564,33 +564,24 @@ defmodule AttestoPhoenix.Router do
     # conformance requirements of any route-mount opt-out combination.
     userinfo_route = userinfo_route(userinfo?, prefix, userinfo_path, userinfo_controller)
 
-    # RFC 8628 §3.1: the device authorization endpoint is emitted only when the
-    # host opts in (`device: true`), so a deployment that does not offer the
-    # device grant exposes no device endpoint at all.
+    # Build the device route AST once. Route-class expansion uses the two
+    # pieces separately; the compatibility catalog composes the same pieces in
+    # their historic adjacent order.
+    {device_authorization_route, device_verification_route} =
+      classed_device_routes(
+        device?,
+        prefix,
+        device_authorization_path,
+        device_authorization_controller,
+        device_verification_path,
+        device_verification_controller
+      )
+
     device_route =
       if device? do
         quote do
-          post(
-            unquote(prefix <> device_authorization_path),
-            unquote(device_authorization_controller),
-            :create
-          )
-
-          # RFC 8628 §3.3: the user-facing verification page. GET shows the
-          # confirm prompt (and pre-fills `?user_code=` from
-          # `verification_uri_complete`); POST carries the explicit approve/deny
-          # decision (no approval is ever derived from a GET / the URL alone).
-          get(
-            unquote(prefix <> device_verification_path),
-            unquote(device_verification_controller),
-            :verify
-          )
-
-          post(
-            unquote(prefix <> device_verification_path),
-            unquote(device_verification_controller),
-            :verify
-          )
+          unquote(device_authorization_route)
+          unquote(device_verification_route)
         end
       end
 
@@ -617,20 +608,6 @@ defmodule AttestoPhoenix.Router do
       )
 
     federation_route = federation_route(federation?, federation_path, federation_controller)
-
-    # Route-class expansion needs to split the device grant's non-browser
-    # authorization request from its resource-owner verification page while
-    # retaining their legacy order. The legacy branch below continues to use
-    # `device_route` exactly as before.
-    {device_authorization_route, device_verification_route} =
-      classed_device_routes(
-        device?,
-        prefix,
-        device_authorization_path,
-        device_authorization_controller,
-        device_verification_path,
-        device_verification_controller
-      )
 
     # OpenID Connect CIBA Core 1.0 §7.1: the backchannel authentication endpoint
     # is emitted only when the host opts in (`ciba: true`), so a deployment that

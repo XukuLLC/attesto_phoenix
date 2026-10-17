@@ -30,11 +30,26 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo31
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo34
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo37
+  alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo42
   alias Ecto.Adapters.SQL.Sandbox
   alias Mix.Tasks.AttestoPhoenix.Gen.Migration
 
   @moduletag :ecto
   @moduletag :tmp_dir
+
+  @store_tables ~w(
+    attesto_authorization_codes
+    attesto_refresh_tokens
+    attesto_refresh_family_revocations
+    attesto_device_codes
+    attesto_ciba_requests
+    attesto_logout_sessions
+    dpop_nonces
+    dpop_replays
+    attesto_pushed_authorization_requests
+    attesto_client_id_metadata
+    attesto_consent_grants
+  )
 
   setup do
     AppEnvSnapshot.ensure_unset!([
@@ -228,6 +243,84 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
              """)
   end
 
+  test "4.2 upgrade backfills stable logout delivery ids and guards leased rollback", %{
+    tmp_dir: tmp_dir
+  } do
+    prefix = "attesto_logout_42_#{System.unique_integer([:positive])}"
+    table = ~s|"#{prefix}"."attesto_logout_sessions"|
+    first_id = "00000000-0000-0000-0000-000000000001"
+    second_id = "00000000-0000-0000-0000-000000000002"
+
+    Sandbox.mode(TestRepo, :auto)
+    on_exit(fn -> Sandbox.mode(TestRepo, :manual) end)
+    on_exit(fn -> TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{prefix}" CASCADE|) end)
+
+    TestRepo.query!(~s|CREATE SCHEMA "#{prefix}"|)
+    TestRepo.query!(~s|CREATE TABLE #{table} (id uuid PRIMARY KEY)|)
+    TestRepo.query!(~s|INSERT INTO #{table} (id) VALUES ('#{first_id}'), ('#{second_id}')|)
+
+    assert_raise Postgrex.Error, fn ->
+      EctoLogoutSessionStore.validate_retry_schema!(TestRepo, prefix)
+    end
+
+    {migration, version} =
+      generated_upgrade(tmp_dir, prefix, "4.2", UpgradeAttestoPhoenixTo42)
+
+    assert :ok = EctoLogoutSessionStore.validate_retry_schema!(TestRepo, prefix)
+
+    assert %{rows: [[^first_id, nil, nil, 0], [^second_id, nil, nil, 0]]} =
+             TestRepo.query!(
+               ~s|SELECT delivery_id, lease_id, lease_expires_at, delivery_attempts FROM #{table} ORDER BY delivery_id|
+             )
+
+    assert %{
+             rows: [
+               ["attesto_logout_sessions_delivery_id_index"],
+               ["attesto_logout_sessions_lease_expires_at_index"],
+               ["attesto_logout_sessions_lease_id_delivery_id_index"]
+             ]
+           } =
+             TestRepo.query!(
+               """
+               SELECT indexname
+               FROM pg_catalog.pg_indexes
+               WHERE schemaname = $1
+                 AND indexname IN (
+                   'attesto_logout_sessions_delivery_id_index',
+                   'attesto_logout_sessions_lease_expires_at_index',
+                   'attesto_logout_sessions_lease_id_delivery_id_index'
+                 )
+               ORDER BY indexname
+               """,
+               [prefix]
+             )
+
+    TestRepo.query!(~s|UPDATE #{table} SET lease_id = 'worker-1' WHERE delivery_id = '#{first_id}'|)
+
+    assert_raise RuntimeError, ~r/Cannot safely rollback 4.2 migration/, fn ->
+      Ecto.Migrator.down(TestRepo, version, migration, log: false)
+    end
+
+    TestRepo.query!(~s|UPDATE #{table} SET lease_id = NULL, lease_expires_at = NULL|)
+    assert :ok = Ecto.Migrator.down(TestRepo, version, migration, log: false)
+
+    assert %{rows: []} =
+             TestRepo.query!(
+               """
+               SELECT column_name
+               FROM information_schema.columns
+               WHERE table_schema = $1
+                 AND table_name = 'attesto_logout_sessions'
+                 AND column_name IN ('delivery_id', 'lease_id', 'lease_expires_at', 'delivery_attempts')
+               """,
+               [prefix]
+             )
+
+    assert_raise Postgrex.Error, fn ->
+      EctoLogoutSessionStore.validate_retry_schema!(TestRepo, prefix)
+    end
+  end
+
   defp assert_upgrade_34_ciba_prefix(tmp_dir, prefix, column_type, migrator_opts) do
     TestRepo.query!(~s|CREATE TABLE "#{prefix}"."attesto_ciba_requests" (client_notification_token #{column_type})|)
 
@@ -316,6 +409,69 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     module
   end
 
+  defp support_migrations do
+    migrations_dir = Path.expand("../../support/migrations", __DIR__)
+
+    migrations_dir
+    |> File.ls!()
+    |> Enum.filter(&String.ends_with?(&1, ".exs"))
+    |> Enum.sort()
+    |> Enum.with_index(fn file, index ->
+      [{module, _binary} | _] = Code.compile_file(Path.join(migrations_dir, file))
+      {index + 1, module}
+    end)
+  end
+
+  defp schema_columns(prefix) do
+    %{rows: rows} =
+      TestRepo.query!(
+        """
+        SELECT
+          relation.relname,
+          attribute.attnum,
+          attribute.attname,
+          pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
+          attribute.attnotnull,
+          COALESCE(pg_catalog.pg_get_expr(default_value.adbin, default_value.adrelid), '')
+        FROM pg_catalog.pg_class AS relation
+        JOIN pg_catalog.pg_namespace AS namespace
+          ON namespace.oid = relation.relnamespace
+        JOIN pg_catalog.pg_attribute AS attribute
+          ON attribute.attrelid = relation.oid
+        LEFT JOIN pg_catalog.pg_attrdef AS default_value
+          ON default_value.adrelid = relation.oid
+         AND default_value.adnum = attribute.attnum
+        WHERE namespace.nspname = $1
+          AND relation.relname = ANY($2)
+          AND relation.relkind IN ('r', 'p')
+          AND attribute.attnum > 0
+          AND NOT attribute.attisdropped
+        ORDER BY relation.relname, attribute.attnum
+        """,
+        [prefix, @store_tables]
+      )
+
+    rows
+  end
+
+  defp schema_indexes(prefix) do
+    %{rows: rows} =
+      TestRepo.query!(
+        """
+        SELECT tablename, indexname, indexdef
+        FROM pg_catalog.pg_indexes
+        WHERE schemaname = $1
+          AND tablename = ANY($2)
+        ORDER BY tablename, indexname
+        """,
+        [prefix, @store_tables]
+      )
+
+    Enum.map(rows, fn [table, name, definition] ->
+      [table, name, String.replace(definition, prefix, "<schema>")]
+    end)
+  end
+
   defp prefix_config(prefix) do
     Config.new(
       issuer: "https://issuer.example",
@@ -327,6 +483,47 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
       load_principal: fn _ -> {:error, :not_found} end,
       schema_prefix: prefix
     )
+  end
+
+  test "support migrations stay identical to the fresh generator schema", %{tmp_dir: tmp_dir} do
+    fixture_prefix = "attesto_fixture_#{System.unique_integer([:positive])}"
+    generated_prefix = "attesto_contract_#{System.unique_integer([:positive])}"
+
+    Sandbox.mode(TestRepo, :auto)
+    on_exit(fn -> Sandbox.mode(TestRepo, :manual) end)
+
+    on_exit(fn ->
+      TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{fixture_prefix}" CASCADE|)
+      TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{generated_prefix}" CASCADE|)
+    end)
+
+    TestRepo.query!(~s|CREATE SCHEMA "#{fixture_prefix}"|)
+    TestRepo.query!(~s|CREATE SCHEMA "#{generated_prefix}"|)
+
+    assert [_ | _] =
+             Ecto.Migrator.run(TestRepo, support_migrations(), :up,
+               all: true,
+               log: false,
+               prefix: fixture_prefix
+             )
+
+    generated_dir = Path.join(tmp_dir, "generated-contract")
+
+    Migration.run([
+      "--repo",
+      inspect(TestRepo),
+      "--migrations-path",
+      migrations_dir(generated_dir),
+      "--schema-prefix",
+      generated_prefix
+    ])
+
+    [generated_file] = Path.wildcard(Path.join(migrations_dir(generated_dir), "*.exs"))
+    migration = compile_migration(generated_file, CreateAttestoPhoenixTables)
+    assert :ok = Ecto.Migrator.up(TestRepo, 1, migration, log: false, prefix: generated_prefix)
+
+    assert schema_columns(fixture_prefix) == schema_columns(generated_prefix)
+    assert schema_indexes(fixture_prefix) == schema_indexes(generated_prefix)
   end
 
   test "applies the generated schema prefix and routes every Ecto store through it", %{

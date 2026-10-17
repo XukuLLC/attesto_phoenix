@@ -54,8 +54,9 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   """
 
   alias Attesto.ClientIdMetadata, as: Core
+  alias AttestoPhoenix.{Callback, Config}
+  alias AttestoPhoenix.ClientIdMetadata.Client
   alias AttestoPhoenix.ClientIdMetadata.{HostPolicy, JWKSResolver, Resolver}
-  alias AttestoPhoenix.Config
 
   @typedoc """
   A resolved CIMD client: the normalized, string-keyed metadata map
@@ -180,8 +181,69 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   raising `KeyError`.
   """
   @spec scopes(client()) :: [String.t()]
-  def scopes(%{"scope" => scope}) when is_binary(scope), do: String.split(scope)
+  def scopes(%{"scope" => scope}) when is_binary(scope), do: Attesto.Scope.parse(scope)
   def scopes(_client), do: []
+
+  @doc false
+  @spec client_jwks(Config.t(), term()) :: {:ok, map() | list()} | {:error, :missing_client_jwks}
+  def client_jwks(%Config{} = config, %Client{metadata: metadata}) do
+    case resolve_jwks(metadata, config) do
+      {:ok, jwks} -> {:ok, jwks}
+      _error -> {:error, :missing_client_jwks}
+    end
+  end
+
+  def client_jwks(%Config{} = config, client) do
+    case Config.client_jwks_fun(config) do
+      nil ->
+        {:error, :missing_client_jwks}
+
+      callback ->
+        case Callback.invoke(callback, [host_client(client)]) do
+          {:ok, jwks} when is_map(jwks) or is_list(jwks) -> {:ok, jwks}
+          jwks when is_map(jwks) or is_list(jwks) -> {:ok, jwks}
+          _other -> {:error, :missing_client_jwks}
+        end
+    end
+  end
+
+  @doc false
+  @spec client_jwks_value(Config.t(), term()) :: map() | list() | nil
+  def client_jwks_value(%Config{} = config, client) do
+    case client_jwks(config, client) do
+      {:ok, jwks} -> jwks
+      {:error, :missing_client_jwks} -> nil
+    end
+  end
+
+  @doc false
+  @spec host_client(term()) :: term()
+  def host_client(%Client{metadata: metadata}) do
+    Map.put(metadata, :scopes, scopes(metadata))
+  end
+
+  def host_client(client), do: client
+
+  @doc false
+  @spec client_native?(Config.t(), term()) :: boolean()
+  def client_native?(_config, %Client{}), do: false
+
+  def client_native?(%Config{} = config, client) do
+    Callback.invoke_boolean(Config.client_native_fun(config), [client], false, :client_native?)
+  end
+
+  @doc false
+  @spec load_host_client(Config.t(), String.t()) :: {:ok, term()} | {:error, term()}
+  def load_host_client(%Config{} = config, client_id) when is_binary(client_id) do
+    if cimd_client_id?(client_id, config) do
+      case resolve(client_id, config) do
+        {:ok, metadata} -> {:ok, host_client(Client.new(metadata))}
+        error -> error
+      end
+    else
+      Config.client_store_load(config, client_id)
+    end
+  end
 
   @doc """
   Returns `true` iff `redirect_uri` is same-origin (scheme, host, and port) with

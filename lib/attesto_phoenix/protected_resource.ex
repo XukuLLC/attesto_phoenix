@@ -29,20 +29,35 @@ defmodule AttestoPhoenix.ProtectedResource do
   """
   @spec authenticate(Plug.Conn.t(), Config.t(), String.t() | nil) :: result()
   def authenticate(%Plug.Conn{} = conn, %Config{} = config, resource_metadata) do
-    Config.with_request_config(config, fn -> do_authenticate(conn, config, resource_metadata) end)
+    authenticate(conn, config, resource_metadata, [])
   end
 
-  defp do_authenticate(%Plug.Conn{} = conn, %Config{} = config, resource_metadata) do
+  @doc false
+  @spec authenticate(Plug.Conn.t(), Config.t(), String.t() | nil, keyword()) :: result()
+  def authenticate(%Plug.Conn{} = conn, %Config{} = config, resource_metadata, opts) when is_list(opts) do
+    Config.with_request_config(config, fn -> do_authenticate(conn, config, resource_metadata, opts) end)
+  end
+
+  defp do_authenticate(%Plug.Conn{} = conn, %Config{} = config, resource_metadata, opts) do
+    claims_key = Keyword.get(opts, :claims_key, @claims_key)
+    core_overrides = Keyword.get(opts, :core_overrides, [])
+    error_overrides = Keyword.get(opts, :error_overrides, [])
+
     case RequestContext.check_https(conn, config) do
       :ok ->
-        conn = Authenticate.call(conn, authenticate_opts(config, resource_metadata))
+        authenticate_opts =
+          config
+          |> authenticate_opts(resource_metadata, core_overrides)
+          |> Keyword.put(:claims_key, claims_key)
+
+        conn = Authenticate.call(conn, Authenticate.init(authenticate_opts))
 
         cond do
           conn.halted ->
             {:halt, conn}
 
-          access_token_revoked?(config, conn.assigns[@claims_key]) ->
-            claims = conn.assigns[@claims_key]
+          access_token_revoked?(config, conn.assigns[claims_key]) ->
+            claims = conn.assigns[claims_key]
             DenialAudit.emit(config, conn, :invalid_token)
 
             {:halt,
@@ -50,11 +65,11 @@ defmodule AttestoPhoenix.ProtectedResource do
                conn,
                scheme_of(claims),
                "invalid_token",
-               error_opts(config, resource_metadata, [])
+               error_opts(config, resource_metadata, error_overrides)
              )}
 
           true ->
-            {:ok, conn, conn.assigns[@claims_key]}
+            {:ok, conn, conn.assigns[claims_key]}
         end
 
       {:error, :insecure_transport} ->
@@ -65,7 +80,11 @@ defmodule AttestoPhoenix.ProtectedResource do
            conn,
            :bearer,
            "invalid_token",
-           error_opts(config, resource_metadata, description: "TLS required")
+           error_opts(
+             config,
+             resource_metadata,
+             Keyword.put(error_overrides, :description, "TLS required")
+           )
          )}
     end
   end
@@ -73,15 +92,22 @@ defmodule AttestoPhoenix.ProtectedResource do
   @doc "Build the options consumed by `Attesto.Plug.Authenticate`."
   @spec authenticate_opts(Config.t(), String.t() | nil) :: keyword()
   def authenticate_opts(%Config{} = config, resource_metadata) do
+    authenticate_opts(config, resource_metadata, [])
+  end
+
+  @doc false
+  @spec authenticate_opts(Config.t(), String.t() | nil, keyword()) :: keyword()
+  def authenticate_opts(%Config{} = config, resource_metadata, overrides) when is_list(overrides) do
     [config: attesto_config(config), claims_key: @claims_key]
     |> Keyword.put(:bearer_methods, config.bearer_methods_supported)
     |> put_optional(:send_error, config.send_error)
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)
     |> Keyword.merge(Adapter.protected_resource_opts(config))
+    |> Keyword.merge(overrides)
     # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it
     # must also carry the protected-resource metadata pointer when configured.
-    |> put_optional(:resource_metadata, resource_metadata)
+    |> Keyword.put(:resource_metadata, resource_metadata)
     |> DenialAudit.wrap(config)
   end
 

@@ -15,11 +15,11 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateRefreshTokens do
   def change do
     create table(:attesto_refresh_tokens, primary_key: false) do
       add(:id, :binary_id, primary_key: true)
-      add(:token_hash, :string, null: false)
-      add(:family_id, :string, null: false)
+      add(:token_hash, :string, size: 88, null: false)
+      add(:family_id, :string, size: 255, null: false)
       add(:generation, :integer, null: false, default: 0)
-      add(:client_id, :string)
-      add(:subject, :string, null: false)
+      add(:client_id, :string, size: 255)
+      add(:subject, :string, size: 255, null: false)
       add(:scope, {:array, :string}, null: false, default: [])
       add(:resource, {:array, :string}, null: false, default: [])
       add(:acr, :string)
@@ -33,7 +33,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateRefreshTokens do
       add(:successor, :map)
       add(:family_revoked, :boolean, null: false, default: false)
       add(:expires_at, :utc_datetime, null: false)
-      add(:parent_hash, :string)
+      add(:parent_hash, :string, size: 88)
 
       timestamps(updated_at: false, type: :utc_datetime)
     end
@@ -41,5 +41,6 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateRefreshTokens do
     create(unique_index(:attesto_refresh_tokens, [:token_hash]))
     create(unique_index(:attesto_refresh_tokens, [:family_id, :generation]))
     create(index(:attesto_refresh_tokens, [:family_id]))
+    create(index(:attesto_refresh_tokens, [:expires_at]))
   end
 end

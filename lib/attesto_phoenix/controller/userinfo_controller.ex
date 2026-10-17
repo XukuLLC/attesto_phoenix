@@ -80,6 +80,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   import Plug.Conn
 
+  alias Attesto.Scope
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
@@ -183,7 +184,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # RFC 9068 §2.2.3: the access token's `scope` claim is a space-delimited
   # string. An absent or malformed claim grants nothing.
   defp granted_scopes(%{"scope" => scope}) when is_binary(scope) do
-    String.split(scope, ~r/\s+/, trim: true)
+    Scope.parse(scope, whitespace: :ascii_whitespace)
   end
 
   defp granted_scopes(_claims), do: []
