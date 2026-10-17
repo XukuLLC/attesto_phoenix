@@ -120,7 +120,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
           )
 
         assert status == 0, output
-        assert %{"issues" => []} = Jason.decode!(output)
+        # A fresh dependency build may prepend Mix compilation progress before
+        # Credo's JSON document. Decode the document itself so the clean-build
+        # release gate remains deterministic.
+        {json_offset, 1} = :binary.match(output, "{")
+        json = binary_part(output, json_offset, byte_size(output) - json_offset)
+        assert %{"issues" => []} = Jason.decode!(json)
       end)
     end
 

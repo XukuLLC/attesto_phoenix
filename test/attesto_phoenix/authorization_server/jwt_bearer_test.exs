@@ -645,6 +645,17 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       end
     end
 
+    defmodule CacheControlFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      @impl true
+      def fetch(url, opts) do
+        {:ok, result} = JwtBearerTest.StubFetcher.fetch(url, opts)
+        {:ok, %{result | cache_control: Keyword.fetch!(opts, :test_cache_control)}}
+      end
+    end
+
     defmodule RecordingCache do
       @moduledoc false
       @behaviour AttestoPhoenix.ClientIdMetadata.Cache
@@ -678,13 +689,28 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       defp respond(result), do: result
     end
 
-    defp remote_jwks_config(cache, fetcher \\ __MODULE__.StubFetcher, uri \\ "https://idp.example/jwks.json") do
+    defp remote_jwks_config(
+           cache,
+           fetcher \\ __MODULE__.StubFetcher,
+           uri \\ "https://idp.example/jwks.json",
+           extra_opts \\ []
+         ) do
       config(
-        jwt_bearer: [
-          issuers: %{@idp => [jwks_uri: uri, allowed_algs: ["RS256"]]},
-          jwks_fetcher: fetcher,
-          jwks_cache: cache
-        ]
+        jwt_bearer:
+          [
+            issuers: %{@idp => [jwks_uri: uri, allowed_algs: ["RS256"]]},
+            jwks_fetcher: fetcher,
+            jwks_cache: cache
+          ] ++ extra_opts
+      )
+    end
+
+    defp cache_control_config(directives) do
+      remote_jwks_config(
+        RecordingCache,
+        CacheControlFetcher,
+        "https://idp.example/jwks.json",
+        fetch_opts: [test_cache_control: directives]
       )
     end
 
@@ -793,6 +819,47 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
       assert is_binary(response.access_token)
       refute_received {:cache_put, _url, _expires_at}
+    end
+
+    test "a private response does not enter the shared JWKS cache" do
+      Process.put({RecordingCache, :owner}, self())
+      config = cache_control_config(private: true, max_age: 600)
+
+      assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+      assert is_binary(response.access_token)
+      refute_received {:cache_put, _url, _expires_at}
+    end
+
+    test "s-maxage overrides max-age without being raised to the heuristic minimum" do
+      Process.put({RecordingCache, :owner}, self())
+      started_at = DateTime.utc_now()
+      config = cache_control_config(s_maxage: 30, max_age: 600)
+
+      assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+      assert is_binary(response.access_token)
+      assert_receive {:cache_put, "https://idp.example/jwks.json", expires_at}
+      remaining = DateTime.diff(expires_at, started_at, :second)
+      assert remaining > 0 and remaining <= 30
+    end
+
+    test "Expires freshness is based on Date and reduced by Age" do
+      Process.put({RecordingCache, :owner}, self())
+      received_at = DateTime.utc_now() |> DateTime.truncate(:second)
+      expected_expiry = DateTime.add(received_at, 100, :second)
+
+      directives = [
+        date: Calendar.strftime(received_at, "%a, %d %b %Y %H:%M:%S GMT"),
+        expires: Calendar.strftime(DateTime.add(received_at, 120, :second), "%a, %d %b %Y %H:%M:%S GMT"),
+        age: 20,
+        received_at: received_at
+      ]
+
+      config = cache_control_config(directives)
+
+      assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
+      assert is_binary(response.access_token)
+      assert_receive {:cache_put, "https://idp.example/jwks.json", expires_at}
+      assert abs(DateTime.diff(expires_at, expected_expiry, :millisecond)) <= 10
     end
   end
 

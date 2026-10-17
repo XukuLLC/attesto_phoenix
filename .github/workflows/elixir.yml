@@ -58,12 +58,12 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           repository: XukuLLC/attesto
-          ref: 4a63b7ed0536f22a2ca55ab3a3aa55abc33993f6
+          ref: c2c1c6ee4c89143bb000db8bc4ad66a8b61503ee
           path: attesto
 
       - name: Verify Attesto core revision
         working-directory: attesto
-        run: test "$(git rev-parse HEAD)" = "4a63b7ed0536f22a2ca55ab3a3aa55abc33993f6"
+        run: test "$(git rev-parse HEAD)" = "c2c1c6ee4c89143bb000db8bc4ad66a8b61503ee"
 
       - name: Set up Elixir
         uses: erlef/setup-beam@v1.24.1
@@ -75,17 +75,17 @@ jobs:
         uses: actions/cache@v6.1.0
         with:
           path: deps
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-4a63b7ed0536f22a2ca55ab3a3aa55abc33993f6-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-c2c1c6ee4c89143bb000db8bc4ad66a8b61503ee-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-4a63b7ed0536f22a2ca55ab3a3aa55abc33993f6-${{ hashFiles('attesto/**') }}-mix-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-c2c1c6ee4c89143bb000db8bc4ad66a8b61503ee-${{ hashFiles('attesto/**') }}-mix-
 
       - name: Restore build cache
         uses: actions/cache@v6.1.0
         with:
           path: _build
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-4a63b7ed0536f22a2ca55ab3a3aa55abc33993f6-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-c2c1c6ee4c89143bb000db8bc4ad66a8b61503ee-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-4a63b7ed0536f22a2ca55ab3a3aa55abc33993f6-${{ hashFiles('attesto/**') }}-build-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-c2c1c6ee4c89143bb000db8bc4ad66a8b61503ee-${{ hashFiles('attesto/**') }}-build-
 
       - name: Install dependencies
         run: |
@@ -147,7 +147,7 @@ jobs:
 
 
   released-consumer:
-    name: Released Attesto 2.4.0 minimum consumer
+    name: Released Attesto 2.5.0 minimum consumer
     needs: build
     runs-on: ubuntu-latest
     env:
@@ -163,8 +163,8 @@ jobs:
           elixir-version: "1.20.4"
           otp-version: "29.0.5"
 
-      - name: Compile minimum consumer against released Attesto 2.4.0
-        # Attesto 2.4.0 is published before the Phoenix release tag is created.
+      - name: Compile minimum consumer against released Attesto 2.5.0
+        # Attesto 2.5.0 is published before the Phoenix release tag is created.
         # This fresh job has no source opt-in or source-built artifacts.
         working-directory: integration/consumer_without_req
         run: |
@@ -176,7 +176,7 @@ jobs:
           compile_log="${RUNNER_TEMP}/attesto_phoenix_released_minimum_compile.log"
           mix deps.compile attesto_phoenix --force 2>&1 | tee "$compile_log"
           if grep -F "warning:" "$compile_log"; then
-            echo "AttestoPhoenix emitted a compiler warning against released Attesto 2.4.0" >&2
+            echo "AttestoPhoenix emitted a compiler warning against released Attesto 2.5.0" >&2
             exit 1
           fi
           mix run --no-start verify.exs

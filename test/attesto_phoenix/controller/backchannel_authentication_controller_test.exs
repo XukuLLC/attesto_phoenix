@@ -185,6 +185,18 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
     assert body(conn)["error"] == "invalid_request"
   end
 
+  test "rejects every non-empty query string, including unrelated parameters" do
+    params = %{"scope" => "openid", "login_hint" => "alice@example.test"}
+    conn = call(params, [basic("cli-1", "s3cr3t")], @path <> "?unrelated=1")
+
+    assert conn.status == 400
+
+    assert body(conn) == %{
+             "error" => "invalid_request",
+             "error_description" => "request parameters must be sent in the request body, not the query string"
+           }
+  end
+
   test "accepts a signed authentication request (§7.1.1)" do
     jwt =
       signed_request(%{
@@ -199,10 +211,10 @@ defmodule AttestoPhoenix.Controller.BackchannelAuthenticationControllerTest do
     assert is_binary(body(conn)["auth_req_id"])
   end
 
-  defp call(params, headers) do
+  defp call(params, headers, path \\ @path) do
     conn =
       :post
-      |> conn(@path, params)
+      |> conn(path, params)
       |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
       |> put_req_header("content-type", "application/x-www-form-urlencoded")
 

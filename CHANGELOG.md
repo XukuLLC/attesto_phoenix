@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.1.0] - 2026-10-17
+
+### Security
+
+- Reject every non-empty query string on the Device Authorization and CIBA
+  backchannel-authentication POST endpoints, matching the existing token, PAR,
+  introspection, and revocation endpoint guard.
+- Delegate Client ID Metadata outbound-address classification to Attesto's
+  shared IANA-derived policy, including IPv4-embedded IPv6 and transition
+  representations.
+
+### Fixed
+
+- Derive a Client ID Metadata Document client's identifier directly from its
+  verified client record instead of invoking the host client-identifier
+  callback again.
+- Honor shared-cache freshness directives (`s-maxage`, `max-age`, `Expires`,
+  `Age`, and `Date`) when caching JWT-bearer assertion JWKS responses.
+
+### Changed
+
+- Require Attesto `>= 2.5.0 and < 3.0.0` for the shared outbound-address
+  policy used by Client ID Metadata retrieval.
+
 ## [4.0.2] - 2026-10-15
 
 ### Security

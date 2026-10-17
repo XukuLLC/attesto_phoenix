@@ -65,6 +65,36 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationControllerTest do
     assert JSON.decode!(conn.resp_body)["error"] == "invalid_client"
   end
 
+  test "rejects every non-empty query string, including unrelated parameters" do
+    Application.put_env(:attesto_phoenix, AttestoPhoenix.Config,
+      issuer: "https://issuer.example",
+      audience: "https://api.example.com",
+      keystore: StubKeystore,
+      repo: StubRepo,
+      load_client: fn _client_id -> raise "query guard must run before client lookup" end,
+      verify_client_secret: fn _client, _secret -> false end,
+      load_principal: fn _subject -> {:error, :not_found} end,
+      device_code_store: ETS,
+      device_authorization: [enabled: true],
+      require_https: false
+    )
+
+    params = %{"scope" => "read"}
+
+    response =
+      :post
+      |> conn("/oauth/device_authorization?unrelated=1", params)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+      |> DeviceAuthorizationController.create(params)
+
+    assert response.status == 400
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => "invalid_request",
+             "error_description" => "request parameters must be sent in the request body, not the query string"
+           }
+  end
+
   defp client_assertion(jwk, alg) do
     now = System.system_time(:second)
 

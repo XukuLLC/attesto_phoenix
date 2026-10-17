@@ -146,7 +146,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.0"}
+    {:attesto_phoenix, "~> 4.1"}
   ]
 end
 ```
@@ -157,7 +157,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.0"},
+    {:attesto_phoenix, "~> 4.1"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -171,6 +171,9 @@ original request. It also requires Attesto 2.4.0 and the 3.7 replay-retention
 migration. Read the [4.0 upgrade guide](guides/upgrade_4_0.md) before deploying;
 it includes the callback example and the complete ordered 3.0, 3.1, 3.4, 3.6,
 and 3.7 migration commands.
+
+AttestoPhoenix 4.1 requires Attesto 2.5.0 for the shared outbound-address
+policy used by Client ID Metadata retrieval.
 
 ## Quick start
 

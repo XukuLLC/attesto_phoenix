@@ -35,6 +35,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
 
   alias Attesto.IdentityAssertion
   alias AttestoPhoenix.{Callback, Config, DPoP.Adapter}
+  alias AttestoPhoenix.ClientIdMetadata.Resolver
 
   require Logger
 
@@ -271,16 +272,15 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
 
   defp cache_put(cache, uri, jwks, cache_control, opts) do
     bounds = Keyword.get(opts, :jwks_cache_ttl_bounds, {300, 86_400})
+    expires_at = Resolver.key_cache_expires_at(cache_control, cache_ttl_bounds: bounds)
 
-    case ttl_seconds(cache_control, bounds) do
-      ttl when ttl > 0 ->
-        case cache.put(uri, jwks, DateTime.add(DateTime.utc_now(), ttl, :second)) do
-          :ok -> :ok
-          _fault -> warn_cache_write_fault()
-        end
-
-      _ ->
-        :ok
+    if DateTime.after?(expires_at, DateTime.utc_now()) do
+      case cache.put(uri, jwks, expires_at) do
+        :ok -> :ok
+        _fault -> warn_cache_write_fault()
+      end
+    else
+      :ok
     end
   rescue
     _exception -> warn_cache_write_fault()
@@ -297,24 +297,6 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     Logger.warning(@cache_write_warning)
     :ok
   end
-
-  # RFC 9111 freshness: honor `no-store`/`no-cache` (do not cache), clamp a
-  # present `max-age` to the configured bounds, and otherwise cache for the
-  # minimum bound (JWKS endpoints often send no directive but keys rotate
-  # slowly).
-  defp ttl_seconds(cache_control, {min, max}) do
-    cond do
-      Keyword.get(cache_control, :no_store, false) -> 0
-      Keyword.get(cache_control, :no_cache, false) -> 0
-      cache_control[:max_age] == 0 -> 0
-      is_integer(cache_control[:max_age]) -> clamp(cache_control[:max_age], min, max)
-      true -> min
-    end
-  end
-
-  defp clamp(value, min, _max) when value < min, do: min
-  defp clamp(value, _min, max) when value > max, do: max
-  defp clamp(value, _min, _max), do: value
 
   defp verify(config, opts, assertion, issuer, issuer_opts, jwks, client_id) do
     verify_opts =

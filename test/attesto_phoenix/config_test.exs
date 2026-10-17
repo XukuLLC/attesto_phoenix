@@ -6,6 +6,7 @@ defmodule AttestoPhoenix.ConfigTest do
 
   alias Attesto.DPoP.NonceStore.ETS
   alias Attesto.RequestObject.Policy
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Store.EctoRefreshStore
@@ -1170,6 +1171,26 @@ defmodule AttestoPhoenix.ConfigTest do
       cfg = config(client_id: {FlatCallbackModule, :client_id, ["-suffix"]})
 
       assert Config.client_identifier(cfg, "client") == "client-suffix"
+    end
+  end
+
+  describe "client_identifier/3" do
+    test "reads a CIMD client's validated identifier without invoking the host callback" do
+      client_id = "https://client.example/client.json"
+      client = %CIMDClient{metadata: %{"client_id" => client_id}}
+      owner = self()
+
+      cfg =
+        config(
+          client_id: fn host_client ->
+            send(owner, {:host_client_id_callback, host_client})
+            "host-client-id"
+          end
+        )
+
+      assert Config.client_identifier(cfg, client, "presented-client-id") == client_id
+      refute_received {:host_client_id_callback, _client}
+      assert Config.client_identifier(config(), client, "presented-client-id") == client_id
     end
   end
 

@@ -24,6 +24,7 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
   alias AttestoPhoenix.AuthorizationServer.DeviceAuthorization.Request
   alias AttestoPhoenix.ClientAuthentication
   alias AttestoPhoenix.{Config, OAuthError, RequestContext}
+  alias AttestoPhoenix.Controller.QueryParameterGuard
 
   @dpop_request_header "dpop"
   @http_method_post "POST"
@@ -33,32 +34,15 @@ defmodule AttestoPhoenix.Controller.DeviceAuthorizationController do
     config = Config.resolve!(conn)
     conn = OAuthError.no_store(conn, config)
 
-    with :ok <- require_enabled(config),
+    with :ok <- QueryParameterGuard.reject(conn),
+         :ok <- require_enabled(config),
          :ok <- check_https(conn, config),
-         :ok <- reject_query_credentials(conn),
          {:ok, result} <- authenticate_client(config, conn, params),
          {:ok, response} <- DeviceAuthorization.request(config, build_request(config, conn, result, params)) do
       json(conn, response)
     else
+      {:error, :query_parameters_not_allowed} -> render_error(conn, config, QueryParameterGuard.error())
       {:error, %OAuthError{} = err} -> render_error(conn, config, err)
-    end
-  end
-
-  # RFC 6749 §2.3.1: credentials and request params belong in the form body.
-  # Query-string credentials leak through access logs, caches, and browser
-  # history, so reject them before client authentication (as the token endpoint
-  # does), since Phoenix merges query and body params for the action.
-  @query_credential_params ~w(client_id client_secret scope)
-  defp reject_query_credentials(conn) do
-    conn = fetch_query_params(conn)
-
-    case Enum.find(@query_credential_params, &Map.has_key?(conn.query_params, &1)) do
-      nil ->
-        :ok
-
-      key ->
-        {:error,
-         OAuthError.new(:invalid_request, "#{key} must be sent in the request body, not the query string", status: 400)}
     end
   end
 

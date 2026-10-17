@@ -26,7 +26,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
     end
   end
 
-  describe "special_use_ip?/1 (RFC 6890 CIDR table)" do
+  describe "special_use_ip?/1 (shared IANA special-purpose policy)" do
     test "rejects every required special-use IPv4 class" do
       blocked = [
         {127, 0, 0, 1},
@@ -62,24 +62,33 @@ defmodule AttestoPhoenix.ClientIdMetadata.FetcherTest do
       end
     end
 
-    test "rejects Teredo (2001:0000::/32) and ORCHIDv2 (2001:20::/28), accepts neighbouring public 2001:: space" do
-      # Teredo embeds a client IPv4 in its low bits (here 169.254.169.254); the
-      # whole prefix is blocked regardless (RFC 4380 / RFC 6890). ORCHIDv2 is the
-      # /28 at 2001:20:: (RFC 7343). Both are non-octet-aligned/edge cases.
+    test "follows IANA's exceptions within the otherwise non-global 2001::/23" do
       blocked = [
         {0x2001, 0x0000, 0x4136, 0xE378, 0x8000, 0x63BF, 0xA9FE, 0xA9FE},
+        {0x2001, 0x0001, 0, 0, 0, 0, 0, 4},
+        {0x2001, 0x0002, 0, 0, 0, 0, 0, 1},
+        {0x2001, 0x0010, 0, 0, 0, 0, 0, 1},
         {0x2001, 0x0020, 0, 0, 0, 0, 0, 1},
-        {0x2001, 0x002F, 0, 0, 0, 0, 0, 1}
+        {0x2001, 0x002F, 0, 0, 0, 0, 0, 1},
+        {0x2001, 0x0030, 0, 0, 0, 0, 0, 1},
+        {0x2001, 0x003F, 0, 0, 0, 0, 0, 1},
+        {0x2001, 0x0040, 0, 0, 0, 0, 0, 1}
       ]
 
       for ip <- blocked do
         assert Fetcher.special_use_ip?(ip), "expected #{inspect(ip)} to be special-use"
       end
 
-      # Tight edges: 2001:1::/32 (one below Teredo) and 2001:30::/28 (one above
-      # ORCHIDv2) are ordinary global unicast and must NOT be blocked.
-      refute Fetcher.special_use_ip?({0x2001, 0x0001, 0, 0, 0, 0, 0, 1})
-      refute Fetcher.special_use_ip?({0x2001, 0x0030, 0, 0, 0, 0, 0, 1})
+      for ip <- [
+            {0x2001, 0x0001, 0, 0, 0, 0, 0, 1},
+            {0x2001, 0x0001, 0, 0, 0, 0, 0, 2},
+            {0x2001, 0x0001, 0, 0, 0, 0, 0, 3},
+            {0x2001, 0x0003, 0, 0, 0, 0, 0, 1},
+            {0x2001, 0x0004, 0x0112, 0, 0, 0, 0, 1}
+          ] do
+        refute Fetcher.special_use_ip?(ip), "expected #{inspect(ip)} to be globally reachable"
+      end
+
       # A real public 2001:: host (Google PDNS 2001:4860:4860::8888) stays allowed.
       refute Fetcher.special_use_ip?({0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888})
     end

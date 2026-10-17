@@ -966,6 +966,8 @@ defmodule AttestoPhoenix.Config do
   alias Attesto.RequestObject.Policy
   alias Attesto.ResourceIndicator
   alias AttestoPhoenix.Callback
+  alias AttestoPhoenix.ClientIdMetadata
+  alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.ClientIdMetadata.Fetcher.Req
   alias AttestoPhoenix.ClientIdMetadata.HostPolicy
   alias AttestoPhoenix.Store.EctoRefreshStore
@@ -3557,13 +3559,23 @@ defmodule AttestoPhoenix.Config do
   @doc """
   Resolve the host identifier for an opaque client.
 
+  A client resolved from a Client ID Metadata Document carries its validated
+  URL identifier in the document. That identifier is returned directly; the
+  host callback only receives host-owned client values.
+
   `absent_default` is used only when no `:client_id` callback is configured.
   Once configured, the callback must honor its non-empty-string contract;
   invalid results are integration faults and never fall through to a
   credential-carried identifier.
   """
   @spec client_identifier(t(), term(), term()) :: String.t() | term()
-  def client_identifier(%__MODULE__{} = config, client, absent_default \\ nil) do
+  def client_identifier(config, client, absent_default \\ nil)
+
+  def client_identifier(%__MODULE__{}, %CIMDClient{metadata: metadata}, _absent_default) do
+    ClientIdMetadata.client_id(metadata)
+  end
+
+  def client_identifier(%__MODULE__{} = config, client, absent_default) do
     case client_id_fun(config) do
       nil ->
         absent_default
