@@ -338,6 +338,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # an unknown client from a wrong secret.
   @client_auth_failed "client authentication failed"
 
+  # The attestation payload is read before client authentication; this is
+  # the bound `Attesto.WalletAttestation` applies when it verifies the JWT.
+  @max_attestation_bytes 256 * 1_024
+
   @registered_auth_methods ~w(client_secret_basic client_secret_post
                               private_key_jwt attest_jwt_client_auth tls_client_auth
                               self_signed_tls_client_auth none)
@@ -935,7 +939,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   end
 
   defp attested_client_id(attestation, presented_client_id) do
-    with {:ok, %{"sub" => client_id}} <- JWS.peek_json(attestation, :payload),
+    with {:ok, %{"sub" => client_id}} <- JWS.peek_json(attestation, :payload, max_compact_bytes: @max_attestation_bytes),
          true <- is_binary(client_id) and client_id != "",
          true <- is_nil(presented_client_id) or presented_client_id == client_id do
       {:ok, client_id}

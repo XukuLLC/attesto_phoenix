@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: XukuLLC/attesto
-          ref: 3c3936af092233c8895abcce5ae0245600c339d4
+          ref: 5df398e193a0db1e94b2f804beec596d41503669
           path: attesto
 
       - name: Verify Attesto core revision

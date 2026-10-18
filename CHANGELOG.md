@@ -48,6 +48,11 @@ defaults in a minor release.
   record. Requests without client authentication now return `invalid_client`
   without revealing whether the code requires holder-of-key proof.
 
+- Bound the wallet attestation, OID4VP response code, and credential proof
+  JWTs that are read before authentication to the limits Attesto core applies
+  when it verifies them. Attesto 2.6.1 bounds JSON nesting on the same paths
+  and belongs in the same deployment.
+
 ### Fixed
 
 - Preserve subject-token expiry and client delegation lineage (`act`) during

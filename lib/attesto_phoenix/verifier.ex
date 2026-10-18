@@ -20,6 +20,9 @@ defmodule AttestoPhoenix.Verifier do
   @self_issued_audience "https://self-issued.me/v2"
   @request_object_type "oauth-authz-req+jwt"
   @response_code_type "oid4vp-response-code+jwt"
+  # A response code carries a session identifier and registered claims only
+  # and is read before any authentication.
+  @max_response_code_bytes 16 * 1_024
   @encrypted_response_alg "ECDH-ES"
   # HAIP §5 requires the verifier to advertise both A128GCM and A256GCM content
   # encryption.
@@ -150,7 +153,8 @@ defmodule AttestoPhoenix.Verifier do
   defp verify_response_code(config, response_code) do
     now = System.system_time(:second)
 
-    with {:ok, %{"typ" => @response_code_type} = header} <- JWS.peek_json(response_code, :protected),
+    with {:ok, %{"typ" => @response_code_type} = header} <-
+           JWS.peek_json(response_code, :protected, max_compact_bytes: @max_response_code_bytes),
          :ok <- JWS.reject_unsupported_crit(header, supported: []),
          candidates when candidates != [] <- response_code_candidates(config, header["kid"]),
          {:ok, claims} <-

@@ -31,6 +31,9 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   require Logger
 
   @credential_configuration_ids_claim "credential_configuration_ids"
+  # The bound `Attesto.CredentialProof` applies; a proof header may carry a
+  # key attestation JWT.
+  @max_proof_bytes 256 * 1_024
   @mdoc_signing_key_error "mso_mdoc issuance requires an EC P-256 (ES256) VC signing key."
   @invalid_builder_result_warning "AttestoPhoenix credential builder returned an invalid result; credential issuance denied"
   @builder_failure "AttestoPhoenix credential builder callback failed"
@@ -244,7 +247,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   defp verify_proof(_config, _claims, _proof), do: {:error, :invalid_proof}
 
   defp peek_proof_payload(jwt) do
-    case JWS.peek_json(jwt, :payload) do
+    case JWS.peek_json(jwt, :payload, max_compact_bytes: @max_proof_bytes) do
       {:ok, payload} when is_map(payload) -> {:ok, payload}
       _other -> {:error, :invalid_proof}
     end
