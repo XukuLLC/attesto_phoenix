@@ -63,7 +63,7 @@ jobs:
 
       - name: Verify Attesto core revision
         working-directory: attesto
-        run: test "$(git rev-parse HEAD)" = "3c3936af092233c8895abcce5ae0245600c339d4"
+        run: test "$(git rev-parse HEAD)" = "5df398e193a0db1e94b2f804beec596d41503669"
 
       - name: Set up Elixir
         uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
@@ -75,17 +75,17 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: deps
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-3c3936af092233c8895abcce5ae0245600c339d4-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-5df398e193a0db1e94b2f804beec596d41503669-${{ hashFiles('attesto/**') }}-mix-${{ hashFiles('**/mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-3c3936af092233c8895abcce5ae0245600c339d4-${{ hashFiles('attesto/**') }}-mix-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-5df398e193a0db1e94b2f804beec596d41503669-${{ hashFiles('attesto/**') }}-mix-
 
       - name: Restore build cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: _build
-          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-3c3936af092233c8895abcce5ae0245600c339d4-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
+          key: ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-5df398e193a0db1e94b2f804beec596d41503669-${{ hashFiles('attesto/**') }}-build-${{ hashFiles('**/mix.lock') }}-${{ hashFiles('**/mix.exs') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-3c3936af092233c8895abcce5ae0245600c339d4-${{ hashFiles('attesto/**') }}-build-
+            ${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-attesto-5df398e193a0db1e94b2f804beec596d41503669-${{ hashFiles('attesto/**') }}-build-
 
       - name: Install dependencies
         run: |
