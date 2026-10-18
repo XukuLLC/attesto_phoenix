@@ -6,6 +6,19 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.2.1] - 2026-10-18
+
+### Changed
+
+- Require Attesto `>= 2.6.1 and < 3.0.0`, so the token endpoint's
+  pre-authentication JSON nesting and size bounds ship with every 4.2
+  deployment instead of being a recommendation.
+- Give `delivery_id` a database default in the generated `--upgrade 4.2`
+  migration so a 4.1 writer that inserts a logout session during a rolling
+  upgrade still succeeds; 4.2 writers always supply their own identifier. The
+  README's "Upgrading to 4.2" section now states the rollout order and the
+  one-line `ALTER` for databases migrated with the 4.2.0 generator.
+
 ## [4.2.0] - 2026-10-18
 
 ### Breaking

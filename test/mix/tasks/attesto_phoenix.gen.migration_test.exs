@@ -104,7 +104,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|add :lease_expires_at, :utc_datetime|
       assert source =~ ~s|add :delivery_attempts, :integer, null: false, default: 0|
       assert source =~ ~s|SET delivery_id = id::text WHERE delivery_id IS NULL|
-      assert source =~ ~s|modify :delivery_id, :string, size: 255, null: false|
+      assert source =~ ~s|modify :delivery_id, :string,|
+      assert source =~ ~s|default: fragment("md5(random()::text \|\| clock_timestamp()::text)")|
       assert source =~ ~s|create unique_index(:attesto_logout_sessions, [:delivery_id], prefix: prefix)|
       assert source =~ ~s|create index(:attesto_logout_sessions, [:lease_expires_at], prefix: prefix)|
       assert source =~ ~s|create index(:attesto_logout_sessions, [:lease_id, :delivery_id], prefix: prefix)|

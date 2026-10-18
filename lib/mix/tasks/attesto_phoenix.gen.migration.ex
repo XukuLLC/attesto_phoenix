@@ -2270,7 +2270,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       execute("UPDATE " <> table <> " SET delivery_id = id::text WHERE delivery_id IS NULL")
 
       alter table(:attesto_logout_sessions, prefix: prefix) do
-        modify :delivery_id, :string, size: 255, null: false
+        # A database default keeps 4.1 writers inserting during a rolling
+        # upgrade; 4.2 writers always supply their own identifier. md5 over
+        # random() and the clock needs no extension on any supported PostgreSQL.
+        modify :delivery_id, :string,
+          size: 255,
+          null: false,
+          default: fragment("md5(random()::text || clock_timestamp()::text)")
       end
 
       create unique_index(:attesto_logout_sessions, [:delivery_id], prefix: prefix)
