@@ -5,9 +5,11 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     case dependency!(:attesto) do
       {:attesto, requirement} when is_binary(requirement) ->
         # Phoenix 4.2 uses Attesto 2.6's durable logout-store lease contract and
-        # authorization-code replay integration, and 4.2.1 requires the 2.6.1
-        # pre-authentication JSON bounds its token-endpoint reads rely on.
-        assert Version.match?("2.6.1", requirement)
+        # authorization-code replay integration, 4.2.1 requires the 2.6.1
+        # pre-authentication JSON bounds its token-endpoint reads rely on, and
+        # 4.2.2 requires 2.7.0 for its JOSE 1.11.13 floor.
+        assert Version.match?("2.7.0", requirement)
+        refute Version.match?("2.6.1", requirement)
         refute Version.match?("2.6.0", requirement)
         refute Version.match?("2.5.0", requirement)
         refute Version.match?("2.4.0", requirement)
@@ -55,7 +57,8 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "an empty source path selects the released requirement" do
     with_environment(%{"ATTESTO_SOURCE_PATH" => "", "ATTESTO_PATH" => nil}, fn ->
       assert {:attesto, requirement} = dependency!(:attesto)
-      assert Version.match?("2.6.1", requirement)
+      assert Version.match?("2.7.0", requirement)
+      refute Version.match?("2.6.1", requirement)
       refute Version.match?("2.6.0", requirement)
       refute Version.match?("2.5.0", requirement)
       refute Version.match?("2.4.0", requirement)
@@ -86,9 +89,9 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     assert exit_code == 0, output
 
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
-    assert metadata =~ ~s(<<"version">>,<<"4.2.1">>)
+    assert metadata =~ ~s(<<"version">>,<<"4.2.2">>)
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
-    assert metadata =~ ~s(<<"requirement">>,<<">= 2.6.1 and < 3.0.0">>)
+    assert metadata =~ ~s(<<"requirement">>,<<">= 2.7.0 and < 3.0.0">>)
     assert File.regular?(Path.join(output_path, "guides/upgrade_4_0.md"))
   end
 

@@ -276,7 +276,8 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
           "PS384",
           "PS512",
           "EdDSA",
-          "Ed25519"
+          "Ed25519",
+          "Ed448"
         ],
         "end_session_endpoint" => "https://issuer.example/oauth/end_session",
         "frontchannel_logout_session_supported" => true,

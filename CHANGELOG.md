@@ -6,6 +6,23 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.2.2] - 2026-10-27
+
+### Security
+
+- Decrypt `direct_post.jwt` presentation responses through `Attesto.JWE`,
+  which admits only a public P-256 ephemeral key (`epk`) before JOSE parses
+  the protected header. With JOSE 1.11.12 and earlier, an `epk` of another key
+  type made decryption loop without end (CVE-2026-65628), and an RSA private
+  `epk` without CRT members cost about a second of CPU per request
+  (CVE-2026-65631). Any client holding a live presentation session id could
+  send either. The endpoint is mounted only with `presentation: true`.
+  Protected headers on this endpoint are now limited to 16 KiB.
+
+### Changed
+
+- Require Attesto `>= 2.7.0 and < 3.0.0`, which requires JOSE 1.11.13.
+
 ## [4.2.1] - 2026-10-18
 
 ### Changed

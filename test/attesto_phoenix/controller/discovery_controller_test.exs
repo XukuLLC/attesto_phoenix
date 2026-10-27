@@ -177,7 +177,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
           "PS384",
           "PS512",
           "EdDSA",
-          "Ed25519"
+          "Ed25519",
+          "Ed448"
         ],
         "end_session_endpoint" => "https://issuer.example/oauth/end_session",
         "grant_types_supported" => [

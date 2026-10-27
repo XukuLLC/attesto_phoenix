@@ -10,7 +10,7 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  alias Attesto.PresentationSession
+  alias Attesto.{JWE, PresentationSession}
   alias AttestoPhoenix.{Config, OAuthError, RequestContext, Verifier}
   alias Plug.Conn.Unfetched
 
@@ -82,15 +82,20 @@ defmodule AttestoPhoenix.Controller.PresentationResponseController do
   defp decrypt_response(encrypted_response, store) when is_binary(encrypted_response) do
     # The JWE `kid` is the presentation session id (the verifier advertised a
     # fresh, per-request encryption key keyed by it); recover that session's
-    # private key to decrypt.
+    # private key to decrypt. `Attesto.JWE` admits only a public P-256 `epk`
+    # before JOSE sees the header: the wallet chooses that key, and JOSE before
+    # 1.11.13 looped forever on a key of another type.
     with {:ok, segments} <- compact_jwe(encrypted_response),
          {:ok, header} <- protected_header(segments.protected),
          :ok <- encrypted_response_algorithms(header),
          :ok <- encrypted_response_parameters(segments),
          {:ok, kid} <- jwe_kid(header),
          {:ok, jwk_map} <- PresentationSession.response_encryption_jwk(store, kid),
-         %JOSE.JWK{} = private_jwk <- JOSE.JWK.from_map(jwk_map),
-         {plaintext, %JOSE.JWE{}} <- JOSE.JWE.block_decrypt(private_jwk, encrypted_response),
+         {:ok, plaintext, _header} <-
+           JWE.decrypt(jwk_map, encrypted_response,
+             max_compact_bytes: @max_compact_jwe_bytes,
+             max_plaintext_bytes: @max_compact_jwe_bytes
+           ),
          {:ok, params} <- decode_json_map(plaintext),
          {:ok, state, vp_token} <- decoded_response(params),
          true <- state == kid do

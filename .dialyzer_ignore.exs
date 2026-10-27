@@ -12,7 +12,7 @@
   {"lib/attesto_phoenix/config.ex", :pattern_match, {5269, 8}},
 
   # Host callbacks are not constrained at runtime by their declared success type.
-  {"lib/attesto_phoenix/controller/credential_controller.ex", :pattern_match_cov, {377, 8}},
+  {"lib/attesto_phoenix/controller/credential_controller.ex", :pattern_match_cov, {380, 8}},
 
   # URI and Plug structs can be manually assembled with malformed field values.
   {"lib/attesto_phoenix/controller/registration_controller.ex", :pattern_match_cov, {549, 8}},

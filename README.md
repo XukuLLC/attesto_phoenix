@@ -178,9 +178,9 @@ policy used by Client ID Metadata retrieval.
 
 ## Upgrading to 4.2
 
-AttestoPhoenix 4.2 requires Attesto 2.6.1 and adds durable delivery leases to
-the bundled Ecto logout-session store. Apply the generated migration before
-starting 4.2 writers:
+AttestoPhoenix 4.2 requires Attesto 2.6.1 (2.7.0 from 4.2.2) and adds durable
+delivery leases to the bundled Ecto logout-session store. Apply the generated
+migration before starting 4.2 writers:
 
 ```bash
 mix attesto_phoenix.gen.migration --upgrade 4.2 --repo MyApp.Repo

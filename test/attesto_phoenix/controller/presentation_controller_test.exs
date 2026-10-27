@@ -323,6 +323,43 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     end)
   end
 
+  test "direct_post.jwt rejects an ephemeral key other than a public P-256 key before decrypting",
+       %{conn: conn} = ctx do
+    config = configure_response_mode(ctx.config, "direct_post.jwt")
+    ctx = %{ctx | config: config}
+    session = create_request(ctx)
+    encryption_jwk = advertised_encryption_jwk(session.id, ctx.request_jwk)
+
+    valid =
+      encrypt_response(
+        encryption_jwk,
+        JSON.encode!(%{"vp_token" => valid_vp_token(ctx, session.nonce), "state" => session.id})
+      )
+
+    [protected | _rest] = String.split(valid, ".")
+    header = protected |> Base.url_decode64!(padding: false) |> JSON.decode!()
+    {_modules, x25519} = {:okp, :X25519} |> JOSE.JWK.generate_key() |> JOSE.JWK.to_public_map()
+    {_modules, p384} = {:ec, "P-384"} |> JOSE.JWK.generate_key() |> JOSE.JWK.to_public_map()
+    {_modules, p256_private} = {:ec, "P-256"} |> JOSE.JWK.generate_key() |> JOSE.JWK.to_map()
+
+    # Without CRT members, JOSE before 1.11.13 recovered the primes of this
+    # RSA key while parsing the header; the X25519 key made it loop forever.
+    rsa_private = %{
+      "kty" => "RSA",
+      "n" => encode64(:crypto.strong_rand_bytes(256)),
+      "e" => "AQAB",
+      "d" => encode64(:crypto.strong_rand_bytes(255))
+    }
+
+    Enum.reduce([x25519, rsa_private, p384, p256_private], conn, fn epk, request_conn ->
+      protected = header |> Map.put("epk", epk) |> JSON.encode!() |> encode64()
+      response = post_encrypted_response(request_conn, config, replace_jwe_segment(valid, 0, protected))
+      assert_invalid_request(response)
+      assert_pending(session.id)
+      recycle(response)
+    end)
+  end
+
   test "direct_post.jwt rejects separator floods without globally splitting them", %{conn: conn} = ctx do
     config = configure_response_mode(ctx.config, "direct_post.jwt")
     session = create_request(%{ctx | config: config})
