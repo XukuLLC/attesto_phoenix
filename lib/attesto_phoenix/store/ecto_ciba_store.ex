@@ -26,9 +26,8 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
 
   @behaviour Attesto.CIBAStore
 
-  import Ecto.Query, only: [from: 2]
+  import Ecto.Query, only: [dynamic: 2]
 
-  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.CIBARequest
   alias AttestoPhoenix.Store.Ecto, as: StoreEcto
   alias AttestoPhoenix.Store.PendingDecision
@@ -49,18 +48,7 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
 
   @impl Attesto.CIBAStore
   @spec lookup(Attesto.CIBAStore.auth_req_id_hash()) :: {:ok, Attesto.CIBAStore.entry()} | :error
-  def lookup(hash) when is_binary(hash) do
-    prefix = Config.table_prefix()
-
-    case repo().one(from(c in CIBARequest, where: c.auth_req_id_hash == ^hash),
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
-      nil -> :error
-      row -> {:ok, CIBARequest.to_entry(row)}
-    end
-  end
+  def lookup(hash) when is_binary(hash), do: PendingDecision.fetch(CIBARequest, :auth_req_id_hash, hash)
 
   @impl Attesto.CIBAStore
   @spec approve(Attesto.CIBAStore.auth_req_id_hash(), map(), map()) ::
@@ -68,7 +56,7 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   def approve(hash, approval, opts) when is_binary(hash) and is_map(approval) and is_map(opts) do
     granted_claims = Map.get(approval, :granted_claims, %{})
     PendingDecision.validate_granted_claims!(granted_claims, @invalid_approval_claims)
-    now = decision_now(opts)
+    now = PendingDecision.decision_now(opts)
 
     PendingDecision.decide(CIBARequest, :auth_req_id_hash, hash, now,
       status: :approved,
@@ -84,42 +72,27 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
   @spec deny(Attesto.CIBAStore.auth_req_id_hash(), map()) ::
           {:ok, Attesto.CIBAStore.entry()} | {:error, :not_found | :already_decided | :expired}
   def deny(hash, opts) when is_binary(hash) and is_map(opts) do
-    PendingDecision.decide(CIBARequest, :auth_req_id_hash, hash, decision_now(opts), status: :denied)
+    PendingDecision.decide(CIBARequest, :auth_req_id_hash, hash, PendingDecision.decision_now(opts), status: :denied)
   end
 
   @impl Attesto.CIBAStore
   @spec poll(Attesto.CIBAStore.auth_req_id_hash(), map()) ::
           {:ok, Attesto.CIBAStore.entry()} | {:error, :slow_down} | :error
   def poll(hash, %{now: now}) when is_binary(hash) do
-    {repo, prefix} = StoreEcto.mutation_context()
-    now_dt = now |> DateTime.from_unix!() |> DateTime.truncate(:second)
+    now_dt = PendingDecision.to_datetime(now)
 
-    # The §7.3 throttle: accept the first poll (last_polled_at NULL) or a poll
-    # at least the row's `interval` seconds after the last accepted one. The
-    # interval is the ROW's column (the value the client was told at issue), so
-    # `$now - interval` is computed per-row in SQL. interval 0 makes the cutoff
-    # `$now`, so any past `last_polled_at` passes (enforcement disabled).
-    query =
-      from c in CIBARequest,
-        where:
-          c.auth_req_id_hash == ^hash and
-            (is_nil(c.last_polled_at) or
-               fragment(
-                 "? <= CAST(? AS timestamp) - (? * interval '1 second')",
-                 c.last_polled_at,
-                 ^now_dt,
-                 c.interval
-               )),
-        select: c
+    # The §7.3 throttle: a poll at least the row's `interval` seconds after the
+    # last accepted one. The interval is the ROW's column (the value the client
+    # was told at issue), so `$now - interval` is computed per-row in SQL.
+    # interval 0 makes the cutoff `$now`, so any past `last_polled_at` passes
+    # (enforcement disabled).
+    throttle =
+      dynamic(
+        [c],
+        fragment("? <= CAST(? AS timestamp) - (? * interval '1 second')", c.last_polled_at, ^now_dt, c.interval)
+      )
 
-    case repo.update_all(query, [set: [last_polled_at: now_dt]],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
-      {1, [row]} -> {:ok, CIBARequest.to_entry(%{row | last_polled_at: now_dt})}
-      {0, _} -> PendingDecision.slow_down_or_missing(CIBARequest, :auth_req_id_hash, hash, repo, prefix)
-    end
+    PendingDecision.poll(CIBARequest, :auth_req_id_hash, hash, now, throttle)
   end
 
   @impl Attesto.CIBAStore
@@ -135,11 +108,7 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
 
   # ----- internal -----
 
-  defp decision_now(opts), do: Map.get(opts, :now, System.system_time(:second))
-
   defp unix_to_datetime(nil), do: nil
-  defp unix_to_datetime(unix) when is_integer(unix), do: unix |> DateTime.from_unix!() |> DateTime.truncate(:second)
+  defp unix_to_datetime(unix) when is_integer(unix), do: PendingDecision.to_datetime(unix)
   defp unix_to_datetime(%DateTime{} = dt), do: DateTime.truncate(dt, :second)
-
-  defp repo, do: Config.ecto_repo!()
 end

@@ -225,8 +225,10 @@ defaults now fail closed; each has an explicit setting for a deployment that
 needs the old behaviour:
 
 - Dynamic registration admits only `authorization_code`, `refresh_token`, and
-  the device grant. List any other registrable grant in
-  `:registration_grant_types`, behind an admission control.
+  the device grant, and of those only the ones in `:grant_types_supported`; a
+  server without device authorization does not start admitting the device
+  grant. List any other registrable grant in `:registration_grant_types`,
+  behind an admission control.
 - `private_key_jwt` assertions at the token and backchannel endpoints must use
   the issuer as `aud`. Clients that send the token endpoint URL fail with
   `invalid_client` until they are updated or the URL is listed in
@@ -315,7 +317,11 @@ guide](guides/upgrade_3_0_schema_prefix.md); do not infer it from configuration.
   including OAuth token exchange. An explicit empty `grant_types_supported: []`
   or `token_endpoint_auth_methods_supported: []` remains empty; it does not
   fall back to the package defaults. Set an explicit narrowed catalog before
-  deployment when token exchange must remain unavailable.
+  deployment when token exchange must remain unavailable. From 4.3 the
+  registration endpoint no longer accepts that whole catalog by default: it
+  admits only `authorization_code`, `refresh_token`, and the device grant (see
+  [Upgrading to 4.3](#upgrading-to-43)), and token exchange and other
+  non-interactive grants need `:registration_grant_types`.
 - Client-authentication method policy is exact in 3.0. In 2.14.2, an unset or
   empty `token_endpoint_auth_methods_supported` value did not restrict endpoint
   authentication, so mTLS could work when its callbacks were wired. In 3.0,
@@ -1080,9 +1086,9 @@ requests when enabled. Put deployment admission controls such as an initial
 access token, rate limits, or an allowlist in the host pipeline before the
 controller.
 
-Since 4.3 a registration may request only the supported grants in which a
-resource owner approves the client: `authorization_code`, `refresh_token`, and
-the RFC 8628 device grant. `client_credentials`, JWT-bearer, token exchange, and
+Since 4.3 a registration may request only the grants in which a resource owner
+approves the client: `authorization_code`, `refresh_token`, and the RFC 8628
+device grant, each only if it is in `:grant_types_supported`. `client_credentials`, JWT-bearer, token exchange, and
 CIBA mint tokens with no resource owner approving the client, so a host that
 wants registrants to have them lists them in `:registration_grant_types`, and
 does so only behind an admission control:

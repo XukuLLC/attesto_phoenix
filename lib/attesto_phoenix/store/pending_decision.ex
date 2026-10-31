@@ -1,9 +1,10 @@
 defmodule AttestoPhoenix.Store.PendingDecision do
   @moduledoc false
 
-  import Ecto.Query, only: [from: 2]
+  import Ecto.Query, only: [from: 2, dynamic: 2]
 
   alias Attesto.Claims
+  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Store.Ecto, as: StoreEcto
 
   @type decision_error :: {:error, :not_found | :already_decided | :expired}
@@ -13,7 +14,7 @@ defmodule AttestoPhoenix.Store.PendingDecision do
   def decide(schema, key_field, key, now, set)
       when is_atom(schema) and is_atom(key_field) and is_binary(key) and is_integer(now) and is_list(set) do
     {repo, prefix} = StoreEcto.mutation_context()
-    now_dt = now |> DateTime.from_unix!() |> DateTime.truncate(:second)
+    now_dt = to_datetime(now)
 
     query =
       from row in schema,
@@ -28,11 +29,49 @@ defmodule AttestoPhoenix.Store.PendingDecision do
     end
   end
 
+  @spec fetch(module(), atom(), String.t()) :: {:ok, map()} | :error
+  def fetch(schema, key_field, key) when is_atom(schema) and is_atom(key_field) and is_binary(key) do
+    query = from row in schema, where: field(row, ^key_field) == ^key
+
+    case Config.ecto_repo!().one(query, query_options(Config.table_prefix())) do
+      nil -> :error
+      row -> {:ok, schema.to_entry(row)}
+    end
+  end
+
+  # Record an accepted poll: the first one (`last_polled_at` NULL) or one that
+  # satisfies the store's `throttle` condition on the same row, in a single
+  # conditional UPDATE. A miss is `slow_down` when the row exists and `:error`
+  # when it does not.
+  @spec poll(module(), atom(), String.t(), integer(), Ecto.Query.dynamic_expr()) ::
+          {:ok, map()} | {:error, :slow_down} | :error
+  def poll(schema, key_field, key, now, throttle)
+      when is_atom(schema) and is_atom(key_field) and is_binary(key) and is_integer(now) do
+    {repo, prefix} = StoreEcto.mutation_context()
+    now_dt = to_datetime(now)
+
+    conditions =
+      dynamic([row], field(row, ^key_field) == ^key and (is_nil(row.last_polled_at) or ^throttle))
+
+    query = from row in schema, where: ^conditions, select: row
+
+    case repo.update_all(query, [set: [last_polled_at: now_dt]], query_options(prefix)) do
+      {1, [row]} -> {:ok, schema.to_entry(%{row | last_polled_at: now_dt})}
+      {0, _} -> slow_down_or_missing(schema, key_field, key, repo, prefix)
+    end
+  end
+
+  @spec decision_now(map()) :: integer()
+  def decision_now(opts) when is_map(opts), do: Map.get(opts, :now, System.system_time(:second))
+
+  @spec to_datetime(integer()) :: DateTime.t()
+  def to_datetime(unix) when is_integer(unix), do: unix |> DateTime.from_unix!() |> DateTime.truncate(:second)
+
   @spec consume(module(), atom(), String.t(), integer()) :: {:ok, map()} | :error
   def consume(schema, key_field, key, now)
       when is_atom(schema) and is_atom(key_field) and is_binary(key) and is_integer(now) do
     {repo, prefix} = StoreEcto.mutation_context()
-    now_dt = now |> DateTime.from_unix!() |> DateTime.truncate(:second)
+    now_dt = to_datetime(now)
 
     query =
       from row in schema,

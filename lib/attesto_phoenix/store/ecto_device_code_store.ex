@@ -25,9 +25,8 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
 
   @behaviour Attesto.DeviceCodeStore
 
-  import Ecto.Query, only: [from: 2]
+  import Ecto.Query, only: [dynamic: 2]
 
-  alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DeviceCode
   alias AttestoPhoenix.Store.Ecto, as: StoreEcto
   alias AttestoPhoenix.Store.PendingDecision
@@ -59,33 +58,12 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   @impl Attesto.DeviceCodeStore
   @spec lookup_user_code(Attesto.DeviceCodeStore.user_code()) ::
           {:ok, Attesto.DeviceCodeStore.entry()} | :error
-  def lookup_user_code(user_code) when is_binary(user_code) do
-    prefix = Config.table_prefix()
-
-    case repo().one(from(d in DeviceCode, where: d.user_code == ^user_code),
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
-      nil -> :error
-      row -> {:ok, DeviceCode.to_entry(row)}
-    end
-  end
+  def lookup_user_code(user_code) when is_binary(user_code),
+    do: PendingDecision.fetch(DeviceCode, :user_code, user_code)
 
   @impl Attesto.DeviceCodeStore
   @spec get(Attesto.DeviceCodeStore.device_code_hash()) :: {:ok, Attesto.DeviceCodeStore.entry()} | :error
-  def get(hash) when is_binary(hash) do
-    prefix = Config.table_prefix()
-
-    case repo().one(from(d in DeviceCode, where: d.device_code_hash == ^hash),
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
-      nil -> :error
-      row -> {:ok, DeviceCode.to_entry(row)}
-    end
-  end
+  def get(hash) when is_binary(hash), do: PendingDecision.fetch(DeviceCode, :device_code_hash, hash)
 
   @impl Attesto.DeviceCodeStore
   @spec approve(Attesto.DeviceCodeStore.user_code(), map(), map()) ::
@@ -94,7 +72,7 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
     granted_claims = Map.get(approval, :granted_claims, %{})
     PendingDecision.validate_granted_claims!(granted_claims, @invalid_approval_claims)
 
-    PendingDecision.decide(DeviceCode, :user_code, user_code, decision_now(opts),
+    PendingDecision.decide(DeviceCode, :user_code, user_code, PendingDecision.decision_now(opts),
       status: :approved,
       subject: Map.get(approval, :subject),
       granted_scope: Map.get(approval, :granted_scope, []),
@@ -106,30 +84,16 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   @spec deny(Attesto.DeviceCodeStore.user_code(), map()) ::
           {:ok, Attesto.DeviceCodeStore.entry()} | {:error, :not_found | :already_decided | :expired}
   def deny(user_code, opts) when is_binary(user_code) and is_map(opts) do
-    PendingDecision.decide(DeviceCode, :user_code, user_code, decision_now(opts), status: :denied)
+    PendingDecision.decide(DeviceCode, :user_code, user_code, PendingDecision.decision_now(opts), status: :denied)
   end
 
   @impl Attesto.DeviceCodeStore
   @spec poll(Attesto.DeviceCodeStore.device_code_hash(), map()) ::
           {:ok, Attesto.DeviceCodeStore.entry()} | {:error, :slow_down} | :error
   def poll(hash, %{now: now, interval: interval}) when is_binary(hash) do
-    {repo, prefix} = StoreEcto.mutation_context()
-    now_dt = DateTime.from_unix!(now) |> DateTime.truncate(:second)
-    cutoff = DateTime.from_unix!(now - interval) |> DateTime.truncate(:second)
-
-    query =
-      from d in DeviceCode,
-        where: d.device_code_hash == ^hash and (is_nil(d.last_polled_at) or d.last_polled_at <= ^cutoff),
-        select: d
-
-    case repo.update_all(query, [set: [last_polled_at: now_dt]],
-           prefix: prefix,
-           log: false,
-           telemetry_event: nil
-         ) do
-      {1, [row]} -> {:ok, DeviceCode.to_entry(%{row | last_polled_at: now_dt})}
-      {0, _} -> PendingDecision.slow_down_or_missing(DeviceCode, :device_code_hash, hash, repo, prefix)
-    end
+    # RFC 8628 §3.5: the interval is the one the core passes in.
+    cutoff = PendingDecision.to_datetime(now - interval)
+    PendingDecision.poll(DeviceCode, :device_code_hash, hash, now, dynamic([d], d.last_polled_at <= ^cutoff))
   end
 
   @impl Attesto.DeviceCodeStore
@@ -145,8 +109,4 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
   end
 
   # ----- internal -----
-
-  defp decision_now(opts), do: Map.get(opts, :now, System.system_time(:second))
-
-  defp repo, do: Config.ecto_repo!()
 end

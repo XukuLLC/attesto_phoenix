@@ -6,6 +6,19 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.3.1] - 2026-10-31
+
+### Changed
+
+- The Ecto CIBA and device-code stores share their throttled poll update and
+  key lookups. Behaviour is unchanged.
+
+### Documentation
+
+- The 4.3.0 notes and "Upgrading to 4.3" state that the registration default
+  only admits grants that are also in `:grant_types_supported`, and the 2.x
+  upgrade notes on the registration grant catalog point to the 4.3 default.
+
 ## [4.3.0] - 2026-10-31
 
 ### Security
@@ -18,8 +31,10 @@ defaults in a minor release.
   those names produces duplicate query parameters on redirect (Keycloak
   CVE-2026-9689 / CVE-2026-18209, django-oauth-toolkit 3.4.1, Doorkeeper #1851).
 - **Breaking:** dynamic registration (RFC 7591 §2) now admits only the
-  supported grants in which a resource owner approves the client:
-  `authorization_code`, `refresh_token`, and the RFC 8628 device grant. Until
+  grants in which a resource owner approves the client:
+  `authorization_code`, `refresh_token`, and the RFC 8628 device grant, each
+  only if it is also in `:grant_types_supported`, so a server without device
+  authorization does not start admitting the device grant. Until
   now the endpoint accepted every grant the server supports, so an anonymous
   registration on an open endpoint could claim `client_credentials`,
   JWT-bearer, token exchange, or CIBA and mint tokens with no user in the
