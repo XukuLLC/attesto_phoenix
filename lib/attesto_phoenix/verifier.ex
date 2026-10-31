@@ -13,8 +13,90 @@ defmodule AttestoPhoenix.Verifier do
   changes request-object signing policy.
   """
 
-  alias Attesto.{JWS, Key, PresentationRequest, PresentationSession, Secret, SigningAlg, VpToken}
+  alias Attesto.{
+    JWE,
+    JWS,
+    Key,
+    PresentationRequest,
+    PresentationSession,
+    Secret,
+    SigningAlg,
+    StrictJSON,
+    VpToken
+  }
+
   alias AttestoPhoenix.Config
+
+  defmodule PresentationResponse do
+    @moduledoc """
+    Normalized OID4VP direct-post presentation response (`direct_post` or
+    `direct_post.jwt`).
+    """
+
+    alias Attesto.StrictJSON
+
+    @enforce_keys [:mode]
+    defstruct [:mode, :response, :state, :vp_token]
+
+    @type t ::
+            %__MODULE__{
+              mode: :encrypted,
+              response: String.t(),
+              state: nil,
+              vp_token: nil
+            }
+            | %__MODULE__{
+                mode: :plaintext,
+                response: nil,
+                state: String.t(),
+                vp_token: map()
+              }
+
+    @doc """
+    Normalize a direct-post request body map into a typed
+    `%PresentationResponse{}` struct.
+    """
+    @spec from_params(term()) :: {:ok, t()} | {:error, :malformed}
+    def from_params(params) when is_map(params) and not is_struct(params) do
+      case fetch_param(params, "response") do
+        {:ok, encrypted_response} when is_binary(encrypted_response) ->
+          {:ok, %__MODULE__{mode: :encrypted, response: encrypted_response}}
+
+        {:ok, _non_binary} ->
+          {:error, :malformed}
+
+        :error ->
+          with state when is_binary(state) and state != "" <- param(params, "state"),
+               {:ok, vp_token} <- decode_vp_token(param(params, "vp_token")) do
+            {:ok, %__MODULE__{mode: :plaintext, state: state, vp_token: vp_token}}
+          else
+            _ -> {:error, :malformed}
+          end
+      end
+    end
+
+    def from_params(_params), do: {:error, :malformed}
+
+    defp decode_vp_token(%{} = vp_token), do: {:ok, vp_token}
+
+    defp decode_vp_token(vp_token) when is_binary(vp_token) do
+      case StrictJSON.decode(vp_token) do
+        {:ok, %{} = decoded} -> {:ok, decoded}
+        _ -> {:error, :malformed}
+      end
+    end
+
+    defp decode_vp_token(_vp_token), do: {:error, :malformed}
+
+    defp param(params, key), do: Map.get(params, key) || Map.get(params, String.to_existing_atom(key))
+
+    defp fetch_param(params, name) do
+      case Map.fetch(params, name) do
+        {:ok, value} -> {:ok, value}
+        :error -> Map.fetch(params, String.to_existing_atom(name))
+      end
+    end
+  end
 
   @presentation_ttl_seconds 300
   @self_issued_audience "https://self-issued.me/v2"
@@ -23,10 +105,21 @@ defmodule AttestoPhoenix.Verifier do
   # A response code carries a session identifier and registered claims only
   # and is read before any authentication.
   @max_response_code_bytes 16 * 1_024
+  # `response` is attacker-controlled input at a public endpoint. Bound it and
+  # parse at most four separators before JOSE performs Base64URL decoding or
+  # authenticated decryption. Presentations may be substantially larger than
+  # ordinary JWTs, so the ciphertext receives a 16 MiB total envelope while the
+  # protected header retains the hardened 256 KiB JOSE ceiling.
+  @max_compact_jwe_bytes 16 * 1_024 * 1_024
+  @max_protected_segment_bytes 256 * 1_024
   @encrypted_response_alg "ECDH-ES"
   # HAIP §5 requires the verifier to advertise both A128GCM and A256GCM content
   # encryption.
   @encrypted_response_enc_values ["A128GCM", "A256GCM"]
+  # Validate the JWE alg/enc from the compact response's protected header — the
+  # first segment is base64url-encoded JSON — before decrypting, rather than
+  # introspecting the decoded %JOSE.JWE{} struct.
+  @accepted_response_encs ~w(A128GCM A256GCM)
 
   @type create_attrs :: %{
           required(:dcql_query) => map(),
@@ -111,6 +204,40 @@ defmodule AttestoPhoenix.Verifier do
   end
 
   def presentation_result(%Config{}, _id), do: :error
+
+  @doc """
+  Verify and atomically complete an OID4VP direct-post presentation response,
+  returning `{:ok, %{"redirect_uri" => redirect_uri}}` or `{:error, reason}`.
+  """
+  @spec complete_presentation_response(Config.t(), PresentationResponse.t() | map()) ::
+          {:ok, %{required(String.t()) => String.t()}} | {:error, :invalid_request | :misconfigured}
+  def complete_presentation_response(%Config{} = config, %PresentationResponse{} = response) do
+    with {:ok, store} <- response_session_store(config),
+         {:ok, state, vp_token} <- resolve_presentation_response(response, config, store),
+         {:ok, _request_object} <- PresentationSession.request_object(store, state),
+         {:ok, _results} <- verify_presentation_response(store, state, vp_token),
+         {:ok, response_code} <- issue_presentation_response_code(config, state) do
+      # OID4VP §8.2 permits, and HAIP §5.1 requires, a `redirect_uri` carrying a
+      # `response_code` so the wallet returns the user to the verifier front-end,
+      # which then retrieves the completed presentation result. That read is
+      # single-use (`AttestoPhoenix.Verifier.presentation_result/2` consumes the
+      # session), so this browser-borne `response_code` cannot be replayed from
+      # history/logs to re-read the presented claims.
+      {:ok, %{"redirect_uri" => presentation_complete_redirect_uri(config, response_code)}}
+    else
+      {:error, :misconfigured} = error -> error
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  def complete_presentation_response(%Config{} = config, params) when is_map(params) and not is_struct(params) do
+    case PresentationResponse.from_params(params) do
+      {:ok, response} -> complete_presentation_response(config, response)
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  def complete_presentation_response(%Config{}, _params), do: {:error, :invalid_request}
 
   defp do_presentation_result(config, response_code) do
     with {:ok, session_id} <- verify_response_code(config, response_code),
@@ -413,5 +540,195 @@ defmodule AttestoPhoenix.Verifier do
     Config.presentation_request_endpoint_url(config) <>
       "/" <>
       URI.encode(id, &URI.char_unreserved?/1)
+  end
+
+  defp presentation_complete_redirect_uri(config, response_code) do
+    config.issuer <> "/presentation/complete?response_code=" <> URI.encode_www_form(response_code)
+  end
+
+  defp response_session_store(config) do
+    case Config.presentation_session_store(config) do
+      store when is_atom(store) and not is_nil(store) -> {:ok, store}
+      _ -> {:error, :misconfigured}
+    end
+  end
+
+  defp resolve_presentation_response(
+         %PresentationResponse{mode: :encrypted, response: encrypted_response},
+         _config,
+         store
+       ) do
+    decrypt_presentation_response(encrypted_response, store)
+  end
+
+  defp resolve_presentation_response(
+         %PresentationResponse{mode: :plaintext, state: state, vp_token: vp_token},
+         config,
+         store
+       ) do
+    plaintext_presentation_response(state, vp_token, config, store)
+  end
+
+  defp plaintext_presentation_response(state, vp_token, config, store) do
+    # A session created with a per-session `direct_post.jwt` override (via
+    # AttestoPhoenix.Verifier's `response_mode` attr) has an ephemeral
+    # response-encryption key attached to it even when the GLOBAL config mode
+    # is "direct_post". Accepting a plaintext submission for such a session
+    # would let a wallet (or attacker) silently downgrade that session's
+    # confidentiality requirement, so a session with an encryption key MUST
+    # reject plaintext, regardless of the global mode. `decoded_response/1`
+    # must run first to recover `state` before this lookup is possible.
+    with "direct_post" <- Config.presentation_response_mode(config),
+         :error <- PresentationSession.response_encryption_jwk(store, state) do
+      {:ok, state, vp_token}
+    else
+      _ -> {:error, :malformed}
+    end
+  end
+
+  defp decrypt_presentation_response(encrypted_response, store) when is_binary(encrypted_response) do
+    # The JWE `kid` is the presentation session id (the verifier advertised a
+    # fresh, per-request encryption key keyed by it); recover that session's
+    # private key to decrypt. `Attesto.JWE` admits only a public P-256 `epk`
+    # before JOSE sees the header: the wallet chooses that key, and JOSE before
+    # 1.11.13 looped forever on a key of another type.
+    with {:ok, segments} <- compact_jwe(encrypted_response),
+         {:ok, header} <- protected_jwe_header(segments.protected),
+         :ok <- encrypted_response_algorithms(header),
+         :ok <- encrypted_response_parameters(segments),
+         {:ok, kid} <- jwe_kid(header),
+         {:ok, jwk_map} <- PresentationSession.response_encryption_jwk(store, kid),
+         {:ok, plaintext, _header} <-
+           JWE.decrypt(jwk_map, encrypted_response,
+             max_compact_bytes: @max_compact_jwe_bytes,
+             max_plaintext_bytes: @max_compact_jwe_bytes
+           ),
+         {:ok, params} <- decode_json_map(plaintext),
+         {:ok, state, vp_token} <- decoded_presentation_response(params),
+         true <- state == kid do
+      {:ok, state, vp_token}
+    else
+      _ -> {:error, :malformed}
+    end
+  rescue
+    _error -> {:error, :malformed}
+  catch
+    _kind, _reason -> {:error, :malformed}
+  end
+
+  defp decrypt_presentation_response(_encrypted_response, _store), do: {:error, :malformed}
+
+  defp jwe_kid(%{"kid" => kid}) when is_binary(kid) and kid != "", do: {:ok, kid}
+  defp jwe_kid(_header), do: {:error, :malformed}
+
+  defp protected_jwe_header(encoded) do
+    with {:ok, json} <- decode64(encoded),
+         {:ok, header} <- decode_json_map(json) do
+      {:ok, header}
+    else
+      _ -> {:error, :malformed}
+    end
+  end
+
+  defp decode_json_map(bytes) do
+    case StrictJSON.decode(bytes) do
+      {:ok, %{} = map} -> {:ok, map}
+      _other -> {:error, :malformed}
+    end
+  end
+
+  defp decode64(encoded) do
+    with {:ok, decoded} <- Base.url_decode64(encoded, padding: false),
+         true <- Base.url_encode64(decoded, padding: false) == encoded do
+      {:ok, decoded}
+    else
+      _other -> {:error, :malformed}
+    end
+  end
+
+  defp decoded_presentation_response(%{"state" => state, "vp_token" => raw_vp_token})
+       when is_binary(state) and state != "" do
+    with {:ok, vp_token} <- decode_vp_token(raw_vp_token) do
+      {:ok, state, vp_token}
+    end
+  end
+
+  defp decoded_presentation_response(_params), do: {:error, :malformed}
+
+  defp compact_jwe(encrypted_response) when byte_size(encrypted_response) <= @max_compact_jwe_bytes do
+    with [protected, rest] <- :binary.split(encrypted_response, "."),
+         [encrypted_key, rest] <- :binary.split(rest, "."),
+         [iv, rest] <- :binary.split(rest, "."),
+         [ciphertext, tag] <- :binary.split(rest, "."),
+         :nomatch <- :binary.match(tag, "."),
+         true <- protected != "" and byte_size(protected) <= @max_protected_segment_bytes do
+      {:ok,
+       %{
+         protected: protected,
+         encrypted_key: encrypted_key,
+         iv: iv,
+         ciphertext: ciphertext,
+         tag: tag
+       }}
+    else
+      _parts -> {:error, :malformed}
+    end
+  end
+
+  defp compact_jwe(_encrypted_response), do: {:error, :malformed}
+
+  defp encrypted_response_algorithms(header) do
+    with %{"alg" => "ECDH-ES", "enc" => enc} when enc in @accepted_response_encs <- header,
+         # Reject a compressed JWE (`zip`, RFC 7516 §4.1.3) BEFORE decrypting. The
+         # recipient key is the per-session key we advertise to the wallet, so
+         # anyone can mint a valid `direct_post.jwt`; a `zip:"DEF"` payload would
+         # have JOSE `zlib:inflate` a tiny ciphertext into hundreds of MB/GB (a
+         # ~1000:1 decompression bomb) inside `block_decrypt`, before any size
+         # check - an unauthenticated OOM on a public endpoint. No `zip` is used
+         # on this response, so its presence is always malformed.
+         false <- Map.has_key?(header, "zip") do
+      :ok
+    else
+      _ -> {:error, :malformed}
+    end
+  end
+
+  # RFC 7518 §4.6 uses direct key agreement for ECDH-ES, so the encrypted-key
+  # segment is empty. AES-GCM requires a 96-bit IV and a 128-bit authentication
+  # tag (§8.5). Validate those fixed boundaries before passing input to JOSE;
+  # this keeps correctness independent of a dependency's permissive decoder.
+  defp encrypted_response_parameters(%{encrypted_key: "", iv: iv, ciphertext: ciphertext, tag: tag})
+       when byte_size(iv) == 16 and byte_size(tag) == 22 do
+    with {:ok, iv} when byte_size(iv) == 12 <- decode64(iv),
+         {:ok, ciphertext} when byte_size(ciphertext) > 0 <- decode64(ciphertext),
+         {:ok, tag} when byte_size(tag) == 16 <- decode64(tag) do
+      :ok
+    else
+      _other -> {:error, :malformed}
+    end
+  end
+
+  defp encrypted_response_parameters(_segments), do: {:error, :malformed}
+
+  defp decode_vp_token(%{} = vp_token), do: {:ok, vp_token}
+
+  defp decode_vp_token(vp_token) when is_binary(vp_token) do
+    case decode_json_map(vp_token) do
+      {:ok, decoded} -> {:ok, decoded}
+      _ -> {:error, :malformed}
+    end
+  end
+
+  defp decode_vp_token(_vp_token), do: {:error, :malformed}
+
+  defp verify_presentation_response(store, state, vp_token) do
+    PresentationSession.verify_response(
+      store,
+      {:state, state},
+      vp_token,
+      now: System.system_time(:second)
+    )
+  rescue
+    ArgumentError -> {:error, :malformed}
   end
 end

@@ -262,6 +262,9 @@ defmodule AttestoPhoenix.SecurityBoundaryRegressionTest do
       resolve_jwt_bearer_subject: fn claims -> {:ok, claims["sub"]} end,
       register_client: fn attrs -> {:ok, attrs} end,
       registration_enabled: true,
+      # A host that admits client_credentials registrations behind its own
+      # admission control; the default refuses them.
+      registration_grant_types: ["authorization_code", "refresh_token", "client_credentials"],
       openid_provider: false,
       scopes_supported: [],
       jwt_bearer: [
@@ -287,7 +290,10 @@ defmodule AttestoPhoenix.SecurityBoundaryRegressionTest do
       registration_enabled: true,
       token_endpoint_auth_methods_supported: ["client_secret_basic"],
       openid_provider: false,
-      scopes_supported: []
+      scopes_supported: [],
+      # A host that admits client_credentials registrations behind its own
+      # admission control; the default refuses them.
+      registration_grant_types: ["authorization_code", "refresh_token", "client_credentials"]
     }
 
     struct(Config, Map.merge(base, Map.new(overrides)))

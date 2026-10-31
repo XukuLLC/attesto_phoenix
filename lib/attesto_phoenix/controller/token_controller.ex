@@ -252,16 +252,17 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # token endpoint's policy: a body `client_id` without a secret is the
   # public-client path (RFC 6749 §2.1), so `allow_public: true`; the client
   # assertion audience is derived from trusted `Config` (never the request `Host`).
-  # RFC 7523 §3: the assertion `aud` MUST identify the authorization server —
-  # the issuer identifier OR the token endpoint URL are both valid audiences.
-  # Which one is REQUIRED depends on the profile: FAPI 2.0 Security Profile
-  # Final §5.3.2.1 wants the issuer, FAPI-CIBA ID1 audiences a token-endpoint
-  # assertion to the token endpoint URL, and this server is certified to both.
-  # `Config.client_assertion_audiences/1` therefore accepts both by default and
-  # lets a single-profile deployment narrow it. Both values name THIS server, so
-  # accepting either does not admit an assertion minted for a different
-  # authorization server — the point of the audience restriction. The assertion
-  # lifetime is limited to 300 seconds by the shared endpoint policy.
+  # RFC 7523 §3: the assertion `aud` MUST identify the authorization server.
+  # `Config.client_assertion_audiences/1` accepts the issuer identifier alone by
+  # default (draft-ietf-oauth-rfc7523bis, FAPI 2.0 Security Profile Final
+  # §5.3.2.1). The token endpoint URL also names THIS server, but it is the
+  # value the 2025 audience-injection attack (CVE-2025-27370 / CVE-2025-27371)
+  # exploits: a malicious AS publishes this server's token endpoint URL as one of
+  # its own endpoints, the client signs an assertion audienced to it, and the
+  # malicious AS replays it here. The issuer cannot be republished that way. A
+  # profile that still audiences assertions to the endpoint URL (FAPI-CIBA ID1
+  # test plans) must list it explicitly. The assertion lifetime is limited to 300
+  # seconds by the shared endpoint policy.
   defp authenticate_client(config, conn, params) do
     case ClientAuthentication.authenticate_request_with_context(conn, params, config, :token) do
       {:ok, %ClientAuthentication.Result{} = result} ->

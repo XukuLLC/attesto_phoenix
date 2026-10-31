@@ -248,7 +248,8 @@ defmodule AttestoPhoenix.ClientAuthentication do
     defp public_and_audiences(config, :introspection), do: {false, [config.issuer]}
     defp public_and_audiences(config, :device_authorization), do: {true, [config.issuer]}
 
-    defp public_and_audiences(config, :backchannel_authentication), do: {false, backchannel_assertion_audiences(config)}
+    defp public_and_audiences(config, :backchannel_authentication),
+      do: {false, Config.client_assertion_audiences(config)}
 
     defp public_and_audiences(config, :revocation), do: {true, [config.issuer]}
 
@@ -258,16 +259,6 @@ defmodule AttestoPhoenix.ClientAuthentication do
       do: {@all_methods, false, true, false}
 
     defp authentication_controls(_endpoint), do: {@all_methods, false, true, true}
-
-    defp backchannel_assertion_audiences(config) do
-      audiences = Config.client_assertion_audiences(config)
-
-      if is_nil(config.client_assertion_audiences) do
-        audiences ++ [Config.backchannel_authentication_endpoint_url(config)]
-      else
-        audiences
-      end
-    end
   end
 
   defmodule Result do

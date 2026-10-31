@@ -63,6 +63,11 @@ defmodule AttestoPhoenix.Config do
 
   ### Optional callbacks
 
+  Every callback key (required or optional) accepts a function, a
+  `{module, function}` tuple, or a `{module, function, extra_args}` tuple. In
+  the 3-tuple form, `AttestoPhoenix.Callback.invoke/2` **appends** `extra_args`
+  after the per-call arguments (`apply(module, function, call_args ++ extra_args)`).
+
     * `:client_auth_method` - `(client -> method | {:ok, method})`. Returns the
       client's registered `token_endpoint_auth_method` as a string or atom
       from trusted registry data. Required for host-owned confidential clients.
@@ -177,8 +182,11 @@ defmodule AttestoPhoenix.Config do
       a leakage risk). `response` is the RFC 7662 member map (carrying `aud`,
       `client_id`, `sub`, `scope`, ...), letting the host match the token's
       audience/scope against the calling protected resource. Optional - when
-      unset, every authenticated caller may introspect any token (the
-      single-trust-domain default).
+      unset, a caller may introspect only a token issued to it (`client_id`)
+      or naming it in `aud`; every other caller gets `active: false`. Set it
+      when a protected resource introspects tokens audienced to a resource
+      identifier that is not its `client_id`, for example
+      `fn caller, response -> resources_served_by(caller) |> Enum.any?(&(&1 in List.wrap(response["aud"]))) end`.
     * `:resource_indicators` - RFC 8707 resource policy as
       `[allowed_resources: [...], allowed_resources_for: callback]`. Static
       entries are absolute resource URIs. The optional one-argument callback
@@ -624,12 +632,22 @@ defmodule AttestoPhoenix.Config do
       Ed25519, and explicit Ed25519). A non-FAPI deployment can widen it;
       verification and the advertised metadata stay in lockstep because both
       read this one value.
-    * `:client_assertion_audiences` - accepted `private_key_jwt` audiences,
-      as a list or a one-arity function of the config. The 3.x compatibility
-      default accepts the issuer and token endpoint identifiers. For the
-      issuer-only rfc7523bis-11 profile, configure a callback returning
-      `[config.issuer]` after updating clients. Assertions still carry exactly
-      one audience, including a single-member array.
+    * `:client_assertion_audiences` - accepted `private_key_jwt` audiences
+      at the token and backchannel authentication endpoints, as a list or a
+      one-arity function of the config. Defaults to the issuer identifier
+      alone (`draft-ietf-oauth-rfc7523bis`, FAPI 2.0 §5.3.2.1), the value
+      every other endpoint already requires. Endpoint URLs are not accepted
+      by default because they are what the 2025 audience-injection
+      disclosure (CVE-2025-27370, CVE-2025-27371) relies on: a malicious AS
+      republishes this server's token endpoint as its own, so a client that
+      uses one key at both sends it an assertion this server would accept. A
+      deployment whose clients still send an endpoint URL (older RFC 7523
+      clients, FAPI-CIBA test plans) can list it explicitly, for example
+      `fn config -> [config.issuer, AttestoPhoenix.Config.token_endpoint_url(config)] end`;
+      accepted non-issuer audiences emit
+      `[:attesto_phoenix, :client_authentication, :legacy_assertion_audience]`.
+      Assertions still carry exactly one audience, including a single-member
+      array.
     * `:client_auth_enforce_fapi_alg_policy` - additionally enforce FAPI's RSA
       modulus and Edwards-curve restrictions for `private_key_jwt`. When unset,
       this defaults to `true` if `:client_auth_signing_algs` is omitted and to
@@ -779,6 +797,16 @@ defmodule AttestoPhoenix.Config do
       at boot). Default `nil` - a scopeless registration stays scopeless
       (fail-closed). Setting this lets a scopeless DCR client (e.g. an MCP/agent
       client) register with a usable scope without each host reinventing it.
+    * `:registration_grant_types` - the grant types a dynamic registration
+      (RFC 7591 §2) may request. A list is enforced exactly and must be a
+      subset of `:grant_types_supported` (validated at boot). Default `nil` -
+      the supported subset of `authorization_code`, `refresh_token`, and the
+      RFC 8628 device grant, the grants in which a resource owner approves
+      the client. `client_credentials`, JWT-bearer, token exchange, and CIBA
+      must be listed explicitly, and only behind an admission control, since
+      an anonymous registration could otherwise claim a grant that mints
+      tokens with no resource owner in the loop. Read it back with
+      `registration_grant_types/1`.
     * `:client_id_metadata` - Client ID Metadata Document support - CIMD
       (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG). A
       keyword list configuring whether (and how) the authorization server
@@ -1124,6 +1152,7 @@ defmodule AttestoPhoenix.Config do
     scopes_supported: [],
     protected_resource_scopes_supported: nil,
     registration_default_scope: nil,
+    registration_grant_types: nil,
     registration_default_application_type: "web",
     bearer_methods_supported: ["header"],
     claims_supported: [],
@@ -1266,6 +1295,7 @@ defmodule AttestoPhoenix.Config do
           scopes_supported: [String.t()],
           protected_resource_scopes_supported: [String.t()] | nil,
           registration_default_scope: [String.t()] | :scopes_supported | nil,
+          registration_grant_types: [String.t()] | nil,
           registration_default_application_type: String.t(),
           bearer_methods_supported: [String.t()],
           claims_supported: [String.t()],
@@ -2623,6 +2653,34 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
+  # RFC 7591 §2: the grants an unauthenticated registrant may claim without host
+  # opt-in. Each puts a resource owner's approval between the new client and a
+  # token. client_credentials, JWT bearer, token exchange and CIBA do not (CIBA
+  # lets the client start authentication for any user it can name), so a host
+  # lists them in `:registration_grant_types` behind its own admission control.
+  @default_registration_grant_types [
+    "authorization_code",
+    "refresh_token",
+    "urn:ietf:params:oauth:grant-type:device_code"
+  ]
+
+  @doc """
+  The grant types a dynamic registration (RFC 7591 §2) may request.
+
+  Resolves `:registration_grant_types`: an explicit list is returned as
+  configured (validated at boot to be a subset of `grant_types_supported/1`);
+  `nil` (the default) resolves to the supported grants in which a resource
+  owner approves the client: `authorization_code`, `refresh_token`, and the
+  RFC 8628 device grant.
+  """
+  @spec registration_grant_types(t()) :: [String.t()]
+  def registration_grant_types(%__MODULE__{registration_grant_types: list}) when is_list(list), do: list
+
+  def registration_grant_types(%__MODULE__{} = config) do
+    supported = grant_types_supported(config)
+    Enum.filter(@default_registration_grant_types, &(&1 in supported))
+  end
+
   @doc """
   Derives the `Attesto.Config` consumed by the protocol layer from this config.
 
@@ -2993,16 +3051,15 @@ defmodule AttestoPhoenix.Config do
   @doc """
   The `aud` values a `private_key_jwt` client assertion may carry (RFC 7523 §3).
 
-  The 3.x compatibility default accepts the issuer and token endpoint URL.
-  Configure a callback returning `[config.issuer]` for rfc7523bis-11 after
-  updating clients. An issuer-only default belongs in the next major version;
-  see the moduledoc.
+  Defaults to `[config.issuer]`. Endpoint URLs are accepted only when the
+  host lists them in `:client_assertion_audiences`; see the moduledoc for the
+  audience-injection attack they enable.
   """
   @spec client_assertion_audiences(t()) :: [String.t()]
   def client_assertion_audiences(%__MODULE__{} = config) do
     audiences =
       case config.client_assertion_audiences do
-        nil -> [config.issuer, token_endpoint_url(config)]
+        nil -> [config.issuer]
         fun when is_function(fun, 1) -> fun.(config)
         audiences when is_list(audiences) -> audiences
       end
@@ -3942,6 +3999,38 @@ defmodule AttestoPhoenix.Config do
 
   defp validate_registration_default_scope!(%__MODULE__{}), do: :ok
 
+  # The registration grant catalog must be a subset of the server's grant
+  # catalog: a grant the token endpoint rejects cannot be registrable, and a
+  # non-list value must not silently widen registration back to the full set.
+  defp validate_registration_grant_types!(%__MODULE__{registration_grant_types: nil}), do: :ok
+
+  defp validate_registration_grant_types!(%__MODULE__{registration_grant_types: list} = config) when is_list(list) do
+    supported = grant_types_supported(config)
+    unsupported = Enum.reject(list, &(&1 in supported))
+
+    cond do
+      not Enum.all?(list, &(is_binary(&1) and &1 != "")) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :registration_grant_types must be a list of non-empty grant type strings"
+
+      Enum.uniq(list) != list ->
+        raise ArgumentError, "AttestoPhoenix.Config: :registration_grant_types contains duplicate entries"
+
+      unsupported != [] ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :registration_grant_types contains grant type(s) " <>
+                "#{inspect(unsupported)} not in :grant_types_supported #{inspect(supported)}"
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_registration_grant_types!(%__MODULE__{}) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :registration_grant_types must be nil or a list of grant type strings"
+  end
+
   # Session Management must never fail open: with no OP secret the browser-state
   # value would be a bare random string an injected/parent-domain cookie could
   # forge (and a login-state change could not rotate). Refuse to build a config
@@ -4237,6 +4326,7 @@ defmodule AttestoPhoenix.Config do
     validate_ciba!(config)
     validate_session_management!(config)
     validate_registration_default_scope!(config)
+    validate_registration_grant_types!(config)
     validate_jwt_bearer!(config)
     validate_req_adapters!(config)
     validate_behaviour_modules!(config)

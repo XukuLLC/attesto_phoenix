@@ -131,6 +131,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
         host_config(
           scopes_supported: ["profile", "email"],
           registration_enabled: true,
+          registration_grant_types: ["client_credentials"],
           register_client: fn attrs -> {:ok, attrs} end
         )
 
@@ -151,6 +152,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
           scopes_supported: ["openid", "profile"],
           registration_default_scope: :scopes_supported,
           registration_enabled: true,
+          registration_grant_types: ["client_credentials"],
           register_client: fn attrs -> {:ok, attrs} end
         )
 
@@ -168,6 +170,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
           openid_provider: false,
           scopes_supported: ["read"],
           registration_enabled: true,
+          registration_grant_types: ["client_credentials"],
           register_client: fn attrs -> {:ok, attrs} end
         )
 
@@ -184,6 +187,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
         host_config(
           scopes_supported: ["profile"],
           registration_enabled: true,
+          registration_grant_types: ["client_credentials"],
           register_client: fn _attrs -> {:error, :client_restricted} end
         )
 

@@ -279,6 +279,33 @@ defmodule AttestoPhoenix.VerifierTest do
     end
   end
 
+  describe "PresentationResponse.from_params/1 and complete_presentation_response/2" do
+    test "normalizes encrypted and plaintext presentation responses and rejects >32-deep JSON", ctx do
+      assert {:ok, %Verifier.PresentationResponse{mode: :encrypted, response: "jwe.compact"}} =
+               Verifier.PresentationResponse.from_params(%{"response" => "jwe.compact"})
+
+      assert {:ok, %Verifier.PresentationResponse{mode: :plaintext, state: "sid-1", vp_token: %{"cred_1" => ["tok"]}}} =
+               Verifier.PresentationResponse.from_params(%{
+                 "state" => "sid-1",
+                 "vp_token" => ~s({"cred_1":["tok"]})
+               })
+
+      deep_json = String.duplicate(~s({"a":), 33) <> "1" <> String.duplicate("}", 33)
+
+      assert {:error, :malformed} =
+               Verifier.PresentationResponse.from_params(%{
+                 "state" => "sid-1",
+                 "vp_token" => deep_json
+               })
+
+      misconfigured = %{ctx.config | presentation_session_store: nil}
+      {:ok, req} = Verifier.PresentationResponse.from_params(%{"response" => "jwe.compact"})
+
+      assert {:error, :misconfigured} =
+               Verifier.complete_presentation_response(misconfigured, req)
+    end
+  end
+
   defp request_attrs(ctx) do
     %{
       dcql_query: dcql_query(),

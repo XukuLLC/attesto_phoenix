@@ -39,7 +39,15 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       scopes_supported: ["read", "write"]
     }
 
-    struct(Config, Map.merge(base, Map.new(overrides)))
+    overrides = Map.new(overrides)
+    config = struct(Config, Map.merge(base, overrides))
+
+    # These tests model a host that admits every supported grant at
+    # registration. The 4.3 default (resource-owner-approved grants only) is
+    # pinned by tests that pass `registration_grant_types: nil`.
+    if Map.has_key?(overrides, :registration_grant_types),
+      do: config,
+      else: %{config | registration_grant_types: Config.grant_types_supported(config)}
   end
 
   defp post_register(config, metadata, content_type \\ "application/json") do
@@ -359,6 +367,43 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       end
     end
 
+    test "the default refuses non-interactive grants and admits resource-owner-approved ones" do
+      config = config(registration_grant_types: nil)
+
+      for grant <- ["client_credentials", "urn:ietf:params:oauth:grant-type:jwt-bearer"] do
+        conn = post_register(config, %{"grant_types" => [grant]})
+
+        assert conn.status == 400
+        assert JSON.decode!(conn.resp_body)["error"] == "invalid_client_metadata"
+      end
+
+      conn =
+        post_register(config, %{
+          "grant_types" => ["authorization_code", "refresh_token"],
+          "redirect_uris" => ["https://client.example/cb"]
+        })
+
+      assert conn.status == 201
+    end
+
+    test "rejects a grant outside :registration_grant_types even when the server supports it" do
+      config = config(registration_grant_types: ["authorization_code", "refresh_token"])
+
+      conn = post_register(config, %{"grant_types" => ["client_credentials"]})
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+
+      conn =
+        post_register(config, %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 201
+      assert body(conn)["grant_types"] == ["authorization_code"]
+    end
+
     test "requires the registration media type" do
       conn =
         :post
@@ -620,6 +665,50 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
       assert conn.status == 201, conn.resp_body
       assert body(conn)["post_logout_redirect_uris"] == ["https://client.example/after-logout"]
+    end
+
+    test "refuses reserved OAuth response parameter names in redirect_uris and post_logout_redirect_uris queries" do
+      reserved = ~w(code state iss error error_description session_state response)
+
+      for param <- reserved do
+        for uri <- [
+              "https://client.example/cb?#{param}=injected",
+              "https://client.example/cb?tenant=acme&#{param}=injected",
+              "https://client.example/cb?#{param}"
+            ] do
+          conn =
+            post_register(config([]), %{
+              "grant_types" => ["authorization_code"],
+              "redirect_uris" => [uri]
+            })
+
+          assert conn.status == 400, "expected #{uri} refused in redirect_uris"
+          assert body(conn)["error"] == "invalid_redirect_uri"
+          assert body(conn)["error_description"] =~ "reserved"
+        end
+
+        logout_uri = "https://client.example/after-logout?#{param}=injected"
+
+        conn =
+          post_register(config([]), %{
+            "grant_types" => ["authorization_code"],
+            "redirect_uris" => ["https://client.example/cb"],
+            "post_logout_redirect_uris" => [logout_uri]
+          })
+
+        assert conn.status == 400, "expected #{logout_uri} refused in post_logout_redirect_uris"
+        assert body(conn)["error"] == "invalid_redirect_uri"
+        assert body(conn)["error_description"] =~ "reserved"
+      end
+
+      conn =
+        post_register(config([]), %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/cb?tenant=acme"],
+          "post_logout_redirect_uris" => ["https://client.example/after-logout?tenant=acme"]
+        })
+
+      assert conn.status == 201, conn.resp_body
     end
   end
 

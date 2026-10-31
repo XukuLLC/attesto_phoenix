@@ -126,6 +126,7 @@ authorization server, use `attesto_phoenix`.
 ## Contents
 
 - [Installation](#installation)
+- [Upgrading to 4.3](#upgrading-to-43)
 - [Upgrading to 4.2](#upgrading-to-42)
 - [Upgrading to 4.0](#upgrading-to-40)
 - [Quick start](#quick-start)
@@ -147,7 +148,7 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.2"}
+    {:attesto_phoenix, "~> 4.3"}
   ]
 end
 ```
@@ -158,7 +159,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.2"},
+    {:attesto_phoenix, "~> 4.3"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -215,6 +216,27 @@ verifies the lease columns when it starts. A custom
 destructive-take implementation. Because the store contract does not provide
 global pending-work enumeration, a custom store must also run its own
 persistent retry scheduler and backoff policy.
+
+
+## Upgrading to 4.3
+
+AttestoPhoenix 4.3 requires Attesto 2.8.0 and needs no migration. Three
+defaults now fail closed; each has an explicit setting for a deployment that
+needs the old behaviour:
+
+- Dynamic registration admits only `authorization_code`, `refresh_token`, and
+  the device grant. List any other registrable grant in
+  `:registration_grant_types`, behind an admission control.
+- `private_key_jwt` assertions at the token and backchannel endpoints must use
+  the issuer as `aud`. Clients that send the token endpoint URL fail with
+  `invalid_client` until they are updated or the URL is listed in
+  `:client_assertion_audiences`; the
+  `[:attesto_phoenix, :client_authentication, :legacy_assertion_audience]`
+  event shows which clients still depend on it.
+- Introspection returns `{"active": false}` to a caller that is neither the
+  token's client nor named in its `aud`. A protected resource that introspects
+  tokens for a resource identifier other than its `client_id` configures
+  `:introspection_authorize`.
 
 ## Quick start
 
@@ -1058,6 +1080,17 @@ requests when enabled. Put deployment admission controls such as an initial
 access token, rate limits, or an allowlist in the host pipeline before the
 controller.
 
+Since 4.3 a registration may request only the supported grants in which a
+resource owner approves the client: `authorization_code`, `refresh_token`, and
+the RFC 8628 device grant. `client_credentials`, JWT-bearer, token exchange, and
+CIBA mint tokens with no resource owner approving the client, so a host that
+wants registrants to have them lists them in `:registration_grant_types`, and
+does so only behind an admission control:
+
+```elixir
+registration_grant_types: ["authorization_code", "refresh_token", "client_credentials"]
+```
+
 Registration validation does not make client metadata trusted. Display values
 such as `client_name`, `software_id`, `software_version`, and `contacts` are
 bounded and checked for valid UTF-8 and control characters, but markup is
@@ -1342,22 +1375,44 @@ incoherent lists fail when the server configuration is built rather than being
 advertised and rejected only at request time.
 
 `:client_assertion_audiences` controls accepted `private_key_jwt` audiences
-at the token and backchannel authentication endpoints. The 3.x default
-continues to accept issuer and endpoint identifiers for existing clients and
-certification profiles. The next major version can adopt the issuer-only
-default in `draft-ietf-oauth-rfc7523bis-11` (RFC Editor queue, RFC 10070).
-After updating clients to use trusted issuer audiences, select that policy:
+at the token and backchannel authentication endpoints. Since 4.3 it defaults
+to the issuer identifier alone (`draft-ietf-oauth-rfc7523bis-11`, RFC Editor
+queue, RFC 10070), the value PAR, introspection, device authorization and
+revocation already required. The token endpoint URL is no longer accepted by
+default: it is the value the 2025 audience-injection attack (CVE-2025-27370,
+CVE-2025-27371) relies on, where a malicious authorization server republishes
+this server's token endpoint as its own and replays the assertion a shared-key
+client signs for it. A deployment whose clients still send an endpoint URL, or
+a FAPI-CIBA test plan that does, lists it explicitly:
 
 ```elixir
 client_assertion_audiences: fn config ->
-  [config.issuer]
+  [
+    config.issuer,
+    AttestoPhoenix.Config.token_endpoint_url(config),
+    AttestoPhoenix.Config.backchannel_authentication_endpoint_url(config)
+  ]
 end
 ```
 
-PAR, introspection and device registration continue to require the issuer
-identifier. Successful legacy assertions emit
+Successful assertions with a non-issuer audience emit
 `[:attesto_phoenix, :client_authentication, :legacy_assertion_audience]` with
-neutral method metadata so a host can measure migration progress.
+neutral method metadata so a host can measure migration progress and remove
+the extra values.
+
+Token introspection releases an active response only to a caller entitled to
+the token. Since 4.3, without `:introspection_authorize`, that is the client
+the token was issued to or a client named in the token's `aud`; every other
+authenticated caller gets `{"active": false}` (RFC 7662 §2.2). A protected
+resource that introspects tokens audienced to a resource identifier other than
+its `client_id` needs a policy that maps the caller to the resources it serves:
+
+```elixir
+introspection_authorize: fn caller_client_id, response ->
+  audiences = List.wrap(response["aud"])
+  Enum.any?(MyApp.Resources.served_by(caller_client_id), &(&1 in audiences))
+end
+```
 
 When `:request_object_policy` is configured, signed request objects are verified
 at PAR submission and re-verified at `/authorize`; verified request-object

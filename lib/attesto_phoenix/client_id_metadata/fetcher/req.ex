@@ -236,7 +236,7 @@ if Code.ensure_loaded?(Req) do
     defp perform_request(uri, pinned_url, timeout, max_bytes, opts) do
       case Keyword.get(opts, :req_options, []) do
         [] ->
-          case AttestoPhoenix.PinnedHTTP.request(
+          case AttestoPhoenix.PinnedHTTP.request_inline(
                  :get,
                  pinned_url,
                  uri.host,

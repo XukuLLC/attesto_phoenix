@@ -29,7 +29,7 @@ if Code.ensure_loaded?(Req) do
     alone for that path - restrict egress at the network layer.
     """
 
-    alias AttestoPhoenix.ClientIdMetadata.HostPolicy
+    alias Attesto.OutboundTarget
 
     @typedoc """
     A screened target. `url` dials the checked IP; `host` is the bare hostname
@@ -37,7 +37,7 @@ if Code.ensure_loaded?(Req) do
     `authority` is the original `host[:port]` (IPv6 bracketed) for the `Host`
     header.
     """
-    @type screened :: %{url: String.t(), host: String.t(), authority: String.t()}
+    @type screened :: OutboundTarget.screened()
 
     @doc """
     Screen `url`. On success returns `{:ok, %{url: <url with host replaced by the
@@ -60,95 +60,6 @@ if Code.ensure_loaded?(Req) do
         MUST stay off in production.
     """
     @spec screen(String.t(), keyword()) :: {:ok, screened()} | {:error, term()}
-    def screen(url, opts \\ []) when is_binary(url) and is_list(opts) do
-      allow_loopback = allow_loopback!(opts)
-
-      with {:ok, uri} <- validate(url, allow_loopback),
-           {:ok, ips} <- resolve(uri.host, opts),
-           {:ok, pinned} <- pin(ips, allow_loopback) do
-        {:ok,
-         %{
-           url: URI.to_string(%{uri | host: url_host(pinned)}),
-           host: uri.host,
-           authority: authority(uri)
-         }}
-      end
-    end
-
-    defp allow_loopback!(opts) do
-      case Keyword.get(opts, :allow_loopback, false) do
-        value when is_boolean(value) ->
-          value
-
-        _unexpected ->
-          raise ArgumentError, ":allow_loopback must be true or false"
-      end
-    end
-
-    # Put the checked IP into the request URL. `URI.to_string/1` brackets a
-    # colon-containing (IPv6) host itself; the original port is preserved by
-    # leaving `uri.port` untouched.
-    defp url_host(ip), do: ip_to_string(ip)
-
-    # The Host header the RP expects: original host, its port when non-default,
-    # IPv6 bracketed (RFC 7230). Dropping the port misroutes an RP that routes on
-    # the full authority.
-    defp authority(%URI{host: host, port: port, scheme: scheme}) do
-      HostPolicy.authority(%URI{host: host, port: port, scheme: scheme})
-    end
-
-    defp validate(url, allow_loopback) do
-      case URI.new(url) do
-        {:ok, %URI{scheme: scheme, host: host} = uri}
-        when is_binary(host) and host != "" and (scheme == "https" or (allow_loopback and scheme == "http")) ->
-          {:ok, uri}
-
-        {:ok, _uri} ->
-          {:error, :insecure_or_hostless_url}
-
-        {:error, _reason} ->
-          {:error, :invalid_url}
-      end
-    end
-
-    # Resolve both A and AAAA; every returned address is screened so a mixed
-    # answer cannot smuggle an internal address in via the unused family.
-    defp resolve(host, opts) do
-      resolver = Keyword.get(opts, :resolver, &:inet.getaddrs/2)
-      host_charlist = String.to_charlist(host)
-
-      case lookup(resolver, host_charlist, :inet) ++ lookup(resolver, host_charlist, :inet6) do
-        [] -> {:error, :unresolvable}
-        ips -> {:ok, ips}
-      end
-    end
-
-    defp lookup(resolver, host_charlist, family) do
-      case resolver.(host_charlist, family) do
-        {:ok, ips} when is_list(ips) -> ips
-        _other -> []
-      end
-    end
-
-    # Reject if ANY resolved address is special-use; otherwise pin to the first.
-    # In production loopback is special-use and blocked; the `:allow_loopback`
-    # escape hatch exempts only loopback (every other range stays blocked).
-    defp pin(ips, allow_loopback) do
-      case Enum.find(ips, &blocked?(&1, allow_loopback)) do
-        nil -> {:ok, hd(ips)}
-        blocked -> {:error, {:blocked_ip, blocked}}
-      end
-    end
-
-    defp blocked?(ip, true), do: not loopback?(ip) and HostPolicy.special_use_ip?(ip)
-    defp blocked?(ip, false), do: HostPolicy.special_use_ip?(ip)
-
-    defp loopback?({127, _b, _c, _d}), do: true
-    defp loopback?({0, 0, 0, 0, 0, 0, 0, 1}), do: true
-    # IPv4-mapped loopback (::ffff:127.0.0.0/8): high word 0x7Fxx.
-    defp loopback?({0, 0, 0, 0, 0, 0xFFFF, w7, _w8}) when div(w7, 256) == 127, do: true
-    defp loopback?(_ip), do: false
-
-    defp ip_to_string(ip), do: ip |> :inet.ntoa() |> to_string()
+    defdelegate screen(url, opts \\ []), to: OutboundTarget
   end
 end

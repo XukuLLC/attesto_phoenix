@@ -3,19 +3,12 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
   `POST /oauth/introspect` - OAuth 2.0 Token Introspection (RFC 7662), with the
   signed-JWT response of RFC 9701 (FAPI 2.0 Message Signing §5.5).
 
-  This is the thin interface over the conn-free core `Attesto.Introspection`:
-  it authenticates the calling client, lifts the `token` (and optional
-  `token_type_hint`) off the request, asks the core whether the token is active,
-  and renders the response - negotiating, by the `Accept` header, between the
-  plain JSON response (RFC 7662 §2.2) and a signed JWT
-  (`Attesto.SignedIntrospection`, `application/token-introspection+jwt`,
-  RFC 9701). Activeness, claim selection, and the no-existence-oracle discipline
-  remain the core's (`Attesto.Token` verification for access tokens and the
-  `Attesto.RefreshStore` for refresh tokens). For RFC 8707 tokens, the endpoint
-  supplies the trusted static resources and, only when needed, resolves the
-  signed token's original OAuth client for its per-client resource policy. The
-  authenticated introspection caller is kept separate and is passed only to the
-  host's optional `:introspection_authorize` policy (RFC 7662 §4 / RFC 9701 §5).
+  This is the thin HTTP interface over
+  `AttestoPhoenix.AuthorizationServer.Introspection`: it authenticates the
+  calling client, extracts the `token` parameter, delegates introspection and
+  optional RFC 9701 JWT signing to the conn-free core, and renders the response
+  negotiating by the `Accept` header between `application/json` (RFC 7662 §2.2)
+  and `application/token-introspection+jwt` (RFC 9701).
 
   ## Client authentication (RFC 7662 §2.1)
 
@@ -43,31 +36,13 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
 
   import Plug.Conn
 
-  alias Attesto.Introspection
-  alias Attesto.SignedIntrospection
-
-  alias AttestoPhoenix.{
-    Callback,
-    ClientAuthentication,
-    Config,
-    HTTPAccept,
-    OAuthError,
-    ProtectedResource,
-    ResourceAudiencePolicy
-  }
-
+  alias AttestoPhoenix.AuthorizationServer.Introspection
+  alias AttestoPhoenix.{ClientAuthentication, Config, HTTPAccept, OAuthError}
   alias AttestoPhoenix.Controller.QueryParameterGuard
-  alias AttestoPhoenix.Store.EctoRefreshStore
-
-  require Logger
 
   # RFC 9701 §4: the media type a caller requests (via Accept) to receive the
   # introspection response as a signed JWT, and the type of that response.
   @signed_media_type "application/token-introspection+jwt"
-
-  # The Attesto.RefreshStore consulted for opaque refresh tokens, defaulting to
-  # the package's Ecto-backed store when the host configures none.
-  @default_refresh_store EctoRefreshStore
 
   # RFC 6749 §5.2 error code, held as the atom `OAuthError.new/3` requires.
   @error_invalid_request :invalid_request
@@ -88,32 +63,22 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
          :ok <- require_https(conn, config, {:error, error(@error_invalid_request, "TLS required")}),
          {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
            authenticate_client(config, conn, params),
-         {:ok, token} <- fetch_token(params) do
+         {:ok, token} <- Introspection.fetch_token(params) do
       respond(conn, config, client_id, token, params)
     else
-      {:error, :query_parameters_not_allowed} -> render_error(conn, config, QueryParameterGuard.error())
-      {:error, %OAuthError{} = err} -> render_error(conn, config, err)
+      {:error, :query_parameters_not_allowed} ->
+        render_error(conn, config, QueryParameterGuard.error())
+
+      {:error, %OAuthError{} = err} ->
+        render_error(conn, config, err)
     end
   end
 
   defp respond(conn, config, client_id, token, params) do
-    protocol_config = Config.to_attesto_config(config)
-
-    response =
-      Introspection.introspect(protocol_config, token,
-        refresh_store: refresh_store(config),
-        issuer: config.issuer,
-        token_type_hint: token_type_hint(params),
-        trusted_audiences: ResourceAudiencePolicy.resolver(config),
-        authorize: caller_authorize(config, client_id)
-      )
-      |> suppress_contained_access_token(config)
+    response = Introspection.introspect(config, client_id, token, token_type_hint(params))
 
     if signed_response_requested?(conn) do
-      # The audience is the authenticated client_id, always present for a
-      # successful confidential authentication (this endpoint forbids the public
-      # path), so signing never depends on the optional `:client_id` callback.
-      {:ok, jwt} = SignedIntrospection.response_jwt(protocol_config, client_id, response)
+      {:ok, jwt} = Introspection.sign_response(config, client_id, response)
 
       conn
       |> put_resp_header("content-type", @signed_media_type)
@@ -123,13 +88,8 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     end
   end
 
-  defp suppress_contained_access_token(%{"active" => true} = response, config) do
-    if ProtectedResource.access_token_revoked?(config, response),
-      do: %{"active" => false},
-      else: response
-  end
-
-  defp suppress_contained_access_token(response, _config), do: response
+  defp token_type_hint(%{"token_type_hint" => hint}) when is_binary(hint) and hint != "", do: hint
+  defp token_type_hint(_params), do: nil
 
   # RFC 9701 §4: the signed response is returned only when the caller explicitly
   # asks for `#{@signed_media_type}` in Accept with a non-zero quality (RFC 9110
@@ -139,49 +99,6 @@ defmodule AttestoPhoenix.Controller.IntrospectionController do
     conn
     |> get_req_header("accept")
     |> HTTPAccept.accepts?(@signed_media_type)
-  end
-
-  defp fetch_token(%{"token" => token}) when is_binary(token) and token != "", do: {:ok, token}
-
-  defp fetch_token(_params),
-    do: {:error, error(@error_invalid_request, "the request is missing the required \"token\" parameter")}
-
-  defp token_type_hint(%{"token_type_hint" => hint}) when is_binary(hint) and hint != "", do: hint
-  defp token_type_hint(_params), do: nil
-
-  defp refresh_store(%Config{refresh_store: store}) when is_atom(store) and not is_nil(store), do: store
-
-  defp refresh_store(%Config{}), do: @default_refresh_store
-
-  # RFC 7662 §4 / RFC 9701 §5: build the core's caller-authorization predicate
-  # from the host's optional `:introspection_authorize` callback, capturing the
-  # authenticated caller's client_id. When the host configures none, no
-  # predicate is passed and every authenticated caller may introspect any token
-  # (the single-trust-domain default). A deliberate `false` is an ordinary
-  # authorization denial. Exceptions and non-boolean returns also downgrade the
-  # response to inactive, but emit one fixed warning so a policy integration
-  # fault is not mistaken for a deliberate denial.
-  defp caller_authorize(%Config{} = config, client_id) do
-    case Callback.config_callback(config, :introspection_authorize) do
-      nil -> nil
-      callback -> fn response -> introspection_authorized?(callback, client_id, response) end
-    end
-  end
-
-  defp introspection_authorized?(callback, client_id, response) do
-    case Callback.invoke(callback, [client_id, response]) do
-      result when is_boolean(result) -> result
-      _unexpected -> introspection_policy_fault()
-    end
-  rescue
-    _exception -> introspection_policy_fault()
-  catch
-    _kind, _reason -> introspection_policy_fault()
-  end
-
-  defp introspection_policy_fault do
-    Logger.warning("AttestoPhoenix introspection authorization callback failed; token treated as inactive")
-    false
   end
 
   # RFC 6749 §2.3 / RFC 7662 §2.1: authenticate the caller through the shared

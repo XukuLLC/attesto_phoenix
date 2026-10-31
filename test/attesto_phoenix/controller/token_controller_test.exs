@@ -810,34 +810,9 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
 
     @tag registered_auth_method: :private_key_jwt
-    test "issuer-only profile rejects token endpoint private_key_jwt audience" do
-      # rfc7523bis-11 requires the authorization server issuer identifier.
-      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
-      client_jwks = %{"keys" => [public_jwk(client_key)]}
-
-      put_config(
-        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
-        client_assertion_audiences: fn config -> [config.issuer] end
-      )
-
-      assertion =
-        client_assertion(client_key, "confidential-1", %{
-          "aud" => "https://issuer.example/oauth/token"
-        })
-
-      conn =
-        post_token(%{
-          "grant_type" => "unsupported",
-          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
-          "client_assertion" => assertion
-        })
-
-      assert body(conn)["error"] == "invalid_client"
-    end
-
-    @tag registered_auth_method: :private_key_jwt
-    test "accepts legacy endpoint assertion audience with the 3.x default" do
-      # A legacy deployment can retain endpoint audiences through explicit policy.
+    test "the default rejects a token endpoint private_key_jwt audience (CVE-2025-27370)" do
+      # rfc7523bis-11 requires the authorization server issuer identifier; the
+      # endpoint URL is the value an audience-injection attacker republishes.
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}
 
@@ -855,7 +830,49 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
           "client_assertion" => assertion
         })
 
+      assert body(conn)["error"] == "invalid_client"
+    end
+
+    @tag registered_auth_method: :private_key_jwt
+    test "an explicit endpoint-audience opt-in accepts the token endpoint URL and reports it" do
+      # A legacy deployment can retain endpoint audiences through explicit policy.
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+      put_config(
+        client_jwks: fn %{id: "confidential-1"} -> client_jwks end,
+        client_assertion_audiences: fn config -> [config.issuer, Config.token_endpoint_url(config)] end
+      )
+
+      handler_id = {__MODULE__, :legacy_assertion_audience, make_ref()}
+      test_pid = self()
+
+      :ok =
+        :telemetry.attach(
+          handler_id,
+          [:attesto_phoenix, :client_authentication, :legacy_assertion_audience],
+          fn _event, measurements, metadata, _config ->
+            send(test_pid, {:legacy_audience, measurements, metadata})
+          end,
+          nil
+        )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assertion =
+        client_assertion(client_key, "confidential-1", %{
+          "aud" => "https://issuer.example/oauth/token"
+        })
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+          "client_assertion" => assertion
+        })
+
       assert body(conn)["error"] == "unsupported_grant_type"
+      assert_received {:legacy_audience, %{count: 1}, %{method: :private_key_jwt}}
     end
 
     @tag registered_auth_method: :private_key_jwt

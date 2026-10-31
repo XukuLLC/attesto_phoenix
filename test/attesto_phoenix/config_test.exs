@@ -1237,6 +1237,63 @@ defmodule AttestoPhoenix.ConfigTest do
     end
   end
 
+  describe ":registration_grant_types (RFC 7591 §2)" do
+    test "defaults to the supported grants in which a resource owner approves the client" do
+      config = config([])
+
+      assert Config.registration_grant_types(config) ==
+               Enum.filter(
+                 ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"],
+                 &(&1 in Config.grant_types_supported(config))
+               )
+
+      refute "client_credentials" in Config.registration_grant_types(config)
+
+      wide =
+        config(
+          grant_types_supported: [
+            "authorization_code",
+            "refresh_token",
+            "client_credentials",
+            "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+            "urn:ietf:params:oauth:grant-type:device_code"
+          ]
+        )
+
+      assert Config.registration_grant_types(wide) ==
+               ["authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:device_code"]
+    end
+
+    test "an explicit subset is returned as configured" do
+      config = config(registration_grant_types: ["authorization_code", "refresh_token"])
+      assert Config.registration_grant_types(config) == ["authorization_code", "refresh_token"]
+    end
+
+    test "rejects a grant the server does not support" do
+      assert_raise ArgumentError, ~r/registration_grant_types contains grant type/, fn ->
+        config(
+          grant_types_supported: ["authorization_code"],
+          registration_grant_types: ["authorization_code", "client_credentials"]
+        )
+      end
+    end
+
+    test "rejects non-list, non-string, and duplicate entries" do
+      assert_raise ArgumentError, ~r/registration_grant_types must be nil or a list/, fn ->
+        config(registration_grant_types: "authorization_code")
+      end
+
+      assert_raise ArgumentError, ~r/non-empty grant type strings/, fn ->
+        config(registration_grant_types: ["authorization_code", ""])
+      end
+
+      assert_raise ArgumentError, ~r/duplicate/, fn ->
+        config(registration_grant_types: ["authorization_code", "authorization_code"])
+      end
+    end
+  end
+
   describe ":registration_default_scope (RFC 7591 §2)" do
     test "OIDC normalization creates one effective scope catalog" do
       omitted = config(openid_provider: true, scopes_supported: ["profile", "email"])
@@ -1646,6 +1703,12 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe ":client_assertion_audiences" do
+    test "defaults to the issuer identifier alone (CVE-2025-27370 / CVE-2025-27371)" do
+      built = config([])
+
+      assert Config.client_assertion_audiences(built) == [built.issuer]
+    end
+
     test "accepts a static non-empty absolute URI list" do
       audiences = ["https://issuer.example", "urn:example:token-endpoint"]
       built = config(client_assertion_audiences: audiences)

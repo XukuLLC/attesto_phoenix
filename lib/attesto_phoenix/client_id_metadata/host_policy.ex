@@ -46,13 +46,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicy do
   def special_use_ip?(address), do: not Attesto.IPAddress.public_fetch_destination?(address)
 
   @spec authority(URI.t()) :: String.t()
-  def authority(%URI{host: host, port: port, scheme: scheme}) when is_binary(host) and is_integer(port) do
-    host_part = if String.contains?(host, ":"), do: "[" <> host <> "]", else: host
-
-    if default_port?(scheme, port),
-      do: host_part,
-      else: host_part <> ":" <> Integer.to_string(port)
-  end
+  defdelegate authority(uri), to: Attesto.OutboundTarget
 
   defp canonicalize_dns(host) do
     labels =
@@ -94,8 +88,4 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicy do
   end
 
   defp canonicalize_hosts(_hosts), do: {:error, :invalid_host}
-
-  defp default_port?("https", 443), do: true
-  defp default_port?("http", 80), do: true
-  defp default_port?(_scheme, _port), do: false
 end

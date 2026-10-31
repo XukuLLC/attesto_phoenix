@@ -3,11 +3,125 @@ defmodule AttestoPhoenix.CredentialIssuer do
 
   import AttestoPhoenix.Controller.OID4VCIHelpers, only: [maybe_put_option: 3]
 
-  alias Attesto.{Key, MapParams, Mdoc, SdJwtVc, SigningAlg}
-  alias AttestoPhoenix.Config
+  alias Attesto.{
+    CredentialProof,
+    CredentialRequest,
+    CredentialResponse,
+    JWS,
+    Key,
+    MapParams,
+    Mdoc,
+    SdJwtVc,
+    SigningAlg
+  }
+
+  alias AttestoPhoenix.{Callback, Config}
+
+  require Logger
 
   @sd_jwt_vc_formats ~w(vc+sd-jwt dc+sd-jwt)
   @credential_formats @sd_jwt_vc_formats ++ ["jwt_vc_json", "mso_mdoc"]
+  @credential_configuration_ids_claim "credential_configuration_ids"
+  # The bound `Attesto.CredentialProof` applies; a proof header may carry a
+  # key attestation JWT.
+  @max_proof_bytes 256 * 1_024
+  @mdoc_signing_key_error "mso_mdoc issuance requires an EC P-256 (ES256) VC signing key."
+  @invalid_builder_result_warning "AttestoPhoenix credential builder returned an invalid result; credential issuance denied"
+  @builder_failure "AttestoPhoenix credential builder callback failed"
+  @deferred_builder_failure "AttestoPhoenix deferred credential builder callback failed"
+  @invalid_deferred_builder_result_warning "AttestoPhoenix deferred credential builder returned an invalid result; credential issuance denied"
+  @nonce_consume_failure "c_nonce_store consume/1 must return :ok or {:error, reason}"
+  @nonce_validity_failure "c_nonce_store valid?/1 must return true or false"
+
+  @doc """
+  Complete a deferred OID4VCI credential request for an authenticated wallet,
+  returning `{:ok, response_map}` or `{:error, error_code, error_description}`.
+  """
+  @spec issue_deferred_request(Config.t(), map(), map()) ::
+          {:ok, map()} | {:error, String.t(), String.t()}
+  def issue_deferred_request(%Config{} = config, claims, request) when is_map(claims) and is_map(request) do
+    with {:ok, transaction_id} <- deferred_transaction_id(request),
+         {:ok, deferred} <- build_deferred_credential(config, claims["sub"], transaction_id),
+         :ok <- deferred_entitled?(claims, deferred.credential_configuration_id),
+         {:ok, credential} <-
+           issue(
+             config,
+             claims["sub"],
+             deferred.credential_configuration_id,
+             deferred.holder_jwk,
+             deferred.credential
+           ) do
+      {:ok, CredentialResponse.build(credential)}
+    else
+      {:error, :missing_transaction_id} ->
+        {:error, "invalid_credential_request", "transaction_id is required"}
+
+      {:error, :issuance_pending} ->
+        {:error, "issuance_pending", "The credential is not yet ready."}
+
+      {:error, _reason} ->
+        {:error, "invalid_credential_request", "credential unavailable"}
+    end
+  end
+
+  @doc """
+  Validate an OID4VCI credential request, verify holder-key proof(s), consume
+  the `c_nonce`, and issue the holder-bound credential(s) as a conn-free
+  response map.
+  """
+  @spec issue_request(Config.t(), map(), map()) ::
+          {:ok, map()}
+          | {:error, :not_entitled}
+          | {:error, String.t(), String.t()}
+  def issue_request(%Config{} = config, claims, request) when is_map(claims) and is_map(request) do
+    parsed_request = Callback.map_value(%{result: CredentialRequest.parse(request)}, :result)
+
+    with {:ok, parsed} <- parsed_request,
+         :ok <- reject_response_encryption(parsed.response_encryption),
+         {:ok, credential_configuration_id} <- selector(parsed.selector),
+         :ok <- entitled?(claims, parsed.selector, credential_configuration_id),
+         {:ok, holder_jwks} <- verify_proofs(config, claims, parsed.proofs),
+         {:ok, credentials} <-
+           build_credentials(config, claims["sub"], credential_configuration_id, holder_jwks) do
+      {:ok, CredentialResponse.build(credentials)}
+    else
+      {:error, :not_entitled} ->
+        {:error, :not_entitled}
+
+      {:error, :unknown_credential_configuration} ->
+        # OID4VCI §8.3.1: the request names a credential_configuration_id the
+        # access token was not granted (or the issuer does not support).
+        {:error, "unknown_credential_configuration",
+         "The access token does not authorize the requested credential_configuration_id."}
+
+      {:error, :unknown_credential_identifier} ->
+        # OID4VCI §8.3.1: the request names a credential_identifier that was not
+        # returned in this access token's authorization_details.
+        {:error, "unknown_credential_identifier",
+         "The access token does not authorize the requested credential_identifier."}
+
+      {:error, :invalid_nonce, description} ->
+        {:error, "invalid_nonce", description}
+
+      {:error, :invalid_proof, description} ->
+        {:error, "invalid_proof", description}
+
+      {:error, :invalid_credential_request, description} ->
+        {:error, "invalid_credential_request", description}
+
+      {:error, :response_encryption_not_supported, description} ->
+        {:error, "invalid_encryption_parameters", description}
+
+      {:error, :invalid_mdoc_signing_key} ->
+        {:error, "invalid_credential_request", @mdoc_signing_key_error}
+
+      {:error, :unavailable_credential} ->
+        {:error, "invalid_credential_request", "credential unavailable"}
+
+      {:error, _reason} ->
+        {:error, "invalid_credential_request", "Invalid credential request."}
+    end
+  end
 
   @spec issue(Config.t(), String.t(), String.t(), map(), map()) ::
           {:ok, String.t()} | {:error, atom()}
@@ -235,4 +349,301 @@ defmodule AttestoPhoenix.CredentialIssuer do
   end
 
   defp configuration_value(configuration, key), do: MapParams.fetch(configuration, key)
+
+  # `Attesto.CredentialRequest.parse` accepts and normalizes a wallet's
+  # `credential_response_encryption` request per OID4VCI §8.2, but this issuer
+  # does not implement Credential Response encryption (a future feature) and
+  # its metadata never advertises it as supported. Silently returning a
+  # plaintext credential when the wallet explicitly required an encrypted
+  # response would be a silent confidentiality downgrade, so fail closed with
+  # a clear OID4VCI error instead.
+  defp reject_response_encryption(nil), do: :ok
+
+  defp reject_response_encryption(%{}) do
+    {:error, :response_encryption_not_supported,
+     "This credential issuer does not support Credential Response encryption."}
+  end
+
+  defp selector({:configuration_id, id}), do: {:ok, id}
+
+  # OID4VCI §6.2/§8.2: when the token response returned `credential_identifiers`,
+  # the wallet presents one as `credential_identifier`. This issuer maps each
+  # identifier 1:1 onto its `credential_configuration_id` (see the token
+  # endpoint's `credential_authorization_detail/1`), so it resolves to the same
+  # id; `entitled?/2` still gates it against the access token's granted set, so
+  # an identifier the token was not issued for is rejected.
+  defp selector({:credential_identifier, id}), do: {:ok, id}
+
+  # A token that carries the credential entitlement claim but not this id names a
+  # credential the wallet was not authorized for: a bad request (400) whose error
+  # code names which selector was unknown (OID4VCI §8.3.1). A token with no
+  # entitlement claim at all is not a credential-issuance token, which is the
+  # genuine insufficient-scope (403) condition.
+  defp entitled?(%{@credential_configuration_ids_claim => ids}, selector, id) when is_list(ids) do
+    cond do
+      id in ids -> :ok
+      match?({:credential_identifier, _}, selector) -> {:error, :unknown_credential_identifier}
+      true -> {:error, :unknown_credential_configuration}
+    end
+  end
+
+  defp entitled?(_claims, _selector, _id), do: {:error, :not_entitled}
+
+  defp verify_proofs(_config, _claims, []), do: {:error, :invalid_proof, "A credential proof is required."}
+
+  defp verify_proofs(config, claims, proofs) do
+    proofs
+    |> Enum.reduce_while({:ok, [], []}, fn proof, {:ok, jwks, nonces} ->
+      case verify_proof(config, claims, proof) do
+        {:ok, holder_jwk, nonce} -> {:cont, {:ok, [holder_jwk | jwks], [nonce | nonces]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      # Every proof verified against a live c_nonce. Now single-use it once for
+      # the whole request (OID4VCI `proofs` share one nonce, so consuming
+      # per-proof would fail the second) so a captured proof cannot be replayed.
+      {:ok, holder_jwks, nonces} ->
+        case consume_nonces(config, Enum.uniq(nonces)) do
+          :ok -> {:ok, Enum.reverse(holder_jwks)}
+          {:error, :invalid_nonce} -> invalid_nonce_error()
+        end
+
+      # OID4VCI §8.3: an invalid or expired proof nonce is `invalid_nonce`,
+      # distinct from an otherwise malformed or wrongly-signed proof.
+      {:error, :invalid_nonce} ->
+        invalid_nonce_error()
+
+      {:error, :invalid_proof} ->
+        {:error, :invalid_proof, "Invalid credential proof."}
+    end
+  end
+
+  defp invalid_nonce_error, do: {:error, :invalid_nonce, "The proof nonce is invalid or has expired."}
+
+  # Atomically single-use the request's c_nonce(s) after the batch verifies. A
+  # store that cannot `consume/1` (only `valid?/1`) must not be used for
+  # issuance - fail closed rather than leave the nonce replayable.
+  defp consume_nonces(config, nonces) do
+    with {:ok, store} <- consuming_nonce_store(config) do
+      consume_each(store, nonces)
+    end
+  end
+
+  defp consuming_nonce_store(config) do
+    case Callback.config_callback(config, :c_nonce_store) do
+      store when is_atom(store) and not is_nil(store) ->
+        if function_exported?(store, :consume, 1), do: {:ok, store}, else: {:error, :invalid_nonce}
+
+      _store ->
+        {:error, :invalid_nonce}
+    end
+  end
+
+  defp consume_each(store, nonces) do
+    Enum.reduce_while(nonces, :ok, fn nonce, :ok ->
+      case consume_nonce!(store, nonce) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} -> {:halt, {:error, :invalid_nonce}}
+      end
+    end)
+  end
+
+  defp consume_nonce!(store, nonce) do
+    case store.consume(nonce) do
+      :ok -> :ok
+      {:error, _reason} = error -> error
+      _unexpected -> raise RuntimeError, @nonce_consume_failure
+    end
+  rescue
+    _error -> raise RuntimeError, @nonce_consume_failure
+  catch
+    _kind, _reason -> raise RuntimeError, @nonce_consume_failure
+  end
+
+  defp verify_proof(config, claims, {"jwt", jwt}) do
+    with {:ok, payload} <- peek_proof_payload(jwt),
+         {:ok, nonce} <- proof_nonce(payload),
+         :ok <- check_nonce(config, nonce),
+         {:ok, %{jwk: holder_jwk}} <-
+           CredentialProof.verify_jwt(jwt, proof_opts(config, claims, nonce)) do
+      {:ok, holder_jwk, nonce}
+    else
+      {:error, :invalid_nonce} -> {:error, :invalid_nonce}
+      _other -> {:error, :invalid_proof}
+    end
+  end
+
+  defp verify_proof(_config, _claims, _proof), do: {:error, :invalid_proof}
+
+  defp peek_proof_payload(jwt) do
+    case JWS.peek_json(jwt, :payload, max_compact_bytes: @max_proof_bytes) do
+      {:ok, payload} when is_map(payload) -> {:ok, payload}
+      _other -> {:error, :invalid_proof}
+    end
+  end
+
+  defp proof_nonce(payload) do
+    case Map.get(payload, "nonce") do
+      nonce when is_binary(nonce) and nonce != "" -> {:ok, nonce}
+      _other -> {:error, :invalid_proof}
+    end
+  end
+
+  defp check_nonce(config, nonce) do
+    if nonce_valid?(config, nonce), do: :ok, else: {:error, :invalid_nonce}
+  end
+
+  defp nonce_valid?(config, nonce) do
+    case Callback.config_callback(config, :c_nonce_store) do
+      store when is_atom(store) and not is_nil(store) ->
+        if function_exported?(store, :valid?, 1) do
+          nonce_valid_from_store!(store, nonce)
+        else
+          false
+        end
+
+      _ ->
+        false
+    end
+  end
+
+  defp nonce_valid_from_store!(store, nonce) do
+    case store.valid?(nonce) do
+      true -> true
+      false -> false
+      _unexpected -> raise RuntimeError, @nonce_validity_failure
+    end
+  rescue
+    _error -> raise RuntimeError, @nonce_validity_failure
+  catch
+    _kind, _reason -> raise RuntimeError, @nonce_validity_failure
+  end
+
+  defp proof_opts(config, claims, nonce) do
+    [issuer: config.issuer, nonce: nonce]
+    |> maybe_put_client_id(claims)
+    |> maybe_put_key_attestation(config)
+  end
+
+  # When the host configures trusted key-attestation keys, verify a
+  # `key_attestation` header carried by the proof and (under HAIP) require one.
+  defp maybe_put_key_attestation(opts, config) do
+    case Config.key_attestation_trusted_jwks(config) do
+      nil ->
+        opts
+
+      jwks ->
+        opts
+        |> Keyword.put(:key_attestation_trusted_jwks, jwks)
+        |> Keyword.put(:require_key_attestation, Config.require_key_attestation?(config))
+    end
+  end
+
+  # RFC 9068 §2.2 guarantees every access token JWT carries a `client_id`
+  # claim, so this binds every credential-request proof's `iss` to the
+  # authenticated client regardless of grant type. (Previously this only
+  # fired for a `"grant_type" => "authorization_code"` claim that no token
+  # minting path ever wrote, so the iss-binding check was permanently
+  # dead code and a forged/absent proof `iss` was accepted.)
+  defp maybe_put_client_id(opts, %{"client_id" => client_id}) when is_binary(client_id),
+    do: Keyword.put(opts, :client_id, client_id)
+
+  defp maybe_put_client_id(opts, _claims), do: opts
+
+  defp build_credentials(config, subject, credential_configuration_id, holder_jwks) do
+    case validate_configuration(config, credential_configuration_id) do
+      :ok ->
+        holder_jwks
+        |> Enum.reduce_while(
+          {:ok, []},
+          &reduce_credential(&1, &2, config, subject, credential_configuration_id)
+        )
+        |> reverse_credentials()
+
+      {:error, _reason} ->
+        {:error, :unavailable_credential}
+    end
+  end
+
+  defp reduce_credential(holder_jwk, {:ok, acc}, config, subject, credential_configuration_id) do
+    case build_credential(config, subject, credential_configuration_id, holder_jwk) do
+      {:ok, credential} -> {:cont, {:ok, [credential | acc]}}
+      {:error, :invalid_mdoc_signing_key} -> {:halt, {:error, :invalid_mdoc_signing_key}}
+      {:error, _reason} -> {:halt, {:error, :unavailable_credential}}
+    end
+  end
+
+  defp reverse_credentials({:ok, credentials}), do: {:ok, Enum.reverse(credentials)}
+  defp reverse_credentials(error), do: error
+
+  defp build_credential(config, subject, credential_configuration_id, holder_jwk) do
+    case invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
+      {:ok, result} when is_map(result) ->
+        issue(config, subject, credential_configuration_id, holder_jwk, result)
+
+      other ->
+        normalize_build_result(other)
+    end
+  end
+
+  defp invoke_build_credential!(config, subject, credential_configuration_id, holder_jwk) do
+    Config.build_credential(config, subject, credential_configuration_id, holder_jwk)
+  rescue
+    _error -> raise RuntimeError, @builder_failure
+  catch
+    _kind, _reason -> raise RuntimeError, @builder_failure
+  end
+
+  defp normalize_build_result({:error, reason}), do: {:error, reason}
+
+  defp normalize_build_result(_other) do
+    Logger.warning(@invalid_builder_result_warning)
+    {:error, :invalid_credential}
+  end
+
+  defp deferred_transaction_id(%{"transaction_id" => id}) when is_binary(id) and id != "", do: {:ok, id}
+
+  defp deferred_transaction_id(_request), do: {:error, :missing_transaction_id}
+
+  defp build_deferred_credential(config, subject, transaction_id) do
+    case invoke_deferred_builder(config, subject, transaction_id) do
+      {:returned, result} -> validate_deferred_builder_result(result)
+      :failed -> raise RuntimeError, @deferred_builder_failure
+    end
+  end
+
+  defp invoke_deferred_builder(config, subject, transaction_id) do
+    {:returned, Config.build_deferred_credential(config, subject, transaction_id)}
+  catch
+    _kind, _reason -> :failed
+  end
+
+  defp validate_deferred_builder_result(result) do
+    case result do
+      {:ok,
+       %{
+         credential_configuration_id: credential_configuration_id,
+         holder_jwk: holder_jwk,
+         credential: credential
+       } = deferred}
+      when is_binary(credential_configuration_id) and credential_configuration_id != "" and
+             is_map(holder_jwk) and is_map(credential) ->
+        {:ok, deferred}
+
+      {:error, _reason} = error ->
+        error
+
+      _unexpected ->
+        Logger.warning(@invalid_deferred_builder_result_warning)
+        {:error, :invalid_credential}
+    end
+  end
+
+  defp deferred_entitled?(%{@credential_configuration_ids_claim => ids}, credential_configuration_id)
+       when is_list(ids) do
+    if credential_configuration_id in ids, do: :ok, else: {:error, :not_entitled}
+  end
+
+  defp deferred_entitled?(_claims, _credential_configuration_id), do: {:error, :not_entitled}
 end

@@ -3,12 +3,10 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   `POST /oauth/revoke` - OAuth 2.0 Token Revocation (RFC 7009).
 
   A client presents a credential it issued and asks the authorization
-  server to invalidate it. This endpoint revokes the *refresh* credential:
-  revoking one refresh token tears down its whole family (every token
-  descended from the same authorization), via the configured
-  `Attesto.RefreshStore`. Access tokens are stateless, short-lived JWTs
-  with no server-side state to drop, so a hint pointing at one is honored
-  as a no-op success rather than an error (RFC 7009 §2.2).
+  server to invalidate it. This controller owns the HTTP framing (`require_https`,
+  `no-store` cache headers, client authentication, and RFC 6749 §5.2 challenge
+  rendering) and delegates token revocation and `:token_revoked` event
+  construction to `AttestoPhoenix.AuthorizationServer.Revocation`.
 
   ## Client authentication (RFC 7009 §2.1, RFC 6749 §2.3)
 
@@ -24,19 +22,11 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   The resolved `client_id` is then threaded into revocation so one client cannot
   revoke another client's tokens (RFC 7009 §2.1).
 
-  Client authentication is delegated to the shared
-  `AttestoPhoenix.ClientAuthentication` service, which resolves clients and
-  compares secrets through the host's configured callbacks; this controller
-  owns no client registry or authentication parser.
-
   ## No-existence oracle (RFC 7009 §2.2)
 
   Once the client is authenticated, the response is always `HTTP 200` with
   an empty body, whether or not the presented token existed, was expired,
-  or was already revoked. A revocation endpoint must not let a caller probe
-  which tokens are live. The only non-200 outcomes are a malformed request
-  (`invalid_request`, missing the required `token` parameter) and failed
-  client authentication (`invalid_client`).
+  or was already revoked.
 
   ## Caching (RFC 6749 §5.1)
 
@@ -65,7 +55,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
 
   import Plug.Conn
 
-  alias Attesto.Revocation
+  alias AttestoPhoenix.AuthorizationServer.Revocation
   alias AttestoPhoenix.ClientAuthentication
   alias AttestoPhoenix.ClientAuthentication.ErrorContext
   alias AttestoPhoenix.Config
@@ -87,9 +77,6 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   # RFC 6749 §5.2 error codes.
   @error_invalid_request :invalid_request
 
-  # RFC 7009 §2.1: the form parameter carrying the credential to revoke, and
-  # the optional hint about its type (RFC 7009 §2.1).
-  @token_param "token"
   @token_type_hint_param "token_type_hint"
 
   # Config.refresh_store selects the Attesto.RefreshStore used for revocation.
@@ -116,8 +103,8 @@ defmodule AttestoPhoenix.Controller.RevocationController do
          :ok <- RequestContext.check_https(conn, config),
          {:ok, %ClientAuthentication.Result{client_id: client_id}} <-
            authenticate_client(config, conn, params),
-         {:ok, token} <- fetch_token(params) do
-      revoke_token(conn, config, client_id, token, params)
+         {:ok, token} <- Revocation.fetch_token(params) do
+      revoke_token(conn, config, client_id, token, token_type_hint(params))
     else
       {:error, :query_parameters_not_allowed} ->
         OAuthError.render(conn, QueryParameterGuard.error(), auth_scheme: :none, config: config)
@@ -155,23 +142,29 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     end
   end
 
-  defp revoke_token(conn, config, client_id, token, params) do
-    # RFC 7009 §2.1: bind the revocation to the authenticated client so a
-    # client cannot revoke another client's tokens. `Attesto.Revocation`
-    # returns `:ok` for every accepted revocation request, whether the token
-    # was unknown, expired, already revoked, or owned by another client. This
-    # prevents the endpoint from becoming a token-existence oracle.
-    :ok =
-      Revocation.revoke(refresh_store(config, conn), token,
-        client_id: client_id,
-        issuer: config.issuer
+  defp revoke_token(conn, config, client_id, token, token_type_hint) do
+    {:ok, events} =
+      Revocation.revoke(
+        config,
+        client_id,
+        token,
+        token_type_hint,
+        refresh_store: refresh_store(config, conn)
       )
 
-    emit_revoked(config, client_id, params)
+    callback = Config.on_event_fun(config)
+    Enum.each(events, &Event.dispatch(callback, &1))
 
     conn
     |> send_resp(@http_ok, "")
     |> halt()
+  end
+
+  defp token_type_hint(params) do
+    case Map.get(params, @token_type_hint_param) do
+      hint when is_binary(hint) -> hint
+      _ -> nil
+    end
   end
 
   # RFC 7009 §2.1: confidential clients use their registered authentication
@@ -200,7 +193,11 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     %{
       error
       | status: @http_unauthorized,
-        headers: put_www_authenticate(error.headers, OAuthError.format_challenge(scheme, realm: config.basic_realm))
+        headers:
+          put_www_authenticate(
+            error.headers,
+            OAuthError.format_challenge(scheme, realm: config.basic_realm)
+          )
     }
   end
 
@@ -210,29 +207,6 @@ defmodule AttestoPhoenix.Controller.RevocationController do
     headers
     |> Enum.reject(fn {key, _value} -> String.downcase(key) == "www-authenticate" end)
     |> Kernel.++([{"www-authenticate", challenge}])
-  end
-
-  defp fetch_token(params) do
-    case Map.get(params, @token_param) do
-      token when is_binary(token) and token != "" ->
-        {:ok, token}
-
-      # RFC 7009 §2.1: `token` is REQUIRED.
-      _missing ->
-        {:error, :invalid_request}
-    end
-  end
-
-  # Audit/telemetry hook (RFC 7009 leaves auditing to the deployment). The
-  # resolved event callback is optional, so a config without one is a silent
-  # no-op. The event is emitted only after a successful, authenticated
-  # revocation request; its metadata carries the optional `token_type_hint`
-  # for context but never the token value.
-  defp emit_revoked(%Config{} = config, client_id, params) do
-    Event.emit(config, :token_revoked,
-      client_id: client_id,
-      metadata: %{token_type_hint: Map.get(params, @token_type_hint_param)}
-    )
   end
 
   # RFC 6749 §5.2: non-authentication revocation errors use the shared JSON

@@ -6,6 +6,72 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.3.0] - 2026-10-31
+
+### Security
+
+- Refuse dynamic registration of `redirect_uris` and `post_logout_redirect_uris`
+  whose query component carries a reserved OAuth or OpenID response parameter
+  name (`code`, `state`, `iss`, `error`, `error_description`, `session_state`,
+  `response`), returning `invalid_redirect_uri`. Appending authorization or
+  logout response parameters onto a registered URI that already contains one of
+  those names produces duplicate query parameters on redirect (Keycloak
+  CVE-2026-9689 / CVE-2026-18209, django-oauth-toolkit 3.4.1, Doorkeeper #1851).
+- **Breaking:** dynamic registration (RFC 7591 §2) now admits only the
+  supported grants in which a resource owner approves the client:
+  `authorization_code`, `refresh_token`, and the RFC 8628 device grant. Until
+  now the endpoint accepted every grant the server supports, so an anonymous
+  registration on an open endpoint could claim `client_credentials`,
+  JWT-bearer, token exchange, or CIBA and mint tokens with no user in the
+  loop. The new `:registration_grant_types` option lists the registrable
+  grants explicitly (a subset of `:grant_types_supported`, validated at boot);
+  a host whose registrants need `client_credentials` lists it there, behind
+  its own admission control. Surfaced by mining the class behind Boruta
+  CVE-2026-65635.
+- **Breaking:** `private_key_jwt` client assertions at the token and
+  backchannel authentication endpoints must be audienced to the issuer
+  identifier alone, as PAR, introspection, device authorization, and
+  revocation already required. The token endpoint URL (and, at the
+  backchannel endpoint, the backchannel endpoint URL) is no longer accepted
+  by default: it is the value the 2025 audience-injection attack
+  (CVE-2025-27370, CVE-2025-27371) relies on, where a malicious authorization
+  server republishes this server's endpoint as its own and replays the
+  assertion a shared-key client signs for it. A deployment whose clients, or a
+  FAPI-CIBA test plan, still send an endpoint URL lists it in
+  `:client_assertion_audiences`; accepted non-issuer audiences continue to emit
+  `[:attesto_phoenix, :client_authentication, :legacy_assertion_audience]`.
+- **Breaking:** without `:introspection_authorize`, token introspection
+  releases an active response only to the client the token was issued to or a
+  client named in the token's `aud`; any other authenticated caller receives
+  `{"active": false}` (RFC 7662 §2.2). Until now every authenticated client
+  could read any token's subject, scope, and audience, which made
+  introspection a token-validation oracle for anyone who could obtain client
+  credentials, including through open dynamic registration. A protected
+  resource that introspects tokens audienced to a resource identifier other
+  than its `client_id` configures `:introspection_authorize` to map callers to
+  the resources they serve. Same class as the Keycloak introspection fixes of
+  2026.
+
+### Changed
+
+- Require Attesto `>= 2.8.0 and < 3.0.0` for `Attesto.OutboundTarget.screen/2`,
+  to which `AttestoPhoenix.SSRFGuard` and the Client ID Metadata host policy
+  now delegate outbound URL validation, DNS resolution, and public-IP
+  screening.
+- `AttestoPhoenix.ClientIdMetadata.Fetcher.Req` runs its pinned HTTP request
+  inside its own deadline task instead of spawning a second, nested one.
+- Extract `Plug.Conn`-free core domain modules and functions from the remaining
+  HTTP controllers (`AttestoPhoenix.AuthorizationServer.Registration`,
+  `AttestoPhoenix.AuthorizationServer.Userinfo`,
+  `AttestoPhoenix.AuthorizationServer.Introspection`,
+  `AttestoPhoenix.AuthorizationServer.Revocation`,
+  `AttestoPhoenix.Verifier.complete_presentation_response/2`, and the
+  internal credential and deferred-credential issuance paths), and replace
+  `PresentationResponseController`'s
+  private `object_push` JSON decoder with `Attesto.StrictJSON.decode/1` (adding
+  its 32-level maximum nesting depth bound to presentation `vp_token`, JWE
+  protected-header, and decrypted-response JSON decoding).
+
 ## [4.2.2] - 2026-10-27
 
 ### Security

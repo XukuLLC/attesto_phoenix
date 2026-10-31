@@ -1373,12 +1373,8 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
 
         expected_audiences =
           case endpoint do
-            :token ->
+            endpoint when endpoint in [:token, :backchannel_authentication] ->
               Config.client_assertion_audiences(config)
-
-            :backchannel_authentication ->
-              Config.client_assertion_audiences(config) ++
-                [Config.backchannel_authentication_endpoint_url(config)]
 
             _other ->
               [config.issuer]

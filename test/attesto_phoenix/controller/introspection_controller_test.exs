@@ -77,6 +77,9 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
       client_id: fn %{id: id} -> id end,
       principal_kinds: [Attesto.PrincipalKind.new("client", "oc_")],
       refresh_store: StubRefreshStore,
+      # rs-1 is a protected resource the host entitles to every token in these
+      # tests. The default policy (no callback) has its own describe block.
+      introspection_authorize: fn caller, _response -> caller == @client_id end,
       require_https: false
     ]
   end
@@ -447,6 +450,44 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
     [_header, payload, _signature] = String.split(token, ".", parts: 3)
     {:ok, json} = Base.url_decode64(payload, padding: false)
     JSON.decode!(json)[name]
+  end
+
+  describe "create/2 default caller policy without :introspection_authorize (RFC 7662 §2.2)" do
+    setup do
+      Application.put_env(
+        :attesto_phoenix,
+        AttestoPhoenix.Config,
+        Keyword.delete(config_opts(), :introspection_authorize)
+      )
+
+      :ok
+    end
+
+    test "an access token issued to another client is inactive for the caller", %{config: config} do
+      conn = call(%{"token" => access_token(config)})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
+
+    test "an access token issued to the caller is active", %{config: config} do
+      conn = call(%{"token" => access_token(config, client_id: @client_id)})
+
+      assert conn.status == 200
+      body = JSON.decode!(conn.resp_body)
+      assert body["active"] == true
+      assert body["client_id"] == @client_id
+    end
+
+    test "a refresh token issued to another client is inactive for the caller" do
+      token = "another-clients-refresh-token"
+      put_refresh_record(token, "https://issuer.test")
+
+      conn = call(%{"token" => token, "token_type_hint" => "refresh_token"})
+
+      assert conn.status == 200
+      assert JSON.decode!(conn.resp_body) == %{"active" => false}
+    end
   end
 
   describe "create/2 :introspection_authorize caller policy (RFC 7662 §4 / RFC 9701 §5)" do

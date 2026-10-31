@@ -83,6 +83,8 @@ defmodule AttestoPhoenix.AuthorizationServer.DcrClientCredentialsTest do
       load_principal: fn _subject -> {:error, :not_found} end,
       register_client: fn attrs -> {:ok, attrs} end,
       registration_enabled: true,
+      # client_credentials is registrable only by explicit host opt-in.
+      registration_grant_types: ["authorization_code", "refresh_token", "client_credentials"],
       scopes_supported: ["read", "write"]
     })
   end

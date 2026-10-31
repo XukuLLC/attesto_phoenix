@@ -27,6 +27,25 @@ if Code.ensure_loaded?(Mint.HTTP) do
       end
     end
 
+    @spec request_inline(
+            atom(),
+            String.t(),
+            String.t(),
+            [{binary(), binary()}],
+            binary(),
+            pos_integer(),
+            non_neg_integer() | :discard
+          ) ::
+            {:ok, response()} | {:error, term()}
+    def request_inline(method, pinned_url, hostname, headers, body, timeout_ms, body_limit)
+        when method in [:get, :post] do
+      if valid_request?(pinned_url, hostname, headers, body, timeout_ms, body_limit) do
+        do_request(method, pinned_url, hostname, headers, body, timeout_ms, body_limit)
+      else
+        {:error, :invalid_request}
+      end
+    end
+
     # Mint owns its socket through messages delivered to the process which
     # opened the connection. Isolating that process also means an outbound
     # request can neither consume nor reorder messages in its caller's mailbox.
