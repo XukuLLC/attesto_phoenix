@@ -7,9 +7,12 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
         # Phoenix 4.2 uses Attesto 2.6's durable logout-store lease contract and
         # authorization-code replay integration, 4.2.1 requires the 2.6.1
         # pre-authentication JSON bounds its token-endpoint reads rely on,
-        # 4.2.2 requires 2.7.0 for its JOSE 1.11.13 floor, and 4.3 requires
-        # 2.8.0 for Attesto.OutboundTarget.screen/2.
-        assert Version.match?("2.8.0", requirement)
+        # 4.2.2 requires 2.7.0 for its JOSE 1.11.13 floor, 4.3 requires
+        # 2.8.0 for Attesto.OutboundTarget.screen/2, and 4.4 requires 2.10.0
+        # for Attesto.StrictJSON.decode_value/2 and Attesto.URI.valid_port?/2.
+        assert Version.match?("2.10.0", requirement)
+        refute Version.match?("2.9.0", requirement)
+        refute Version.match?("2.8.0", requirement)
         refute Version.match?("2.7.0", requirement)
         refute Version.match?("2.6.1", requirement)
         refute Version.match?("2.6.0", requirement)
@@ -59,7 +62,9 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "an empty source path selects the released requirement" do
     with_environment(%{"ATTESTO_SOURCE_PATH" => "", "ATTESTO_PATH" => nil}, fn ->
       assert {:attesto, requirement} = dependency!(:attesto)
-      assert Version.match?("2.8.0", requirement)
+      assert Version.match?("2.10.0", requirement)
+      refute Version.match?("2.9.0", requirement)
+      refute Version.match?("2.8.0", requirement)
       refute Version.match?("2.7.0", requirement)
       refute Version.match?("2.6.1", requirement)
       refute Version.match?("2.6.0", requirement)
@@ -92,9 +97,9 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     assert exit_code == 0, output
 
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
-    assert metadata =~ ~s(<<"version">>,<<"4.3.1">>)
+    assert metadata =~ ~s(<<"version">>,<<"4.4.0">>)
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
-    assert metadata =~ ~s(<<"requirement">>,<<">= 2.8.0 and < 3.0.0">>)
+    assert metadata =~ ~s(<<"requirement">>,<<">= 2.10.0 and < 3.0.0">>)
     assert File.regular?(Path.join(output_path, "guides/upgrade_4_0.md"))
   end
 

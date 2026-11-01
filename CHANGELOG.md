@@ -6,7 +6,7 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
-## [Unreleased]
+## [4.4.0] - 2026-11-01
 
 ### Security
 
@@ -22,6 +22,8 @@ defaults in a minor release.
 
 ### Changed
 
+- Require Attesto `>= 2.10.0 and < 3.0.0` for `Attesto.StrictJSON.decode_value/2`
+  and `Attesto.URI.valid_port?/2`.
 - Decode remote Client ID Metadata Documents (`ClientIdMetadata.Resolver`),
   remote CIMD and ID-JAG `jwks_uri` responses (`ClientIdMetadata.JWKSResolver`
   and `AuthorizationServer.JwtBearer`), and token-endpoint

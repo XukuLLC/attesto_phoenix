@@ -639,7 +639,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
          true <- scheme == "https",
          true <- is_binary(host) and host != "",
          {:ok, _canonical_host} <- HostPolicy.canonicalize(host),
-         true <- valid_uri_port?(value, uri.port) do
+         true <- Attesto.URI.valid_port?(value, uri.port) do
       true
     else
       _other -> false
@@ -665,7 +665,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
          {:ok, _canonical_host} <- HostPolicy.canonicalize(host),
          true <- is_nil(uri.userinfo),
          true <- allow_fragment? or is_nil(uri.fragment),
-         true <- valid_uri_port?(value, uri.port) do
+         true <- Attesto.URI.valid_port?(value, uri.port) do
       true
     else
       _other -> false
@@ -675,12 +675,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   defp valid_metadata_uri?(_value, _schemes, _allow_fragment?), do: false
 
   defp invalid_percent_encoding?(value), do: Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value)
-
-  defp valid_uri_port?(value, nil), do: not String.ends_with?(URI.parse(value).authority || "", ":")
-
-  defp valid_uri_port?(value, port) when is_integer(port) do
-    port in 1..65_535 and not String.ends_with?(URI.parse(value).authority || "", ":")
-  end
 
   defp valid_tls_identity?(key, value) do
     bounded_text?(value, @max_tls_identity_bytes) and
@@ -817,7 +811,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
          true <- scheme in ["https", "http"],
          true <- is_binary(host) and host != "",
          {:ok, canonical_host} <- HostPolicy.canonicalize(host),
-         true <- valid_uri_port?(value, uri.port) do
+         true <- Attesto.URI.valid_port?(value, uri.port) do
       {:ok, {scheme, canonical_host, effective_uri_port(uri)}}
     else
       _other -> {:error, :invalid_origin}

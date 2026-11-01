@@ -270,8 +270,8 @@ defmodule AttestoPhoenix.ClientIdMetadata do
          when is_binary(rh) and rh != "" <- URI.new(redirect_uri),
          client_port = effective_port(client_uri),
          redirect_port = effective_port(redirect),
-         true <- valid_port?(client_id, client_port),
-         true <- valid_port?(redirect_uri, redirect_port) do
+         true <- Attesto.URI.valid_port?(client_id, client_port),
+         true <- Attesto.URI.valid_port?(redirect_uri, redirect_port) do
       cs == rs and ch == rh and client_port == redirect_port
     else
       _ -> false
@@ -366,13 +366,4 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   # compare equal.
   defp effective_port(%URI{port: port}) when is_integer(port), do: port
   defp effective_port(%URI{scheme: scheme}), do: URI.default_port(scheme)
-
-  defp valid_port?(value, port) when is_binary(value) and is_integer(port) and port in 1..65_535 do
-    case URI.parse(value).authority do
-      authority when is_binary(authority) -> not String.ends_with?(authority, ":")
-      _ -> false
-    end
-  end
-
-  defp valid_port?(_value, _port), do: false
 end
