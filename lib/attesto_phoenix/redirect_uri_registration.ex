@@ -18,7 +18,8 @@ defmodule AttestoPhoenix.RedirectURIRegistration do
          false <- String.contains?(value, "\\"),
          false <- Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value),
          true <- RedirectURI.unambiguous?(value),
-         {:ok, %URI{fragment: nil, userinfo: nil} = uri} <- URI.new(value) do
+         {:ok, %URI{fragment: nil, userinfo: nil} = uri} <- URI.new(value),
+         false <- String.ends_with?(URI.parse(value).authority || "", ":") do
       acceptable?(uri, value, opts)
     else
       _other -> false

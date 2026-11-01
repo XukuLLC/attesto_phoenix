@@ -2610,7 +2610,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp parse_requested_credential_configurations(value) do
-    with {:ok, [_ | _] = entries} <- JSON.decode(value),
+    with {:ok, [_ | _]} <- JSON.decode(value),
+         {:ok, %{"entries" => [_ | _] = entries}} <-
+           Attesto.StrictJSON.decode(~s({"entries":) <> value <> "}"),
          true <- Enum.all?(entries, &valid_requested_credential_entry?/1) do
       {:ok, entries |> Enum.map(& &1["credential_configuration_id"]) |> Enum.uniq()}
     else

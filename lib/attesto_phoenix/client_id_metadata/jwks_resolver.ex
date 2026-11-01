@@ -91,7 +91,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.JWKSResolver do
 
   defp fetch_and_cache(fetcher, cache, metadata, uri, entry, opts) do
     with {:ok, %{body: body} = response} <- fetcher.fetch(uri, opts),
-         {:ok, keys} <- JSON.decode(body),
+         {:ok, keys} <- Attesto.StrictJSON.decode(body),
          :ok <- Core.validate_public_jwks(keys) do
       cache_keys(cache, metadata, uri, keys, entry, Map.get(response, :cache_control, []), opts)
       {:ok, keys}

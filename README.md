@@ -26,22 +26,22 @@ The Attesto family also includes:
 
 An authorization server built from `attesto` + `attesto_phoenix` is
 [OpenID Certified](https://openid.net/certification/certified-openid-connect-implementations/)
-to **FAPI 2.0 Security Profile Final — OP**, **FAPI 2.0 Message
-Signing Final — OP**, **FAPI-CIBA — OP**, **OpenID Connect Basic — OP** and
-**Config — OP**, **RP-Initiated**, **Back-Channel**, and **Front-Channel
-Logout — OP**, and **Session Management — OP** — the first Elixir provider with
+to **FAPI 2.0 Security Profile Final — OP** and **FAPI 2.0 Message
+Signing Final — OP** (`AttestoPhoenix 4.2.0` / `Attesto 2.6.1`, certified `2026-10-18`; `Attesto 1.0`, certified `2026-07-06`), **FAPI-CIBA — OP** (`Attesto 1.0`, certified `2026-07-08`), **OpenID Connect Basic — OP** (`Attesto 1.0.0`, certified `2026-07-04`) and
+**Config — OP** (`Attesto 1.0`, certified `2026-07-08`), **RP-Initiated** and **Back-Channel Logout — OP** (`Attesto 1.0.0`, certified `2026-07-04`), **Front-Channel
+Logout — OP** (`Attesto 1.0`, certified `2026-07-07`), and **Session Management — OP** (`Attesto 1.0`, certified `2026-07-07`) — the first Elixir provider with
 FAPI 2.0 certification.
 
-[![FAPI 2.0 Certified](https://img.shields.io/badge/FAPI_2.0-Certified-F78C40)](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)
-[![FAPI-CIBA Certified](https://img.shields.io/badge/FAPI--CIBA-Certified-F78C40)](https://openid.net/certification/certified-fapi-ciba-openid-providers-profiles/)
-[![OpenID Connect Certified](https://img.shields.io/badge/OpenID_Connect-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-profiles/)
-[![Logout Profiles Certified](https://img.shields.io/badge/Logout_Profiles-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
-[![Session Management Certified](https://img.shields.io/badge/Session_Management-Certified-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
-[![OpenID4VCI 1.0 + HAIP 1.0 Issuer Certified](https://img.shields.io/badge/OpenID4VCI_1.0_%2B_HAIP_1.0-Issuer_Certified-F78C40)](https://openid.net/certification/certified-oid4vci-haip-final/)
-[![OpenID4VP 1.0 + HAIP 1.0 Verifier Certified](https://img.shields.io/badge/OpenID4VP_1.0_%2B_HAIP_1.0-Verifier_Certified-F78C40)](https://openid.net/certification/certified-oid4vp-haip-final/)
+[![FAPI 2.0 Certified — AttestoPhoenix 4.2.0 / Attesto 2.6.1 (2026-10-18)](https://img.shields.io/badge/FAPI_2.0-Certified_(v4.2.0_/_v2.6.1,_2026--10--18)-F78C40)](https://openid.net/certification/certified-fapi-2-0-op-security-profile-final-message-signing-final/)
+[![FAPI-CIBA Certified — Attesto 1.0 (2026-07-08)](https://img.shields.io/badge/FAPI--CIBA-Certified_(v1.0,_2026--07--08)-F78C40)](https://openid.net/certification/certified-fapi-ciba-openid-providers-profiles/)
+[![OpenID Connect Certified — Attesto 1.0.0 / 1.0 (2026-07-04 / 2026-07-08)](https://img.shields.io/badge/OpenID_Connect-Certified_(v1.0.0,_2026--07--04)-F78C40)](https://openid.net/certification/certified-openid-providers-profiles/)
+[![Logout Profiles Certified — Attesto 1.0.0 / 1.0 (2026-07-04 / 2026-07-07)](https://img.shields.io/badge/Logout_Profiles-Certified_(v1.0.0,_2026--07--04)-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
+[![Session Management Certified — Attesto 1.0 (2026-07-07)](https://img.shields.io/badge/Session_Management-Certified_(v1.0,_2026--07--07)-F78C40)](https://openid.net/certification/certified-openid-providers-for-logout-profiles/)
+[![OpenID4VCI 1.0 + HAIP 1.0 Issuer Certified — Attesto 2.2.2 / attesto_phoenix 3.5.1 (2026-10-06)](https://img.shields.io/badge/OpenID4VCI_1.0_%2B_HAIP_1.0-Issuer_Certified_(v2.2.2_/_v3.5.1,_2026--10--06)-F78C40)](https://openid.net/certification/certified-oid4vci-haip-final/)
+[![OpenID4VP 1.0 + HAIP 1.0 Verifier Certified — Attesto 2.2.2 / attesto_phoenix 3.5.1 (2026-10-06)](https://img.shields.io/badge/OpenID4VP_1.0_%2B_HAIP_1.0-Verifier_Certified_(v2.2.2_/_v3.5.1,_2026--10--06)-F78C40)](https://openid.net/certification/certified-oid4vp-haip-final/)
 
 The certified credential deployment uses `attesto` **2.2.2**,
-`attesto_phoenix` **3.5.1**, and `attesto_client` **2.6.1**. Its
+`attesto_phoenix` **3.5.1**, and `attesto_client` **2.6.1** (certified `2026-10-06`). Its
 **OpenID4VCI 1.0 + HAIP 1.0 issuer** coverage includes **SD-JWT VC** and
 **ISO mdoc**, with both wallet-initiated and issuer-initiated authorization code
 flows. Its **OpenID4VP 1.0 + HAIP 1.0 verifier** coverage includes both formats

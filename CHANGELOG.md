@@ -6,6 +6,34 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [Unreleased]
+
+### Security
+
+- Extend `AttestoPhoenix.AuthorizationServer.JwtBearer` replay TTL calculation so
+  the `jti` replay claim covers `exp - now + 1` across the full 60-second future
+  `iat` clock-skew allowance (`max_lifetime + 61`) and does not clamp TTL to
+  300 seconds when `assertion_max_lifetime_seconds: nil` is configured.
+- Reject `cnf`-bound assertions in the direct
+  `AttestoPhoenix.AuthorizationServer.JwtBearer.authorize/3` helper before
+  subject resolution or replay claiming, because `authorize/3` carries no
+  sender-constraint proof context (`Token.issue/2` uses `prepare/3` and verifies
+  `cnf.jkt` against the request's DPoP proof).
+
+### Changed
+
+- Decode remote Client ID Metadata Documents (`ClientIdMetadata.Resolver`),
+  remote CIMD and ID-JAG `jwks_uri` responses (`ClientIdMetadata.JWKSResolver`
+  and `AuthorizationServer.JwtBearer`), and token-endpoint
+  `authorization_details` (`AuthorizationServer.Token`) through
+  `Attesto.StrictJSON`, rejecting duplicate JSON object member names and
+  container nesting beyond 32 levels.
+- Reject fragments, empty trailing authority colons (`https://host:/path`), and
+  malformed or out-of-range ports in
+  `AttestoPhoenix.ClientIdMetadata.same_origin_redirect_uri?/2`,
+  `AttestoPhoenix.RedirectURIRegistration.valid?/2`, and dynamic client
+  registration URI metadata (`Registration`).
+
 ## [4.3.1] - 2026-10-31
 
 ### Changed

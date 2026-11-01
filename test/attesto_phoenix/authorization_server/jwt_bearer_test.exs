@@ -417,6 +417,61 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert {:error, :replay} = JwtBearerGrant.authorize(config, @cid, params)
     end
 
+    test "the public authorize API rejects cnf-bound assertions without resolving subject or consuming replay" do
+      test_pid = self()
+      {_proof, jkt} = dpop_proof_and_jkt()
+
+      config =
+        config(
+          resolve_jwt_bearer_subject: fn claims ->
+            send(test_pid, {:subject_resolved, claims["jti"]})
+            {:ok, claims["sub"]}
+          end,
+          replay_check: fn key, ttl ->
+            send(test_pid, {:replay_claimed, key, ttl})
+            :ok
+          end
+        )
+
+      params = %{"assertion" => assertion(%{"jti" => "cnf-direct-jti", "cnf" => %{"jkt" => jkt}})}
+
+      assert {:error, :invalid_assertion} = JwtBearerGrant.authorize(config, @cid, params)
+      refute_received {:subject_resolved, _}
+      refute_received {:replay_claimed, _, _}
+    end
+
+    test "replay_ttl covers the full remaining acceptance window under clock skew and nil max_lifetime" do
+      now = System.system_time(:second)
+      test_pid = self()
+
+      skewed_config =
+        config(
+          replay_check: fn _key, ttl ->
+            send(test_pid, {:skewed_ttl, ttl})
+            :ok
+          end
+        )
+
+      skewed_jwt = assertion(%{"jti" => "skewed-jti", "iat" => now + 55, "exp" => now + 355})
+      assert {:ok, _} = JwtBearerGrant.authorize(skewed_config, @cid, %{"assertion" => skewed_jwt})
+      assert_received {:skewed_ttl, skewed_ttl}
+      assert skewed_ttl >= 355
+
+      unbounded_config =
+        config(
+          jwt_bearer: [assertion_max_lifetime_seconds: nil],
+          replay_check: fn _key, ttl ->
+            send(test_pid, {:unbounded_ttl, ttl})
+            :ok
+          end
+        )
+
+      unbounded_jwt = assertion(%{"jti" => "unbounded-jti", "iat" => now, "exp" => now + 1800})
+      assert {:ok, _} = JwtBearerGrant.authorize(unbounded_config, @cid, %{"assertion" => unbounded_jwt})
+      assert_received {:unbounded_ttl, unbounded_ttl}
+      assert unbounded_ttl >= 1800
+    end
+
     test "unexpected replay callback results fail loudly instead of impersonating a replay" do
       for invalid <- [nil, :unexpected, {:error, :storage_unavailable}] do
         config = config(replay_check: fn _key, _ttl -> invalid end)
@@ -722,11 +777,32 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       )
     end
 
+    defmodule DuplicateKeyJwksFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      @impl true
+      def fetch(_url, _opts) do
+        {_kty, map} = JOSE.JWK.to_public_map(JwtBearerTest.idp_key())
+        kid = JOSE.JWK.thumbprint(JwtBearerTest.idp_key())
+        valid_keys = JSON.encode!([Map.merge(map, %{"kid" => kid, "alg" => "RS256"})])
+        body = ~s({"keys":#{valid_keys},"keys":[]})
+        {:ok, %{body: body, cache_control: [max_age: 600]}}
+      end
+    end
+
     test "fetches and verifies against the issuer's jwks_uri" do
       config = remote_jwks_config(nil)
 
       assert {:ok, response, _} = issue(config, %{"assertion" => assertion()})
       assert is_binary(response.access_token)
+    end
+
+    test "rejects a jwks_uri JSON response containing duplicate object keys" do
+      config = remote_jwks_config(nil, __MODULE__.DuplicateKeyJwksFetcher)
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(config, %{"assertion" => assertion()})
     end
 
     test "a fetch failure warning excludes the URI and callback reason" do

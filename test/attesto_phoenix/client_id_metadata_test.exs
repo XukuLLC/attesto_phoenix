@@ -101,6 +101,23 @@ defmodule AttestoPhoenix.ClientIdMetadataTest do
       refute ClientIdMetadata.same_origin_redirect_uri?(@client_id, "")
       refute ClientIdMetadata.same_origin_redirect_uri?(@client_id, nil)
     end
+
+    test "refuses a redirect_uri or client_id with a fragment or malformed/out-of-range port" do
+      for bad <- [
+            "https://app.example/cb#frag",
+            "https://app.example/cb#",
+            "https://app.example:443xyz/cb",
+            "https://app.example:99999/cb",
+            "https://app.example:/cb",
+            "https://app.example:0/cb"
+          ] do
+        refute ClientIdMetadata.same_origin_redirect_uri?(@client_id, bad),
+               "expected redirect_uri #{inspect(bad)} to be rejected"
+
+        refute ClientIdMetadata.same_origin_redirect_uri?(bad, "https://app.example/cb"),
+               "expected client_id #{inspect(bad)} to be rejected"
+      end
+    end
   end
 
   describe "loopback_redirect_uri?/2" do

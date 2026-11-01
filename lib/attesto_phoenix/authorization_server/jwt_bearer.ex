@@ -33,7 +33,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   RFC 8693 token-exchange grant (which runs at the IdP).
   """
 
-  alias Attesto.{IdentityAssertion, Scope}
+  alias Attesto.{IdentityAssertion, Scope, StrictJSON}
   alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, ReplayClaim}
   alias AttestoPhoenix.ClientIdMetadata.Resolver
 
@@ -88,11 +88,19 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
 
   defp do_authorize(%Config{} = config, client_id, params) do
     with {:ok, prepared} <- prepare(config, client_id, params),
+         :ok <- reject_unverified_cnf(prepared.claims),
          {:ok, subject} <- resolve_subject(config, prepared.claims),
          :ok <- commit_replay_claim(config, prepared.replay_claim) do
       {:ok, prepared |> Map.delete(:replay_claim) |> Map.put(:subject, subject)}
     end
   end
+
+  # `authorize/3` carries no sender-constraint proof context (`Token` uses
+  # `prepare/3` and verifies `cnf.jkt` against the request's DPoP proof before
+  # resolving the subject or claiming replay). A direct `authorize/3` caller
+  # must never accept a proof-of-possession assertion as bearer.
+  defp reject_unverified_cnf(%{"cnf" => _}), do: {:error, :invalid_assertion}
+  defp reject_unverified_cnf(_claims), do: :ok
 
   @doc """
   Validate an ID-JAG while deferring subject resolution and its atomic replay
@@ -243,7 +251,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
 
     case fetcher.fetch(uri, fetch_opts) do
       {:ok, %{body: body, cache_control: cache_control}} ->
-        case JSON.decode(body) do
+        case StrictJSON.decode(body) do
           {:ok, %{"keys" => keys} = jwks} when is_list(keys) ->
             cache_put(cache, uri, jwks, cache_control, opts)
             {:ok, jwks}
@@ -329,9 +337,18 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   defp prepare_replay(_opts, _claims), do: {:error, :invalid_assertion}
 
   defp replay_ttl(exp, opts) do
-    remaining = exp - System.system_time(:second)
-    ceiling = Keyword.get(opts, :assertion_max_lifetime_seconds) || 300
-    remaining |> min(ceiling) |> max(1)
+    remaining = exp - System.system_time(:second) + 1
+
+    case Keyword.fetch(opts, :assertion_max_lifetime_seconds) do
+      {:ok, nil} ->
+        max(remaining, 1)
+
+      {:ok, max_lifetime} when is_integer(max_lifetime) and max_lifetime > 0 ->
+        remaining |> min(max_lifetime + 61) |> max(1)
+
+      _ ->
+        remaining |> min(361) |> max(1)
+    end
   end
 
   # draft §6.1: `scope` is OPTIONAL. When present it is the UPPER bound on what

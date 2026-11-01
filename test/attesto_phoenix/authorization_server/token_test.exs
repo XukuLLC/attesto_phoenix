@@ -1005,6 +1005,54 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       refute claim!(response.access_token, "credential_configuration_ids")
       refute Map.has_key?(response, :authorization_details)
     end
+
+    test "refresh_token authorization_details rejects duplicate JSON object keys" do
+      code_store =
+        start_code_store_with_credential_configuration_ids(
+          "oc_user-1",
+          ["openid", "credential", "offline_access"],
+          ["UniversityDegreeCredential"]
+        )
+
+      refresh_store = start_refresh_store()
+
+      config =
+        config(
+          code_store: code_store,
+          refresh_store: refresh_store,
+          issue_refresh_token?: fn _client, _scope -> true end,
+          credential_configurations_supported: %{
+            "UniversityDegreeCredential" => %{"scope" => "credential"}
+          }
+        )
+
+      code_request =
+        request(config,
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, %{refresh_token: refresh_token}, _events} = Token.issue(config, code_request)
+
+      dup_details =
+        ~s([{"type":"openid_credential","credential_configuration_id":"UniversityDegreeCredential","credential_configuration_id":"ForbiddenCredential"}])
+
+      refresh_req =
+        request(config,
+          grant_type: "refresh_token",
+          params: %{
+            "refresh_token" => refresh_token,
+            "authorization_details" => dup_details
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_authorization_details}, _events} =
+               Token.issue(config, refresh_req)
+    end
   end
 
   describe "refresh_token grant (RFC 6749 §6)" do

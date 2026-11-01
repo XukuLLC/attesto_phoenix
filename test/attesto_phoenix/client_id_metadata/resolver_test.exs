@@ -403,6 +403,31 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       assert :miss = ETS.get(url)
     end
 
+    test "rejects duplicate JSON object keys in metadata documents and remote jwks_uri responses", %{agent: agent} do
+      url = unique_url()
+
+      dup_doc =
+        ~s({"client_id":#{JSON.encode!(url)},"redirect_uris":["https://app.example/cb"],"token_endpoint_auth_method":"none","token_endpoint_auth_method":"client_secret_basic"})
+
+      StubFetcher.script(agent, url, {:ok, %{body: dup_doc, cache_control: [max_age: 3600]}})
+      assert {:error, :invalid_json} = Resolver.resolve(url, resolver_config())
+      assert :miss = ETS.get(url)
+
+      jwks_url = "https://app.example/clients/#{System.unique_integer([:positive])}/jwks.json"
+      {_kty, pub_map} = JOSE.JWK.to_public_map(JOSE.JWK.generate_key({:ec, "P-256"}))
+      dup_jwks = ~s({"keys":[#{JSON.encode!(pub_map)}],"keys":[]})
+      StubFetcher.script(agent, jwks_url, {:ok, %{body: dup_jwks, cache_control: [max_age: 3600]}})
+
+      metadata = %{
+        "client_id" => unique_url(),
+        "redirect_uris" => ["https://app.example/cb"],
+        "jwks_uri" => jwks_url
+      }
+
+      assert {:error, :missing_client_jwks} =
+               AttestoPhoenix.ClientIdMetadata.resolve_jwks(metadata, resolver_config())
+    end
+
     test "wraps a fetcher error and does not cache", %{agent: agent} do
       url = unique_url()
       StubFetcher.script(agent, url, {:error, {:status, 404}})

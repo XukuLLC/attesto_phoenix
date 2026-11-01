@@ -197,7 +197,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   end
 
   defp decode(body) do
-    case JSON.decode(body) do
+    case Attesto.StrictJSON.decode(body) do
       {:ok, doc} when is_map(doc) -> {:ok, doc}
       _other -> {:error, :invalid_json}
     end
