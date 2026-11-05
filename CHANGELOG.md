@@ -6,6 +6,21 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.4.1] - 2026-11-05
+
+### Security
+
+- Require Attesto `>= 2.11.0 and < 3.0.0`. Attesto 2.11.0 refuses a present
+  JSON `null` where an omitted claim means "no restriction", including a
+  `"cnf": null` access token that earlier releases could accept as an unbound
+  bearer token under the Jason or Poison JOSE backend.
+
+### Changed
+
+- Verified claims carry JSON `null` as `nil` whichever JSON backend JOSE uses,
+  following Attesto 2.11.0. Under JOSE's builtin OTP backend they previously
+  carried `:null`, including in claims passed to host callbacks.
+
 ## [4.4.0] - 2026-11-01
 
 ### Security

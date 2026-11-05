@@ -3279,7 +3279,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       conn = post_auth_code()
       assert conn.status == 200
       access_claims = peek_claims(body(conn)["access_token"])
-      assert access_claims["claims"] == %{"id_token" => %{"name" => :null}}
+      assert access_claims["claims"] == %{"id_token" => %{"name" => nil}}
 
       {:ok, claims} =
         Attesto.IDToken.verify(id_token_config(), body(conn)["id_token"], client_id: "public-1")
