@@ -373,6 +373,46 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       assert :miss = ETS.get(url)
     end
 
+    test "refuses and never caches a document with an empty grant type", %{agent: agent} do
+      url = unique_url()
+
+      body =
+        JSON.encode!(%{
+          "client_id" => url,
+          "redirect_uris" => ["https://app.example/cb"],
+          "token_endpoint_auth_method" => "none",
+          "grant_types" => ["authorization_code", ""]
+        })
+
+      StubFetcher.script(agent, url, {:ok, %{body: body, cache_control: [max_age: 3600]}})
+
+      assert {:error, :invalid_metadata} = Resolver.resolve(url, resolver_config())
+      assert :miss = ETS.get(url)
+    end
+
+    test "a cached document with an empty grant type is visible and refetched", %{agent: agent} do
+      url = unique_url()
+
+      cached = %{
+        "client_id" => url,
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "none",
+        "grant_types" => [""]
+      }
+
+      FaultCache.script({:ok, cached})
+      StubFetcher.script(agent, url, {:ok, %{body: valid_body(url), cache_control: []}})
+
+      log =
+        capture_log(fn ->
+          assert {:ok, client} = Resolver.resolve(url, resolver_config(cache: FaultCache))
+          assert client["grant_types"] == ["authorization_code", "refresh_token"]
+        end)
+
+      assert StubFetcher.calls(agent, url) == 1
+      assert log =~ "AttestoPhoenix CIMD cache failed; fetching fresh client metadata"
+    end
+
     test "errors and never caches a client_id mismatch", %{agent: agent} do
       url = unique_url()
       # The document's client_id does not equal the URL it was fetched from.

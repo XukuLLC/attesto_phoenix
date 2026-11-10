@@ -45,8 +45,9 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
     5. **Decode + validate.** The body is JSON-decoded and handed to
        `validate_document/2`, which enforces the `client_id` match and the
        no-symmetric-secret rules and normalizes the document into the client
-       shape. A malformed JSON body or an invalid document is an `{:error, _}`
-       and is **never** cached.
+       shape. A `grant_types` entry that is an empty string is refused as
+       `:invalid_metadata` as well. A malformed JSON body or an invalid
+       document is an `{:error, _}` and is **never** cached.
     6. **Cache + return.** Only after validation succeeds is the document stored
        via `Cache.put/3`, with an `expires_at` derived from the response's
        shared-cache `Cache-Control: s-maxage` / `max-age` / `Expires`
@@ -162,9 +163,22 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   end
 
   defp validate_cached_metadata(client_id, metadata) do
-    case ClientIdMetadata.validate_document(client_id, metadata) do
+    case validate_document(client_id, metadata) do
       {:ok, normalized} -> {:ok, normalized}
       {:error, _reason} -> warn_cache_read_fault()
+    end
+  end
+
+  # RFC 7591 §2: `grant_types` is an array of grant type strings. The core
+  # validation accepts any string array; an empty string names no grant type,
+  # and the token endpoint's per-client grant check treats such a list as a
+  # broken registration. Refuse the document here so the client is rejected as
+  # invalid at every endpoint instead.
+  defp validate_document(client_id, doc) do
+    with {:ok, metadata} <- ClientIdMetadata.validate_document(client_id, doc) do
+      if Enum.all?(Map.get(metadata, "grant_types", []), &(&1 != "")),
+        do: {:ok, metadata},
+        else: {:error, :invalid_metadata}
     end
   end
 
@@ -176,7 +190,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
 
     with {:ok, %{body: body, cache_control: cache_control}} <- fetch(fetcher, client_id, opts),
          {:ok, doc} <- decode(body),
-         {:ok, metadata} <- ClientIdMetadata.validate_document(client_id, doc) do
+         {:ok, metadata} <- validate_document(client_id, doc) do
       metadata = Cache.metadata_only(metadata)
       cache_put(client_id, metadata, cache_control, opts)
       {:ok, metadata}

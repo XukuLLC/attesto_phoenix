@@ -56,6 +56,12 @@ defaults in a minor release.
   longer than 255 bytes with `invalid_request`. Such an entry raised
   `Postgrex.Error` when `EctoCIBAStore` inserted it into its 255-character
   array column.
+- Refuse a Client ID Metadata Document whose `grant_types` contains an empty
+  string as `:invalid_metadata`. `ClientIdMetadata.Resolver` accepted it, and
+  the token endpoint's per-client grant check then raised `ArgumentError` for
+  every token request naming that `client_id`. The client is now rejected as
+  `invalid_client`, and such a document is neither cached nor accepted from
+  a cache.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens

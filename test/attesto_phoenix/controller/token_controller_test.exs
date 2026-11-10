@@ -3374,6 +3374,29 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       :ok
     end
 
+    test "a CIMD document with an empty grant type is refused as an invalid client" do
+      # A distinct URL: the failed resolution leaves a short fetch backoff for it.
+      client_id = "https://app.example/clients/empty-grant-type.json"
+
+      CimdFetcher.script(client_id, %{
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "none",
+        "grant_types" => ["authorization_code", ""]
+      })
+
+      conn =
+        post_token(%{
+          "grant_type" => "authorization_code",
+          "client_id" => client_id,
+          "code" => "x",
+          "code_verifier" => String.duplicate("a", 43),
+          "redirect_uri" => "https://app.example/cb"
+        })
+
+      assert body(conn)["error"] == "invalid_client"
+      refute Map.has_key?(body(conn), "access_token")
+    end
+
     test "a CIMD public client (none + PKCE) authenticates, only the grant type is rejected" do
       CimdFetcher.script(@cimd_public_client_id, %{
         "redirect_uris" => ["https://app.example/cb"],
