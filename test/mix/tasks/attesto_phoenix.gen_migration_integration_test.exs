@@ -31,6 +31,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo34
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo37
   alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo42
+  alias AttestoPhoenix.TestRepo.Migrations.UpgradeAttestoPhoenixTo45
   alias Ecto.Adapters.SQL.Sandbox
   alias Mix.Tasks.AttestoPhoenix.Gen.Migration
 
@@ -319,6 +320,144 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
     assert_raise Postgrex.Error, fn ->
       EctoLogoutSessionStore.validate_retry_schema!(TestRepo, prefix)
     end
+  end
+
+  # Columns that generators before 4.5 created as varchar(255) or
+  # varchar(255)[]: {table, scalar columns, list columns}.
+  @pre_45_columns [
+    {"attesto_authorization_codes", ~w(client_id), ~w(scope resource)},
+    {"attesto_refresh_tokens", ~w(client_id acr), ~w(scope resource)},
+    {"attesto_device_codes", ~w(client_id), ~w(scope resource granted_scope)},
+    {"attesto_ciba_requests", ~w(client_id binding_message acr), ~w(scope resource granted_scope)},
+    {"attesto_logout_sessions", ~w(client_id), []}
+  ]
+
+  defp create_fresh_schema(tmp_dir, prefix) do
+    TestRepo.query!(~s|CREATE SCHEMA "#{prefix}"|)
+    generated_dir = Path.join(tmp_dir, "fresh-#{System.unique_integer([:positive])}")
+
+    Migration.run([
+      "--repo",
+      inspect(TestRepo),
+      "--migrations-path",
+      migrations_dir(generated_dir),
+      "--schema-prefix",
+      prefix
+    ])
+
+    [file] = Path.wildcard(Path.join(migrations_dir(generated_dir), "*.exs"))
+    migration = compile_migration(file, CreateAttestoPhoenixTables)
+    assert :ok = Ecto.Migrator.up(TestRepo, next_migration_version(), migration, log: false, prefix: prefix)
+  end
+
+  defp narrow_to_pre_45_layout(prefix) do
+    for {table, scalars, lists} <- @pre_45_columns do
+      changes =
+        Enum.map(scalars, &~s|ALTER COLUMN "#{&1}" TYPE varchar(255)|) ++
+          Enum.map(lists, &~s|ALTER COLUMN "#{&1}" TYPE varchar(255)[]|)
+
+      TestRepo.query!(~s|ALTER TABLE "#{prefix}"."#{table}" | <> Enum.join(changes, ", "))
+    end
+  end
+
+  test "4.5 upgrade widens every request-supplied column to the fresh layout and keeps rows", %{
+    tmp_dir: tmp_dir
+  } do
+    fresh_prefix = "attesto_width_fresh_#{System.unique_integer([:positive])}"
+    prefix = "attesto_width_45_#{System.unique_integer([:positive])}"
+    table = ~s|"#{prefix}"."attesto_authorization_codes"|
+    long_client_id = "https://client.example.com/" <> String.duplicate("a", 2_021)
+
+    Sandbox.mode(TestRepo, :auto)
+    on_exit(fn -> Sandbox.mode(TestRepo, :manual) end)
+
+    on_exit(fn ->
+      TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{fresh_prefix}" CASCADE|)
+      TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{prefix}" CASCADE|)
+    end)
+
+    create_fresh_schema(tmp_dir, fresh_prefix)
+    create_fresh_schema(tmp_dir, prefix)
+    narrow_to_pre_45_layout(prefix)
+    refute schema_columns(prefix) == schema_columns(fresh_prefix)
+
+    insert = fn client_id, scope ->
+      TestRepo.query!(
+        "INSERT INTO #{table} (code_hash, client_id, subject, scope, redirect_uri, expires_at, inserted_at) " <>
+          "VALUES ($1, $2, 'subject', $3, 'https://client.example.com/cb', now(), now())",
+        ["code-#{System.unique_integer([:positive])}", client_id, scope]
+      )
+    end
+
+    insert.("legacy-client", ["openid"])
+
+    assert_raise Postgrex.Error, ~r/value too long for type character varying\(255\)/, fn ->
+      insert.(long_client_id, ["openid"])
+    end
+
+    {migration, version} = generated_upgrade(tmp_dir, prefix, "4.5", UpgradeAttestoPhoenixTo45)
+
+    assert schema_columns(prefix) == schema_columns(fresh_prefix)
+    assert schema_indexes(prefix) == schema_indexes(fresh_prefix)
+    assert %{rows: [["legacy-client", ["openid"]]]} = TestRepo.query!("SELECT client_id, scope FROM #{table}")
+
+    insert.(long_client_id, ["openid", String.duplicate("s", 300)])
+
+    # Rolling back keeps the wider columns and every stored value.
+    assert :ok = Ecto.Migrator.down(TestRepo, version, migration, log: false)
+    assert schema_columns(prefix) == schema_columns(fresh_prefix)
+    assert %{rows: [[2]]} = TestRepo.query!("SELECT count(*) FROM #{table}")
+  end
+
+  test "4.5 upgrade with a generated nil prefix skips optional tables the installation lacks", %{
+    tmp_dir: tmp_dir
+  } do
+    prefix = "attesto_width_partial_#{System.unique_integer([:positive])}"
+
+    Sandbox.mode(TestRepo, :auto)
+    on_exit(fn -> Sandbox.mode(TestRepo, :manual) end)
+    on_exit(fn -> TestRepo.query!(~s|DROP SCHEMA IF EXISTS "#{prefix}" CASCADE|) end)
+
+    TestRepo.query!(~s|CREATE SCHEMA "#{prefix}"|)
+
+    # A refresh-only installation: the optional device, CIBA, and logout tables
+    # were never created.
+    TestRepo.query!("""
+    CREATE TABLE "#{prefix}"."attesto_refresh_tokens" (
+      token_hash varchar(88) NOT NULL UNIQUE,
+      client_id varchar(255),
+      scope varchar(255)[] NOT NULL DEFAULT ARRAY[]::varchar[],
+      resource varchar(255)[] NOT NULL DEFAULT ARRAY[]::varchar[],
+      acr varchar(255)
+    )
+    """)
+
+    Migration.run(["--repo", inspect(TestRepo), "--migrations-path", migrations_dir(tmp_dir), "--upgrade", "4.5"])
+    [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_4_5.exs"))
+    migration = compile_migration(file, UpgradeAttestoPhoenixTo45)
+
+    assert :ok = Ecto.Migrator.up(TestRepo, next_migration_version(), migration, log: false, prefix: prefix)
+
+    assert %{
+             rows: [
+               ["acr", "text"],
+               ["client_id", "text"],
+               ["resource", "character varying[]"],
+               ["scope", "character varying[]"]
+             ]
+           } =
+             TestRepo.query!(
+               """
+               SELECT attname, pg_catalog.format_type(atttypid, atttypmod)
+               FROM pg_catalog.pg_attribute
+               WHERE attrelid = pg_catalog.to_regclass($1)
+                 AND attname IN ('acr', 'client_id', 'scope', 'resource')
+               ORDER BY attname
+               """,
+               ["#{prefix}.attesto_refresh_tokens"]
+             )
+
+    assert %{rows: [[nil]]} = TestRepo.query!("SELECT to_regclass($1)", ["#{prefix}.attesto_ciba_requests"])
   end
 
   defp assert_upgrade_34_ciba_prefix(tmp_dir, prefix, column_type, migrator_opts) do

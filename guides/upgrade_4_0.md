@@ -154,6 +154,14 @@ mix attesto_phoenix.gen.migration --upgrade 3.6 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 3.7 --repo MyApp.Repo
 ```
 
+When upgrading directly to a later 4.x release, continue with the milestones
+that release adds:
+
+```sh
+mix attesto_phoenix.gen.migration --upgrade 4.2 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 4.5 --repo MyApp.Repo
+```
+
 Pass the same `--schema-prefix` used by the runtime stores to every command
 when the deployment uses an explicit PostgreSQL schema. Review the generated
 files before running `mix ecto.migrate`.
@@ -172,6 +180,15 @@ The milestones provide:
   legacy rows linked to a refresh family retain `NULL`. The 4.0 sweeper keeps
   such a marker while the refresh-token table contains an unexpired family
   member and deletes it after the family ends.
+- **4.2:** durable logout-delivery identifiers and leases.
+- **4.5:** `text` for `client_id` in the authorization-code, refresh-token,
+  device-code, CIBA, and logout-session tables, for the refresh-token and
+  CIBA `acr`, and for the CIBA `binding_message`, and unbounded `varchar[]`
+  for the `scope`, `resource`, and `granted_scope` lists. Without it, a value
+  longer than 255 characters (such as a Client ID Metadata Document
+  `client_id`, which may be 2,048 bytes) makes the Ecto stores raise
+  `Postgrex.Error` 22001. PostgreSQL applies these changes without rewriting
+  the tables.
 
 A database already upgraded through an earlier 3.x release only needs later
 milestones it has not applied. Do not generate a second migration for a

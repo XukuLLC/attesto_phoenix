@@ -35,7 +35,9 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       first token).
     * `:client_id` - the OAuth client the token was issued to (RFC 6749 §10.4
       requires rotation to be confined to the issuing client). `nil` for a
-      token with no client binding.
+      token with no client binding. A `text` column, like the other
+      client- and request-supplied columns (see the `--upgrade 4.5`
+      migration).
     * `:subject` - the resource owner the token authorizes.
     * `:scope` - the granted scope as a list of strings (RFC 6749 §3.3); a
       successor's scope MUST be identical to its predecessor's (RFC 6749 §6).

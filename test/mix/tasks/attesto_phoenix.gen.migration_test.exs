@@ -112,6 +112,51 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ "Cannot safely rollback 4.2 migration"
     end
 
+    test "generates the request-value width upgrade", %{tmp_dir: tmp_dir} do
+      run!(["--upgrade", "4.5", "--schema-prefix", "auth"], tmp_dir)
+
+      assert [file] =
+               Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_4_5.exs"))
+
+      source = File.read!(file)
+      assert source =~ ~s|prefix = effective_prefix("auth")|
+      assert source =~ ~s|"ALTER TABLE IF EXISTS "|
+
+      for table <- ~w(attesto_authorization_codes attesto_refresh_tokens attesto_device_codes
+                      attesto_ciba_requests attesto_logout_sessions) do
+        assert source =~ ~s|{"#{table}",|
+      end
+
+      assert source =~ ~s|{"client_id", "text"}|
+      assert source =~ ~s|{"scope", "varchar[]"}|
+      assert source =~ ~s|{"granted_scope", "varchar[]"}|
+      assert source =~ ~s|{"binding_message", "text"}|
+      assert source =~ ~s|def down, do: :ok|
+    end
+
+    test "the generated 4.5 upgrade passes strict lint unchanged", %{tmp_dir: tmp_dir} do
+      tmp_dir = Path.expand(tmp_dir)
+      project_dir = File.cwd!()
+      File.write!(Path.join(tmp_dir, ".formatter.exs"), "[inputs: [\"**/*.exs\"]]\n")
+
+      File.cd!(tmp_dir, fn ->
+        run!(["--upgrade", "4.5", "--schema-prefix", "auth"], tmp_dir)
+        assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_4_5.exs"))
+        assert :ok = Format.run(["--check-formatted", file])
+
+        {output, status} =
+          System.cmd("mix", ["credo", "--strict", "--format", "json", file],
+            cd: project_dir,
+            stderr_to_stdout: true
+          )
+
+        assert status == 0, output
+        {json_offset, 1} = :binary.match(output, "{")
+        json = binary_part(output, json_offset, byte_size(output) - json_offset)
+        assert %{"issues" => []} = Jason.decode!(json)
+      end)
+    end
+
     test "renders an omitted 3.4 prefix without a redundant nil expression", %{tmp_dir: tmp_dir} do
       run!(["--upgrade", "3.4"], tmp_dir)
       assert [file] = Path.wildcard(Path.join(migrations_dir(tmp_dir), "*_upgrade_attesto_phoenix_to_3_4.exs"))
@@ -191,6 +236,20 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert source =~ ~s|create table(:attesto_pushed_authorization_requests|
       assert source =~ ~s|create table(:attesto_client_id_metadata|
       assert source =~ ~s|create table(:attesto_consent_grants|
+    end
+
+    test "stores client- and request-supplied values without a 255-character limit", %{tmp_dir: tmp_dir} do
+      run!([], tmp_dir)
+      source = generated_migration(tmp_dir)
+
+      # Five tables carry a client_id; a CIMD client_id may be 2,048 bytes.
+      assert length(String.split(source, "add :client_id, :text")) == 6
+      refute source =~ ~r/add :client_id, :string/
+      refute source =~ ~r/add :(scope|resource|granted_scope), \{:array, :string\}/
+      assert source =~ ~s|add :binding_message, :text|
+      assert length(String.split(source, "add :acr, :text")) == 3
+      # acr_values entries are refused above 255 bytes at the backchannel endpoint.
+      assert source =~ ~s|add :acr_values, {:array, :string}, null: false, default: []|
     end
 
     test "client_id_metadata keys on url as PK with a jsonb metadata column", %{tmp_dir: tmp_dir} do
@@ -672,7 +731,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert output =~ "mix attesto_phoenix.gen.migration [options]"
       assert output =~ "mix attesto_phoenix.gen.migration --upgrade MILESTONE [options]"
 
-      for milestone <- ~w(3.0 3.1 3.4 3.6 3.7 4.2) do
+      for milestone <- ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5) do
         assert output =~ milestone
       end
 

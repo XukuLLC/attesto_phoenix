@@ -12,10 +12,10 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateAuthorizationCodes do
   def change do
     create table(:attesto_authorization_codes, primary_key: false) do
       add(:code_hash, :string, size: 88, primary_key: true, null: false)
-      add(:client_id, :string, size: 255, null: false)
+      add(:client_id, :text, null: false)
       add(:subject, :string, size: 255, null: false)
-      add(:scope, {:array, :string}, null: false, default: [])
-      add(:resource, {:array, :string}, null: false, default: [])
+      add(:scope, {:array, :varchar}, null: false, default: [])
+      add(:resource, {:array, :varchar}, null: false, default: [])
       add(:redirect_uri, :text, null: false)
       # PKCE optional at persistence: a confidential client the host exempted
       # from PKCE (Attesto.AuthorizationRequest's :require_pkce) issues a code

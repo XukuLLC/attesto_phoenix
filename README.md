@@ -126,6 +126,7 @@ authorization server, use `attesto_phoenix`.
 ## Contents
 
 - [Installation](#installation)
+- [Upgrading to 4.5](#upgrading-to-45)
 - [Upgrading to 4.3](#upgrading-to-43)
 - [Upgrading to 4.2](#upgrading-to-42)
 - [Upgrading to 4.0](#upgrading-to-40)
@@ -239,6 +240,34 @@ needs the old behaviour:
   token's client nor named in its `aud`. A protected resource that introspects
   tokens for a resource identifier other than its `client_id` configures
   `:introspection_authorize`.
+
+## Upgrading to 4.5
+
+AttestoPhoenix 4.5 stores client- and request-supplied values without the
+255-character limit the earlier generators gave their columns. With those
+columns, a Client ID Metadata Document `client_id` longer than 255 bytes (the
+resolver admits up to 2,048), a scope token or resource indicator longer than
+255 characters, a CIBA `binding_message` of more than 255 characters (the
+grapheme limit does not bound characters), or an `acr` value over 255
+characters made the bundled Ecto stores raise `Postgrex.Error` 22001, and the
+request failed with a 500. Generate and apply the 4.5 migration:
+
+```bash
+mix attesto_phoenix.gen.migration --upgrade 4.5 --repo MyApp.Repo
+mix ecto.migrate
+```
+
+It changes `client_id` in the authorization-code, refresh-token, device-code,
+CIBA, and logout-session tables, the refresh-token and CIBA `acr`, and the CIBA
+`binding_message` to `text`, and the `scope`, `resource`, and `granted_scope`
+lists to unbounded `varchar[]`. PostgreSQL applies both changes without
+rewriting the tables, so each `ALTER TABLE` holds its `ACCESS EXCLUSIVE` lock
+only briefly. Tables the installation never created are skipped. 4.4 nodes
+read and write the widened columns unchanged, so the migration can run before
+or during the rollout, and its rollback leaves the columns widened. Until it
+has run, a value over 255 characters still fails in those stores. CIBA
+`acr_values` entries keep their 255-byte limit, enforced at the backchannel
+endpoint with `invalid_request`.
 
 ## Quick start
 
@@ -1787,9 +1816,9 @@ mix attesto_phoenix.gen.migration --repo MyApp.Repo
 ```
 
 Existing 2.x databases must not use that command. Generate the 3.0, 3.1, 3.4,
-3.6, and 3.7 upgrade migrations, in that order, and follow the stopped-cutover
-guide above. Existing 3.x installations generate only the later migrations
-they have not already applied:
+3.6, 3.7, 4.2, and 4.5 upgrade migrations, in that order, and follow the
+stopped-cutover guide above. Existing 3.x and 4.x installations generate only
+the later migrations they have not already applied:
 
 ```bash
 mix attesto_phoenix.gen.migration --upgrade 3.0 --repo MyApp.Repo
@@ -1797,13 +1826,18 @@ mix attesto_phoenix.gen.migration --upgrade 3.1 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 3.4 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 3.6 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 3.7 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 4.2 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 4.5 --repo MyApp.Repo
 ```
 
 The 3.6 migration widens cached Client ID Metadata URLs to `TEXT`. The 3.7
 migration adds authorization-code replay retention. Historical successful code
 rows linked to refresh families receive a NULL deadline. The sweeper retains
 them while an unexpired refresh-token descendant exists and deletes them after
-the family ends.
+the family ends. The 4.2 migration adds durable logout-delivery leases (see
+[Upgrading to 4.2](#upgrading-to-42)). The 4.5 migration removes the
+255-character limit from client- and request-supplied columns (see
+[Upgrading to 4.5](#upgrading-to-45)).
 
 When the host configures a non-default `schema_prefix`, the generator picks it
 up automatically from `config :attesto_phoenix, otp_app: ...` (or the current

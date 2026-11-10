@@ -38,8 +38,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         tables the bundled stores read, including the durable refresh-family
         revocation tombstones. Existing installations generate each migration
         milestone they have not already applied: `--upgrade 3.0`, `3.1`,
-        `3.4`, `3.6`, `3.7`, and `4.2`, in that order, while writers remain
-        stopped.
+        `3.4`, `3.6`, `3.7`, `4.2`, and `4.5`, in that order, while writers
+        remain stopped.
         Each validates canonical pre-existing objects before adoption; custom
         layouts need a reviewed migration.
 
@@ -127,7 +127,7 @@ if Code.ensure_loaded?(Igniter) do
     @default_oauth_path_prefix "/oauth"
     @config_pipeline :attesto_phoenix_config
     @refresh_successor_secret_bytes 32
-    @upgrade_migration_versions ~w(3.0 3.1 3.4 3.6 3.7 4.2)
+    @upgrade_migration_versions ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5)
 
     # The recommended production behaviours and the callbacks each scaffolded
     # module implements. Each tuple is `{submodule, behaviour, [{function,
@@ -2108,7 +2108,7 @@ if Code.ensure_loaded?(Igniter) do
            If this is an upgrade of an existing database, do not run the fresh
            create-table command above. After inventorying the existing layout,
            generate each forward migration milestone that the deployment has
-           not already applied. A 2.x database needs all six, in this order:
+           not already applied. A 2.x database needs all seven, in this order:
 
                #{upgrade_migration_commands}
 
@@ -2124,7 +2124,9 @@ if Code.ensure_loaded?(Igniter) do
            `replay_retain_until` deadline used to preserve replay evidence for
            the lifetime of the refresh family. The 4.2 file adds stable logout
            delivery identifiers and renewable leases, backfilling legacy rows
-           from their UUID primary keys.
+           from their UUID primary keys. The 4.5 file removes the
+           255-character limit from client- and request-supplied columns such
+           as `client_id`, scope lists, and the CIBA binding message.
            Existing canonical objects are validated before adoption. Stop and
            investigate if any migration rejects the database layout.
 

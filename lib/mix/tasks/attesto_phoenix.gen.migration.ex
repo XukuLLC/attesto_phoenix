@@ -123,6 +123,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Add durable logout-delivery leases:
       mix attesto_phoenix.gen.migration --upgrade 4.2 --repo MyApp.Repo
 
+      # Remove the 255-character limit from client- and request-supplied values:
+      mix attesto_phoenix.gen.migration --upgrade 4.5 --repo MyApp.Repo
+
   ## Options
 
     * `--help` - print concise usage, accepted options, and supported upgrade
@@ -130,8 +133,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
     * `--upgrade` - generate a migration to upgrade an existing database rather
       than creating fresh tables. Supported values: `3.0`/`3.0.0` and
-      `3.1`/`3.1.0`, `3.4`/`3.4.0`, `3.6`/`3.6.0`, `3.7`/`3.7.0`, and
-      `4.2`/`4.2.0`. The 3.4 migration adds the nullable
+      `3.1`/`3.1.0`, `3.4`/`3.4.0`, `3.6`/`3.6.0`, `3.7`/`3.7.0`,
+      `4.2`/`4.2.0`, and `4.5`/`4.5.0`. The 3.4 migration adds the nullable
       immutable `family_expires_at` and `attestation_jkt` columns without
       changing existing families. Pre-upgrade attested families require
       revocation and re-authorization because their original instance key was
@@ -149,6 +152,14 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       The 4.2 migration adds durable logout-delivery identifiers and leases.
       Existing rows derive their stable `delivery_id` from their UUID primary
       key before the column becomes required.
+      The 4.5 migration removes the 255-character limit from columns that
+      hold client- or request-supplied values: `client_id` in the
+      authorization-code, refresh-token, device-code, CIBA, and logout-session
+      tables becomes `text`, as do the refresh-token and CIBA `acr` and the
+      CIBA `binding_message`; the `scope`, `resource`, and `granted_scope`
+      lists become unbounded `varchar[]`. PostgreSQL makes both changes
+      without rewriting the tables. Tables that do not exist are skipped, and
+      the rollback leaves the columns widened.
       The 3.0 migration adopts or creates the exact unique index
       on `attesto_refresh_tokens(family_id, generation)`, creates or adopts the
       `attesto_refresh_family_revocations` table, and safely backfills every
@@ -230,7 +241,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   @nonce_column_size 255
   @identifier_column_size 255
   @max_migration_version 99_999_999_999_999
-  @upgrade_milestones ~w(3.0 3.1 3.4 3.6 3.7 4.2)
+  @upgrade_milestones ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5)
   @accepted_option_labels [
     "--help",
     "--repo (-r)",
@@ -585,6 +596,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       "3.6" -> generate_upgrade_3_6_for_repo(repo, opts, prefix)
       "3.7" -> generate_upgrade_3_7_for_repo(repo, opts, prefix)
       "4.2" -> generate_upgrade_4_2_for_repo(repo, opts, prefix)
+      "4.5" -> generate_upgrade_4_5_for_repo(repo, opts, prefix)
       nil -> generate_fresh_for_repo(repo, opts, prefix)
     end
   end
@@ -725,6 +737,21 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       base_name,
       logout_delivery_lease_upgrade_migration_template(assigns),
       :upgrade_4_2
+    )
+  end
+
+  defp generate_upgrade_4_5_for_repo(repo, opts, prefix) do
+    ensure_repo(repo, [])
+    path = migrations_path(repo, opts)
+    create_directory(path)
+    base_name = "upgrade_attesto_phoenix_to_4_5"
+    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    create_migration_file(
+      path,
+      base_name,
+      request_value_width_upgrade_migration_template(assigns),
+      :upgrade_4_5
     )
   end
 
@@ -942,7 +969,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_4") ++
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_6") ++
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_7") ++
-        migration_kind_files(path, "upgrade_attesto_phoenix_to_4_2")
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_4_2") ++
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_4_5")
 
     if upgrade_files != [] do
       file_names =
@@ -1017,6 +1045,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   end
 
   defp ensure_migration_kind_available!(path, base_name, :upgrade_4_2) do
+    if migration_kind_files(path, base_name) != [] do
+      Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
+    end
+  end
+
+  defp ensure_migration_kind_available!(path, base_name, :upgrade_4_5) do
     if migration_kind_files(path, base_name) != [] do
       Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
     end
@@ -1193,12 +1227,18 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # that identity when it includes this table's UPDATE or DELETE operations.
       create table(:<%= @authorization_codes %>, primary_key: false, prefix: prefix) do
         add :code_hash, :string, size: <%= @hash_size %>, primary_key: true, null: false
-        add :client_id, :string, size: <%= @identifier_size %>, null: false
+        # Client- and request-supplied values have no 255-character bound: a
+        # Client ID Metadata Document client_id may be 2,048 bytes, and RFC 6749
+        # section 3.3 scope tokens and RFC 8707 resource URIs have no length
+        # limit. Lists use unbounded varchar[] rather than text[] because
+        # PostgreSQL widens a varchar(255)[] column to varchar[] without
+        # rewriting the table (see the --upgrade 4.5 migration).
+        add :client_id, :text, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
-        add :scope, {:array, :string}, null: false, default: []
+        add :scope, {:array, :varchar}, null: false, default: []
         # RFC 8707 resource indicator(s) bound at authorization time; the token
         # endpoint mints the access token `aud` from this set.
-        add :resource, {:array, :string}, null: false, default: []
+        add :resource, {:array, :varchar}, null: false, default: []
         add :redirect_uri, :text, null: false
         # PKCE binding (RFC 7636, section 4.3). Stored so the token endpoint can
         # verify the code_verifier presented at redemption.
@@ -1255,17 +1295,17 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :token_hash, :string, size: <%= @hash_size %>, null: false
         add :family_id, :string, size: <%= @identifier_size %>, null: false
         add :generation, :integer, null: false, default: 0
-        add :client_id, :string, size: <%= @identifier_size %>
+        add :client_id, :text
         add :subject, :string, size: <%= @identifier_size %>, null: false
-        add :scope, {:array, :string}, null: false, default: []
+        add :scope, {:array, :varchar}, null: false, default: []
         # RFC 8707 resource indicator(s) bound to the grant; carried unchanged
         # through rotation. A refresh request may audience its access token to
         # a subset (RFC 8707 section 2.2).
-        add :resource, {:array, :string}, null: false, default: []
+        add :resource, {:array, :varchar}, null: false, default: []
         # RFC 9470 / OIDC Core: original authentication context, carried across
         # rotation so a refreshed access token reports the real auth event
         # (auth_time is never re-stamped). auth_time is unix seconds.
-        add :acr, :string
+        add :acr, :text
         add :auth_time, :bigint
         add :family_expires_at, :bigint
         add :attestation_jkt, :string, size: 43
@@ -1327,17 +1367,17 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :id, :binary_id, primary_key: true
         add :device_code_hash, :string, size: <%= @hash_size %>, null: false
         add :user_code, :string, size: <%= @identifier_size %>, null: false
-        add :client_id, :string, size: <%= @identifier_size %>, null: false
-        add :scope, {:array, :string}, null: false, default: []
+        add :client_id, :text, null: false
+        add :scope, {:array, :varchar}, null: false, default: []
         # RFC 8707 resource indicator(s) bound at the device-authorization endpoint.
-        add :resource, {:array, :string}, null: false, default: []
+        add :resource, {:array, :varchar}, null: false, default: []
         # RFC 9449 section 10 DPoP holder-of-key pre-binding (NULL for unbound).
         add :dpop_jkt, :string, size: <%= @identifier_size %>
         # pending | approved | denied | consumed (the state machine).
         add :status, :string, size: 16, null: false, default: "pending"
         # Bound at approval (NULL until the user authorizes).
         add :subject, :string, size: <%= @identifier_size %>
-        add :granted_scope, {:array, :string}
+        add :granted_scope, {:array, :varchar}
         add :granted_claims, :map
         # Unix-second-truncated timestamp of the last accepted poll (NULL before
         # the first); the atomic slow_down guard compares against it.
@@ -1362,12 +1402,15 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       create table(:<%= @ciba_requests %>, primary_key: false, prefix: prefix) do
         add :id, :binary_id, primary_key: true
         add :auth_req_id_hash, :string, size: <%= @hash_size %>, null: false
-        add :client_id, :string, size: <%= @identifier_size %>, null: false
+        add :client_id, :text, null: false
         # poll | ping | push (FAPI-CIBA forbids push).
         add :delivery_mode, :string, size: 16, null: false
-        add :scope, {:array, :string}, null: false, default: []
+        add :scope, {:array, :varchar}, null: false, default: []
+        # The backchannel endpoint refuses an entry longer than 255 bytes.
         add :acr_values, {:array, :string}, null: false, default: []
-        add :binding_message, :string
+        # binding_message_max_length counts graphemes, and one grapheme can
+        # span several characters, so no varchar length bounds the message.
+        add :binding_message, :text
         # Ping/push only: the client-generated bearer secret the notification POST
         # carries (NULL for poll). A single-flow-scoped, short-lived secret.
         # CIBA Core §7.1 permits up to 1024 characters, so the database column
@@ -1377,16 +1420,16 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         # identified BEFORE the auth_req_id is issued). Bound at issue.
         add :hint_subject, :string, size: <%= @identifier_size %>, null: false
         # RFC 8707 resource indicator(s) bound at the backchannel endpoint.
-        add :resource, {:array, :string}, null: false, default: []
+        add :resource, {:array, :varchar}, null: false, default: []
         # RFC 9449 §10 DPoP holder-of-key pre-binding (NULL for unbound).
         add :dpop_jkt, :string, size: <%= @identifier_size %>
         # pending | approved | denied | consumed (the state machine).
         add :status, :string, size: 16, null: false, default: "pending"
         # Bound at approval (NULL until the user authenticates).
         add :subject, :string, size: <%= @identifier_size %>
-        add :acr, :string
+        add :acr, :text
         add :auth_time, :utc_datetime
-        add :granted_scope, {:array, :string}
+        add :granted_scope, {:array, :varchar}
         add :granted_claims, :map
         # The §7.3 minimum seconds between accepted polls, frozen at issue.
         add :interval, :integer, null: false, default: 0
@@ -1412,7 +1455,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :id, :binary_id, primary_key: true
         add :sid, :string, size: <%= @identifier_size %>, null: false
         add :subject, :string, size: <%= @identifier_size %>, null: false
-        add :client_id, :string, size: <%= @identifier_size %>, null: false
+        add :client_id, :text, null: false
         add :backchannel_logout_uri, :text
         # The RP's backchannel_logout_session_required: whether its logout token
         # MUST carry sid (Back-Channel Logout 1.0 section 2.2).
@@ -2318,6 +2361,87 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         remove :delivery_id
       end
     end
+
+    defp effective_prefix(explicit_prefix) do
+      cond do
+        is_binary(explicit_prefix) and byte_size(explicit_prefix) > 0 ->
+          explicit_prefix
+
+        migrator_prefix = Ecto.Migration.prefix() ->
+          to_string(migrator_prefix)
+
+        repo_default = repo().config()[:migration_default_prefix] ->
+          to_string(repo_default)
+
+        true ->
+          nil
+      end
+    end
+
+    defp qualify_table(table, nil), do: quote_identifier(table)
+    defp qualify_table(table, ""), do: quote_identifier(table)
+    defp qualify_table(table, prefix), do: quote_identifier(prefix) <> "." <> quote_identifier(table)
+
+    defp quote_identifier(identifier) do
+      "\\\"" <> String.replace(to_string(identifier), "\\\"", "\\\"\\\"") <> "\\\""
+    end
+  end
+  """)
+
+  embed_template(:request_value_width_upgrade_migration, """
+  defmodule <%= inspect @module %> do
+    @moduledoc false
+
+    # Generated by `mix attesto_phoenix.gen.migration --upgrade 4.5`.
+    #
+    # Removes the 255-character limit from columns that hold client- or
+    # request-supplied values. A Client ID Metadata Document client_id may be
+    # 2,048 bytes, RFC 6749 section 3.3 scope tokens and RFC 8707 resource URIs
+    # have no length limit, and a CIBA binding_message is bounded in graphemes,
+    # not characters. Writing a longer value into a varchar(255) column fails
+    # with PostgreSQL error 22001.
+    #
+    # varchar(255) to text and varchar(255)[] to varchar[] are both changes
+    # PostgreSQL applies without rewriting the table or its indexes; each
+    # ALTER TABLE still takes an ACCESS EXCLUSIVE lock for its brief duration.
+    # Optional tables that this installation never created are skipped.
+
+    use Ecto.Migration
+
+    @columns [
+      {"attesto_authorization_codes", [{"client_id", "text"}, {"scope", "varchar[]"}, {"resource", "varchar[]"}]},
+      {"attesto_refresh_tokens",
+       [{"client_id", "text"}, {"scope", "varchar[]"}, {"resource", "varchar[]"}, {"acr", "text"}]},
+      {"attesto_device_codes",
+       [{"client_id", "text"}, {"scope", "varchar[]"}, {"resource", "varchar[]"}, {"granted_scope", "varchar[]"}]},
+      {"attesto_ciba_requests",
+       [
+         {"client_id", "text"},
+         {"scope", "varchar[]"},
+         {"resource", "varchar[]"},
+         {"granted_scope", "varchar[]"},
+         {"binding_message", "text"},
+         {"acr", "text"}
+       ]},
+      {"attesto_logout_sessions", [{"client_id", "text"}]}
+    ]
+
+    def up do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+
+      for {table, columns} <- @columns do
+        changes =
+          Enum.map_join(columns, ", ", fn {column, type} ->
+            "ALTER COLUMN " <> quote_identifier(column) <> " TYPE " <> type
+          end)
+
+        execute("ALTER TABLE IF EXISTS " <> qualify_table(table, prefix) <> " " <> changes)
+      end
+    end
+
+    # Earlier releases read and write these columns unchanged, and narrowing
+    # them again would fail for any stored value longer than 255 characters.
+    def down, do: :ok
 
     defp effective_prefix(explicit_prefix) do
       cond do

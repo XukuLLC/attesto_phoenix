@@ -17,6 +17,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
   alias AttestoPhoenix.TestRepo
@@ -74,6 +75,21 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
     test "persists a record retrievable by its code_hash" do
       assert :ok = EctoCodeStore.put(entry("hash-1"))
       assert {:ok, %{code_hash: "hash-1"}} = EctoCodeStore.take("hash-1")
+    end
+
+    test "persists a client_id, scope token, and resource longer than 255 characters" do
+      # A Client ID Metadata Document client_id may be up to 2,048 bytes, and
+      # neither RFC 6749 §3.3 scope tokens nor RFC 8707 resource URIs have a
+      # length limit.
+      client_id = "https://client.example.com/" <> String.duplicate("a", 2_021)
+      scope = ["openid", String.duplicate("s", 300)]
+      resource = ["https://api.example.com/" <> String.duplicate("r", 300)]
+      data = grant_data(%{client_id: client_id, scope: scope, resource: resource})
+
+      assert :ok = EctoCodeStore.put(entry("hash-long-values", data))
+
+      assert {:ok, %{data: %{client_id: ^client_id, scope: ^scope, resource: ^resource}}} =
+               EctoCodeStore.take("hash-long-values")
     end
 
     test "round-trips the grant context through the column bridge" do
@@ -480,6 +496,79 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       for sentinel <- [code_hash, family_id, code_jti, family_jti] do
         refute log =~ sentinel
       end
+    end
+  end
+
+  describe "authorization endpoint" do
+    @long_client_id "https://client.example.com/" <> String.duplicate("a", 300)
+    @redirect_uri "https://client.example.com/callback"
+    @code_challenge "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+
+    defmodule EndpointKeystore do
+      @moduledoc false
+      @behaviour Attesto.Keystore
+
+      @pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
+
+      @impl true
+      def signing_pem, do: @pem
+
+      @impl true
+      def verification_pems, do: [@pem]
+    end
+
+    def endpoint_client(client_id), do: {:ok, %{id: client_id}}
+
+    def endpoint_authenticate(_conn, _request, _opts),
+      do: {:authenticated, %{subject: "user-42", auth_time: System.system_time(:second)}}
+
+    defp authorize(params) do
+      config =
+        Config.new(
+          issuer: "https://issuer.example.com",
+          audience: "https://issuer.example.com",
+          keystore: EndpointKeystore,
+          repo: TestRepo,
+          load_client: &__MODULE__.endpoint_client/1,
+          verify_client_secret: fn _client, _secret -> false end,
+          load_principal: fn _subject -> {:error, :not_found} end,
+          client_id: fn %{id: id} -> id end,
+          client_redirect_uris: fn _client -> [@redirect_uri] end,
+          authenticate_resource_owner: &__MODULE__.endpoint_authenticate/3,
+          consent: fn _conn, _request, subject -> {:consented, subject} end,
+          code_store: EctoCodeStore,
+          principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")]
+        )
+
+      Phoenix.ConnTest.build_conn()
+      |> Map.put(:scheme, :https)
+      |> Plug.Conn.put_private(:attesto_phoenix_config, config)
+      |> AuthorizeController.authorize(
+        Map.merge(
+          %{
+            "response_type" => "code",
+            "client_id" => @long_client_id,
+            "redirect_uri" => @redirect_uri,
+            "scope" => "openid",
+            "state" => "xyz",
+            "code_challenge" => @code_challenge,
+            "code_challenge_method" => "S256"
+          },
+          params
+        )
+      )
+    end
+
+    test "issues a code for a client_id and scope token longer than 255 characters" do
+      long_scope = String.duplicate("s", 300)
+      conn = authorize(%{"scope" => "openid " <> long_scope})
+
+      assert conn.status == 302
+      [location] = Plug.Conn.get_resp_header(conn, "location")
+      assert %{"code" => code} = location |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
+
+      assert {:ok, %{data: %{client_id: @long_client_id, scope: ["openid", ^long_scope]}}} =
+               EctoCodeStore.take(Attesto.Secret.hash(code))
     end
   end
 end

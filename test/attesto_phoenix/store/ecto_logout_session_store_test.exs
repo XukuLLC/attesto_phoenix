@@ -72,6 +72,13 @@ defmodule AttestoPhoenix.Store.EctoLogoutSessionStoreTest do
 
   defp row!(sid), do: TestRepo.get_by!(LogoutSession, sid: sid)
 
+  test "records a session for a client_id longer than 255 characters" do
+    client_id = "https://client.example.com/" <> String.duplicate("a", 2_021)
+    record(%{sid: "s-long-client", client_id: client_id})
+
+    assert [%{client_id: ^client_id}] = Store.targets(%{sid: "s-long-client"})
+  end
+
   test "record + targets by sid returns the RP" do
     e = record(%{sid: "s1", client_id: "rp-a", session_required: true})
 

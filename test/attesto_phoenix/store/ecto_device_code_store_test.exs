@@ -99,6 +99,30 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStoreTest do
              DeviceCode.redeem(Store, device_code, %{client_id: "cli-1"}, now: now, interval: 0)
   end
 
+  test "a client_id, scope token, and resource longer than 255 characters round-trip" do
+    now = System.system_time(:second)
+    client_id = "https://client.example.com/" <> String.duplicate("a", 2_021)
+    long_scope = String.duplicate("s", 300)
+    resource = ["https://api.example.com/" <> String.duplicate("r", 300)]
+
+    assert {:ok, %{device_code: device_code, user_code: user_code}} =
+             DeviceCode.issue(Store, %{client_id: client_id, scope: ["read", long_scope], resource: resource},
+               now: now,
+               ttl: 600
+             )
+
+    assert :ok =
+             DeviceCode.approve(
+               Store,
+               user_code,
+               %{subject: "user:alice", scope: [long_scope], claims: %{}},
+               now: now
+             )
+
+    assert {:ok, %Grant{client_id: ^client_id, scope: [^long_scope], resource: ^resource}} =
+             DeviceCode.redeem(Store, device_code, %{client_id: client_id}, now: now, interval: 0)
+  end
+
   test "put rejects an extra canonical data key before database projection" do
     assert_raise ArgumentError, "device code has invalid canonical data", fn ->
       put(%{

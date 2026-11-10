@@ -30,6 +30,15 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
   tokens up to 1,024 characters. Ecto represents both SQL `text` and `varchar`
   with the `:string` field type; a historical `varchar(255)` column requires
   the generated `--upgrade 3.4` migration before accepting longer tokens.
+
+  `client_id`, `binding_message`, and `acr` are `text`, and `scope`,
+  `resource`, and `granted_scope` are unbounded `varchar[]`: a Client ID
+  Metadata Document client_id may be 2,048 bytes, scope tokens have no length
+  limit, and `binding_message_max_length` counts graphemes, each of which can
+  span several characters. A table created before 4.5 needs the generated
+  `--upgrade 4.5` migration before accepting longer values. `acr_values`
+  entries stay in `varchar(255)[]`; the backchannel endpoint refuses longer
+  ones.
   """
 
   use Ecto.Schema

@@ -16,7 +16,7 @@ defmodule AttestoPhoenix.TestRepo.Migrations.CreateLogoutSessions do
       add(:id, :binary_id, primary_key: true)
       add(:sid, :string, size: 255, null: false)
       add(:subject, :string, size: 255, null: false)
-      add(:client_id, :string, size: 255, null: false)
+      add(:client_id, :text, null: false)
       add(:backchannel_logout_uri, :text)
       add(:session_required, :boolean, null: false, default: false)
       add(:frontchannel_logout_uri, :text)

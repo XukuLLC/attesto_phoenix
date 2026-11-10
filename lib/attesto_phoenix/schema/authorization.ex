@@ -27,9 +27,11 @@ defmodule AttestoPhoenix.Schema.Authorization do
   reproduced at redemption time:
 
     * `:client_id` - the client the code was issued to (RFC 6749 §4.1.3:
-      the code MUST be redeemed by that same client).
+      the code MUST be redeemed by that same client). A `text` column: a
+      Client ID Metadata Document client_id may be 2,048 bytes.
     * `:subject` - the resource owner the code authenticates.
-    * `:scope` - the granted scope, a list of scope tokens.
+    * `:scope` - the granted scope, a list of scope tokens, in an unbounded
+      `varchar[]` column because scope tokens have no length limit.
     * `:redirect_uri` - the registered redirect URI, compared by exact
       string match at redemption (RFC 6749 §3.1.2 / §4.1.3).
     * `:code_challenge` / `:code_challenge_method` - the PKCE challenge and

@@ -275,6 +275,28 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
       end
     end
 
+    test "issues and rotates a family whose client_id, scope token, and resource exceed 255 characters" do
+      now = System.system_time(:second)
+      client_id = "https://client.example.com/" <> String.duplicate("a", 2_021)
+      scope = ["openid", String.duplicate("s", 300)]
+      resource = ["https://api.example.com/" <> String.duplicate("r", 300)]
+
+      assert {:ok, issued} =
+               CoreRefreshToken.issue(
+                 EctoRefreshStore,
+                 %{subject: "sub-1", client_id: client_id, scope: scope, resource: resource},
+                 now: now
+               )
+
+      assert {:ok, %{data: %{client_id: ^client_id, scope: ^scope, resource: ^resource}}} =
+               EctoRefreshStore.get(Attesto.Secret.hash(issued.token))
+
+      assert {:ok, rotated} = CoreRefreshToken.rotate(EctoRefreshStore, issued.token, client_id: client_id, now: now)
+
+      assert {:ok, %{data: %{client_id: ^client_id, scope: ^scope, resource: ^resource}}} =
+               EctoRefreshStore.get(Attesto.Secret.hash(rotated.token))
+    end
+
     test "the atomic SQL transition cannot narrow, widen, or drop the granted scope or resource set" do
       now = System.system_time(:second)
       resources = ["https://api.example/a", "https://api.example/b"]

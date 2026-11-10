@@ -144,6 +144,26 @@ defaults in a minor release.
   `{:error, :invalid_rotation}` for a child whose scope or resource set
   differs from its parent's. The `:build_refresh_principal` callback's
   `:resource` is the access token's effective resource set, as before.
+- Store client- and request-supplied values without a 255-character limit.
+  The generated tables kept `client_id`, the `scope`, `resource`, and
+  `granted_scope` lists, the refresh-token and CIBA `acr`, and the CIBA
+  `binding_message` in `varchar(255)` columns, so a longer value made the
+  Ecto stores raise `Postgrex.Error` 22001 and the request failed with a 500:
+  `/authorize` for a Client ID Metadata Document `client_id` over 255 bytes
+  (the resolver admits up to 2,048) or with a scope token over 255
+  characters, refresh-token issuance for such a client, device authorization,
+  a CIBA request, and logout-session recording (where the failure was logged
+  and the session was not recorded). A CIBA `binding_message` within the
+  default 128-grapheme limit could exceed 255 characters, because one
+  grapheme can span several. The fresh migration now creates these columns
+  as `text`, and the lists as unbounded `varchar[]`. Existing installations
+  must generate and apply the new migration:
+  `mix attesto_phoenix.gen.migration --upgrade 4.5 --repo MyApp.Repo`, then
+  `mix ecto.migrate`. PostgreSQL applies it without rewriting the tables,
+  missing optional tables are skipped, 4.4 nodes work with the widened
+  columns, and its rollback leaves them widened. Until it has run, such
+  values still fail in the bundled stores. CIBA `acr_values` keep their
+  255-byte limit at the backchannel endpoint.
 
 ## [4.4.1] - 2026-11-05
 

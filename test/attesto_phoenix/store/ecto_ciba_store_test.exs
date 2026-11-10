@@ -107,6 +107,39 @@ defmodule AttestoPhoenix.Store.EctoCIBAStoreTest do
              CIBA.redeem(Store, auth_req_id, %{client_id: "cli-1"}, now: now)
   end
 
+  test "a client_id, scope token, resource, and binding message longer than 255 characters round-trip" do
+    now = System.system_time(:second)
+    client_id = "https://client.example.com/" <> String.duplicate("a", 2_021)
+    long_scope = String.duplicate("s", 300)
+    resource = ["https://api.example.com/" <> String.duplicate("r", 300)]
+    # 128 graphemes, the default binding_message_max_length, of two code
+    # points each: 256 characters as PostgreSQL counts them.
+    binding_message = String.duplicate("é", 128)
+    acr = "urn:example:acr:" <> String.duplicate("c", 300)
+
+    request = %Request{
+      client_id: client_id,
+      delivery_mode: :poll,
+      hint: {:login_hint, "user:alice"},
+      scope: ["openid", long_scope],
+      binding_message: binding_message
+    }
+
+    assert {:ok, %{auth_req_id: auth_req_id}} =
+             CIBA.issue(Store, request, %{subject: "user:alice", resource: resource}, now: now, interval: 1)
+
+    assert {:ok, %{data: %{client_id: ^client_id, binding_message: ^binding_message}}} =
+             Store.lookup(Attesto.Secret.hash(auth_req_id))
+
+    assert {:ok, _decision} =
+             CIBA.approve(Store, auth_req_id, %{subject: "user:alice", acr: acr, scope: ["openid", long_scope]},
+               now: now
+             )
+
+    assert {:ok, %Grant{client_id: ^client_id, scope: ["openid", ^long_scope], resource: ^resource, acr: ^acr}} =
+             CIBA.redeem(Store, auth_req_id, %{client_id: client_id}, now: now)
+  end
+
   test "put rejects an extra canonical data key before database projection" do
     assert_raise ArgumentError, "CIBA request has invalid canonical data", fn ->
       record = put_record()
