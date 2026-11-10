@@ -748,6 +748,73 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     assert_receive {:event, %AttestoPhoenix.Event{name: :auth_succeeded, subject: @subject}}
   end
 
+  describe "DPoP target URI" do
+    setup %{config: config} do
+      start_supervised!({ReplayCache, []})
+
+      key = DPoP.generate_key()
+      {_, public} = key |> JOSE.JWK.to_public() |> JOSE.JWK.to_map()
+      %{dpop_key: key, dpop_token: mint(config, scope: "openid", dpop_jkt: Attesto.DPoP.compute_jkt(public))}
+    end
+
+    test "with :resource_origin, refuses a proof made for the server named in the request Host", ctx do
+      config = %{ctx.config | resource_origin: "https://mcp.example"}
+
+      conn =
+        ctx
+        |> dpop_resource_request("https://other.example/reports", "https://other.example/reports")
+        |> Authenticate.call(Authenticate.init(config: config))
+
+      assert_dpop_refused(conn)
+    end
+
+    test "with :resource_origin, accepts a proof for that origin when the request Host differs", ctx do
+      config = %{ctx.config | resource_origin: "https://mcp.example"}
+
+      conn =
+        ctx
+        |> dpop_resource_request("http://other.example:4000/reports", "https://mcp.example/reports")
+        |> Authenticate.call(Authenticate.init(config: config))
+
+      refute conn.halted
+      assert conn.assigns.attesto_claims["cnf"]["jkt"]
+    end
+
+    test "a per-plug core :origin pins the route without conflicting with the configured :htu", ctx do
+      opts = Authenticate.init(config: ctx.config, origin: "https://mcp.example")
+
+      refused =
+        ctx
+        |> dpop_resource_request("https://other.example/reports", "https://other.example/reports")
+        |> Authenticate.call(opts)
+
+      assert_dpop_refused(refused)
+
+      accepted =
+        ctx
+        |> dpop_resource_request("https://other.example/reports", "https://mcp.example/reports")
+        |> Authenticate.call(opts)
+
+      refute accepted.halted
+    end
+  end
+
+  defp dpop_resource_request(%{dpop_key: key, dpop_token: token}, url, htu) do
+    proof = DPoP.proof(key, "GET", htu, access_token: token)
+
+    :get
+    |> conn(url)
+    |> put_req_header("authorization", "DPoP " <> token)
+    |> put_req_header("dpop", proof)
+  end
+
+  defp assert_dpop_refused(conn) do
+    assert conn.halted
+    assert conn.status == 401
+    assert JSON.decode!(conn.resp_body)["error"] == "invalid_dpop_proof"
+    assert ["DPoP " <> _] = get_resp_header(conn, "www-authenticate")
+  end
+
   # Read the audit store inside Plug's synchronous send boundary. These tests
   # cannot pass merely because the event appears after Authenticate.call/2.
   @denial_paths ~w(missing malformed invalid audience mtls_missing mtls_invalid

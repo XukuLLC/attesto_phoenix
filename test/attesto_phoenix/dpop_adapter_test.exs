@@ -148,6 +148,25 @@ defmodule AttestoPhoenix.DPoP.AdapterTest do
     assert opts[:cert_der].(conn(:get, "/reports")) == nil
   end
 
+  test "protected-resource htu follows :resource_origin, not the request authority" do
+    opts = Adapter.protected_resource_opts(config(resource_origin: "https://api.example.com/", trusted_proxies: [:any]))
+
+    proxied =
+      :get
+      |> conn("http://internal.example:4000/reports?page=1")
+      |> Plug.Conn.put_req_header("x-forwarded-host", "other.example")
+      |> Plug.Conn.put_req_header("x-forwarded-proto", "https")
+
+    assert opts[:htu].(proxied) == "https://api.example.com/reports"
+    refute Keyword.has_key?(opts, :origin)
+  end
+
+  test "protected-resource htu is derived from the request without :resource_origin or :htu" do
+    opts = Adapter.protected_resource_opts(config([]))
+
+    assert opts[:htu].(conn(:get, "https://other.example/reports")) == "https://other.example/reports"
+  end
+
   test "protected-resource replay is disabled with DPoP disabled" do
     opts = Adapter.protected_resource_opts(config(dpop_enabled: false))
 

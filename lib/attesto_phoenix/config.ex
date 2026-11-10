@@ -135,7 +135,11 @@ defmodule AttestoPhoenix.Config do
     * `:basic_realm` - realm string for token-endpoint Basic auth challenges.
       Default `"OAuth"`.
     * `:htu` - `(conn -> canonical_url_string)`. Overrides how the DPoP `htu`
-      is computed behind proxies. Defaults to derivation from `:trusted_proxies`.
+      is computed behind proxies, at the bundled endpoints and at every
+      protected resource. Defaults to derivation from `:trusted_proxies`, and
+      at protected resources to `:resource_origin` when that is set. Mutually
+      exclusive with `:resource_origin`. Build it from configured origins, not
+      from request headers.
     * `:cert_der` - `(conn -> der_binary | nil)`. Deprecated compatibility alias
       for terminator-provided certificate extraction. It is invoked only when
       the adapter-reported immediate socket peer matches `:trusted_proxies`.
@@ -625,6 +629,26 @@ defmodule AttestoPhoenix.Config do
     * `:audience` - default access-token audience. This must be one absolute
       HTTPS resource identifier. Use RFC 8707 `resource` parameters and
       `:resource_indicators` when a grant may target other resources.
+    * `:resource_origin` - the external origin clients address this
+      configuration's protected resources by, such as
+      `"https://api.example.com"`: an `https` URL with a host, an optional
+      port, and no path, userinfo, query, or fragment. Default `nil`. When
+      set, the DPoP `htu` a proof must sign (RFC 9449 §4.3) at every protected
+      resource authenticated with this configuration is this origin followed
+      by `conn.request_path`; the request's scheme, `Host` header, forwarded
+      headers, and port are not used. That covers
+      `AttestoPhoenix.Plug.Authenticate`, the bundled UserInfo and credential
+      endpoints, and `AttestoPhoenix.DPoP.Adapter.protected_resource_opts/1`.
+      When unset, the protected-resource `htu` is built from the request:
+      the `Host` header, or the forwarded host from a peer in
+      `:trusted_proxies`. A server that answers more than one `Host` then
+      accepts a DPoP-bound token with a proof made for another server, so set
+      this on every deployment that accepts DPoP-bound tokens at its
+      protected resources. It is independent of `:issuer`, which names the
+      authorization server and may be a different origin. Set `:htu` instead
+      when this configuration's protected resources are served on several
+      origins (including a bundled UserInfo endpoint on the issuer origin and
+      host resources on another); the two options are mutually exclusive.
     * `:client_auth_signing_algs` - the JOSE algorithms accepted for
       `private_key_jwt` client-assertion signatures, and the set advertised as
       `token_endpoint_auth_signing_alg_values_supported` in discovery. Defaults
@@ -1094,6 +1118,7 @@ defmodule AttestoPhoenix.Config do
     :resource_metadata,
     :resource_metadata_resolver,
     :htu,
+    :resource_origin,
     :cert_der,
     :forwarded_cert_der,
     :client_certificate_chain_validated?,
@@ -1269,6 +1294,7 @@ defmodule AttestoPhoenix.Config do
           resource_metadata_resolver: callback() | nil,
           basic_realm: String.t(),
           htu: callback() | nil,
+          resource_origin: String.t() | nil,
           cert_der: callback() | nil,
           forwarded_cert_der: callback() | nil,
           client_certificate_chain_validated?: callback() | nil,
@@ -4318,6 +4344,7 @@ defmodule AttestoPhoenix.Config do
     validate_issuer!(config)
     validate_resource_indicators!(config)
     validate_resource_metadata!(config)
+    validate_resource_origin!(config)
     validate_boolean_flags!(config)
     validate_nested_boolean_flags!(config)
     validate_client_id_metadata_limits!(config)
@@ -4668,6 +4695,38 @@ defmodule AttestoPhoenix.Config do
               "host and no fragment (the RFC 9728 protected-resource metadata document advertised " <>
               "in the WWW-Authenticate challenge); got #{inspect(rm)}."
     end
+  end
+
+  # The protected-resource DPoP `htu` is this origin followed by the request
+  # path (RFC 9449 §4.3), so only a bare https origin composes into a target
+  # URI: a path would sit in front of every request path, and userinfo, query,
+  # and fragment have no place in an `htu`. The same rule as
+  # `Attesto.Plug.Authenticate`'s `:origin`. `:htu` already builds every target
+  # URI, so a value here next to it would never be read.
+  defp validate_resource_origin!(%__MODULE__{resource_origin: nil}), do: :ok
+
+  defp validate_resource_origin!(%__MODULE__{resource_origin: origin, htu: htu}) do
+    if !resource_origin?(origin) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :resource_origin, when set, must be an https URL with a host, an " <>
+              "optional port, and no path, userinfo, query, or fragment " <>
+              "(e.g. \"https://api.example.com\"); got #{inspect(origin)}."
+    end
+
+    if !is_nil(htu) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: set either :resource_origin or :htu, not both; " <>
+              ":htu builds every DPoP target URI, including the protected-resource one."
+    end
+
+    :ok
+  end
+
+  # `absolute_resource_url?/1` is false for a non-binary, so `URI.new/1` only
+  # sees a string.
+  defp resource_origin?(origin) do
+    absolute_resource_url?(origin) and
+      match?({:ok, %URI{path: path, query: nil}} when path in [nil, "", "/"], URI.new(origin))
   end
 
   defp validate_refresh_rotation!(%__MODULE__{} = config) do

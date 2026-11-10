@@ -50,7 +50,10 @@ defmodule AttestoPhoenix.DPoP.Adapter do
 
   This is the protected-resource path: replay checking is disabled when DPoP
   is disabled, while `htu`, nonce, nonce issuance, and certificate extraction
-  are resolved from the same Phoenix config used by the endpoint.
+  are resolved from the same Phoenix config used by the endpoint. The `:htu`
+  callback is always present and follows `htu/1`; the result never carries
+  core's `:origin`, so it composes with `Attesto.Plug.Authenticate`, which
+  takes one or the other.
   """
   @spec protected_resource_opts(Config.t()) :: keyword()
   def protected_resource_opts(%Config{} = config) do
@@ -98,9 +101,16 @@ defmodule AttestoPhoenix.DPoP.Adapter do
 
   def cert_der(%Config{}), do: nil
 
-  @doc "Resolve the canonical request URL callback used for DPoP `htu`."
+  @doc """
+  Resolve the protected-resource DPoP `htu` callback.
+
+  See `AttestoPhoenix.RequestContext.protected_resource_url/2`: a configured
+  `:htu` decides; otherwise a configured `:resource_origin` followed by the
+  request path; otherwise the URL derived from the request through
+  `:trusted_proxies`, which follows the request `Host`.
+  """
   @spec htu(Config.t()) :: (Plug.Conn.t() -> String.t())
-  def htu(%Config{} = config), do: fn conn -> RequestContext.canonical_url(conn, config) end
+  def htu(%Config{} = config), do: fn conn -> RequestContext.protected_resource_url(conn, config) end
 
   defp protected_resource_replay_check(%Config{dpop_enabled: false}), do: nil
   defp protected_resource_replay_check(%Config{} = config), do: replay_check(config)

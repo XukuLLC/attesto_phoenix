@@ -40,17 +40,41 @@ not on whatever reached the application socket.
   * `:require_https` - keep this `true` (the default) in production so the
     endpoints enforce HTTPS.
 
-  * `:htu` - `(conn -> canonical_url_string)`. When the default derivation from
-    `:trusted_proxies` is not enough (an unusual proxy chain, a host rewrite),
-    override exactly how the DPoP `htu` is computed. Return the canonical URL
-    the client would have signed.
+  * `:resource_origin` - the fixed canonical `https` origin of the protected
+    resources, such as `"https://api.example.com"`. The DPoP `htu` at every
+    protected resource (`AttestoPhoenix.Plug.Authenticate`, the bundled
+    UserInfo and credential endpoints) is this origin followed by the request
+    path, so neither the proxy hop nor a client-chosen `Host` affects it. It is
+    independent of `:issuer`, because the resource server and the
+    authorization server may live on different origins.
+
+  * `:htu` - `(conn -> canonical_url_string)`. When neither the configured
+    URLs nor `:resource_origin` describe the topology (protected resources on
+    several origins, a path-rewriting proxy), override exactly how the DPoP
+    `htu` is computed. Return the canonical URL the client would have signed,
+    built from configured origins rather than request headers. Mutually
+    exclusive with `:resource_origin`.
+
+## Where the DPoP `htu` comes from
+
+  * Token, PAR, and device authorization endpoints: their configured public
+    URL (derived from `:issuer`), or an exact `:mtls_endpoint_aliases` entry
+    when the request arrives on that alias.
+  * Protected resources: `:htu` if set; otherwise `:resource_origin` followed
+    by the request path; otherwise the URL rebuilt from the request through
+    `:trusted_proxies`. The last form takes its host from the request `Host`
+    header (or the forwarded host from a trusted proxy), so a server that
+    answers more than one `Host` accepts a DPoP-bound token with a proof made
+    for another server.
 
 ## Checklist
 
   - [ ] `:issuer` is the fixed canonical `https` URL (no internal host).
+  - [ ] `:resource_origin` is the canonical `https` origin of your protected
+        resources if they accept DPoP-bound tokens.
   - [ ] `:trusted_proxies` lists your proxy's address range, nothing wider.
   - [ ] `:require_https` is `true`.
   - [ ] Advertised endpoint paths match the mount via `:oauth_path_prefix` (see
         the consumer migration guide).
-  - [ ] If proofs are rejected behind the proxy, set `:htu` to return the
-        canonical signed URL.
+  - [ ] If proofs are rejected behind the proxy and `:resource_origin` does not
+        describe the topology, set `:htu` to return the canonical signed URL.

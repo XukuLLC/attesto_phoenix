@@ -1570,6 +1570,39 @@ defmodule AttestoPhoenix.ConfigTest do
       assert cfg.resource_metadata == "https://api.example/.well-known/x"
     end
 
+    test ":resource_origin, when set, must be a bare https origin and excludes :htu" do
+      base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
+
+      for bad <- [
+            "",
+            "api.example",
+            "http://api.example",
+            "https://api.example/v1",
+            "https://user@api.example",
+            "https://api.example?x=1",
+            "https://api.example#frag",
+            ["https://api.example"],
+            123
+          ] do
+        assert_raise ArgumentError, ~r/:resource_origin, when set, must be an https URL with a host/, fn ->
+          Config.new(Keyword.put(base, :resource_origin, bad))
+        end
+      end
+
+      assert_raise ArgumentError, ~r/set either :resource_origin or :htu, not both/, fn ->
+        base
+        |> Keyword.put(:resource_origin, "https://api.example")
+        |> Keyword.put(:htu, fn conn -> "https://api.example" <> conn.request_path end)
+        |> Config.new()
+      end
+
+      for good <- ["https://api.example", "https://api.example/", "https://api.example:8443"] do
+        assert Config.new(Keyword.put(base, :resource_origin, good)).resource_origin == good
+      end
+
+      assert Config.new(base).resource_origin == nil
+    end
+
     test ":resource_metadata_resolver selects per-request metadata and may deliberately omit it" do
       base = Keyword.put(audience_required_opts(), :audience, "https://api.example.com")
       static = "https://api.example/.well-known/oauth-protected-resource"

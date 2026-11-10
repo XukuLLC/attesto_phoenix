@@ -6,6 +6,57 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [Unreleased]
+
+### Security
+
+- Add the `:resource_origin` configuration key: the external `https` origin
+  clients address this configuration's protected resources by, such as
+  `"https://api.example.com"`. When it is set, the DPoP target URI (`htu`) a
+  proof must sign at a protected resource is that origin followed by the
+  request path. This covers `AttestoPhoenix.Plug.Authenticate`, the bundled
+  UserInfo and credential endpoints, and
+  `AttestoPhoenix.DPoP.Adapter.protected_resource_opts/1`, which
+  `attesto_mcp_server`'s Phoenix integration uses. Until now the
+  protected-resource `htu` was always rebuilt from the request `Host` header
+  (or the forwarded host from a trusted proxy) unless the host wrote an
+  `:htu` callback, and Attesto core's `:origin` could not be used on this
+  path because the adapter already supplied `:htu`. This applies only when
+  DPoP is enabled and the server answers more than one `Host`: such a server
+  accepted a DPoP-bound access token together with a proof made for another
+  server when the sender named that server in `Host` (RFC 9449 §4.3).
+
+  To pin the origin, add `resource_origin: "https://api.example.com"` (the
+  origin of your protected resources) to `config :my_app,
+  AttestoPhoenix.Config` or to the options given to `Config.new/1`. It is not
+  the issuer: the authorization server may live on another origin, and
+  `:issuer` is not consulted. When the bundled UserInfo or credential
+  endpoints are served on a different origin than the host's own resources,
+  set `:htu` instead, or pin each route with
+  `plug AttestoPhoenix.Plug.Authenticate, origin: "..."`.
+  `:resource_origin` must be an `https` URL with a host, an optional port, and
+  no path, userinfo, query, or fragment, and `Config.new/1` raises when it is
+  combined with `:htu`.
+
+  Behaviour change: none until `:resource_origin` is set. Without it the
+  protected-resource `htu` is still derived from the request, so a server that
+  answers more than one `Host` stays exposed until the key (or `:htu`) is
+  configured. Once it is set, a proof signed for any other origin, including
+  an alias hostname that reaches the same deployment, is refused.
+
+### Fixed
+
+- `AttestoPhoenix.Plug.Authenticate` accepts Attesto core's `:origin` as a
+  per-plug option. The adapter's `:htu` callback was merged alongside it, and
+  `Attesto.Plug.Authenticate.init/1` raised `ArgumentError` for the pair, so
+  every request on that route failed. A per-plug `:origin` now replaces the
+  configured `htu` derivation for that route.
+
+### Added
+
+- `AttestoPhoenix.RequestContext.protected_resource_url/2` returns the DPoP
+  target URI for a protected-resource request under a configuration.
+
 ## [4.5.0] - 2026-11-09
 
 ### Security

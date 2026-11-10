@@ -332,6 +332,24 @@ defmodule AttestoPhoenix.RequestContext do
     |> URI.to_string()
   end
 
+  @doc """
+  Returns the DPoP `htu` a proof must sign at a protected resource.
+
+  A configured `config.htu` callback decides, as in `canonical_url/2`.
+  Otherwise a configured `config.resource_origin` is joined with
+  `conn.request_path`, so neither the request's scheme, `Host` header,
+  forwarded headers, nor port can choose the URI a proof is compared against
+  (RFC 9449 §4.3). Without either, this is `canonical_url/2`: the URL clients
+  reached as seen through `:trusted_proxies`, whose host comes from the
+  request `Host` header or the forwarded host.
+  """
+  @spec protected_resource_url(Plug.Conn.t(), Config.t()) :: String.t()
+  def protected_resource_url(%Plug.Conn{} = conn, %Config{htu: nil, resource_origin: origin}) when is_binary(origin) do
+    String.trim_trailing(origin, "/") <> conn.request_path
+  end
+
+  def protected_resource_url(%Plug.Conn{} = conn, %Config{} = config), do: canonical_url(conn, config)
+
   @doc false
   @spec canonical_url(Plug.Conn.t(), Config.t(), String.t()) :: String.t()
   def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu}, configured_url)

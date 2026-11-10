@@ -51,6 +51,19 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   Invalid runtime resolver results are omitted. A resolver exception is not
   rescued and aborts the request, because resolvers are trusted host
   configuration rather than untrusted request input.
+
+  ## DPoP target URI
+
+  The URI a DPoP proof must sign (`htu`, RFC 9449 §4.3) comes from the
+  configuration's `:htu` callback when that is set, otherwise from its
+  `:resource_origin` followed by `conn.request_path`, and otherwise from the
+  request as seen through `:trusted_proxies`, which follows the request `Host`
+  header. Set `:resource_origin` on any deployment that
+  accepts DPoP-bound tokens and answers more than one `Host`; see "DPoP target
+  URI" in `AttestoPhoenix.ProtectedResource` for the full order. Every option
+  not listed above is passed to `Attesto.Plug.Authenticate`, so a route can
+  also pin its own target URI with core's `:origin` (which replaces the
+  configured derivation for that route) or `:htu`.
   """
 
   @behaviour Plug

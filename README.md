@@ -474,6 +474,7 @@ config :my_app, AttestoPhoenix.Config,
   # remain HTTPS-only regardless of this value.
   require_https: true,
   trusted_proxies: ["10.0.0.0/8"],     # honor X-Forwarded-* only from these
+  resource_origin: "https://api.example.com", # DPoP htu origin at protected resources
   access_token_ttl: 900,
   refresh_token_ttl: 1_209_600,
   refresh_token_max_lifetime: nil,      # optional fixed family limit, seconds
@@ -1388,9 +1389,12 @@ authoritative, even if middleware rewrites `conn.remote_ip` from a forwarded
 header. Standard scheme/host/port rewrites are likewise ignored for an
 untrusted socket peer when deriving HTTPS. For a trusted proxy, Attesto reads
 the right-most scheme, host, and port token supplied by the nearest trusted
-hop. DPoP `htu` for bundled endpoints comes from their configured public URL,
-or from an exact configured RFC 8705 mTLS endpoint alias when the request
-arrives on that alias, so an arbitrary request `Host` cannot redefine it. The
+hop. DPoP `htu` for the bundled token, PAR, and device authorization
+endpoints comes from their configured public URL, or from an exact configured
+RFC 8705 mTLS endpoint alias when the request arrives on that alias, so an
+arbitrary request `Host` cannot redefine it. Protected resources, including
+the bundled UserInfo and credential endpoints, take it from `:resource_origin`
+(see "DPoP target URI" under "Protecting resources"). The
 deprecated `:cert_der` callback is subject to the same gate so
 older header-based deployments fail closed until they configure their proxy
 allowlist and migrate. PKI authentication
@@ -1790,6 +1794,31 @@ plug AttestoPhoenix.Plug.Authenticate,
 The extractor returns `{:ok, :bearer, token}`, `{:ok, :dpop, token}`, or
 `:missing`. Attesto still verifies the token through the same JWT/DPoP/mTLS
 path; the cookie format and CSRF policy remain host concerns.
+
+### DPoP target URI
+
+A DPoP proof signs the URI of the request it was made for (`htu`, RFC 9449
+§4.3). At a protected resource the URI a proof is compared against comes from,
+in order: a per-plug core `:htu` or `:origin` override on
+`AttestoPhoenix.Plug.Authenticate`, the configuration's `:htu` callback, the
+configuration's `:resource_origin` followed by the request path, and otherwise
+the URL derived from the request through `:trusted_proxies`. That last form
+uses the request `Host` header (or the forwarded host from a trusted proxy),
+so a server that answers more than one `Host` accepts a DPoP-bound token
+together with a proof made for another server. Pin the origin with one value:
+
+```elixir
+config :my_app, AttestoPhoenix.Config,
+  issuer: "https://auth.example.com",
+  audience: "https://api.example.com",
+  resource_origin: "https://api.example.com"
+```
+
+`:resource_origin` is the resource server's own origin, not the issuer's. It
+applies to every protected resource that uses the configuration, including the
+bundled UserInfo and credential endpoints; when those are served on another
+origin than the host's resources, set `:htu` instead, or pin each route with
+`plug AttestoPhoenix.Plug.Authenticate, origin: "https://api.example.com"`.
 
 ### Req DPoP clients
 

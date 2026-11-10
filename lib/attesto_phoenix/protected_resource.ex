@@ -7,6 +7,33 @@ defmodule AttestoPhoenix.ProtectedResource do
   receive the verified claims only after this common work succeeds. Every 401
   completes the synchronous `:auth_denied` callback before sending the response;
   hosts must commit audit writes before returning (see `AttestoPhoenix.EventSink`).
+
+  ## DPoP target URI
+
+  A DPoP proof signs the URI of the request it was made for (`htu`, RFC 9449
+  §4.3), and the resource compares it with the URI it computes for the
+  request. That URI is chosen in this order:
+
+    1. a per-route override passed to `AttestoPhoenix.Plug.Authenticate`:
+       core's `:htu` callback or core's `:origin`;
+    2. the configuration's `:htu` callback;
+    3. the configuration's `:resource_origin` followed by `conn.request_path`;
+    4. the URL derived from the request through `:trusted_proxies`, whose host
+       is the request `Host` header or the forwarded host.
+
+  The last form follows the request `Host`, so a server that answers more than
+  one `Host` accepts a DPoP-bound token together with a proof made for another
+  server. Pin the origin with one configuration value:
+
+      config :my_app, AttestoPhoenix.Config,
+        issuer: "https://auth.example.com",
+        audience: "https://api.example.com",
+        resource_origin: "https://api.example.com"
+
+  `:resource_origin` applies to every protected resource that uses this
+  configuration, including the bundled UserInfo and credential endpoints. When
+  those are served on another origin than the host's resources, set `:htu`
+  (or a per-route override) instead.
   """
 
   alias Attesto.Plug.Authenticate
@@ -103,7 +130,7 @@ defmodule AttestoPhoenix.ProtectedResource do
     |> put_optional(:send_error, config.send_error)
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)
-    |> Keyword.merge(Adapter.protected_resource_opts(config))
+    |> Keyword.merge(adapter_opts(config, overrides))
     |> Keyword.merge(overrides)
     # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it
     # must also carry the protected-resource metadata pointer when configured.
@@ -166,6 +193,17 @@ defmodule AttestoPhoenix.ProtectedResource do
     ]
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Keyword.merge(extra)
+  end
+
+  # `Attesto.Plug.Authenticate` takes either `:origin` or `:htu` and raises at
+  # `init/1` when given both, and `do_authenticate/4` runs `init/1` on every
+  # request. A per-plug core `:origin` is the caller's choice of target URI for
+  # this route, so the configured `:htu` callback is left out when one is
+  # present.
+  defp adapter_opts(config, overrides) do
+    opts = Adapter.protected_resource_opts(config)
+
+    if Keyword.has_key?(overrides, :origin), do: Keyword.delete(opts, :htu), else: opts
   end
 
   defp put_optional(opts, _key, nil), do: opts
