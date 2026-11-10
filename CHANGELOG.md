@@ -90,6 +90,11 @@ defaults in a minor release.
   and CIBA ping deliveries to such hosts always failed with
   `%Mint.TransportError{reason: :nxdomain}`. An IPv6 literal now opens an
   IPv6 socket.
+- Render the `:invalid` stage for an expired `user_code` on the device
+  verification page. `DeviceVerificationController` rendered `:prompt` for
+  any pending code, so the user was asked to confirm a request whose
+  approval then failed as `:invalid`. The moduledoc already listed expired
+  codes under `:invalid`.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens

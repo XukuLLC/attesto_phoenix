@@ -285,6 +285,16 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationControllerTest do
     assert body(call(:post, %{"user_code" => user_code, "decision" => "deny"}))["stage"] == "denied"
   end
 
+  test "GET with an expired user_code renders :invalid instead of the prompt" do
+    issued_at = System.system_time(:second) - 120
+
+    assert {:ok, %{user_code: user_code}} =
+             DeviceCode.issue(Store, %{client_id: "cli-1", scope: ["read"]}, now: issued_at, ttl: 60)
+
+    assert body(call(:get, %{"user_code" => user_code}))["stage"] == "invalid"
+    assert body(call(:post, %{"user_code" => user_code, "decision" => "approve"}))["stage"] == "invalid"
+  end
+
   test "an unknown / malformed user_code renders :invalid" do
     assert body(call(:post, %{"user_code" => "BCDFGHJK", "decision" => "approve"}))["stage"] == "invalid"
     assert body(call(:get, %{"user_code" => "not-a-code"}))["stage"] == "invalid"

@@ -125,12 +125,25 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   # about to authorize (or just the code-entry prompt when no/invalid code).
   defp prompt(conn, config, _store, nil), do: render_stage(conn, config, :prompt, nil, nil)
 
+  # RFC 8628 §3.5: an expired device code can no longer be approved (approval
+  # re-checks expiry in the store), so the page reports it as invalid rather
+  # than asking the user to confirm a request that cannot complete. Store
+  # lookups do not filter on expiry, so the check is made here.
   defp prompt(conn, config, store, user_code) do
     case lookup_device_code(config, store, user_code) do
-      {:ok, %{status: :pending} = view} -> render_stage(conn, config, :prompt, user_code, view)
-      {:ok, _decided} -> render_stage(conn, config, :invalid, user_code, nil)
-      :error -> render_stage(conn, config, :invalid, user_code, nil)
-      {:error, :invalid_user_code} -> render_stage(conn, config, :invalid, user_code, nil)
+      {:ok, %{status: :pending, expires_at: expires_at} = view} ->
+        if expires_at > System.system_time(:second),
+          do: render_stage(conn, config, :prompt, user_code, view),
+          else: render_stage(conn, config, :invalid, user_code, nil)
+
+      {:ok, _decided} ->
+        render_stage(conn, config, :invalid, user_code, nil)
+
+      :error ->
+        render_stage(conn, config, :invalid, user_code, nil)
+
+      {:error, :invalid_user_code} ->
+        render_stage(conn, config, :invalid, user_code, nil)
     end
   end
 
