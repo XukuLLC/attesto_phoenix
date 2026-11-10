@@ -275,6 +275,40 @@ defmodule AttestoPhoenix.Store.EctoRefreshStoreTest do
       end
     end
 
+    test "the atomic SQL transition cannot narrow, widen, or drop the granted scope or resource set" do
+      now = System.system_time(:second)
+      resources = ["https://api.example/a", "https://api.example/b"]
+
+      assert {:ok, issued} =
+               CoreRefreshToken.issue(
+                 EctoRefreshStore,
+                 %{subject: "sub-1", client_id: "client-1", scope: ["read", "write"], resource: resources},
+                 now: now
+               )
+
+      assert {:ok, parent} = EctoRefreshStore.get(Attesto.Secret.hash(issued.token))
+
+      for data <- [
+            %{parent.data | scope: ["read"]},
+            %{parent.data | scope: ["read", "write", "admin"]},
+            %{parent.data | resource: ["https://api.example/a"]},
+            %{parent.data | resource: []}
+          ] do
+        candidate = child(parent, "grant-child", %{data: data})
+        retry = successor(candidate, "grant-child", now + 10)
+        assert {:error, :invalid_rotation} = EctoRefreshStore.rotate(parent.token_hash, candidate, retry, now: now)
+        assert_parent_unchanged(parent)
+      end
+
+      opts = [client_id: "client-1", scope: ["read"], resource: ["https://api.example/a"], now: now]
+      assert {:ok, rotated} = CoreRefreshToken.rotate(EctoRefreshStore, issued.token, opts)
+      assert rotated.context.scope == ["read"]
+      assert rotated.context.resource == ["https://api.example/a"]
+      assert {:ok, row} = EctoRefreshStore.get(Attesto.Secret.hash(rotated.token))
+      assert row.data.scope == ["read", "write"]
+      assert row.data.resource == resources
+    end
+
     test "fixed family expiry survives SQL rotation and encrypted lost-response retries" do
       now = System.system_time(:second)
 

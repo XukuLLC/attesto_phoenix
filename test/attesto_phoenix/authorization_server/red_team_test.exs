@@ -135,7 +135,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RedTeamTest do
   end
 
   describe "token grant reuse and rotation grace-window binding attacks" do
-    test "retrying a consumed refresh token within the grace window with a modified scope, resource, or DPoP key triggers reuse revocation" do
+    test "retrying a consumed refresh token within the grace window outside the grant or with another DPoP key triggers reuse revocation" do
       start_stores()
       resource_a = "https://api.example/a"
       resource_b = "https://api.example/b"
@@ -181,16 +181,47 @@ defmodule AttestoPhoenix.AuthorizationServer.RedTeamTest do
 
       assert {:ok, rotated, [%Event{name: :refresh_rotated}]} = Token.issue(config, first_req)
 
-      # Modified scope during the grace window must NOT replay the cached successor;
-      # it must trigger reuse detection and revoke the successor family.
-      scope_mismatch_req =
-        %{first_req | params: Map.put(first_req.params, "scope", "write")}
+      # The cached successor carries the full grant, so a retry naming another
+      # granted subset is served that successor with an access token for the
+      # subset it asked for.
+      subset_retry_req =
+        %{first_req | params: %{first_req.params | "scope" => "write", "resource" => resource_b}}
+
+      assert {:ok, retried, [%Event{name: :refresh_rotated}]} = Token.issue(config, subset_retry_req)
+      assert retried.refresh_token == rotated.refresh_token
+
+      # A retry asking for scope outside the grant must NOT replay the cached
+      # successor; it triggers reuse detection and revokes the family.
+      scope_outside_req = %{first_req | params: %{first_req.params | "scope" => "admin"}}
 
       assert {:error, %OAuthError{error: :invalid_grant},
               [%Event{name: :refresh_reuse_detected}, %Event{name: :token_denied}]} =
-               Token.issue(config, scope_mismatch_req)
+               Token.issue(config, scope_outside_req)
 
       assert :error = RefreshETS.get(Attesto.Secret.hash(rotated.refresh_token))
+
+      # The same holds for a resource outside the grant.
+      {:ok, resource_family} =
+        Attesto.RefreshToken.issue(RefreshETS, %{
+          subject: "oc_user-1",
+          scope: ["read", "write"],
+          resource: [resource_a, resource_b],
+          client_id: "client-1",
+          issuer: @issuer,
+          dpop_jkt: jkt_1
+        })
+
+      resource_req = %{first_req | params: %{first_req.params | "refresh_token" => resource_family.token}}
+      assert {:ok, resource_rotated, _} = Token.issue(config, resource_req)
+
+      resource_outside_req =
+        %{resource_req | params: %{resource_req.params | "resource" => "https://api.example/c"}}
+
+      assert {:error, %OAuthError{error: :invalid_grant},
+              [%Event{name: :refresh_reuse_detected}, %Event{name: :token_denied}]} =
+               Token.issue(config, resource_outside_req)
+
+      assert :error = RefreshETS.get(Attesto.Secret.hash(resource_rotated.refresh_token))
 
       # Issue a second family and verify a different DPoP key during the grace window also revokes.
       {:ok, second} =

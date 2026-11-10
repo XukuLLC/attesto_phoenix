@@ -263,7 +263,7 @@ defmodule AttestoPhoenix.Config do
     * `:build_refresh_principal` - optional
       `(client, refresh_context -> map | {:error, :invalid_grant})` live policy
       check for refresh grants. It receives the authenticated client plus the
-      persisted issuer and subject, effective scope, resource, refresh
+      persisted issuer and subject, effective scope and resource, refresh
       family/generation, original `acr`/`auth_time`, and authorization-session
       `session_id`. Its returned principal is used without a second
       `:build_principal` lookup; protocol-owned claims and the authenticated

@@ -1258,8 +1258,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         add :client_id, :string, size: <%= @identifier_size %>
         add :subject, :string, size: <%= @identifier_size %>, null: false
         add :scope, {:array, :string}, null: false, default: []
-        # RFC 8707 resource indicator(s) bound to the grant; carried through
-        # rotation (subset-only narrowing) so the refreshed token's `aud` matches.
+        # RFC 8707 resource indicator(s) bound to the grant; carried unchanged
+        # through rotation. A refresh request may audience its access token to
+        # a subset (RFC 8707 section 2.2).
         add :resource, {:array, :string}, null: false, default: []
         # RFC 9470 / OIDC Core: original authentication context, carried across
         # rotation so a refreshed access token reports the real auth event

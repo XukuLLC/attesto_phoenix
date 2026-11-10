@@ -2419,7 +2419,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     for {backend, label} <- [{Attesto.RefreshStore.ETS, "ETS"}, {EctoRefreshStore, "Postgres"}] do
       @tag ecto: backend == EctoRefreshStore
       @tag registered_auth_method: :client_secret_basic
-      test "#{label} credential refresh keeps RAR rights independent while narrowing scope and request details" do
+      test "#{label} credential refresh narrows only the access token for scope and request details" do
         enable_minting()
         refresh_store = attested_refresh_store(unquote(backend))
         key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -2499,17 +2499,36 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         assert body(retry)["refresh_token"] == body(rotated)["refresh_token"]
         assert peek_claims(body(retry)["access_token"])["credential_configuration_ids"] == ["Explicit"]
 
+        # RFC 6749 §6: the rotated refresh token keeps the presented token's
+        # scope, and RFC 9396 §6.1 leaves the user's authorization unchanged by
+        # a token-request subset, so the stored grant is the original one.
         successor = body(rotated)["refresh_token"]
-        escalation = post_dpop_confidential_refresh(successor, dpop_proof(jwk: key), %{"scope" => "read"})
+        assert {:ok, %{data: stored}} = refresh_store.get(Attesto.Secret.hash(successor))
+        assert stored.scope == ["read", "offline_access"]
+        assert stored.claims["credential_configuration_ids"] == ["ScopeOnly", "Explicit", "ExplicitOther"]
+
+        escalation = post_dpop_confidential_refresh(successor, dpop_proof(jwk: key), %{"scope" => "read admin"})
         assert escalation.status == 400
         assert body(escalation)["error"] == "invalid_scope"
         assert {:ok, %{consumed: false}} = refresh_store.get(Attesto.Secret.hash(successor))
 
         next = post_dpop_confidential_refresh(successor, dpop_proof(jwk: key), %{"scope" => "offline_access"})
         assert next.status == 200
-        # RFC 9396 §6.1 keeps the user grant unchanged by a token-request RAR
-        # subset. Both explicit rights remain, while the removed scope does not.
+        # Both explicit rights remain, while the scope-bound right follows the
+        # access token's narrowed scope.
         assert peek_claims(body(next)["access_token"])["credential_configuration_ids"] == ["Explicit", "ExplicitOther"]
+
+        # A later refresh obtains the full original scope, and with it the
+        # scope-bound credential, again.
+        full_scope = %{"scope" => "read offline_access"}
+        full = post_dpop_confidential_refresh(body(next)["refresh_token"], dpop_proof(jwk: key), full_scope)
+        assert full.status == 200
+        full_claims = peek_claims(body(full)["access_token"])
+        assert full_claims["scope"] == "read offline_access"
+        assert full_claims["credential_configuration_ids"] == ["ScopeOnly", "Explicit", "ExplicitOther"]
+
+        credential = post_refreshed_credential(body(full)["access_token"], key, "ScopeOnly")
+        assert credential.status == 200
       end
     end
 
@@ -2583,14 +2602,12 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert peek_claims(body(wrong_key)["access_token"])["cnf"]["jkt"] == wrong_jkt
     end
 
-    test "authorization-code refresh context carries a narrowed resource" do
+    test "a token-request resource subset audiences the access token while the refresh token keeps the grant" do
       enable_minting()
       start_refresh_store()
+      resources = ["https://api.example/a", "https://api.example/b"]
 
-      code_store =
-        start_code_store("oc_sub-1", ["read", "offline_access"],
-          resource: ["https://api.example/a", "https://api.example/b"]
-        )
+      code_store = start_code_store("oc_sub-1", ["read", "offline_access"], resource: resources)
 
       put_config(
         refresh_store: Attesto.RefreshStore.ETS,
@@ -2608,8 +2625,34 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         })
 
       assert conn.status == 200
-      assert {:ok, refresh} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(body(conn)["refresh_token"]))
-      assert refresh.data.resource == ["https://api.example/a"]
+      assert peek_claims(body(conn)["access_token"])["aud"] == "https://api.example/a"
+
+      # RFC 8707 §2.2: any refresh token returned is bound to the full original
+      # grant, so a later refresh may audience a token to either resource.
+      refresh_token = body(conn)["refresh_token"]
+      assert {:ok, refresh} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+      assert refresh.data.resource == resources
+
+      other =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "public-1",
+          "refresh_token" => refresh_token,
+          "resource" => "https://api.example/b"
+        })
+
+      assert other.status == 200
+      assert peek_claims(body(other)["access_token"])["aud"] == "https://api.example/b"
+
+      full =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "public-1",
+          "refresh_token" => body(other)["refresh_token"]
+        })
+
+      assert full.status == 200
+      assert peek_claims(body(full)["access_token"])["aud"] == resources
     end
 
     test "no refresh token when offline_access is absent and no host gate is set" do

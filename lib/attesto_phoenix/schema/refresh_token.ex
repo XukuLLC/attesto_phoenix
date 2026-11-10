@@ -38,7 +38,9 @@ defmodule AttestoPhoenix.Schema.RefreshToken do
       token with no client binding.
     * `:subject` - the resource owner the token authorizes.
     * `:scope` - the granted scope as a list of strings (RFC 6749 §3.3); a
-      successor's scope MUST be a subset of its predecessor's.
+      successor's scope MUST be identical to its predecessor's (RFC 6749 §6).
+    * `:resource` - the granted RFC 8707 resource indicators; a successor
+      stays bound to its predecessor's full set (RFC 8707 §2.2).
     * `:cnf` - the RFC 7800 confirmation claim binding the token to a proof of
       possession (e.g. `%{"jkt" => thumbprint}` for a DPoP key, RFC 9449;
       `%{"x5t#S256" => thumbprint}` for an mTLS certificate, RFC 8705). `nil`

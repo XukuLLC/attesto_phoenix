@@ -472,10 +472,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       issued = token_issued_event(request, scope, "ciba", token_type, binding)
       # RFC 9470: fold the Grant's struct-level acr/auth_time into its `claims`
       # so the shared refresh-issuance path (which reads them from `claims`)
-      # seeds the refresh family with the real authentication event.
+      # seeds the refresh family with the real authentication event. RFC 8707
+      # §2.2: the refresh family keeps the full approved resource set, as on
+      # the device grant; a token-request subset audiences only this token.
       maybe_issue_refresh_token(
         request,
-        ciba_refresh_grant(grant, audience),
+        ciba_refresh_grant(grant),
         scope,
         token_type,
         binding,
@@ -666,12 +668,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       response = maybe_echo_credential_authorization_details(response, grant)
       issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
 
+      # RFC 8707 §2.2: a token-request `resource` subset audiences only this
+      # access token; any refresh token returned is bound to the full
+      # original grant.
       issue_authorization_code_response(
         request,
         code,
         grant,
         scope,
-        audience,
+        grant.resource,
         {token_type, binding},
         response,
         [issued]
@@ -1449,13 +1454,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # so the shared refresh-issuance path (`issue_initial_refresh_token`, which
   # reads them from `claims`) seeds the refresh family with the real
   # authentication event, exactly as the authorization-code grant does.
-  defp ciba_refresh_grant(grant, resource) do
+  defp ciba_refresh_grant(grant) do
     claims =
       grant.claims
       |> MapParams.put_optional("acr", valid_acr(grant.acr))
       |> MapParams.put_optional("auth_time", valid_auth_time(grant.auth_time))
 
-    %{grant | claims: claims, resource: resource}
+    %{grant | claims: claims}
   end
 
   # RFC 9470 / OIDC Core §2: the CIBA Grant carries the satisfied `acr` and the
@@ -1571,10 +1576,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # The request-time `resource` on a refresh narrows the bound set (the core
-  # enforces subset-only). An absent parameter (`{:ok, []}` from the validator)
-  # becomes `nil` so the full granted set is kept; a present-but-malformed value
-  # is `invalid_target`.
+  # The request-time `resource` on a refresh selects a subset of the bound set
+  # for the new access token (the core enforces subset-only and keeps the full
+  # set on the rotated refresh token). An absent parameter (`{:ok, []}` from the
+  # validator) becomes `nil` so the full granted set is used; a
+  # present-but-malformed value is `invalid_target`.
   defp refresh_requested_resource(params) do
     case ResourceIndicator.validate(Map.get(params, "resource")) do
       {:ok, []} ->
@@ -1591,10 +1597,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp rotate_refresh(%Request{config: config} = request, presented, requested, resource, jkt) do
     opts =
       [client_id: token_client_id(request), issuer: config.issuer]
+      # RFC 6749 §6 / RFC 8707 §2.2: a present `scope` or `resource` selects a
+      # subset of the grant for this access token only (`rotated.context`); the
+      # rotated refresh token keeps the full grant. Absent (`nil`), the access
+      # token carries the full granted scope and resource set.
       |> put_optional_kw(:scope, requested)
-      # RFC 8707: a present `resource` narrows the bound set (subset-only); absent
-      # (`nil`) keeps the full granted set so the refreshed token stays audienced
-      # to the resources the original grant authorized.
       |> put_optional_kw(:resource, resource)
       # RFC 9449 §5: only public clients need their refresh token bound to the
       # DPoP proof key. A confidential client still presents and verifies a

@@ -121,6 +121,29 @@ defaults in a minor release.
   window resets. The `:client_id_metadata` docs and `FlowControl` now say so
   and point at `:allowed_hosts`, the quota and cache settings, and upstream
   rate limiting. Behaviour is unchanged.
+- Keep the full grant on refresh tokens when a token request names a
+  narrower `scope` or `resource`. A refresh request with a `scope` or
+  `resource` subset stored that subset as the rotated refresh token's grant,
+  so one down-scoped refresh permanently removed the other scopes, the other
+  resources, and the scope-bound OID4VCI credential configurations from the
+  family. The authorization-code and CIBA grants also bound the initial
+  refresh token to a token-request `resource` subset; the device grant
+  already kept the full set. RFC 6749 §6 requires a new refresh token's scope
+  to be identical to the presented token's, RFC 8707 §2.2 binds a refresh
+  token to the full original grant, and RFC 9396 §6.1 leaves the user's
+  authorization unchanged by a token-request `authorization_details` subset.
+  Refresh tokens now keep the full grant: the subset applies only to the
+  access token issued for that request, and a later refresh can obtain the
+  full scope, resources, and credential configurations again. A request
+  outside the grant is still `invalid_scope`, `invalid_target`, or
+  `invalid_authorization_details`. A lost-response retry inside
+  `:refresh_token_rotation_grace_seconds` that names a different subset of
+  the grant now receives the same successor instead of revoking the family;
+  a retry from another client or DPoP key, or one asking for anything
+  outside the grant, still revokes it. `EctoRefreshStore.rotate/4` returns
+  `{:error, :invalid_rotation}` for a child whose scope or resource set
+  differs from its parent's. The `:build_refresh_principal` callback's
+  `:resource` is the access token's effective resource set, as before.
 
 ## [4.4.1] - 2026-11-05
 

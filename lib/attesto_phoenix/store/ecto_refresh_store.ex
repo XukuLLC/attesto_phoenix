@@ -648,11 +648,18 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
     Map.get(child, :consumed) == false and is_nil(Map.get(child, :consumed_at))
   end
 
+  # RFC 6749 §6 / RFC 8707 §2.2: a rotated refresh token keeps exactly the
+  # presented token's scope and resource set; a narrower refresh request
+  # narrows only the access token minted for it.
   defp child_family_bindings_match?(row, child) do
     child_family_deadline(child) == stored_family_deadline(row) and
       child_attestation_binding(child) == stored_attestation_binding(row) and
-      child_issuer_binding(child) == RefreshIssuerMigration.issuer_binding(row.claims)
+      child_issuer_binding(child) == RefreshIssuerMigration.issuer_binding(row.claims) and
+      child_grant_sets(child) == {row.scope, row.resource}
   end
+
+  defp child_grant_sets(%{data: %{scope: scope, resource: resource}}), do: {scope, resource}
+  defp child_grant_sets(_child), do: :invalid
 
   defp validate_expiry(row, child, now) do
     child_expires_at = Map.get(child, :expires_at)

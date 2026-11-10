@@ -605,7 +605,7 @@ config :my_app, AttestoPhoenix.Config,
 ```
 
 The callback receives the authenticated client and a map containing
-`:subject`, `:client_id`, persisted `:issuer`, effective `:scope`, persisted
+`:subject`, `:client_id`, persisted `:issuer`, effective `:scope`, effective
 `:resource`, refresh `:family_id` and `:generation`, original `:acr` and
 `:auth_time`, and the authorization-time `:session_id` when one was established.
 Return the complete principal map to mint, or `{:error, :invalid_grant}` to
@@ -1503,10 +1503,13 @@ attesto_routes(
   `openid_credential` `authorization_details`.
 
 Refresh retains the credential permissions granted by the issuer. Scope-based
-permissions follow scope narrowing; explicit `authorization_details` permissions
-remain separate. A refresh request can select a subset of its granted credential
-configurations, and requests for additional configurations are rejected before
-rotation. Internal permission provenance stays in grant storage.
+permissions follow the scope of each refreshed access token; explicit
+`authorization_details` permissions remain separate. A refresh request can
+select a subset of its granted scope and credential configurations for that
+access token, and requests for additional configurations are rejected before
+rotation. The rotated refresh token keeps the full grant, so a later refresh
+can obtain the full scope and every granted configuration again. Internal
+permission provenance stays in grant storage.
 
 Requires: `:build_credential`, `:credential_configurations_supported`, a
 `:pre_authorized_code_store` and `:c_nonce_store`, the `:credential_offer_store`

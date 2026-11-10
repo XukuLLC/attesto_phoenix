@@ -2073,7 +2073,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                Token.issue(config, ciba_request(config, auth_req_id))
     end
 
-    test "token-time resource selection may narrow the CIBA grant and remains narrowed on refresh" do
+    test "token-time resource selection narrows the CIBA access token while the refresh token keeps the grant" do
       accounts = "https://api.example.com/accounts"
       payments = "https://api.example.com/payments"
 
@@ -2092,17 +2092,28 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, initial, _events} = Token.issue(config, token_request)
       assert aud!(initial.access_token) == accounts
-      assert refresh_record!(initial.refresh_token).data.resource == [accounts]
+      # RFC 8707 §2.2: the refresh token stays bound to the full approved grant.
+      assert refresh_record!(initial.refresh_token).data.resource == [accounts, payments]
 
-      assert {:ok, refreshed, _events} =
-               Token.issue(config, grant_id_refresh_request(config, initial.refresh_token))
+      payments_refresh =
+        %{
+          grant_id_refresh_request(config, initial.refresh_token)
+          | params: %{"refresh_token" => initial.refresh_token, "resource" => payments}
+        }
 
-      assert aud!(refreshed.access_token) == accounts
+      assert {:ok, refreshed, _events} = Token.issue(config, payments_refresh)
+      assert aud!(refreshed.access_token) == payments
+      assert refresh_record!(refreshed.refresh_token).data.resource == [accounts, payments]
+
+      assert {:ok, full, _events} =
+               Token.issue(config, grant_id_refresh_request(config, refreshed.refresh_token))
+
+      assert aud!(full.access_token) == [accounts, payments]
 
       widening_refresh =
         %{
-          grant_id_refresh_request(config, refreshed.refresh_token)
-          | params: %{"refresh_token" => refreshed.refresh_token, "resource" => payments}
+          grant_id_refresh_request(config, full.refresh_token)
+          | params: %{"refresh_token" => full.refresh_token, "resource" => "https://api.example.com/other"}
         }
 
       assert {:error, %OAuthError{error: :invalid_target}, _events} =
