@@ -491,7 +491,15 @@ prevents recovery of an in-flight rotation retry. `AttestoPhoenix.Config`
 refuses the bundled Ecto store with a non-zero grace period when this setting
 is missing or too short. Set `refresh_token_rotation_grace_seconds: 0` only
 when you intentionally prefer strict immediate reuse handling and do not need
-retry recovery. The installer writes an idempotent runtime entry with this
+retry recovery.
+
+The grace period trusts whatever binds the refresh family. For a public client
+that refreshes without DPoP, that is only its public `client_id`: anyone who
+copied the previous refresh token can redeem it within the window, gets the
+same successor as the legitimate client, and does not trigger family
+revocation until a presentation after the window. Public clients that send
+DPoP proofs get key-bound refresh tokens instead. Where public clients refresh
+without DPoP and that exposure matters, use `0` or a shorter window. The installer writes an idempotent runtime entry with this
 production fail-fast behavior and an explicitly development/test-only fallback.
 
 Successor retry state written by this release uses an authenticated v2 envelope

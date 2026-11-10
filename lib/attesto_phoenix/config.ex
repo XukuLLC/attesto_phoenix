@@ -778,7 +778,19 @@ defmodule AttestoPhoenix.Config do
       `:refresh_token_ttl`. Default `60`; set `0` for strict immediate reuse
       revocation. A non-zero window is important for clients that lose the
       first rotation response and retry the previous token (OAuth 2.0 Security
-      BCP §4.14.2; FAPI 2.0 Security Profile §5.3.2.1). With the bundled Ecto
+      BCP §4.14.2; FAPI 2.0 Security Profile §5.3.2.1). Inside the window a
+      retry is accepted from any presenter that passes the family's binding
+      check: client authentication for a confidential client, the bound key
+      for a DPoP- or attestation-bound family, and only the public
+      `client_id` for a public client whose refresh token was issued without
+      a DPoP proof. Someone who copied such an unbound public-client token
+      before it was rotated can redeem it inside the window, receives the
+      same successor as the legitimate client, and the family is not revoked;
+      reuse is detected only on a presentation after the window. Public
+      clients that send DPoP proofs receive key-bound refresh tokens and are
+      not exposed this way. Use `0`, or a shorter window, when public clients
+      refresh without DPoP and immediate reuse detection matters more than
+      retry recovery. With the bundled Ecto
       refresh store, a non-zero value requires the application-wide
       `:refresh_successor_secret` described under `:refresh_store`, a positive
       `:sweep_interval_ms`, and supervision of the packaged sweeper or an

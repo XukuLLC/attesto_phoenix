@@ -63,6 +63,12 @@ defaults in a minor release.
   `RevocationController` and `AuthorizationServer.Revocation` docs and the
   README did not say so, and a client could read the `200` as a successful
   access-token revocation. Behaviour is unchanged.
+- Document what `:refresh_token_rotation_grace_seconds` (default 60) allows
+  for a public client that refreshes without DPoP. Inside the window the
+  previous refresh token is accepted on the public `client_id` alone, so a
+  party that copied it before rotation receives the same successor and the
+  family is not revoked until a presentation after the window. Behaviour is
+  unchanged.
 
 ## [4.4.1] - 2026-11-05
 
