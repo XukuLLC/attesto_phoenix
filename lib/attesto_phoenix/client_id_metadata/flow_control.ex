@@ -7,6 +7,14 @@ defmodule AttestoPhoenix.ClientIdMetadata.FlowControl do
   budgets. Rejected and failed requests never become metadata cache entries;
   a short, bounded failure marker only suppresses repeated outbound work.
 
+  A fetch is charged to the window when it is admitted, before its outcome is
+  known, so the request budgets bound outbound work even when every fetch
+  fails. The same property lets an unauthenticated caller who presents fresh
+  uncached `client_id` URLs spend the global budget, or one host's budget, and
+  keep other uncached clients from resolving until the window resets. See the
+  `:client_id_metadata` options in `AttestoPhoenix.Config` for the settings
+  that narrow this.
+
   Fetch callbacks run in the admitted caller, preserving request-local
   configuration and repository ownership. A crashed caller releases its slot.
   A slow caller retains its slot until it terminates, so even a custom fetcher

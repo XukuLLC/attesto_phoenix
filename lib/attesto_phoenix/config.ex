@@ -875,6 +875,16 @@ defmodule AttestoPhoenix.Config do
           node-wide outbound request limits. Defaults `120` / `30` within
           `:fetch_rate_window_ms` (default `60_000`). Documents and remote
           JWKS share these quotas; requests over a limit fail closed.
+          A fetch is charged when it is admitted, whether or not it succeeds,
+          and the `client_id` URL comes from an unauthenticated request. A
+          caller who presents fresh uncached URLs can therefore spend the
+          node-wide quota (on any hosts) or one host's quota (on that host)
+          and leave every uncached CIMD client that depends on it unresolved,
+          answered `invalid_client`, until the window resets. Cached clients
+          keep working. Set `:allowed_hosts` when the client hosts are known,
+          size the quotas and the `:cache_ttl_bounds` fallback for the
+          expected clients, and rate-limit the authorization endpoint per
+          source in front of the application.
         * `:failure_backoff_ms` - short failure suppression. Default `1_000`.
         * `:max_flow_entries` - maximum coordinator bookkeeping entries.
           Default `1_024`.

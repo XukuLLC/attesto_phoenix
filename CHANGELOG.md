@@ -69,6 +69,13 @@ defaults in a minor release.
   party that copied it before rotation receives the same successor and the
   family is not revoked until a presentation after the window. Behaviour is
   unchanged.
+- Document that the shared Client ID Metadata fetch budgets can be spent by
+  unauthenticated requests naming fresh uncached `client_id` URLs. Admission
+  is charged before the fetch, so 120 such requests in a minute (or 30 on one
+  host) leave other uncached CIMD clients answered `invalid_client` until the
+  window resets. The `:client_id_metadata` docs and `FlowControl` now say so
+  and point at `:allowed_hosts`, the quota and cache settings, and upstream
+  rate limiting. Behaviour is unchanged.
 
 ## [4.4.1] - 2026-11-05
 
