@@ -95,6 +95,12 @@ defaults in a minor release.
   any pending code, so the user was asked to confirm a request whose
   approval then failed as `:invalid`. The moduledoc already listed expired
   codes under `:invalid`.
+- Correct the `RequestContext.client_ip/2` documentation. It said the
+  left-most `X-Forwarded-For` entry is returned; the function returns the
+  right-most entry, the one appended by the trusted proxy, and unwinds only
+  that one hop. Behind a CDN and a trusted load balancer, emitted events such
+  as `:auth_denied` therefore carry the CDN edge address. Behaviour is
+  unchanged.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens

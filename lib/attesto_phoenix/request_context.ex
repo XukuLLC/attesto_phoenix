@@ -130,12 +130,17 @@ defmodule AttestoPhoenix.RequestContext do
   @doc """
   Returns the client IP as a string, or `nil` if it cannot be determined.
 
-  When the request comes from a trusted proxy and carries `X-Forwarded-For`, the
-  left-most entry (the original client per RFC 7239 / the de-facto
-  `X-Forwarded-For` convention) is returned. Otherwise the direct connection's
+  When the socket peer is a trusted proxy and the request carries
+  `X-Forwarded-For`, the right-most entry is returned: the address that proxy
+  appended for the hop that connected to it. Entries farther left are not used,
+  because the client can send them. Otherwise the direct connection's
   adapter-reported socket peer address is used. An untrusted peer cannot forge
   the client IP this way: its `X-Forwarded-For` is ignored entirely, and a
   middleware-rewritten `conn.remote_ip` is not authoritative.
+
+  Only one proxy hop is unwound. Behind a chain such as a CDN in front of a
+  trusted load balancer, the value is the address the load balancer saw (the
+  CDN edge), not the original client.
   """
   @spec client_ip(Plug.Conn.t(), Config.t()) :: String.t() | nil
   def client_ip(%Plug.Conn{} = conn, %Config{} = config) do
