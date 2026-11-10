@@ -8,6 +8,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Userinfo do
   filters the returned claims to those authorized by the granted scopes (§5.4)
   or individually requested via `claims.userinfo` (§5.5), and pins `sub` to the
   verified token subject (§5.3.2).
+
+  Individually requested claims are honoured only when the provider supports
+  the `claims` request parameter (`:claims_parameter_supported`). Otherwise a
+  `claims` object recorded on the access token is ignored: the host callback
+  receives `%{}` and only the scope-implied claims are released.
   """
 
   alias Attesto.Scope
@@ -42,7 +47,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Userinfo do
     # OpenID Connect Core §5.3.1: the access token must carry the `openid` scope.
     if @openid_scope in granted_scopes do
       subject = claims["sub"]
-      requested_claims = requested_claims(claims)
+      requested_claims = requested_claims(config, claims)
 
       userinfo =
         config
@@ -96,7 +101,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Userinfo do
 
   # OpenID Connect Core §5.5: individual claims are requested through the
   # `claims` request parameter, which the host may record on the access token.
-  # Absent that, no individual claims are requested.
-  defp requested_claims(%{"claims" => requested}) when is_map(requested), do: requested
-  defp requested_claims(_claims), do: %{}
+  # A provider that does not support that parameter (OpenID Connect Discovery
+  # §3 `claims_parameter_supported`) gives it no effect, so a recorded `claims`
+  # object cannot widen the release beyond the granted scopes. Access tokens
+  # issued from a refresh family keep the original code's `claims` object, so
+  # the check is made here at release and not only where codes are issued.
+  defp requested_claims(%Config{claims_parameter_supported: true}, %{"claims" => requested}) when is_map(requested),
+    do: requested
+
+  defp requested_claims(_config, _claims), do: %{}
 end

@@ -395,7 +395,49 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     end
   end
 
+  describe "claims parameter not supported (OpenID Connect Discovery §3)" do
+    test "a claims object on the token releases nothing beyond scope by default" do
+      token =
+        mint(
+          scope: "openid",
+          request_claims: %{
+            "userinfo" => %{"email" => nil, "phone_number" => nil, "unscoped_secret" => nil}
+          }
+        )
+
+      claims = body(get_userinfo(token))
+
+      assert claims == %{"sub" => @subject}
+    end
+
+    test "the host callback receives no requested claims by default" do
+      test_pid = self()
+
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.put(:build_userinfo_claims, fn _subject, _scopes, requested ->
+        send(test_pid, {:requested_claims, requested})
+        @host_claims
+      end)
+      |> put_config()
+
+      token = mint(scope: "openid email", request_claims: %{"userinfo" => %{"phone_number" => nil}})
+      claims = body(get_userinfo(token))
+
+      assert_received {:requested_claims, requested}
+      assert requested == %{}
+      assert claims == %{"sub" => @subject, "email" => "ada@example.com", "email_verified" => true}
+    end
+  end
+
   describe "individually requested claims (OpenID Connect Core §5.5)" do
+    setup do
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.put(:claims_parameter_supported, true)
+      |> put_config()
+    end
+
     test "releases a claim named by the claims parameter's userinfo member" do
       # The `email` claim is requested individually even though the `email`
       # scope is not granted; OIDC Core §5.5 says it is returned anyway.

@@ -52,7 +52,8 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   Beyond the scope-implied set, individual claims requested through the OpenID
   Connect `claims` request parameter's `userinfo` member (OpenID Connect Core
-  §5.5) are also released.
+  §5.5) are also released when `:claims_parameter_supported` is `true`. With
+  the default `false`, a `claims` object on the access token is ignored.
 
   ## Configuration contract
 

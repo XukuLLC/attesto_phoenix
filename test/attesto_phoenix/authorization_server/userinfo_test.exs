@@ -49,7 +49,7 @@ defmodule AttestoPhoenix.AuthorizationServer.UserinfoTest do
     end
 
     test "shapes claims by granted scope and individually requested claims.userinfo members" do
-      config = build_config()
+      config = build_config(claims_parameter_supported: true)
 
       claims = %{
         "sub" => "user-1",
@@ -64,6 +64,24 @@ defmodule AttestoPhoenix.AuthorizationServer.UserinfoTest do
                "email" => "ada@example.com",
                "email_verified" => true,
                "custom_claim" => "requested-value"
+             }
+    end
+
+    test "ignores claims.userinfo members when the claims parameter is not supported" do
+      config = build_config()
+
+      claims = %{
+        "sub" => "user-1",
+        "scope" => "openid email",
+        "claims" => %{"userinfo" => %{"custom_claim" => nil, "phone_number" => nil}}
+      }
+
+      assert {:ok, userinfo} = Userinfo.resolve_claims(config, claims)
+
+      assert userinfo == %{
+               "sub" => "user-1",
+               "email" => "ada@example.com",
+               "email_verified" => true
              }
     end
 

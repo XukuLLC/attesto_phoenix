@@ -725,9 +725,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `Attesto.AuthorizationCode` admits no sibling key beside the nine canonical
   # ones.
   defp code_claims_with_private_context(config, request, conn, subject, subject_id, family_id) do
-    claims = code_claims(conn, request, subject)
+    claims = code_claims(conn, config, request, subject)
 
-    # `code_claims/3` currently builds a closed library-owned key set, so this
+    # `code_claims/4` currently builds a closed library-owned key set, so this
     # cannot be reached through a supported host callback. Keep the check at the
     # ownership boundary as defense in depth if host-provided code claims are
     # added later.
@@ -785,8 +785,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # that satisfied `max_age` but returned no `auth_time` is a host fault, logged
   # so the misconfiguration is visible rather than silently dropping the claim.
   # Only the keys the host actually supplied are carried, so the token endpoint
-  # can distinguish "absent" from a value.
-  defp code_claims(conn, request, subject) do
+  # can distinguish "absent" from a value. The OIDC `claims` request parameter
+  # (OIDC Core §5.5) is carried only when the provider supports it
+  # (`:claims_parameter_supported`); otherwise it has no effect on the ID Token
+  # or UserInfo response.
+  defp code_claims(conn, config, request, subject) do
     auth_time = Map.get(subject, :auth_time)
 
     if not is_nil(request.max_age) and is_nil(auth_time) do
@@ -795,7 +798,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
     %{}
     |> MapParams.put_optional("nonce", request.nonce)
-    |> MapParams.put_optional("claims", request.claims)
+    |> MapParams.put_optional("claims", supported_claims_request(config, request))
     |> MapParams.put_optional("auth_time", auth_time)
     |> MapParams.put_optional("acr", Map.get(subject, :acr))
     |> MapParams.put_optional("amr", Map.get(subject, :amr))
@@ -819,6 +822,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       Map.get(conn.private, :attesto_credential_authorization_details_ids)
     )
   end
+
+  defp supported_claims_request(%Config{claims_parameter_supported: true}, request), do: request.claims
+  defp supported_claims_request(_config, _request), do: nil
 
   # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ───────
 

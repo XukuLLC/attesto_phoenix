@@ -719,10 +719,16 @@ defmodule AttestoPhoenix.Config do
     * `:claims_parameter_supported` - whether the provider accepts the OpenID
       Connect `claims` request parameter (OpenID Connect Discovery §3 /
       OpenID Connect Core §5.5). Default `false`: the authorization endpoint
-      does not consume a `claims` parameter unless the host wires it, so the
-      provider does not claim support for it. Advertised in the OpenID Provider
-      Metadata only when set to `true` (the core builder treats absence as
-      `false` per OpenID Connect Discovery §3).
+      does not record a `claims` parameter on the code, the
+      `:build_id_token_claims` and `:build_userinfo_claims` callbacks receive no
+      requested claims from it, and UserInfo releases only the claims the
+      granted scopes authorize. When `true`, the authorization endpoint records
+      the parameter and UserInfo also releases each claim named in its
+      `userinfo` member that `:build_userinfo_claims` returns, whatever the
+      granted scopes. The host's consent step and callback then decide which
+      individually requested claims may be released. Advertised in the OpenID
+      Provider Metadata only when set to `true` (the core builder treats
+      absence as `false` per OpenID Connect Discovery §3).
     * `:acr_values_supported` - list of Authentication Context Class Reference
       values the provider can satisfy (OpenID Connect Discovery §3 /
       OpenID Connect Core §2). Advertised only when the host configures a

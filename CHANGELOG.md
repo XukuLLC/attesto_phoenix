@@ -6,6 +6,23 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [Unreleased]
+
+### Security
+
+- Honour the OpenID Connect `claims` request parameter only when
+  `:claims_parameter_supported` is `true`. With the default `false`, the
+  authorization endpoint still recorded the parameter on the code, and
+  UserInfo released every claim named in its `userinfo` member that
+  `:build_userinfo_claims` returned, whatever the granted scopes, so a client
+  granted only `openid` could read any claim the host callback supplied. With
+  `false`, the authorization endpoint no longer records the parameter, the
+  `:build_id_token_claims` and `:build_userinfo_claims` callbacks receive no
+  requested claims from it, and UserInfo ignores a `claims` object already on
+  an access token, including tokens refreshed from earlier codes. A host that
+  relies on the parameter sets `claims_parameter_supported: true`, which also
+  advertises it in OpenID Provider Metadata.
+
 ## [4.4.1] - 2026-11-05
 
 ### Security

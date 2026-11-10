@@ -390,12 +390,23 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
 
     test "the issued code preserves the OIDC claims request object" do
+      put_config(claims_parameter_supported: true)
+
       claims = %{"userinfo" => %{"name" => %{"essential" => true}}}
       conn = call(valid_params(%{"claims" => JSON.encode!(claims)}))
       code = location_query(conn)["code"]
 
       record = TestStore.peek(code)
       assert record.data.claims["claims"] == claims
+    end
+
+    test "the issued code omits the claims request object when the parameter is not supported" do
+      claims = %{"userinfo" => %{"name" => %{"essential" => true}}}
+      conn = call(valid_params(%{"claims" => JSON.encode!(claims)}))
+      code = location_query(conn)["code"]
+
+      record = TestStore.peek(code)
+      refute Map.has_key?(record.data.claims, "claims")
     end
 
     test "preserves an existing query component in the redirect_uri" do
