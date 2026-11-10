@@ -110,7 +110,20 @@ defmodule AttestoPhoenix.Controller.TokenController do
         {:error, error(@error_invalid_request, "missing Content-Type")}
 
       content_type ->
-        {:error, error(@error_invalid_request, "unsupported token request Content-Type: #{content_type}")}
+        {:error, error(@error_invalid_request, unsupported_content_type_description(content_type))}
+    end
+  end
+
+  # The header value is echoed only when it is a syntactically valid media type
+  # (RFC 9110 §8.3.1 `type "/" subtype`, both RFC 9110 §5.6.2 tokens). Token
+  # characters all fall inside the RFC 6749 §5.2 `error_description` set, while
+  # an arbitrary header value can carry bytes outside it, including invalid
+  # UTF-8 that cannot be encoded into the JSON error body at all.
+  defp unsupported_content_type_description(content_type) do
+    if Regex.match?(~r/\A[!#$%&'*+.^_`|~0-9a-z-]+\/[!#$%&'*+.^_`|~0-9a-z-]+\z/, content_type) do
+      "unsupported token request Content-Type: #{content_type}"
+    else
+      "unsupported token request Content-Type"
     end
   end
 

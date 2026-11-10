@@ -1211,6 +1211,30 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error_description"] == "unsupported token request Content-Type: text/plain"
     end
 
+    test "rejects a non-UTF-8 Content-Type without echoing it" do
+      put_config(load_client: fn _id -> flunk("client lookup must not run for unsupported Content-Type") end)
+
+      for content_type <- [<<"text/", 0xFF>>, <<0xFF>>, <<0xC3>>] do
+        conn = post_token_with_content_type(client_credentials_params(), content_type)
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_request"
+        assert body(conn)["error_description"] == "unsupported token request Content-Type"
+      end
+    end
+
+    test "echoes only a syntactically valid media type in the error description" do
+      put_config(load_client: fn _id -> flunk("client lookup must not run for unsupported Content-Type") end)
+
+      for content_type <- [~s(text/"plain"), "text/pl\\ain", "téxt/plain", "text plain", "text/", ""] do
+        conn = post_token_with_content_type(client_credentials_params(), content_type)
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_request"
+        assert body(conn)["error_description"] == "unsupported token request Content-Type"
+      end
+    end
+
     test "accepts application/x-www-form-urlencoded token requests" do
       enable_minting()
 

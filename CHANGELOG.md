@@ -35,6 +35,13 @@ defaults in a minor release.
 
 ### Fixed
 
+- Return `400 invalid_request` from the token endpoint for any unsupported
+  `Content-Type`. `TokenController` copied the header value into
+  `error_description`, so a value with invalid UTF-8 (for example
+  `text/\xFF`) made the JSON error body unencodable and an unauthenticated
+  request got a 500. The value is now echoed only when it is a syntactically
+  valid media type; otherwise the description is
+  `unsupported token request Content-Type`.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens
