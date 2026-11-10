@@ -156,6 +156,16 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStoreTest do
       assert {:error, :not_found} = Store.consume(nil, cg_binding())
     end
 
+    test "a token PostgreSQL text cannot hold is :not_found" do
+      {:ok, token} = Store.mint(cg_binding(), @ttl)
+
+      for presented <- [token <> <<0>>, "tok" <> <<0>>, <<0xFF>>] do
+        assert {:error, :not_found} = Store.consume(presented, cg_binding())
+      end
+
+      assert :ok = Store.consume(token, cg_binding())
+    end
+
     test "a blank token is :not_found" do
       assert {:error, :not_found} = Store.consume("", cg_binding())
     end

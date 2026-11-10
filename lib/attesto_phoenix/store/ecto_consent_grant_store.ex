@@ -75,13 +75,20 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
 
   Returns `:ok` to the single winning caller and `{:error, reason}` to every
   other (`:not_found`, `:binding_mismatch`, `:expired`, `:consumed`). A `nil` or
-  blank token short-circuits to `{:error, :not_found}` without touching the
-  database.
+  blank token, or one that is not valid UTF-8 text without NUL bytes (so could
+  not have been minted here), short-circuits to `{:error, :not_found}` without
+  touching the database.
   """
   @impl AttestoPhoenix.ConsentGrantStore
   @spec consume(String.t() | nil, ConsentGrant.binding()) ::
           :ok | {:error, AttestoPhoenix.ConsentGrantStore.consume_error()}
   def consume(token, %{} = binding) when is_binary(token) and token != "" do
+    if StoreEcto.text_value?(token), do: consume_minted(token, binding), else: {:error, :not_found}
+  end
+
+  def consume(_token, %{}), do: {:error, :not_found}
+
+  defp consume_minted(token, binding) do
     {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now()
     hash = ConsentGrant.binding_hash(binding)
@@ -101,8 +108,6 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
       {0, _} -> disambiguate(repo, token, hash, now, prefix)
     end
   end
-
-  def consume(_token, %{}), do: {:error, :not_found}
 
   # The conditional update matched nothing. Read the row back so the caller gets
   # a precise reason (fail closed: any reason still refuses consent). The order

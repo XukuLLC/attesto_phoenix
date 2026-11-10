@@ -42,6 +42,20 @@ defaults in a minor release.
   request got a 500. The value is now echoed only when it is a syntactically
   valid media type; otherwise the description is
   `unsupported token request Content-Type`.
+- Stop request strings that PostgreSQL `text` cannot hold from reaching the
+  Ecto stores. A NUL byte (or invalid UTF-8) raised `Postgrex.Error` 22021 out
+  of `EctoNonceStore.valid?/1,2` and `accept/2,3` (a DPoP proof `nonce` or
+  attestation challenge, unauthenticated), `EctoPARStore.fetch/1` and
+  `take/1` (`/authorize?request_uri=...%00`, unauthenticated) and
+  `EctoConsentGrantStore.consume/2`. These now return their not-found result
+  without a query: `false`, `{:error, :unknown}`, `:error` and
+  `{:error, :not_found}`, so the endpoints answer `use_dpop_nonce` and
+  `invalid_request_uri`. `EctoPARStore.put/3` also returns
+  `{:error, :invalid_text}` for such a `request_uri`.
+- Reject a CIBA `acr_values` entry that contains a control character or is
+  longer than 255 bytes with `invalid_request`. Such an entry raised
+  `Postgrex.Error` when `EctoCIBAStore` inserted it into its 255-character
+  array column.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens

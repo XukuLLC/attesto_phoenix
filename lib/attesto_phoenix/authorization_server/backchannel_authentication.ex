@@ -75,6 +75,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
          :ok <- require_registered_delivery_mode(config, client_map),
          params = strip_client_auth(request.params),
          {:ok, validated} <- validate(config, client_map, params),
+         :ok <- validate_acr_values(validated),
          :ok <- authorize_resource(config, request.client, validated),
          :ok <- guard_replay(config, validated),
          {:ok, subject} <- resolve_user(config, validated),
@@ -152,6 +153,25 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
       {:error, reason} ->
         {:error, error(reason, "the backchannel authentication request is invalid")}
     end
+  end
+
+  # CIBA Core §7.1 / OpenID Connect Core §2: each `acr_values` entry is an
+  # Authentication Context Class Reference, an identifier string such as a URI.
+  # The core parser only splits the parameter on spaces. Refuse an entry with a
+  # control character or longer than 255 bytes: neither is a usable class
+  # reference, and the bundled Ecto store keeps each entry in a 255-character
+  # column that rejects NUL.
+  @max_acr_value_bytes 255
+
+  defp validate_acr_values(%CIBA.Request{acr_values: values}) do
+    if Enum.all?(values, &valid_acr_value?/1),
+      do: :ok,
+      else: {:error, error(:invalid_request, "acr_values contains an invalid value")}
+  end
+
+  defp valid_acr_value?(value) do
+    byte_size(value) <= @max_acr_value_bytes and String.valid?(value) and
+      not Regex.match?(~r/[\x00-\x1F\x7F]/, value)
   end
 
   # RFC 8707 §2.2: syntax is validated in the conn-free CIBA request parser;

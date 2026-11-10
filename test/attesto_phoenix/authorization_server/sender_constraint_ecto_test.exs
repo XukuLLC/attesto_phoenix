@@ -146,5 +146,15 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraintEctoTest do
       assert {:ok, {:dpop, ^jkt}, "DPoP", _pending} =
                SenderConstraint.resolve(config, input(proof_with_nonce), @plain)
     end
+
+    test "a proof nonce containing NUL is answered use_dpop_nonce" do
+      config = config(dpop_nonce_required: true, nonce_store: EctoNonceStore)
+      {proof, _jkt} = dpop_proof_and_jkt(nonce: "abc" <> <<0>> <> "def")
+
+      assert {:error, %OAuthError{error: :use_dpop_nonce, headers: [{"dpop-nonce", nonce}]}} =
+               SenderConstraint.resolve(config, input(proof), @plain)
+
+      assert TestRepo.get_by(DPoPNonce, nonce: nonce)
+    end
   end
 end

@@ -340,6 +340,29 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
 
       assert :ets.info(Store, :size) == 0
     end
+
+    test "an acr_values entry with a control character or over 255 bytes is invalid_request and is not stored" do
+      for acr_values <- [
+            "urn:acr:silver a" <> <<0>> <> "b",
+            "urn:acr:silver " <> String.duplicate("a", 256),
+            "urn:acr:" <> <<1>> <> "silver"
+          ] do
+        params = %{"scope" => "openid", "login_hint" => "alice@example.test", "acr_values" => acr_values}
+
+        assert {:error, %OAuthError{error: :invalid_request, status: 400}} =
+                 BackchannelAuthentication.request(config(), request(poll_client(), params))
+      end
+
+      assert :ets.info(Store, :size) == 0
+
+      params = %{
+        "scope" => "openid",
+        "login_hint" => "alice@example.test",
+        "acr_values" => "urn:acr:silver " <> String.duplicate("a", 255)
+      }
+
+      assert {:ok, %{auth_req_id: _}} = BackchannelAuthentication.request(config(), request(poll_client(), params))
+    end
   end
 
   describe "request/2 hint resolution (host callback)" do

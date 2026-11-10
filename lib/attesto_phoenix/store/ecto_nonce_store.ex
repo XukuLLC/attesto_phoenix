@@ -59,6 +59,7 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
 
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.DPoPNonce
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
   alias AttestoPhoenix.Store.Sweeper
 
   # RFC 9449 §8 requires an unpredictable nonce. 256 bits from a CSPRNG,
@@ -123,7 +124,14 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
 
   def valid?(%Config{}, _), do: false
 
+  # The nonce arrives from a client-signed DPoP proof or attestation, so it can
+  # hold any JSON string. Every nonce this store issued is base64url text; a
+  # value PostgreSQL cannot bind was never issued and is not looked up.
   defp valid_with(repo, prefix, nonce) do
+    StoreEcto.text_value?(nonce) and live_nonce?(repo, prefix, nonce)
+  end
+
+  defp live_nonce?(repo, prefix, nonce) do
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
     query =
@@ -160,6 +168,10 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
   end
 
   defp accept_with(repo, prefix, nonce, ttl) do
+    if StoreEcto.text_value?(nonce), do: consume_nonce(repo, prefix, nonce, ttl), else: {:error, :unknown}
+  end
+
+  defp consume_nonce(repo, prefix, nonce, ttl) do
     Sweeper.check_running_for_store(repo, prefix)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     cutoff = DateTime.add(now, -ttl, :second)

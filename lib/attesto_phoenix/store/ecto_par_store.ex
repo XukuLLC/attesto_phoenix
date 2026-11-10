@@ -50,7 +50,7 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   @spec put(String.t(), map(), pos_integer()) :: :ok | {:error, term()}
   def put(request_uri, params, ttl_seconds)
       when is_binary(request_uri) and is_map(params) and is_integer(ttl_seconds) and ttl_seconds > 0 do
-    if nul_free?(params) do
+    if StoreEcto.text_value?(request_uri) and nul_free?(params) do
       put_validated(request_uri, params, ttl_seconds)
     else
       {:error, :invalid_text}
@@ -91,10 +91,18 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   when it is absent or expired. Non-consuming by contract: the authorization
   endpoint may resolve the same `request_uri` more than once across a
   login/consent detour (RFC 9126); TTL, not resolution, ends its life.
+
+  The authorization endpoint passes the client's `request_uri` query value
+  here unchanged. A value that is not valid UTF-8 text without NUL bytes
+  cannot have been stored by `put/3` and returns `:error` without a query.
   """
   @impl AttestoPhoenix.PARStore
   @spec fetch(String.t()) :: {:ok, map()} | :error
   def fetch(request_uri) when is_binary(request_uri) do
+    if StoreEcto.text_value?(request_uri), do: fetch_stored(request_uri), else: :error
+  end
+
+  defp fetch_stored(request_uri) do
     prefix = Config.table_prefix()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 
@@ -115,11 +123,16 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   The resolve and the delete are one indivisible `DELETE … WHERE … RETURNING`
   statement, so for hosts that opt into single-use PAR references exactly one of
   any number of concurrent callers (on any node) gets `{:ok, params}`; the rest
-  get `:error`. An expired row is treated as absent.
+  get `:error`. An expired row is treated as absent, and a `request_uri` that
+  `put/3` could not have stored returns `:error` as in `fetch/1`.
   """
   @impl AttestoPhoenix.PARStore
   @spec take(String.t()) :: {:ok, map()} | :error
   def take(request_uri) when is_binary(request_uri) do
+    if StoreEcto.text_value?(request_uri), do: take_stored(request_uri), else: :error
+  end
+
+  defp take_stored(request_uri) do
     {repo, prefix} = StoreEcto.mutation_context()
     now = DateTime.utc_now() |> DateTime.truncate(:second)
 

@@ -112,6 +112,12 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
     test "is false for a non-binary input", %{config: config} do
       refute EctoNonceStore.valid?(config, nil)
     end
+
+    test "is false for a value PostgreSQL text cannot hold", %{config: config} do
+      for nonce <- ["abc" <> <<0>> <> "def", <<0xFF, 0xFE>>] do
+        refute EctoNonceStore.valid?(config, nonce)
+      end
+    end
   end
 
   describe "accept/3" do
@@ -132,6 +138,12 @@ defmodule AttestoPhoenix.Store.EctoNonceStoreTest do
 
     test "rejects an unknown nonce", %{config: config} do
       assert {:error, :unknown} == EctoNonceStore.accept(config, "never-issued", @ttl)
+    end
+
+    test "rejects a value PostgreSQL text cannot hold as unknown", %{config: config} do
+      for nonce <- ["abc" <> <<0>> <> "def", <<0xFF, 0xFE>>] do
+        assert {:error, :unknown} == EctoNonceStore.accept(config, nonce, @ttl)
+      end
     end
 
     test "rejects a nonce older than the consume ttl", %{config: config} do

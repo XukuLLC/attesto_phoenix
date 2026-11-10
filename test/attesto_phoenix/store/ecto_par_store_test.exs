@@ -97,6 +97,22 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
     refute TestRepo.get(PushedAuthorizationRequest, @request_uri)
   end
 
+  test "put rejects a request_uri PostgreSQL text cannot hold" do
+    assert {:error, :invalid_text} = EctoPARStore.put(@request_uri <> <<0>>, @params, 90)
+    assert {:error, :invalid_text} = EctoPARStore.put(@request_uri <> <<0xFF>>, @params, 90)
+  end
+
+  test "fetch and take answer :error for a request_uri PostgreSQL text cannot hold" do
+    :ok = EctoPARStore.put(@request_uri, @params, 90)
+
+    for request_uri <- [@request_uri <> <<0>>, <<0>>, "x" <> <<0>>, @request_uri <> <<0xFF>>] do
+      assert :error = EctoPARStore.fetch(request_uri)
+      assert :error = EctoPARStore.take(request_uri)
+    end
+
+    assert {:ok, @params} = EctoPARStore.fetch(@request_uri)
+  end
+
   test "query telemetry is suppressed for request_uri writes, reads, and deletes" do
     capture = AttestoPhoenix.TestTelemetryCapture.attach(TestRepo)
     on_exit(fn -> AttestoPhoenix.TestTelemetryCapture.detach(capture) end)
