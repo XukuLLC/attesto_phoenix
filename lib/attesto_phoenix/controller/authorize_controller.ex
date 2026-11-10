@@ -76,6 +76,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       does not supply `:consent`, consent is treated as implicitly granted only
       for a client the host explicitly classifies as confidential. Public
       clients require an explicit consent callback before a code can be issued.
+      Without `:consent`, a request carrying `prompt=consent` is answered
+      `consent_required` by redirect, since the library cannot prompt the
+      resource owner itself (OIDC Core §3.1.2.1).
 
   Both callbacks may hand control back to a host-rendered page; the controller
   only proceeds to mint a code when both yield a subject. The actual login and
@@ -139,9 +142,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   @error_consent_required "consent_required"
   @error_interaction_required "interaction_required"
 
-  # OIDC Core §3.1.2.1: the two `prompt` values this controller acts on.
+  # OIDC Core §3.1.2.1: the `prompt` values this controller acts on.
   @prompt_none "none"
   @prompt_login "login"
+  @prompt_consent "consent"
 
   @doc """
   Authorization endpoint action (RFC 6749 §3.1, OIDC Core §3.1.2).
@@ -576,26 +580,40 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         error_code = if prompt_none?, do: @error_consent_required, else: @error_access_denied
         emit_error(conn, config, request, error_code)
 
-      :missing_public_client_consent ->
-        # RFC 8252 §8.6: a public client's identity cannot be established from
-        # its client_id alone, so a remembered or implicit approval can be
-        # claimed by an impersonating app. A host that serves public clients
-        # must make an explicit consent decision for each authorization request.
-        # Under prompt=none the protocol response is consent_required; on an
-        # interactive request, absence of the callback is a host configuration
-        # error because this library does not render consent UI itself.
-        emit_failure(conn, config, @error_consent_required)
-
-        if prompt_none? do
-          emit_error(conn, config, request, @error_consent_required)
-        else
-          Logger.error("public-client authorization requires an explicit :consent callback")
-          emit_error(conn, config, request, @error_server_error)
-        end
+      reason when reason in [:consent_prompt_unavailable, :missing_public_client_consent] ->
+        run_without_consent_callback(conn, config, request, reason, prompt_none?)
 
       _other ->
         Logger.error("consent callback returned an invalid result")
         emit_error(conn, config, request, @error_server_error)
+    end
+  end
+
+  # No :consent callback is configured and implicit consent does not apply.
+  defp run_without_consent_callback(conn, config, request, :consent_prompt_unavailable, _prompt_none?) do
+    # OIDC Core §3.1.2.1: `prompt=consent` asks the OP to prompt for consent,
+    # and an OP that cannot obtain it MUST return an error, typically
+    # consent_required. Without a :consent callback there is no consent step
+    # to run.
+    emit_failure(conn, config, @error_consent_required)
+    emit_error(conn, config, request, @error_consent_required)
+  end
+
+  defp run_without_consent_callback(conn, config, request, :missing_public_client_consent, prompt_none?) do
+    # RFC 8252 §8.6: a public client's identity cannot be established from
+    # its client_id alone, so a remembered or implicit approval can be
+    # claimed by an impersonating app. A host that serves public clients
+    # must make an explicit consent decision for each authorization request.
+    # Under prompt=none the protocol response is consent_required; on an
+    # interactive request, absence of the callback is a host configuration
+    # error because this library does not render consent UI itself.
+    emit_failure(conn, config, @error_consent_required)
+
+    if prompt_none? do
+      emit_error(conn, config, request, @error_consent_required)
+    else
+      Logger.error("public-client authorization requires an explicit :consent callback")
+      emit_error(conn, config, request, @error_server_error)
     end
   end
 
@@ -945,16 +963,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   # The host consent hook. A confidential client may retain the historical
-  # implicit-consent behavior when the hook is absent. Public clients require
-  # an explicit decision on every request: their client_id does not authenticate
-  # the calling app, so remembered or automatic approval is vulnerable to
-  # client impersonation (RFC 8252 §8.6).
+  # implicit-consent behavior when the hook is absent, unless the request
+  # explicitly asks for a consent prompt (OIDC Core §3.1.2.1 `prompt=consent`).
+  # Public clients require an explicit decision on every request: their
+  # client_id does not authenticate the calling app, so remembered or automatic
+  # approval is vulnerable to client impersonation (RFC 8252 §8.6).
   defp consent(conn, config, client, request, subject) do
     case Config.consent_fun(config) do
       nil ->
-        if RequestPolicy.client_public?(config, client),
-          do: :missing_public_client_consent,
-          else: {:consented, subject}
+        cond do
+          RequestPolicy.client_public?(config, client) -> :missing_public_client_consent
+          @prompt_consent in request.prompt -> :consent_prompt_unavailable
+          true -> {:consented, subject}
+        end
 
       callback ->
         Callback.invoke(callback, [conn, request, subject])

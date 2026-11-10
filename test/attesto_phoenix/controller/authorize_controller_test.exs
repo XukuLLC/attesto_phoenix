@@ -1551,6 +1551,33 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert is_binary(location_query(conn)["code"])
     end
 
+    test "prompt=consent without a consent callback is consent_required for a confidential client" do
+      put_config(consent: nil, client_public?: fn _client -> false end)
+
+      conn = call(valid_params(%{"prompt" => "consent"}))
+
+      assert conn.status == 302
+      assert location_query(conn)["error"] == "consent_required"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "prompt=consent runs the consent callback when one is configured" do
+      test_pid = self()
+
+      put_config(
+        client_public?: fn _client -> false end,
+        consent: fn _conn, request, subject ->
+          send(test_pid, {:consent_prompt, request.prompt})
+          {:consented, subject}
+        end
+      )
+
+      conn = call(valid_params(%{"prompt" => "consent"}))
+
+      assert_received {:consent_prompt, ["consent"]}
+      assert is_binary(location_query(conn)["code"])
+    end
+
     test "a public client cannot receive implicit consent when the callback is absent" do
       put_config(consent: nil, client_public?: fn _client -> true end)
 

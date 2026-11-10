@@ -79,6 +79,11 @@ defaults in a minor release.
   `invalid_request` ("invalid_client_id"), although the code already meant to
   supply it. The authenticated identifier is now added before validation; a
   body `client_id` that differs from it is still rejected.
+- Answer `prompt=consent` with `consent_required` when no `:consent` callback
+  is configured. For a confidential client the authorization endpoint issued
+  a code with implicit consent, although OpenID Connect Core §3.1.2.1
+  requires an error when the provider cannot obtain consent. Requests without
+  `prompt=consent` keep the implicit-consent behaviour.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens
