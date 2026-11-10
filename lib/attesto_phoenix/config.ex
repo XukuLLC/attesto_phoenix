@@ -766,7 +766,10 @@ defmodule AttestoPhoenix.Config do
       existing families without a deadline retain their inactivity policy.
       The bundled Ecto code store retains a successful authorization-code
       replay marker while the refresh table contains an unexpired member of the
-      issued family, including when this setting is `nil`.
+      issued family, including when this setting is `nil`. With a
+      `:refresh_store` that does not persist through
+      `AttestoPhoenix.Store.EctoRefreshStore`, the marker is kept until the
+      family deadline this setting fixes, and indefinitely when it is `nil`.
     * `:refresh_token_expiration_metadata` - opt into the experimental
       `draft-ietf-oauth-refresh-token-expiration-03` token-timeout response and
       discovery fields. Default `false`. This advertises credential expiry;

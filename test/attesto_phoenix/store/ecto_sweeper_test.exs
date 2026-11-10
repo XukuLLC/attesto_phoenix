@@ -3,6 +3,7 @@ defmodule AttestoPhoenix.Store.EctoSweeperTest do
 
   import Ecto.Query
 
+  alias Attesto.RefreshStore.ETS
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Schema.RefreshToken
@@ -235,6 +236,52 @@ defmodule AttestoPhoenix.Store.EctoSweeperTest do
     assert TestRepo.get_by(Authorization, code_hash: "legacy-live") == nil
   end
 
+  test "keeps successful markers until the family deadline when another store holds refresh tokens" do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    expired = DateTime.add(now, -60, :second)
+    past = DateTime.add(now, -1, :second)
+    future = DateTime.add(now, 300, :second)
+
+    rows = [
+      authorization("other-store-bounded-live", expired,
+        consumed_at: expired,
+        consumed_success: true,
+        family_id: "other-store-bounded-live",
+        replay_retain_until: future
+      ),
+      authorization("other-store-unbounded", expired,
+        consumed_at: expired,
+        consumed_success: true,
+        family_id: "other-store-unbounded",
+        replay_retain_until: nil
+      ),
+      authorization("other-store-bounded-ended", expired,
+        consumed_at: expired,
+        consumed_success: true,
+        family_id: "other-store-bounded-ended",
+        replay_retain_until: past
+      ),
+      authorization("other-store-no-refresh", expired,
+        consumed_at: expired,
+        consumed_success: true,
+        family_id: nil,
+        replay_retain_until: nil
+      )
+    ]
+
+    Enum.each(rows, &TestRepo.insert!/1)
+
+    # The configured refresh store keeps its families outside the bundled
+    # refresh-token table, which is empty here.
+    sweeper = start_sweeper(nil, refresh_store: ETS)
+
+    assert Sweeper.sweep_now(sweeper)["attesto_authorization_codes"] == 2
+    assert %Authorization{} = TestRepo.get_by(Authorization, code_hash: "other-store-bounded-live")
+    assert %Authorization{} = TestRepo.get_by(Authorization, code_hash: "other-store-unbounded")
+    assert TestRepo.get_by(Authorization, code_hash: "other-store-bounded-ended") == nil
+    assert TestRepo.get_by(Authorization, code_hash: "other-store-no-refresh") == nil
+  end
+
   test "evaluates refresh-family liveness inside the configured schema prefix" do
     prefix = "auth_sweeper_#{System.unique_integer([:positive, :monotonic])}"
     TestRepo.query!("CREATE SCHEMA #{prefix}")
@@ -297,9 +344,9 @@ defmodule AttestoPhoenix.Store.EctoSweeperTest do
     assert TestRepo.get_by(Authorization, [code_hash: "prefixed-live-family"], prefix: prefix) == nil
   end
 
-  defp start_sweeper(schema_prefix \\ nil) do
+  defp start_sweeper(schema_prefix \\ nil, overrides \\ []) do
     config =
-      Config.new(
+      [
         issuer: "https://issuer.example",
         audience: "https://resource.example",
         keystore: FakeKeystore,
@@ -309,7 +356,9 @@ defmodule AttestoPhoenix.Store.EctoSweeperTest do
         load_client: fn _ -> {:error, :not_found} end,
         verify_client_secret: fn _, _ -> false end,
         load_principal: fn _ -> {:error, :not_found} end
-      )
+      ]
+      |> Keyword.merge(overrides)
+      |> Config.new()
 
     {:ok, pid} = Sweeper.start_link(config: config, name: nil)
     Sandbox.allow(TestRepo, self(), pid)

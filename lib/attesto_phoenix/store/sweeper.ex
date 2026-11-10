@@ -46,6 +46,12 @@ defmodule AttestoPhoenix.Store.Sweeper do
   family is retained while any unexpired refresh token remains in that family.
   This lookup also gives legacy rows with a NULL family deadline a finite
   retention boundary once their last descendant expires or is revoked.
+  The lookup reads the bundled refresh-token table, so it applies only when
+  `:refresh_store` persists through `AttestoPhoenix.Store.EctoRefreshStore`
+  (or is unset). With any other refresh store that table says nothing about
+  the family, and a successful row is kept until its `replay_retain_until`
+  family deadline instead, indefinitely when the family has no
+  `:refresh_token_max_lifetime`.
   A newly claimed code also carries a short finalization reservation so a
   concurrent sweep cannot erase it between the atomic claim and the successful
   reuse-marker update.
@@ -236,6 +242,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
       # public configuration field is `:schema_prefix`.
       table_prefix: Config.table_prefix(config),
       refresh_rotation_grace_seconds: config.refresh_token_rotation_grace_seconds,
+      refresh_table_authoritative?: refresh_table_authoritative?(config),
       logout_retry_config: logout_retry_config(config),
       interval_ms: interval_ms,
       lifecycle_target: target,
@@ -289,6 +296,12 @@ defmodule AttestoPhoenix.Store.Sweeper do
     end
   end
 
+  # Only the bundled Ecto refresh store writes the refresh-token table the
+  # authorization-code retention query consults. An unset store issues no
+  # refresh families, so the table is still the only possible record of one.
+  defp refresh_table_authoritative?(%Config{refresh_store: nil}), do: true
+  defp refresh_table_authoritative?(%Config{} = config), do: Config.refresh_store_backend(config) == EctoRefreshStore
+
   defp logout_retry_config(%Config{} = config) do
     if Config.logout_enabled?(config) and
          Config.logout_session_store(config) == EctoLogoutSessionStore do
@@ -336,6 +349,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
          repo: repo,
          table_prefix: prefix,
          refresh_rotation_grace_seconds: grace,
+         refresh_table_authoritative?: refresh_table_authoritative?,
          logout_retry_config: logout_retry_config
        }) do
     now = DateTime.utc_now()
@@ -349,7 +363,8 @@ defmodule AttestoPhoenix.Store.Sweeper do
       )
 
     %{
-      @authorization_codes => delete_expired(repo, expired_query(@authorization_codes, now), prefix),
+      @authorization_codes =>
+        delete_expired(repo, authorization_codes_expired_query(now, refresh_table_authoritative?), prefix),
       @refresh_tokens => delete_expired(repo, refresh_expired_query(now), prefix),
       @device_codes => delete_expired(repo, expired_query(@device_codes, now), prefix),
       @ciba_requests => delete_expired(repo, expired_query(@ciba_requests, now), prefix),
@@ -387,13 +402,14 @@ defmodule AttestoPhoenix.Store.Sweeper do
   # rows carry replay-revocation provenance after successful redemption. Keep a
   # code row until its linked access token and refresh family are no longer
   # live; otherwise a replay can no longer find the row and revoke descendants.
-  # A successful family marker is retained while the refresh-token table still
-  # contains an unexpired member of that family. This mirrors the core ETS
+  # When the refresh-token table belongs to the configured refresh store, a
+  # successful family marker is retained while that table still contains an
+  # unexpired member of the family. This mirrors the core ETS
   # store's live-descendant rule and lets legacy successful rows whose
   # `replay_retain_until` is NULL retire once their family has ended. An
   # unsuccessful claimed row is retained only through its short finalization
   # reservation, preventing a sweep between `take/1` and `mark_consumed/2`.
-  defp expired_query(@authorization_codes, now) do
+  defp authorization_codes_expired_query(now, true = _refresh_table_authoritative?) do
     expired = authorization_code_expired(now)
 
     from(r in @authorization_codes,
@@ -409,6 +425,20 @@ defmodule AttestoPhoenix.Store.Sweeper do
               select: 1
             )
           )
+    )
+  end
+
+  # Core `Attesto.CodeStore.mark_consumed/2` contract: a successful marker for a
+  # refresh family persists through `replay_retain_until`, and a NULL deadline
+  # on a family means no fixed maximum lifetime, so no local timer retires it.
+  defp authorization_codes_expired_query(now, false = _refresh_table_authoritative?) do
+    expired = authorization_code_expired(now)
+
+    from(r in @authorization_codes,
+      where: ^expired,
+      where:
+        r.consumed_success != true or is_nil(r.family_id) or r.family_id == "" or
+          (not is_nil(r.replay_retain_until) and r.replay_retain_until <= ^now)
     )
   end
 

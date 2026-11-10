@@ -32,6 +32,16 @@ defaults in a minor release.
   it as a JSON array string or a decoded list. A request without authorization
   details hashes as before, so in-flight grants for such requests still
   consume after the upgrade.
+- Keep successfully redeemed authorization-code rows until their
+  `replay_retain_until` family deadline when `:refresh_store` does not persist
+  through `EctoRefreshStore`. `Store.Sweeper` decided retention for those rows
+  only from the bundled refresh-token table, which such a store never writes,
+  so it deleted them once the code and its access token expired. A later
+  replay of the code then looked unknown and the refresh family was not
+  revoked. With a refresh store that keeps families elsewhere, a row is now
+  kept until the deadline, indefinitely when `:refresh_token_max_lifetime` is
+  unset. Retention with `EctoRefreshStore` or an unset `:refresh_store` is
+  unchanged.
 
 ### Fixed
 
