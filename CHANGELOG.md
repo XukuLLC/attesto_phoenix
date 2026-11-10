@@ -6,10 +6,13 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
-## [Unreleased]
+## [4.5.0] - 2026-11-09
 
 ### Security
 
+- Require Attesto `>= 2.12.0 and < 3.0.0`. Attesto 2.12.0 keeps the full
+  grant on a rotated refresh token, which the refresh changes below depend
+  on, and refuses a JWK Set where one JWK is expected.
 - Honour the OpenID Connect `claims` request parameter only when
   `:claims_parameter_supported` is `true`. With the default `false`, the
   authorization endpoint still recorded the parameter on the code, and
