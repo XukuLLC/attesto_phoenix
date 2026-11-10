@@ -113,8 +113,19 @@ if Code.ensure_loaded?(Mint.HTTP) do
       Mint.HTTP.connect(String.to_existing_atom(scheme), address, port,
         hostname: hostname,
         protocols: [:http1],
-        transport_opts: [timeout: timeout_ms, send_timeout: timeout_ms]
+        transport_opts: [timeout: timeout_ms, send_timeout: timeout_ms] ++ address_family_opts(address)
       )
+    end
+
+    # The pinned URL carries the screened IP literal. Mint hands the address to
+    # `:gen_tcp` / `:ssl`, which treat a string as an IPv4 host name unless the
+    # socket is opened as `:inet6`, so an IPv6 literal must select that family.
+    # IPv4 fallback is disabled because the literal has no IPv4 form.
+    defp address_family_opts(address) do
+      case :inet.parse_ipv6strict_address(String.to_charlist(address)) do
+        {:ok, _ip} -> [inet6: true, inet4: false]
+        {:error, _reason} -> []
+      end
     end
 
     defp request_target(%URI{path: path, query: query}) do

@@ -84,6 +84,12 @@ defaults in a minor release.
   a code with implicit consent, although OpenID Connect Core §3.1.2.1
   requires an error when the provider cannot obtain consent. Requests without
   `prompt=consent` keep the implicit-consent behaviour.
+- Dial outbound targets whose host resolves only to IPv6. The SSRF screen
+  pinned the IPv6 address, but the pinned connection was opened as IPv4, so
+  Client ID Metadata documents, remote `jwks_uri` sets, back-channel logout
+  and CIBA ping deliveries to such hosts always failed with
+  `%Mint.TransportError{reason: :nxdomain}`. An IPv6 literal now opens an
+  IPv6 socket.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens
