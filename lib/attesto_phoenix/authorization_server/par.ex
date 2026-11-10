@@ -127,13 +127,13 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
     with :ok <- reject_request_uri(params),
          {:ok, params} <- verify_request_object(config, client, bound_client_id, params),
          :ok <- require_matching_client_id(params, bound_client_id),
+         params = put_resolved_client_id(params, bound_client_id),
          :ok <- validate_pushed_request(config, client, params),
          {:ok, dpop_jkt} <- verify_dpop_binding(config, dpop_input, params) do
       stored =
         params
         |> Map.drop(["client_secret", "client_assertion", "client_assertion_type"])
         |> put_verified_dpop_jkt(dpop_jkt)
-        |> put_resolved_client_id(bound_client_id)
 
       case par_store(config).put(request_uri, stored, ttl) do
         :ok ->
@@ -274,8 +274,9 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   #
   # Checked on the EFFECTIVE parameters, after any signed request object has
   # been merged, so a `client_id` carried only inside the object is covered too.
-  # An absent `client_id` is left alone: `put_resolved_client_id/2` supplies the
-  # authenticated one.
+  # An absent `client_id` is left alone: `put_resolved_client_id/2` then supplies
+  # the authenticated one before the request is validated, so a client that
+  # identifies itself only through client authentication can push.
   defp require_matching_client_id(%{"client_id" => presented}, bound_client_id)
        when is_binary(presented) and presented != "" and presented != bound_client_id do
     detail = "client_id does not match the authenticated client"
@@ -284,7 +285,8 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
 
   defp require_matching_client_id(_params, _bound_client_id), do: :ok
 
-  # Bind the stored record to the client that authenticated. The identifier is
+  # Bind the validated and stored request to the client that authenticated. The
+  # identifier is
   # the host's `:client_id` callback when it resolves, and otherwise the one
   # `AttestoPhoenix.ClientAuthentication` authenticated - never the request
   # body's, which the caller controls. The prior `client[:id]`/`client["id"]`

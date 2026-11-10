@@ -215,6 +215,23 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["client_id"] == "confidential-1"
   end
 
+  test "stores a Basic-authenticated pushed request that omits client_id from the body" do
+    params = Map.delete(auth_params(), "client_id")
+    credentials = Base.encode64("confidential-1:s3cr3t")
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> PARController.create(params)
+
+    assert conn.status == 201
+    body = JSON.decode!(conn.resp_body)
+    assert {:ok, stored, 45} = PARStore.lookup(body["request_uri"])
+    assert stored["client_id"] == "confidential-1"
+    assert stored["redirect_uri"] == "https://client.example/cb"
+  end
+
   test "rejects a body client_id that conflicts with the Basic credentials (RFC 6749 §2.3.1)" do
     # An internally inconsistent request: a body client_id that disagrees with
     # the authoritative Basic userid is rejected before any secret verification.

@@ -72,6 +72,13 @@ defaults in a minor release.
   every token request naming that `client_id`. The client is now rejected as
   `invalid_client`, and such a document is neither cached nor accepted from
   a cache.
+- Accept a pushed authorization request that carries no `client_id` in its
+  body when the client authenticated by other means (for example HTTP Basic
+  or `client_assertion`). `AuthorizationServer.PAR` validated the request
+  before supplying the authenticated `client_id`, so the push failed with
+  `invalid_request` ("invalid_client_id"), although the code already meant to
+  supply it. The authenticated identifier is now added before validation; a
+  body `client_id` that differs from it is still rejected.
 - Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
   tokens and their families only. It answers `200` for a presented access
   token without revoking it, and revoking a refresh token leaves access tokens
