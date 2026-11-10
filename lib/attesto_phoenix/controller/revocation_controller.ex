@@ -28,6 +28,28 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   an empty body, whether or not the presented token existed, was expired,
   or was already revoked.
 
+  ## Refresh tokens only (RFC 7009 §2.1)
+
+  This endpoint revokes refresh tokens. Revoking one revokes its whole refresh
+  family, so no later refresh can succeed. Access tokens are self-contained
+  signed JWTs that resource servers verify without a lookup, and the endpoint
+  keeps no per-token denylist for them:
+
+    * A presented access token is treated like any other token the server does
+      not hold: the response is `200` and the access token stays valid until
+      its `exp`. RFC 7009 §2.2.1 defines `unsupported_token_type` for this
+      case; the endpoint answers `200` instead because common clients revoke
+      the access token before the refresh token and stop at the first error,
+      which would leave the refresh token live.
+    * Revoking a refresh token does not invalidate access tokens already issued
+      from its family. RFC 7009 §2.1 asks for that only from a server that
+      supports access-token revocation.
+
+  Keep `:access_token_ttl` short so an access token outlives its refresh family
+  by at most that lifetime. A resource server that needs immediate access-token
+  revocation checks the token's `jti` (or the family claim named by
+  `:authorization_grant_id_claim`) against a host-maintained denylist.
+
   ## Caching (RFC 6749 §5.1)
 
   Every response carries `Cache-Control: no-store` and `Pragma: no-cache`,

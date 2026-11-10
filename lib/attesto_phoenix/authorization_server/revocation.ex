@@ -5,6 +5,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Revocation do
   Validates the required `"token"` parameter, revokes the refresh token and its
   descendant family bound to the authenticated `client_id` via
   `Attesto.Revocation`, and returns the `:token_revoked` audit event as data.
+
+  Only refresh tokens are revocable. A presented access token is handled like
+  an unknown token and stays valid until it expires, and access tokens already
+  issued from a revoked refresh family are not invalidated. See
+  `AttestoPhoenix.Controller.RevocationController` for the reasoning.
   """
 
   alias Attesto.Revocation

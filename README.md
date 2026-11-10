@@ -1649,6 +1649,15 @@ end
 mTLS binding when enabled, resolves the subject via `:load_principal`, emits
 neutral `:auth_succeeded` / `:auth_denied` events through `:on_event`.
 
+Access tokens are self-contained and stay valid until `exp`. `POST
+/oauth/revoke` revokes refresh tokens and their families only: it answers
+`200` for a presented access token without revoking it, and revoking a refresh
+token does not invalidate access tokens already issued from that family. The
+one access token the library tracks is the one returned with an authorization
+code, which is revoked when that code is replayed. Keep `:access_token_ttl`
+short, or check `jti` against your own denylist where a resource needs
+immediate revocation.
+
 When `conn.private[:attesto_phoenix_config]` is present, that validated request
 config is authoritative; plug `:config`/`:otp_app` options are used only when
 the request-private value is absent. A malformed request-private value fails

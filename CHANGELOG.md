@@ -33,6 +33,16 @@ defaults in a minor release.
   details hashes as before, so in-flight grants for such requests still
   consume after the upgrade.
 
+### Fixed
+
+- Document what `POST /oauth/revoke` revokes. The endpoint revokes refresh
+  tokens and their families only. It answers `200` for a presented access
+  token without revoking it, and revoking a refresh token leaves access tokens
+  already issued from that family valid until they expire. The
+  `RevocationController` and `AuthorizationServer.Revocation` docs and the
+  README did not say so, and a client could read the `200` as a successful
+  access-token revocation. Behaviour is unchanged.
+
 ## [4.4.1] - 2026-11-05
 
 ### Security
