@@ -13,9 +13,10 @@ defmodule AttestoPhoenix.ConsentGrantStore do
   user authorizes; the host's `:consent` callback (`AttestoPhoenix.ConsentPolicy`)
   consumes it before a code is issued.
 
-  The grant is bound to a hash over the canonical request fields
-  (`subject + client_id + redirect_uri + sorted scope set + code_challenge +
-  code_challenge_method`, built by `AttestoPhoenix.ConsentGrant.binding/2`).
+  The grant is bound to a hash over the canonical request fields (subject,
+  client, redirect URI, scope and resource sets, claims request, authorization
+  details, DPoP key and PKCE challenge, built by
+  `AttestoPhoenix.ConsentGrant.binding/2`; see that module for the exact list).
   `mint/2` records a fresh row keyed on an unguessable token; `consume/2`
   atomically claims it iff the recomputed binding matches and the grant is
   unexpired and unconsumed, so a token works exactly once for exactly the

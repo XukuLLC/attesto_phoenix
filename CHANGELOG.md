@@ -22,6 +22,16 @@ defaults in a minor release.
   an access token, including tokens refreshed from earlier codes. A host that
   relies on the parameter sets `claims_parameter_supported: true`, which also
   advertises it in OpenID Provider Metadata.
+- Bind consent grants to the request's RFC 9396 `authorization_details`.
+  `AttestoPhoenix.ConsentGrant.binding/2`, `binding_from_params/2` and
+  `binding_hash/1` ignored the field, so a grant minted for a request without
+  authorization details could be consumed for an otherwise identical request
+  that named an OID4VCI `openid_credential` configuration, and the issued
+  access token carried that credential entitlement. The binding now carries
+  `authorization_details` in request order, and `binding_from_params/2` reads
+  it as a JSON array string or a decoded list. A request without authorization
+  details hashes as before, so in-flight grants for such requests still
+  consume after the upgrade.
 
 ## [4.4.1] - 2026-11-05
 

@@ -5,7 +5,8 @@ defmodule AttestoPhoenix.ConsentGrant do
 
   A consent grant must approve *exactly* the authorization request the resource
   owner saw — the same client, redirect URI, scope and resource sets, requested
-  claims, DPoP key, PKCE challenge, and PKCE method — and nothing else. This
+  claims, authorization details, DPoP key, PKCE challenge, and PKCE method — and
+  nothing else. This
   module builds that binding from either
   raw authorization params (`binding_from_params/2`, used by the consent-screen
   mint action) or from a validated `%Attesto.AuthorizationRequest{}` (`binding/2`,
@@ -16,7 +17,8 @@ defmodule AttestoPhoenix.ConsentGrant do
   ## Canonical binding
 
   The binding contains `(subject, client_id, redirect_uri, scope, resource,
-  claims, dpop_jkt, code_challenge, code_challenge_method)`.
+  claims, dpop_jkt, code_challenge, code_challenge_method)`, followed by
+  `authorization_details` when the request carries any.
 
     * `subject` - the OIDC `sub` of the resource owner who consented. Binding to
       the subject stops one user's consent token from approving another's request.
@@ -40,6 +42,13 @@ defmodule AttestoPhoenix.ConsentGrant do
       empty string when the request carries no PKCE challenge. Binding it stops
       a consent granted for an `S256` request from being reused for a `plain`
       request with the same challenge value.
+    * `authorization_details` - the RFC 9396 authorization details array, in
+      request order. Each object is encoded like `claims`. Binding it stops a
+      consent shown for a request without, or with different, authorization
+      details from approving one that carries an entitlement such as an
+      OID4VCI `openid_credential` configuration. An absent or empty array adds
+      nothing to the encoding, so the hash of a request without authorization
+      details does not depend on this field.
 
   `binding_hash/1` is SHA-256 over a type-tagged, length-framed canonical
   encoding, URL-base64 encoded without padding. It is stable across the mint
@@ -53,6 +62,7 @@ defmodule AttestoPhoenix.ConsentGrant do
   the request carries no PKCE challenge.
   """
   @type binding :: %{
+          optional(:authorization_details) => [map()],
           subject: String.t(),
           client_id: String.t(),
           redirect_uri: String.t(),
@@ -64,8 +74,11 @@ defmodule AttestoPhoenix.ConsentGrant do
           code_challenge_method: String.t() | nil
         }
 
-  @binding_fields ~w(client_id redirect_uri scope resource claims dpop_jkt code_challenge code_challenge_method)a
-  @canonical_fields [:subject] ++ @binding_fields
+  # Always encoded, in this order. `authorization_details` follows only when it
+  # is non-empty (see `encode_authorization_details/1`).
+  @fixed_fields ~w(client_id redirect_uri scope resource claims dpop_jkt code_challenge code_challenge_method)a
+  @binding_fields @fixed_fields ++ [:authorization_details]
+  @canonical_fields [:subject] ++ @fixed_fields
 
   @doc """
   Builds the consent binding for `request` consented to by `subject`.
@@ -92,8 +105,9 @@ defmodule AttestoPhoenix.ConsentGrant do
   using `binding/2`.
 
   `params` is read by string keys. Scope and resource sets are normalized;
-  `claims` may be the original JSON object string or an already-decoded map.
-  Unknown params are ignored. Malformed values raise `ArgumentError`; callers
+  `claims` may be the original JSON object string or an already-decoded map,
+  and `authorization_details` the original JSON array string or an
+  already-decoded list. Unknown params are ignored. Malformed values raise `ArgumentError`; callers
   handling untrusted data without an existing validation boundary should use
   `safe_binding_from_params/2`. For the equivalent validated request,
   `binding_hash(binding_from_params(params, subject)) ==
@@ -111,7 +125,8 @@ defmodule AttestoPhoenix.ConsentGrant do
   Safely builds a consent binding from untrusted raw parameters.
 
   Returns `{:error, :invalid_binding}` for an invalid required scalar, set,
-  claims object, DPoP thumbprint value, or nested JSON value.
+  claims object, authorization details array, DPoP thumbprint value, or nested
+  JSON value.
   """
   @spec safe_binding_from_params(map(), String.t()) ::
           {:ok, binding()} | {:error, :invalid_binding}
@@ -139,7 +154,10 @@ defmodule AttestoPhoenix.ConsentGrant do
   def binding_hash(%{} = binding) do
     case validate_binding(binding) do
       {:ok, normalized} ->
-        canonical = Enum.map(@canonical_fields, &encode_value(Map.fetch!(normalized, &1)))
+        canonical =
+          Enum.map(@canonical_fields, &encode_value(Map.fetch!(normalized, &1))) ++
+            encode_authorization_details(normalized.authorization_details)
+
         :sha256 |> :crypto.hash(canonical) |> Base.url_encode64(padding: false)
 
       {:error, :invalid_binding} ->
@@ -153,6 +171,8 @@ defmodule AttestoPhoenix.ConsentGrant do
          {:ok, scope} <- string_set(Map.get(params, "scope"), :space_delimited),
          {:ok, resource} <- string_set(Map.get(params, "resource"), :scalar_or_list),
          {:ok, claims} <- claims_param(Map.get(params, "claims")),
+         {:ok, authorization_details} <-
+           authorization_details_param(Map.get(params, "authorization_details")),
          {:ok, dpop_jkt} <- optional_string(Map.get(params, "dpop_jkt")),
          {:ok, code_challenge} <- optional_string(Map.get(params, "code_challenge")),
          {:ok, code_challenge_method} <- optional_string(Map.get(params, "code_challenge_method")) do
@@ -163,6 +183,7 @@ defmodule AttestoPhoenix.ConsentGrant do
          scope: scope,
          resource: resource,
          claims: claims,
+         authorization_details: authorization_details,
          dpop_jkt: dpop_jkt,
          code_challenge: code_challenge,
          code_challenge_method: code_challenge_method
@@ -178,7 +199,7 @@ defmodule AttestoPhoenix.ConsentGrant do
     |> Map.put(:subject, subject)
   end
 
-  defp normalize_binding_value(field, nil) when field in [:scope, :resource], do: []
+  defp normalize_binding_value(field, nil) when field in [:scope, :resource, :authorization_details], do: []
 
   defp normalize_binding_value(:scope, scope) when is_binary(scope),
     do: scope |> String.split(" ", trim: true) |> Enum.uniq() |> Enum.sort()
@@ -200,6 +221,7 @@ defmodule AttestoPhoenix.ConsentGrant do
          :ok <- validate_string_list(normalized.resource),
          :ok <- validate_json_value(normalized.claims),
          true <- is_map(normalized.claims),
+         :ok <- validate_authorization_details(normalized.authorization_details),
          :ok <- validate_optional_string(normalized.dpop_jkt),
          :ok <- validate_optional_string(normalized.code_challenge),
          :ok <- validate_optional_string(normalized.code_challenge_method) do
@@ -251,6 +273,36 @@ defmodule AttestoPhoenix.ConsentGrant do
   end
 
   defp claims_param(_value), do: {:error, :invalid_binding}
+
+  defp authorization_details_param(nil), do: {:ok, []}
+
+  defp authorization_details_param(value) when is_binary(value) do
+    case JSON.decode(value) do
+      {:ok, details} when is_list(details) -> authorization_details_param(details)
+      _ -> {:error, :invalid_binding}
+    end
+  end
+
+  defp authorization_details_param(value) when is_list(value) do
+    case validate_authorization_details(value) do
+      :ok -> {:ok, value}
+      _ -> {:error, :invalid_binding}
+    end
+  end
+
+  defp authorization_details_param(_value), do: {:error, :invalid_binding}
+
+  # RFC 9396 §2: a JSON array of JSON objects.
+  defp validate_authorization_details(details) when is_list(details) do
+    if Enum.all?(details, &(is_map(&1) and validate_json_value(&1) == :ok)),
+      do: :ok,
+      else: {:error, :invalid_binding}
+  end
+
+  defp validate_authorization_details(_details), do: {:error, :invalid_binding}
+
+  defp encode_authorization_details([]), do: []
+  defp encode_authorization_details(details), do: [encode_value(details)]
 
   defp optional_string(nil), do: {:ok, nil}
   defp optional_string(value) when is_binary(value), do: {:ok, value}

@@ -3,8 +3,8 @@ defmodule AttestoPhoenix.ConsentGrantTest do
   Pure (no-DB) tests for the consent binding and its canonical hash
   (RFC 6749 §4.1.1): the binding built from an `%Attesto.AuthorizationRequest{}`,
   order-agnostic scope-set hashing (RFC 6749 §3.3), and a hash that changes when
-  the client, redirect URI, scope set, subject, PKCE challenge, or PKCE method
-  differs.
+  the client, redirect URI, scope set, subject, authorization details, PKCE
+  challenge, or PKCE method differs.
   """
 
   use ExUnit.Case, async: true
@@ -49,6 +49,7 @@ defmodule AttestoPhoenix.ConsentGrantTest do
                scope: ["openid", "profile"],
                resource: [],
                claims: %{},
+               authorization_details: [],
                dpop_jkt: nil,
                code_challenge: "challenge-xyz",
                code_challenge_method: "S256"
@@ -143,6 +144,21 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
     end
 
+    test "authorization_details match the equivalent validated request" do
+      details = [
+        %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegree"},
+        %{"type" => "payment_initiation", "instructedAmount" => %{"currency" => "EUR", "amount" => "1"}}
+      ]
+
+      raw = params(%{"authorization_details" => JSON.encode!(details)})
+
+      assert {:ok, from_params} = ConsentGrant.safe_binding_from_params(raw, @subject)
+      from_request = ConsentGrant.binding(request(authorization_details: details), @subject)
+
+      assert from_params == from_request
+      assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
+    end
+
     test "malformed raw values return a controlled error" do
       invalid = [
         %{"client_id" => %{}},
@@ -151,6 +167,10 @@ defmodule AttestoPhoenix.ConsentGrantTest do
         %{"resource" => ["https://a.example", 1]},
         %{"claims" => "[]"},
         %{"claims" => %{"userinfo" => {:not, :json}}},
+        %{"authorization_details" => "{}"},
+        %{"authorization_details" => ~s(["openid_credential"])},
+        %{"authorization_details" => [%{"type" => {:not, :json}}]},
+        %{"authorization_details" => %{"type" => "openid_credential"}},
         %{"dpop_jkt" => %{}},
         %{"code_challenge" => []}
       ]
@@ -281,6 +301,48 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       for binding <- changed do
         refute ConsentGrant.binding_hash(base) == ConsentGrant.binding_hash(binding)
       end
+    end
+
+    test "authorization_details change the hash" do
+      degree = %{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegree"}
+      payment = %{"type" => "payment_initiation", "instructedAmount" => %{"currency" => "EUR"}}
+
+      base = ConsentGrant.binding(request(), @subject)
+
+      changed = [
+        ConsentGrant.binding(request(authorization_details: [degree]), @subject),
+        ConsentGrant.binding(request(authorization_details: [degree, payment]), @subject),
+        ConsentGrant.binding(request(authorization_details: [payment, degree]), @subject)
+      ]
+
+      hashes = Enum.map([base | changed], &ConsentGrant.binding_hash/1)
+
+      assert length(Enum.uniq(hashes)) == length(hashes)
+    end
+
+    test "authorization_details object key order is insignificant" do
+      left =
+        ConsentGrant.binding(
+          request(authorization_details: [%{"type" => "openid_credential", "credential_configuration_id" => "A"}]),
+          @subject
+        )
+
+      right =
+        ConsentGrant.binding(
+          request(authorization_details: [%{"credential_configuration_id" => "A", "type" => "openid_credential"}]),
+          @subject
+        )
+
+      assert ConsentGrant.binding_hash(left) == ConsentGrant.binding_hash(right)
+    end
+
+    test "a binding without authorization_details hashes as one that omits the key" do
+      binding = ConsentGrant.binding(request(), @subject)
+
+      assert ConsentGrant.binding_hash(binding) ==
+               ConsentGrant.binding_hash(Map.delete(binding, :authorization_details))
+
+      assert ConsentGrant.binding_hash(binding) == "eUoIAUahrPmq9RcTg-_uqVjShv9CwoqTH-mC-D_Y1eo"
     end
 
     test "an absent code_challenge hashes as the empty string, distinct from any present one" do

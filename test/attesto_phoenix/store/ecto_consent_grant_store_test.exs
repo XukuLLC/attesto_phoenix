@@ -137,6 +137,14 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStoreTest do
       {:ok, token} = Store.mint(ConsentGrant.binding(request(), "sub-123"), @ttl)
       assert {:error, :binding_mismatch} = Store.consume(token, ConsentGrant.binding(request(), "sub-456"))
     end
+
+    test "a grant without authorization_details is refused for a request that adds them" do
+      details = [%{"type" => "openid_credential", "credential_configuration_id" => "UniversityDegree"}]
+      {:ok, token} = Store.mint(cg_binding(), @ttl)
+
+      assert {:error, :binding_mismatch} = Store.consume(token, cg_binding(authorization_details: details))
+      assert :ok = Store.consume(token, cg_binding())
+    end
   end
 
   describe "consume/2 - not found" do
