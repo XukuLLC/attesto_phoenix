@@ -72,7 +72,11 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   (`{"error": code, "error_description": ...}`) with the RFC 7591 §3.2.2 codes
   `invalid_redirect_uri` and `invalid_client_metadata`. A host store rejection
   surfaces as `invalid_client_metadata` (the request named a client the store
-  would not accept) rather than a 500. Both success and error responses carry
+  would not accept) rather than a 500, unless the host chose the answer: a 4xx
+  `AttestoPhoenix.OAuthError`, or `{:unavailable, retry_after_seconds}` for
+  `503` with `Retry-After`. The metadata in a success response is read back
+  from the stored client when `:client_registration_metadata` is configured.
+  Both success and error responses carry
   no-store cache headers (RFC 7234 §5.2) because the body can carry a freshly
   minted credential.
 

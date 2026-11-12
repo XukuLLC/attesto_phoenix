@@ -1605,6 +1605,21 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
                Attesto.Secret.hash(registration_access_token)
     end
 
+    test "renders a host capacity refusal as 503 with Retry-After" do
+      config = config(register_client: fn _attrs -> {:error, {:unavailable, 45}} end)
+
+      conn =
+        post_register(config, %{
+          "grant_types" => ["authorization_code"],
+          "redirect_uris" => ["https://client.example/callback"]
+        })
+
+      assert conn.status == 503
+      assert Plug.Conn.get_resp_header(conn, "retry-after") == ["45"]
+      assert Plug.Conn.get_resp_header(conn, "cache-control") == ["no-store"]
+      assert body(conn)["error"] == "temporarily_unavailable"
+    end
+
     test "renders a host store rejection as invalid_client_metadata, not a 500" do
       config = config(register_client: fn _attrs -> {:error, :duplicate} end)
 

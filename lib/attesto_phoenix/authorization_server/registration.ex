@@ -20,11 +20,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   """
 
   alias Attesto.{Key, PairwiseSubject, RedirectURI, Secret, SecureCompare, SigningAlg}
+  alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.AuthorizationServer.Userinfo
   alias AttestoPhoenix.{Callback, Config, Event, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.HostPolicy
   alias AttestoPhoenix.RedirectURIRegistration
+
+  require Logger
 
   defmodule Request do
     @moduledoc "Normalized dynamic client registration request (RFC 7591 §2)."
@@ -376,11 +379,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
     with :ok <- check_enabled(config),
          {:ok, validated} <- validate_metadata(request, config),
          {:ok, issued} <- issue_client(validated, config),
-         {:ok, _stored} <- persist(issued, config) do
+         {:ok, stored} <- persist(issued, config) do
       # ── Event ────────────────────────────────────────────────────────────────
       # The event records WHICH client was registered, never the secret.
       event = Event.new(:client_registered, %{client_id: Map.get(issued, "client_id")})
-      {:ok, client_information_response(issued), [event]}
+      {:ok, registration_response(config, issued, stored), [event]}
     end
   end
 
@@ -482,9 +485,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
          {:ok, validated} <- validate_metadata(request, config),
          :ok <- check_immutable_members(current, validated),
          attrs = updated_attrs(validated, client_id, current),
-         {:ok, _stored} <- persist_update(config, client, attrs) do
+         {:ok, stored} <- persist_update(config, client, attrs) do
       event = Event.new(:client_updated, %{client_id: client_id})
-      {:ok, management_response(config, client_id, bearer, attrs), [event]}
+      {:ok, management_response(config, client_id, bearer, stored_metadata(config, stored, attrs)), [event]}
     end
   end
 
@@ -580,10 +583,39 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   end
 
   defp persist_update(config, client, attrs) do
-    case Callback.invoke(Config.update_client_fun(config), [client, attrs]) do
-      {:ok, stored} -> {:ok, stored}
-      {:error, _reason} -> {:error, error(@error_invalid_client_metadata, "the client could not be updated")}
+    config
+    |> Config.update_client_fun()
+    |> Callback.invoke([client, attrs])
+    |> store_result("the client could not be updated")
+  end
+
+  # RFC 7591 §3.2.1: the response describes the client as registered, "including
+  # any fields that the server has provisioned or modified". What was
+  # registered is what the host stored, so the metadata is read back from the
+  # stored client when the host can report it (`:client_registration_metadata`).
+  # A host that narrows scopes or grant types then answers with what it kept,
+  # not with what was asked for. Without that callback, or when it returns
+  # something that is not a map, the validated request is the best description
+  # there is.
+  defp stored_metadata(config, stored, requested) do
+    case registered_metadata(config, stored) do
+      {:ok, metadata} -> metadata
+      {:error, _not_available} -> requested
     end
+  end
+
+  # Members only the response can state: the identifier, the credentials
+  # issued in plaintext exactly once, and the management endpoint. They always
+  # come from issuance, never from the store, which holds hashes.
+  @issued_members ~w(client_id client_id_issued_at client_secret client_secret_expires_at
+                     registration_access_token registration_client_uri)
+
+  defp registration_response(config, issued, stored) do
+    config
+    |> stored_metadata(stored, issued)
+    |> Map.drop(@management_private_members)
+    |> Map.merge(Map.take(issued, @issued_members))
+    |> client_information_response()
   end
 
   # RFC 7592 §3: the client information response for a management request.
@@ -610,6 +642,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
     with {:ok, auth_method} <- validate_auth_method(request.token_endpoint_auth_method, config),
          {:ok, application_type} <- validate_application_type(request.application_type, config),
          {:ok, grant_types} <- validate_grant_types(request.grant_types, config),
+         {:ok, response_types} <- validate_response_types(metadata, grant_types),
          {:ok, redirect_uris} <-
            validate_redirect_uris(request.redirect_uris, grant_types, application_type, config),
          {:ok, scope} <- validate_scope(request.scope, config),
@@ -619,13 +652,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
          :ok <- validate_frontchannel_logout_origin(passthrough, redirect_uris),
          {:ok, oidc} <- validate_oidc_response_metadata(metadata, redirect_uris, config) do
       core =
-        Map.merge(oidc, %{
+        oidc
+        |> Map.merge(%{
           "token_endpoint_auth_method" => auth_method,
           "application_type" => application_type,
           "grant_types" => grant_types,
           "redirect_uris" => redirect_uris,
           "scope" => scope
         })
+        |> put_if_present("response_types", response_types)
 
       # The known RFC 7591 §2 display/identity members are merged UNDER the
       # protocol-critical members so a request can never override the validated
@@ -1409,6 +1444,55 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
 
   # RFC 7591 §2: every requested grant type must be one the server supports
   # (RFC 6749 §1.3). Absent, the default is authorization_code.
+  # RFC 7591 §2: `response_types` and `grant_types` describe the same flows from
+  # two sides and must agree. This server's authorization endpoint supports
+  # the `code` response type, which goes with the `authorization_code` grant
+  # type: a client registering one without the other is asking for a flow it
+  # could never complete.
+  #
+  # An absent member takes the RFC's default, `["code"]`, when the client
+  # registers the `authorization_code` grant; a client with no
+  # authorization-endpoint grant has no response type and the member is left
+  # out. A value this server does not support is refused, not silently
+  # replaced, so the response never claims a response type the client did not
+  # get.
+  defp validate_response_types(metadata, grant_types) do
+    code_grant? = "authorization_code" in grant_types
+
+    case Map.fetch(metadata, "response_types") do
+      :error ->
+        {:ok, if(code_grant?, do: ["code"])}
+
+      {:ok, response_types} when is_list(response_types) ->
+        cond do
+          not valid_response_type_list?(response_types) ->
+            {:error, error(@error_invalid_client_metadata, "response_types must be an array of distinct strings")}
+
+          Enum.any?(response_types, &(&1 not in Metadata.response_types_supported())) ->
+            {:error, error(@error_invalid_client_metadata, "response_types contains an unsupported value")}
+
+          "code" in response_types != code_grant? ->
+            {:error,
+             error(
+               @error_invalid_client_metadata,
+               "response_types and grant_types must agree: code goes with authorization_code (RFC 7591 §2)"
+             )}
+
+          true ->
+            {:ok, response_types}
+        end
+
+      {:ok, _other} ->
+        {:error, error(@error_invalid_client_metadata, "response_types must be an array")}
+    end
+  end
+
+  defp valid_response_type_list?(response_types) do
+    list_within_limit?(response_types, @max_metadata_collection_entries) and
+      Enum.uniq(response_types) == response_types and
+      Enum.all?(response_types, &(is_binary(&1) and &1 != "" and byte_size(&1) <= 128))
+  end
+
   defp validate_grant_types(nil, config) do
     validate_requested_grant_types(["authorization_code"], Config.registration_grant_types(config))
   end
@@ -1641,16 +1725,51 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   # The plaintext client_secret is replaced with its one-way hash before
   # persistence so the store never holds the bearer value (RFC 6749 §2.3.1).
   defp persist(issued, config) do
-    case Callback.invoke(Config.register_client_fun(config), [persistable_attrs(issued)]) do
-      {:ok, stored} ->
-        {:ok, stored}
+    config
+    |> Config.register_client_fun()
+    |> Callback.invoke([persistable_attrs(issued)])
+    |> store_result("the requested client could not be registered")
+  end
 
-      {:error, _reason} ->
-        # A store-level rejection (constraint violation, unacceptable metadata)
-        # is a client problem, not a server fault: render it as RFC 7591 §3.2.2
-        # invalid_client_metadata rather than a 500.
-        {:error, error(@error_invalid_client_metadata, "the requested client could not be registered")}
-    end
+  # What a host persistence callback's answer becomes on the wire.
+  #
+  #   * `{:error, {:unavailable, retry_after_seconds}}` - the host cannot take
+  #     the registration now (a count or rate limit): `503` with `Retry-After`
+  #     (RFC 9110 §15.6.4, §10.2.3).
+  #   * `{:error, %OAuthError{}}` with a 4xx status - the host's own refusal,
+  #     sent as given.
+  #   * any other `{:error, reason}` - a store-level rejection (a constraint
+  #     violation, unacceptable metadata) is a client problem, not a server
+  #     fault: RFC 7591 §3.2.2 `invalid_client_metadata`, never a 500. The
+  #     reason is not sent. An `%OAuthError{}` with any other status lands
+  #     here too and is logged: a host error must not put a 5xx body, or a
+  #     status the host did not mean to choose, on the wire by accident.
+  defp store_result({:ok, stored}, _default_description), do: {:ok, stored}
+
+  defp store_result({:error, {:unavailable, retry_after}}, _default_description)
+       when is_integer(retry_after) and retry_after >= 0 do
+    {:error,
+     OAuthError.new(:temporarily_unavailable, "registration is temporarily unavailable; retry later",
+       status: 503,
+       headers: [{"retry-after", Integer.to_string(retry_after)}]
+     )}
+  end
+
+  defp store_result({:error, %OAuthError{status: status} = refusal}, _default_description) when status in 400..499 do
+    {:error, refusal}
+  end
+
+  defp store_result({:error, %OAuthError{status: status}}, default_description) do
+    Logger.warning(
+      "registration store returned an OAuthError with status #{inspect(status)}; " <>
+        "only 4xx refusals are passed through, answering invalid_client_metadata"
+    )
+
+    {:error, error(@error_invalid_client_metadata, default_description)}
+  end
+
+  defp store_result({:error, _reason}, default_description) do
+    {:error, error(@error_invalid_client_metadata, default_description)}
   end
 
   defp persistable_attrs(issued) do

@@ -148,6 +148,185 @@ defmodule AttestoPhoenix.AuthorizationServer.RegistrationTest do
     end
   end
 
+  describe "register/2 response_types (RFC 7591 §2)" do
+    @redirect %{"redirect_uris" => ["https://client.example/cb"]}
+
+    test "defaults to code for an authorization_code client, stored and returned" do
+      config = build_config()
+
+      assert {:ok, response, _events} = Registration.register(config, @redirect)
+      assert response["response_types"] == ["code"]
+      assert_received {:registered_attrs, %{"response_types" => ["code"]}}
+    end
+
+    test "a client with no authorization-endpoint grant has no response type" do
+      config = build_config(registration_grant_types: ["client_credentials"])
+      metadata = %{"grant_types" => ["client_credentials"], "token_endpoint_auth_method" => "client_secret_basic"}
+
+      assert {:ok, response, _events} = Registration.register(config, metadata)
+      refute Map.has_key?(response, "response_types")
+
+      assert {:ok, response, _events} = Registration.register(config, Map.put(metadata, "response_types", []))
+      assert response["response_types"] == []
+    end
+
+    test "refuses a value the authorization endpoint does not support" do
+      config = build_config()
+
+      for response_types <- [["token"], ["code", "id_token"], ["code token"], ["none"]] do
+        assert {:error, %OAuthError{error: :invalid_client_metadata, error_description: description}} =
+                 Registration.register(config, Map.put(@redirect, "response_types", response_types))
+
+        assert description =~ "unsupported"
+      end
+    end
+
+    test "refuses response_types that disagree with grant_types" do
+      config = build_config(registration_grant_types: ["authorization_code", "client_credentials"])
+
+      # code without the authorization_code grant
+      assert {:error, %OAuthError{error: :invalid_client_metadata, error_description: description}} =
+               Registration.register(config, %{
+                 "grant_types" => ["client_credentials"],
+                 "token_endpoint_auth_method" => "client_secret_basic",
+                 "response_types" => ["code"]
+               })
+
+      assert description =~ "must agree"
+
+      # the authorization_code grant without code
+      assert {:error, %OAuthError{error: :invalid_client_metadata}} =
+               Registration.register(config, Map.put(@redirect, "response_types", []))
+    end
+
+    test "refuses a malformed member" do
+      config = build_config()
+
+      for response_types <- ["code", ["code", "code"], [1], [""], %{"0" => "code"}, nil] do
+        assert {:error, %OAuthError{error: :invalid_client_metadata}} =
+                 Registration.register(config, Map.put(@redirect, "response_types", response_types))
+      end
+    end
+  end
+
+  describe "register/2 response built from the stored client (RFC 7591 §3.2.1)" do
+    test "reports what the host stored, with the credentials issued here" do
+      config =
+        build_config(
+          scopes_supported: ["openid", "profile"],
+          register_client: fn attrs ->
+            # The host narrows the scope and sets a member of its own.
+            {:ok, attrs |> Map.put("scope", "openid") |> Map.put("client_name", "Stored Name")}
+          end,
+          client_registration_metadata: fn stored -> stored end
+        )
+
+      assert {:ok, response, _events} =
+               Registration.register(config, %{
+                 "redirect_uris" => ["https://client.example/cb"],
+                 "scope" => "openid profile",
+                 "client_name" => "Requested Name"
+               })
+
+      assert response["scope"] == "openid"
+      assert response["client_name"] == "Stored Name"
+
+      # Issued once, in plaintext, by the library; the store holds only hashes.
+      assert is_binary(response["client_id"])
+      assert is_binary(response["client_secret"])
+      assert response["client_secret_expires_at"] == 0
+      assert is_binary(response["registration_access_token"])
+      assert response["registration_client_uri"] =~ response["client_id"]
+      refute Map.has_key?(response, "client_secret_hash")
+      refute Map.has_key?(response, "registration_access_token_hash")
+    end
+
+    test "a store cannot replace the issued identifier or credentials" do
+      config =
+        build_config(
+          register_client: fn attrs -> {:ok, attrs} end,
+          client_registration_metadata: fn stored ->
+            Map.merge(stored, %{"client_id" => "chosen-by-store", "client_secret" => "chosen-by-store"})
+          end
+        )
+
+      assert {:ok, response, [event]} =
+               Registration.register(config, %{"redirect_uris" => ["https://client.example/cb"]})
+
+      assert response["client_id"] == event.client_id
+      refute response["client_id"] == "chosen-by-store"
+      refute response["client_secret"] == "chosen-by-store"
+    end
+
+    test "without :client_registration_metadata, or with a non-map from it, the validated request is reported" do
+      for overrides <- [[], [client_registration_metadata: fn _stored -> :not_a_map end]] do
+        config = build_config([register_client: fn _attrs -> {:ok, :opaque_host_client} end] ++ overrides)
+
+        assert {:ok, response, _events} =
+                 Registration.register(config, %{
+                   "redirect_uris" => ["https://client.example/cb"],
+                   "client_name" => "Requested Name"
+                 })
+
+        assert response["client_name"] == "Requested Name"
+        assert response["redirect_uris"] == ["https://client.example/cb"]
+      end
+    end
+  end
+
+  describe "register/2 host refusals (RFC 7591 §3.2.2)" do
+    @metadata %{"redirect_uris" => ["https://client.example/cb"]}
+
+    test "a capacity refusal answers 503 with Retry-After" do
+      config = build_config(register_client: fn _attrs -> {:error, {:unavailable, 120}} end)
+
+      assert {:error, %OAuthError{error: :temporarily_unavailable, status: 503, headers: [{"retry-after", "120"}]}} =
+               Registration.register(config, @metadata)
+    end
+
+    test "a 4xx OAuthError from the host is passed through" do
+      refusal = OAuthError.new(:access_denied, "registration is closed to this network", status: 403)
+      config = build_config(register_client: fn _attrs -> {:error, refusal} end)
+
+      assert {:error, ^refusal} = Registration.register(config, @metadata)
+    end
+
+    test "any other refusal stays invalid_client_metadata, and its reason is not sent" do
+      import ExUnit.CaptureLog
+
+      for reason <- [
+            :constraint_violation,
+            "duplicate key value violates unique constraint",
+            {:unavailable, -1},
+            {:unavailable, "soon"}
+          ] do
+        config = build_config(register_client: fn _attrs -> {:error, reason} end)
+
+        assert {:error,
+                %OAuthError{
+                  error: :invalid_client_metadata,
+                  status: 400,
+                  error_description: "the requested client could not be registered"
+                }} = Registration.register(config, @metadata)
+      end
+
+      # A host error carrying a 5xx status is not put on the wire.
+      server_fault = OAuthError.new(:server_error, "database password is hunter2", status: 500)
+      config = build_config(register_client: fn _attrs -> {:error, server_fault} end)
+
+      log =
+        capture_log(fn ->
+          assert {:error, %OAuthError{error: :invalid_client_metadata, status: 400} = error} =
+                   Registration.register(config, @metadata)
+
+          refute error.error_description =~ "hunter2"
+        end)
+
+      assert log =~ "only 4xx refusals are passed through"
+      refute log =~ "hunter2"
+    end
+  end
+
   describe "unregister/3" do
     test "verifies the registration access token in constant time and invokes unregister_client" do
       token = "reg-access-token-123"

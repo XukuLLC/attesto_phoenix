@@ -388,12 +388,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     validated =
       AuthorizationRequest.validate(
         params,
-        RequestPolicy.validation_opts(config, client) ++
-          [
-            request_object_jwks: client_jwks(config, client),
-            request_object_audience: config.issuer,
-            request_object_policy: config.request_object_policy
-          ]
+        RequestPolicy.validation_opts(config, client) ++ RequestPolicy.request_object_opts(config, client)
       )
 
     case validated do
@@ -562,11 +557,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp require_par_if_configured(_config, _request, true), do: :ok
 
   defp par_store(config), do: config_field(config, :par_store, ETS)
-
-  # The request-object (JAR) verification keys for the client. For a CIMD client
-  # the keys are the document's `jwks` / `jwks_uri` (RFC 9101 §6.2); for a
-  # registered client they are the host's `:client_jwks` callback.
-  defp client_jwks(config, client), do: ClientIdMetadata.client_jwks_value(config, client)
 
   # The per-request validation policy (registered redirect URIs, PKCE, nonce) is
   # resolved by the conn-free `AttestoPhoenix.AuthorizationServer.RequestPolicy`,
@@ -1528,10 +1518,38 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # callers keep the JSON body. The body is encoded and sent directly (not
   # through Phoenix content negotiation) so a user agent that arrived without an
   # `Accept` header still receives the error rather than a 406.
-  defp render_direct_error(conn, _config, reason) do
+  defp render_direct_error(conn, config, reason) do
     description = direct_error_description(Callback.map_value(%{reason: reason}, :reason))
     code = direct_error_code(reason)
 
+    case config.render_authorization_error do
+      nil -> render_default_direct_error(conn, code, description)
+      callback -> render_host_direct_error(conn, callback, code, description)
+    end
+  end
+
+  # The host's page for a non-redirectable error (RFC 6749 §4.1.2.1). It is
+  # handed the code and the library's own reason text, never a request
+  # parameter. A callback that does not send a response is a host fault; the
+  # person still has to be told something, so the built-in page is rendered
+  # on the conn as it arrived.
+  defp render_host_direct_error(conn, callback, code, description) do
+    error = PhoenixOAuthError.new(direct_error_atom(code), description, status: 400)
+
+    case Callback.invoke(callback, [conn, error]) do
+      %Plug.Conn{state: state} = rendered when state in [:sent, :chunked, :file] ->
+        rendered
+
+      _not_a_sent_conn ->
+        Logger.error("authorization error render callback did not send a response; rendering the built-in page")
+        render_default_direct_error(conn, code, description)
+    end
+  end
+
+  defp direct_error_atom("invalid_request_uri"), do: :invalid_request_uri
+  defp direct_error_atom(_invalid_request), do: :invalid_request
+
+  defp render_default_direct_error(conn, code, description) do
     if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
       conn
       |> put_resp_content_type("text/html")

@@ -17,6 +17,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
 
   alias Attesto.AuthorizationRequest
   alias Attesto.RedirectURI
+  alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
   alias AttestoPhoenix.{Callback, ClientClassification, ClientIdMetadata, Config, RedirectURIRegistration}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
@@ -53,6 +54,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   this list, so the endpoints cannot drift apart.
   """
   @spec validation_opts(Config.t(), term()) :: keyword()
+  # (see `request_object_opts/2` for the Request Object inputs)
   def validation_opts(config, client) do
     [
       registered_redirect_uris: registered_redirect_uris(config, client),
@@ -61,6 +63,42 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
       require_nonce: require_nonce?(config),
       response_modes_supported: config.response_modes_supported
     ]
+  end
+
+  @doc """
+  The `Attesto.AuthorizationRequest.validate/2` options for an unverified
+  signed `request` object: the client's trusted keys, the issuer audience, the
+  configured policy, and whether this server supports request objects for the
+  client at all.
+
+  Appended to `validation_opts/2` by a caller whose parameters may still carry
+  a Request Object.
+  """
+  @spec request_object_opts(Config.t(), term()) :: keyword()
+  def request_object_opts(config, client) do
+    jwks = ClientIdMetadata.client_jwks_value(config, client)
+
+    [
+      request_object_jwks: jwks,
+      request_object_audience: config.issuer,
+      request_object_policy: config.request_object_policy,
+      request_objects_supported: request_objects_supported?(config, jwks)
+    ]
+  end
+
+  @doc """
+  Whether a `request` parameter from this client can be considered at all.
+
+  Request-object support is what both metadata documents advertise
+  (`RequestObjectMetadata.supported?/1`): the host can resolve a client's
+  trusted keys. A server without it answers `request_not_supported` (OIDC
+  Core §3.1.2.6). A client that carries its own keys, as a Client ID Metadata
+  Document client does, is still served, and a client of a supporting server
+  that simply has no keys gets `invalid_request_object` as before.
+  """
+  @spec request_objects_supported?(Config.t(), term()) :: boolean()
+  def request_objects_supported?(config, client_jwks) do
+    RequestObjectMetadata.supported?(config) or not is_nil(client_jwks)
   end
 
   @doc """

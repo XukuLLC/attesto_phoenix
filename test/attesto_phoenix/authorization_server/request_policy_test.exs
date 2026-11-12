@@ -1,6 +1,7 @@
 defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
   use ExUnit.Case, async: true
 
+  alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.Config
@@ -424,6 +425,42 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
 
       assert error.error == "invalid_request"
       assert error.error_description =~ "code_challenge"
+    end
+  end
+
+  describe "request_object_opts/2 on a server with no :client_jwks" do
+    defp document_jwks do
+      {_kty, public} = {:ec, "P-256"} |> JOSE.JWK.generate_key() |> JOSE.JWK.to_public_map()
+      %{"keys" => [Map.merge(public, %{"kid" => "document-key", "alg" => "ES256"})]}
+    end
+
+    test "a Client ID Metadata Document client is served from the keys its document carries" do
+      config = config([])
+      jwks = document_jwks()
+      cimd = %CIMDClient{metadata: %{"redirect_uris" => ["https://app.example/cb"], "jwks" => jwks}}
+
+      refute RequestObjectMetadata.supported?(config)
+
+      opts = RequestPolicy.request_object_opts(config, cimd)
+      assert opts[:request_objects_supported] == true
+      assert opts[:request_object_jwks] == jwks
+    end
+
+    test "a document client without keys, and a registered client, are not" do
+      config = config([])
+      keyless = %CIMDClient{metadata: %{"redirect_uris" => ["https://app.example/cb"]}}
+
+      for client <- [keyless, @confidential] do
+        opts = RequestPolicy.request_object_opts(config, client)
+        assert opts[:request_objects_supported] == false
+        assert opts[:request_object_jwks] == nil
+      end
+    end
+
+    test "request_objects_supported?/2 follows the host resolver or the client's own keys" do
+      refute RequestPolicy.request_objects_supported?(config([]), nil)
+      assert RequestPolicy.request_objects_supported?(config([]), document_jwks())
+      assert RequestPolicy.request_objects_supported?(config(client_jwks: fn _client -> nil end), nil)
     end
   end
 

@@ -30,9 +30,18 @@ defmodule AttestoPhoenix.RegistrationStore do
   Persist a dynamically registered client (RFC 7591 §3.2.1).
 
   Receives the validated, issuance-ready attributes (the at-rest secret hash,
-  never the plaintext). Returns `{:ok, client}` or `{:error, reason}`; a store
-  rejection surfaces to the caller as `invalid_client_metadata` rather than a
-  server fault.
+  never the plaintext). Returns `{:ok, client}` or `{:error, reason}`:
+
+    * `{:error, {:unavailable, retry_after_seconds}}` - the store cannot take
+      the registration now (a count or rate limit). The client gets `503` with
+      `Retry-After` (RFC 9110 §15.6.4).
+    * `{:error, %AttestoPhoenix.OAuthError{}}` with a 4xx status - the host's
+      own refusal, sent as given.
+    * any other `{:error, reason}` - `400 invalid_client_metadata` (RFC 7591
+      §3.2.2), not a server fault. The reason is not sent. An `OAuthError`
+      with a status outside 4xx is treated this way too, and logged.
+
+  `update_client/2` follows the same rule.
   """
   @callback register_client(attrs :: map()) :: {:ok, client()} | {:error, term()}
 

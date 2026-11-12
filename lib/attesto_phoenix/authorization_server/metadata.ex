@@ -16,6 +16,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
 
   @response_types_supported ["code"]
 
+  @doc """
+  The OAuth response types the authorization endpoint supports (RFC 8414 §2
+  `response_types_supported`). Dynamic registration validates a client's
+  `response_types` against this list.
+  """
+  @spec response_types_supported() :: [String.t()]
+  def response_types_supported, do: @response_types_supported
+
   @wallet_attestation_auth_method "attest_jwt_client_auth"
 
   @doc """

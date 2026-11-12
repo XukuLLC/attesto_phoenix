@@ -6,6 +6,68 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.8.0] - 2026-11-12
+
+Requires `attesto >= 2.14.0`.
+
+### Changed
+
+- Access tokens are refused unless their JOSE header `typ` is the configured
+  `at+jwt` (RFC 9068 §4), at every endpoint that verifies one: UserInfo,
+  introspection, the protected-resource plug, token exchange. The rule is
+  core's `Attesto.Token.verify/3`; see the attesto 2.14.0 changelog. Tokens
+  this server mints have always carried the header.
+- A server with no way to resolve client keys (no `:client_jwks` callback and
+  no `:client_store` providing one) answers a `request` parameter with
+  `request_not_supported` (OIDC Core §3.1.2.6) at the authorization and PAR
+  endpoints. It used to answer `invalid_request_object`. Such a server already
+  advertises `request_parameter_supported: false`. A server that does support
+  request objects still answers `invalid_request_object` for a client that
+  has no usable keys, and a Client ID Metadata Document client that carries
+  its own keys is still served.
+- A `request` parameter sent more than once is answered `invalid_request` at
+  both endpoints (RFC 6749 §3.1). It used to be ignored.
+- Dynamic registration validates `response_types` (RFC 7591 §2). The member
+  used to be dropped: it was neither checked, stored, nor returned. It must
+  now be a list of distinct strings drawn from the response types the
+  authorization endpoint supports (`code`), and it must agree with
+  `grant_types`: `code` goes with `authorization_code`. An absent member
+  defaults to `["code"]` for an `authorization_code` client and is left out
+  for a client with no authorization-endpoint grant. The validated value is
+  passed to `:register_client` / `:update_client` and returned.
+
+  Behaviour change: a registration that names an unsupported response type
+  (`token`, `id_token`, a hybrid) or a pair that cannot work is refused with
+  `invalid_client_metadata` where it used to succeed, and the attributes
+  handed to `:register_client` gain a `"response_types"` member.
+- The registration response describes the client as stored (RFC 7591
+  §3.2.1). When `:client_registration_metadata` is configured, the metadata
+  in a registration or update response is read back from the client that
+  `:register_client` or `:update_client` returned, so a host that narrows
+  scopes or grant types answers with what it kept. The response used to
+  repeat the request. `client_id`, `client_id_issued_at`, the plaintext
+  credentials and the management URI still come from issuance, and a stored
+  value cannot replace them. Without the callback the response is unchanged.
+
+### Added
+
+- `:render_authorization_error`, `(conn, %AttestoPhoenix.OAuthError{} ->
+  conn)`, renders every authorization-endpoint error that cannot be
+  redirected: an unknown client, a missing, invalid or unregistered
+  `redirect_uri`, an unknown or expired `request_uri`, a refused resume, a
+  request over plain HTTP, a refused embedded user agent. The error carries
+  the OAuth code, the library's own reason text and status 400, and no
+  request parameter. Unset, the built-in page is rendered as before. A
+  callback that does not send a response is logged and the built-in page is
+  rendered.
+- `:register_client` and `:update_client` can choose the refusal the client
+  sees. `{:error, {:unavailable, retry_after_seconds}}` answers `503` with
+  `Retry-After` (RFC 9110 §15.6.4), for a host that limits registrations by
+  count or rate. `{:error, %AttestoPhoenix.OAuthError{}}` with a 4xx status
+  is sent as given. Any other refusal is `400 invalid_client_metadata` as
+  before, and an `OAuthError` with a status outside 4xx is answered that way
+  too and logged, so a host fault cannot put a 5xx body on the wire.
+
 ## [4.7.1] - 2026-11-11
 
 ### Fixed

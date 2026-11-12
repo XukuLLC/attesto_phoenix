@@ -394,6 +394,69 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert stored["redirect_uri"] == "https://app.example/cb"
   end
 
+  # The same request-object rule at PAR: a server with no :client_jwks serves
+  # a document client from the keys its document carries.
+  describe "a CIMD client's pushed request object on a server with no :client_jwks" do
+    # A client id per test: the document cache is shared across the node.
+    defp push_cimd_request_object(document_key, signing_key) do
+      client_id = "https://app.example/clients/par-request-#{System.unique_integer([:positive])}.json"
+
+      doc = %{
+        "client_id" => client_id,
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_method" => "private_key_jwt",
+        "jwks" => %{"keys" => [public_jwk(document_key)]}
+      }
+
+      {:ok, _} =
+        start_supervised(%{
+          id: CimdFetcher,
+          start: {Agent, :start_link, [fn -> %{client_id => JSON.encode!(doc)} end, [name: CimdFetcher]]}
+        })
+
+      put_config(client_id_metadata: [enabled: true, fetcher: CimdFetcher, cache: CimdCache])
+
+      claims =
+        Map.merge(request_claims(), %{
+          "iss" => client_id,
+          "client_id" => client_id,
+          "redirect_uri" => "https://app.example/cb"
+        })
+
+      request = signed_request_object(signing_key, client_id, claims, %{"typ" => "oauth-authz-req+jwt"})
+
+      params = %{
+        "client_id" => client_id,
+        "request" => request,
+        "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+        "client_assertion" => client_assertion(document_key, client_id)
+      }
+
+      {client_id, :post |> conn(@endpoint_path, params) |> PARController.create(params)}
+    end
+
+    test "a validly signed object is verified against the document's keys and stored" do
+      key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      {client_id, conn} = push_cimd_request_object(key, key)
+
+      assert conn.status == 201
+      assert {:ok, stored, _ttl} = PARStore.lookup(JSON.decode!(conn.resp_body)["request_uri"])
+      assert stored["client_id"] == client_id
+      assert stored["redirect_uri"] == "https://app.example/cb"
+    end
+
+    test "an object signed by a key the document does not carry is invalid_request_object" do
+      document_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      other_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      {_client_id, conn} = push_cimd_request_object(document_key, other_key)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_request_object"
+    end
+  end
+
   test "rejects a cross-origin CIMD redirect at PAR before storing the request" do
     cimd_client_id = "https://cross-origin-app.example/clients/par.json"
     client_key = JOSE.JWK.generate_key({:ec, "P-256"})
@@ -842,14 +905,31 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_dpop_proof"
     end
 
-    test "rejects a signed request object when the client has no JWKS configured (fail closed)" do
+    test "a server with no :client_jwks answers a pushed request object request_not_supported" do
       request_key = JOSE.JWK.generate_key({:ec, "P-256"})
 
       # The default (generic) policy permits a host with no :client_jwks (request
-      # objects are optional), but a request object that IS pushed still has no
-      # key to verify against, so it is rejected rather than trusted. (A policy
-      # that REQUIRES request objects without :client_jwks is rejected at boot;
-      # see AttestoPhoenix.ConfigTest.)
+      # objects are optional). Such a server does not support the `request`
+      # parameter and advertises `request_parameter_supported: false`, so a
+      # pushed object is refused with the code OIDC Core §3.1.2.6 gives for
+      # that, not trusted and not called invalid. (A policy that REQUIRES
+      # request objects without :client_jwks is rejected at boot; see
+      # AttestoPhoenix.ConfigTest.)
+
+      request =
+        signed_request_object(request_key, "confidential-1", request_claims(), %{
+          "typ" => "oauth-authz-req+jwt"
+        })
+
+      conn = par_with_request_object(request)
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "request_not_supported"
+    end
+
+    test "a supporting server answers a client that has no keys invalid_request_object" do
+      put_config(client_jwks: fn %{id: "confidential-1"} -> nil end)
+      request_key = JOSE.JWK.generate_key({:ec, "P-256"})
 
       request =
         signed_request_object(request_key, "confidential-1", request_claims(), %{
@@ -860,6 +940,19 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
 
       assert conn.status == 400
       assert JSON.decode!(conn.resp_body)["error"] == "invalid_request_object"
+    end
+
+    test "a repeated request parameter is invalid_request (RFC 6749 §3.1)" do
+      conn = par_with_request_object(["a.b.c", "d.e.f"])
+
+      assert conn.status == 400
+      assert JSON.decode!(conn.resp_body)["error"] == "invalid_request"
+    end
+
+    test "an empty request parameter counts as omitted" do
+      conn = par_with_request_object("")
+
+      assert conn.status == 201
     end
   end
 

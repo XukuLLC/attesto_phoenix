@@ -947,6 +947,75 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert record.data.client_id == client_id
     end
 
+    # A server with no :client_jwks does not support request objects in
+    # general, but a document client brings its own keys, so its signed
+    # request is verified against them.
+    defp cimd_signed_request(client_id) do
+      signed_request_object(%{
+        "iss" => client_id,
+        "client_id" => client_id,
+        "redirect_uri" => @cimd_redirect_uri,
+        "state" => "from-object"
+      })
+    end
+
+    test "a document client's signed request object is verified against the document's keys" do
+      client_id = unique_cimd_client_id()
+      {request, client_jwk} = cimd_signed_request(client_id)
+      script_doc(client_id, cimd_doc(%{"jwks" => %{"keys" => [client_jwk]}}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn = call(%{"client_id" => client_id, "response_type" => "code", "request" => request})
+
+      assert conn.status == 302
+      assert location(conn) =~ @cimd_redirect_uri
+      query = location_query(conn)
+      assert query["state"] == "from-object"
+      assert TestStore.peek(query["code"]).data.client_id == client_id
+    end
+
+    test "a document client's request object signed by another key is invalid_request_object" do
+      client_id = unique_cimd_client_id()
+      {request, _signing_jwk} = cimd_signed_request(client_id)
+      {_other_request, other_jwk} = cimd_signed_request(client_id)
+      script_doc(client_id, cimd_doc(%{"jwks" => %{"keys" => [other_jwk]}}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => @cimd_redirect_uri,
+            "request" => request
+          })
+        )
+
+      assert %{"error" => "invalid_request_object"} = query = location_query(conn)
+      refute Map.has_key?(query, "code")
+    end
+
+    test "on the same server a document client without keys, and a registered client, get request_not_supported" do
+      client_id = unique_cimd_client_id()
+      {request, _jwk} = cimd_signed_request(client_id)
+      script_doc(client_id, cimd_doc())
+      put_config(client_id_metadata: cimd_config())
+
+      keyless =
+        call(
+          valid_params(%{
+            "client_id" => client_id,
+            "redirect_uri" => @cimd_redirect_uri,
+            "request" => request
+          })
+        )
+
+      assert %{"error" => "request_not_supported"} = location_query(keyless)
+
+      {registered_request, _jwk} = signed_request_object(%{})
+      registered = call(valid_params(%{"request" => registered_request}))
+      assert %{"error" => "request_not_supported"} = location_query(registered)
+    end
+
     test "rejects a redirect_uri not in the document (direct error)" do
       client_id = unique_cimd_client_id()
       script_doc(client_id, cimd_doc())
@@ -2082,6 +2151,126 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert Interaction.max_age_allowance(1_000, 1_200, 1_400) == 400
       assert Interaction.max_age_allowance(1_000, 999, 1_400) == 0
       assert Interaction.max_age_allowance(1_000, nil, 1_400) == 0
+    end
+  end
+
+  describe ":render_authorization_error (RFC 6749 §4.1.2.1)" do
+    test "the host renders a non-redirectable error from the code and the library's reason" do
+      test_pid = self()
+
+      put_config(
+        render_authorization_error: fn conn, error ->
+          send(test_pid, {:rendered, error})
+
+          conn
+          |> put_resp_content_type("text/plain")
+          |> send_resp(error.status, "host page: #{error.error}")
+        end
+      )
+
+      conn = call(valid_params(%{"redirect_uri" => "https://evil.example/steal", "state" => "<script>"}))
+
+      assert conn.status == 400
+      assert conn.resp_body == "host page: invalid_request"
+      assert get_resp_header(conn, "location") == []
+
+      assert_received {:rendered,
+                       %AttestoPhoenix.OAuthError{
+                         error: :invalid_request,
+                         error_description: "redirect_uri is not registered for this client",
+                         status: 400
+                       } = error}
+
+      # The error carries nothing the request supplied.
+      refute inspect(error) =~ "evil.example"
+      refute inspect(error) =~ "<script>"
+    end
+
+    test "every non-redirectable error goes through the callback" do
+      test_pid = self()
+
+      put_config(
+        render_authorization_error: fn conn, error ->
+          send(test_pid, {:rendered, error.error, error.error_description})
+          send_resp(conn, 400, "")
+        end
+      )
+
+      valid_params() |> Map.delete("client_id") |> call()
+      assert_received {:rendered, :invalid_request, "client_id is invalid"}
+
+      valid_params() |> Map.delete("redirect_uri") |> call()
+      assert_received {:rendered, :invalid_request, "redirect_uri is required"}
+
+      call(%{"client_id" => @client_id, "request_uri" => "urn:ietf:params:oauth:request_uri:unknown"})
+      assert_received {:rendered, :invalid_request_uri, "the request_uri is unknown or has expired"}
+
+      build_conn()
+      |> Map.put(:scheme, :http)
+      |> with_config()
+      |> AuthorizeController.authorize(valid_params())
+
+      assert_received {:rendered, :invalid_request, "TLS required"}
+    end
+
+    test "a redirectable error does not use the callback" do
+      test_pid = self()
+      put_config(render_authorization_error: fn conn, _error -> send(test_pid, :rendered) && conn end)
+
+      conn = call(valid_params(%{"response_type" => "token"}))
+
+      assert %{"error" => "unsupported_response_type"} = location_query(conn)
+      refute_received :rendered
+    end
+
+    test "a callback that sends nothing falls back to the built-in page" do
+      put_config(render_authorization_error: fn conn, _error -> conn end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          conn = call(valid_params(%{"redirect_uri" => "https://evil.example/steal"}))
+
+          assert conn.status == 400
+          assert JSON.decode!(conn.resp_body)["error_description"] == "redirect_uri is not registered for this client"
+        end)
+
+      assert log =~ "authorization error render callback did not send a response"
+    end
+
+    test "unset, the built-in page is unchanged" do
+      conn = call(valid_params(%{"redirect_uri" => "https://evil.example/steal"}))
+
+      assert conn.status == 400
+      assert get_resp_header(conn, "content-type") == ["application/json; charset=utf-8"]
+
+      assert JSON.decode!(conn.resp_body) == %{
+               "error" => "invalid_request",
+               "error_description" => "redirect_uri is not registered for this client"
+             }
+    end
+  end
+
+  describe "request parameter (OIDC Core §3.1.2.6, RFC 6749 §3.1)" do
+    test "a server with no :client_jwks answers request_not_supported" do
+      conn = call(valid_params(%{"request" => "eyJhbGciOiJFUzI1NiJ9.e30.c2ln"}))
+
+      assert %{"error" => "request_not_supported", "state" => "xyz"} = location_query(conn)
+    end
+
+    test "a supporting server answers a client with no keys invalid_request_object" do
+      put_config(client_jwks: fn _client -> nil end)
+
+      conn = call(valid_params(%{"request" => "eyJhbGciOiJFUzI1NiJ9.e30.c2ln"}))
+
+      assert %{"error" => "invalid_request_object"} = location_query(conn)
+    end
+
+    test "a repeated request parameter is invalid_request, and an empty one is ignored" do
+      conn = call(valid_params(%{"request" => ["a.b.c", "d.e.f"]}))
+      assert %{"error" => "invalid_request"} = location_query(conn)
+
+      conn = call(valid_params(%{"request" => ""}))
+      assert is_binary(location_query(conn)["code"])
     end
   end
 

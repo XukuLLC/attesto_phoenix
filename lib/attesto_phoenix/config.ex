@@ -111,6 +111,24 @@ defmodule AttestoPhoenix.Config do
       bound to.
     * `:on_event` - `(%AttestoPhoenix.Event{} -> any)`. Audit/telemetry hook.
       No-op by default; the library never stores events itself.
+    * `:render_authorization_error` - `(conn, %AttestoPhoenix.OAuthError{} ->
+      conn)`. Optional. Renders every authorization-endpoint error that cannot
+      be redirected: an unknown client, a missing, invalid or unregistered
+      `redirect_uri`, an unknown or expired `request_uri`, a refused resume, a
+      request over plain HTTP, a refused embedded user agent. RFC 6749
+      §4.1.2.1 says the server must not redirect in these cases and should
+      inform the resource owner, so this page is the only thing the person
+      sees. The error carries the OAuth code in `:error`
+      (`:invalid_request` or `:invalid_request_uri`), the library's own
+      reason text in `:error_description`, and `status: 400`. It carries no
+      request parameter: a `client_id`, `redirect_uri` or `state` on such a
+      request is untrusted input, and a page that echoes one is how an
+      attacker's text or link ends up on the server's origin. They are still
+      on `conn`; do not render them. The callback must send the response and
+      return the conn. Unset, the library renders its built-in page (HTML
+      for a browser, JSON otherwise). If the callback returns anything other
+      than a sent conn, the built-in page is rendered and the fault is
+      logged.
     * `:send_error` - `(conn, status, body_map -> conn)`. Optional transport
       hook used by `AttestoPhoenix.OAuthError` to serialize OAuth/OIDC errors
       into the host's API envelope while preserving the RFC status, challenge,
@@ -178,7 +196,17 @@ defmodule AttestoPhoenix.Config do
       JWK Set.
     * `:register_client` - `(metadata -> {:ok, client} | {:error, reason})`.
       Persists a dynamically registered client. Required only when
-      `:registration_enabled`.
+      `:registration_enabled`. A refusal reaches the client as follows:
+      `{:error, {:unavailable, retry_after_seconds}}`, for a host that limits
+      registrations by count or rate, answers `503` with `Retry-After`;
+      `{:error, %AttestoPhoenix.OAuthError{}}` with a 4xx status is sent as
+      the host built it; any other `{:error, reason}` answers `400
+      invalid_client_metadata` (RFC 7591 §3.2.2) and the reason is not sent.
+      `:update_client` follows the same rule. The registration response
+      describes the client the callback returned when
+      `:client_registration_metadata` is configured (see that key); the
+      identifier, the plaintext credentials and the management URI always
+      come from issuance.
     * `:unregister_client` - `(client -> :ok | {:ok, client} | {:error, reason})`.
       Deletes a dynamically registered client for registration management
       cleanup (RFC 7592). Optional; when unset, DELETE requests to the
@@ -191,8 +219,13 @@ defmodule AttestoPhoenix.Config do
       registered metadata as it was handed to `:register_client` (a
       string-keyed map). Serves `GET` on the registration management endpoint
       (RFC 7592 §2.1) and is the baseline an update is compared with.
-      Credential hashes in the map are never sent to the client. Optional;
-      when unset, `GET` and `PUT` fail closed.
+      It is also how a registration or update response reports what was
+      registered (RFC 7591 §3.2.1): the callback is applied to the client
+      `:register_client` or `:update_client` returned, so a host that narrows
+      scopes or grant types answers with what it kept. Credential hashes in
+      the map are never sent to the client. Optional; when unset, `GET` and
+      `PUT` fail closed, and a registration response reports the validated
+      request.
     * `:update_client` - `(client, metadata -> {:ok, client} | {:error,
       reason})`. Replaces a dynamically registered client's metadata after a
       validated `PUT` to the registration management endpoint (RFC 7592
@@ -1369,6 +1402,7 @@ defmodule AttestoPhoenix.Config do
     :logout_session_store,
     :terminate_session,
     :render_logged_out,
+    :render_authorization_error,
     :client_post_logout_redirect_uris,
     :client_backchannel_logout_uri,
     :client_backchannel_logout_session_required,
@@ -1608,6 +1642,7 @@ defmodule AttestoPhoenix.Config do
           terminate_session: callback() | nil,
           on_invalid_id_token_hint: :reject | :terminate_session,
           render_logged_out: callback() | nil,
+          render_authorization_error: callback() | nil,
           client_post_logout_redirect_uris: callback() | nil,
           client_backchannel_logout_uri: callback() | nil,
           client_backchannel_logout_session_required: callback() | nil,
@@ -3656,6 +3691,7 @@ defmodule AttestoPhoenix.Config do
     replay_check: 2,
     terminate_session: 2,
     render_logged_out: 2,
+    render_authorization_error: 2,
     interaction_browser_binding: 1
   }
 

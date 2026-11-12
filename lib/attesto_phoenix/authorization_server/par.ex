@@ -329,17 +329,33 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # to PAR by such a deployment would be rejected as `invalid_request_object`.
   defp verify_request_object(config, client, bound_client_id, %{"request" => request})
        when is_binary(request) and request != "" do
-    opts =
-      [issuer: bound_client_id, audience: config.issuer] ++
-        RequestObject.Policy.to_verify_opts(request_object_policy(config))
+    jwks = client_jwks(config, client)
 
-    case RequestObject.verify(request, client_jwks(config, client) || %{"keys" => []}, opts) do
-      {:ok, object_params} ->
-        {:ok, Map.put(object_params, "request", request)}
+    if RequestPolicy.request_objects_supported?(config, jwks) do
+      opts =
+        [issuer: bound_client_id, audience: config.issuer] ++
+          RequestObject.Policy.to_verify_opts(request_object_policy(config))
 
-      {:error, _reason} ->
-        {:error, error(@error_invalid_request_object, "request object is invalid")}
+      case RequestObject.verify(request, jwks || %{"keys" => []}, opts) do
+        {:ok, object_params} ->
+          {:ok, Map.put(object_params, "request", request)}
+
+        {:error, _reason} ->
+          {:error, error(@error_invalid_request_object, "request object is invalid")}
+      end
+    else
+      # OIDC Core §3.1.2.6: this server does not support the `request`
+      # parameter, which is a different answer from an object it could not
+      # verify.
+      {:error, OAuthError.new(:request_not_supported, "request object is not supported", status: 400)}
     end
+  end
+
+  # RFC 6749 §3.1: a parameter MUST NOT be included more than once. A `request`
+  # that arrives as a list or a map is not one Request Object.
+  defp verify_request_object(_config, _client, _bound_client_id, %{"request" => request})
+       when not is_binary(request) and not is_nil(request) do
+    {:error, error(@error_invalid_request, "request must be a single value")}
   end
 
   # No `request` object pushed. FAPI 2.0 Message Signing §5.3.1: when the

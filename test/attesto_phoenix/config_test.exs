@@ -564,6 +564,18 @@ defmodule AttestoPhoenix.ConfigTest do
       end
     end
 
+    test "validates :render_authorization_error as a two-argument callback" do
+      assert %Config{render_authorization_error: nil} = config([])
+      callback = fn conn, _error -> conn end
+      assert %Config{render_authorization_error: ^callback} = config(render_authorization_error: callback)
+
+      for invalid <- [fn conn -> conn end, fn conn, _error, _extra -> conn end, :not_a_callback] do
+        assert_raise ArgumentError, ~r/:render_authorization_error must be a two-argument callback/, fn ->
+          config(render_authorization_error: invalid)
+        end
+      end
+    end
+
     test "accepts only :reject or :terminate_session for :on_invalid_id_token_hint" do
       assert %Config{on_invalid_id_token_hint: :reject} = config([])
 
