@@ -21,6 +21,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Introspection do
   """
 
   alias Attesto.{Introspection, SignedIntrospection}
+  alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
 
   alias AttestoPhoenix.{
     Callback,
@@ -75,7 +76,23 @@ defmodule AttestoPhoenix.AuthorizationServer.Introspection do
       authorize: caller_authorize(config, client_id)
     )
     |> suppress_contained_access_token(config)
+    |> put_caller_subject(config, client_id)
   end
+
+  # OIDC Core §8: the caller is shown the `sub` it is shown everywhere else. A
+  # pairwise caller gets its derived identifier for the token's resource
+  # owner, whichever client the token was issued to, so introspection is not a
+  # way to learn the host subject. When the identifier cannot be established
+  # the token is reported inactive.
+  defp put_caller_subject(%{"active" => true, "sub" => subject} = response, config, client_id)
+       when is_binary(subject) and subject != "" do
+    case SubjectIdentifier.for_client_id(config, client_id, subject) do
+      {:ok, sub} -> Map.put(response, "sub", sub)
+      {:error, _reason} -> %{"active" => false}
+    end
+  end
+
+  defp put_caller_subject(response, _config, _client_id), do: response
 
   @doc """
   Sign an RFC 7662 introspection `response` map as an RFC 9701 JWT audienced to

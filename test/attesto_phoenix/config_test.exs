@@ -522,6 +522,121 @@ defmodule AttestoPhoenix.ConfigTest do
       assert %Config{} = config(refresh_token_ttl: 60, refresh_token_rotation_grace_seconds: 60)
     end
 
+    test ":response_modes_supported is a non-empty subset of core's supported modes" do
+      assert %Config{response_modes_supported: modes} = config([])
+      assert modes == Attesto.AuthorizationRequest.supported_response_modes()
+      assert %Config{response_modes_supported: ["query"]} = config(response_modes_supported: ["query"])
+
+      for bad <- [[], ["fragment"], ["query", "query"], "query", nil] do
+        assert_raise ArgumentError, ~r/AttestoPhoenix.Config: :response_modes_supported must be a non-empty list/, fn ->
+          config(response_modes_supported: bad)
+        end
+      end
+    end
+
+    test "bounds :id_token_ttl by the core ID Token lifetime ceiling" do
+      assert %Config{id_token_ttl: 3600, id_token_azp: :never} = config([])
+      assert %Config{id_token_ttl: 300} = config(id_token_ttl: 300)
+      assert %Config{id_token_ttl: 3600} = config(id_token_ttl: 3600)
+
+      for value <- [0, -1, 1.5, "300", nil, 3601] do
+        assert_raise ArgumentError, ~r/:id_token_ttl must be a positive integer not exceeding 3600 seconds/, fn ->
+          config(id_token_ttl: value)
+        end
+      end
+    end
+
+    test "bounds :interaction_ttl and takes a one-argument :interaction_browser_binding" do
+      assert %Config{interaction_ttl: 600, interaction_browser_binding: nil} = config([])
+      assert %Config{interaction_ttl: 3600} = config(interaction_ttl: 3600)
+
+      for value <- [0, -1, 3601, 1.5, "600", nil] do
+        assert_raise ArgumentError, ~r/:interaction_ttl must be a positive integer not exceeding 3600 seconds/, fn ->
+          config(interaction_ttl: value)
+        end
+      end
+
+      binding = fn _conn -> "browser" end
+      assert %Config{interaction_browser_binding: ^binding} = config(interaction_browser_binding: binding)
+
+      assert_raise ArgumentError, ~r/:interaction_browser_binding must be a one-argument callback/, fn ->
+        config(interaction_browser_binding: fn _conn, _extra -> "browser" end)
+      end
+    end
+
+    test "accepts only :reject or :terminate_session for :on_invalid_id_token_hint" do
+      assert %Config{on_invalid_id_token_hint: :reject} = config([])
+
+      assert %Config{on_invalid_id_token_hint: :terminate_session} =
+               config(on_invalid_id_token_hint: :terminate_session)
+
+      for value <- [true, nil, "reject", :ignore] do
+        assert_raise ArgumentError, ~r/:on_invalid_id_token_hint must be :reject or :terminate_session/, fn ->
+          config(on_invalid_id_token_hint: value)
+        end
+      end
+    end
+
+    test "validates :userinfo_scope_claims and :userinfo_always_claims" do
+      assert %Config{userinfo_scope_claims: %{}, userinfo_always_claims: []} = config([])
+
+      assert %Config{userinfo_scope_claims: %{"profile" => ["tenant"]}, userinfo_always_claims: ["tenant"]} =
+               config(userinfo_scope_claims: %{"profile" => ["tenant"]}, userinfo_always_claims: ["tenant"])
+
+      for value <- [nil, [], [{"profile", ["tenant"]}], %{profile: ["tenant"]}, %{"" => ["tenant"]}] do
+        assert_raise ArgumentError, ~r/AttestoPhoenix.Config: :userinfo_scope_claims/, fn ->
+          config(userinfo_scope_claims: value)
+        end
+      end
+
+      for value <- [%{"profile" => "tenant"}, %{"profile" => [:tenant]}, %{"profile" => [""]}] do
+        assert_raise ArgumentError, ~r/:userinfo_scope_claims claim names must be a list/, fn ->
+          config(userinfo_scope_claims: value)
+        end
+      end
+
+      for value <- [nil, "tenant", [:tenant], %{}] do
+        assert_raise ArgumentError, ~r/:userinfo_always_claims claim names must be a list/, fn ->
+          config(userinfo_always_claims: value)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:userinfo_always_claims must not name sub/, fn ->
+        config(userinfo_always_claims: ["sub"])
+      end
+
+      assert_raise ArgumentError, ~r/:userinfo_scope_claims must not name sub/, fn ->
+        config(userinfo_scope_claims: %{"profile" => ["sub"]})
+      end
+    end
+
+    test "checks configured UserInfo claims against a non-empty :claims_supported" do
+      assert %Config{} =
+               config(
+                 claims_supported: ["sub", "tenant", "plan"],
+                 userinfo_scope_claims: %{"profile" => ["tenant"]},
+                 userinfo_always_claims: ["plan"]
+               )
+
+      assert_raise ArgumentError, ~r/absent from :claims_supported: \["plan"\]/, fn ->
+        config(
+          claims_supported: ["sub", "tenant"],
+          userinfo_scope_claims: %{"profile" => ["tenant"]},
+          userinfo_always_claims: ["plan"]
+        )
+      end
+    end
+
+    test "accepts only :never or :always for :id_token_azp" do
+      assert %Config{id_token_azp: :always} = config(id_token_azp: :always)
+
+      for value <- [true, false, nil, "always", :sometimes] do
+        assert_raise ArgumentError, ~r/:id_token_azp must be :never or :always/, fn ->
+          config(id_token_azp: value)
+        end
+      end
+    end
+
     test "validates the optional fixed family limit and experimental expiry metadata" do
       assert config().refresh_token_max_lifetime == nil
       assert config(refresh_token_max_lifetime: 60).refresh_token_max_lifetime == 60
@@ -1485,6 +1600,12 @@ defmodule AttestoPhoenix.ConfigTest do
       for invalid <- [fn _context -> :ok end, :not_a_callback, {__MODULE__, :missing_callback}] do
         assert_raise ArgumentError, ~r/:authorization_code_completion must be a two-argument callback/, fn ->
           config(authorization_code_completion: invalid)
+        end
+
+        for key <- [:authorization_code_issuance, :refresh_completion] do
+          assert_raise ArgumentError, ~r/#{inspect(key)} must be a two-argument callback/, fn ->
+            config([{key, invalid}])
+          end
         end
       end
     end

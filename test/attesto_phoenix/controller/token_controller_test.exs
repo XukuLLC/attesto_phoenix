@@ -1681,6 +1681,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
                       %AttestoPhoenix.Event{
                         name: :token_issued,
                         grant_type: "client_credentials",
+                        subject: nil,
                         metadata: metadata
                       }}
 
@@ -3185,6 +3186,58 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       # present when the exchange supplies the artifacts to bind.
       assert is_binary(claims["at_hash"])
       assert is_binary(claims["c_hash"])
+      # Defaults: a one-hour lifetime and no `azp`.
+      assert claims["exp"] - claims["iat"] == 3600
+      refute Map.has_key?(claims, "azp")
+    end
+
+    test "token_issued carries the resource owner for an authorization_code grant" do
+      capture_events()
+      enable_minting()
+      code_store = start_openid_code_store(["openid"], %{"nonce" => "n-evt"})
+      put_config(code_store: code_store)
+
+      conn = post_auth_code()
+
+      assert conn.status == 200
+
+      assert_receive {:event,
+                      %AttestoPhoenix.Event{
+                        name: :token_issued,
+                        grant_type: "authorization_code",
+                        subject: "oc_sub-1"
+                      }}
+    end
+
+    test ":id_token_ttl sets the ID Token lifetime" do
+      enable_minting()
+      code_store = start_openid_code_store(["openid"], %{"nonce" => "n-ttl"})
+      put_config(code_store: code_store, id_token_ttl: 300)
+
+      conn = post_auth_code()
+
+      assert conn.status == 200
+
+      {:ok, claims} =
+        Attesto.IDToken.verify(id_token_config(), body(conn)["id_token"], client_id: "public-1", nonce: "n-ttl")
+
+      assert claims["exp"] - claims["iat"] == 300
+    end
+
+    test "id_token_azp: :always stamps azp with the client the ID Token is issued to" do
+      enable_minting()
+      code_store = start_openid_code_store(["openid"], %{"nonce" => "n-azp"})
+      put_config(code_store: code_store, id_token_azp: :always)
+
+      conn = post_auth_code()
+
+      assert conn.status == 200
+
+      {:ok, claims} =
+        Attesto.IDToken.verify(id_token_config(), body(conn)["id_token"], client_id: "public-1", nonce: "n-azp")
+
+      assert claims["azp"] == "public-1"
+      assert claims["aud"] == "public-1"
     end
 
     test "records a logout session at ID-Token mint for a front-channel-capable client" do

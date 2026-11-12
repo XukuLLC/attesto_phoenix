@@ -96,9 +96,19 @@ defmodule AttestoPhoenix.Config do
       during a rolling upgrade. Existing bindings and attestation keys remain
       enforced. Return to `:reject` after legacy token writers are retired.
     * `:authorize_scope` - `(client, requested_scope -> {:ok, granted_scope} |
-      {:error, :invalid_scope})`. Validates or narrows requested scope. Defaults
+      {:error, :invalid_scope})`, or the three-argument form
+      `(client, requested_scope, resources -> {:ok, granted_scope} |
+      {:error, :invalid_scope | :invalid_target})`, which also receives the
+      request's resolved RFC 8707 resource indicators and is used when the
+      callback has that arity. Validates or narrows requested scope. Defaults
       to requiring every requested scope to appear in the effective
-      authorization-server scope catalog.
+      authorization-server scope catalog. The policy runs at the authorization
+      endpoint, after request validation and before the resource owner is
+      authenticated, and again at the token endpoint, with the same arguments.
+      At the authorization endpoint a refusal is a redirectable `invalid_scope`
+      or `invalid_target` (RFC 6749 §4.1.2.1, RFC 8707 §2), under `prompt=none`
+      too, and a narrowed scope is what the consent step sees and the code is
+      bound to.
     * `:on_event` - `(%AttestoPhoenix.Event{} -> any)`. Audit/telemetry hook.
       No-op by default; the library never stores events itself.
     * `:send_error` - `(conn, status, body_map -> conn)`. Optional transport
@@ -175,8 +185,21 @@ defmodule AttestoPhoenix.Config do
       registration management endpoint fail closed.
     * `:client_registration_access_token_hash` - `(client -> String.t() | nil)`.
       Extracts the stored hash of the registration access token issued with a
-      dynamic client (RFC 7592). Optional; when unset, DELETE requests fail
-      closed.
+      dynamic client (RFC 7592). Optional; when unset, every request to the
+      registration management endpoint fails closed.
+    * `:client_registration_metadata` - `(client -> map)`. Returns the client's
+      registered metadata as it was handed to `:register_client` (a
+      string-keyed map). Serves `GET` on the registration management endpoint
+      (RFC 7592 §2.1) and is the baseline an update is compared with.
+      Credential hashes in the map are never sent to the client. Optional;
+      when unset, `GET` and `PUT` fail closed.
+    * `:update_client` - `(client, metadata -> {:ok, client} | {:error,
+      reason})`. Replaces a dynamically registered client's metadata after a
+      validated `PUT` to the registration management endpoint (RFC 7592
+      §2.2). `metadata` is the complete new registration, validated by the
+      rules a registration request is, with `client_id` and
+      `client_id_issued_at`; the host replaces what it stored and keeps the
+      credential hashes. Optional; when unset, `PUT` fails closed.
     * `:introspection_authorize` - `(caller_client_id, response -> boolean)`.
       Authorizes the authenticated introspection caller against the token being
       introspected (RFC 7662 §4 / RFC 9701 §5). Consulted only for an active
@@ -293,6 +316,9 @@ defmodule AttestoPhoenix.Config do
       `sub` is present (OpenID Connect Core §5.3.2). `granted_scopes` is the
       list of scopes on the access token; `requested_claims` is the per-claim
       request map from the OpenID Connect `claims` parameter (`%{}` when none).
+      It may return `{:error, :invalid_token}` to refuse the subject, for
+      example one disabled after the access token was minted; the endpoint
+      then answers `401` with the RFC 6750 §3.1 `invalid_token` challenge.
       Required only when the UserInfo endpoint is mounted.
     * `:build_credential` - `(subject, credential_configuration_id,
       holder_jwk -> {:ok, credential} | {:error, reason})`. Produces the
@@ -425,9 +451,14 @@ defmodule AttestoPhoenix.Config do
       `:refresh_store` is configured.
     * `:authorization_code_private_context` - `(context -> map | nil)`.
       Optional trusted issuance callback for host-private authorization state.
-      `context` contains exactly the authorized `:client_id`, `:subject`, and
-      freshly generated authorization-grant provenance `:family_id`; it contains
-      no request parameters or token secrets. This identifier is the value
+      `context` contains the authorized `:client_id`, the `:subject` id string,
+      the freshly generated authorization-grant provenance `:family_id`,
+      `:authentication` (the subject map the host's authentication and consent
+      callbacks returned, with whatever it carries: `:subject`, `:auth_time`,
+      `:sid`, `:acr`, `:amr` and any host keys), and the validated request's `:scope`
+      (a list) and `:resource` (a list of RFC 8707 resource indicators, empty
+      when none was requested). It contains no raw request parameters or token
+      secrets. The family identifier is the value
       exposed by `:authorization_grant_id_claim` when configured, not the
       separately generated refresh-rotation family identifier. A returned map
       must be a portable JSON object
@@ -461,6 +492,68 @@ defmodule AttestoPhoenix.Config do
       silently skipped. Deploy callback-capable nodes before enabling private
       context; this check cannot detect an older package version on another
       node.
+    * `:authorization_code_issuance` - `(context, continuation -> result)`.
+      Optional synchronous wrapper around authorization-code issuance at the
+      authorization endpoint, after authentication, consent and the
+      private-context callback, and before the code exists. `context` is
+      `%{client_id, subject, family_id, private_context}`: the authorized
+      client, the subject id string, the authorization-grant provenance id,
+      and the map `:authorization_code_private_context` returned (or `nil`).
+      The zero-arity continuation stores the code and returns `{:ok, code}` or
+      `{:error, reason}`. A host runs it inside its own transaction and locks
+      to issue the code atomically with a session or eligibility check, and
+      returns the continuation's result unchanged; the one `{:ok, _}` wrapper
+      of `Repo.transaction/1` is accepted. When unset, the code is issued
+      directly, as before.
+
+      The host may refuse with `{:error, %AttestoPhoenix.OAuthError{}}`. Its
+      error code becomes the redirectable authorization error:
+      `access_denied` when the user is no longer eligible, `server_error` or
+      `temporarily_unavailable` on a host failure. `login_required` is honored
+      only for a `prompt=none` request; on an interactive request, and for any
+      other code, the answer is `server_error` with a log line. The error
+      description is not sent to the client.
+
+      The continuation follows the rules of
+      `AttestoPhoenix.AuthorizationServer.Continuation`: one invocation, in
+      the callback's process, during the callback. A success returned without
+      invoking it issues nothing and is answered `server_error`. When the
+      request came through PAR, its `request_uri` has already been claimed, so
+      a refusal here ends that pushed request. The continuation's result holds
+      the authorization code; the callback must not log or store it.
+    * `:refresh_completion` - `(context, continuation -> result)`. Optional
+      synchronous wrapper around the refresh grant, from rotation of the
+      presented refresh token through scope policy, `:build_refresh_principal`
+      and the mint. `context` is `%{client_id, subject, family_id, scope,
+      resource, auth_time, acr, sid}`, read from the stored grant without
+      consuming it: the authenticated client, the grant's subject, its refresh
+      family, the granted scope and resource lists, the original
+      authentication time and context, and the host session identifier the
+      grant was issued under (`nil` when none was recorded). It carries no
+      token, token hash, or host claims. The host re-checks the subject's
+      eligibility and runs the continuation inside its own transaction and
+      locks, returning its `{:ok, response, events}` or error result
+      unchanged, or refuses with
+      `{:error, AttestoPhoenix.OAuthError.new(:invalid_grant)}`. When unset,
+      the grant runs directly in the order it always has.
+
+      Rotation is the continuation's first step. A host that refuses without
+      invoking the continuation has not consumed the presented token. With
+      `AttestoPhoenix.Store.EctoRefreshStore` on the repo the host's
+      transaction runs on, the rotation joins that transaction, so a rollback
+      (a `Repo.rollback/1`, or an exception) also leaves the presented token
+      usable. A refresh store that is not transactional with the host, such as
+      `Attesto.RefreshStore.ETS`, cannot be rolled back: once the continuation
+      has run, the presented token is rotated whatever the host returns, and a
+      host that needs to refuse must do so before invoking it.
+
+      Reuse detection is not undone by a rollback: when the continuation
+      reports a replayed token, the family revocation is applied again after
+      the callback returns, outside the host's transaction. The DPoP proof
+      replay claim is committed before the callback and is not part of the
+      continuation. A presented token with no stored record is not passed to
+      the callback; the grant fails as an unknown token. The continuation
+      follows the rules of `AttestoPhoenix.AuthorizationServer.Continuation`.
     * `:authorization_code_completion` - `(context, continuation -> result)`.
       Optional synchronous wrapper around authorization-code completion. It is
       invoked after the code has been redeemed and before `:build_principal` or
@@ -561,6 +654,43 @@ defmodule AttestoPhoenix.Config do
       operations under the same request configuration. This declaration enables
       issuer migration and the Ecto retry-secret/cleanup checks; it never
       replaces `:refresh_store` or bypasses its policy callbacks.
+    * `:client_subject_type` - `(client -> "public" | "pairwise")`. The
+      client's subject identifier type (OpenID Connect Core §8). Unset, every
+      client is `public` and sees the host's own subject identifier. A
+      `pairwise` client sees a `sub` derived from its sector identifier, the
+      host subject and `:pairwise_subject_salt`
+      (`Attesto.PairwiseSubject.derive/3`), the same value in its ID Tokens,
+      UserInfo responses, introspection responses and back-channel logout
+      tokens. The sector identifier is the one host the client's registered
+      redirect URIs share; `sector_identifier_uri` is not supported, so a
+      pairwise client whose redirect URIs span hosts is refused wherever a
+      `sub` would be issued. Access tokens keep the host subject in `sub`:
+      they are addressed to the resource server. At the end-session endpoint
+      the `:terminate_session` context's `:subject` comes from the
+      `id_token_hint`, so for a pairwise client it is the pairwise value, which
+      cannot be turned back into the host subject; identify the session by
+      `:sid` there. Configuring this callback
+      makes discovery advertise `subject_types_supported: ["public",
+      "pairwise"]` and requires `:pairwise_subject_salt`.
+    * `:pairwise_subject_salt` - the secret pairwise identifiers are derived
+      with: a binary of at least 32 bytes, identical on every node and never
+      changed (changing it changes every pairwise `sub`). Required when
+      `:client_subject_type` is configured.
+    * `:client_userinfo_signed_response_alg` - `(client -> alg | nil)`. The
+      client's registered `userinfo_signed_response_alg` (OpenID Connect
+      Dynamic Client Registration 1.0 §2). When it names an algorithm this
+      server signs with, the UserInfo endpoint answers that client with a
+      signed JWT (`application/jwt`) carrying `iss` and `aud` (OpenID Connect
+      Core §5.3.2). `nil`, or an unset callback, keeps the JSON response.
+    * `:interaction_browser_binding` - `(conn -> binary)`. Returns a value that
+      identifies the current browser, stable from the moment a request is
+      parked until it is resumed and not presentable by another browser, such
+      as a pre-login session identifier held in a cookie. Required to use
+      `AttestoPhoenix.Interaction.park/2`; a parked request is resumed only by
+      the browser whose value matches. Only a hash of the value is stored.
+    * `:interaction_ttl` - how long a parked authorization request can be
+      resumed, in seconds. A positive integer no greater than 3600. Default
+      `600`. Parked requests are stored in `:par_store`.
     * `:par_store` - module implementing `AttestoPhoenix.PARStore`. Defaults to
       the single-node `AttestoPhoenix.Store.PAR.ETS`; use
       `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
@@ -737,6 +867,17 @@ defmodule AttestoPhoenix.Config do
       `userinfo_endpoint_url/1`; when the macro's local UserInfo route is
       disabled, only that derived value is eligible for suppression at the
       removed route-equivalent path. `nil` omits the member.
+    * `:userinfo_scope_claims` - a map from scope to extra claim names the
+      UserInfo endpoint releases for that scope, added to the OpenID Connect
+      Core §5.4 set (`AttestoPhoenix.AuthorizationServer.Userinfo.standard_scope_claims/0`).
+      A standard scope gains the listed names; a host-defined scope gets the
+      listed names as its whole set. Default `%{}`. A name is released only
+      when `:build_userinfo_claims` returns a value for it.
+    * `:userinfo_always_claims` - claim names the UserInfo endpoint releases
+      for every token carrying `openid`, whatever its other scopes. Default
+      `[]`. Neither option may name `sub`. When `:claims_supported` is
+      non-empty, every name in both options must appear in it; with the
+      default empty `:claims_supported` that check is skipped.
     * `:claims_supported` - list of claim names the host's UserInfo endpoint
       and ID Tokens can return (OpenID Connect Discovery §3). Advertised in the
       OpenID Provider Metadata; omitted when unset.
@@ -781,7 +922,26 @@ defmodule AttestoPhoenix.Config do
       issuer or advertised endpoint validation.
     * `:trusted_proxies` - list of trusted proxy CIDRs/IPs controlling whether
       `X-Forwarded-*` headers are honored. Default `[]` (no forwarded trust).
+    * `:response_modes_supported` - the authorization response modes this
+      server accepts and advertises as `response_modes_supported`: a non-empty
+      list drawn from `Attesto.AuthorizationRequest.supported_response_modes/0`,
+      which is also the default. An authorization or pushed request for a mode
+      outside the list is answered with a redirectable `invalid_request`. A
+      request with no `response_mode` asks for `query`, so leaving `"query"`
+      out makes an explicit mode mandatory. `"form_post"` (OAuth 2.0 Form Post
+      Response Mode) delivers the response as an auto-submitted HTML form POST
+      to the redirect URI.
     * `:access_token_ttl` - access-token lifetime, seconds. Default `900`.
+    * `:id_token_ttl` - ID Token lifetime, seconds (the distance from `iat` to
+      `exp`, OIDC Core §2). A positive integer no greater than
+      `Attesto.IDToken.max_lifetime_seconds/0` (`3600`). Default `3600`. It applies to
+      every ID Token this server mints, including those from the CIBA grant.
+    * `:id_token_azp` - whether minted ID Tokens carry the `azp` claim.
+      `:never` (the default) omits it. `:always` sets `azp` to the client the
+      ID Token is issued to. OIDC Core §2 makes `azp` OPTIONAL and says
+      implementations not using extensions "are encouraged to not use azp", so
+      `:always` runs against that encouragement; it exists for relying parties
+      that check `azp` on a single-audience ID Token.
     * `:refresh_token_ttl` - refresh-token inactivity lifetime, seconds. Must be a positive
       integer no greater than `2_147_483_647`. Default `1_209_600`.
     * `:refresh_token_max_lifetime` - optional positive lifetime, seconds, for
@@ -962,6 +1122,14 @@ defmodule AttestoPhoenix.Config do
       and expired back-channel logout delivery leases.
       Configuration validates the interval but cannot prove that the host has
       actually supervised the process.
+    * `:on_invalid_id_token_hint` - what the end-session endpoint does with an
+      `id_token_hint` that fails verification. `:reject` (the default) answers
+      `400` before `:terminate_session` runs. `:terminate_session` runs the
+      callback with `%{subject: nil, sid: nil, client_id: nil, hint: :invalid}`
+      so the host can ask the End-User whether to log out (RP-Initiated Logout
+      1.0 §2, §4). `post_logout_redirect_uri` is never honored for such a
+      request. The `:terminate_session` context always carries `:hint`:
+      `:verified`, `:absent` or `:invalid`.
     * `logout: [retry_initial_delay_seconds: ..., retry_max_delay_seconds: ...]`
       - bounded exponential backoff for failed deliveries in the bundled Ecto
       logout-session store. Defaults to 30 seconds initially and 3,600 seconds
@@ -1054,6 +1222,7 @@ defmodule AttestoPhoenix.Config do
 
   alias Attesto.RequestObject.Policy
   alias Attesto.ResourceIndicator
+  alias AttestoPhoenix.AuthorizationServer.Userinfo
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.ClientIdMetadata
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
@@ -1126,6 +1295,8 @@ defmodule AttestoPhoenix.Config do
     :register_client,
     :unregister_client,
     :client_registration_access_token_hash,
+    :client_registration_metadata,
+    :update_client,
     :introspection_authorize,
     :principal_kinds,
     :build_principal,
@@ -1155,6 +1326,8 @@ defmodule AttestoPhoenix.Config do
     :issue_refresh_token?,
     :authorization_code_private_context,
     :authorization_code_completion,
+    :authorization_code_issuance,
+    :refresh_completion,
     :resolve_jwt_bearer_subject,
     :code_store,
     :refresh_store,
@@ -1221,7 +1394,13 @@ defmodule AttestoPhoenix.Config do
     authorization_response_iss: true,
     require_https: true,
     trusted_proxies: [],
+    response_modes_supported: Attesto.AuthorizationRequest.supported_response_modes(),
     access_token_ttl: 900,
+    id_token_ttl: 3600,
+    id_token_azp: :never,
+    on_invalid_id_token_hint: :reject,
+    userinfo_scope_claims: %{},
+    userinfo_always_claims: [],
     refresh_token_ttl: 1_209_600,
     refresh_token_max_lifetime: nil,
     refresh_token_expiration_metadata: false,
@@ -1232,6 +1411,11 @@ defmodule AttestoPhoenix.Config do
     oauth_body_guard: :observe,
     authorization_code_ttl: 60,
     par_ttl: 90,
+    interaction_ttl: 600,
+    pairwise_subject_salt: nil,
+    client_subject_type: nil,
+    client_userinfo_signed_response_alg: nil,
+    interaction_browser_binding: nil,
     par_max_entries: 1_024,
     par_max_record_bytes: 262_144,
     dpop_enabled: true,
@@ -1301,6 +1485,8 @@ defmodule AttestoPhoenix.Config do
           client_mtls_metadata: callback() | nil,
           register_client: callback() | nil,
           unregister_client: callback() | nil,
+          client_registration_metadata: callback() | nil,
+          update_client: callback() | nil,
           client_registration_access_token_hash: callback() | nil,
           introspection_authorize: callback() | nil,
           principal_kinds: [Attesto.PrincipalKind.t()] | callback() | nil,
@@ -1324,6 +1510,8 @@ defmodule AttestoPhoenix.Config do
           issue_refresh_token?: callback() | nil,
           authorization_code_private_context: callback() | nil,
           authorization_code_completion: callback() | nil,
+          authorization_code_issuance: callback() | nil,
+          refresh_completion: callback() | nil,
           resolve_jwt_bearer_subject: callback() | nil,
           code_store: module() | nil,
           refresh_store: module() | nil,
@@ -1363,7 +1551,12 @@ defmodule AttestoPhoenix.Config do
           require_pkce: boolean(),
           require_https: boolean(),
           trusted_proxies: [String.t()],
+          response_modes_supported: [String.t()],
           access_token_ttl: pos_integer(),
+          id_token_ttl: pos_integer(),
+          id_token_azp: :never | :always,
+          userinfo_scope_claims: %{String.t() => [String.t()]},
+          userinfo_always_claims: [String.t()],
           refresh_token_ttl: pos_integer(),
           refresh_token_max_lifetime: pos_integer() | nil,
           refresh_token_expiration_metadata: boolean(),
@@ -1374,6 +1567,11 @@ defmodule AttestoPhoenix.Config do
           oauth_body_guard: :observe | :required,
           authorization_code_ttl: pos_integer(),
           par_ttl: pos_integer(),
+          interaction_ttl: pos_integer(),
+          pairwise_subject_salt: binary() | nil,
+          client_subject_type: callback() | nil,
+          client_userinfo_signed_response_alg: callback() | nil,
+          interaction_browser_binding: callback() | nil,
           par_max_entries: pos_integer(),
           par_max_record_bytes: pos_integer(),
           dpop_enabled: boolean(),
@@ -1408,6 +1606,7 @@ defmodule AttestoPhoenix.Config do
           ciba: keyword(),
           backchannel_authentication_path: String.t() | nil,
           terminate_session: callback() | nil,
+          on_invalid_id_token_hint: :reject | :terminate_session,
           render_logged_out: callback() | nil,
           client_post_logout_redirect_uris: callback() | nil,
           client_backchannel_logout_uri: callback() | nil,
@@ -3408,6 +3607,8 @@ defmodule AttestoPhoenix.Config do
     client_native?: {:client_store, :client_native?, 1},
     client_requires_mtls?: {:client_store, :client_requires_mtls?, 1},
     client_requires_dpop?: {:client_store, :client_requires_dpop?, 1},
+    client_subject_type: {:client_store, :client_subject_type, 1},
+    client_userinfo_signed_response_alg: {:client_store, :client_userinfo_signed_response_alg, 1},
     client_grant_types: {:client_store, :client_grant_types, 1},
     client_ciba_registration: {:client_store, :client_ciba_registration, 1},
     load_principal: {:principal_store, :load_principal, 1},
@@ -3421,6 +3622,8 @@ defmodule AttestoPhoenix.Config do
     register_client: {:registration, :register_client, 1},
     unregister_client: {:registration, :unregister_client, 1},
     client_registration_access_token_hash: {:registration, :client_registration_access_token_hash, 1},
+    client_registration_metadata: {:registration, :client_registration_metadata, 1},
+    update_client: {:registration, :update_client, 2},
     build_userinfo_claims: {:claims_provider, :build_userinfo_claims, 3},
     build_id_token_claims: {:claims_provider, :build_id_token_claims, 4}
   }
@@ -3448,9 +3651,12 @@ defmodule AttestoPhoenix.Config do
     issue_refresh_token?: 2,
     authorization_code_private_context: 1,
     authorization_code_completion: 2,
+    authorization_code_issuance: 2,
+    refresh_completion: 2,
     replay_check: 2,
     terminate_session: 2,
-    render_logged_out: 2
+    render_logged_out: 2,
+    interaction_browser_binding: 1
   }
 
   @max_callback_arity 255
@@ -3533,7 +3739,13 @@ defmodule AttestoPhoenix.Config do
 
   defp validate_flat_callbacks!(%__MODULE__{} = config) do
     Enum.each(@resolution, fn {key, {_store_key, _fun, arity}} ->
-      validate_configured_callback!(key, Map.get(config, key), arity)
+      callback = Map.get(config, key)
+
+      # `:authorize_scope` has a second, three-argument form that also takes
+      # the request's resources (see `authorize_scope_callback/1`).
+      if !(key == :authorize_scope and not is_nil(callback) and callback_contract(callback, 3) == :ok) do
+        validate_configured_callback!(key, callback, arity)
+      end
     end)
 
     Enum.each(@flat_callback_arities, fn {key, arity} ->
@@ -3686,6 +3898,28 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
+  @doc """
+  The scope-authorization callback and the arity to call it with.
+
+  The three-argument form `(client, requested_scope, resources)` is preferred:
+  an explicit `:authorize_scope` function of arity 3 (or an MFA that resolves
+  to one), or a `:scope_policy` module exporting `authorize_scope/3`. Otherwise
+  the two-argument form is used, including the built-in catalog policy.
+  """
+  @spec authorize_scope_callback(t()) :: {callback(), 2 | 3}
+  def authorize_scope_callback(%__MODULE__{authorize_scope: nil, scope_policy: module} = config)
+      when is_atom(module) and not is_nil(module) do
+    if callback_exported?(module, :authorize_scope, 3),
+      do: {{module, :authorize_scope}, 3},
+      else: {authorize_scope_fun(config), 2}
+  end
+
+  def authorize_scope_callback(%__MODULE__{authorize_scope: nil} = config), do: {authorize_scope_fun(config), 2}
+
+  def authorize_scope_callback(%__MODULE__{authorize_scope: flat}) do
+    {flat, if(callback_contract(flat, 3) == :ok, do: 3, else: 2)}
+  end
+
   defp default_authorize_scope_fun(scopes_supported) do
     catalog = MapSet.new(scopes_supported)
 
@@ -3775,7 +4009,7 @@ defmodule AttestoPhoenix.Config do
   `ArgumentError` when the host has not configured the callback, so a mounted
   UserInfo endpoint cannot silently return an empty document.
   """
-  @spec build_userinfo_claims(t(), String.t(), [String.t()], map()) :: map()
+  @spec build_userinfo_claims(t(), String.t(), [String.t()], map()) :: map() | {:error, :invalid_token}
   def build_userinfo_claims(%__MODULE__{} = config, subject, scopes, requested) do
     case build_userinfo_claims_fun(config) do
       nil ->
@@ -3838,6 +4072,25 @@ defmodule AttestoPhoenix.Config do
   @spec authorization_code_completion_fun(t()) :: callback() | nil
   def authorization_code_completion_fun(%__MODULE__{} = config),
     do: Callback.config_callback(config, :authorization_code_completion)
+
+  @doc """
+  The host's optional wrapper around authorization-code issuance.
+
+  See the `:authorization_code_issuance` option. When `nil`, the authorization
+  endpoint issues the code directly.
+  """
+  @spec authorization_code_issuance_fun(t()) :: callback() | nil
+  def authorization_code_issuance_fun(%__MODULE__{} = config),
+    do: Callback.config_callback(config, :authorization_code_issuance)
+
+  @doc """
+  The host's optional wrapper around the refresh grant's rotation and mint.
+
+  See the `:refresh_completion` option. When `nil`, the token endpoint rotates
+  and mints directly.
+  """
+  @spec refresh_completion_fun(t()) :: callback() | nil
+  def refresh_completion_fun(%__MODULE__{} = config), do: Callback.config_callback(config, :refresh_completion)
 
   @doc "Returns the configured OID4VCI credential builder callback, or `nil`."
   @spec build_credential_fun(t()) :: callback() | nil
@@ -4350,8 +4603,15 @@ defmodule AttestoPhoenix.Config do
     validate_client_id_metadata_limits!(config)
     validate_required_par_store!(config)
     validate_par_limits!(config)
+    validate_interaction_ttl!(config.interaction_ttl)
+    validate_pairwise_subjects!(config)
     validate_refresh_store_backend!(config)
     validate_refresh_rotation!(config)
+    validate_response_modes_supported!(config.response_modes_supported)
+    validate_id_token_ttl!(config.id_token_ttl)
+    validate_id_token_azp!(config.id_token_azp)
+    validate_userinfo_release!(config)
+    validate_on_invalid_id_token_hint!(config.on_invalid_id_token_hint)
     validate_dpop_nonce!(config)
     validate_wallet_attestation_challenge_store!(config.wallet_attestation_challenge_store)
     validate_key_attestation!(config)
@@ -4472,9 +4732,15 @@ defmodule AttestoPhoenix.Config do
 
   defp capable_refresh_store?(store) do
     is_atom(store) and not is_nil(store) and Code.ensure_loaded?(store) and
-      Enum.all?(Attesto.RefreshStore.behaviour_info(:callbacks), fn {name, arity} ->
+      Enum.all?(required_refresh_store_callbacks(), fn {name, arity} ->
         function_exported?(store, name, arity)
       end)
+  end
+
+  # A wrapper has to provide the required callbacks only; an optional one it
+  # omits (`revoke_families/1`) is detected where it is used.
+  defp required_refresh_store_callbacks do
+    Attesto.RefreshStore.behaviour_info(:callbacks) -- Attesto.RefreshStore.behaviour_info(:optional_callbacks)
   end
 
   # RFC 9068 §2.2 access-token claims, including its referenced OIDC identity
@@ -4727,6 +4993,58 @@ defmodule AttestoPhoenix.Config do
   defp resource_origin?(origin) do
     absolute_resource_url?(origin) and
       match?({:ok, %URI{path: path, query: nil}} when path in [nil, "", "/"], URI.new(origin))
+  end
+
+  # The rule is core's (`Attesto.AuthorizationRequest.response_modes!/1`); this
+  # runs it at boot and names the configuration key.
+  defp validate_response_modes_supported!(modes) do
+    Attesto.AuthorizationRequest.response_modes!(modes)
+    :ok
+  rescue
+    error in ArgumentError ->
+      reraise ArgumentError, "AttestoPhoenix.Config: :" <> Exception.message(error), __STACKTRACE__
+  end
+
+  defp validate_on_invalid_id_token_hint!(mode) when mode in [:reject, :terminate_session], do: :ok
+
+  defp validate_on_invalid_id_token_hint!(mode) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :on_invalid_id_token_hint must be :reject or :terminate_session; got #{inspect(mode)}."
+  end
+
+  # The rule is `Userinfo.validate_release!/3`; this runs it at boot and names
+  # the module.
+  defp validate_userinfo_release!(config) do
+    Userinfo.validate_release!(
+      config.userinfo_scope_claims,
+      config.userinfo_always_claims,
+      config.claims_supported
+    )
+  rescue
+    error in ArgumentError ->
+      reraise ArgumentError, "AttestoPhoenix.Config: " <> Exception.message(error), __STACKTRACE__
+  end
+
+  # `Attesto.IDToken.mint/4` only shortens its own ceiling, so a larger value
+  # here would be silently clamped. Refuse it at boot instead. The ceiling is
+  # core's; it is read, not restated.
+  defp validate_id_token_ttl!(ttl) do
+    max = Attesto.IDToken.max_lifetime_seconds()
+
+    if is_integer(ttl) and ttl > 0 and ttl <= max do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :id_token_ttl must be a positive integer not exceeding " <>
+              "#{max} seconds; got #{inspect(ttl)}."
+    end
+  end
+
+  defp validate_id_token_azp!(mode) when mode in [:never, :always], do: :ok
+
+  defp validate_id_token_azp!(mode) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :id_token_azp must be :never or :always; got #{inspect(mode)}."
   end
 
   defp validate_refresh_rotation!(%__MODULE__{} = config) do
@@ -5029,6 +5347,37 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp validate_required_par_store!(_config), do: :ok
+
+  # OIDC Core §8.1: a pairwise `sub` is only as unguessable as the salt, and a
+  # client that is pairwise with no salt could not be issued a `sub` at all.
+  # The salt rule is core's (`Attesto.PairwiseSubject.valid_salt?/1`).
+  defp validate_pairwise_subjects!(%__MODULE__{pairwise_subject_salt: salt} = config) do
+    cond do
+      not is_nil(salt) and not Attesto.PairwiseSubject.valid_salt?(salt) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :pairwise_subject_salt must be a binary of at least " <>
+                "#{Attesto.PairwiseSubject.min_salt_bytes()} bytes."
+
+      is_nil(salt) and not is_nil(resolve_callback(config, :client_subject_type)) ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :client_subject_type is configured, so a client can be pairwise; " <>
+                "set :pairwise_subject_salt to a stable secret of at least " <>
+                "#{Attesto.PairwiseSubject.min_salt_bytes()} bytes."
+
+      true ->
+        :ok
+    end
+  end
+
+  @max_interaction_ttl 3600
+
+  defp validate_interaction_ttl!(ttl) when is_integer(ttl) and ttl > 0 and ttl <= @max_interaction_ttl, do: :ok
+
+  defp validate_interaction_ttl!(ttl) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :interaction_ttl must be a positive integer not exceeding " <>
+            "#{@max_interaction_ttl} seconds; got #{inspect(ttl)}."
+  end
 
   defp validate_par_limits!(%__MODULE__{} = config) do
     Enum.each([:par_max_entries, :par_max_record_bytes], fn key ->
@@ -5386,7 +5735,7 @@ defmodule AttestoPhoenix.Config do
     client_store: [load_client: 1, verify_client_secret: 2],
     principal_store: [load_principal: 1],
     consent_policy: [],
-    scope_policy: [authorize_scope: 2],
+    scope_policy: [],
     event_sink: [on_event: 1],
     registration: [register_client: 1],
     claims_provider: []
@@ -5597,6 +5946,8 @@ defmodule AttestoPhoenix.Config do
         Enum.each(Map.fetch!(@behaviour_required, store_key), fn callback ->
           validate_behaviour_callback!(store_key, behaviour, module, callback)
         end)
+
+        validate_scope_policy_exports!(store_key, behaviour, module)
     end
   end
 
@@ -5605,6 +5956,18 @@ defmodule AttestoPhoenix.Config do
           "AttestoPhoenix.Config: #{inspect(store_key)} must be a module implementing " <>
             "#{inspect(behaviour)}; got #{inspect(module)}."
   end
+
+  # A scope policy implements `authorize_scope/2`, `authorize_scope/3`, or
+  # both, so neither arity can sit in the required table on its own.
+  defp validate_scope_policy_exports!(:scope_policy, behaviour, module) do
+    if !(function_exported?(module, :authorize_scope, 2) or function_exported?(module, :authorize_scope, 3)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :scope_policy module #{inspect(module)} " <>
+              "does not export authorize_scope/2 or authorize_scope/3, required by #{inspect(behaviour)}."
+    end
+  end
+
+  defp validate_scope_policy_exports!(_store_key, _behaviour, _module), do: :ok
 
   defp validate_behaviour_callback!(store_key, behaviour, module, {fun, arity}) do
     case function_exported?(module, fun, arity) do

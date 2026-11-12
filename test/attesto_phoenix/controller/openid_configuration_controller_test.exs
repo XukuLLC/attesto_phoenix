@@ -198,6 +198,24 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       assert decode_body(registration)["error"] == "invalid_client_metadata"
     end
 
+    test "advertises pairwise subjects and UserInfo signing once the host configures them" do
+      body = decode_body(call_show(host_config(), protocol_config()))
+      assert body["subject_types_supported"] == ["public"]
+      refute Map.has_key?(body, "userinfo_signing_alg_values_supported")
+
+      config =
+        host_config(
+          client_subject_type: fn _client -> "pairwise" end,
+          pairwise_subject_salt: String.duplicate("k", 32),
+          client_userinfo_signed_response_alg: fn _client -> nil end
+        )
+
+      body = decode_body(call_show(config, protocol_config()))
+      assert body["subject_types_supported"] == ["public", "pairwise"]
+      assert [alg] = body["userinfo_signing_alg_values_supported"]
+      assert alg in body["id_token_signing_alg_values_supported"]
+    end
+
     test "renders the required OIDC Provider Metadata fields as JSON" do
       conn = call_show(host_config(), protocol_config())
       body = decode_body(conn)
@@ -335,7 +353,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
         "request_uri_parameter_supported" => false,
         "require_pushed_authorization_requests" => true,
         "require_signed_request_object" => true,
-        "response_modes_supported" => ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"],
+        "response_modes_supported" => ["query", "form_post", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"],
         "response_types_supported" => ["code"],
         "scopes_supported" => ["openid", "profile", "email"],
         "subject_types_supported" => ["public"],
@@ -480,7 +498,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationControllerTest do
       body = call_show(host_config(), protocol_config()) |> decode_body()
 
       assert body["response_modes_supported"] ==
-               ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
+               ["query", "form_post", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
     end
 
     test "advertises authorization_signing_alg_values_supported matching the ID Token algs" do

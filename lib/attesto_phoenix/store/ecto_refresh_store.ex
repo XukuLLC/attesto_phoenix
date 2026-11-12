@@ -28,6 +28,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   alias AttestoPhoenix.RefreshSuccessorCipher
   alias AttestoPhoenix.Schema.RefreshFamilyRevocation
   alias AttestoPhoenix.Schema.RefreshToken
+  alias AttestoPhoenix.Store.Ecto, as: StoreEcto
   alias AttestoPhoenix.Store.Sweeper
 
   @app :attesto_phoenix
@@ -266,6 +267,42 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
       _invalid_return ->
         raise RuntimeError,
               "#{inspect(__MODULE__)} revoke_family/1 violated the repo transaction contract"
+    end
+  end
+
+  @doc """
+  Revokes every family that has a token whose grant matches `criteria`
+  (`:subject`, `:client_id` and/or `:sid`, ANDed; see
+  `Attesto.RevocationCriteria`) and returns `{:ok, count}` with the number of
+  families revoked.
+
+  The matching family ids are read first, then each is revoked through
+  `revoke_family/1`: locked, tombstoned, and its rows removed. Called inside a
+  caller's transaction, all of it commits or rolls back with that transaction.
+  The session identifier is matched inside the `claims` JSONB column under the
+  criteria's `:sid_claim` key, not a dedicated column, so it needs no
+  migration.
+
+  Access tokens already issued from those families are not affected; a
+  self-contained JWT access token stays valid until it expires unless the
+  protected resource consults introspection or the revocation denylist.
+  """
+  @impl Attesto.RefreshStore
+  @spec revoke_families(Attesto.RevocationCriteria.criteria()) :: {:ok, non_neg_integer()}
+  def revoke_families(criteria) do
+    criteria = Attesto.RevocationCriteria.new!(criteria)
+    prefix = table_prefix()
+
+    live_rows = from(r in RefreshToken, where: r.family_revoked == false, distinct: true, select: r.family_id)
+
+    case StoreEcto.where_criteria(live_rows, criteria) do
+      :none ->
+        {:ok, 0}
+
+      query ->
+        family_ids = repo().all(query, prefix: prefix, log: false, telemetry_event: nil)
+        Enum.each(family_ids, &revoke_family/1)
+        {:ok, length(family_ids)}
     end
   end
 

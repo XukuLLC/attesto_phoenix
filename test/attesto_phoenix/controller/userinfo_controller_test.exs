@@ -318,6 +318,118 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     end
   end
 
+  describe "host claim release (:userinfo_scope_claims / :userinfo_always_claims)" do
+    defp merge_config(overrides) do
+      :attesto_phoenix
+      |> Application.fetch_env!(AttestoPhoenix.Config)
+      |> Keyword.merge(overrides)
+      |> put_config()
+    end
+
+    test "adds claim names to a standard scope without removing its own" do
+      merge_config(userinfo_scope_claims: %{"profile" => ["unscoped_secret"]})
+
+      claims = body(get_userinfo(mint(scope: "openid profile")))
+      assert claims["unscoped_secret"] == "nope"
+      assert claims["name"] == "Ada Lovelace"
+
+      refute Map.has_key?(body(get_userinfo(mint(scope: "openid email"))), "unscoped_secret")
+    end
+
+    test "gives a host-defined scope its own claim set" do
+      merge_config(userinfo_scope_claims: %{"staff" => ["unscoped_secret"]})
+
+      assert body(get_userinfo(mint(scope: "openid staff"))) ==
+               %{"sub" => @subject, "unscoped_secret" => "nope"}
+    end
+
+    test "releases always-claims for every openid token and no other" do
+      merge_config(userinfo_always_claims: ["preferred_username"])
+
+      assert body(get_userinfo(mint(scope: "openid"))) ==
+               %{"sub" => @subject, "preferred_username" => "ada"}
+
+      assert get_userinfo(mint(scope: "profile")).status == 403
+    end
+
+    test "a claim source refusal answers the invalid_token challenge" do
+      metadata_url = "https://api.example/.well-known/oauth-protected-resource/userinfo"
+
+      merge_config(
+        resource_metadata: metadata_url,
+        build_userinfo_claims: fn _subject, _scopes, _requested -> {:error, :invalid_token} end
+      )
+
+      conn = get_userinfo(mint(scope: "openid profile"))
+
+      assert conn.status == 401
+      assert body(conn)["error"] == "invalid_token"
+      assert [challenge] = get_resp_header(conn, "www-authenticate")
+      assert challenge =~ "Bearer"
+      assert challenge =~ ~s(error="invalid_token")
+      assert challenge =~ ~s(resource_metadata="#{metadata_url}")
+      assert get_resp_header(conn, "cache-control") == ["no-store"]
+    end
+  end
+
+  describe "signed responses (OpenID Connect Core §5.3.2)" do
+    defp signed_config(alg, extra \\ []) do
+      merge_config(
+        [
+          load_client: fn id -> {:ok, %{id: id}} end,
+          client_userinfo_signed_response_alg: fn _client -> alg end
+        ] ++ extra
+      )
+    end
+
+    test "a client that registered the server's algorithm gets application/jwt with iss and aud" do
+      signed_config(Token.signing_alg())
+      token = mint(scope: "openid email")
+
+      conn = get_userinfo(token)
+
+      assert conn.status == 200
+      assert [content_type] = get_resp_header(conn, "content-type")
+      assert content_type =~ "application/jwt"
+      assert get_resp_header(conn, "cache-control") == ["no-store"]
+
+      assert {true, %JOSE.JWT{fields: claims}, %JOSE.JWS{}} =
+               JOSE.JWT.verify_strict(Attesto.Key.jwk(@signing_pem), [Token.signing_alg()], conn.resp_body)
+
+      assert claims["iss"] == @issuer
+      assert claims["aud"] == peek_claims(token)["client_id"]
+      assert claims["sub"] == @subject
+      assert claims["email"] == "ada@example.com"
+      refute Map.has_key?(claims, "name")
+    end
+
+    test "a client with no registered algorithm keeps JSON" do
+      signed_config(nil)
+
+      conn = get_userinfo(mint(scope: "openid"))
+      assert conn.status == 200
+      assert body(conn) == %{"sub" => @subject}
+    end
+
+    test "a client that registered another algorithm is not sent unsigned claims" do
+      for alg <- ["none", "HS256"] do
+        signed_config(alg)
+
+        conn = get_userinfo(mint(scope: "openid email"))
+        assert conn.status == 500
+        assert body(conn) == %{"error" => "server_error"}
+      end
+    end
+
+    test "a token whose client can no longer be loaded is refused" do
+      signed_config(Token.signing_alg(), load_client: fn _id -> {:error, :not_found} end)
+
+      conn = get_userinfo(mint(scope: "openid"))
+      assert conn.status == 401
+      assert body(conn)["error"] == "invalid_token"
+    end
+  end
+
   describe "claims (OpenID Connect Core §5.3.2 / §5.4)" do
     test "returns only sub for a bare openid token" do
       token = mint(scope: "openid")

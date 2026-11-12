@@ -61,7 +61,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       `{:authenticated, subject}` only if it can be established silently, else
       `{:none}`), and `:max_age` (when present, the host MUST reauthenticate if
       the existing authentication is older and return the resulting
-      `auth_time`). Under `prompt=none` the controller converts a `{:halt,
+      `auth_time`). The controller checks the returned `auth_time` against
+      `max_age`. Under `prompt=none` an authentication that is too old is
+      answered `login_required`. On an interactive request it is a host
+      contract violation answered `server_error`, with 60 seconds allowed
+      beyond `max_age` for the hop back from the host's login. A missing
+      `auth_time` when `max_age` was requested is `server_error` under either
+      prompt. Under `prompt=none` the controller converts a `{:halt,
       conn}` or `{:none}` into a `login_required` redirect rather than letting
       any UI run; a `{:halt, conn}` consent screen becomes `consent_required`
       (OIDC Core §3.1.2.6).
@@ -115,10 +121,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   alias Attesto.Secret
   alias Attesto.SessionState
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
+  alias AttestoPhoenix.AuthorizationServer.Continuation
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
+  alias AttestoPhoenix.AuthorizationServer.ScopeAuthorization
   alias AttestoPhoenix.{BrowserState, Callback, Config, Event, HTTPAccept, RequestContext}
   alias AttestoPhoenix.ClientIdMetadata
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
+  alias AttestoPhoenix.Interaction
+  alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
+  alias AttestoPhoenix.RouteControls
   alias AttestoPhoenix.Store.PAR.ETS
 
   require Logger
@@ -129,6 +140,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   # RFC 8707 §2 / RFC 6749 §5.2: a requested `resource` the server does not serve.
   @error_invalid_target "invalid_target"
+  @error_invalid_scope "invalid_scope"
+  @resumed_private_key :attesto_phoenix_resumed_interaction
 
   # RFC 9126 §2.3: the PAR `request_uri` is no longer usable. Reported at
   # completion (by redirect, the request is already validated) when the
@@ -159,6 +172,55 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   @spec authorize(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def authorize(conn, params) do
     config = Config.resolve!(conn)
+    # `par: false` with a configuration that requires PAR cannot serve any
+    # request; fail loudly instead of answering each client `invalid_request`.
+    :ok = RouteControls.check_par!(conn, config)
+
+    case resume_parked_request(conn, config, params) do
+      {:ok, conn, params} ->
+        authorize_params(conn, config, params)
+
+      {:error, reason} ->
+        emit_failure(conn, config, reason)
+        render_direct_error(conn, config, reason)
+    end
+  end
+
+  # ── Resume (AttestoPhoenix.Interaction) ──────────────────────────────────
+
+  # A request carrying `resume` stands for a request parked earlier with
+  # `AttestoPhoenix.Interaction.park/2`. The parked parameters replace the
+  # request's and then go through the whole pipeline below as a fresh request
+  # would. `resume` alone identifies the request, so any other parameter beside
+  # it is refused: it could only be an attempt to alter what was parked.
+  defp resume_parked_request(conn, config, %{"resume" => resume_id} = params) do
+    with true <- map_size(params) == 1,
+         :ok <- RequestContext.check_https(conn, config),
+         {:ok, parked} <- Interaction.take(config, conn, resume_id) do
+      {:ok, Plug.Conn.put_private(conn, @resumed_private_key, parked), parked.params}
+    else
+      false -> {:error, :resume_with_parameters}
+      {:error, :insecure_transport} -> {:error, :insecure_transport}
+      {:error, :invalid_resume} -> {:error, :invalid_resume}
+    end
+  end
+
+  defp resume_parked_request(conn, _config, params), do: {:ok, conn, params}
+
+  defp resumed(conn), do: conn.private[@resumed_private_key]
+
+  # The parked request named the client it was validated for. The resumed
+  # parameters are the same ones, so this holds unless the stored entry was
+  # altered; it is checked rather than assumed.
+  defp check_resumed_client(conn, request) do
+    case resumed(conn) do
+      nil -> :ok
+      %{client_id: client_id} when client_id == request.client_id -> :ok
+      _mismatch -> {:error, {:direct, :invalid_resume}}
+    end
+  end
+
+  defp authorize_params(conn, config, params) do
     # Capture the PAR reference before resolution rebinds `params` to the stored
     # set, so it can be consumed once (and only once) a code is issued.
     par_request_uri = params["request_uri"]
@@ -167,7 +229,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
          :ok <- RequestContext.check_embedded_user_agent(conn, config),
          {:ok, params, par_resolved?} <- resolve_request_uri(config, params),
          {:ok, client} <- load_client(config, params),
-         {:ok, request} <- validate_request(config, client, params, par_resolved?) do
+         {:ok, request} <- validate_request(config, client, params, par_resolved?),
+         :ok <- check_resumed_client(conn, request),
+         {:ok, request} <- authorize_scope(config, client, request) do
       conn
       |> stash_par_request_uri(par_request_uri, par_resolved?)
       |> stash_credential_configuration_ids(credential_configuration_ids(config, request))
@@ -198,6 +262,35 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # error is reported by redirecting back to the validated redirect_uri.
         emit_failure(conn, config, error.error)
         emit_redirect_error(conn, config, error)
+
+      {:error, {:scope_refused, request, error_code}} ->
+        # RFC 6749 §4.1.2.1 `invalid_scope` / RFC 8707 §2 `invalid_target`: the
+        # host's scope policy refused a fully validated request.
+        emit_failure(conn, config, error_code)
+        emit_error(conn, config, request, error_code)
+    end
+  end
+
+  # ── Scope policy (RFC 6749 §3.3 / §4.1.2.1, RFC 8707 §2) ─────────────────
+
+  # The host's scope policy runs here, on the validated request and before the
+  # resource owner is asked to authenticate, with the same arguments the token
+  # endpoint will pass. A scope the policy would refuse at redemption is
+  # refused now, as a redirectable error that `prompt=none` does not change,
+  # and a narrowed scope is what consent sees and the code is bound to. The
+  # policy may only narrow: a scope it adds is treated as a refusal.
+  defp authorize_scope(config, client, request) do
+    case ScopeAuthorization.authorize(config, client, request.scope, request.resource) do
+      {:ok, granted} ->
+        if granted -- request.scope == [],
+          do: {:ok, %{request | scope: granted}},
+          else: {:error, {:scope_refused, request, @error_invalid_scope}}
+
+      {:error, :invalid_scope} ->
+        {:error, {:scope_refused, request, @error_invalid_scope}}
+
+      {:error, :invalid_target} ->
+        {:error, {:scope_refused, request, @error_invalid_target}}
     end
   end
 
@@ -293,14 +386,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `redirect_uri` already is.
   defp validate_within_origin(config, client, params) do
     validated =
-      AuthorizationRequest.validate(params,
-        registered_redirect_uris: RequestPolicy.registered_redirect_uris(config, client),
-        redirect_uri_matching: RequestPolicy.redirect_uri_matching(config, client),
-        require_nonce: RequestPolicy.require_nonce?(config),
-        require_pkce: RequestPolicy.require_pkce?(config, client),
-        request_object_jwks: client_jwks(config, client),
-        request_object_audience: config.issuer,
-        request_object_policy: config.request_object_policy
+      AuthorizationRequest.validate(
+        params,
+        RequestPolicy.validation_opts(config, client) ++
+          [
+            request_object_jwks: client_jwks(config, client),
+            request_object_audience: config.issuer,
+            request_object_policy: config.request_object_policy
+          ]
       )
 
     case validated do
@@ -386,12 +479,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   defp resolve_request_uri(config, %{"request_uri" => request_uri} = params)
        when is_binary(request_uri) and request_uri != "" do
-    case par_store(config) do
-      nil ->
+    cond do
+      # Parked requests share the store; their keys are never a `request_uri`.
+      Interaction.reserved_key?(request_uri) ->
+        {:error, {:direct, :invalid_request_uri}}
+
+      is_nil(par_store(config)) ->
         {:ok, params, false}
 
-      store ->
-        case fetch_par_request(store, request_uri) do
+      true ->
+        case fetch_par_request(par_store(config), request_uri) do
           {:ok, stored} -> resolve_stored_request(params, stored)
           :error -> resolve_missing_request_uri(request_uri, params)
         end
@@ -495,7 +592,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
     case authenticate_resource_owner(conn, config, request) do
       {:authenticated, subject} ->
-        run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt)
+        run_authenticated(conn, config, client, request, subject, prompt_none?, dpop_jkt)
 
       {:none} ->
         # OIDC Core §3.1.2.6: the host has no already-authenticated subject it
@@ -544,6 +641,63 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # crash, and do not issue a code.
         Logger.error("authenticate_resource_owner callback returned an invalid result")
         emit_error(conn, config, request, @error_server_error)
+    end
+  end
+
+  defp run_authenticated(conn, config, client, request, subject, prompt_none?, dpop_jkt) do
+    case check_authentication_age(conn, request, subject, prompt_none?) do
+      :ok ->
+        run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt)
+
+      {:error, error_code} ->
+        emit_failure(conn, config, error_code)
+        emit_error(conn, config, request, error_code)
+    end
+  end
+
+  # OIDC Core §3.1.2.1: when the request carries `max_age`, the authentication
+  # the host returned must be no older than that, and must carry an `auth_time`
+  # (the ID Token MUST include it). The rule itself is
+  # `Attesto.AuthorizationRequest.check_auth_time/4`; this maps its result to the
+  # response.
+  #
+  #   * `prompt=none`: the host could not have re-authenticated, so the check is
+  #     exact and an authentication that is too old is `login_required`
+  #     (§3.1.2.6).
+  #   * Otherwise the host was told to re-authenticate (`auth_opts.max_age`) and
+  #     returned an authentication that is still too old. That is a host
+  #     contract violation, not something the client can fix: `server_error`.
+  #     A host that did re-authenticate comes back to this endpoint a moment
+  #     after the login completed, so the interactive check allows
+  #     `@reauthentication_allowance_seconds` beyond `max_age`; without it
+  #     `max_age=0` could never be satisfied.
+  #     A resumed request has the time it was parked, so that interval is
+  #     replaced by `Interaction.max_age_allowance/3`: an authentication made
+  #     after the park satisfies `max_age`, an earlier one is checked exactly.
+  #   * A missing or malformed `auth_time` is a host fault under either prompt.
+  @reauthentication_allowance_seconds 60
+
+  defp check_authentication_age(conn, request, subject, prompt_none?) do
+    auth_time = Map.get(subject, :auth_time)
+    now = System.system_time(:second)
+
+    allowance =
+      case resumed(conn) do
+        _any when prompt_none? -> 0
+        nil -> @reauthentication_allowance_seconds
+        %{parked_at: parked_at} -> Interaction.max_age_allowance(parked_at, auth_time, now)
+      end
+
+    case AuthorizationRequest.check_auth_time(request, auth_time, now, allowance: allowance) do
+      :ok ->
+        :ok
+
+      {:error, :max_age_exceeded} when prompt_none? ->
+        {:error, @error_login_required}
+
+      {:error, reason} ->
+        Logger.error("max_age was requested but the host returned an unusable authentication: #{reason}")
+        {:error, @error_server_error}
     end
   end
 
@@ -722,10 +876,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp mint_code_and_redirect(conn, config, request, subject, attrs) do
-    case AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) do
-      {:ok, code} ->
+    case issue_code(config, attrs) do
+      {:ok, code} when is_binary(code) ->
         emit_code_issued(conn, config, request.client_id, request.scope)
         emit_success(conn, config, request, subject, code)
+
+      {:error, %PhoenixOAuthError{} = refusal} ->
+        # The host's `:authorization_code_issuance` callback refused.
+        error_code = issuance_refusal_code(refusal, request)
+        emit_failure(conn, config, error_code)
+        emit_error(conn, config, request, error_code)
 
       {:error, reason} ->
         # Issuance failing on a validated request is a server/config fault,
@@ -736,9 +896,82 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
   end
 
+  # With no `:authorization_code_issuance` callback the code is issued
+  # directly, exactly as before the hook existed. With one, the host runs the
+  # issuance through its continuation, inside its own transaction and locks if
+  # it wants, so the code is stored atomically with whatever the host checks or
+  # writes. The context carries the identifiers the private-context callback
+  # saw and that callback's result; never the code.
+  defp issue_code(config, attrs) do
+    issue = fn -> AuthorizationCode.issue(code_store(config), attrs, ttl: config.authorization_code_ttl) end
+
+    case Config.authorization_code_issuance_fun(config) do
+      nil ->
+        issue.()
+
+      callback ->
+        context = %{
+          client_id: attrs.client_id,
+          subject: attrs.subject,
+          family_id: attrs.family_id,
+          private_context: Map.get(attrs.claims, PrivateContext.claims_key())
+        }
+
+        Continuation.run(issuance_profile(), &Callback.invoke(callback, &1), context, issue)
+    end
+  end
+
+  defp issuance_profile do
+    %{
+      callback: "authorization code issuance callback",
+      continuation: "authorization code issuance continuation",
+      work: "authorization code issuance",
+      not_done: "no code was issued",
+      no_success: "no code was returned",
+      no_response: "issuance did not succeed and no code was returned",
+      after_success:
+        "unless the host's transaction rolled back, a code was stored that the client never " <>
+          "receives; it expires unredeemed",
+      state_key: {__MODULE__, :authorization_code_issuance_continuation},
+      succeeded?: &match?({:ok, code} when is_binary(code), &1),
+      well_formed?: fn
+        {:ok, code} when is_binary(code) -> true
+        {:error, _reason} -> true
+        _other -> false
+      end,
+      refusal: {:error, :issuance_callback_contract_violation}
+    }
+  end
+
+  # RFC 6749 §4.1.2.1 / OIDC Core §3.1.2.6: the errors a host may name when it
+  # refuses issuance. `access_denied` and `server_error` (and
+  # `temporarily_unavailable`) apply to any request. `login_required` is an
+  # answer to `prompt=none` only; on an interactive request the host was able
+  # to log the user in, so naming it there is a host fault. Any other code is
+  # one this endpoint has no meaning for at this point.
+  defp issuance_refusal_code(%PhoenixOAuthError{error: error}, request) do
+    cond do
+      error in [:access_denied, :server_error, :temporarily_unavailable] ->
+        Atom.to_string(error)
+
+      error == :login_required and @prompt_none in request.prompt ->
+        @error_login_required
+
+      true ->
+        Logger.error(
+          "authorization code issuance callback refused with #{inspect(error)}, which does not " <>
+            "apply to this request; answered server_error"
+        )
+
+        @error_server_error
+    end
+  end
+
   # The host's `:authorization_code_private_context` callback (when configured)
-  # is given exactly the authorized client, subject, and the freshly generated
-  # family id - no request parameters, no token secrets. Its result rides with
+  # is given the authorized client, the subject id, the freshly generated
+  # family id, the authentication map the host's own callbacks returned, and
+  # the validated request's scope and resource list - no raw request
+  # parameters, no token secrets. Its result rides with
   # the code inside `:claims` under a reserved namespaced key, because
   # `Attesto.AuthorizationCode` admits no sibling key beside the nine canonical
   # ones.
@@ -757,7 +990,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
           {:ok, claims}
 
         callback ->
-          context = %{client_id: request.client_id, subject: subject_id, family_id: family_id}
+          context = %{
+            client_id: request.client_id,
+            subject: subject_id,
+            family_id: family_id,
+            authentication: subject,
+            scope: request.scope,
+            resource: request.resource
+          }
 
           PrivateContext.put(claims, Callback.invoke(callback, [context]))
       end
@@ -799,9 +1039,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # is whatever the host's authentication/consent callbacks established. When the
   # request carried `max_age` (OIDC Core §3.1.2.1), `auth_time` is REQUIRED in
   # the ID Token, so the host's freshly-established `auth_time` (after any
-  # re-authentication it performed to satisfy `max_age`) is carried here; a host
-  # that satisfied `max_age` but returned no `auth_time` is a host fault, logged
-  # so the misconfiguration is visible rather than silently dropping the claim.
+  # re-authentication it performed to satisfy `max_age`) is carried here;
+  # `check_authentication_age/3` has already refused a request whose host
+  # returned none.
   # Only the keys the host actually supplied are carried, so the token endpoint
   # can distinguish "absent" from a value. The OIDC `claims` request parameter
   # (OIDC Core §5.5) is carried only when the provider supports it
@@ -809,10 +1049,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # or UserInfo response.
   defp code_claims(conn, config, request, subject) do
     auth_time = Map.get(subject, :auth_time)
-
-    if not is_nil(request.max_age) and is_nil(auth_time) do
-      Logger.error("max_age was requested but the host returned no auth_time")
-    end
 
     %{}
     |> MapParams.put_optional("nonce", request.nonce)
@@ -933,6 +1169,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   #   * `:interactive` - `false` when `prompt=none`: the host MUST NOT render any
   #     UI; it returns `{:authenticated, subject}` only if a subject can be
   #     established silently, else `{:none}`.
+  #   * `:resumed` - `true` when the request was parked with
+  #     `AttestoPhoenix.Interaction.park/2` and is being resumed.
   #
   # The host returns `{:authenticated, subject}`, `{:halt, conn}` (it took over
   # the connection to render login UI), or `{:none}` (no subject can be
@@ -945,7 +1183,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         {:halt, emit_error(conn, config, request, @error_server_error)}
 
       callback ->
-        Callback.invoke(callback, [conn, request, auth_opts(request)])
+        Callback.invoke(callback, [conn, request, auth_opts(conn, request)])
     end
   end
 
@@ -953,12 +1191,18 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # must honour from the validated request. `prompt=login` forces reauth;
   # `prompt=none` forbids UI; `max_age` bounds the age of an acceptable existing
   # authentication.
-  defp auth_opts(request) do
+  #
+  # `:resumed` is `true` when the request was restored from
+  # `AttestoPhoenix.Interaction.park/2`: the End-User has been through the
+  # host's login for this request, so a host that parks on `prompt=login` does
+  # not send them there again.
+  defp auth_opts(conn, request) do
     %{
       prompt: request.prompt,
       force_reauth: @prompt_login in request.prompt,
       interactive: @prompt_none not in request.prompt,
-      max_age: request.max_age
+      max_age: request.max_age,
+      resumed: not is_nil(resumed(conn))
     }
   end
 
@@ -1145,6 +1389,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       "query" ->
         do_redirect(conn, redirect_uri, Map.to_list(params) ++ iss_param(config))
 
+      # OAuth 2.0 Form Post Response Mode: the same parameters as `query`
+      # (including the RFC 9207 `iss`), delivered in a POST body.
+      "form_post" ->
+        deliver_form_post(conn, redirect_uri, "form_post", Map.to_list(params) ++ iss_param(config))
+
       jwt_mode ->
         {:ok, response} =
           JARM.response_jwt(Config.to_attesto_config(config), client_id, params)
@@ -1174,16 +1423,27 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp deliver_jarm(conn, redirect_uri, "form_post.jwt", response) do
+    deliver_form_post(conn, redirect_uri, "form_post.jwt", [{"response", response}])
+  end
+
+  # OAuth 2.0 Form Post Response Mode §2: the response parameters are HTML
+  # form values the user agent POSTs to the redirect URI; none of them appears
+  # in a URL. The page carries the authorization response, so it must not be
+  # cached (§4, and RFC 6749 §5.1's rule for responses bearing credentials).
+  # One renderer serves the plain mode and its JARM variant.
+  defp deliver_form_post(conn, redirect_uri, mode, fields) do
     if web_form_action?(redirect_uri) do
       conn
+      |> put_resp_header("cache-control", "no-store")
+      |> put_resp_header("pragma", "no-cache")
       |> put_resp_header(
         "content-security-policy",
         "default-src 'none'; script-src 'unsafe-inline'; form-action https: http:; base-uri 'none'; frame-ancestors 'none'"
       )
       |> put_resp_header("content-type", "text/html; charset=utf-8")
-      |> send_resp(:ok, form_post_html(redirect_uri, response))
+      |> send_resp(:ok, form_post_html(redirect_uri, fields))
     else
-      send_resp(conn, :bad_request, "invalid redirect_uri for form_post.jwt")
+      send_resp(conn, :bad_request, "invalid redirect_uri for #{mode}")
     end
   end
 
@@ -1200,11 +1460,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   # OAuth 2.0 Form Post Response Mode: a minimal auto-submitting form that POSTs
-  # the signed `response` to the redirect_uri. The action and value are HTML-
-  # attribute-escaped; a noscript fallback keeps it usable without scripting.
-  defp form_post_html(redirect_uri, response) do
+  # the response parameters to the redirect_uri. The action and every name and
+  # value are HTML-attribute-escaped; a noscript fallback keeps it usable
+  # without scripting.
+  defp form_post_html(redirect_uri, fields) do
     action = Plug.HTML.html_escape(redirect_uri)
-    value = Plug.HTML.html_escape(response)
+
+    inputs =
+      Enum.map_join(fields, "\n", fn {name, value} ->
+        ~s(<input type="hidden" name="#{Plug.HTML.html_escape(name)}" value="#{Plug.HTML.html_escape(value)}"/>)
+      end)
 
     """
     <!DOCTYPE html>
@@ -1212,7 +1477,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     <head><title>Submitting…</title></head>
     <body onload="document.forms[0].submit()">
     <form method="post" action="#{action}">
-    <input type="hidden" name="response" value="#{value}"/>
+    #{inputs}
     <noscript><button type="submit">Continue</button></noscript>
     </form>
     </body>
@@ -1361,6 +1626,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp direct_error_description(:redirect_uri_not_registered), do: "redirect_uri is not registered for this client"
 
   defp direct_error_description(:invalid_request_uri), do: "the request_uri is unknown or has expired"
+
+  defp direct_error_description(:invalid_resume),
+    do: "the resume reference is unknown, has expired, was already used, or belongs to another browser"
+
+  defp direct_error_description(:resume_with_parameters),
+    do: "resume cannot be combined with other authorization request parameters"
 
   defp direct_error_description(:request_uri_client_mismatch), do: "the request_uri was not issued to this client"
 

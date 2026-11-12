@@ -15,8 +15,11 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     * `:terminate_session` (REQUIRED when logout is enabled) —
       `(conn, context -> {:ok, conn} | {:ok, conn, session} | {:halt, conn})`.
       Clears the host's browser login session. `context` is `%{subject, sid,
-      client_id}` carrying the `id_token_hint`'s values (any may be nil). The
-      host is the authority on the session:
+      client_id, hint}` carrying the `id_token_hint`'s values (any may be nil)
+      and `hint`, which is `:verified`, `:absent` or `:invalid`. For a client
+      with a pairwise subject type, `subject` is the pairwise identifier from
+      the hint, not the host's own; match the session by `sid`. The host is
+      the authority on the session:
 
         * `{:ok, conn}` — the current session was cleared; run front-channel
           logout only (no back-channel fan-out).
@@ -44,6 +47,17 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   that wants an explicit confirmation step returns `{:halt, conn}` and renders
   its own page. The controller additionally requires HTTPS. Without this
   binding, `/end_session` is a logout-CSRF / forced-logout primitive.
+
+  ## An `id_token_hint` that fails verification
+
+  By default (`on_invalid_id_token_hint: :reject`) such a request is answered
+  `400` before `:terminate_session` runs. With
+  `on_invalid_id_token_hint: :terminate_session` the callback runs with
+  `%{subject: nil, sid: nil, client_id: nil, hint: :invalid}`, so the host can
+  ask the End-User whether to log out, which RP-Initiated Logout §2 requires
+  when a hint is missing or does not match the current session. Nothing from
+  the failed hint is used and `post_logout_redirect_uri` is never honored for
+  the request (§4), whatever the callback returns.
 
   ## Redirect safety
 
@@ -126,7 +140,13 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   end
 
   defp parse(config, params) do
-    case EndSession.parse(Config.to_attesto_config(config), params) do
+    on_invalid_hint =
+      case config.on_invalid_id_token_hint do
+        :reject -> :reject
+        :terminate_session -> :discard
+      end
+
+    case EndSession.parse(Config.to_attesto_config(config), params, on_invalid_hint: on_invalid_hint) do
       {:ok, request} ->
         {:ok, request}
 
@@ -164,7 +184,12 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   # ── perform the logout ───────────────────────────────────────────────────
 
   defp logout(conn, config, request, redirect) do
-    context = %{subject: request.subject, sid: request.sid, client_id: request.client_id}
+    context = %{
+      subject: request.subject,
+      sid: request.sid,
+      client_id: request.client_id,
+      hint: request.id_token_hint
+    }
 
     case terminate_session(conn, config, context) do
       {:error, status, body} ->

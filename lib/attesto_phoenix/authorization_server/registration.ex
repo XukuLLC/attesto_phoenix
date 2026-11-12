@@ -19,7 +19,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   never touches a `Plug.Conn`, and returns events as data.
   """
 
-  alias Attesto.{Key, RedirectURI, Secret, SecureCompare, SigningAlg}
+  alias Attesto.{Key, PairwiseSubject, RedirectURI, Secret, SecureCompare, SigningAlg}
+  alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
+  alias AttestoPhoenix.AuthorizationServer.Userinfo
   alias AttestoPhoenix.{Callback, Config, Event, OAuthError}
   alias AttestoPhoenix.ClientIdMetadata.HostPolicy
   alias AttestoPhoenix.RedirectURIRegistration
@@ -400,12 +402,202 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   @spec unregister(Config.t(), String.t(), String.t() | nil) ::
           :ok | {:error, OAuthError.t()}
   def unregister(%Config{} = config, client_id, token) when is_binary(client_id) do
+    with {:ok, client, _bearer} <- authorize_management(config, client_id, token) do
+      unregister_client(config, client)
+    end
+  end
+
+  @doc """
+  Authorize a request to a client's configuration endpoint (RFC 7592 §2):
+  registration is enabled, `token` is the registration access token issued
+  with `client_id`, and the client still exists.
+
+  The one check behind read, update and delete. Returns `{:ok, client,
+  token}` or the RFC 7592 §2 `401 invalid_token` error, which does not say
+  whether the client exists.
+  """
+  @spec authorize_management(Config.t(), String.t(), String.t() | nil) ::
+          {:ok, term(), String.t()} | {:error, OAuthError.t()}
+  def authorize_management(%Config{} = config, client_id, token) when is_binary(client_id) do
     with :ok <- check_enabled(config),
          {:ok, bearer} <- require_bearer_token(token),
          {:ok, client} <- load_client(config, client_id),
          :ok <- verify_registration_access_token(config, client, bearer) do
-      unregister_client(config, client)
+      {:ok, client, bearer}
     end
+  end
+
+  @doc """
+  Read a client's current registration (RFC 7592 §2.1).
+
+  Returns `{:ok, client_information_response}`: the registered metadata from
+  the host's `:client_registration_metadata` callback, with `client_id`,
+  `registration_client_uri` and `registration_access_token`. The token is the
+  one presented; it is not rotated. `client_secret` is not returned, because
+  only its hash is stored.
+
+  Fails closed when `:client_registration_metadata` is not configured.
+  """
+  @spec read(Config.t(), String.t(), String.t() | nil) :: {:ok, map()} | {:error, OAuthError.t()}
+  def read(%Config{} = config, client_id, token) when is_binary(client_id) do
+    with {:ok, client, bearer} <- authorize_management(config, client_id, token),
+         {:ok, metadata} <- registered_metadata(config, client) do
+      {:ok, management_response(config, client_id, bearer, metadata)}
+    end
+  end
+
+  @doc """
+  Replace a client's registered metadata (RFC 7592 §2.2).
+
+  `metadata` is the request document. It is the client's complete new
+  metadata: a member it omits is reset to its default, exactly as in a
+  registration request, and it is validated by the same rules as one. Beyond
+  those rules, per RFC 7592 §2.2:
+
+    * `client_id` MUST be present and equal the client being updated.
+    * `registration_access_token`, `registration_client_uri`,
+      `client_secret_expires_at` and `client_id_issued_at` MUST NOT be present.
+    * `client_secret`, when present, MUST be the client's current secret. The
+      client cannot choose a secret.
+
+  Three members cannot be changed by an update and are refused when they
+  differ from the registered value: `token_endpoint_auth_method` (it decides
+  whether the client has a secret, and this server does not issue or retire
+  one on update), `subject_type`, and, for a pairwise client, the host its
+  redirect URIs share (either change would alter every `sub` the client has
+  been given).
+
+  The registration access token and the client secret are not rotated.
+  Returns `{:ok, client_information_response, events}`. Fails closed when
+  `:client_registration_metadata` or `:update_client` is not configured.
+  """
+  @spec update(Config.t(), String.t(), String.t() | nil, term()) ::
+          {:ok, map(), [Event.t()]} | {:error, OAuthError.t()}
+  def update(%Config{} = config, client_id, token, metadata) when is_binary(client_id) do
+    with {:ok, client, bearer} <- authorize_management(config, client_id, token),
+         {:ok, current} <- registered_metadata(config, client),
+         :ok <- require_update_callback(config),
+         {:ok, metadata} <- check_update_members(config, client, client_id, metadata),
+         {:ok, request} <- Request.from_params(metadata),
+         {:ok, validated} <- validate_metadata(request, config),
+         :ok <- check_immutable_members(current, validated),
+         attrs = updated_attrs(validated, client_id, current),
+         {:ok, _stored} <- persist_update(config, client, attrs) do
+      event = Event.new(:client_updated, %{client_id: client_id})
+      {:ok, management_response(config, client_id, bearer, attrs), [event]}
+    end
+  end
+
+  # RFC 7592 §2.2: members a client MUST NOT send in an update request.
+  @update_forbidden_members ~w(registration_access_token registration_client_uri
+                               client_secret_expires_at client_id_issued_at)
+
+  # Members of a stored registration that are credentials or their hashes, or
+  # that the response sets itself. They never appear in a management response
+  # taken from the host's stored metadata.
+  @management_private_members ~w(client_secret client_secret_hash client_secret_expires_at
+                                 registration_access_token registration_access_token_hash
+                                 registration_client_uri)
+
+  defp check_update_members(config, client, client_id, metadata) when is_map(metadata) and not is_struct(metadata) do
+    cond do
+      Map.get(metadata, "client_id") != client_id ->
+        {:error, error(@error_invalid_client_metadata, "client_id must be present and match the client being updated")}
+
+      Enum.any?(@update_forbidden_members, &Map.has_key?(metadata, &1)) ->
+        {:error,
+         error(
+           @error_invalid_client_metadata,
+           "an update must not include #{Enum.join(@update_forbidden_members, ", ")} (RFC 7592 §2.2)"
+         )}
+
+      not current_secret?(config, client, Map.fetch(metadata, "client_secret")) ->
+        {:error, error(@error_invalid_client_metadata, "client_secret does not match the registered secret")}
+
+      true ->
+        {:ok, Map.drop(metadata, ["client_id", "client_secret"])}
+    end
+  end
+
+  defp check_update_members(_config, _client, _client_id, _metadata) do
+    {:error, error(@error_invalid_client_metadata, "registration metadata must be a JSON object")}
+  end
+
+  defp current_secret?(_config, _client, :error), do: true
+
+  defp current_secret?(config, client, {:ok, secret}) when is_binary(secret) and secret != "",
+    do: Config.client_store_verify_secret(config, client, secret)
+
+  defp current_secret?(_config, _client, {:ok, _other}), do: false
+
+  defp check_immutable_members(current, validated) do
+    cond do
+      changed?(current, validated, "token_endpoint_auth_method") ->
+        {:error,
+         error(@error_invalid_client_metadata, "token_endpoint_auth_method cannot be changed; register a new client")}
+
+      subject_type(current) != subject_type(validated) ->
+        {:error, error(@error_invalid_client_metadata, "subject_type cannot be changed; register a new client")}
+
+      subject_type(validated) == "pairwise" and sector(current) != sector(validated) ->
+        {:error,
+         error(
+           @error_invalid_client_metadata,
+           "a pairwise client's redirect_uris must stay on the registered host; register a new client"
+         )}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp changed?(current, validated, member), do: Map.get(current, member) != Map.get(validated, member)
+  defp subject_type(metadata), do: Map.get(metadata, "subject_type") || "public"
+  defp sector(metadata), do: metadata |> Map.get("redirect_uris") |> PairwiseSubject.sector_identifier()
+
+  # The stored registration keeps its identifier and issuance time; everything
+  # else is the validated request (replace, not merge, RFC 7592 §2.2).
+  defp updated_attrs(validated, client_id, current) do
+    validated
+    |> Map.put("client_id", client_id)
+    |> put_if_present("client_id_issued_at", Map.get(current, "client_id_issued_at"))
+  end
+
+  defp put_if_present(map, _key, nil), do: map
+  defp put_if_present(map, key, value), do: Map.put(map, key, value)
+
+  defp registered_metadata(config, client) do
+    with callback when not is_nil(callback) <- Config.client_registration_metadata_fun(config),
+         %{} = metadata when not is_struct(metadata) <- Callback.invoke(callback, [client]) do
+      {:ok, Map.new(metadata, fn {key, value} -> {to_string(key), value} end)}
+    else
+      _ -> {:error, management_not_configured_error()}
+    end
+  end
+
+  defp require_update_callback(config) do
+    if is_nil(Config.update_client_fun(config)), do: {:error, management_not_configured_error()}, else: :ok
+  end
+
+  defp persist_update(config, client, attrs) do
+    case Callback.invoke(Config.update_client_fun(config), [client, attrs]) do
+      {:ok, stored} -> {:ok, stored}
+      {:error, _reason} -> {:error, error(@error_invalid_client_metadata, "the client could not be updated")}
+    end
+  end
+
+  # RFC 7592 §3: the client information response for a management request.
+  defp management_response(config, client_id, bearer, metadata) do
+    metadata
+    |> Map.drop(@management_private_members)
+    |> Map.put("client_id", client_id)
+    |> Map.put("registration_access_token", bearer)
+    |> Map.put("registration_client_uri", Config.registration_client_uri(config, client_id))
+    |> client_information_response()
+  end
+
+  defp management_not_configured_error do
+    error(@error_invalid_client_metadata, "dynamic client registration management is not configured")
   end
 
   # ── Metadata validation (RFC 7591 §2) ────────────────────────────────────
@@ -424,19 +616,69 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
          {:ok, passthrough} <- validate_passthrough_metadata(metadata),
          :ok <- validate_key_source_metadata(passthrough),
          :ok <- validate_method_metadata(auth_method, passthrough, config),
-         :ok <- validate_frontchannel_logout_origin(passthrough, redirect_uris) do
-      core = %{
-        "token_endpoint_auth_method" => auth_method,
-        "application_type" => application_type,
-        "grant_types" => grant_types,
-        "redirect_uris" => redirect_uris,
-        "scope" => scope
-      }
+         :ok <- validate_frontchannel_logout_origin(passthrough, redirect_uris),
+         {:ok, oidc} <- validate_oidc_response_metadata(metadata, redirect_uris, config) do
+      core =
+        Map.merge(oidc, %{
+          "token_endpoint_auth_method" => auth_method,
+          "application_type" => application_type,
+          "grant_types" => grant_types,
+          "redirect_uris" => redirect_uris,
+          "scope" => scope
+        })
 
       # The known RFC 7591 §2 display/identity members are merged UNDER the
       # protocol-critical members so a request can never override the validated
       # auth method, grants, redirect URIs, or scope through a passthrough key.
       {:ok, Map.merge(passthrough, core)}
+    end
+  end
+
+  # OpenID Connect Dynamic Client Registration 1.0 §2: `subject_type`,
+  # `sector_identifier_uri` and `userinfo_signed_response_alg`. Each is
+  # accepted only for what this server does: a subject type it issues
+  # (`SubjectIdentifier.subject_types_supported/1`), a pairwise client whose
+  # redirect URIs share one host (`sector_identifier_uri` is not fetched, so it
+  # is refused), and a UserInfo signing algorithm it signs with. An absent
+  # member is left out so the host stores only what the client registered.
+  defp validate_oidc_response_metadata(metadata, redirect_uris, config) do
+    with {:ok, acc} <- validate_subject_type(metadata, redirect_uris, config) do
+      validate_userinfo_signed_response_alg(metadata, acc, config)
+    end
+  end
+
+  defp validate_subject_type(metadata, redirect_uris, config) do
+    subject_type = Map.get(metadata, "subject_type")
+
+    cond do
+      Map.has_key?(metadata, "sector_identifier_uri") ->
+        {:error, error(@error_invalid_client_metadata, "sector_identifier_uri is not supported")}
+
+      is_nil(subject_type) ->
+        {:ok, %{}}
+
+      subject_type not in SubjectIdentifier.subject_types_supported(config) ->
+        {:error, error(@error_invalid_client_metadata, "subject_type is not supported")}
+
+      subject_type == "pairwise" and not match?({:ok, _}, PairwiseSubject.sector_identifier(redirect_uris)) ->
+        {:error, error(@error_invalid_client_metadata, "a pairwise client's redirect_uris must all be on one host")}
+
+      true ->
+        {:ok, %{"subject_type" => subject_type}}
+    end
+  end
+
+  defp validate_userinfo_signed_response_alg(metadata, acc, config) do
+    case Map.fetch(metadata, "userinfo_signed_response_alg") do
+      :error ->
+        {:ok, acc}
+
+      {:ok, alg} ->
+        if is_binary(alg) and alg in (Userinfo.signing_alg_values(config) || []) do
+          {:ok, Map.put(acc, "userinfo_signed_response_alg", alg)}
+        else
+          {:error, error(@error_invalid_client_metadata, "userinfo_signed_response_alg is not supported")}
+        end
     end
   end
 
@@ -1485,11 +1727,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   defp unregister_client(config, client) do
     case Config.unregister_client_fun(config) do
       nil ->
-        {:error,
-         error(
-           @error_invalid_client_metadata,
-           "dynamic client registration management is not configured"
-         )}
+        {:error, management_not_configured_error()}
 
       callback ->
         case Callback.invoke(callback, [client]) do

@@ -10,13 +10,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   the corresponding endpoint policies.
   """
 
-  alias Attesto.AuthorizationRequest
   alias Attesto.SigningAlg
   alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.Config
 
   @response_types_supported ["code"]
-  @response_modes_supported AuthorizationRequest.supported_response_modes()
 
   @wallet_attestation_auth_method "attest_jwt_client_auth"
 
@@ -39,7 +37,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     |> Map.merge(%{
       "authorization_endpoint" => config.authorization_endpoint || Config.authorize_endpoint_url(config),
       "response_types_supported" => @response_types_supported,
-      "response_modes_supported" => @response_modes_supported,
+      "response_modes_supported" => config.response_modes_supported,
       "grant_types_supported" => Config.grant_types_supported(config),
       "token_endpoint_auth_methods_supported" => Config.token_endpoint_auth_methods_supported(config),
       "token_endpoint_auth_signing_alg_values_supported" => config.client_auth_signing_algs,

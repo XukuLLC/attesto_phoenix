@@ -6,6 +6,262 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [Unreleased]
+
+Requires `attesto >= 2.13.0`.
+
+### Changed
+
+- The authorization endpoint enforces `max_age` (OIDC Core §3.1.2.1). Until
+  now the `auth_time` returned by `:authenticate_resource_owner` was copied
+  into the code without being compared to the request's `max_age`, and a
+  missing `auth_time` was only logged. The rule is
+  `Attesto.AuthorizationRequest.check_auth_time/4`; the controller maps its
+  result:
+  - Under `prompt=none`, an authentication older than `max_age` is answered
+    with a `login_required` redirect (§3.1.2.6).
+  - On an interactive request, an authentication older than `max_age` means
+    the host did not re-authenticate as `auth_opts.max_age` told it to. The
+    client cannot correct that, so the answer is a `server_error` redirect and
+    an error log line. The interactive check allows 60 seconds beyond
+    `max_age` for the hop back from the host's login page, so `max_age=0`
+    works with a host that re-authenticates and returns.
+  - When `max_age` was requested and the host returns no `auth_time`, or one
+    that is malformed or in the future, the answer is `server_error` under
+    either prompt. §3.1.2.1 says the ID Token MUST include `auth_time` in that
+    case, so no code is issued without one.
+
+  Behaviour change: a host whose `:authenticate_resource_owner` ignores
+  `auth_opts.max_age`, or returns no `auth_time`, now gets an error redirect
+  for requests that carry `max_age` where it used to get a code. Return the
+  time of the End-User's last active authentication as `:auth_time`, and
+  re-authenticate when it is older than `auth_opts.max_age`. Requests without
+  `max_age` are unaffected.
+
+- The scope policy (`:authorize_scope` / `:scope_policy`) runs at the
+  authorization endpoint, after request validation and before
+  `:authenticate_resource_owner`. Until now it ran only at the token endpoint,
+  so a scope the policy refuses got a code and failed at redemption. A refusal
+  is answered with a redirectable `invalid_scope` (RFC 6749 §4.1.2.1), under
+  `prompt=none` too. A scope the policy narrows is what `:consent` sees and
+  what the code is bound to. Both endpoints decide through
+  `AttestoPhoenix.AuthorizationServer.ScopeAuthorization.authorize/4`.
+
+  Behaviour change: with no `:authorize_scope` and no `:scope_policy`, the
+  built-in policy accepts only scopes in the effective `:scopes_supported`
+  catalog, and it now refuses the rest at the authorization endpoint. A
+  deployment that never set a catalog or a policy and relied on getting a code
+  for an unlisted scope sets `:scopes_supported` or supplies a policy.
+- At the token endpoint the request's resource indicators are resolved before
+  the scope policy runs, so the policy can receive them. A token request with
+  both an invalid `resource` and a refused scope is now answered
+  `invalid_target` where it used to be answered `invalid_scope`.
+- `form_post` is in the default `:response_modes_supported`, so both
+  discovery documents now advertise it and the authorization and PAR endpoints
+  accept it (see Added). A deployment that must not offer it sets
+  `:response_modes_supported` without it.
+- A `form_post.jwt` response is sent with `Cache-Control: no-store`.
+
+### Fixed
+
+- `:token_issued` events carry the resource-owner `:subject`. The event
+  documentation described the field, but it was always `nil` on this event.
+  It is now the redeemed grant's subject for the authorization-code, device,
+  CIBA, pre-authorized-code and jwt-bearer grants, and the subject token's
+  `sub` for token exchange. It stays `nil` for `client_credentials`, which has
+  no resource owner. `:refresh_issued` and `:refresh_rotated` already carried
+  it.
+
+### Added
+
+- `AttestoPhoenix.Interaction.park/2` stores the authorization request being
+  processed and returns a `resume_id`; sending the browser to the
+  authorization endpoint with `?resume=<resume_id>` and nothing else resumes
+  it. A host uses it to get back to a request after its login page
+  (`prompt=login`, `max_age`, no session). A resume re-runs the parked
+  parameters through the whole pipeline (client load, validation, scope
+  policy), and `:authenticate_resource_owner` receives `auth_opts.resumed:
+  true`; `auth_opts` now always carries `:resumed`. A parked request resumes
+  once, within `:interaction_ttl` seconds (default 600, at most 3600), and
+  only from the browser whose `:interaction_browser_binding` value matches.
+  `resume` with any other parameter, or an unknown, expired, used or
+  wrong-browser `resume`, is a direct error page. Parked requests are kept in
+  `:par_store` (which needs `take/1`) under keys no `request_uri` can have, so
+  there is no new table and the existing expiry applies.
+- On a resumed request with `max_age`, an authentication made after the
+  request was parked satisfies `max_age`, and an earlier one is checked
+  exactly. The 60-second interval a fresh interactive request gets does not
+  apply to a resume.
+- Pairwise subject identifiers (OpenID Connect Core §8.1).
+  `:client_subject_type` (`(client -> "public" | "pairwise")`, also an
+  optional `AttestoPhoenix.ClientStore` callback) and
+  `:pairwise_subject_salt` (at least 32 bytes, required once the callback is
+  configured). A pairwise client is shown
+  `Attesto.PairwiseSubject.derive/3` of its sector identifier, the host
+  subject and the salt as `sub` in its ID Tokens, UserInfo responses,
+  introspection responses (by caller) and back-channel logout tokens;
+  `AttestoPhoenix.AuthorizationServer.SubjectIdentifier` is the one place
+  that decides. Access tokens keep the host subject. The sector identifier is
+  the one host the client's redirect URIs share; `sector_identifier_uri` is
+  not supported, and a pairwise client whose redirect URIs span hosts is
+  refused at registration and wherever a `sub` would be issued. Discovery
+  advertises `subject_types_supported: ["public", "pairwise"]` once the
+  callback is configured. For a pairwise client, the `:terminate_session`
+  context's `:subject` (taken from the `id_token_hint`) is the pairwise
+  value.
+- Signed UserInfo responses (OpenID Connect Core §5.3.2).
+  `:client_userinfo_signed_response_alg` (`(client -> alg | nil)`, also an
+  optional `AttestoPhoenix.ClientStore` callback) makes the UserInfo endpoint
+  answer that client with a JWT (`application/jwt`) signed with the current
+  signing key and carrying `iss` and `aud`. Discovery then advertises
+  `userinfo_signing_alg_values_supported`. A client registered for an
+  algorithm this server does not sign with gets a `500`, never unsigned
+  claims. Encrypted UserInfo responses are not implemented.
+- Dynamic registration accepts `subject_type` and
+  `userinfo_signed_response_alg` (OpenID Connect Dynamic Client Registration
+  1.0 §2) when this server supports the requested value, and refuses
+  `sector_identifier_uri`.
+- RFC 7592 client read and update: `GET` and `PUT` on
+  `/oauth/register/:client_id`, mounted with `registration: true` and
+  authorized by the registration access token through the check `DELETE`
+  uses (`Registration.authorize_management/3`). `GET` needs the new
+  `:client_registration_metadata` callback and `PUT` also `:update_client`
+  (both optional `AttestoPhoenix.RegistrationStore` callbacks); without them
+  the request fails closed. An update is the client's complete new metadata,
+  validated by the registration rules, with the RFC 7592 §2.2 member rules:
+  `client_id` must match, `registration_access_token`,
+  `registration_client_uri`, `client_secret_expires_at` and
+  `client_id_issued_at` must be absent, and a `client_secret` must be the
+  current one. `token_endpoint_auth_method` and `subject_type` cannot be
+  changed, and a pairwise client's redirect URIs must stay on its host.
+  Neither the registration access token nor the client secret is rotated;
+  responses echo the presented token and never include `client_secret`. A
+  successful update emits a `:client_updated` event.
+- `response_mode=form_post` (OAuth 2.0 Form Post Response Mode). The
+  authorization response, success or redirectable error, is rendered as an
+  auto-submitting HTML form that POSTs the parameters to the redirect URI, so
+  none of them appears in a URL. Names and values are HTML-escaped, the page
+  is sent with `Cache-Control: no-store`, and the RFC 9207 `iss` parameter is
+  included as it is for `query`. It uses the form renderer `form_post.jwt`
+  already had. A redirect URI that is not `http` or `https` cannot be a form
+  action and is answered `400`, as for `form_post.jwt`.
+- `:authorization_code_issuance` wraps authorization-code issuance at the
+  authorization endpoint in a host callback, `(context, continuation)`, with
+  `context` `%{client_id, subject, family_id, private_context}`. The host runs
+  the continuation inside its own transaction and locks, so the code is stored
+  atomically with a session or eligibility check, or refuses with an
+  `AttestoPhoenix.OAuthError`: `access_denied`, `server_error` or
+  `temporarily_unavailable` are redirected as named, and `login_required` only
+  for a `prompt=none` request. Unset, issuance is unchanged.
+- `:refresh_completion` wraps the refresh grant in a host callback,
+  `(context, continuation)`, with `context` `%{client_id, subject, family_id,
+  scope, resource, auth_time, acr, sid}` read from the stored grant. Rotation
+  of the presented refresh token happens inside the continuation. A host that
+  refuses with `invalid_grant` before invoking it has not consumed the token,
+  and with `AttestoPhoenix.Store.EctoRefreshStore` on the host's repo a
+  rollback of the host's transaction undoes the rotation. A refresh store that
+  is not transactional with the host cannot be rolled back once the
+  continuation has run. A family revocation from reuse detection, or from a
+  `:build_refresh_principal` denial, is applied again after the callback
+  returns, so a host rollback does not undo it.
+  Unset, the refresh grant runs in the order it always has.
+- `AttestoPhoenix.AuthorizationServer.Continuation` holds the contract the
+  three continuation hooks share: one invocation, in the callback's process,
+  with the continuation's result returned unchanged and verified by digest.
+  `:authorization_code_completion` now runs through it; its behavior and log
+  lines are unchanged.
+- The scope policy has a three-argument form,
+  `authorize_scope(client, requested_scope, resources)`, which also receives
+  the request's resolved RFC 8707 resource indicators. It is used when the
+  `:authorize_scope` callback has that arity or the `:scope_policy` module
+  exports it, and is called with the same arguments at the authorization and
+  token endpoints. It may answer `{:error, :invalid_target}` (RFC 8707 §2) for
+  a refusal about a resource or a resource-and-scope combination; the
+  two-argument form may answer only `{:error, :invalid_scope}`. A
+  `:scope_policy` module may export either form or both.
+- `AttestoPhoenix.Revocation.revoke_subject/2`, `revoke_client/2` and
+  `revoke_session/2` (and the general `revoke/2`) delete the unredeemed
+  authorization codes and revoke the refresh-token families of a subject, a
+  client or a host session, and return
+  `{:ok, %{codes: n, refresh_families: m}}`. With the bundled Ecto stores they
+  run on the configured repo, so a call inside the host's transaction commits
+  or rolls back with it. Access tokens already issued are not revoked: a
+  self-contained JWT access token stays valid until it expires unless the
+  protected resource consults introspection or a denylist.
+- `AttestoPhoenix.Store.EctoCodeStore.delete_unconsumed/1` and
+  `AttestoPhoenix.Store.EctoRefreshStore.revoke_families/1` implement the new
+  optional core store callbacks. Both select by `:subject`, `:client_id`
+  and/or `:sid`. The session identifier is matched inside the existing
+  `claims` JSONB column, so there is no new column and no migration; a
+  selection by `:sid` alone scans the table's live rows.
+- `AttestoPhoenix.Store.Sweeper.sweep_once/2` runs one deletion pass over the
+  Attesto tables with a caller-supplied `now` and returns the per-table
+  counts. It opens no transaction, so it runs inside the caller's. It is the
+  pass the supervised process runs. Back-channel logout retries are not part
+  of it, because they make network calls; the supervised process keeps doing
+  those.
+- `AttestoPhoenix.Store.Sweeper` takes `cluster_lock: {:advisory, key}`. Each
+  scheduled deletion pass then runs in a transaction that first takes the
+  PostgreSQL advisory lock `key` with `pg_try_advisory_xact_lock`, so with the
+  same key on every node one node sweeps per interval and the others skip it.
+  `sweep_now/0,1` returns `:skipped` for a skipped pass.
+- `attesto_routes/1` takes `par:`, `revocation:` and `introspection:`, each
+  defaulting to `true`. `false` leaves the route unmounted, and both the RFC
+  8414 and the OpenID Provider metadata documents then omit that endpoint and
+  its `*_auth_methods_supported` and signing-algorithm members. Both documents
+  read the omitted routes from `AttestoPhoenix.RouteControls`. `par: false`
+  with `require_pushed_authorization_requests: true` raises `ArgumentError` on
+  the metadata and authorization routes at request time; the router options
+  are compile-time and the configuration is per request, so the conflict is
+  not visible at boot.
+- `:userinfo_scope_claims` (a map from scope to extra claim names) and
+  `:userinfo_always_claims` (claim names released for every `openid` token)
+  widen what the UserInfo endpoint releases beyond the OIDC Core §5.4 set. A
+  standard scope gains the listed names; a host-defined scope gets them as its
+  whole set. Neither may name `sub`. When `:claims_supported` is non-empty,
+  every configured name must appear in it.
+- `:build_userinfo_claims` may return `{:error, :invalid_token}` to refuse a
+  subject, for example one disabled after its access token was minted. The
+  UserInfo endpoint answers `401` with the same RFC 6750 §3.1 `invalid_token`
+  challenge a rejected token gets.
+- `:on_invalid_id_token_hint` sets what the end-session endpoint does with an
+  `id_token_hint` that fails verification. `:reject` (the default) answers
+  `400`, as before. `:terminate_session` runs the `:terminate_session`
+  callback with `%{subject: nil, sid: nil, client_id: nil, hint: :invalid}` so
+  the host can ask the End-User whether to log out (RP-Initiated Logout 1.0
+  §2, §4). Nothing from the failed hint is used, and
+  `post_logout_redirect_uri` is never honored for such a request.
+- The `:terminate_session` context carries `:hint`: `:verified`, `:absent` or
+  `:invalid`.
+- The `:authorization_code_private_context` callback's context also carries
+  `:authentication` (the subject map the host's authentication and consent
+  callbacks returned, including `:auth_time` and `:sid` when the host set
+  them), and the validated request's `:scope` and `:resource`. `:subject` is
+  still the subject id string. A callback that matched the context with
+  `map_size/1` or an exact-map comparison has three more keys to allow for.
+- `:response_modes_supported` sets the authorization response modes this
+  server accepts and advertises: a non-empty list drawn from
+  `Attesto.AuthorizationRequest.supported_response_modes/0`, which stays the
+  default. An authorization or pushed request for a mode outside the list is
+  answered with a redirectable `invalid_request`, and both discovery documents
+  advertise the configured list in `response_modes_supported`. A request with
+  no `response_mode` asks for `query`, so leaving `"query"` out makes an
+  explicit JARM mode mandatory.
+- The validated request passed to `:authenticate_resource_owner` and
+  `:consent` carries `id_token_hint` and `login_hint` (OIDC Core §3.1.2.1),
+  including for a request that arrived through PAR.
+- `:id_token_ttl` sets the ID Token lifetime in seconds. It must be a positive
+  integer no greater than `Attesto.IDToken.max_lifetime_seconds/0` (3600), and
+  defaults to 3600, the lifetime ID Tokens had before. It applies to every ID
+  Token this server mints, including those from the CIBA grant.
+- `:id_token_azp` controls the `azp` claim on minted ID Tokens. `:never` (the
+  default) omits it, as before. `:always` sets it to the client the ID Token
+  is issued to. OIDC Core §2 makes `azp` OPTIONAL and says implementations not
+  using extensions "are encouraged to not use azp"; `:always` runs against
+  that encouragement and exists for relying parties that check `azp` on a
+  single-audience ID Token. `azp` could not be added through
+  `:build_id_token_claims`, because it is a reserved claim.
+
 ## [4.6.0] - 2026-11-09
 
 ### Security

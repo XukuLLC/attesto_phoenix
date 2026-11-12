@@ -485,5 +485,38 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
 
   defp ensure_sanitized_error(%Ecto.Changeset{} = changeset), do: changeset
 
+  @doc """
+  Deletes every unredeemed authorization code whose grant matches `criteria`
+  (`:subject`, `:client_id` and/or `:sid`, ANDed; see
+  `Attesto.RevocationCriteria`) and returns `{:ok, count}`.
+
+  One `DELETE ... WHERE consumed_at IS NULL AND ...` statement on the
+  configured repo, so it joins a transaction the caller has open. The session
+  identifier is matched inside the `claims` JSONB column (`claims->>'sid'`),
+  not a dedicated column, so it needs no migration; the statement scans the
+  rows the other criteria leave, or the unredeemed rows when `:sid` is the only
+  criterion.
+
+  Redeemed rows are kept: they hold the reuse marker and the access-token
+  link. Access tokens already issued are not affected; a self-contained JWT
+  access token stays valid until it expires unless the protected resource
+  consults introspection or the revocation denylist.
+  """
+  @impl Attesto.CodeStore
+  @spec delete_unconsumed(Attesto.RevocationCriteria.criteria()) :: {:ok, non_neg_integer()}
+  def delete_unconsumed(criteria) do
+    criteria = Attesto.RevocationCriteria.new!(criteria)
+    {repo, prefix} = StoreEcto.mutation_context()
+
+    case StoreEcto.where_criteria(from(r in Authorization, where: is_nil(r.consumed_at)), criteria) do
+      :none ->
+        {:ok, 0}
+
+      query ->
+        {count, _} = repo.delete_all(query, [prefix: prefix] ++ @claims_query_opts)
+        {:ok, count}
+    end
+  end
+
   defp repo, do: Config.ecto_repo!()
 end

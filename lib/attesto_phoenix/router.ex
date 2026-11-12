@@ -27,14 +27,18 @@ defmodule AttestoPhoenix.Router do
     * `GET /oauth/authorize` - the authorization endpoint (RFC 6749 §3.1;
       OpenID Connect Core 1.0 §3.1.2).
     * `POST /oauth/token` - the token endpoint (RFC 6749 §3.2).
-    * `POST /oauth/par` - pushed authorization requests (RFC 9126).
-    * `POST /oauth/revoke` - the token revocation endpoint (RFC 7009 §2).
+    * `POST /oauth/par` - pushed authorization requests (RFC 9126), omitted
+      with `par: false`.
+    * `POST /oauth/revoke` - the token revocation endpoint (RFC 7009 §2),
+      omitted with `revocation: false`.
     * `POST /oauth/introspect` - the token introspection endpoint (RFC 7662 §2),
-      with the RFC 9701 signed-JWT response negotiated by the `Accept` header.
+      with the RFC 9701 signed-JWT response negotiated by the `Accept` header,
+      omitted with `introspection: false`.
     * `POST /oauth/register` - dynamic client registration (RFC 7591 §3.1),
       mounted only when registration is enabled (see `:registration` below).
-    * `DELETE /oauth/register/:client_id` - dynamic client registration
-      management cleanup (RFC 7592 §2), mounted with registration.
+    * `GET`, `PUT` and `DELETE /oauth/register/:client_id` - the client
+      configuration endpoint (RFC 7592 §2): read, update and delete a
+      dynamically registered client. Mounted with registration.
     * `POST /oauth/nonce` - the OID4VCI c_nonce endpoint, mounted only with
       `credential_issuance: true`.
     * `GET /oauth/statuslist/:id` - the IETF Token Status List endpoint,
@@ -183,7 +187,8 @@ defmodule AttestoPhoenix.Router do
       attributes are not available when Phoenix expands the nested route
       macro and are rejected with an actionable error.
     * `:registration` - when `true`, mounts `POST /oauth/register`
-      (RFC 7591) and `DELETE /oauth/register/:client_id` (RFC 7592). Defaults
+      (RFC 7591) and `GET`/`PUT`/`DELETE /oauth/register/:client_id`
+      (RFC 7592). Defaults
       to `false`. The endpoints still fail closed at request time unless the
       host has wired the registration callbacks in `AttestoPhoenix.Config`;
       this option only controls whether the routes exist, so a deployment that
@@ -198,6 +203,21 @@ defmodule AttestoPhoenix.Router do
       supported. A dynamic macro `:prefix` is rejected for this option
       combination because that prefix does not apply to the root metadata
       request; move it to a surrounding scope instead.
+    * `:par`, `:revocation`, `:introspection` - compile-time route-mount
+      controls for `POST /oauth/par` (RFC 9126), `POST /oauth/revoke`
+      (RFC 7009) and `POST /oauth/introspect` (RFC 7662). Each defaults to
+      `true`. `false` omits the route, and both metadata documents (RFC 8414
+      and OpenID Provider Metadata) then leave out that endpoint and its
+      `*_auth_methods_supported` and signing-algorithm members; the two
+      documents read the same record (`AttestoPhoenix.RouteControls`). A
+      route omitted here is treated as absent, so a host that serves its own
+      endpoint at the same path has to publish its own metadata for it.
+      `par: false` together with `require_pushed_authorization_requests: true`
+      in `AttestoPhoenix.Config` leaves no way to complete an authorization
+      request. The router options are compile-time and the configuration is
+      resolved per request, so the conflict cannot be refused at boot: the
+      metadata and authorization routes raise `ArgumentError` on each request
+      instead.
     * `:openid_configuration` - when `false`, omits the OpenID Provider
       configuration document while retaining RFC 8414 authorization-server
       metadata. This is also a compile-time route-mount control and defaults to
@@ -458,6 +478,16 @@ defmodule AttestoPhoenix.Router do
     session_management? = normalize_route_mount_control!(opts, :session_management, false, __CALLER__)
     userinfo? = normalize_route_mount_control!(opts, :userinfo, true, __CALLER__)
 
+    # PAR, revocation and introspection are mounted by default. The omitted
+    # ones are recorded on the metadata and authorization routes, where
+    # `AttestoPhoenix.RouteControls` reads them back.
+    omitted_routes =
+      Enum.reject(AttestoPhoenix.RouteControls.controls(), fn control ->
+        normalize_route_mount_control!(opts, control, true, __CALLER__)
+      end)
+
+    omitted_private = omitted_routes_private(omitted_routes)
+
     openid_configuration? =
       normalize_route_mount_control!(opts, :openid_configuration, true, __CALLER__)
 
@@ -537,6 +567,18 @@ defmodule AttestoPhoenix.Router do
             :create
           )
 
+          get(
+            unquote(prefix <> register_path <> "/:client_id"),
+            unquote(registration_controller),
+            :show
+          )
+
+          put(
+            unquote(prefix <> register_path <> "/:client_id"),
+            unquote(registration_controller),
+            :update
+          )
+
           delete(
             unquote(prefix <> register_path <> "/:client_id"),
             unquote(registration_controller),
@@ -555,8 +597,23 @@ defmodule AttestoPhoenix.Router do
         userinfo?,
         prefix <> userinfo_path,
         openid_configuration_path,
-        openid_configuration_controller
+        openid_configuration_controller,
+        omitted_private
       )
+
+    discovery_route = get_route(discovery_path, discovery_controller, :show, omitted_private)
+
+    authorize_routes =
+      quote do
+        unquote(get_route(prefix <> authorize_path, authorize_controller, :authorize, omitted_private))
+        unquote(post_route(prefix <> authorize_path, authorize_controller, :authorize, omitted_private))
+      end
+
+    par_route = optional_post_route(:par, omitted_routes, prefix <> par_path, par_controller)
+    revocation_route = optional_post_route(:revocation, omitted_routes, prefix <> revoke_path, revocation_controller)
+
+    introspection_route =
+      optional_post_route(:introspection, omitted_routes, prefix <> introspect_path, introspection_controller)
 
     # OpenID Connect Core §5.3 defines UserInfo as a protected endpoint. This
     # macro keeps its local route enabled by default so existing calls expand to
@@ -706,7 +763,7 @@ defmodule AttestoPhoenix.Router do
           scope "/" do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :metadata))
 
-            get(unquote(discovery_path), unquote(discovery_controller), :show)
+            unquote(discovery_route)
             unquote(federation_route)
             unquote(credential_issuer_metadata_route)
             unquote(jwt_vc_issuer_metadata_route)
@@ -719,17 +776,16 @@ defmodule AttestoPhoenix.Router do
           scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :interactive))
 
-            get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
-            post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+            unquote(authorize_routes)
           end
 
           scope "/", log: false do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
 
             post(unquote(prefix <> token_path), unquote(token_controller), :create)
-            post(unquote(prefix <> par_path), unquote(par_controller), :create)
-            post(unquote(prefix <> revoke_path), unquote(revocation_controller), :create)
-            post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
+            unquote(par_route)
+            unquote(revocation_route)
+            unquote(introspection_route)
             unquote(registration_route)
             unquote(device_authorization_route)
             unquote(nonce_route)
@@ -776,7 +832,7 @@ defmodule AttestoPhoenix.Router do
           # and OpenID Connect Discovery §4 Provider Metadata are both
           # unauthenticated public documents. A path-bearing issuer requires the
           # host-mounted derived locations documented above.
-          get(unquote(discovery_path), unquote(discovery_controller), :show)
+          unquote(discovery_route)
           unquote(federation_route)
           unquote(credential_issuer_metadata_route)
           unquote(jwt_vc_issuer_metadata_route)
@@ -802,20 +858,19 @@ defmodule AttestoPhoenix.Router do
             # carries no client-authentication pipeline (RFC 6749 §3.1: the client
             # is not authenticated here; the resource owner authenticates through
             # the host's login/consent callbacks).
-            get(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
-            post(unquote(prefix <> authorize_path), unquote(authorize_controller), :authorize)
+            unquote(authorize_routes)
 
             # RFC 6749 §3.2 / RFC 7009 §2: token issuance and revocation are POST
             # endpoints under the host-chosen prefix. They authenticate the client
             # from the request itself (RFC 6749 §2.3, RFC 7009 §2).
             post(unquote(prefix <> token_path), unquote(token_controller), :create)
-            post(unquote(prefix <> par_path), unquote(par_controller), :create)
-            post(unquote(prefix <> revoke_path), unquote(revocation_controller), :create)
+            unquote(par_route)
+            unquote(revocation_route)
 
             # RFC 7662 §2: token introspection is a POST endpoint that authenticates
             # the client from the request (RFC 7662 §2.1); RFC 9701 adds the signed
             # JWT response negotiated by the Accept header.
-            post(unquote(prefix <> introspect_path), unquote(introspection_controller), :create)
+            unquote(introspection_route)
 
             unquote(registration_route)
             unquote(device_route)
@@ -1092,29 +1147,64 @@ defmodule AttestoPhoenix.Router do
 
   defp federation_route(false, _path, _controller), do: nil
 
-  defp openid_configuration_route(true, true, _local_userinfo_path, path, controller) do
-    quote do
-      get(unquote(path), unquote(controller), :show)
-    end
+  defp openid_configuration_route(true, true, _local_userinfo_path, path, controller, omitted_private) do
+    get_route(path, controller, :show, omitted_private)
   end
 
-  defp openid_configuration_route(true, false, local_userinfo_path, path, controller) do
+  defp openid_configuration_route(true, false, local_userinfo_path, path, controller, omitted_private) do
     {[], local_userinfo_segments} = Utils.build_path_match(local_userinfo_path)
     metadata_path_segment_count = path |> Utils.split() |> length()
 
-    quote do
-      get(
-        unquote(path),
-        unquote(controller),
-        :show,
-        private: %{
-          attesto_phoenix_local_userinfo_route: {unquote(local_userinfo_segments), unquote(metadata_path_segment_count)}
-        }
+    private =
+      Map.put(
+        omitted_private,
+        :attesto_phoenix_local_userinfo_route,
+        {local_userinfo_segments, metadata_path_segment_count}
       )
+
+    get_route(path, controller, :show, private)
+  end
+
+  defp openid_configuration_route(false, _userinfo?, _local_userinfo_path, _path, _controller, _omitted_private),
+    do: nil
+
+  # The route record `AttestoPhoenix.RouteControls` reads. With every route
+  # mounted there is nothing to record, and the routes expand exactly as they
+  # did before these controls existed.
+  defp omitted_routes_private([]), do: %{}
+  defp omitted_routes_private(omitted), do: %{AttestoPhoenix.RouteControls.private_key() => omitted}
+
+  defp get_route(path, controller, action, private) when map_size(private) == 0 do
+    quote do
+      get(unquote(path), unquote(controller), unquote(action))
     end
   end
 
-  defp openid_configuration_route(false, _userinfo?, _local_userinfo_path, _path, _controller), do: nil
+  defp get_route(path, controller, action, private) do
+    quote do
+      get(unquote(path), unquote(controller), unquote(action), private: unquote(Macro.escape(private)))
+    end
+  end
+
+  defp post_route(path, controller, action, private) when map_size(private) == 0 do
+    quote do
+      post(unquote(path), unquote(controller), unquote(action))
+    end
+  end
+
+  defp post_route(path, controller, action, private) do
+    quote do
+      post(unquote(path), unquote(controller), unquote(action), private: unquote(Macro.escape(private)))
+    end
+  end
+
+  defp optional_post_route(control, omitted, path, controller) do
+    if control not in omitted do
+      quote do
+        post(unquote(path), unquote(controller), :create)
+      end
+    end
+  end
 
   defp userinfo_route(true, prefix, path, controller) do
     quote do

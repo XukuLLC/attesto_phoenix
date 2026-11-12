@@ -190,6 +190,15 @@ defmodule AttestoPhoenix.Store.Sweeper do
   interval raises `ArgumentError` so a misconfigured host fails at boot instead
   of starting a process that never sweeps.
 
+  `:cluster_lock` is optional. `cluster_lock: {:advisory, key}`, with `key` a
+  signed 64-bit integer, makes each scheduled deletion pass run inside a
+  transaction that first takes the PostgreSQL advisory lock `key`
+  (`pg_try_advisory_xact_lock`). When every node's sweeper uses the same key,
+  one node sweeps per interval and the rest skip it. The lock ends with the
+  transaction, so a crashed sweep cannot keep it. Choose a key no other part
+  of the application uses. Back-channel logout retries are not under the lock;
+  they are leased per row.
+
   The installer passes `:if_configured` as `true` for upgrade compatibility.
   In that mode an absent interval returns `:ignore`, allowing an existing host
   that does not use the bundled Ecto stores to keep the sweeper disabled. An
@@ -207,15 +216,36 @@ defmodule AttestoPhoenix.Store.Sweeper do
   end
 
   defp start_sweeper_process(config, opts) do
+    init_arg = {config, cluster_lock!(opts)}
+
     if Keyword.has_key?(opts, :name) do
-      start_named_process(config, opts[:name])
+      start_named_process(init_arg, opts[:name])
     else
-      GenServer.start_link(__MODULE__, config, name: default_name(config))
+      GenServer.start_link(__MODULE__, init_arg, name: default_name(config))
     end
   end
 
-  defp start_named_process(config, nil), do: GenServer.start_link(__MODULE__, config)
-  defp start_named_process(config, name), do: GenServer.start_link(__MODULE__, config, name: name)
+  defp start_named_process(init_arg, nil), do: GenServer.start_link(__MODULE__, init_arg)
+  defp start_named_process(init_arg, name), do: GenServer.start_link(__MODULE__, init_arg, name: name)
+
+  # PostgreSQL advisory-lock keys are signed 64-bit integers.
+  @advisory_key_min -0x8000_0000_0000_0000
+  @advisory_key_max 0x7FFF_FFFF_FFFF_FFFF
+
+  defp cluster_lock!(opts) do
+    case Keyword.get(opts, :cluster_lock) do
+      nil ->
+        nil
+
+      {:advisory, key} when is_integer(key) and key >= @advisory_key_min and key <= @advisory_key_max ->
+        {:advisory, key}
+
+      invalid ->
+        raise ArgumentError,
+              "AttestoPhoenix.Store.Sweeper: :cluster_lock must be {:advisory, key} with a signed " <>
+                "64-bit integer key; got #{inspect(invalid)}"
+    end
+  end
 
   @doc false
   def child_spec(opts) do
@@ -229,8 +259,8 @@ defmodule AttestoPhoenix.Store.Sweeper do
   end
 
   @impl true
-  @spec init(Config.t()) :: {:ok, map()}
-  def init(%Config{} = config) do
+  @spec init({Config.t(), {:advisory, integer()} | nil}) :: {:ok, map()}
+  def init({%Config{} = config, cluster_lock}) do
     interval_ms = sweep_interval_ms!(config)
     target = {config.repo, Config.table_prefix(config)}
     validate_logout_retry_schema!(config, target)
@@ -244,6 +274,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
       refresh_rotation_grace_seconds: config.refresh_token_rotation_grace_seconds,
       refresh_table_authoritative?: refresh_table_authoritative?(config),
       logout_retry_config: logout_retry_config(config),
+      cluster_lock: cluster_lock,
       interval_ms: interval_ms,
       lifecycle_target: target,
       lifecycle_pid: nil,
@@ -326,11 +357,14 @@ defmodule AttestoPhoenix.Store.Sweeper do
   request or application configuration. It raises `RuntimeError` when that
   sweeper is not registered; an acknowledged equivalent cleanup worker is not
   invoked as though it were this GenServer.
+
+  A sweeper started with `:cluster_lock` returns `:skipped` when another node
+  holds the lock.
   """
-  @spec sweep_now() :: %{optional(String.t()) => non_neg_integer()}
+  @spec sweep_now() :: %{optional(String.t()) => non_neg_integer()} | :skipped
   def sweep_now, do: sweep_now(default_server())
 
-  @spec sweep_now(GenServer.server()) :: %{optional(String.t()) => non_neg_integer()}
+  @spec sweep_now(GenServer.server()) :: %{optional(String.t()) => non_neg_integer()} | :skipped
   def sweep_now(server) do
     GenServer.call(server, :sweep_now)
   end
@@ -340,22 +374,80 @@ defmodule AttestoPhoenix.Store.Sweeper do
     {:reply, sweep(state), state}
   end
 
-  # Deletes, per table, every row whose `expires_at` is strictly before the
-  # single "now" captured for this sweep. Returns a map of table => deleted
-  # count. A `DELETE` that raises (e.g. a missing table) propagates: silently
-  # swallowing a failed sweep would let a table grow unbounded with no signal,
-  # so this fails loud rather than fails quiet.
-  defp sweep(%{
-         repo: repo,
-         table_prefix: prefix,
-         refresh_rotation_grace_seconds: grace,
-         refresh_table_authoritative?: refresh_table_authoritative?,
-         logout_retry_config: logout_retry_config
-       }) do
+  @doc """
+  Runs one deletion pass over the Attesto tables and returns the number of
+  rows deleted per table.
+
+  This is the pass the supervised process runs on its interval, callable from
+  the host: a scheduled job, a release task, or a test. It issues its queries
+  on `config.repo` and opens no transaction of its own, so a caller that wraps
+  it in `Repo.transaction/1` gets the whole pass in that transaction. `now` is
+  the single expiry boundary applied to every table.
+
+  It also redacts refresh-successor ciphertext whose retry deadline has
+  passed, as the process does. It does not retry back-channel logout
+  deliveries: those make network calls and must not run inside a caller's
+  transaction. The supervised process keeps doing them, leased so concurrent
+  nodes never deliver the same row twice.
+
+  A `DELETE` that raises (a missing table, say) propagates.
+  """
+  @spec sweep_once(Config.t(), DateTime.t()) :: %{optional(String.t()) => non_neg_integer()}
+  def sweep_once(%Config{} = config, %DateTime{} = now) do
+    delete_pass(
+      %{
+        repo: config.repo,
+        table_prefix: Config.table_prefix(config),
+        refresh_rotation_grace_seconds: config.refresh_token_rotation_grace_seconds,
+        refresh_table_authoritative?: refresh_table_authoritative?(config)
+      },
+      now
+    )
+  end
+
+  # One scheduled sweep: logout delivery retries, then the deletion pass. The
+  # retries are leased per row, so they run on every node; the deletion pass
+  # runs under the cluster lock when one is configured.
+  defp sweep(%{repo: repo, table_prefix: prefix, logout_retry_config: logout_retry_config} = state) do
     now = DateTime.utc_now()
 
     retry_logout_deliveries(logout_retry_config, repo, prefix, now)
 
+    case Map.get(state, :cluster_lock) do
+      nil -> delete_pass(state, now)
+      {:advisory, key} -> delete_pass_under_advisory_lock(state, now, key)
+    end
+  end
+
+  # `pg_try_advisory_xact_lock` is held until the transaction ends, so the
+  # lock cannot outlive a crashed sweep, and a node that does not get it skips
+  # this interval instead of queueing behind the holder.
+  defp delete_pass_under_advisory_lock(%{repo: repo} = state, now, key) do
+    {:ok, result} =
+      repo.transaction(fn ->
+        case repo.query!("SELECT pg_try_advisory_xact_lock($1)", [key], log: false, telemetry_event: nil) do
+          %{rows: [[true]]} -> delete_pass(state, now)
+          %{rows: [[false]]} -> :skipped
+        end
+      end)
+
+    result
+  end
+
+  # Deletes, per table, every row whose `expires_at` is strictly before `now`.
+  # Returns a map of table => deleted count. A `DELETE` that raises (e.g. a
+  # missing table) propagates: silently swallowing a failed sweep would let a
+  # table grow unbounded with no signal, so this fails loud rather than fails
+  # quiet.
+  defp delete_pass(
+         %{
+           repo: repo,
+           table_prefix: prefix,
+           refresh_rotation_grace_seconds: grace,
+           refresh_table_authoritative?: refresh_table_authoritative?
+         },
+         now
+       ) do
     _redacted =
       EctoRefreshStore.redact_expired_successors(repo, now,
         prefix: prefix,

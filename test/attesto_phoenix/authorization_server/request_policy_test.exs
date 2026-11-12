@@ -51,6 +51,21 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicyTest do
     struct!(Config, fields)
   end
 
+  describe "validation_opts/2" do
+    # PAR and the authorization endpoint both validate with these options, so
+    # one assertion covers form_post for both.
+    test "carries the configured response modes, form_post among the defaults" do
+      default = Config.new(required_fields())
+      modes = RequestPolicy.validation_opts(default, @confidential)[:response_modes_supported]
+
+      assert modes == Attesto.AuthorizationRequest.supported_response_modes()
+      assert "form_post" in modes
+
+      narrowed = Config.new(required_fields() ++ [response_modes_supported: ["query"]])
+      assert RequestPolicy.validation_opts(narrowed, @confidential)[:response_modes_supported] == ["query"]
+    end
+  end
+
   describe "require_pkce?/2" do
     test "a public client always requires PKCE, even with the global flag relaxed" do
       assert RequestPolicy.require_pkce?(config(require_pkce: false), @public)

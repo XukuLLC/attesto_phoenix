@@ -344,6 +344,62 @@ defmodule AttestoPhoenix.Store.EctoSweeperTest do
     assert TestRepo.get_by(Authorization, [code_hash: "prefixed-live-family"], prefix: prefix) == nil
   end
 
+  test "sweep_once/2 deletes inside the caller's transaction and rolls back with it" do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    TestRepo.insert!(authorization("once-expired", DateTime.add(now, -60, :second)))
+    TestRepo.insert!(authorization("once-live", DateTime.add(now, 60, :second)))
+
+    config =
+      Config.new(
+        issuer: "https://issuer.example",
+        audience: "https://resource.example",
+        keystore: FakeKeystore,
+        repo: TestRepo,
+        load_client: fn _ -> {:error, :not_found} end,
+        verify_client_secret: fn _, _ -> false end,
+        load_principal: fn _ -> {:error, :not_found} end
+      )
+
+    assert {:error, :rolled_back} =
+             TestRepo.transaction(fn ->
+               assert Sweeper.sweep_once(config, now)["attesto_authorization_codes"] == 1
+               assert TestRepo.get_by(Authorization, code_hash: "once-expired") == nil
+               TestRepo.rollback(:rolled_back)
+             end)
+
+    assert %Authorization{} = TestRepo.get_by(Authorization, code_hash: "once-expired")
+
+    counts = Sweeper.sweep_once(config, now)
+    assert counts["attesto_authorization_codes"] == 1
+    assert counts |> Map.keys() |> Enum.sort() == Enum.sort(@swept_tables)
+    assert TestRepo.get_by(Authorization, code_hash: "once-expired") == nil
+    assert %Authorization{} = TestRepo.get_by(Authorization, code_hash: "once-live")
+  end
+
+  test "a sweeper with cluster_lock takes the real advisory lock and sweeps" do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+    TestRepo.insert!(authorization("locked-expired", DateTime.add(now, -60, :second)))
+
+    config =
+      Config.new(
+        issuer: "https://issuer.example",
+        audience: "https://resource.example",
+        keystore: FakeKeystore,
+        repo: TestRepo,
+        sweep_interval_ms: 60_000,
+        load_client: fn _ -> {:error, :not_found} end,
+        verify_client_secret: fn _, _ -> false end,
+        load_principal: fn _ -> {:error, :not_found} end
+      )
+
+    {:ok, pid} = Sweeper.start_link(config: config, name: nil, cluster_lock: {:advisory, 918_273_645})
+    Sandbox.allow(TestRepo, self(), pid)
+    on_exit(fn -> if Process.alive?(pid), do: GenServer.stop(pid) end)
+
+    assert Sweeper.sweep_now(pid)["attesto_authorization_codes"] == 1
+    assert TestRepo.get_by(Authorization, code_hash: "locked-expired") == nil
+  end
+
   defp start_sweeper(schema_prefix \\ nil, overrides \\ []) do
     config =
       [

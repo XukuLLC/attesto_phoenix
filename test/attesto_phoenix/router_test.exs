@@ -31,6 +31,7 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
   alias Phoenix.Router.NoRouteError
+  alias Plug.Conn.WrapperError
 
   @federation_path "/.well-known/openid-federation"
 
@@ -194,6 +195,26 @@ defmodule AttestoPhoenix.RouterTest do
         route_pipelines: [metadata: []]
       )
     end
+  end
+
+  defmodule ProtocolRoutesOmittedRouter do
+    @moduledoc false
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    attesto_routes(par: false, revocation: false, introspection: false)
+  end
+
+  defmodule ClassPipelineProtocolRoutesOmittedRouter do
+    @moduledoc false
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :oauth_protocol do
+      plug :accepts, ["json"]
+    end
+
+    attesto_routes(route_pipelines: [protocol: :oauth_protocol], par: false, userinfo: false)
   end
 
   defmodule UserInfoDisabledRouter do
@@ -478,6 +499,97 @@ defmodule AttestoPhoenix.RouterTest do
     {response, JSON.decode!(response.resp_body)}
   end
 
+  describe "attesto_routes/1 par, revocation and introspection controls" do
+    @omittable_members ~w(
+      pushed_authorization_request_endpoint
+      revocation_endpoint
+      revocation_endpoint_auth_methods_supported
+      introspection_endpoint
+      introspection_endpoint_auth_methods_supported
+      introspection_signing_alg_values_supported
+    )
+
+    test "the default router mounts and advertises all three" do
+      for path <- ["/oauth/par", "/oauth/revoke", "/oauth/introspect"] do
+        assert find_route(DefaultRouter, :post, path)
+      end
+
+      config = metadata_config(openid_provider: true)
+
+      for path <- ["/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"] do
+        {_conn, metadata} = dispatch_metadata(DefaultRouter, path, config)
+        assert metadata["pushed_authorization_request_endpoint"] == "https://issuer.example/oauth/par"
+        assert metadata["revocation_endpoint"] == "https://issuer.example/oauth/revoke"
+        assert metadata["introspection_endpoint"] == "https://issuer.example/oauth/introspect"
+      end
+    end
+
+    test "false omits each route and both metadata documents drop its members" do
+      for path <- ["/oauth/par", "/oauth/revoke", "/oauth/introspect"] do
+        refute find_route(ProtocolRoutesOmittedRouter, :post, path)
+      end
+
+      assert find_route(ProtocolRoutesOmittedRouter, :post, "/oauth/token")
+      config = metadata_config(openid_provider: true)
+
+      for path <- ["/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"] do
+        {conn, metadata} = dispatch_metadata(ProtocolRoutesOmittedRouter, path, config)
+        assert conn.status == 200
+
+        for member <- @omittable_members do
+          refute Map.has_key?(metadata, member), "#{path} still advertises #{member}"
+        end
+
+        refute Enum.any?(Map.keys(metadata), &String.starts_with?(&1, ["revocation_", "introspection_"]))
+        assert metadata["token_endpoint"] == "https://issuer.example/oauth/token"
+      end
+    end
+
+    test "one omitted route leaves the others advertised, alongside userinfo: false" do
+      refute find_route(ClassPipelineProtocolRoutesOmittedRouter, :post, "/oauth/par")
+      assert find_route(ClassPipelineProtocolRoutesOmittedRouter, :post, "/oauth/revoke")
+      config = metadata_config(openid_provider: true)
+
+      {_conn, metadata} =
+        dispatch_metadata(ClassPipelineProtocolRoutesOmittedRouter, "/.well-known/openid-configuration", config)
+
+      refute Map.has_key?(metadata, "pushed_authorization_request_endpoint")
+      refute Map.has_key?(metadata, "userinfo_endpoint")
+      assert metadata["revocation_endpoint"] == "https://issuer.example/oauth/revoke"
+    end
+
+    test "par: false with required PAR raises on the metadata and authorization routes" do
+      config = metadata_config(openid_provider: true, require_pushed_authorization_requests: true)
+
+      for path <- ["/.well-known/oauth-authorization-server", "/.well-known/openid-configuration", "/oauth/authorize"] do
+        %WrapperError{reason: error} =
+          assert_raise WrapperError, fn ->
+            ProtocolRoutesOmittedRouter.call(configured_conn(:get, path, config), [])
+          end
+
+        assert %ArgumentError{message: message} = error
+        assert message =~ "par: false"
+        assert message =~ "require_pushed_authorization_requests: true"
+      end
+
+      {conn, metadata} = dispatch_metadata(DefaultRouter, "/.well-known/oauth-authorization-server", config)
+      assert conn.status == 200
+      assert metadata["require_pushed_authorization_requests"] == true
+    end
+
+    test "a non-boolean control is refused at compile time" do
+      assert_raise ArgumentError, ~r/route-mount control :par must expand at compile time to true or false/, fn ->
+        Code.compile_string("""
+        defmodule AttestoPhoenix.RouterTest.BadParControlRouter do
+          use Phoenix.Router
+          use AttestoPhoenix.Router
+          attesto_routes(par: :no)
+        end
+        """)
+      end
+    end
+  end
+
   describe "attesto_routes/1" do
     test "mounts the discovery document at the well-known path" do
       assert find_route(DefaultRouter, :get, "/.well-known/oauth-authorization-server")
@@ -718,6 +830,8 @@ defmodule AttestoPhoenix.RouterTest do
 
     test "mounts registration when enabled" do
       assert find_route(RegistrationRouter, :post, "/oauth/register")
+      assert find_route(RegistrationRouter, :get, "/oauth/register/:client_id")
+      assert find_route(RegistrationRouter, :put, "/oauth/register/:client_id")
       assert find_route(RegistrationRouter, :delete, "/oauth/register/:client_id")
     end
 
@@ -822,6 +936,10 @@ defmodule AttestoPhoenix.RouterTest do
                 [:oauth_server]},
                {:post, "/oauth/register", RegistrationController, :create, "registration", protected_metadata,
                 [:oauth_server]},
+               {:get, "/oauth/register/:client_id", RegistrationController, :show, "registration", protected_metadata,
+                [:oauth_server]},
+               {:put, "/oauth/register/:client_id", RegistrationController, :update, "registration", protected_metadata,
+                [:oauth_server]},
                {:delete, "/oauth/register/:client_id", RegistrationController, :delete, "registration",
                 protected_metadata, [:oauth_server]},
                {:post, "/oauth/device_authorization", DeviceAuthorizationController, :create, "device_authorization",
@@ -869,6 +987,8 @@ defmodule AttestoPhoenix.RouterTest do
         {:post, "/oauth/revoke"},
         {:post, "/oauth/introspect"},
         {:post, "/oauth/register"},
+        {:get, "/oauth/register/:client_id"},
+        {:put, "/oauth/register/:client_id"},
         {:delete, "/oauth/register/:client_id"},
         {:post, "/oauth/device_authorization"},
         {:post, "/oauth/bc-authorize"},

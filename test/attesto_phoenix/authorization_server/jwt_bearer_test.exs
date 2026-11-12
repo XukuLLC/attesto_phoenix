@@ -195,6 +195,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert response.token_type == "Bearer"
       assert event.name == :token_issued
       assert event.grant_type == @grant
+      assert event.subject == "user-123"
     end
 
     test "the assertion scope claim is the granted-scope ceiling" do

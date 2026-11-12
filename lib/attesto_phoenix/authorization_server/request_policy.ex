@@ -39,17 +39,28 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   @spec validate(Config.t(), term(), map(), keyword()) ::
           {:ok, AuthorizationRequest.t()} | {:error, AuthorizationRequest.error()}
   def validate(config, client, params, extra_opts \\ []) do
-    opts =
-      [
-        registered_redirect_uris: registered_redirect_uris(config, client),
-        redirect_uri_matching: redirect_uri_matching(config, client),
-        require_pkce: require_pkce?(config, client),
-        require_nonce: require_nonce?(config)
-      ] ++ extra_opts
-
     params
-    |> AuthorizationRequest.validate(opts)
+    |> AuthorizationRequest.validate(validation_opts(config, client) ++ extra_opts)
     |> enforce_cimd_redirect_origin(config, client)
+  end
+
+  @doc """
+  The `Attesto.AuthorizationRequest.validate/2` options `config` and `client`
+  resolve to: the registered redirect URIs and how they are matched, the PKCE
+  and nonce requirements, and the response modes this server accepts.
+
+  Every caller that validates an authorization request builds its options from
+  this list, so the endpoints cannot drift apart.
+  """
+  @spec validation_opts(Config.t(), term()) :: keyword()
+  def validation_opts(config, client) do
+    [
+      registered_redirect_uris: registered_redirect_uris(config, client),
+      redirect_uri_matching: redirect_uri_matching(config, client),
+      require_pkce: require_pkce?(config, client),
+      require_nonce: require_nonce?(config),
+      response_modes_supported: config.response_modes_supported
+    ]
   end
 
   @doc """

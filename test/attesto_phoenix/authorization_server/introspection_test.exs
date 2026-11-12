@@ -112,6 +112,35 @@ defmodule AttestoPhoenix.AuthorizationServer.IntrospectionTest do
       assert Introspection.introspect(config, nil, jwt, nil) == %{"active" => false}
     end
 
+    test "a pairwise caller is shown its derived sub; one with no sector identifier gets inactive" do
+      salt = String.duplicate("k", 32)
+
+      clients = %{
+        "client-1" => %{type: "pairwise", redirect_uris: ["https://rp.example/cb"]},
+        "client-2" => %{type: "public", redirect_uris: ["https://two.example/cb"]},
+        "client-3" => %{type: "pairwise", redirect_uris: ["https://a.example/cb", "https://b.example/cb"]}
+      }
+
+      config =
+        build_config(
+          load_client: fn id -> with :error <- Map.fetch(clients, id), do: {:error, :not_found} end,
+          client_redirect_uris: fn client -> client.redirect_uris end,
+          client_subject_type: fn client -> client.type end,
+          pairwise_subject_salt: salt
+        )
+
+      assert %{"active" => true, "sub" => sub} =
+               Introspection.introspect(config, "client-1", mint_access_token(config, "client-1"))
+
+      assert sub == Attesto.PairwiseSubject.derive("rp.example", "usr_42", salt)
+
+      assert %{"active" => true, "sub" => "usr_42"} =
+               Introspection.introspect(config, "client-2", mint_access_token(config, "client-2"))
+
+      assert Introspection.introspect(config, "client-3", mint_access_token(config, "client-3")) ==
+               %{"active" => false}
+    end
+
     test "downgrades to inactive when introspection_authorize denies the caller" do
       config =
         build_config(

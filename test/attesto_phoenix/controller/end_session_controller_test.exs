@@ -358,6 +358,61 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       conn = call(:get, %{"id_token_hint" => hint <> "tamper"})
       assert conn.status == 400
     end
+
+    test "a tampered hint never reaches :terminate_session by default", %{hint: hint} do
+      conn = call(:get, %{"id_token_hint" => hint <> "tamper"})
+      refute conn.private[:terminated]
+    end
+
+    test "on_invalid_id_token_hint: :terminate_session hands the host a context with no hint data", %{hint: hint} do
+      parent = self()
+
+      @config_key
+      |> then(&Application.fetch_env!(:attesto_phoenix, &1))
+      |> Keyword.merge(
+        on_invalid_id_token_hint: :terminate_session,
+        terminate_session: fn conn, context ->
+          send(parent, {:terminate_context, context})
+          {:ok, put_private(conn, :terminated, true)}
+        end
+      )
+      |> then(&Application.put_env(:attesto_phoenix, @config_key, &1))
+
+      conn =
+        call(:get, %{
+          "id_token_hint" => hint <> "tamper",
+          "client_id" => "rp-1",
+          "post_logout_redirect_uri" => "https://rp.example/after",
+          "state" => "xyz"
+        })
+
+      assert_received {:terminate_context, %{subject: nil, sid: nil, client_id: nil, hint: :invalid}}
+
+      # RP-Initiated Logout §4: no post-logout redirect for a failed hint, even
+      # one naming a registered URI.
+      assert conn.status == 200
+      assert get_resp_header(conn, "location") == []
+      assert body(conn)["logged_out"] == true
+      assert conn.private[:terminated] == true
+    end
+
+    test "the :terminate_session context says whether the hint was verified or absent", %{hint: hint} do
+      parent = self()
+
+      @config_key
+      |> then(&Application.fetch_env!(:attesto_phoenix, &1))
+      |> Keyword.put(:terminate_session, fn conn, context ->
+        send(parent, {:hint, context.hint})
+        {:ok, conn}
+      end)
+      |> then(&Application.put_env(:attesto_phoenix, @config_key, &1))
+
+      call(:get, %{"id_token_hint" => hint})
+      assert_received {:hint, :verified}
+
+      call(:get, %{})
+      assert_received {:hint, :absent}
+    end
   end
 
   describe "back-channel fan-out" do
@@ -389,6 +444,42 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
       assert eventually(fn ->
                not AttestoPhoenix.TestRepo.exists?(from(l in LogoutSession, where: l.sid == ^@sid))
              end)
+    end
+
+    test "a pairwise RP's logout_token carries its derived sub", %{hint: hint} do
+      salt = String.duplicate("k", 32)
+      config = Application.fetch_env!(:attesto_phoenix, @config_key)
+      load_client = Keyword.fetch!(config, :load_client)
+
+      with_app_config(
+        Keyword.merge(config,
+          load_client: fn
+            "rp-pairwise" -> {:ok, %{id: "rp-pairwise", post_logout: [], redirect_uris: ["https://rp-p.example/cb"]}}
+            other -> load_client.(other)
+          end,
+          client_redirect_uris: fn client -> Map.get(client, :redirect_uris, ["https://rp.example/cb"]) end,
+          client_subject_type: fn client -> if client.id == "rp-pairwise", do: "pairwise", else: "public" end,
+          pairwise_subject_salt: salt
+        ),
+        fn ->
+          :ok =
+            Store.record(%{
+              sid: @sid,
+              subject: @subject,
+              client_id: "rp-pairwise",
+              backchannel_logout_uri: "https://rp-p.example/bc",
+              session_required: true,
+              expires_at: System.system_time(:second) + 3600
+            })
+
+          assert call(:get, %{"id_token_hint" => hint}).status == 200
+
+          assert_receive {:bc_post, "https://rp-p.example/bc", token}, 1_000
+          claims = logout_payload(token)
+          assert claims["sub"] == Attesto.PairwiseSubject.derive("rp-p.example", @subject, salt)
+          assert claims["sid"] == @sid
+        end
+      )
     end
 
     test "a slow RP cannot serialize another RP's back-channel notification", %{hint: hint} do

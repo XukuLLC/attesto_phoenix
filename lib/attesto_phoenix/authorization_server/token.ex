@@ -46,8 +46,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   alias Attesto.{AuthorizationCode, DeviceCode, IDToken, JWS, MapParams, RefreshToken, ResourceIndicator}
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
+  alias AttestoPhoenix.AuthorizationServer.Continuation
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
+  alias AttestoPhoenix.AuthorizationServer.ScopeAuthorization
   alias AttestoPhoenix.AuthorizationServer.SenderConstraint
+  alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.AuthorizationServer.Token.Request
 
   alias AttestoPhoenix.{
@@ -100,6 +103,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   @refresh_grant_type_claim "attesto_phoenix.authorization_grant_type"
   @refresh_grant_family_claim "attesto_phoenix.authorization_grant_family_id"
   @refresh_session_id_claim "attesto_phoenix.session_id"
+  @refresh_reuse_detected_key {__MODULE__, :refresh_reuse_detected}
+
+  @doc false
+  # The refresh-context claim that carries the host session identifier. Public
+  # so `AttestoPhoenix.Revocation` selects refresh families by session with
+  # the key this module writes.
+  @spec refresh_session_id_claim() :: String.t()
+  def refresh_session_id_claim, do: @refresh_session_id_claim
   @credential_details_ids_claim "attesto_phoenix.credential_authorization_details_ids"
   @credential_scope_bindings_claim "attesto_phoenix.credential_scope_bindings"
 
@@ -289,9 +300,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              SenderConstraint.binding_jkt(binding)
            ),
          {:ok, grant, private_context} <- take_private_context(config, grant),
-         {:ok, scope} <- authorize_scope(config, client, grant.scope),
-         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
-         {:ok, audience} <- resolve_code_resource(grant, params) do
+         {:ok, audience} <- resolve_code_resource(grant, params),
+         {:ok, scope} <- authorize_scope(config, client, grant.scope, audience),
+         :ok <- require_granted_scope_within_ceiling(scope, grant.scope) do
       complete_authorization_code(
         request,
         code,
@@ -307,7 +318,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # RFC 6749 §6 + §10.4: refresh-token rotation with reuse detection.
   defp dispatch(%Request{grant_type: "refresh_token"} = request) do
-    %{config: config, client: client, params: params} = request
+    %{config: config, params: params} = request
 
     with {:ok, presented} <- require_param(params, "refresh_token"),
          requested = parse_requested_scope(params),
@@ -315,41 +326,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          :ok <- validate_refresh_credential_request(config, presented, requested, requested_credentials),
          {:ok, resource} <- refresh_requested_resource(params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
-         :ok <- commit_claim_for_presented_grant(request, :refresh, presented, pending_claim),
-         {:ok, rotated} <-
-           rotate_refresh(
-             request,
-             presented,
-             requested,
-             resource,
-             SenderConstraint.binding_jkt(binding)
-           ),
-         {:ok, scope} <- authorize_scope(config, client, rotated.context.scope),
-         :ok <- require_granted_scope_within_ceiling(scope, rotated.context.scope),
-         credential_claims = refresh_credential_claims(config, rotated.context, scope, requested_credentials),
-         requested_claims = refresh_requested_claims(rotated.context),
-         {:ok, response} <-
-           mint_refresh(
-             request,
-             rotated,
-             scope,
-             token_type,
-             binding,
-             requested_claims
-             |> Map.merge(credential_claims)
-             |> Map.merge(refresh_authorization_grant_id_claims(config, rotated)),
-             # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
-             # (never re-stamped on rotation), so the refreshed access token
-             # reports the real authentication event.
-             audience_opts(rotated.context.resource) ++ context_auth_context_opts(rotated.context)
-           ) do
-      response =
-        response
-        |> put_refresh_response(rotated, config)
-        |> maybe_echo_credential_authorization_details(%{claims: credential_claims})
-
-      {:ok, response,
-       [refresh_rotated_event(request, rotated.context.subject, scope, "refresh_token", token_type, binding)]}
+         :ok <- commit_claim_for_presented_grant(request, :refresh, presented, pending_claim) do
+      complete_refresh(request, presented, fn ->
+        finish_refresh(request, presented, {requested, requested_credentials, resource}, token_type, binding)
+      end)
     end
   end
 
@@ -361,13 +341,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          subject = token_client_id(request),
-         {:ok, scope} <- authorize_scope(config, client, requested_scope),
+         {:ok, audience} <- request_resource_audience(config, client, params),
+         {:ok, scope} <- authorize_scope(config, client, requested_scope, audience),
          :ok <- require_granted_scope_within_request(scope, requested_scope),
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
-         {:ok, audience} <- request_resource_audience(config, client, params),
          {:ok, response} <-
            mint(request, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
-      {:ok, response, [token_issued_event(request, scope, "client_credentials", token_type, binding)]}
+      {:ok, response, [token_issued_event(request, nil, scope, "client_credentials", token_type, binding)]}
     end
   end
 
@@ -385,9 +365,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          redemption = redeem_device_code(request, device_code, SenderConstraint.binding_jkt(binding)),
          :ok <- commit_claim_for_polling_grant(config, redemption, pending_claim),
          {:ok, grant} <- redemption,
-         {:ok, scope} <- authorize_scope(config, client, grant.scope),
-         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
+         {:ok, scope} <- authorize_scope(config, client, grant.scope, audience),
+         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
          {:ok, response} <-
            mint(
              request,
@@ -400,7 +380,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              # the verification page recorded onto the approved code.
              audience_opts(audience) ++ auth_context_opts(Callback.map_value(grant, :claims))
            ) do
-      issued = token_issued_event(request, scope, "device_code", token_type, binding)
+      issued = token_issued_event(request, grant.subject, scope, "device_code", token_type, binding)
       maybe_issue_refresh_token(request, grant, scope, token_type, binding, response, [issued], "device_code")
     end
   end
@@ -418,7 +398,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          redemption = redeem_pre_authorized_code(request, code, params),
          {:ok, grant} <- redemption,
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
-         {:ok, scope} <- authorize_scope(config, client, Enum.join(grant.authorized_scopes, " ")),
+         {:ok, scope} <- authorize_scope(config, client, Enum.join(grant.authorized_scopes, " "), []),
          :ok <- require_granted_scope_within_ceiling(scope, grant.authorized_scopes),
          {:ok, response} <-
            mint(
@@ -430,7 +410,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              %{"credential_configuration_ids" => grant.credential_configuration_ids},
              []
            ) do
-      {:ok, response, [token_issued_event(request, scope, "pre-authorized_code", token_type, binding)]}
+      issued = token_issued_event(request, grant.subject, scope, "pre-authorized_code", token_type, binding)
+      {:ok, response, [issued]}
     end
   end
 
@@ -451,9 +432,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          redemption = redeem_ciba(request, auth_req_id, SenderConstraint.binding_jkt(binding)),
          :ok <- commit_claim_for_polling_grant(config, redemption, pending_claim),
          {:ok, grant} <- redemption,
-         {:ok, scope} <- authorize_scope(config, client, grant.scope),
-         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
          {:ok, audience} <- resolve_code_resource(grant, params),
+         {:ok, scope} <- authorize_scope(config, client, grant.scope, audience),
+         :ok <- require_granted_scope_within_ceiling(scope, grant.scope),
          {:ok, response} <-
            mint(
              request,
@@ -469,7 +450,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          # CIBA Core §10.1: the token response carries an ID Token (no nonce -
          # CIBA has none - and no c_hash - there is no authorization code).
          {:ok, response} <- maybe_mint_ciba_id_token(request, grant, scope, response) do
-      issued = token_issued_event(request, scope, "ciba", token_type, binding)
+      issued = token_issued_event(request, grant.subject, scope, "ciba", token_type, binding)
       # RFC 9470: fold the Grant's struct-level acr/auth_time into its `claims`
       # so the shared refresh-issuance path (which reads them from `claims`)
       # seeds the refresh family with the real authentication event. RFC 8707
@@ -505,13 +486,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
          requested = requested_exchange_scope(params, claims),
          :ok <- require_scope_within_subject_token(requested, claims),
-         {:ok, scope} <- authorize_scope(config, client, requested),
+         {:ok, audience} <- exchange_resource_audience(config, client, params, claims),
+         {:ok, scope} <- authorize_scope(config, client, requested, audience),
          :ok <- require_scope_within_subject_token(scope, claims),
          :ok <- require_granted_scope_within_request(scope, requested),
-         {:ok, audience} <- exchange_resource_audience(config, client, params, claims),
          {:ok, response} <- mint_exchanged_token(request, claims, scope, token_type, binding, audience) do
       response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
-      {:ok, response, [token_issued_event(request, scope, "token_exchange", token_type, binding)]}
+      issued = token_issued_event(request, Map.get(claims, "sub"), scope, "token_exchange", token_type, binding)
+      {:ok, response, [issued]}
     else
       {:error, %OAuthError{} = err} -> {:error, err}
       {:error, _reason} -> {:error, error(@error_invalid_grant, "subject token is invalid")}
@@ -538,7 +520,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, audience} <- jwt_bearer_resource_audience(config, client, params, claims),
          requested = jwt_bearer_requested_scope(params, ceiling),
          :ok <- require_scope_within_ceiling(requested, ceiling),
-         {:ok, scope} <- authorize_scope(config, client, requested),
+         {:ok, scope} <- authorize_scope(config, client, requested, audience),
          :ok <- require_scope_within_ceiling(scope, ceiling),
          :ok <- require_granted_scope_within_request(scope, requested),
          {:ok, subject} <- resolve_jwt_bearer_subject(config, claims),
@@ -552,7 +534,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # IdP's policy/deprovisioning window, letting a client keep minting access
       # after the IdP has revoked the user's entitlement. The client re-presents
       # a fresh ID-JAG instead of refreshing.
-      {:ok, response, [token_issued_event(request, scope, @grant_jwt_bearer, token_type, binding)]}
+      {:ok, response, [token_issued_event(request, subject, scope, @grant_jwt_bearer, token_type, binding)]}
     end
   end
 
@@ -623,13 +605,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         finish_authorization_code(request, code, grant, scope, audience, token_type, binding)
 
       callback ->
-        with_authorization_code_continuation(
-          fn -> finish_authorization_code(request, code, grant, scope, audience, token_type, binding) end,
-          fn continuation, ref ->
-            callback
-            |> Callback.invoke([context, continuation])
-            |> normalize_authorization_code_completion(ref)
-          end
+        Continuation.run(
+          code_completion_profile(),
+          &Callback.invoke(callback, &1),
+          context,
+          fn -> finish_authorization_code(request, code, grant, scope, audience, token_type, binding) end
         )
     end
   end
@@ -666,7 +646,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # response. Omitted entirely for a plain authorization_code grant that
       # carried none — this leaves every non-OID4VCI flow byte-identical.
       response = maybe_echo_credential_authorization_details(response, grant)
-      issued = token_issued_event(request, scope, "authorization_code", token_type, binding)
+      issued = token_issued_event(request, grant.subject, scope, "authorization_code", token_type, binding)
 
       # RFC 8707 §2.2: a token-request `resource` subset audiences only this
       # access token; any refresh token returned is bound to the full
@@ -684,311 +664,35 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # The host wrapper is trusted policy, but continuation cardinality is a
-  # protocol invariant rather than a convention. A private atomic gate scopes
-  # the closure to this callback. The closure checks its owner and consumes the
-  # gate before completion, then records a secret-free `:started` marker before
-  # entering host-visible work. The outer `after` closes it and deletes the
-  # private provenance entry on every callback return or termination.
-  defp with_authorization_code_continuation(completion, callback) do
-    owner = self()
-    ref = make_ref()
-    gate = :atomics.new(1, signed: false)
-
-    continuation = fn -> run_authorization_code_continuation(owner, ref, gate, completion) end
-
-    try do
-      callback.(continuation, ref)
-    catch
-      kind, reason ->
-        maybe_log_completion_termination(ref, kind)
-        :erlang.raise(kind, reason, __STACKTRACE__)
-    after
-      :atomics.put(gate, 1, 2)
-      Process.delete(authorization_code_continuation_key(ref))
-    end
-  end
-
-  # Cardinality alone bounds the callback to AT MOST one invocation. A private
-  # process-dictionary entry first records a secret-free `:started` marker, then
-  # carries a digest and outcome of the continuation's result, supplying the
-  # missing lower bound and provenance without keeping minted token strings in
-  # process state. This state is outside the ordinary mailbox, so a host
-  # callback's broad receive cannot consume it. The started marker is important:
-  # a host may catch a continuation termination after partial writes, before a
-  # normal result exists to replace it.
-  # A callback that never calls the continuation, or that substitutes a
-  # fabricated `{:ok, response, events}` for the real one, is detected by
-  # `normalize_authorization_code_completion/2`. The host still sees the plain
-  # result, so it can branch on success/failure to decide whether to commit or
-  # roll back.
-  defp run_authorization_code_continuation(owner, ref, gate, completion) do
-    cond do
-      self() != owner ->
-        # A continuation invoked from another process is a host bug with
-        # security-relevant intent. The wire answer stays generic; the operator
-        # gets the reason (the module's documented logging contract).
-        Logger.error(
-          "authorization code continuation was invoked from a process that does not own it; " <>
-            "no token was issued"
-        )
-
-        {:error, error(@error_invalid_request, "unable to issue token")}
-
-      :atomics.compare_exchange(gate, 1, 0, 1) != :ok ->
-        Logger.error(
-          "authorization code continuation was invoked more than once or after its scope " <>
-            "ended; no token was issued"
-        )
-
-        {:error, error(@error_invalid_request, "unable to issue token")}
-
-      true ->
-        # Set this before any completion work. If host code catches a raise,
-        # throw, or exit from the completion, normalization can distinguish a
-        # post-invocation termination from a callback that never invoked us.
-        Process.put(authorization_code_continuation_key(ref), :started)
-        result = completion.()
-
-        Process.put(
-          authorization_code_continuation_key(ref),
-          {completion_result_digest(result), completion_result_outcome(result)}
-        )
-
-        result
-    end
-  end
-
-  # Provenance check. The host is contractually required to return the
-  # continuation's result unchanged; this verifies it actually did, rather than
-  # trusting the outward tuple form. Three outcomes matter:
-  #
-  #   * the continuation never ran - nothing was minted, recorded, or finalized,
-  #     so a fabricated `{:ok, response, events}` must NOT become a token
-  #     response;
-  #   * the continuation started but terminated before producing a result - a
-  #     host may have caught the termination after partial writes, so an error
-  #     may be honored but a success must never be fabricated;
-  #   * the host returned exactly what the continuation produced - the normal
-  #     path, including a deliberate `{:error, _}` after `Repo.rollback/1`;
-  #   * the host committed the continuation inside `Repo.transaction/1` and
-  #     returned the `{:ok, _}` wrapper. The commit already took the mint,
-  #     refresh insert, and code finalization with it, so unwrap rather than
-  #     failing a request whose code is now finalized - failing would score the
-  #     client's retry as a replay and revoke that response's access token and
-  #     the refresh-token family descended from that redemption.
-  defp normalize_authorization_code_completion(result, ref) do
-    case Process.get(authorization_code_continuation_key(ref)) do
-      {digest, outcome} when is_binary(digest) and outcome in [:succeeded, :failed] ->
-        normalize_produced_completion(result, digest, outcome)
-
-      :started ->
-        normalize_started_completion(result)
-
-      _other ->
-        normalize_incomplete_completion(result)
-    end
-  end
-
-  defp authorization_code_continuation_key(ref) do
-    {__MODULE__, :authorization_code_continuation, ref}
-  end
-
-  defp maybe_log_completion_termination(ref, kind) do
-    case Process.get(authorization_code_continuation_key(ref)) do
-      {_digest, :succeeded} -> log_completion_termination_after_success(kind)
-      :started -> log_completion_termination_after_start(kind)
-      _other -> :ok
-    end
-  end
-
-  defp log_completion_termination_after_start(kind) do
-    verb =
-      case kind do
-        :error -> "raised"
-        :throw -> "threw"
-        :exit -> "exited"
-      end
-
-    # Deliberately do not inspect the exception, throw, exit reason, callback
-    # context, or continuation result: any of them may contain host secrets.
-    Logger.error(
-      "authorization code completion callback #{verb} after the continuation started; " <>
-        "partial writes may have occurred and no successful token response was returned"
-    )
-  end
-
-  defp log_completion_termination_after_success(kind) do
-    verb =
-      case kind do
-        :error -> "raised"
-        :throw -> "threw"
-        :exit -> "exited"
-      end
-
-    # Deliberately do not inspect the exception, throw, exit reason, callback
-    # context, or continuation result: any of them may contain host secrets.
-    Logger.error(
-      "authorization code completion callback #{verb} after the continuation succeeded; " <>
+  # What `Continuation.run/4` needs to know about authorization-code
+  # completion: its names in log lines, what counts as success, and the fixed
+  # refusal. The contract itself (one invocation, same process, result returned
+  # unchanged) is `Continuation`'s.
+  defp code_completion_profile do
+    %{
+      callback: "authorization code completion callback",
+      continuation: "authorization code continuation",
+      work: "authorization code completion",
+      not_done: "no token was issued",
+      no_success: "no successful token response was returned",
+      no_response: "completion did not succeed and no token response was returned",
+      # The host may have committed before failing. The code is then
+      # finalized, so the client's retry presents a successfully consumed
+      # code, and reuse detection revokes that response's access token and the
+      # refresh-token family descended from that redemption.
+      after_success:
         "the code may already be finalized, and a client retry may trigger code-reuse " <>
-        "detection and revoke that response's access token and refresh family"
-    )
+          "detection and revoke that response's access token and refresh family",
+      state_key: {__MODULE__, :authorization_code_continuation},
+      succeeded?: &match?({:ok, _response, _events}, &1),
+      well_formed?: &token_result?/1,
+      refusal: {:error, error(@error_invalid_request, "unable to issue token")}
+    }
   end
 
-  defp normalize_produced_completion(result, digest, outcome) do
-    cond do
-      completion_result_digest(result) == digest ->
-        normalize_completion_result(result)
-
-      match?({:ok, _inner}, result) and completion_result_digest(elem(result, 1)) == digest ->
-        maybe_log_failed_completion_wrapper(outcome)
-        result |> elem(1) |> normalize_completion_result()
-
-      true ->
-        normalize_substituted_completion(result, outcome)
-    end
-  end
-
-  defp completion_result_digest(result) do
-    :crypto.hash(:sha256, :erlang.term_to_binary(result, [:deterministic]))
-  end
-
-  defp completion_result_outcome({:ok, _response, _events}), do: :succeeded
-  defp completion_result_outcome(_result), do: :failed
-
-  defp maybe_log_failed_completion_wrapper(:failed) do
-    Logger.warning(
-      "authorization code completion callback returned a success wrapper around a failed " <>
-        "continuation result; an enclosing transaction may have committed partial writes"
-    )
-  end
-
-  defp maybe_log_failed_completion_wrapper(:succeeded), do: :ok
-
-  # The continuation ran but the host returned something else.
-  #
-  # Any substituted return after the continuation SUCCEEDED is the dangerous
-  # case and the reason these clauses are not silent. Two host behaviours reach
-  # it and this library cannot tell them apart from the inside:
-  #
-  #   * the host rolled its transaction back, so the mint, refresh insert, and
-  #     finalization went with it. The error is honest and the earlier code
-  #     claim remains spent but unfinalized; a retry is refused without being
-  #     scored as reuse.
-  #   * the host COMMITTED and then returned something else anyway. The code is
-  #     now finalized, so the client's retry presents a successfully consumed
-  #     code. Reuse detection then revokes that response's access token and the
-  #     refresh-token family descended from that redemption, and returns
-  #     `invalid_grant`, forcing a new authorization flow. Unrelated
-  #     authorization grants are unaffected.
-  #
-  # Distinguishing them would require knowing the host's transaction outcome,
-  # which is outside this boundary. An OAuth error is honoured and every other
-  # substituted return is normalized for the wire, but all are logged at error
-  # level with the consequence named. This lets an operator find the host bug
-  # instead of chasing phantom replay revocations.
-  defp normalize_substituted_completion({:error, %OAuthError{}} = error, :succeeded) do
-    log_substituted_completion_after_success("returned an error")
-    error
-  end
-
-  defp normalize_substituted_completion({:error, _reason}, :succeeded) do
-    log_substituted_completion_after_success("returned an error")
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  defp normalize_substituted_completion(_substituted, :succeeded) do
-    log_substituted_completion_after_success("returned a different result")
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  # The continuation itself failed and the host remapped the reason. The code
-  # was not finalized and no success response can be returned, so there is no
-  # retry hazard to report. Earlier continuation steps may still have persisted
-  # partial state when the host did not provide a transaction.
-  defp normalize_substituted_completion({:error, %OAuthError{}} = error, :failed), do: error
-
-  defp normalize_substituted_completion({:error, _reason}, :failed) do
-    Logger.error("authorization code completion callback failed")
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  defp normalize_substituted_completion(_substituted, :failed) do
-    Logger.error(
-      "authorization code completion callback did not return the continuation's result " <>
-        "unchanged; completion did not succeed and no token response was returned"
-    )
-
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  defp log_substituted_completion_after_success(action) do
-    Logger.error(
-      "authorization code completion callback #{action} after the continuation succeeded; " <>
-        "the code may already be finalized, and a client retry may trigger code-reuse " <>
-        "detection and revoke that response's access token and refresh family"
-    )
-  end
-
-  # The continuation started but terminated before returning a result. A host
-  # may catch that termination and return an OAuth error, but the library cannot
-  # infer whether work before the termination committed. Honor a real OAuth
-  # error while warning about the possible partial writes; never serve a result
-  # that could be a fabricated success.
-  defp normalize_started_completion({:error, %OAuthError{}} = error) do
-    log_caught_completion_termination()
-    error
-  end
-
-  defp normalize_started_completion({:error, _reason}) do
-    log_caught_completion_termination()
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  defp normalize_started_completion(_result) do
-    Logger.error(
-      "authorization code completion callback returned a result after the continuation " <>
-        "terminated; partial writes may have occurred and no successful token response was returned"
-    )
-
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  defp log_caught_completion_termination do
-    Logger.warning(
-      "authorization code completion callback caught a termination after the continuation " <>
-        "started; partial writes may have occurred and the completion result cannot be verified"
-    )
-  end
-
-  # The continuation was never invoked. Nothing was minted or persisted, so the
-  # only safe answers are the host's own error or a refusal - never a success
-  # the host assembled itself.
-  defp normalize_incomplete_completion({:error, %OAuthError{}} = error), do: error
-
-  defp normalize_incomplete_completion({:error, _reason}) do
-    Logger.error("authorization code completion callback failed")
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  defp normalize_incomplete_completion(_result) do
-    Logger.error(
-      "authorization code completion callback returned without invoking the continuation; " <>
-        "no token was issued"
-    )
-
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
-
-  defp normalize_completion_result({:ok, response, events} = result) when is_map(response) and is_list(events),
-    do: result
-
-  defp normalize_completion_result({:error, %OAuthError{}} = error), do: error
-
-  defp normalize_completion_result(_other) do
-    Logger.error("authorization code completion produced an unusable result; no token was issued")
-    {:error, error(@error_invalid_request, "unable to issue token")}
-  end
+  defp token_result?({:ok, response, events}) when is_map(response) and is_list(events), do: true
+  defp token_result?({:error, %OAuthError{}}), do: true
+  defp token_result?(_other), do: false
 
   # RFC 6749 §4.1.4 / §6: optionally issue an initial refresh token so the
   # client can refresh without re-running the authorization flow. The core
@@ -1495,8 +1199,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
           |> put_optional_kw(:acr, valid_acr(grant.acr))
           |> put_optional_kw(:auth_time, valid_auth_time(grant.auth_time))
           |> put_optional_kw(:extra_claims, ciba_id_token_extra_claims(config, client, grant, scope))
+          |> put_id_token_policy(config, client_id)
 
-        case IDToken.mint(attesto_config(config), grant.subject, client_id, opts) do
+        case mint_client_id_token(config, client, grant.subject, client_id, opts) do
           {:ok, id_token} ->
             {:ok, Map.put(response, :id_token, id_token)}
 
@@ -1594,6 +1299,136 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
+  # Everything from rotation on: the work a `:refresh_completion` host runs
+  # through its continuation. Rotation is the first step, so a host that
+  # refuses before calling the continuation, or whose transaction rolls back,
+  # has not consumed the presented token.
+  defp finish_refresh(request, presented, {requested, requested_credentials, resource}, token_type, binding) do
+    %{config: config, client: client} = request
+
+    with {:ok, rotated} <-
+           rotate_refresh(
+             request,
+             presented,
+             requested,
+             resource,
+             SenderConstraint.binding_jkt(binding)
+           ),
+         {:ok, scope} <-
+           authorize_scope(config, client, rotated.context.scope, refresh_resources(rotated.context)),
+         :ok <- require_granted_scope_within_ceiling(scope, rotated.context.scope),
+         credential_claims = refresh_credential_claims(config, rotated.context, scope, requested_credentials),
+         requested_claims = refresh_requested_claims(rotated.context),
+         {:ok, response} <-
+           mint_refresh(
+             request,
+             rotated,
+             scope,
+             token_type,
+             binding,
+             requested_claims
+             |> Map.merge(credential_claims)
+             |> Map.merge(refresh_authorization_grant_id_claims(config, rotated)),
+             # RFC 9470: the refresh context carries the ORIGINAL acr/auth_time
+             # (never re-stamped on rotation), so the refreshed access token
+             # reports the real authentication event.
+             audience_opts(rotated.context.resource) ++ context_auth_context_opts(rotated.context)
+           ) do
+      response =
+        response
+        |> put_refresh_response(rotated, config)
+        |> maybe_echo_credential_authorization_details(%{claims: credential_claims})
+
+      {:ok, response,
+       [refresh_rotated_event(request, rotated.context.subject, scope, "refresh_token", token_type, binding)]}
+    end
+  end
+
+  # With no `:refresh_completion` callback the work runs directly, in the order
+  # it always has. With one, the host receives a secret-free description of the
+  # stored grant and runs the work through its continuation.
+  defp complete_refresh(%Request{config: config} = request, presented, work) do
+    with callback when not is_nil(callback) <- Config.refresh_completion_fun(config),
+         {:ok, context} <- refresh_completion_context(request, presented) do
+      try do
+        Continuation.run(refresh_completion_profile(), &Callback.invoke(callback, &1), context, work)
+      after
+        enforce_detected_reuse(config, context.family_id)
+      end
+    else
+      # No callback, or no stored record for the presented token: there is no
+      # grant to describe to the host, and rotation produces the real error.
+      _direct -> work.()
+    end
+  end
+
+  # Read, without consuming it, the record the presented token names. Only
+  # identifiers and policy inputs go to the host: no token, no token hash, no
+  # successor material, no host claims.
+  defp refresh_completion_context(%Request{config: config} = request, presented) do
+    store = grant_store(config, :refresh_store)
+
+    case store && store.get(Attesto.Secret.hash(presented)) do
+      {:ok, %{family_id: family_id, data: %{} = data}} ->
+        claims = Map.get(data, :claims)
+
+        {:ok,
+         %{
+           client_id: token_client_id(request),
+           subject: Map.get(data, :subject),
+           family_id: family_id,
+           scope: Map.get(data, :scope, []),
+           resource: Map.get(data, :resource, []),
+           auth_time: Map.get(data, :auth_time),
+           acr: Map.get(data, :acr),
+           sid: if(is_map(claims), do: Map.get(claims, @refresh_session_id_claim))
+         }}
+
+      _absent ->
+        :error
+    end
+  end
+
+  # Reuse detection, and a `:build_refresh_principal` denial, revoke the family
+  # inside the continuation. A host that
+  # rolls its transaction back on every error would take that revocation with
+  # it and leave a family with a replayed token alive, so the revocation is
+  # applied again here, after the callback has returned and outside its
+  # transaction, including when the callback raises. `revoke_family/1` is
+  # idempotent.
+  defp enforce_detected_reuse(config, family_id) do
+    if Process.delete(@refresh_reuse_detected_key) == true and is_binary(family_id) do
+      grant_store(config, :refresh_store).revoke_family(family_id)
+    end
+
+    :ok
+  end
+
+  defp refresh_completion_profile do
+    %{
+      callback: "refresh completion callback",
+      continuation: "refresh continuation",
+      work: "refresh completion",
+      not_done: "no token was issued",
+      no_success: "no successful token response was returned",
+      no_response: "the refresh did not succeed and no token response was returned",
+      after_success:
+        "unless the host's transaction rolled back, the presented refresh token is already " <>
+          "rotated and its successor was not returned; the client's retry depends on the retry grace",
+      state_key: {__MODULE__, :refresh_continuation},
+      succeeded?: &match?({:ok, _response, _events}, &1),
+      well_formed?: fn
+        {:error, %OAuthError{}, events} when is_list(events) -> true
+        result -> token_result?(result)
+      end,
+      refusal: {:error, error(@error_invalid_request, "unable to issue token")}
+    }
+  end
+
+  # The resources the refreshed access token is for. Rotation resolved them:
+  # the request's subset when it named one, else the full bound set.
+  defp refresh_resources(context), do: context |> Map.get(:resource) |> List.wrap()
+
   defp rotate_refresh(%Request{config: config} = request, presented, requested, resource, jkt) do
     opts =
       [client_id: token_client_id(request), issuer: config.issuer]
@@ -1622,6 +1457,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         {:ok, rotated}
 
       {:error, :reuse_detected} ->
+        note_detected_reuse(config)
         {:error, grant_error(:reuse_detected), [refresh_reuse_detected_event(request)]}
 
       # Attesto.RefreshToken uses this result only when its refresh-store
@@ -1637,6 +1473,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       {:error, reason} ->
         {:error, grant_error(reason)}
     end
+  end
+
+  # Only a `:refresh_completion` host can undo a family revocation performed
+  # inside the continuation (by rolling back): the one reuse detection makes,
+  # and the one a `:build_refresh_principal` denial makes. Record it so
+  # `enforce_detected_reuse/2` can apply it again once the callback returns.
+  defp note_detected_reuse(config) do
+    if Config.refresh_completion_fun(config), do: Process.put(@refresh_reuse_detected_key, true)
+    :ok
   end
 
   # ── Initial refresh-token issuance (RFC 6749 §4.1.4 / §6) ────────────────
@@ -1847,9 +1692,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp mint_id_token(%Request{config: config, client: client} = request, grant, scope, code, response) do
     case token_client_id(request) do
       client_id when is_binary(client_id) and client_id != "" ->
-        opts = id_token_opts(config, client, grant, scope, code, response)
+        opts = config |> id_token_opts(client, grant, scope, code, response) |> put_id_token_policy(config, client_id)
 
-        case IDToken.mint(attesto_config(config), grant.subject, client_id, opts) do
+        case mint_client_id_token(config, client, grant.subject, client_id, opts) do
           {:ok, id_token} ->
             maybe_record_logout_session(config, client, grant, client_id)
             {:ok, Map.put(response, :id_token, id_token)}
@@ -1865,6 +1710,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       _ ->
         Logger.error("id token mint failed: missing client_id")
         {:error, error(@error_invalid_request, "unable to issue token")}
+    end
+  end
+
+  # OIDC Core §8: the ID Token's `sub` is the identifier this client is shown
+  # for the resource owner, the host subject for a `public` client and the
+  # derived value for a `pairwise` one. A client that is pairwise but has no
+  # usable sector identifier gets no ID Token; the host subject is never used
+  # as a fallback.
+  defp mint_client_id_token(config, client, subject, client_id, opts) do
+    case SubjectIdentifier.for_client(config, client, subject) do
+      {:ok, sub} -> IDToken.mint(attesto_config(config), sub, client_id, opts)
+      {:error, reason} -> {:error, {:subject_identifier, reason}}
     end
   end
 
@@ -1940,6 +1797,19 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     # in as `Attesto.IDToken.mint/4`'s `:extra_claims`, where the protocol
     # claims stay authoritative (a collision is rejected, never shadowed).
     |> put_optional_kw(:extra_claims, id_token_extra_claims(config, client, grant, scope))
+  end
+
+  # Host ID Token policy shared by every mint site: `:id_token_ttl` becomes the
+  # `exp` distance, and `id_token_azp: :always` stamps `azp` with the client the
+  # ID Token is issued to (OIDC Core §2; `Attesto.IDToken.mint/4` checks that it
+  # equals the audience client).
+  defp put_id_token_policy(opts, %Config{} = config, client_id) do
+    opts = Keyword.put(opts, :lifetime, config.id_token_ttl)
+
+    case config.id_token_azp do
+      :always -> Keyword.put(opts, :azp, client_id)
+      :never -> opts
+    end
   end
 
   # OIDC Core §5.4 / §5.5: the additional identity claims an ID Token may
@@ -2071,22 +1941,25 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §3.3: scope resolution is host policy. The documented
   # `:authorize_scope` callback takes the client and the requested scope and
   # returns the granted scope or `{:error, :invalid_scope}` (RFC 6749 §5.2).
-  defp authorize_scope(config, client, requested) do
+  #
+  # `resources` is the RFC 8707 resource list the grant resolved to, so a
+  # three-argument policy sees at this endpoint what it saw at the
+  # authorization endpoint. The decision itself is `ScopeAuthorization`'s.
+  defp authorize_scope(config, client, requested, resources) do
     # The OID4VCI pre-authorized grant presents its authorized scopes as one
     # joined value at the dispatch boundary; callbacks retain the established
     # list-of-scope-values contract.
     requested = if is_binary(requested), do: String.split(requested, " ", trim: true), else: requested
 
-    case invoke(Config.authorize_scope_fun(config), [host_client(client), requested]) do
-      {:ok, scope} when is_list(scope) ->
+    case ScopeAuthorization.authorize(config, client, requested, resources) do
+      {:ok, scope} ->
         {:ok, scope}
 
       {:error, :invalid_scope} ->
         {:error, error(@error_invalid_scope, "scope not permitted")}
 
-      _unexpected ->
-        raise RuntimeError,
-              "AttestoPhoenix.Config :authorize_scope callback violated its return contract"
+      {:error, :invalid_target} ->
+        {:error, error(@error_invalid_target, "scope not permitted for the requested resource")}
     end
   end
 
@@ -2214,6 +2087,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp revoke_denied_refresh_family!(config, family_id) do
+    # Like detected reuse, this revocation must outlive a `:refresh_completion`
+    # host that rolls its transaction back.
+    note_detected_reuse(config)
     store = grant_store(config, :refresh_store)
 
     if function_exported?(store, :revoke_family, 1) do
@@ -2800,9 +2676,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # ── Audit events (returned as data; the controller emits) ────────────────
 
-  defp token_issued_event(request, scope, grant_type, token_type, binding) do
-    issued_like_event(request, :token_issued, scope, grant_type, token_type, binding)
+  # `subject` is the resource owner the token was issued for: the redeemed
+  # grant's subject, or the subject token's `sub` on token exchange. It is `nil`
+  # for `client_credentials`, which has no resource owner.
+  defp token_issued_event(request, subject, scope, grant_type, token_type, binding) do
+    issued_like_event(request, :token_issued, event_subject(subject), scope, grant_type, token_type, binding)
   end
+
+  defp event_subject(subject) when is_binary(subject) and subject != "", do: subject
+  defp event_subject(_subject), do: nil
 
   defp refresh_rotated_event(request, subject, scope, grant_type, token_type, binding) do
     issued_like_event(request, :refresh_rotated, subject, scope, grant_type, token_type, binding)
@@ -2810,10 +2692,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp refresh_issued_event(request, subject, scope, grant_type, token_type, binding) do
     issued_like_event(request, :refresh_issued, subject, scope, grant_type, token_type, binding)
-  end
-
-  defp issued_like_event(request, name, scope, grant_type, token_type, binding) do
-    issued_like_event(request, name, nil, scope, grant_type, token_type, binding)
   end
 
   defp issued_like_event(request, name, subject, scope, grant_type, token_type, binding) do

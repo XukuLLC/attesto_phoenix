@@ -1690,6 +1690,277 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
     end
   end
 
+  describe "registration management read and update (RFC 7592 §2.1, §2.2)" do
+    @management_token "registration-token"
+
+    defp stored_registration(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "client_id" => "client-123",
+          "client_id_issued_at" => 1_700_000_000,
+          "client_name" => "Before",
+          "redirect_uris" => ["https://rp.example/cb"],
+          "grant_types" => ["authorization_code"],
+          "token_endpoint_auth_method" => "client_secret_basic",
+          "application_type" => "web",
+          "scope" => "read",
+          "client_secret_hash" => "secret-hash",
+          "registration_access_token_hash" => Attesto.Secret.hash(@management_token)
+        },
+        overrides
+      )
+    end
+
+    defp management_config(stored, overrides \\ []) do
+      test_pid = self()
+
+      config(
+        Keyword.merge(
+          [
+            load_client: fn "client-123" -> {:ok, stored} end,
+            verify_client_secret: fn _client, secret -> secret == "current-secret" end,
+            client_registration_access_token_hash: fn client -> client["registration_access_token_hash"] end,
+            client_registration_metadata: fn client -> client end,
+            update_client: fn client, attrs ->
+              send(test_pid, {:updated, client, attrs})
+              {:ok, attrs}
+            end,
+            on_event: fn event -> send(test_pid, {:event, event}) end
+          ],
+          overrides
+        )
+      )
+    end
+
+    defp management_request(method, action, config, token, body \\ nil) do
+      conn =
+        method
+        |> conn(@endpoint_path <> "/client-123", body || %{})
+        |> Map.put(:scheme, :https)
+        |> Map.put(:body_params, body || %{})
+        |> put_private(:attesto_phoenix_config, config)
+
+      conn = if body, do: put_req_header(conn, "content-type", "application/json"), else: conn
+      conn = if is_binary(token), do: put_req_header(conn, "authorization", "Bearer " <> token), else: conn
+
+      apply(RegistrationController, action, [conn, %{"client_id" => "client-123"}])
+    end
+
+    defp update_document(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "client_id" => "client-123",
+          "client_name" => "After",
+          "redirect_uris" => ["https://rp.example/cb", "https://rp.example/second"],
+          "grant_types" => ["authorization_code"],
+          "token_endpoint_auth_method" => "client_secret_basic",
+          "scope" => "read write"
+        },
+        overrides
+      )
+    end
+
+    test "GET returns the registration with the presented token and no credential material" do
+      conn = management_request(:get, :show, management_config(stored_registration()), @management_token)
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "cache-control") == ["no-store"]
+      response = body(conn)
+
+      assert response["client_id"] == "client-123"
+      assert response["client_name"] == "Before"
+      assert response["redirect_uris"] == ["https://rp.example/cb"]
+      assert response["registration_access_token"] == @management_token
+      assert response["registration_client_uri"] == "https://issuer.example/oauth/register/client-123"
+
+      for private <- ~w(client_secret client_secret_hash registration_access_token_hash) do
+        refute Map.has_key?(response, private)
+      end
+    end
+
+    test "GET and PUT need the registration access token" do
+      config = management_config(stored_registration(), update_client: fn _c, _a -> flunk("must not update") end)
+
+      for {method, action, body} <- [{:get, :show, nil}, {:put, :update, update_document()}],
+          token <- [nil, "wrong-token"] do
+        conn = management_request(method, action, config, token, body)
+        assert conn.status == 401
+        assert body(conn)["error"] == "invalid_token"
+        assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+      end
+    end
+
+    test "GET and PUT fail closed when the host has not wired the callbacks" do
+      no_metadata = management_config(stored_registration(), client_registration_metadata: nil)
+      assert management_request(:get, :show, no_metadata, @management_token).status == 400
+
+      no_update = management_config(stored_registration(), update_client: nil)
+      conn = management_request(:put, :update, no_update, @management_token, update_document())
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+      assert body(conn)["error_description"] =~ "not configured"
+    end
+
+    test "PUT replaces the metadata, keeps the identifier and issuance time, and rotates nothing" do
+      stored = stored_registration()
+      conn = management_request(:put, :update, management_config(stored), @management_token, update_document())
+
+      assert conn.status == 200
+      response = body(conn)
+      assert response["client_name"] == "After"
+      assert response["redirect_uris"] == ["https://rp.example/cb", "https://rp.example/second"]
+      assert response["scope"] == "read write"
+      assert response["client_id"] == "client-123"
+      assert response["client_id_issued_at"] == 1_700_000_000
+      assert response["registration_access_token"] == @management_token
+      refute Map.has_key?(response, "client_secret")
+
+      assert_received {:updated, ^stored, attrs}
+      assert attrs["client_name"] == "After"
+      assert attrs["client_id"] == "client-123"
+      assert attrs["client_id_issued_at"] == 1_700_000_000
+      refute Map.has_key?(attrs, "client_secret_hash")
+      refute Map.has_key?(attrs, "registration_access_token_hash")
+
+      assert_received {:event, %AttestoPhoenix.Event{name: :client_updated, client_id: "client-123"}}
+    end
+
+    test "PUT resets an omitted member to its default, as a registration would" do
+      document = Map.delete(update_document(), "client_name")
+      conn = management_request(:put, :update, management_config(stored_registration()), @management_token, document)
+
+      assert conn.status == 200
+      refute Map.has_key?(body(conn), "client_name")
+    end
+
+    test "PUT applies the registration rules" do
+      config = management_config(stored_registration(), update_client: fn _c, _a -> flunk("must not update") end)
+
+      for {document, error} <- [
+            {update_document(%{"redirect_uris" => ["javascript:alert(1)"]}), "invalid_redirect_uri"},
+            {update_document(%{"scope" => "read admin"}), "invalid_client_metadata"},
+            {update_document(%{"grant_types" => ["made_up"]}), "invalid_client_metadata"}
+          ] do
+        conn = management_request(:put, :update, config, @management_token, document)
+        assert conn.status == 400
+        assert body(conn)["error"] == error
+      end
+    end
+
+    test "PUT enforces the RFC 7592 §2.2 member rules" do
+      config = management_config(stored_registration(), update_client: fn _c, _a -> flunk("must not update") end)
+
+      refused = [
+        Map.delete(update_document(), "client_id"),
+        update_document(%{"client_id" => "another-client"}),
+        update_document(%{"registration_access_token" => @management_token}),
+        update_document(%{"registration_client_uri" => "https://issuer.example/oauth/register/client-123"}),
+        update_document(%{"client_secret_expires_at" => 0}),
+        update_document(%{"client_id_issued_at" => 1}),
+        update_document(%{"client_secret" => "chosen-by-the-client"}),
+        update_document(%{"client_secret" => 42}),
+        update_document(%{"token_endpoint_auth_method" => "none"})
+      ]
+
+      for document <- refused do
+        conn = management_request(:put, :update, config, @management_token, document)
+        assert conn.status == 400, "accepted #{inspect(document)}"
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+
+    test "PUT accepts the client's current secret and never returns or stores it" do
+      document = update_document(%{"client_secret" => "current-secret"})
+      conn = management_request(:put, :update, management_config(stored_registration()), @management_token, document)
+
+      assert conn.status == 200
+      refute Map.has_key?(body(conn), "client_secret")
+      assert_received {:updated, _client, attrs}
+      refute Map.has_key?(attrs, "client_secret")
+    end
+
+    test "PUT requires application/json" do
+      conn =
+        :put
+        |> conn(@endpoint_path <> "/client-123", update_document())
+        |> Map.put(:scheme, :https)
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> put_req_header("authorization", "Bearer " <> @management_token)
+        |> put_private(:attesto_phoenix_config, management_config(stored_registration()))
+        |> RegistrationController.update(%{"client_id" => "client-123"})
+
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client_metadata"
+    end
+
+    test "a pairwise client cannot move its redirect URIs to another host or change subject type" do
+      stored = stored_registration(%{"subject_type" => "pairwise"})
+
+      config =
+        management_config(stored,
+          client_subject_type: fn client -> client["subject_type"] end,
+          pairwise_subject_salt: String.duplicate("k", 32),
+          update_client: fn _c, attrs -> {:ok, attrs} end
+        )
+
+      same_host = update_document(%{"subject_type" => "pairwise"})
+      assert management_request(:put, :update, config, @management_token, same_host).status == 200
+
+      for document <- [
+            update_document(%{"subject_type" => "pairwise", "redirect_uris" => ["https://other.example/cb"]}),
+            update_document(%{"subject_type" => "public"}),
+            update_document()
+          ] do
+        conn = management_request(:put, :update, config, @management_token, document)
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_client_metadata"
+      end
+    end
+  end
+
+  describe "subject_type and userinfo_signed_response_alg (OIDC Registration §2)" do
+    defp oidc_metadata(extra) do
+      Map.merge(%{"redirect_uris" => ["https://rp.example/cb"], "token_endpoint_auth_method" => "none"}, extra)
+    end
+
+    test "pairwise is accepted only when the server issues it and the redirect URIs share a host" do
+      pairwise =
+        config(client_subject_type: fn _client -> "pairwise" end, pairwise_subject_salt: String.duplicate("k", 32))
+
+      conn = post_register(pairwise, oidc_metadata(%{"subject_type" => "pairwise"}))
+      assert conn.status == 201
+      assert body(conn)["subject_type"] == "pairwise"
+
+      assert post_register(pairwise, oidc_metadata(%{"subject_type" => "public"})).status == 201
+
+      spread =
+        oidc_metadata(%{
+          "subject_type" => "pairwise",
+          "redirect_uris" => ["https://a.example/cb", "https://b.example/cb"]
+        })
+
+      assert body(post_register(pairwise, spread))["error"] == "invalid_client_metadata"
+
+      with_sector =
+        oidc_metadata(%{"subject_type" => "pairwise", "sector_identifier_uri" => "https://rp.example/sector.json"})
+
+      assert body(post_register(pairwise, with_sector))["error_description"] =~ "sector_identifier_uri"
+
+      public_only = config([])
+
+      assert body(post_register(public_only, oidc_metadata(%{"subject_type" => "pairwise"})))["error"] ==
+               "invalid_client_metadata"
+
+      assert post_register(public_only, oidc_metadata(%{"subject_type" => "public"})).status == 201
+      refute Map.has_key?(body(post_register(public_only, oidc_metadata(%{}))), "subject_type")
+    end
+
+    test "userinfo_signed_response_alg is refused when signed responses are not configured" do
+      assert body(post_register(config([]), oidc_metadata(%{"userinfo_signed_response_alg" => "RS256"})))["error"] ==
+               "invalid_client_metadata"
+    end
+  end
+
   describe "event emission (RFC 7591)" do
     test "emits a :client_registered event carrying the client_id, never the secret" do
       test_pid = self()

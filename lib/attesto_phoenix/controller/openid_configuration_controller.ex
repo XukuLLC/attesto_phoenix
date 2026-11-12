@@ -84,8 +84,11 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   alias Attesto.OpenIDDiscovery
   alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
+  alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
+  alias AttestoPhoenix.AuthorizationServer.Userinfo
   alias AttestoPhoenix.{Callback, Config}
   alias AttestoPhoenix.Controller.MetadataSupport
+  alias AttestoPhoenix.RouteControls
   alias AttestoPhoenix.URLComparison
 
   @local_userinfo_route_key :attesto_phoenix_local_userinfo_route
@@ -111,11 +114,13 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
     if Config.openid_provider?(config) do
       protocol_config = MetadataSupport.protocol_config!(conn, __MODULE__)
+      :ok = RouteControls.check_par!(conn, config)
 
       metadata =
         protocol_config
         |> OpenIDDiscovery.metadata(discovery_opts(config, conn))
         |> Metadata.enrich_common(config)
+        |> RouteControls.drop_omitted(RouteControls.omitted(conn))
 
       conn
       |> MetadataSupport.put_public_cache(@cache_max_age_seconds)
@@ -143,6 +148,11 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
   defp discovery_opts(%Config{} = config, %Plug.Conn{} = conn) do
     [
       userinfo_endpoint: userinfo_endpoint(config, conn),
+      # OIDC Core §8: `pairwise` is advertised once a client can be pairwise.
+      subject_types_supported: SubjectIdentifier.subject_types_supported(config),
+      # OIDC Core §5.3.2: advertised once a client can register for a signed
+      # UserInfo response (the core builder drops nil).
+      userinfo_signing_alg_values_supported: Userinfo.signing_alg_values(config),
       frontchannel_logout_supported: frontchannel_logout_supported(config),
       frontchannel_logout_session_supported: frontchannel_logout_session_supported(config),
       # OpenID Connect Session Management 1.0 §3.3: the check_session_iframe,

@@ -84,16 +84,7 @@ defmodule AttestoPhoenix.ProtectedResource do
             {:halt, conn}
 
           access_token_revoked?(config, conn.assigns[claims_key]) ->
-            claims = conn.assigns[claims_key]
-            DenialAudit.emit(config, conn, :invalid_token)
-
-            {:halt,
-             OAuthError.unauthorized(
-               conn,
-               scheme_of(claims),
-               "invalid_token",
-               error_opts(config, resource_metadata, error_overrides)
-             )}
+            {:halt, invalid_token(conn, config, resource_metadata, conn.assigns[claims_key], error_overrides)}
 
           true ->
             {:ok, conn, conn.assigns[claims_key]}
@@ -114,6 +105,25 @@ defmodule AttestoPhoenix.ProtectedResource do
            )
          )}
     end
+  end
+
+  @doc """
+  Answer a request whose verified token is refused after verification, with the
+  RFC 6750 §3.1 `invalid_token` challenge under the token's own scheme.
+
+  Used for a revoked token, and by an endpoint whose host callback reports
+  that the token's subject is no longer valid.
+  """
+  @spec invalid_token(Plug.Conn.t(), Config.t(), String.t() | nil, map(), keyword()) :: Plug.Conn.t()
+  def invalid_token(%Plug.Conn{} = conn, %Config{} = config, resource_metadata, claims, error_overrides \\ []) do
+    DenialAudit.emit(config, conn, :invalid_token)
+
+    OAuthError.unauthorized(
+      conn,
+      scheme_of(claims),
+      "invalid_token",
+      error_opts(config, resource_metadata, error_overrides)
+    )
   end
 
   @doc "Build the options consumed by `Attesto.Plug.Authenticate`."

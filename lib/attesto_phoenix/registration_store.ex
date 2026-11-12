@@ -19,6 +19,8 @@ defmodule AttestoPhoenix.RegistrationStore do
     * `unregister_client/1` (`:unregister_client`)
     * `client_registration_access_token_hash/1`
       (`:client_registration_access_token_hash`)
+    * `client_registration_metadata/1` (`:client_registration_metadata`)
+    * `update_client/2` (`:update_client`)
   """
 
   @typedoc "The host's opaque client representation."
@@ -49,5 +51,25 @@ defmodule AttestoPhoenix.RegistrationStore do
   """
   @callback client_registration_access_token_hash(client()) :: String.t() | nil
 
-  @optional_callbacks unregister_client: 1, client_registration_access_token_hash: 1
+  @doc """
+  Return the client's registered metadata (RFC 7592 §2.1): the string-keyed
+  map `register_client/1` received, as currently stored. When the Config key
+  is unset, GET and PUT requests to the management endpoint fail closed.
+  """
+  @callback client_registration_metadata(client()) :: map()
+
+  @doc """
+  Replace the client's registered metadata after a validated update request
+  (RFC 7592 §2.2). `metadata` is the complete new registration with
+  `client_id` and `client_id_issued_at`; the stored credential hashes are
+  kept. Returns `{:ok, client}` or `{:error, reason}`; a rejection surfaces as
+  `invalid_client_metadata`. When the Config key is unset, PUT requests fail
+  closed.
+  """
+  @callback update_client(client(), metadata :: map()) :: {:ok, client()} | {:error, term()}
+
+  @optional_callbacks unregister_client: 1,
+                      client_registration_access_token_hash: 1,
+                      client_registration_metadata: 1,
+                      update_client: 2
 end

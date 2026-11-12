@@ -495,7 +495,9 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                name: :token_issued,
                client_id: "client-1",
                grant_type: "client_credentials",
-               scope: "read write"
+               scope: "read write",
+               # No resource owner on client_credentials.
+               subject: nil
              } = event
 
       assert event.metadata == %{
@@ -713,6 +715,63 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
       assert {:ok, _entry} =
                ETS.get(Attesto.Secret.hash(Process.get(:auth_code)))
+    end
+
+    test "a pairwise client's ID Token carries the derived sub; the access token keeps the host subject" do
+      salt = String.duplicate("k", 32)
+      code_store = start_code_store("oc_user-1", ["openid"])
+
+      config =
+        config(
+          code_store: code_store,
+          client_id: nil,
+          client_redirect_uris: fn _client -> [@redirect_uri] end,
+          client_subject_type: fn _client -> "pairwise" end,
+          pairwise_subject_salt: salt
+        )
+
+      code_request =
+        request(config,
+          request_client_id: "client-1",
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:ok, response, _events} = Token.issue(config, code_request)
+
+      sector = URI.parse(@redirect_uri).host
+      assert claim!(response.id_token, "sub") == Attesto.PairwiseSubject.derive(sector, "oc_user-1", salt)
+      assert claim!(response.access_token, "sub") == "oc_user-1"
+    end
+
+    test "a pairwise client with no sector identifier is issued no tokens" do
+      code_store = start_code_store("oc_user-1", ["openid"])
+
+      config =
+        config(
+          code_store: code_store,
+          client_id: nil,
+          client_redirect_uris: fn _client -> [@redirect_uri, "https://elsewhere.example/cb"] end,
+          client_subject_type: fn _client -> "pairwise" end,
+          pairwise_subject_salt: String.duplicate("k", 32)
+        )
+
+      code_request =
+        request(config,
+          request_client_id: "client-1",
+          grant_type: "authorization_code",
+          params: %{
+            "code" => Process.get(:auth_code),
+            "code_verifier" => @code_verifier,
+            "redirect_uri" => @redirect_uri
+          }
+        )
+
+      assert {:error, %OAuthError{}, _events} = Token.issue(config, code_request)
     end
 
     test "one authenticated client_id snapshot binds code, ID Token, refresh family, and rotation" do
@@ -1764,7 +1823,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       %{device_code: dc, user_code: uc} = issue_device_code(["read"])
       :ok = Attesto.DeviceCode.approve(Attesto.DeviceCodeStore.ETS, uc, %{subject: "user-1", scope: ["read"]})
 
-      assert {:ok, response, [%Event{name: :token_issued, grant_type: "device_code"}]} =
+      assert {:ok, response, [%Event{name: :token_issued, grant_type: "device_code", subject: "user-1"}]} =
                Token.issue(config, device_request(config, dc))
 
       assert is_binary(response.access_token)
@@ -1876,7 +1935,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       config = pre_authorized_config()
       code = issue_pre_authorized_code()
 
-      assert {:ok, response, [%Event{name: :token_issued, grant_type: "pre-authorized_code"}]} =
+      assert {:ok, response, [%Event{name: :token_issued, grant_type: "pre-authorized_code", subject: "user-1"}]} =
                Token.issue(config, pre_authorized_request(config, code))
 
       assert is_binary(response.access_token)
@@ -2168,7 +2227,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
           auth_time: auth_time
         })
 
-      assert {:ok, response, [%Event{name: :token_issued, grant_type: "ciba"}]} =
+      assert {:ok, response, [%Event{name: :token_issued, grant_type: "ciba", subject: "user-1"}]} =
                Token.issue(config, ciba_request(config, arid))
 
       assert is_binary(response.access_token)
@@ -2317,6 +2376,8 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert {:ok, response, [%Event{name: :token_issued} = event]} =
                Token.issue(config, exchange_request)
 
+      # The exchanged token's resource owner is the subject token's `sub`.
+      assert event.subject == claim!(subject_response.access_token, "sub")
       assert response.token_type == "Bearer"
       assert response.issued_token_type == @subject_token_type_access_token
       assert response.scope == "read"
@@ -2647,6 +2708,29 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       request = request(config, params: %{"scope" => "read"}, request_client_id: "authenticated-client")
 
       assert {:error, %OAuthError{error: :invalid_request}, _events} = Token.issue(config, request)
+    end
+
+    test "a three-argument scope policy receives the resolved resources and may answer invalid_target" do
+      test_pid = self()
+      resource = "https://issuer.example"
+
+      config =
+        config(
+          authorize_scope: fn _client, requested, resources ->
+            send(test_pid, {:scope_policy, requested, resources})
+            if requested == ["admin"], do: {:error, :invalid_target}, else: {:ok, requested}
+          end
+        )
+
+      assert {:ok, _response, _events} =
+               Token.issue(config, request(config, params: %{"scope" => "read", "resource" => resource}))
+
+      assert_received {:scope_policy, ["read"], [^resource]}
+
+      assert {:error, %OAuthError{error: :invalid_target}, [event]} =
+               Token.issue(config, request(config, params: %{"scope" => "admin", "resource" => resource}))
+
+      assert event.result == "invalid_target"
     end
 
     test "an invalid scope decision (RFC 6749 §5.2) surfaces invalid_scope" do

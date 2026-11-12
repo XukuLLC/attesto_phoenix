@@ -52,7 +52,9 @@ defmodule AttestoPhoenix.Event do
   * `:token_issued` - an access (and optionally refresh) token was issued in
     response to a successful grant (RFC 6749 §5.1). Its `:metadata` includes
     `:token_type`, `:sender_constraint`, and `:cnf` so a host can audit whether
-    the issued access token is plain Bearer, DPoP-bound, or mTLS-bound.
+    the issued access token is plain Bearer, DPoP-bound, or mTLS-bound. Carries
+    the resource-owner `:subject` for every grant that has one; `:subject` is
+    `nil` for `client_credentials`.
   * `:token_denied` - a token request was rejected (RFC 6749 §5.2). Its
     `:metadata` includes `:client_id` when known, `:reason` as the structured
     OAuth error atom, and the sender-constraint audit fields `:token_type`,
@@ -85,6 +87,8 @@ defmodule AttestoPhoenix.Event do
     host must commit its audit write before returning for durable recording;
     see `AttestoPhoenix.EventSink`.
   * `:client_registered` - a client was registered (RFC 7591).
+  * `:client_updated` - a client's registration was replaced through the
+    registration management endpoint (RFC 7592 §2.2).
   """
   @type name ::
           :token_issued
@@ -99,6 +103,7 @@ defmodule AttestoPhoenix.Event do
           | :auth_succeeded
           | :auth_denied
           | :client_registered
+          | :client_updated
 
   # The closed set of recognized event names. Used to fail closed on an
   # unrecognized name rather than emitting an event the host cannot interpret.
@@ -115,6 +120,7 @@ defmodule AttestoPhoenix.Event do
     auth_succeeded
     auth_denied
     client_registered
+    client_updated
   )a
 
   @typedoc """

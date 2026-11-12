@@ -268,7 +268,24 @@ defmodule AttestoPhoenix.ClientStore do
   """
   @callback client_ciba_registration(client()) :: map() | nil
 
+  @doc """
+  The client's subject identifier type (OpenID Connect Core §8): `"public"` or
+  `"pairwise"`. See the `:client_subject_type` configuration key. A store that
+  exports this callback makes pairwise clients possible, so the configuration
+  then requires `:pairwise_subject_salt`.
+  """
+  @callback client_subject_type(client()) :: String.t()
+
+  @doc """
+  The client's registered `userinfo_signed_response_alg`, or `nil` for a
+  client that takes the UserInfo response as JSON. See the
+  `:client_userinfo_signed_response_alg` configuration key.
+  """
+  @callback client_userinfo_signed_response_alg(client()) :: String.t() | nil
+
   @optional_callbacks verify_dummy_client_secret: 1,
+                      client_subject_type: 1,
+                      client_userinfo_signed_response_alg: 1,
                       client_id: 1,
                       client_jwks: 1,
                       client_auth_method: 1,

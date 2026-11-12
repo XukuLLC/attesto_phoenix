@@ -27,6 +27,20 @@ defmodule AttestoPhoenix.Store.SweeperTest do
     def calls, do: Agent.get(__MODULE__, & &1.calls)
     def updates, do: Agent.get(__MODULE__, & &1.updates)
 
+    # Advisory-lock support: `transaction/1` runs the function, and `query!/3`
+    # answers the try-lock with whatever the test set (granted by default).
+    def set_lock_available(available?), do: Agent.update(__MODULE__, &Map.put(&1, :lock_available?, available?))
+    def lock_queries, do: Agent.get(__MODULE__, &Map.get(&1, :lock_queries, []))
+
+    def transaction(fun) when is_function(fun, 0), do: {:ok, fun.()}
+
+    def query!(sql, params, _opts) do
+      Agent.get_and_update(__MODULE__, fn state ->
+        queries = Map.get(state, :lock_queries, []) ++ [{sql, params}]
+        {%{rows: [[Map.get(state, :lock_available?, true)]]}, Map.put(state, :lock_queries, queries)}
+      end)
+    end
+
     def update_all(%Ecto.Query{} = query, [], opts) do
       table = query_source(query)
 
@@ -450,6 +464,60 @@ defmodule AttestoPhoenix.Store.SweeperTest do
                  telemetry_event: nil
                }
              ]
+    end
+
+    test "sweep_once/2 runs the same deletion pass without a process" do
+      start_recorder(%{"attesto_device_codes" => 6, "dpop_replays" => 7})
+      config = valid_config(sweep_interval_ms: 60_000, schema_prefix: "auth")
+      now = ~U[2026-01-01 00:00:00Z]
+
+      result = Sweeper.sweep_once(config, now)
+
+      assert result |> Map.keys() |> Enum.sort() == Enum.sort(@swept_tables)
+      assert result["attesto_device_codes"] == 6
+      assert result["dpop_replays"] == 7
+
+      calls = RecordingRepo.calls()
+      assert calls |> Enum.map(& &1.table) |> Enum.sort() == Enum.sort(@swept_tables)
+      assert Enum.all?(calls, &(&1.prefix == "auth"))
+      # The caller's `now` is the boundary for every table.
+      assert calls |> Enum.map(& &1.now) |> Enum.uniq() == [now]
+      # The refresh-successor redaction is part of the pass.
+      assert [_ | _] = RecordingRepo.updates()
+      # No lock is taken: the caller owns the transaction.
+      assert RecordingRepo.lock_queries() == []
+    end
+
+    test "cluster_lock runs the deletion pass under a transaction-scoped advisory lock" do
+      start_recorder(%{"attesto_device_codes" => 6})
+      config = valid_config(sweep_interval_ms: 60_000)
+      {:ok, pid} = Sweeper.start_link(config: config, name: nil, cluster_lock: {:advisory, 4_242})
+      on_exit(fn -> safe_stop(pid, &GenServer.stop/1) end)
+
+      assert %{"attesto_device_codes" => 6} = Sweeper.sweep_now(pid)
+      assert RecordingRepo.lock_queries() == [{"SELECT pg_try_advisory_xact_lock($1)", [4_242]}]
+    end
+
+    test "cluster_lock skips the pass when another node holds the lock" do
+      start_recorder(%{"attesto_device_codes" => 6})
+      RecordingRepo.set_lock_available(false)
+      config = valid_config(sweep_interval_ms: 60_000)
+      {:ok, pid} = Sweeper.start_link(config: config, name: nil, cluster_lock: {:advisory, 4_242})
+      on_exit(fn -> safe_stop(pid, &GenServer.stop/1) end)
+
+      assert Sweeper.sweep_now(pid) == :skipped
+      assert RecordingRepo.calls() == []
+      assert RecordingRepo.updates() == []
+    end
+
+    test "an invalid cluster_lock is refused at start" do
+      config = valid_config(sweep_interval_ms: 60_000)
+
+      for invalid <- [:advisory, {:advisory, "key"}, {:advisory, 0x8000_0000_0000_0000}, {:redis, 1}, true] do
+        assert_raise ArgumentError, ~r/:cluster_lock must be \{:advisory, key\}/, fn ->
+          Sweeper.start_link(config: config, name: nil, cluster_lock: invalid)
+        end
+      end
     end
 
     test "suppresses SQL logging and repo telemetry for every housekeeping query" do

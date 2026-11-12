@@ -535,6 +535,9 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
           client_id: fn %{id: id} -> id end,
           client_redirect_uris: fn _client -> [@redirect_uri] end,
           authenticate_resource_owner: &__MODULE__.endpoint_authenticate/3,
+          # The scope policy runs at the authorization endpoint; this test
+          # requests a scope outside any catalog on purpose.
+          authorize_scope: fn _client, requested -> {:ok, requested} end,
           consent: fn _conn, _request, subject -> {:consented, subject} end,
           code_store: EctoCodeStore,
           principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")]

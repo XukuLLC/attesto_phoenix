@@ -2,6 +2,7 @@ defmodule AttestoPhoenix.BackChannelLogout.Delivery do
   @moduledoc false
 
   alias Attesto.LogoutToken
+  alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.Config
 
   require Logger
@@ -89,7 +90,7 @@ defmodule AttestoPhoenix.BackChannelLogout.Delivery do
     results =
       targets
       |> Task.async_stream(
-        &deliver(attesto_config, http, session, &1),
+        &deliver(config, attesto_config, http, session, &1),
         max_concurrency: max(length(targets), 1),
         ordered: true,
         timeout: @target_timeout_ms,
@@ -114,13 +115,10 @@ defmodule AttestoPhoenix.BackChannelLogout.Delivery do
     end)
   end
 
-  defp deliver(attesto_config, http, session, target) do
-    opts =
-      []
-      |> put_opt(:sub, Map.get(target, :subject) || Map.get(session, :subject))
-      |> put_opt(:sid, target.sid)
-
-    with {:ok, token} <- LogoutToken.mint(attesto_config, target.client_id, opts),
+  defp deliver(config, attesto_config, http, session, target) do
+    with {:ok, sub} <- client_subject(config, target, Map.get(target, :subject) || Map.get(session, :subject)),
+         opts = [] |> put_opt(:sub, sub) |> put_opt(:sid, target.sid),
+         {:ok, token} <- LogoutToken.mint(attesto_config, target.client_id, opts),
          :ok <- http.post(target.backchannel_logout_uri, token) do
       :ok
     else
@@ -130,6 +128,16 @@ defmodule AttestoPhoenix.BackChannelLogout.Delivery do
     _exception -> delivery_failed()
   catch
     _kind, _reason -> delivery_failed()
+  end
+
+  # OIDC Core §8 / Back-Channel Logout 1.0 §2.4: the logout token's `sub` is
+  # the identifier this Relying Party was given in its ID Token, so a pairwise
+  # client is sent its derived value. A token for a client whose identifier
+  # cannot be established is not sent.
+  defp client_subject(_config, _target, nil), do: {:ok, nil}
+
+  defp client_subject(config, target, subject) when is_binary(subject) do
+    SubjectIdentifier.for_client_id(config, target.client_id, subject)
   end
 
   defp delivery_failed do

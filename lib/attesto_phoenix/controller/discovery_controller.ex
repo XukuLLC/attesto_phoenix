@@ -56,6 +56,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.MetadataSupport
+  alias AttestoPhoenix.RouteControls
 
   # RFC 8414 §3: the metadata document is static for a given server
   # configuration, so it may be cached by clients and intermediaries. One
@@ -73,11 +74,13 @@ defmodule AttestoPhoenix.Controller.DiscoveryController do
   def show(conn, _params) do
     config = Config.resolve!(conn)
     protocol_config = MetadataSupport.protocol_config!(conn, __MODULE__)
+    :ok = RouteControls.check_par!(conn, config)
 
     metadata =
       protocol_config
       |> Discovery.metadata(discovery_opts(config))
       |> Metadata.enrich_common(config)
+      |> RouteControls.drop_omitted(RouteControls.omitted(conn))
 
     conn
     |> MetadataSupport.put_public_cache(@cache_max_age_seconds)

@@ -41,13 +41,15 @@ defmodule AttestoPhoenix.ClaimsProvider do
   parameter (`%{}` when none). The host owns the claim source; the library owns
   the scope-to-claim shaping (OpenID Connect Core §5.4) and forces `sub` to the
   verified token subject (OpenID Connect Core §5.3.2). Returns a map of claim
-  values.
+  values, or `{:error, :invalid_token}` to refuse the subject (for example one
+  disabled after the access token was minted); the endpoint then answers the
+  RFC 6750 §3.1 `invalid_token` challenge.
   """
   @callback build_userinfo_claims(
               subject :: String.t(),
               granted_scopes :: [String.t()],
               requested_claims :: map()
-            ) :: map()
+            ) :: map() | {:error, :invalid_token}
 
   @doc """
   Produce the host claims merged into an ID Token (OpenID Connect Core §3.1.3.6

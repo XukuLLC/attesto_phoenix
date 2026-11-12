@@ -2,7 +2,9 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   @moduledoc """
   OAuth 2.0 Dynamic Client Registration endpoint (RFC 7591 §3).
 
-  Handles `POST /oauth/register` and `DELETE /oauth/register/:client_id`. This
+  Handles `POST /oauth/register` and, at the client configuration endpoint
+  `/oauth/register/:client_id` (RFC 7592 §2), `GET` (read), `PUT` (update) and
+  `DELETE`. This
   module owns the HTTP and protocol-framing concerns only: it enforces TLS
   (`require_https`), checks `Content-Type: application/json`, extracts the
   parsed JSON request body or `Bearer` registration access token off the
@@ -128,6 +130,55 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     else
       {:error, %OAuthError{} = err} -> render_error(conn, err)
     end
+  end
+
+  @doc """
+  Client read action (RFC 7592 §2.1): `GET /oauth/register/:client_id` with the
+  registration access token. Renders the client's current registration.
+
+  A host must wire `:client_registration_access_token_hash` and
+  `:client_registration_metadata`; absent either, the endpoint fails closed.
+  """
+  @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def show(conn, %{"client_id" => client_id}) when is_binary(client_id) do
+    config = Config.resolve!(conn)
+    conn = OAuthError.no_store(conn, config)
+
+    with :ok <- require_management_https(conn, config),
+         {:ok, response} <- Registration.read(config, client_id, registration_bearer_token(conn)) do
+      json(conn, response)
+    else
+      {:error, %OAuthError{} = err} -> render_delete_error(conn, err)
+    end
+  end
+
+  @doc """
+  Client update action (RFC 7592 §2.2): `PUT /oauth/register/:client_id` with
+  the registration access token and the client's complete new metadata as
+  `application/json`. Renders the updated registration.
+
+  A host must wire `:client_registration_access_token_hash`,
+  `:client_registration_metadata` and `:update_client`; absent any, the
+  endpoint fails closed.
+  """
+  @spec update(Plug.Conn.t(), map()) :: Plug.Conn.t()
+  def update(conn, %{"client_id" => client_id}) when is_binary(client_id) do
+    config = Config.resolve!(conn)
+    conn = OAuthError.no_store(conn, config)
+
+    with :ok <- require_management_https(conn, config),
+         :ok <- check_content_type(conn),
+         {:ok, response, events} <-
+           Registration.update(config, client_id, registration_bearer_token(conn), Map.get(conn, :body_params)) do
+      emit_all(config, events)
+      json(conn, response)
+    else
+      {:error, %OAuthError{} = err} -> render_delete_error(conn, err)
+    end
+  end
+
+  defp require_management_https(conn, config) do
+    require_https(conn, config, {:error, error(:invalid_request, "the request must be made over TLS")})
   end
 
   @doc """

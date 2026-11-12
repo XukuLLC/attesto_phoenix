@@ -124,7 +124,13 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       assert "code" in body["response_types_supported"]
 
       assert body["response_modes_supported"] ==
-               ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
+               ["query", "form_post", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"]
+    end
+
+    test "advertises the configured :response_modes_supported" do
+      body = decode_body(call_show(host_config(response_modes_supported: ["query", "query.jwt"]), protocol_config()))
+
+      assert body["response_modes_supported"] == ["query", "query.jwt"]
     end
 
     test "snapshots the complete current RFC 8414 metadata map" do
@@ -227,7 +233,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
         ],
         "require_pushed_authorization_requests" => true,
         "require_signed_request_object" => true,
-        "response_modes_supported" => ["query", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"],
+        "response_modes_supported" => ["query", "form_post", "jwt", "query.jwt", "fragment.jwt", "form_post.jwt"],
         "response_types_supported" => ["code"],
         "scopes_supported" => ["openid", "profile", "email"],
         "token_endpoint" => "https://issuer.example/oauth/token",

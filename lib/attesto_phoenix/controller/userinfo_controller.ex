@@ -50,10 +50,27 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   (OpenID Connect Core §5.3.2), the stable subject identifier, regardless of
   scope.
 
+  `:userinfo_scope_claims` adds claim names to a scope's set (or gives a
+  host-defined scope a set), and `:userinfo_always_claims` names claims
+  released for every `openid` token.
+
+  The callback may return `{:error, :invalid_token}` to refuse a subject, for
+  example one disabled after the access token was minted. The response is the
+  same `401` `invalid_token` challenge a rejected token gets (RFC 6750 §3.1).
+
   Beyond the scope-implied set, individual claims requested through the OpenID
   Connect `claims` request parameter's `userinfo` member (OpenID Connect Core
   §5.5) are also released when `:claims_parameter_supported` is `true`. With
   the default `false`, a `claims` object on the access token is ignored.
+
+  ## Signed responses (OpenID Connect Core §5.3.2)
+
+  When the host configures `:client_userinfo_signed_response_alg` and it
+  returns an algorithm for the client the access token was issued to, the
+  response is a JWT (`Content-Type: application/jwt`) signed with this server's
+  current signing key and carrying `iss` and `aud` beside the claims. The
+  algorithm has to be that key's algorithm. Encrypted responses are not
+  implemented.
 
   ## Configuration contract
 
@@ -83,6 +100,8 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.{Config, ProtectedResource}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
+
+  require Logger
 
   @openid_scope "openid"
   @insufficient_scope_description "The UserInfo endpoint requires the openid scope."
@@ -117,12 +136,47 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   defp respond(conn, config, resource_metadata, claims) do
     case Userinfo.resolve_claims(config, claims) do
       {:ok, userinfo} ->
+        send_userinfo(conn, config, resource_metadata, claims, userinfo)
+
+      {:error, :insufficient_scope} ->
+        insufficient_scope(conn, config, ProtectedResource.scheme_of(claims), resource_metadata)
+
+      # The host's claim source refused the subject. Answer exactly as the
+      # verify path answers a token it rejects (RFC 6750 §3.1).
+      {:error, :invalid_token} ->
+        ProtectedResource.invalid_token(conn, config, resource_metadata, claims)
+    end
+  end
+
+  # OpenID Connect Core §5.3.2: JSON, or a signed JWT (`application/jwt`) for a
+  # client that registered `userinfo_signed_response_alg`. The choice is
+  # `Userinfo.response/3`'s.
+  defp send_userinfo(conn, config, resource_metadata, claims, userinfo) do
+    case Userinfo.response(config, claims, userinfo) do
+      :json ->
         conn
         |> PhoenixOAuthError.no_store(config)
         |> json(userinfo)
 
-      {:error, :insufficient_scope} ->
-        insufficient_scope(conn, config, ProtectedResource.scheme_of(claims), resource_metadata)
+      {:jwt, jwt} ->
+        conn
+        |> PhoenixOAuthError.no_store(config)
+        |> put_resp_content_type("application/jwt")
+        |> send_resp(200, jwt)
+
+      {:error, :client_unavailable} ->
+        ProtectedResource.invalid_token(conn, config, resource_metadata, claims)
+
+      {:error, :unsupported_alg} ->
+        # The client registered an algorithm this server does not sign with.
+        # Registration refuses that, so this is a host data fault; the client
+        # is not sent unsigned claims in its place.
+        Logger.error("userinfo: the client's userinfo_signed_response_alg is not a supported signing algorithm")
+
+        conn
+        |> PhoenixOAuthError.no_store(config)
+        |> put_status(:internal_server_error)
+        |> json(%{"error" => "server_error"})
     end
   end
 

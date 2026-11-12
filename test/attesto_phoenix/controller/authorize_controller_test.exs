@@ -81,7 +81,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   # The login binding the controller derives from the authenticate stub's
   # subject + auth_time (+ sid): "subject\nauth_time\nsid".
   @established_binding "user-42\n1700000000\n"
-  @reauth_binding "user-42\n1700009999\n"
 
   defmodule TestStore do
     @moduledoc false
@@ -106,6 +105,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         end
       end)
     end
+
+    def count, do: Agent.get(__MODULE__, &map_size/1)
+    def reset, do: Agent.update(__MODULE__, fn _state -> %{} end)
 
     # Test-only peek that does not consume the code.
     def peek(code) do
@@ -147,6 +149,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         code_store: TestStore,
         authorization_code_ttl: 60,
         require_https: true,
+        # The scope policy runs at this endpoint; without a catalog (or a host
+        # policy) every requested scope would be refused.
+        scopes_supported: ~w(openid profile email address phone offline_access),
         # A real AS configures principal kinds; needed for the derived
         # Attesto.Config when the authorization endpoint signs JARM responses.
         principal_kinds: [Attesto.PrincipalKind.new("user", "usr_")]
@@ -317,8 +322,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert_receive {:private_context_issuance,
                       %{client_id: @client_id, subject: "user-42", family_id: family_id} = context}
 
-      # Exactly the authorized identifiers - no request params, no secrets.
-      assert map_size(context) == 3
+      # The authorized identifiers, the host's own authentication map and the
+      # validated scope and resource - no raw request params, no secrets.
+      assert context |> Map.keys() |> Enum.sort() ==
+               [:authentication, :client_id, :family_id, :resource, :scope, :subject]
+
+      assert %{subject: "user-42", auth_time: 1_700_000_000, amr: ["pwd"]} = context.authentication
+      assert context.scope == record.data.scope
+      assert context.resource == record.data.resource
       assert family_id == record.data.family_id
 
       # Core admits no sibling key beside the nine canonical ones, so the value
@@ -439,6 +450,28 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
   # ── JARM (FAPI 2.0 Message Signing §5.4) ─────────────────────────────────
 
+  describe ":response_modes_supported" do
+    test "a response_mode outside the configured list is a redirectable invalid_request" do
+      put_config(response_modes_supported: ["query", "query.jwt"])
+
+      conn = call(valid_params(%{"response_mode" => "form_post.jwt"}))
+
+      assert conn.status == 302
+      assert location_query(conn)["error"] == "invalid_request"
+      refute Map.has_key?(location_query(conn), "code")
+
+      assert is_binary(location_query(call(valid_params()))["code"])
+      assert is_binary(location_query(call(valid_params(%{"response_mode" => "query.jwt"})))["response"])
+    end
+
+    test "leaving query out makes an explicit JARM mode mandatory" do
+      put_config(response_modes_supported: ["query.jwt"])
+
+      assert location_query(call(valid_params()))["error"] == "invalid_request"
+      assert is_binary(location_query(call(valid_params(%{"response_mode" => "query.jwt"})))["response"])
+    end
+  end
+
   describe "JARM response modes" do
     test "query.jwt returns a single signed response JWT, not plain code/state" do
       conn = call(valid_params(%{"response_mode" => "query.jwt"}))
@@ -490,6 +523,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert csp =~ "base-uri 'none'"
       assert [_, jwt] = Regex.run(~r/name="response" value="([^"]+)"/, conn.resp_body)
       assert decode_jarm(jwt)["code"] |> is_binary()
+    end
+
+    test "form_post.jwt is not cacheable" do
+      conn = call(valid_params(%{"response_mode" => "form_post.jwt"}))
+      assert get_resp_header(conn, "cache-control") == ["no-store"]
     end
 
     test "a redirectable error is itself returned as a signed JWT under query.jwt" do
@@ -1025,6 +1063,29 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       query = location_query(conn)
       assert is_binary(query["code"])
       assert query["state"] == "xyz"
+    end
+
+    test "the host reads id_token_hint and login_hint from a request that arrived through PAR" do
+      request_uri = "urn:ietf:params:oauth:request_uri:hints"
+      test_pid = self()
+
+      put_config(
+        par_store: PARStore,
+        authenticate_resource_owner: fn _conn, request, _auth_opts ->
+          send(test_pid, {:request, request})
+          {:authenticated, %{subject: "user-42"}}
+        end
+      )
+
+      pushed = valid_params(%{"login_hint" => "alice@example.com", "id_token_hint" => "eyJ.hint.jwt"})
+      :ok = PARStore.put(request_uri, pushed, 60)
+
+      conn = call(%{"client_id" => @client_id, "request_uri" => request_uri})
+
+      assert is_binary(location_query(conn)["code"])
+      assert_received {:request, request}
+      assert request.login_hint == "alice@example.com"
+      assert request.id_token_hint == "eyJ.hint.jwt"
     end
 
     test "a raising private-context callback propagates after PAR claims the request_uri" do
@@ -1700,6 +1761,386 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
   # ── prompt handling (OIDC Core §3.1.2.1 / §3.1.2.6) ────────────────────────
 
+  describe "response_mode=form_post (OAuth 2.0 Form Post Response Mode)" do
+    defp form_fields(conn) do
+      ~r/<input type="hidden" name="([^"]*)" value="([^"]*)"\/>/
+      |> Regex.scan(conn.resp_body)
+      |> Map.new(fn [_, name, value] -> {name, value} end)
+    end
+
+    test "a successful response is an auto-submitting form POST with no data in a URL" do
+      conn = call(valid_params(%{"response_mode" => "form_post"}))
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "location") == []
+      assert get_resp_header(conn, "content-type") == ["text/html; charset=utf-8"]
+      assert get_resp_header(conn, "cache-control") == ["no-store"]
+      assert [csp] = get_resp_header(conn, "content-security-policy")
+      assert csp =~ "form-action https: http:"
+
+      assert conn.resp_body =~ ~s(<form method="post" action="https://client.example.com/callback">)
+      assert conn.resp_body =~ ~s|onload="document.forms[0].submit()"|
+
+      fields = form_fields(conn)
+      assert %{"code" => code, "state" => "xyz", "iss" => "https://issuer.example.com"} = fields
+      assert %{data: %{client_id: @client_id}} = TestStore.peek(code)
+      refute Map.has_key?(fields, "response")
+    end
+
+    test "values are HTML-escaped" do
+      state = ~s(a"b<c>&d')
+      conn = call(valid_params(%{"response_mode" => "form_post", "state" => state}))
+
+      refute conn.resp_body =~ state
+      assert conn.resp_body =~ ~s(name="state" value="a&quot;b&lt;c&gt;&amp;d&#39;")
+    end
+
+    test "a redirectable error is delivered the same way" do
+      put_config(authorize_scope: fn _client, _requested -> {:error, :invalid_scope} end)
+
+      conn = call(valid_params(%{"response_mode" => "form_post"}))
+
+      assert conn.status == 200
+      assert get_resp_header(conn, "location") == []
+      assert %{"error" => "invalid_scope", "state" => "xyz"} = fields = form_fields(conn)
+      refute Map.has_key?(fields, "code")
+    end
+
+    test "a validation error on a form_post request is delivered the same way" do
+      conn = call(valid_params(%{"response_mode" => "form_post", "scope" => ~s(open"id)}))
+
+      assert conn.status == 200
+      assert %{"error" => "invalid_scope"} = form_fields(conn)
+    end
+
+    test "a deployment that does not list form_post refuses it by redirect" do
+      put_config(response_modes_supported: ["query"])
+
+      conn = call(valid_params(%{"response_mode" => "form_post"}))
+      assert %{"error" => "invalid_request"} = location_query(conn)
+    end
+  end
+
+  describe ":authorization_code_issuance" do
+    import ExUnit.CaptureLog
+
+    test "the host runs issuance through the continuation and sees a secret-free context" do
+      test_pid = self()
+
+      put_config(
+        authorization_code_completion: &passthrough_completion/2,
+        authorization_code_private_context: fn _context -> %{"security_epoch" => 42} end,
+        authorization_code_issuance: fn context, continuation ->
+          send(test_pid, {:issuance_context, context})
+          result = continuation.()
+          send(test_pid, {:issuance_result, result})
+          result
+        end
+      )
+
+      conn = call(valid_params())
+      code = location_query(conn)["code"]
+      record = TestStore.peek(code)
+
+      assert_receive {:issuance_context, context}
+      assert_receive {:issuance_result, {:ok, ^code}}
+
+      assert context == %{
+               client_id: @client_id,
+               subject: "user-42",
+               family_id: record.data.family_id,
+               private_context: %{"security_epoch" => 42}
+             }
+    end
+
+    test "without a private-context callback the context carries nil for it" do
+      test_pid = self()
+
+      put_config(
+        authorization_code_issuance: fn context, continuation ->
+          send(test_pid, {:issuance_context, context})
+          continuation.()
+        end
+      )
+
+      assert is_binary(location_query(call(valid_params()))["code"])
+      assert_receive {:issuance_context, %{private_context: nil, subject: "user-42"}}
+    end
+
+    test "the Repo.transaction/1 wrapper around a committed result is accepted" do
+      put_config(authorization_code_issuance: fn _context, continuation -> {:ok, continuation.()} end)
+
+      assert is_binary(location_query(call(valid_params()))["code"])
+    end
+
+    test "a host refusal becomes the redirectable error it names and no code is stored" do
+      for {error, expected} <- [
+            {:access_denied, "access_denied"},
+            {:server_error, "server_error"},
+            {:temporarily_unavailable, "temporarily_unavailable"}
+          ] do
+        TestStore.reset()
+
+        put_config(
+          authorization_code_issuance: fn _context, _continuation ->
+            {:error, AttestoPhoenix.OAuthError.new(error, "host detail that must not reach the client")}
+          end
+        )
+
+        query = location_query(call(valid_params()))
+
+        assert %{"error" => ^expected, "state" => "xyz"} = query
+        refute Map.has_key?(query, "code")
+        refute Map.has_key?(query, "error_description")
+        assert TestStore.count() == 0
+      end
+    end
+
+    test "login_required is honored for prompt=none and is a server_error otherwise" do
+      put_config(
+        authorization_code_issuance: fn _context, _continuation ->
+          {:error, AttestoPhoenix.OAuthError.new(:login_required)}
+        end
+      )
+
+      assert %{"error" => "login_required"} = location_query(call(valid_params(%{"prompt" => "none"})))
+
+      log =
+        capture_log(fn ->
+          assert %{"error" => "server_error"} = location_query(call(valid_params()))
+        end)
+
+      assert log =~ "refused with :login_required, which does not apply to this request"
+    end
+
+    test "a success returned without calling the continuation issues nothing" do
+      put_config(authorization_code_issuance: fn _context, _continuation -> {:ok, "forged-code"} end)
+
+      log =
+        capture_log(fn ->
+          query = location_query(call(valid_params()))
+          assert %{"error" => "server_error"} = query
+          refute Map.has_key?(query, "code")
+        end)
+
+      assert log =~ "authorization code issuance callback returned without invoking the continuation"
+      assert TestStore.count() == 0
+    end
+
+    test "the continuation runs at most once" do
+      test_pid = self()
+
+      put_config(
+        authorization_code_issuance: fn _context, continuation ->
+          first = continuation.()
+          send(test_pid, {:second, continuation.()})
+          first
+        end
+      )
+
+      log =
+        capture_log(fn ->
+          assert is_binary(location_query(call(valid_params()))["code"])
+        end)
+
+      assert_receive {:second, {:error, :issuance_callback_contract_violation}}
+      assert log =~ "authorization code issuance continuation was invoked more than once"
+      assert TestStore.count() == 1
+    end
+  end
+
+  describe "park and resume (AttestoPhoenix.Interaction)" do
+    defp call_query(params, browser \\ "browser-1") do
+      :get
+      |> Plug.Test.conn("/oauth/authorize?" <> URI.encode_query(params))
+      |> Map.put(:scheme, :https)
+      |> put_req_header("x-browser", browser)
+      |> with_config()
+      |> AuthorizeController.authorize(params)
+    end
+
+    defp park!(params \\ %{}, overrides \\ []) do
+      put_config(
+        Keyword.merge(
+          [
+            authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+            interaction_browser_binding: &__MODULE__.browser_binding/1
+          ],
+          overrides
+        )
+      )
+
+      conn = call_query(valid_params(params))
+      assert conn.resp_body == "login"
+      assert_received {:parked, resume_id}
+      assert_received {:auth_opts, %{resumed: false}}
+      resume_id
+    end
+
+    test "a parked request resumes once, with auth_opts.resumed, and issues the code" do
+      resume_id = park!()
+
+      conn = call_query(%{"resume" => resume_id})
+
+      assert_received {:auth_opts, %{resumed: true, prompt: []}}
+      assert %{"code" => code, "state" => "xyz"} = location_query(conn)
+      assert TestStore.peek(code).data.scope == ["openid", "profile"]
+
+      replay = call_query(%{"resume" => resume_id})
+      assert replay.status == 400
+      assert replay.resp_body =~ "resume reference"
+      assert location(replay) == nil
+    end
+
+    test "an ordinary request reports resumed: false" do
+      call(valid_params())
+      assert_received {:auth_opts, %{resumed: false}}
+    end
+
+    test "another browser cannot resume, and the attempt spends the parked request" do
+      resume_id = park!()
+
+      stolen = call_query(%{"resume" => resume_id}, "browser-2")
+      assert stolen.status == 400
+      assert location(stolen) == nil
+
+      assert call_query(%{"resume" => resume_id}).status == 400
+    end
+
+    test "resume cannot be combined with other parameters, and that attempt leaves it usable" do
+      resume_id = park!()
+
+      conn = call_query(%{"resume" => resume_id, "scope" => "openid admin"})
+      assert conn.status == 400
+      assert conn.resp_body =~ "cannot be combined"
+
+      assert is_binary(location_query(call_query(%{"resume" => resume_id}))["code"])
+    end
+
+    test "an unknown or malformed resume is a direct error" do
+      put_config(interaction_browser_binding: &__MODULE__.browser_binding/1)
+
+      for resume <- ["never-issued", ""] do
+        conn = call_query(%{"resume" => resume})
+        assert conn.status == 400
+        assert location(conn) == nil
+      end
+    end
+
+    test "an expired parked request cannot be resumed" do
+      resume_id = park!(%{}, interaction_ttl: 1)
+      Process.sleep(1_100)
+
+      assert call_query(%{"resume" => resume_id}).status == 400
+    end
+
+    test "a resumed request is validated again: the scope policy still applies" do
+      resume_id = park!()
+
+      put_config(
+        authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        authorize_scope: fn _client, _requested -> {:error, :invalid_scope} end
+      )
+
+      assert %{"error" => "invalid_scope"} = location_query(call_query(%{"resume" => resume_id}))
+    end
+
+    test "a parked key is refused as a request_uri" do
+      resume_id = park!()
+
+      conn = call(%{"client_id" => @client_id, "request_uri" => "urn:attesto:interaction:" <> resume_id})
+      assert conn.status == 400
+      assert location(conn) == nil
+    end
+
+    test "max_age=0 on a resumed request needs an authentication newer than the park" do
+      resume_id = park!(%{"max_age" => "0"})
+      Process.put(:resume_auth_time, System.system_time(:second) - 30)
+
+      # 30 seconds old is inside the 60-second interval a fresh interactive
+      # request gets, but it predates the park, so the resume refuses it.
+      assert %{"error" => "server_error"} = location_query(call_query(%{"resume" => resume_id}))
+
+      resume_id = park!(%{"max_age" => "0"})
+      Process.put(:resume_auth_time, System.system_time(:second))
+      assert is_binary(location_query(call_query(%{"resume" => resume_id}))["code"])
+    end
+
+    test "park/2 raises without a browser binding" do
+      put_config(authenticate_resource_owner: &__MODULE__.park_or_authenticate/3)
+
+      assert_raise ArgumentError, ~r/:interaction_browser_binding must be configured/, fn ->
+        call_query(valid_params())
+      end
+    end
+
+    test "max_age_allowance/3 is the time since the park only for a later authentication" do
+      alias AttestoPhoenix.Interaction
+
+      assert Interaction.max_age_allowance(1_000, 1_000, 1_400) == 400
+      assert Interaction.max_age_allowance(1_000, 1_200, 1_400) == 400
+      assert Interaction.max_age_allowance(1_000, 999, 1_400) == 0
+      assert Interaction.max_age_allowance(1_000, nil, 1_400) == 0
+    end
+  end
+
+  describe "scope policy at the authorization endpoint (RFC 6749 §4.1.2.1, RFC 8707 §2)" do
+    test "a refused scope is a redirectable invalid_scope before the resource owner is asked" do
+      put_config(authorize_scope: fn _client, _requested -> {:error, :invalid_scope} end)
+
+      conn = call(valid_params())
+
+      assert %{"error" => "invalid_scope", "state" => "xyz"} = query = location_query(conn)
+      refute Map.has_key?(query, "code")
+      refute_received {:authenticate_called, _}
+    end
+
+    test "the built-in catalog policy refuses a scope outside the catalog" do
+      conn = call(valid_params(%{"scope" => "openid unlisted"}))
+      assert %{"error" => "invalid_scope"} = location_query(conn)
+    end
+
+    test "prompt=none does not turn the refusal into an interaction error" do
+      put_config(authorize_scope: fn _client, _requested -> {:error, :invalid_scope} end)
+
+      conn = call(valid_params(%{"prompt" => "none"}))
+      assert %{"error" => "invalid_scope"} = location_query(conn)
+    end
+
+    test "a three-argument policy sees the resources and may answer invalid_target" do
+      test_pid = self()
+
+      put_config(
+        authorize_scope: fn _client, requested, resources ->
+          send(test_pid, {:scope_policy, requested, resources})
+          {:error, :invalid_target}
+        end
+      )
+
+      conn = call(valid_params(%{"resource" => "https://issuer.example.com"}))
+
+      assert %{"error" => "invalid_target", "state" => "xyz"} = location_query(conn)
+      assert_received {:scope_policy, ["openid", "profile"], ["https://issuer.example.com"]}
+    end
+
+    test "a narrowed scope is what consent sees and what the code is bound to" do
+      put_config(authorize_scope: fn _client, requested -> {:ok, requested -- ["profile"]} end)
+
+      conn = call(valid_params())
+      code = location_query(conn)["code"]
+
+      assert TestStore.peek(code).data.scope == ["openid"]
+    end
+
+    test "a policy that adds a scope is refused" do
+      put_config(authorize_scope: fn _client, requested -> {:ok, requested ++ ["admin"]} end)
+
+      conn = call(valid_params())
+      assert %{"error" => "invalid_scope"} = location_query(conn)
+    end
+  end
+
   describe "prompt=none (no interactive UI)" do
     test "the host is told the request is non-interactive" do
       call(valid_params(%{"prompt" => "none"}))
@@ -1824,8 +2265,58 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn = call(valid_params(%{"max_age" => "0"}))
       code = location_query(conn)["code"]
 
+      assert_received {:reauth_auth_time, reauth_auth_time}
       record = TestStore.peek(code)
-      assert record.data.claims["auth_time"] == 1_700_009_999
+      assert record.data.claims["auth_time"] == reauth_auth_time
+    end
+
+    test "an interactive request whose host returns a stale authentication is a server_error" do
+      # The host ignores `auth_opts.max_age` and returns its existing, years-old
+      # authentication. The client cannot fix that, so it is not login_required.
+      put_config(authenticate_resource_owner: &__MODULE__.authenticate_stale/3)
+
+      conn = call(valid_params(%{"max_age" => "300"}))
+
+      assert location_query(conn)["error"] == "server_error"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "prompt=none with an authentication older than max_age is login_required" do
+      put_config(authenticate_resource_owner: &__MODULE__.authenticate_stale/3)
+
+      conn = call(valid_params(%{"max_age" => "300", "prompt" => "none"}))
+
+      assert location_query(conn)["error"] == "login_required"
+      refute Map.has_key?(location_query(conn), "code")
+    end
+
+    test "prompt=none applies max_age exactly, without the re-authentication allowance" do
+      put_config(authenticate_resource_owner: &__MODULE__.authenticate_aged_30s/3)
+
+      # Interactive: a 30-second-old authentication satisfies max_age=0 within
+      # the allowance for the hop back from the host's login.
+      assert is_binary(location_query(call(valid_params(%{"max_age" => "0"})))["code"])
+
+      # prompt=none: no re-authentication can have happened, so it is too old.
+      conn = call(valid_params(%{"max_age" => "0", "prompt" => "none"}))
+      assert location_query(conn)["error"] == "login_required"
+    end
+
+    test "max_age without an auth_time from the host is a server_error under either prompt" do
+      put_config(authenticate_resource_owner: &__MODULE__.authenticate_without_auth_time/3)
+
+      for extra <- [%{}, %{"prompt" => "none"}] do
+        conn = call(valid_params(Map.merge(%{"max_age" => "300"}, extra)))
+
+        assert location_query(conn)["error"] == "server_error"
+        refute Map.has_key?(location_query(conn), "code")
+      end
+    end
+
+    test "a host that returns no auth_time still issues a code when max_age is absent" do
+      put_config(authenticate_resource_owner: &__MODULE__.authenticate_without_auth_time/3)
+
+      assert is_binary(location_query(call(valid_params()))["code"])
     end
   end
 
@@ -1908,10 +2399,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert is_binary(fresh.value)
       refute fresh.value == opbs
 
+      assert_received {:reauth_auth_time, reauth_auth_time}
+
       assert Attesto.SessionState.browser_state_valid?(
                @browser_state_secret,
                fresh.value,
-               @reauth_binding
+               "user-42\n#{reauth_auth_time}\n"
              )
 
       # The RP that earlier held a session_state over the OLD value now
@@ -2469,10 +2962,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     send(self(), {:auth_opts, auth_opts})
 
     auth_time =
-      if auth_opts.force_reauth or max_age_violated?(auth_opts.max_age) do
-        @reauth_auth_time
-      else
-        @established_auth_time
+      cond do
+        # A `max_age` re-authentication happens now: the controller checks the
+        # returned auth_time against `max_age` on the live clock.
+        max_age_violated?(auth_opts.max_age) ->
+          now = System.system_time(:second)
+          send(self(), {:reauth_auth_time, now})
+          now
+
+        auth_opts.force_reauth ->
+          @reauth_auth_time
+
+        true ->
+          @established_auth_time
       end
 
     {:authenticated,
@@ -2484,11 +2986,38 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
      }}
   end
 
-  # The existing authentication is at @established_auth_time; treat a max_age of
-  # 0 (or any value the fixed clock in this stub would exceed) as requiring a
-  # re-auth. The tests only need the "max_age=0 forces re-auth" case.
+  # The existing authentication is at @established_auth_time; a `max_age` it is
+  # older than requires a re-auth (OIDC Core §3.1.2.1).
   defp max_age_violated?(nil), do: false
-  defp max_age_violated?(max_age) when is_integer(max_age), do: max_age == 0
+
+  defp max_age_violated?(max_age) when is_integer(max_age),
+    do: System.system_time(:second) - @established_auth_time > max_age
+
+  # A host that ignores `auth_opts.max_age` and returns its old authentication.
+  def authenticate_stale(_conn, _request, _auth_opts),
+    do: {:authenticated, %{subject: "user-42", auth_time: @established_auth_time}}
+
+  def authenticate_aged_30s(_conn, _request, _auth_opts),
+    do: {:authenticated, %{subject: "user-42", auth_time: System.system_time(:second) - 30}}
+
+  def authenticate_without_auth_time(_conn, _request, _auth_opts), do: {:authenticated, %{subject: "user-42"}}
+
+  # A host that parks the request and shows its login page, then authenticates
+  # on the resume.
+  def park_or_authenticate(conn, request, auth_opts) do
+    send(self(), {:auth_opts, auth_opts})
+
+    if auth_opts.resumed do
+      auth_time = Process.get(:resume_auth_time, System.system_time(:second))
+      {:authenticated, %{subject: "user-42", auth_time: auth_time}}
+    else
+      {:ok, resume_id} = AttestoPhoenix.Interaction.park(conn, request)
+      send(self(), {:parked, resume_id})
+      {:halt, Plug.Conn.send_resp(conn, 200, "login")}
+    end
+  end
+
+  def browser_binding(conn), do: conn |> Plug.Conn.get_req_header("x-browser") |> List.first()
 
   def consent(_conn, _request, subject), do: {:consented, subject}
 end

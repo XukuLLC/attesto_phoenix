@@ -174,7 +174,8 @@ defmodule AttestoPhoenix.EventTest do
                  :refresh_reuse_detected,
                  :auth_succeeded,
                  :auth_denied,
-                 :client_registered
+                 :client_registered,
+                 :client_updated
                ])
     end
   end
