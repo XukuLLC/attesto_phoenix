@@ -6,6 +6,28 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.9.0] - 2026-11-12
+
+Requires `attesto >= 2.16.0 and < 3.0.0`.
+
+### Added
+
+- Verifier issuer trust anchors for SD-JWT VC and mdoc presentations, with
+  an optional host certificate policy and HAIP checks enabled by default.
+  Core validates certificate paths (RFC 5280 §6), binds SD-JWT VC leaves to
+  `iss` using its SAN policy (SD-JWT VC draft-08 §3.5), and validates mdoc
+  issuerAuth chains for the document-signer purpose (ISO 18013-5
+  §§9.1.2.4, 9.3.1). The default HAIP mode refuses self-signed leaves and
+  embedded trust anchors (HAIP 1.0 §6.1.1 specifies these restrictions for
+  SD-JWT VC; ISO 18013-5 Annex B.1.1 excludes the mdoc trust anchor).
+  Anchors and issuer keys or resolvers are mutually exclusive; certificate
+  failures never fall back to issuer keys.
+
+### Changed
+
+- Require `attesto >= 2.16.0 and < 3.0.0`; update the minimum-consumer
+  dependency and CI core revision to 2.16.0.
+
 ## [4.8.0] - 2026-11-12
 
 Requires `attesto >= 2.14.0`.

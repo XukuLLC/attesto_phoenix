@@ -2577,6 +2577,91 @@ defmodule AttestoPhoenix.ConfigTest do
   end
 
   describe "OID4VP verifier configuration" do
+    test "issuer certificate settings are optional and HAIP defaults to true" do
+      built = config()
+      assert Config.verifier_trusted_certificates(built) == nil
+      assert Config.verifier_certificate_trust(built) == nil
+      assert Config.verifier_issuer_trust(built) == nil
+      assert Config.verifier_haip(built)
+    end
+
+    test "accepts DER anchors and each certificate callback form at boot" do
+      der = AttestoPhoenix.X509TestCertificate.der()
+
+      for callback <- [nil, fn _chain -> :ok end, {Function, :identity}, {List, :wrap, []}] do
+        built =
+          config(
+            verifier_trusted_certificates: [der],
+            verifier_certificate_trust: callback,
+            verifier_haip: false
+          )
+
+        assert Config.verifier_trusted_certificates(built) == [der]
+        assert Config.verifier_certificate_trust(built) == callback
+        refute Config.verifier_haip(built)
+      end
+    end
+
+    test "rejects empty, malformed, non-DER, PEM, and improper anchor lists at boot" do
+      der = AttestoPhoenix.X509TestCertificate.der()
+      pem = :public_key.pem_encode([{:Certificate, der, :not_encrypted}])
+
+      for invalid <- [[], der, :invalid, [nil], [123], [""], [<<1, 2, 3>>], [pem], [der, nil], [der | :invalid]] do
+        assert_raise ArgumentError,
+                     ~r/:verifier_trusted_certificates must be a non-empty list of DER certificates/,
+                     fn ->
+                       config(verifier_trusted_certificates: invalid)
+                     end
+      end
+    end
+
+    test "rejects anchors combined with issuer keys or resolvers at boot" do
+      der = AttestoPhoenix.X509TestCertificate.der()
+      resolver = fn _issuer -> flunk("boot must not invoke the resolver") end
+
+      for trust <- [{:issuer_jwks, %{"keys" => []}}, {:issuer_jwks, []}, {:resolve_issuer, resolver}] do
+        assert_raise ArgumentError,
+                     ~r/:verifier_trusted_certificates and :verifier_issuer_trust are mutually exclusive/,
+                     fn ->
+                       config(verifier_trusted_certificates: [der], verifier_issuer_trust: trust)
+                     end
+      end
+    end
+
+    test "rejects malformed certificate policies at boot" do
+      callbacks = [true, :callback, fn -> :ok end, fn _, _ -> :ok end, {Function, :missing}, {List, :wrap, [:extra]}]
+
+      for invalid <- callbacks do
+        assert_raise ArgumentError, ~r/:verifier_certificate_trust must be a one-argument callback/, fn ->
+          config(verifier_certificate_trust: invalid)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:verifier_certificate_trust callback module cannot be loaded/, fn ->
+        config(verifier_certificate_trust: {MissingCertificatePolicy, :allow})
+      end
+    end
+
+    test "rejects non-boolean HAIP configuration at boot" do
+      for invalid <- [nil, "true", "false", 0, 1, :enabled] do
+        assert_raise ArgumentError, ~r/:verifier_haip must be a boolean/, fn ->
+          config(verifier_haip: invalid)
+        end
+      end
+    end
+
+    test "validates the optional issuer-key or resolver default at boot" do
+      for trust <- [{:issuer_jwks, %{}}, {:issuer_jwks, []}, {:resolve_issuer, {Function, :identity}}] do
+        assert Config.verifier_issuer_trust(config(verifier_issuer_trust: trust)) == trust
+      end
+
+      for invalid <- [[], %{}, {:issuer_jwks, nil}, {:resolve_issuer, nil}, {:resolve_issuer, fn -> :ok end}] do
+        assert_raise ArgumentError, ~r/:verifier_issuer_trust must be/, fn ->
+          config(verifier_issuer_trust: invalid)
+        end
+      end
+    end
+
     test "exposes verifier identity settings and convention-derived URLs" do
       certificate_der = <<1, 2, 3>>
 

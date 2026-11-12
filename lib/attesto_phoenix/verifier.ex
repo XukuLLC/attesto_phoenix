@@ -25,7 +25,7 @@ defmodule AttestoPhoenix.Verifier do
     VpToken
   }
 
-  alias AttestoPhoenix.Config
+  alias AttestoPhoenix.{Callback, Config}
 
   defmodule PresentationResponse do
     @moduledoc """
@@ -124,7 +124,7 @@ defmodule AttestoPhoenix.Verifier do
   @type create_attrs :: %{
           required(:dcql_query) => map(),
           required(:expected_query_ids) => [String.t()],
-          required(:issuer_trust) => PresentationSession.issuer_trust(),
+          optional(:issuer_trust) => PresentationSession.issuer_trust(),
           optional(:response_mode) => String.t(),
           optional(:client_id_scheme) => String.t()
         }
@@ -141,20 +141,43 @@ defmodule AttestoPhoenix.Verifier do
 
   The returned `id` is the OID4VP `state`; the absolute `request_uri` serves
   the request object from the convention-derived verifier endpoint.
+
+  With `:verifier_trusted_certificates`, omit `:issuer_trust`: every session
+  uses the configured anchors and a per-request override is refused. Otherwise
+  `:issuer_trust` retains its existing meaning, with `:verifier_issuer_trust`
+  providing an optional default.
   """
   @spec create_presentation_request(Config.t(), create_attrs()) ::
           {:ok, create_result()} | {:error, term()}
   def create_presentation_request(
         %Config{} = config,
-        %{dcql_query: dcql_query, expected_query_ids: expected_query_ids, issuer_trust: issuer_trust} = attrs
+        %{dcql_query: dcql_query, expected_query_ids: expected_query_ids} = attrs
       )
       when is_map(dcql_query) do
     Config.with_request_config(config, fn ->
-      do_create_presentation_request(config, attrs, dcql_query, expected_query_ids, issuer_trust)
+      with {:ok, issuer_trust} <- issuer_trust(config, attrs) do
+        do_create_presentation_request(config, attrs, dcql_query, expected_query_ids, issuer_trust)
+      end
     end)
   end
 
   def create_presentation_request(%Config{}, _attrs), do: {:error, :invalid_attrs}
+
+  defp issuer_trust(config, attrs) do
+    case {Config.verifier_trusted_certificates(config), Map.fetch(attrs, :issuer_trust)} do
+      {nil, {:ok, trust}} -> {:ok, trust}
+      {nil, :error} -> default_issuer_trust(Config.verifier_issuer_trust(config))
+      {anchors, :error} -> {:ok, {:trusted_certificates, anchors}}
+      {_anchors, {:ok, _trust}} -> {:error, :conflicting_issuer_trust}
+    end
+  end
+
+  defp default_issuer_trust(nil), do: {:error, :invalid_attrs}
+
+  defp default_issuer_trust({:resolve_issuer, callback}),
+    do: {:ok, {:resolve_issuer, fn issuer -> Callback.invoke(callback, [issuer]) end}}
+
+  defp default_issuer_trust(trust), do: {:ok, trust}
 
   defp do_create_presentation_request(config, attrs, dcql_query, expected_query_ids, issuer_trust) do
     response_mode = Map.get(attrs, :response_mode) || Config.presentation_response_mode(config)
@@ -215,7 +238,7 @@ defmodule AttestoPhoenix.Verifier do
     with {:ok, store} <- response_session_store(config),
          {:ok, state, vp_token} <- resolve_presentation_response(response, config, store),
          {:ok, _request_object} <- PresentationSession.request_object(store, state),
-         {:ok, _results} <- verify_presentation_response(store, state, vp_token),
+         {:ok, _results} <- verify_presentation_response(config, store, state, vp_token),
          {:ok, response_code} <- issue_presentation_response_code(config, state) do
       # OID4VP §8.2 permits, and HAIP §5.1 requires, a `redirect_uri` carrying a
       # `response_code` so the wallet returns the user to the verifier front-end,
@@ -721,12 +744,20 @@ defmodule AttestoPhoenix.Verifier do
 
   defp decode_vp_token(_vp_token), do: {:error, :malformed}
 
-  defp verify_presentation_response(store, state, vp_token) do
+  defp verify_presentation_response(config, store, state, vp_token) do
+    options = [now: System.system_time(:second), haip: Config.verifier_haip(config)]
+
+    options =
+      case Config.verifier_certificate_trust(config) do
+        nil -> options
+        callback -> Keyword.put(options, :certificate_trust, fn chain -> Callback.invoke(callback, [chain]) end)
+      end
+
     PresentationSession.verify_response(
       store,
       {:state, state},
       vp_token,
-      now: System.system_time(:second)
+      options
     )
   rescue
     ArgumentError -> {:error, :malformed}

@@ -149,10 +149,12 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.8"}
+    {:attesto_phoenix, "~> 4.9"}
   ]
 end
 ```
+
+Requires `attesto >= 2.16.0 and < 3.0.0`.
 
 The optional Igniter installer needs `igniter` available while you run it. It is
 not a runtime dependency of this package:
@@ -160,7 +162,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.8"},
+    {:attesto_phoenix, "~> 4.9"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -1576,6 +1578,49 @@ derive their `alg` from its configured key. Encrypted `direct_post.jwt`
 responses additionally require a dedicated EC P-256
 `:verifier_encryption_keystore`; there is deliberately no fallback to the main
 signing key.
+
+To trust credential issuers through X.509, add these options to the host's
+`AttestoPhoenix.Config`:
+
+```elixir
+verifier_trusted_certificates: [File.read!("priv/issuer-root.der")],
+verifier_certificate_trust: {MyApp.IssuerPolicy, :allow_chain}, # optional
+verifier_haip: true # default
+```
+
+`:verifier_trusted_certificates` is a non-empty list of DER certificates;
+PEM is not accepted, matching `:verifier_x5c`. Malformed anchors, callbacks,
+and non-boolean HAIP values are rejected at boot. The optional policy accepts
+one argument, the validated leaf-first DER chain, and returns `:ok` or
+`{:error, reason}`. Functions, `{module, function}`, and
+`{module, function, extra_args}` are supported. The policy is passed at
+verification time and is never stored in a presentation session.
+
+With anchors configured, omit `:issuer_trust` when calling
+`Verifier.create_presentation_request/2`. The session stores
+`{:trusted_certificates, anchors}`. Core 2.16.0 validates SD-JWT VC `x5c`
+chains and binds the leaf to `iss` using its SAN policy; mdoc issuerAuth
+`x5chain` is validated with purpose `:mdoc_issuer`. The policy can further
+restrict a valid chain but cannot make an invalid chain trusted. Certificate
+failures return the existing uniform `invalid_request` response, leave the
+session pending, and never retry with issuer keys.
+
+`:verifier_haip` is forwarded as `:haip` and defaults to `true`: self-signed
+leaves and chains containing the trust anchor are refused (HAIP 1.0 §6.1.1).
+Setting it to `false` retains path validation (RFC 5280 §6), issuer binding,
+and the host policy.
+
+Without anchors, existing per-request `:issuer_trust` continues to accept
+`{:issuer_jwks, keys}` or `{:resolve_issuer, callback}`. Hosts may also set
+`:verifier_issuer_trust` as a default using either tuple; configured resolvers
+support the same callback forms as the certificate policy. Setting that
+default together with anchors is rejected at boot. Supplying per-request
+issuer trust when anchors are configured returns
+`{:error, :conflicting_issuer_trust}` before creating a session.
+
+The verifier's own `:verifier_x5c` chain identifies the **request signer** to
+the wallet. It is separate from **issuer trust anchors** and does not grant
+trust to credentials signed by that certificate or its issuer.
 
 **`status_list: true`** mounts `GET /oauth/statuslist/:id`, serving a signed
 `statuslist+jwt` built from the `:status_list_store` — the revocation target

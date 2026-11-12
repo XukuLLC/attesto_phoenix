@@ -1140,7 +1140,26 @@ defmodule AttestoPhoenix.Config do
       `:verifier_client_id`; `"x509_san_dns"` derives the identifier from
       `:verifier_dns`.
     * `:verifier_x5c` - verifier certificate chain as DER binaries, leaf first.
-      Required when `:verifier_client_id_scheme` is `"x509_san_dns"`.
+      Required when `:verifier_client_id_scheme` is `"x509_san_dns"`. Identifies
+      the request signer; it does not establish trust in credential issuers.
+    * `:verifier_trusted_certificates` - non-empty list of DER issuer trust
+      anchors, or `nil` (default). PEM is not accepted, matching `:verifier_x5c`.
+      Sessions use `{:trusted_certificates, anchors}` exclusively. Cannot be
+      combined with `:verifier_issuer_trust` or per-request `:issuer_trust`.
+      Core validates SD-JWT VC `x5c` and mdoc issuerAuth `x5chain` paths.
+    * `:verifier_certificate_trust` - optional one-argument host callback
+      receiving the validated leaf-first DER chain. Return `:ok` to allow it
+      or `{:error, reason}` to refuse it. Accepts a function, `{module, function}`,
+      or `{module, function, extra_args}`. Forwarded as `:certificate_trust`;
+      never persisted in the session and cannot override core validation.
+    * `:verifier_haip` - boolean, default `true`, forwarded as `:haip` for
+      certificate verification. HAIP forbids self-signed leaves and chains
+      containing a trust anchor. `false` retains certificate path validation.
+    * `:verifier_issuer_trust` - optional default for the existing per-request
+      `:issuer_trust`: `{:issuer_jwks, keys}` or `{:resolve_issuer, callback}`.
+      Resolver callbacks accept the same forms as `:verifier_certificate_trust`.
+      Mutually exclusive with `:verifier_trusted_certificates` at boot. When
+      both settings are absent, the host must supply per-request issuer trust.
     * `:verifier_dns` - dNSName advertised by the verifier. Required when
       `:verifier_client_id_scheme` is `"x509_san_dns"`.
     * `:presentation_response_mode` - OID4VP response mode advertised to wallets.
@@ -1394,6 +1413,9 @@ defmodule AttestoPhoenix.Config do
     :verifier_client_id,
     :verifier_client_id_scheme,
     :verifier_x5c,
+    :verifier_trusted_certificates,
+    :verifier_certificate_trust,
+    :verifier_issuer_trust,
     :verifier_dns,
     :credential_configurations_supported,
     :federation_authority_hints,
@@ -1466,6 +1488,7 @@ defmodule AttestoPhoenix.Config do
     logout: [],
     session_management: [],
     presentation_response_mode: "direct_post",
+    verifier_haip: true,
     basic_realm: "OAuth"
   ]
 
@@ -1627,6 +1650,10 @@ defmodule AttestoPhoenix.Config do
           verifier_client_id: String.t() | nil,
           verifier_client_id_scheme: String.t() | nil,
           verifier_x5c: [binary()] | nil,
+          verifier_trusted_certificates: [binary()] | nil,
+          verifier_certificate_trust: callback() | nil,
+          verifier_issuer_trust: {:issuer_jwks, map() | list()} | {:resolve_issuer, callback()} | nil,
+          verifier_haip: boolean(),
           verifier_dns: String.t() | nil,
           presentation_response_mode: String.t(),
           credential_configurations_supported: map() | nil,
@@ -2553,6 +2580,22 @@ defmodule AttestoPhoenix.Config do
   @doc "The verifier certificate chain as DER binaries, leaf first."
   @spec verifier_x5c(t()) :: [binary()] | nil
   def verifier_x5c(%__MODULE__{verifier_x5c: x5c}), do: x5c
+
+  @doc "The issuer trust anchors as DER certificates, or `nil` for key-based trust."
+  @spec verifier_trusted_certificates(t()) :: [binary()] | nil
+  def verifier_trusted_certificates(%__MODULE__{verifier_trusted_certificates: anchors}), do: anchors
+
+  @doc "The optional host policy applied after core certificate validation."
+  @spec verifier_certificate_trust(t()) :: callback() | nil
+  def verifier_certificate_trust(%__MODULE__{verifier_certificate_trust: callback}), do: callback
+
+  @doc "Whether to enforce HAIP certificate restrictions (default `true`)."
+  @spec verifier_haip(t()) :: boolean()
+  def verifier_haip(%__MODULE__{verifier_haip: haip}), do: haip
+
+  @doc "The default issuer keys or resolver used when no per-request trust is supplied."
+  @spec verifier_issuer_trust(t()) :: {:issuer_jwks, map() | list()} | {:resolve_issuer, callback()} | nil
+  def verifier_issuer_trust(%__MODULE__{verifier_issuer_trust: trust}), do: trust
 
   @doc "The dNSName advertised by an `x509_san_dns` verifier."
   @spec verifier_dns(t()) :: String.t() | nil
@@ -3676,6 +3719,7 @@ defmodule AttestoPhoenix.Config do
     cert_der: 1,
     forwarded_cert_der: 1,
     client_certificate_chain_validated?: 2,
+    verifier_certificate_trust: 1,
     introspection_authorize: 2,
     build_credential: 3,
     build_deferred_credential: 2,
@@ -4661,6 +4705,7 @@ defmodule AttestoPhoenix.Config do
     validate_verifier_client_id!(config.verifier_client_id)
     validate_verifier_client_id_scheme!(config.verifier_client_id_scheme)
     validate_verifier_x5c!(Callback.config_callback(config, :verifier_x5c))
+    validate_verifier_trust!(config)
     validate_verifier_dns!(config.verifier_dns)
     validate_presentation_response_mode!(config.presentation_response_mode)
     validate_mtls_endpoint_aliases!(config.mtls_endpoint_aliases)
@@ -6113,6 +6158,56 @@ defmodule AttestoPhoenix.Config do
     raise ArgumentError,
           "AttestoPhoenix.Config: :verifier_x5c must be a list of non-empty DER binaries; " <>
             "got #{inspect(x5c)}"
+  end
+
+  defp validate_verifier_trust!(config) do
+    anchors = Callback.config_callback(config, :verifier_trusted_certificates)
+    trust = Callback.config_callback(config, :verifier_issuer_trust)
+
+    if not is_nil(anchors) and not is_nil(trust) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :verifier_trusted_certificates and :verifier_issuer_trust are mutually exclusive"
+    end
+
+    validate_verifier_anchors!(anchors)
+    validate_verifier_issuer_trust!(trust)
+
+    if not is_boolean(Callback.config_callback(config, :verifier_haip)) do
+      raise ArgumentError, "AttestoPhoenix.Config: :verifier_haip must be a boolean"
+    end
+  end
+
+  defp validate_verifier_anchors!(nil), do: :ok
+
+  defp validate_verifier_anchors!(anchors) do
+    if anchors == [] or not der_certificates?(anchors) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :verifier_trusted_certificates must be a non-empty list of DER certificates"
+    end
+  end
+
+  # Decode configuration at boot, without deciding certificate trust here.
+  # Path, validity, issuer binding, and purpose checks belong to Attesto.X509.
+  defp der_certificates?([]), do: true
+
+  defp der_certificates?([der | rest]) when is_binary(der) and byte_size(der) > 0 do
+    _certificate = :public_key.pkix_decode_cert(der, :plain)
+    der_certificates?(rest)
+  rescue
+    _error -> false
+  end
+
+  defp der_certificates?(_certificates), do: false
+
+  defp validate_verifier_issuer_trust!(nil), do: :ok
+  defp validate_verifier_issuer_trust!({:issuer_jwks, keys}) when is_map(keys) or is_list(keys), do: :ok
+
+  defp validate_verifier_issuer_trust!({:resolve_issuer, callback}) when not is_nil(callback),
+    do: validate_configured_callback!(:verifier_issuer_trust, callback, 1)
+
+  defp validate_verifier_issuer_trust!(_trust) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :verifier_issuer_trust must be {:issuer_jwks, keys} or {:resolve_issuer, callback}"
   end
 
   defp validate_verifier_dns!(dns) when is_binary(dns) or is_nil(dns), do: :ok
