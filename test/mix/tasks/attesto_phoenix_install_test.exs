@@ -1680,6 +1680,32 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       end
     end
 
+    test "installs into a host whose runtime config sets an ordinary atom-keyed setting conditionally" do
+      # What `mix phx.new` generates in config/runtime.exs.
+      runtime = """
+      import Config
+
+      if config_env() == :prod do
+        config :test, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
+      end
+      """
+
+      for options <- [[], ["--schema-prefix", "tenant_auth"]] do
+        igniter =
+          test_project(
+            files: %{
+              "mix.exs" => @mix_fixture,
+              @router_path => @router_fixture,
+              @application_path => @application_fixture,
+              @runtime_config_path => runtime
+            }
+          )
+
+        installed = Igniter.compose_task(igniter, @task, options)
+        assert Igniter.exists?(installed, @client_store_path)
+      end
+    end
+
     test "fails closed for conditional OAuth config in every config source" do
       fixtures = [
         {@conditional_if_oauth_path_prefix_config_fixture, @config_path},

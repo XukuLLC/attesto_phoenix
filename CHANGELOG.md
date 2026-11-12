@@ -6,6 +6,22 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.7.1] - 2026-11-11
+
+### Fixed
+
+- `mix attesto_phoenix.install` no longer refuses a freshly generated Phoenix
+  application. `mix phx.new` writes
+  `config :my_app, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")`
+  inside `if config_env() == :prod` in `config/runtime.exs`, and the installer
+  stopped with "could not determine configured :schema_prefix expression
+  nested config expression ...". The check that looks for conditional
+  `AttestoPhoenix.Config` settings treated every nested `config` call with a
+  literal atom key as possibly being that configuration. A literal atom key
+  names an ordinary application setting and is no longer treated as
+  ambiguous. Conditional `AttestoPhoenix.Config` settings, and keys the
+  installer cannot resolve (variables, unknown aliases), are still refused.
+
 ## [4.7.0] - 2026-11-11
 
 Requires `attesto >= 2.13.0`.

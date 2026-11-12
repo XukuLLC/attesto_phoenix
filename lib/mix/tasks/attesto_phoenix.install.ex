@@ -1510,6 +1510,14 @@ if Code.ensure_loaded?(Igniter) do
 
     defp ambiguous_config_module_ast?({:__aliases__, _meta, _parts}, _aliases), do: false
 
+    # A literal atom key (`config :my_app, :dns_cluster_query, ...`) names an
+    # ordinary application setting. It cannot be `AttestoPhoenix.Config`, which
+    # a config file can only spell as an alias. A freshly generated Phoenix
+    # application has such a call inside `if config_env() == :prod`, and
+    # treating it as ambiguous made the installer refuse every new host.
+    defp ambiguous_config_module_ast?(key, _aliases) when is_atom(key), do: false
+    defp ambiguous_config_module_ast?({:__block__, _meta, [key]}, _aliases) when is_atom(key), do: false
+
     defp ambiguous_config_module_ast?(_module, _aliases), do: true
 
     defp ambiguous_schema_prefix_options?(opts) when is_list(opts) do
