@@ -6,7 +6,7 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
-## [Unreleased]
+## [4.7.0] - 2026-11-11
 
 Requires `attesto >= 2.13.0`.
 
