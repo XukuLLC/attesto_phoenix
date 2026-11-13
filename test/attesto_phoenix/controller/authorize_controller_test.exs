@@ -1788,6 +1788,57 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert log =~ "consent callback returned an invalid result"
       refute log =~ "authorize-consent-private-sentinel"
     end
+
+    test "a host failure from either callback is that RFC 6749 §4.1.2.1 code by redirect" do
+      for reason <- [:server_error, :temporarily_unavailable], prompt <- [%{}, %{"prompt" => "none"}] do
+        put_config(
+          authenticate_resource_owner: fn _conn, _request, _opts -> {:error, reason} end,
+          consent: fn _conn, _request, subject -> {:consented, subject} end
+        )
+
+        log = capture_log(fn -> assert_host_failure(call(valid_params(prompt)), reason) end)
+        refute log =~ "returned an invalid result"
+
+        put_config(
+          authenticate_resource_owner: fn _conn, _request, _opts -> {:authenticated, %{subject: "user-42"}} end,
+          consent: fn _conn, _request, _subject -> {:error, reason} end
+        )
+
+        log = capture_log(fn -> assert_host_failure(call(valid_params(prompt)), reason) end)
+        refute log =~ "returned an invalid result"
+      end
+    end
+
+    test "a callback may answer temporarily_unavailable when parking fails" do
+      put_config(
+        par_store: __MODULE__.UnavailableParkStore,
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        authenticate_resource_owner: fn conn, request, _opts ->
+          case Interaction.park(conn, request) do
+            {:ok, _resume_id} -> flunk("the store refused the request")
+            {:error, :unavailable} -> {:error, :temporarily_unavailable}
+          end
+        end
+      )
+
+      conn =
+        :get
+        |> Plug.Test.conn("/oauth/authorize?" <> URI.encode_query(valid_params()))
+        |> Map.put(:scheme, :https)
+        |> put_req_header("x-browser", "browser-1")
+        |> with_config()
+        |> AuthorizeController.authorize(valid_params())
+
+      assert_host_failure(conn, :temporarily_unavailable)
+    end
+
+    defp assert_host_failure(conn, reason) do
+      assert conn.status == 302
+      query = location_query(conn)
+      assert query["error"] == Atom.to_string(reason)
+      refute Map.has_key?(query, "code")
+      refute Map.has_key?(query, "error_description")
+    end
   end
 
   # ── nonce policy (OIDC Core §3.1.2.1) ──────────────────────────────────────
@@ -3647,6 +3698,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   def browser_binding(conn), do: conn |> Plug.Conn.get_req_header("x-browser") |> List.first()
+
+  defmodule UnavailableParkStore do
+    @moduledoc false
+    def put(_key, _entry, _ttl), do: {:error, :unavailable}
+    def take(_key), do: :error
+    def fetch(_key), do: :error
+  end
 
   def park_consent_once(conn, request, subject) do
     send(self(), {:consent_params, Interaction.request_params(conn)})

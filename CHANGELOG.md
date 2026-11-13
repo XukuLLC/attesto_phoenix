@@ -6,7 +6,19 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
-## [4.12.1] - 2026-11-13
+## [4.13.0] - 2026-11-13
+
+### Added
+
+- `:authenticate_resource_owner` and `:consent` may return
+  `{:error, :server_error}` or `{:error, :temporarily_unavailable}` when the
+  host itself fails, for example when `AttestoPhoenix.Interaction.park/2`
+  cannot store the request. The client receives that RFC 6749 §4.1.2.1 code
+  by redirect, under `prompt=none` too; no host text is sent. Before, a host
+  could reach `server_error` only by returning an invalid result, which was
+  logged as a contract violation, and could not answer
+  `temporarily_unavailable` at all. The `Interaction` and `ConsentGrant`
+  examples now handle a failed park this way.
 
 ### Security
 
@@ -24,7 +36,7 @@ defaults in a minor release.
 
 ### Upgrading
 
-- Requests parked by 4.12.0 or earlier are stored under the old key and
+- Requests parked by 4.12.x or earlier are stored under the old key and
   cannot be resumed after the upgrade. A browser mid-sign-in at deploy time
   gets the invalid-resume error page and starts the authorization again. Old
   entries expire after `:interaction_ttl` (default 600 seconds).

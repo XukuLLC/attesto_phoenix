@@ -40,13 +40,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
     * `:authenticate_resource_owner` - `(conn, request, auth_opts ->
       {:authenticated, subject} | {:halt, conn} | {:none} | {:error,
-      :login_required | :consent_required | :interaction_required})`. Returns
+      :login_required | :consent_required | :interaction_required |
+      :server_error | :temporarily_unavailable})`. Returns
       `{:authenticated, subject}` once a resource owner is established for this
       request, `{:halt, conn}` to take over the connection (e.g. redirect to a
       login page that, after login, re-enters this endpoint with the same
       authorization parameters), `{:none}` when no subject can be established
-      without UI, or an `{:error, _}` to explicitly classify why interaction is
-      required (OIDC Core §3.1.2.6). The `subject` is a map carrying at least
+      without UI, an `{:error, _}` to explicitly classify why interaction is
+      required (OIDC Core §3.1.2.6), or `{:error, :server_error}` /
+      `{:error, :temporarily_unavailable}` when the host itself failed, for
+      example when `AttestoPhoenix.Interaction.park/2` could not store the
+      request (RFC 6749 §4.1.2.1). The `subject` is a map carrying at least
       `:subject` (the subject identifier, OIDC Core §2 `sub`) and optionally
       `:auth_time`, `:acr`, and `:amr` (OIDC Core §2), plus `:sid` (the host's
       session id, OIDC Back-Channel Logout 1.0 §2.1 — supply it to make the
@@ -80,12 +84,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       (OIDC Core §3.1.2.6).
 
     * `:consent` - `(conn, request, subject -> {:consented, subject} |
-      {:halt, conn} | {:denied, reason})`. Returns `{:consented, subject}` once
+      {:halt, conn} | {:denied, reason} | {:error, :server_error |
+      :temporarily_unavailable})`. Returns `{:consented, subject}` once
       the resource owner has authorized the request (the returned `subject` may
       carry consent-derived claims), `{:halt, conn}` to take over the
-      connection (e.g. render a consent screen that re-enters this endpoint), or
+      connection (e.g. render a consent screen that re-enters this endpoint),
       `{:denied, _reason}` to refuse, which is reported back to the client as
-      the RFC 6749 §4.1.2.1 `access_denied` error by redirect. When the host
+      the RFC 6749 §4.1.2.1 `access_denied` error by redirect, or
+      `{:error, :server_error}` / `{:error, :temporarily_unavailable}` when the
+      host itself failed, reported by redirect with that code. When the host
       does not supply `:consent`, consent is treated as implicitly granted only
       for a client the host explicitly classifies as confidential. Public
       clients require an explicit consent callback before a code can be issued.
@@ -144,6 +151,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # RFC 6749 §4.1.2.1 error codes reported by redirect.
   @error_access_denied "access_denied"
   @error_server_error "server_error"
+  @host_failures [:server_error, :temporarily_unavailable]
 
   # RFC 8707 §2 / RFC 6749 §5.2: a requested `resource` the server does not serve.
   @error_invalid_target "invalid_target"
@@ -634,6 +642,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         emit_failure(conn, config, error_code)
         emit_error(conn, config, request, error_code)
 
+      {:error, reason} when reason in @host_failures ->
+        emit_host_failure(conn, config, request, reason)
+
       _other ->
         # A callback that returns no known shape is a host/config fault, not a
         # client error. Fail closed with the §4.1.2.1 server_error rather than
@@ -732,6 +743,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp interaction_error_code(:consent_required), do: @error_consent_required
   defp interaction_error_code(:interaction_required), do: @error_interaction_required
 
+  # RFC 6749 §4.1.2.1: the host's login or consent step failed on its side (a
+  # store outage while parking, for instance). The redirect_uri is already
+  # trusted, so the client gets the named code by redirect; no host text is
+  # sent.
+  defp emit_host_failure(conn, config, request, reason) when reason in @host_failures do
+    error_code = Atom.to_string(reason)
+    emit_failure(conn, config, error_code)
+    emit_error(conn, config, request, error_code)
+  end
+
   defp run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt) do
     case consent(conn, config, client, request, subject) do
       {:consented, subject} ->
@@ -758,6 +779,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
         error_code = if prompt_none?, do: @error_consent_required, else: @error_access_denied
         emit_error(conn, config, request, error_code)
+
+      {:error, reason} when reason in @host_failures ->
+        emit_host_failure(conn, config, request, reason)
 
       reason when reason in [:consent_prompt_unavailable, :missing_public_client_consent] ->
         run_without_consent_callback(conn, config, request, reason, prompt_none?)

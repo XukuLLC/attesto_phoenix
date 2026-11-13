@@ -16,10 +16,17 @@ defmodule AttestoPhoenix.Interaction do
             {:authenticated, subject}
 
           :login_needed ->
-            {:ok, resume_id} = AttestoPhoenix.Interaction.park(conn, request)
-            {:halt, redirect(conn, to: "/login?resume=" <> resume_id)}
+            case AttestoPhoenix.Interaction.park(conn, request) do
+              {:ok, resume_id} -> {:halt, redirect(conn, to: "/login?resume=" <> resume_id)}
+              {:error, _reason} -> {:error, :temporarily_unavailable}
+            end
         end
       end
+
+  When the store cannot take the request, `park/2` returns `{:error, reason}`.
+  Return `{:error, :temporarily_unavailable}` (or `{:error, :server_error}`)
+  from either callback: the client receives that RFC 6749 §4.1.2.1 code by
+  redirect.
 
   ## What a resume does
 
@@ -50,8 +57,10 @@ defmodule AttestoPhoenix.Interaction do
         if consent_recorded?(conn, request, subject) do
           {:consented, subject}
         else
-          {:ok, resume_id} = AttestoPhoenix.Interaction.park(conn, request)
-          {:halt, redirect(conn, to: "/consent?resume=" <> resume_id)}
+          case AttestoPhoenix.Interaction.park(conn, request) do
+            {:ok, resume_id} -> {:halt, redirect(conn, to: "/consent?resume=" <> resume_id)}
+            {:error, _reason} -> {:error, :temporarily_unavailable}
+          end
         end
       end
 

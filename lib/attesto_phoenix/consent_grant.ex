@@ -55,11 +55,17 @@ defmodule AttestoPhoenix.ConsentGrant do
 
           _ ->
             params = AttestoPhoenix.Interaction.request_params(conn)
-            {:ok, resume_id} = AttestoPhoenix.Interaction.park(conn, request)
-            save_consent_context!(conn, resume_id, %{
-              params: params, request: request, subject: subject.subject
-            })
-            {:halt, redirect(conn, to: "/consent?resume=" <> resume_id)}
+
+            case AttestoPhoenix.Interaction.park(conn, request) do
+              {:ok, resume_id} ->
+                save_consent_context!(conn, resume_id, %{
+                  params: params, request: request, subject: subject.subject
+                })
+                {:halt, redirect(conn, to: "/consent?resume=" <> resume_id)}
+
+              {:error, _reason} ->
+                {:error, :temporarily_unavailable}
+            end
         end
       end
 

@@ -437,15 +437,18 @@ defmodule AttestoPhoenix.Config do
       request (fail closed).
     * `:authenticate_resource_owner` - `(conn, request, auth_opts ->
       {:authenticated, subject} | {:halt, conn} | {:none} | {:error,
-      :login_required | :consent_required | :interaction_required})`.
+      :login_required | :consent_required | :interaction_required |
+      :server_error | :temporarily_unavailable})`.
       Establishes the resource owner for an authorization request (RFC 6749
       §3.1, OIDC Core §3.1.2.3). Returns `{:authenticated, subject}` once a
       resource owner is known (a map carrying at least `:subject`, the OIDC
       `sub`, and optionally `:auth_time`, `:acr`, `:amr`), `{:halt, conn}` to
       take over the connection (e.g. redirect to a host login page that
       re-enters the authorization endpoint), `{:none}` when no subject can be
-      established without UI, or an `{:error, _}` classifying why interaction is
-      required (OIDC Core §3.1.2.6). `auth_opts` is a map carrying the OIDC Core
+      established without UI, an `{:error, _}` classifying why interaction is
+      required (OIDC Core §3.1.2.6), or `{:error, :server_error}` /
+      `{:error, :temporarily_unavailable}` when the host failed, such as a
+      failed `AttestoPhoenix.Interaction.park/2` (RFC 6749 §4.1.2.1). `auth_opts` is a map carrying the OIDC Core
       §3.1.2.1 `prompt`/`max_age` directives the host must honour: `:prompt`,
       `:force_reauth` (`prompt=login`), `:interactive` (`false` for
       `prompt=none`, forbidding UI), `:max_age`, `:resumed`, `:parked_at`, and
@@ -459,13 +462,16 @@ defmodule AttestoPhoenix.Config do
       UI; the library only invokes this hook. Required only when the
       authorization endpoint is mounted.
     * `:consent` - `(conn, request, subject -> {:consented, subject} |
-      {:halt, conn} | {:denied, reason})`. Obtains the resource owner's consent
+      {:halt, conn} | {:denied, reason} | {:error, :server_error |
+      :temporarily_unavailable})`. Obtains the resource owner's consent
       for an authorization request (RFC 6749 §4.1.1). Returns
       `{:consented, subject}` to proceed (the returned subject may carry
       consent-derived claims), `{:halt, conn}` to take over the connection (e.g.
       render a consent screen that re-enters the authorization endpoint), or
       `{:denied, reason}` to refuse (reported to the client as `access_denied`,
-      RFC 6749 §4.1.2.1). When unset, consent is implicitly granted only for a
+      RFC 6749 §4.1.2.1), or `{:error, :server_error}` /
+      `{:error, :temporarily_unavailable}` when the host failed (reported with
+      that code). When unset, consent is implicitly granted only for a
       client the host explicitly classifies as confidential. Public clients
       require an explicit consent callback before a code can be issued.
     * `:notify_ciba_user` - `(auth_req_id, request, subject -> :ok | {:error,
