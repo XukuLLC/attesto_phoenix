@@ -6,6 +6,19 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.15.1] - 2026-11-13
+
+### Fixed
+
+- `Interaction.decide/4` refused every consent decision from a page served
+  on an origin other than the issuer's, such as a development server on
+  `http://localhost:4000` with an `https://localhost` issuer, or a deployment
+  reachable on a second host. A named `Origin` may now also be the origin the
+  request reached, computed by `RequestContext.canonical_url/2`, which honors
+  forwarded headers only from `:trusted_proxies`. This is the test Phoenix's
+  `check_origin: :conn` applies; a cross-site page cannot make a browser send
+  an `Origin` matching the `Host` it posts to.
+
 ## [4.15.0] - 2026-11-13
 
 Requires attesto >= 2.19.0 (was >= 2.18.0).

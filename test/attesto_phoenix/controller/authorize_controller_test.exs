@@ -2214,6 +2214,32 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert_received {:consent_decision, :allow}
     end
 
+    test "decide accepts the origin the request reached, such as a development server" do
+      decision_config()
+      id = park_for_decision()
+
+      reached =
+        :post
+        |> Plug.Test.conn("http://localhost:4000/consent")
+        |> put_req_header("x-browser", "browser-1")
+        |> put_req_header("origin", "http://localhost:4000")
+        |> put_req_header("sec-fetch-site", "same-origin")
+        |> with_config()
+
+      assert :ok = Interaction.decide(reached, id, :allow, "user-42")
+
+      other_port =
+        :post
+        |> Plug.Test.conn("http://localhost:4000/consent")
+        |> put_req_header("x-browser", "browser-1")
+        |> put_req_header("origin", "http://localhost:4001")
+        |> with_config()
+
+      assert {:error, :cross_origin} = Interaction.decide(other_port, id, :deny, "user-42")
+      assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
+      assert_received {:consent_decision, :allow}
+    end
+
     test "decide accepts Origin: null from a no-referrer page and defers to Sec-Fetch-Site" do
       decision_config()
       id = park_for_decision()

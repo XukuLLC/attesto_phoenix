@@ -101,15 +101,18 @@ defmodule AttestoPhoenix.Interaction do
   server-side on the parked entry, and appears in no URL until the decision is
   recorded, so another site cannot build a valid POST. `decide/4` also refuses
   a request whose `Sec-Fetch-Site` header is present and not `same-origin`, or
-  whose `Origin` header names an origin other than the issuer's, before it
-  reads the store. `Origin: null`, which browsers send on a same-origin form
-  POST from a page with `Referrer-Policy: no-referrer`, names no origin and is
-  not refused on its own. A page rendered from `:consent` is served by the
+  whose `Origin` header names an origin other than the issuer's or the one the
+  request reached, before it reads the store. `Origin: null`, which browsers
+  send on a same-origin form POST from a page with `Referrer-Policy:
+  no-referrer`, names no origin and is not refused on its own. A page rendered from `:consent` is served by the
   authorization route, which cannot run `:protect_from_forgery` because the
   authorization endpoint must accept cross-site POST requests (OIDC Core
   §3.1.2.1); a Plug CSRF token put in that page is not saved to the session,
   so do not require one on this handler. Serve the page and the handler from
-  the issuer's origin.
+  one origin: the issuer's, or the one the browser reached (for example a
+  development server on `http://localhost:4000` with an `https://localhost`
+  issuer). Behind a TLS-terminating proxy, list it in `:trusted_proxies` so
+  the reached origin is computed from its forwarded headers.
 
   The library ships no POST controller because the session, the subject and
   the page belong to the host. Protect the consent page against clickjacking
@@ -203,6 +206,7 @@ defmodule AttestoPhoenix.Interaction do
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.ConsentGrant
+  alias AttestoPhoenix.RequestContext
   # Not a `urn:ietf:params:oauth:request_uri:` reference, so the key space is
   # disjoint from pushed authorization requests held in the same store.
   alias AttestoPhoenix.Store.PAR.ETS
@@ -281,8 +285,8 @@ defmodule AttestoPhoenix.Interaction do
 
   Returns `{:error, :cross_origin}`, before reading the store, when the
   request's `Sec-Fetch-Site` header is present and not `same-origin`, or its
-  `Origin` header names an origin other than the issuer's (`Origin: null` is
-  not refused on its own). A browser with no binding value, such as one that
+  `Origin` header names an origin other than the issuer's or the one this
+  request reached (`Origin: null` is not refused on its own). A browser with no binding value, such as one that
   never parked a request, gets `{:error, :invalid_resume}`.
 
   Call from the host's browser POST handler, using the current subject from
@@ -298,7 +302,7 @@ defmodule AttestoPhoenix.Interaction do
     if config.interaction_browser_binding == nil,
       do: raise(ArgumentError, "AttestoPhoenix.Interaction: :interaction_browser_binding must be configured")
 
-    if same_origin_request?(conn, config.issuer) do
+    if same_origin_request?(conn, config) do
       case browser_binding(config, conn) do
         {:ok, binding} -> record_decision(config, store, binding, resume_id, decision, subject_id)
         :error -> {:error, :invalid_resume}
@@ -520,18 +524,27 @@ defmodule AttestoPhoenix.Interaction do
   # `Origin: null` carries no origin: browsers send it on a same-origin form
   # POST when the page's Referrer-Policy is `no-referrer` (Fetch, "append a
   # request `Origin` header"), so it defers to `Sec-Fetch-Site` and the resume
-  # id, the form's synchronizer token.
-  defp same_origin_request?(conn, issuer) do
+  # id, the form's synchronizer token. A named origin must be the issuer's or
+  # the origin this request reached (`RequestContext.canonical_url/2`, which
+  # honors forwarded headers only from trusted proxies), the same test as
+  # Phoenix's `check_origin: :conn`.
+  defp same_origin_request?(conn, config) do
     fetch_site = Plug.Conn.get_req_header(conn, "sec-fetch-site")
     origin = Plug.Conn.get_req_header(conn, "origin")
 
-    fetch_site in [[], ["same-origin"]] and allowed_origin?(origin, origin_of(issuer))
+    fetch_site in [[], ["same-origin"]] and allowed_origin?(origin, allowed_origins(conn, config))
   end
 
-  defp allowed_origin?([], _issuer_origin), do: true
-  defp allowed_origin?(["null"], _issuer_origin), do: true
-  defp allowed_origin?([origin], issuer_origin) when issuer_origin != nil, do: origin_of(origin) == issuer_origin
-  defp allowed_origin?(_origin, _issuer_origin), do: false
+  defp allowed_origins(conn, config) do
+    [config.issuer, RequestContext.canonical_url(conn, config)]
+    |> Enum.map(&origin_of/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp allowed_origin?([], _allowed), do: true
+  defp allowed_origin?(["null"], _allowed), do: true
+  defp allowed_origin?([origin], allowed), do: origin_of(origin) in allowed and origin_of(origin) != nil
+  defp allowed_origin?(_origin, _allowed), do: false
 
   defp origin_of(url) when is_binary(url) do
     case URI.parse(url) do
