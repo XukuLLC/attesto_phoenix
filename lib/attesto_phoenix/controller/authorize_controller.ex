@@ -150,6 +150,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   # RFC 6749 §4.1.2.1 error codes reported by redirect.
   @error_access_denied "access_denied"
+
+  # The query parameters an authorization response can carry: RFC 6749
+  # §4.1.2 and §4.1.2.1, RFC 9207 `iss`, OIDC Session Management `session_state`
+  # and JARM `response`.
+  @authorization_response_params ~w(code state iss error error_description error_uri session_state response)
   @error_server_error "server_error"
   @host_failures [:server_error, :temporarily_unavailable]
 
@@ -1546,27 +1551,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       else: []
   end
 
-  # RFC 6749 §3.1.2: parameters are appended to the redirect_uri's query
-  # component, preserving any query already present in the registered URI.
+  # RFC 6749 §3.1.2: parameters are added to the redirect_uri's query
+  # component, preserving the query already present in the registered URI.
+  # A registered pair named like an authorization response parameter is
+  # dropped, whether or not this response sets it, so the client never reads
+  # a registered `state`, `code` or `error` in place of the real one.
   defp do_redirect(conn, redirect_uri, params) do
-    location = append_query(redirect_uri, params)
+    location = Attesto.URI.put_query_params(redirect_uri, params, replace: @authorization_response_params)
 
     conn
     |> put_resp_header("location", location)
     |> send_resp(:found, "")
-  end
-
-  defp append_query(uri, params) do
-    encoded = URI.encode_query(params)
-    parsed = URI.parse(uri)
-
-    new_query =
-      case parsed.query do
-        nil -> encoded
-        existing -> existing <> "&" <> encoded
-      end
-
-    URI.to_string(%{parsed | query: new_query})
   end
 
   # ── Direct (non-redirectable) error page (OIDC Core §3.1.2.6) ─────────────

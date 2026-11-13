@@ -149,12 +149,12 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.14"}
+    {:attesto_phoenix, "~> 4.15"}
   ]
 end
 ```
 
-Requires `attesto >= 2.18.0 and < 3.0.0`.
+Requires `attesto >= 2.19.0 and < 3.0.0`.
 
 For `prompt=login`, the authentication callback must return `auth_time` at or
 later than `auth_opts.parked_at` on an interaction resume. Fresh requests allow
@@ -212,7 +212,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.14"},
+    {:attesto_phoenix, "~> 4.15"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end

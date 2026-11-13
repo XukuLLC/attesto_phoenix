@@ -6,6 +6,25 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.15.0] - 2026-11-13
+
+Requires attesto >= 2.19.0 (was >= 2.18.0).
+
+### Fixed
+
+- Authorization responses no longer duplicate a parameter already in the
+  registered `redirect_uri`. A registered
+  `https://client.example/cb?state=static` produced
+  `?state=static&state=abc123&code=...`, and first-value parsers read the
+  registered `state`, so the client's state check failed on success and on
+  errors such as `access_denied`. A registered pair named `code`, `state`,
+  `iss`, `error`, `error_description`, `error_uri`, `session_state` or
+  `response` is now dropped before the response parameters are added, whether
+  or not this response sets it; every other registered pair is kept byte for
+  byte (RFC 6749 §3.1.2). The query is built by
+  `Attesto.URI.put_query_params/3`, which the end-session and front-channel
+  logout redirects also use.
+
 ## [4.14.1] - 2026-11-13
 
 ### Fixed

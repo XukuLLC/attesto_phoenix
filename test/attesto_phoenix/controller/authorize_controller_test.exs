@@ -452,6 +452,34 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert is_binary(query["code"])
     end
 
+    test "a registered response parameter is replaced, never duplicated, on success and error" do
+      registered = "https://client.example.com/cb?state=static&code=old&ui=1&ui=2&error=x"
+      put_config(client_redirect_uris: fn _ -> [registered] end)
+
+      conn = call(valid_params(%{"redirect_uri" => registered, "state" => "real"}))
+      assert conn.status == 302
+      %URI{query: query} = conn |> location() |> URI.parse()
+      pairs = URI.query_decoder(query) |> Enum.to_list()
+      assert Enum.filter(pairs, &match?({"state", _}, &1)) == [{"state", "real"}]
+      assert [{"code", code}] = Enum.filter(pairs, &match?({"code", _}, &1))
+      assert code != "old"
+      assert Enum.filter(pairs, &match?({"ui", _}, &1)) == [{"ui", "1"}, {"ui", "2"}]
+      refute Enum.any?(pairs, &match?({"error", _}, &1))
+
+      put_config(
+        client_redirect_uris: fn _ -> [registered] end,
+        consent: fn _conn, _request, _subject -> {:denied, :user_denied} end
+      )
+
+      denied = call(valid_params(%{"redirect_uri" => registered, "state" => "real"}))
+      %URI{query: query} = denied |> location() |> URI.parse()
+      pairs = URI.query_decoder(query) |> Enum.to_list()
+      assert Enum.filter(pairs, &match?({"state", _}, &1)) == [{"state", "real"}]
+      assert Enum.filter(pairs, &match?({"error", _}, &1)) == [{"error", "access_denied"}]
+      refute Enum.any?(pairs, &match?({"code", _}, &1))
+      assert Enum.filter(pairs, &match?({"ui", _}, &1)) == [{"ui", "1"}, {"ui", "2"}]
+    end
+
     test "omits state when the request carried none" do
       conn = valid_params(%{}) |> Map.delete("state") |> call()
 
