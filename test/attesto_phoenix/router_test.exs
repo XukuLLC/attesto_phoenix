@@ -851,6 +851,16 @@ defmodule AttestoPhoenix.RouterTest do
       assert response_route.plug_opts == :create
     end
 
+    test "mounts the DC API page response route only with presentation enabled" do
+      refute find_route(DefaultRouter, :post, "/oauth/presentation_response/:id")
+      route = find_route(PresentationRouter, :post, "/oauth/presentation_response/:id")
+      assert route.plug == PresentationResponseController
+      assert route.plug_opts == :create_dc_api
+      path = "/verifier/oauth/presentation_response/:id"
+      assert find_route(PrefixedPresentationRouter, :post, path)
+      assert route_pipeline(PrefixedPresentationRouter, :post, path) == [:wallet_protocol]
+    end
+
     test "threads prefix and protocol pipeline through the presentation routes" do
       request_path = "/verifier/oauth" <> Config.presentation_request_tail() <> "/:id"
       response_path = "/verifier/oauth" <> Config.presentation_response_tail()
@@ -1039,6 +1049,7 @@ defmodule AttestoPhoenix.RouterTest do
         {:post, "/oauth/deferred_credential"},
         {:get, "/oauth/presentation_request/:id"},
         {:post, "/oauth/presentation_response"},
+        {:post, "/oauth/presentation_response/:id"},
         {:get, "/oauth/statuslist/:id"}
       ]
 

@@ -149,12 +149,12 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.9"}
+    {:attesto_phoenix, "~> 4.10"}
   ]
 end
 ```
 
-Requires `attesto >= 2.16.0 and < 3.0.0`.
+Requires `attesto >= 2.17.0 and < 3.0.0`.
 
 The optional Igniter installer needs `igniter` available while you run it. It is
 not a runtime dependency of this package:
@@ -162,7 +162,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.9"},
+    {:attesto_phoenix, "~> 4.10"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -1563,21 +1563,23 @@ in `token_endpoint_auth_methods_supported`.
 **`presentation: true`** mounts the OID4VP verifier endpoints:
 
 - `GET  /oauth/presentation_request/:id` — serves the signed request object
-  (`application/oauth-authz-req+jwt`).
+  (`application/oauth-authz-req+jwt`) for redirects, or a JSON `protocol` / `data`
+  descriptor for a DC API session.
 - `POST /oauth/presentation_response` — the `direct_post` (and encrypted
   `direct_post.jwt`) response endpoint; verifies the `vp_token` against the
   session's bound nonce/audience (single-use, uniform error). SD-JWT VC and
   mdoc presentations both verify.
+- `POST /oauth/presentation_response/:id` — accepts the encrypted DC API response
+  posted by the page and returns a single-use `response_code`.
 
 The host drives it through `AttestoPhoenix.Verifier`: `create_presentation_request/2`
 builds + signs the request object (optionally with an `x509_san_dns` client-id +
 `x5c`), and `presentation_result/2` polls the verified claims. Requires a
 `:presentation_session_store`, `:verifier_client_id` (or the x509 config), and
 the `:keystore`. Request-object signatures keep using that main keystore and
-derive their `alg` from its configured key. Encrypted `direct_post.jwt`
-responses additionally require a dedicated EC P-256
-`:verifier_encryption_keystore`; there is deliberately no fallback to the main
-signing key.
+derive their `alg` from its configured key. Encrypted responses use a fresh
+P-256 recipient key stored with each session; request signing is independent
+of response encryption.
 
 To trust credential issuers through X.509, add these options to the host's
 `AttestoPhoenix.Config`:
@@ -1598,7 +1600,7 @@ verification time and is never stored in a presentation session.
 
 With anchors configured, omit `:issuer_trust` when calling
 `Verifier.create_presentation_request/2`. The session stores
-`{:trusted_certificates, anchors}`. Core 2.16.0 validates SD-JWT VC `x5c`
+`{:trusted_certificates, anchors}`. Core 2.17.0 validates SD-JWT VC `x5c`
 chains and binds the leaf to `iss` using its SAN policy; mdoc issuerAuth
 `x5chain` is validated with purpose `:mdoc_issuer`. The policy can further
 restrict a valid chain but cannot make an invalid chain trusted. Certificate
@@ -1621,6 +1623,132 @@ issuer trust when anchors are configured returns
 The verifier's own `:verifier_x5c` chain identifies the **request signer** to
 the wallet. It is separate from **issuer trust anchors** and does not grant
 trust to credentials signed by that certificate or its issuer.
+
+#### Digital Credentials API presentations
+
+Add a trusted page origin to the host's existing configuration:
+
+```elixir
+verifier_dc_api_origin: "https://verifier.example",
+presentation_response_mode: "dc_api.jwt",
+verifier_accepted_algs: ["ES256", "ES384", "ES512"] # optional issuer policy
+```
+
+`presentation_response_mode` still defaults to `"direct_post"`. A host can
+instead select `response_mode: "dc_api.jwt"` on an individual
+`Verifier.create_presentation_request/2` call. The origin must already be
+configured in either case. Plain `dc_api` is rejected: [HAIP 1.0
+§5.2](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0-final.html#section-5.2)
+says a verifier “MUST use the Response Mode `dc_api.jwt`”. There is no plaintext
+DC API fallback.
+
+Signed requests keep the host's verifier identity and signing key. For HAIP's
+`x509_hash` identity ([§5](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0-final.html#section-5)),
+configure `verifier_client_id_scheme: "x509_hash"` and the verifier's leaf-first
+DER `verifier_x5c` chain matching that key.
+
+The origin is validated at boot as an exact HTTPS origin, including a
+non-default port if needed. Paths, trailing slashes, credentials, queries,
+fragments, and explicit port 443 are refused. Never construct this setting
+from `Origin`, `Host`, forwarded headers, parameters, or wallet data. For
+multiple page origins, use one separately validated Config per origin, chosen
+by trusted host configuration. Each session binds to one origin.
+
+[OpenID4VP 1.0 §A.2](https://openid.net/specs/openid-4-verifiable-presentations-1_0-final.html#section-a.2)
+defines signed-request `expected_origins` as “A non-empty array of strings”.
+The signed request contains the configured origin in that array, records
+`response_mode: dc_api.jwt`, and omits `state` and `response_uri`. The stored
+request records the session's flow; response parameters cannot change it.
+DC API responses use the origin audience (“prefixed with `origin:`” in
+[§A.4](https://openid.net/specs/openid-4-verifiable-presentations-1_0-final.html#section-a.4)).
+Phoenix passes the unprefixed stored origin as core `:dc_api_origin` for mdoc
+[§B.2.6.2](https://openid.net/specs/openid-4-verifiable-presentations-1_0-final.html#section-b.2.6.2).
+
+Create a session with the configured issuer trust:
+
+```elixir
+query = Attesto.PresentationRequest.dcql_query(%{
+  credentials: [%{
+    id: "identity",
+    format: "mso_mdoc",
+    meta: %{doctype_value: "org.iso.18013.5.1.mDL"}
+  }]
+})
+
+{:ok, presentation} = AttestoPhoenix.Verifier.create_presentation_request(config, %{
+  dcql_query: query,
+  expected_query_ids: ["identity"],
+  response_mode: "dc_api.jwt"
+})
+```
+
+Persist `presentation.id` in the initiating browser session. Send the page
+`presentation.dc_api_request` and `presentation.response_uri`. The former is
+`%{"protocol" => "openid4vp-v1-signed", "data" => %{"request" => signed_jwt}}`,
+using [§A.1 and §A.3.2.1](https://openid.net/specs/openid-4-verifiable-presentations-1_0-final.html#section-a.3.2.1).
+The page can also GET `presentation.request_uri` to retrieve that descriptor.
+The returned `response_uri` is a local submission URL, not a request claim
+sent to the wallet.
+
+The page invokes the API from a user action. In this example, `presentation`
+is the JSON returned by the host's creation action and `csrfToken` comes from
+its browser session:
+
+```javascript
+button.addEventListener("click", async () => {
+  try {
+    const credential = await navigator.credentials.get({
+      digital: { requests: [presentation.dc_api_request] }
+    });
+    if (!credential || credential.data.error) {
+      showPresentationError();
+      return;
+    }
+    const response = await fetch(presentation.response_uri, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": csrfToken
+      },
+      body: JSON.stringify(credential.data)
+    });
+    if (!response.ok) throw new Error("Presentation verification failed");
+    const { response_code } = await response.json();
+    await completePresentation(response_code); // host's browser completion action
+  } catch {
+    showPresentationError(); // includes cancellation or unavailable platform support
+  }
+});
+```
+
+The browser call follows [W3C Digital Credentials §2.3](https://www.w3.org/TR/2026/WD-digital-credentials-20261105/#requesting-a-digital-credential).
+The wallet returns its response to the page through `DigitalCredential.data`;
+for this mode the object contains `response`, a compact JWE. Post that data
+object, not the whole credential. No wallet redirect or wallet-provided
+`state` is required. Phoenix checks the URL's session id against the JWE `kid`,
+uses the existing `direct_post.jwt` decryption and envelope checks, and rejects
+submissions to the wrong flow's endpoint.
+
+The host must bind creation, submission, and result consumption to the same
+browser session and protect its browser actions against CSRF. The macro does
+not install browser-session or CSRF plugs; the header in the example requires
+host enforcement. A host controller can check its stored presentation id and
+call `Verifier.complete_dc_api_response(config, id, credential_data)` directly,
+then consume the returned code with `Verifier.presentation_result/2`. The
+built-in POST controller returns `%{"response_code" => code}`; its result is
+available once through the same API. Invalid submissions leave the session
+pending; successful submissions complete atomically.
+
+`:verifier_accepted_algs` is forwarded as core `:accepted_algs`. With this
+setting omitted (`nil`), mdoc issuers remain ES256-only and SD-JWT keeps its
+existing policy. An explicit list controls credential issuer signatures in
+both flows; `[]` rejects every issuer algorithm. ES384 requires P-384 and
+ES512 requires P-521. The request advertises the configured mdoc COSE values
+(-7, -35, -36). SD-JWT retains core's FAPI policy; device authentication stays
+ES256. [HAIP 1.0 §7](https://openid.net/specs/openid4vc-high-assurance-interoperability-profile-1_0-final.html#section-7)
+requires ES256 support “at a minimum” and permits additional ecosystem suites.
+This flow support does not claim complete HAIP or ISO reader conformance.
 
 **`status_list: true`** mounts `GET /oauth/statuslist/:id`, serving a signed
 `statuslist+jwt` built from the `:status_list_store` — the revocation target

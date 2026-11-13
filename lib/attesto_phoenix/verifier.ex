@@ -3,14 +3,15 @@ defmodule AttestoPhoenix.Verifier do
   Host-facing OID4VP verifier API.
 
   Presentation requests are persisted before their signed request object is
-  published. Wallet responses are verified by the public direct-post
-  controller, and hosts read the completed result once through
+  published. Wallet direct POST and DC API page submissions share response
+  decryption; the session's stored request determines its flow. Hosts read
+  the completed result once through
   `presentation_result/2` (single-use: the read consumes the session).
 
   Request objects continue to use the main `AttestoPhoenix.Config.keystore/1`; their protected
-  `alg` is derived from that key by `Attesto.JWS.sign_current`. The separate
-  verifier-encryption keystore is only an ECDH-ES recipient key and never
-  changes request-object signing policy.
+  `alg` is derived from that key by `Attesto.JWS.sign_current`. Encrypted modes
+  generate a fresh ECDH-ES recipient key per session and do not change
+  request-object signing policy.
   """
 
   alias Attesto.{
@@ -29,8 +30,8 @@ defmodule AttestoPhoenix.Verifier do
 
   defmodule PresentationResponse do
     @moduledoc """
-    Normalized OID4VP direct-post presentation response (`direct_post` or
-    `direct_post.jwt`).
+    Normalized OID4VP response: plaintext `direct_post`, or the shared JWE
+    envelope for `direct_post.jwt` and `dc_api.jwt`.
     """
 
     alias Attesto.StrictJSON
@@ -130,17 +131,31 @@ defmodule AttestoPhoenix.Verifier do
         }
 
   @type create_result :: %{
-          id: String.t(),
-          nonce: String.t(),
-          client_id: String.t(),
-          request_uri: String.t()
+          required(:id) => String.t(),
+          required(:nonce) => String.t(),
+          required(:client_id) => String.t(),
+          required(:request_uri) => String.t(),
+          optional(:dc_api_request) => map(),
+          optional(:response_uri) => String.t()
         }
 
   @doc """
   Create a verifier presentation session and its signed request object.
 
-  The returned `id` is the OID4VP `state`; the absolute `request_uri` serves
-  the request object from the convention-derived verifier endpoint.
+  Redirects remain the default: the returned `id` is the OID4VP `state` and
+  `request_uri` serves the signed request object.
+
+  Select `response_mode: "dc_api.jwt"` for Digital Credentials API sessions.
+  `:verifier_dc_api_origin` must be configured at boot. The result also includes
+  `dc_api_request` (`protocol` and `data.request`, OpenID4VP 1.0 §§A.1, A.3.2.1)
+  and `response_uri`, the session-specific URL to which the page posts
+  `DigitalCredential.data`. GET `request_uri` returns the same descriptor.
+  The signed request records `dc_api.jwt` and the configured `expected_origins`
+  (§A.2); it contains neither `state` nor `response_uri`. The origin is not a
+  per-request attribute. Plain `dc_api` is unsupported (HAIP 1.0 §5.2).
+
+  Hosts bind creation, submission, and result consumption to their browser
+  session and enforce CSRF protection on browser actions.
 
   With `:verifier_trusted_certificates`, omit `:issuer_trust`: every session
   uses the configured anchors and a per-request override is refused. Otherwise
@@ -185,16 +200,17 @@ defmodule AttestoPhoenix.Verifier do
 
     with {:ok, store} <- presentation_session_store(config),
          :ok <- validate_response_mode(response_mode),
+         :ok <- validate_flow_config(config, response_mode),
          {:ok, client_id} <- verifier_client_id(config, scheme),
          {:ok, session} <-
-           create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query) do
+           create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query, response_mode) do
       finish_presentation_request(store, config, client_id, session, dcql_query, response_mode, scheme)
     end
   end
 
   defp finish_presentation_request(store, config, client_id, session, dcql_query, response_mode, scheme) do
     result =
-      with {:ok, response_options} <- response_options(store, session, response_mode),
+      with {:ok, response_options} <- response_options(store, config, session, response_mode),
            {:ok, jar} <-
              sign_request_object(config, client_id, session, dcql_query, response_options, scheme),
            :ok <- PresentationSession.attach_request_object(store, session.id, jar) do
@@ -204,7 +220,8 @@ defmodule AttestoPhoenix.Verifier do
            nonce: session.nonce,
            client_id: client_id,
            request_uri: request_uri(config, session.id)
-         }}
+         }
+         |> put_dc_api_result(config, session.id, jar, response_mode)}
       end
 
     case result do
@@ -235,22 +252,7 @@ defmodule AttestoPhoenix.Verifier do
   @spec complete_presentation_response(Config.t(), PresentationResponse.t() | map()) ::
           {:ok, %{required(String.t()) => String.t()}} | {:error, :invalid_request | :misconfigured}
   def complete_presentation_response(%Config{} = config, %PresentationResponse{} = response) do
-    with {:ok, store} <- response_session_store(config),
-         {:ok, state, vp_token} <- resolve_presentation_response(response, config, store),
-         {:ok, _request_object} <- PresentationSession.request_object(store, state),
-         {:ok, _results} <- verify_presentation_response(config, store, state, vp_token),
-         {:ok, response_code} <- issue_presentation_response_code(config, state) do
-      # OID4VP §8.2 permits, and HAIP §5.1 requires, a `redirect_uri` carrying a
-      # `response_code` so the wallet returns the user to the verifier front-end,
-      # which then retrieves the completed presentation result. That read is
-      # single-use (`AttestoPhoenix.Verifier.presentation_result/2` consumes the
-      # session), so this browser-borne `response_code` cannot be replayed from
-      # history/logs to re-read the presented claims.
-      {:ok, %{"redirect_uri" => presentation_complete_redirect_uri(config, response_code)}}
-    else
-      {:error, :misconfigured} = error -> error
-      _ -> {:error, :invalid_request}
-    end
+    complete_response(config, response, :redirect)
   end
 
   def complete_presentation_response(%Config{} = config, params) when is_map(params) and not is_struct(params) do
@@ -261,6 +263,86 @@ defmodule AttestoPhoenix.Verifier do
   end
 
   def complete_presentation_response(%Config{}, _params), do: {:error, :invalid_request}
+
+  @doc """
+  Complete a DC API session using the page's `DigitalCredential.data` object.
+
+  `id` comes from the session-specific POST URL returned at creation. The JWE
+  `kid` must match it. No wallet `state` or supplied origin is used. Returns a
+  single-use `response_code` for `presentation_result/2`; no wallet redirect.
+  """
+  @spec complete_dc_api_response(Config.t(), String.t(), map()) ::
+          {:ok, map()} | {:error, :invalid_request | :misconfigured}
+  def complete_dc_api_response(%Config{} = config, id, params) when is_binary(id) and id != "" do
+    case PresentationResponse.from_params(params) do
+      {:ok, %PresentationResponse{mode: :encrypted} = response} -> complete_response(config, response, {:dc_api, id})
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  def complete_dc_api_response(%Config{}, _id, _params), do: {:error, :invalid_request}
+
+  @doc """
+  Read a pending request for its transport. DC API returns the `protocol` and
+  `data` object for `navigator.credentials.get`; redirects return a compact JWS.
+  The session's stored signed request records the mode and expected origin.
+  """
+  @spec presentation_request(Config.t(), String.t()) ::
+          {:ok, :dc_api, map()} | {:ok, :redirect, String.t()} | :error
+  def presentation_request(%Config{} = config, id) do
+    with {:ok, store} <- presentation_session_store(config),
+         {:ok, jar, claims} <- stored_request(store, id) do
+      case claims["response_mode"] do
+        "dc_api.jwt" -> {:ok, :dc_api, dc_api_request(jar)}
+        mode when mode in ["direct_post", "direct_post.jwt"] -> {:ok, :redirect, jar}
+        _ -> :error
+      end
+    else
+      _ -> :error
+    end
+  end
+
+  defp complete_response(config, response, flow) do
+    with {:ok, store} <- response_session_store(config),
+         {:ok, state, vp_token} <- resolve_presentation_response(response, config, store, flow),
+         {:ok, _jar, claims} <- stored_request(store, state),
+         :ok <- matching_flow(claims, flow, response.mode),
+         {:ok, _results} <- verify_presentation_response(config, store, state, vp_token, claims),
+         {:ok, response_code} <- issue_presentation_response_code(config, state) do
+      case flow do
+        :redirect -> {:ok, %{"redirect_uri" => presentation_complete_redirect_uri(config, response_code)}}
+        {:dc_api, _id} -> {:ok, %{"response_code" => response_code}}
+      end
+    else
+      {:error, :misconfigured} = error -> error
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  defp stored_request(store, id) do
+    with {:ok, jar} <- PresentationSession.request_object(store, id),
+         {:ok, claims} <- JWS.peek_json(jar, :payload) do
+      # Only read the request generated and persisted by this verifier. Never
+      # accept a request object supplied with a wallet response as context.
+      {:ok, jar, claims}
+    end
+  end
+
+  defp matching_flow(%{"response_mode" => "dc_api.jwt"}, {:dc_api, _id}, :encrypted), do: :ok
+  defp matching_flow(%{"response_mode" => "direct_post.jwt"}, :redirect, :encrypted), do: :ok
+  defp matching_flow(%{"response_mode" => "direct_post"}, :redirect, :plaintext), do: :ok
+  defp matching_flow(_claims, _flow, _mode), do: {:error, :invalid_request}
+
+  defp dc_api_request(jar), do: %{"protocol" => "openid4vp-v1-signed", "data" => %{"request" => jar}}
+
+  defp put_dc_api_result(result, config, id, jar, "dc_api.jwt") do
+    Map.merge(result, %{
+      dc_api_request: dc_api_request(jar),
+      response_uri: Config.presentation_response_endpoint_url(config) <> "/" <> URI.encode(id, &URI.char_unreserved?/1)
+    })
+  end
+
+  defp put_dc_api_result(result, _config, _id, _jar, _mode), do: result
 
   defp do_presentation_result(config, response_code) do
     with {:ok, session_id} <- verify_response_code(config, response_code),
@@ -364,11 +446,11 @@ defmodule AttestoPhoenix.Verifier do
 
   defp validate_response_code_times(_issued_at, _expires_at, _now), do: {:error, :invalid_response_code}
 
-  defp create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query) do
+  defp create_session(store, config, client_id, expected_query_ids, issuer_trust, dcql_query, response_mode) do
     PresentationSession.create(
       store,
       %{
-        audience: client_id,
+        audience: presentation_audience(config, client_id, response_mode),
         expected_query_ids: expected_query_ids,
         issuer_trust: issuer_trust,
         # The response_uri the wallet's mdoc DeviceResponse binds to via its
@@ -392,7 +474,20 @@ defmodule AttestoPhoenix.Verifier do
       state: session.id
     ]
 
-    request = PresentationRequest.build(Keyword.merge(request_options, response_options))
+    # Core 2.17's builder supports redirect modes only. Reuse its DCQL and
+    # metadata validation, then apply Appendix A.2's DC API parameters.
+    mode = Keyword.get(response_options, :response_mode, "direct_post")
+
+    builder_options =
+      if mode == "dc_api.jwt",
+        do: Keyword.put(response_options, :response_mode, "direct_post.jwt"),
+        else: response_options
+
+    request =
+      request_options
+      |> Keyword.merge(builder_options)
+      |> PresentationRequest.build()
+      |> request_for_flow(config, mode)
 
     claims =
       Map.merge(request, %{
@@ -419,17 +514,17 @@ defmodule AttestoPhoenix.Verifier do
     end
   end
 
-  defp response_options(store, session, response_mode) do
+  defp response_options(store, config, session, response_mode) do
     case response_mode do
       "direct_post" ->
-        {:ok, [client_metadata: base_client_metadata()]}
+        {:ok, [client_metadata: base_client_metadata(config)]}
 
-      "direct_post.jwt" ->
+      mode when mode in ["direct_post.jwt", "dc_api.jwt"] ->
         with {:ok, metadata} <- encrypted_response_metadata(store, session) do
           {:ok,
            [
-             response_mode: "direct_post.jwt",
-             client_metadata: Map.merge(base_client_metadata(), metadata)
+             response_mode: mode,
+             client_metadata: Map.merge(base_client_metadata(config), metadata)
            ]}
         end
 
@@ -438,27 +533,50 @@ defmodule AttestoPhoenix.Verifier do
     end
   end
 
-  defp validate_response_mode(mode) when mode in ["direct_post", "direct_post.jwt"], do: :ok
+  defp validate_response_mode(mode) when mode in ["direct_post", "direct_post.jwt", "dc_api.jwt"], do: :ok
   defp validate_response_mode(_mode), do: {:error, :invalid_attrs}
+
+  defp validate_flow_config(config, "dc_api.jwt") do
+    if is_binary(Config.verifier_dc_api_origin(config)), do: :ok, else: {:error, :dc_api_origin_required}
+  end
+
+  defp validate_flow_config(_config, _mode), do: :ok
+
+  defp presentation_audience(config, _client_id, "dc_api.jwt"), do: "origin:" <> Config.verifier_dc_api_origin(config)
+  defp presentation_audience(_config, client_id, _mode), do: client_id
+
+  defp request_for_flow(request, config, "dc_api.jwt") do
+    request
+    |> Map.drop(["state", "response_uri"])
+    |> Map.put("response_mode", "dc_api.jwt")
+    |> Map.put("expected_origins", [Config.verifier_dc_api_origin(config)])
+  end
+
+  defp request_for_flow(request, _config, _mode), do: request
 
   # OID4VP 1.0 final §5.1: the request's `client_metadata` MUST advertise the
   # verifier's supported presentation formats via `vp_formats_supported`. The
-  # algorithm sub-arrays are what this verifier accepts (ES256 SD-JWT VC issuer
-  # and KB-JWT signatures; COSE ES256 (-7) for mdoc).
-  defp base_client_metadata do
+  # mdoc issuer array follows the configured acceptance policy. SD-JWT keeps
+  # core's FAPI restrictions; device authentication remains ES256.
+  defp base_client_metadata(config) do
     %{
       "vp_formats_supported" => %{
         "dc+sd-jwt" => %{
-          "sd-jwt_alg_values" => ["ES256"],
+          "sd-jwt_alg_values" =>
+            Enum.filter(Config.verifier_accepted_algs(config) || ["ES256"], &(&1 in SigningAlg.fapi_algs())),
           "kb-jwt_alg_values" => ["ES256"]
         },
         "mso_mdoc" => %{
-          "issuerauth_alg_values" => [-7],
+          "issuerauth_alg_values" => Enum.map(Config.verifier_accepted_algs(config) || ["ES256"], &issuer_cose_alg/1),
           "deviceauth_alg_values" => [-7]
         }
       }
     }
   end
+
+  defp issuer_cose_alg("ES256"), do: -7
+  defp issuer_cose_alg("ES384"), do: -35
+  defp issuer_cose_alg("ES512"), do: -36
 
   # OID4VP 1.0 final / HAIP §5: the verifier MUST supply a fresh (ephemeral)
   # response-encryption key per Authorization Request. Generate an EC P-256 key
@@ -579,15 +697,17 @@ defmodule AttestoPhoenix.Verifier do
   defp resolve_presentation_response(
          %PresentationResponse{mode: :encrypted, response: encrypted_response},
          _config,
-         store
+         store,
+         flow
        ) do
-    decrypt_presentation_response(encrypted_response, store)
+    decrypt_presentation_response(encrypted_response, store, flow)
   end
 
   defp resolve_presentation_response(
          %PresentationResponse{mode: :plaintext, state: state, vp_token: vp_token},
          config,
-         store
+         store,
+         :redirect
        ) do
     plaintext_presentation_response(state, vp_token, config, store)
   end
@@ -609,7 +729,7 @@ defmodule AttestoPhoenix.Verifier do
     end
   end
 
-  defp decrypt_presentation_response(encrypted_response, store) when is_binary(encrypted_response) do
+  defp decrypt_presentation_response(encrypted_response, store, flow) when is_binary(encrypted_response) do
     # The JWE `kid` is the presentation session id (the verifier advertised a
     # fresh, per-request encryption key keyed by it); recover that session's
     # private key to decrypt. `Attesto.JWE` admits only a public P-256 `epk`
@@ -620,6 +740,9 @@ defmodule AttestoPhoenix.Verifier do
          :ok <- encrypted_response_algorithms(header),
          :ok <- encrypted_response_parameters(segments),
          {:ok, kid} <- jwe_kid(header),
+         :ok <- matching_response_id(kid, flow),
+         {:ok, _jar, claims} <- stored_request(store, kid),
+         :ok <- matching_flow(claims, flow, :encrypted),
          {:ok, jwk_map} <- PresentationSession.response_encryption_jwk(store, kid),
          {:ok, plaintext, _header} <-
            JWE.decrypt(jwk_map, encrypted_response,
@@ -627,7 +750,7 @@ defmodule AttestoPhoenix.Verifier do
              max_plaintext_bytes: @max_compact_jwe_bytes
            ),
          {:ok, params} <- decode_json_map(plaintext),
-         {:ok, state, vp_token} <- decoded_presentation_response(params),
+         {:ok, state, vp_token} <- decoded_presentation_response(params, flow, kid),
          true <- state == kid do
       {:ok, state, vp_token}
     else
@@ -639,7 +762,11 @@ defmodule AttestoPhoenix.Verifier do
     _kind, _reason -> {:error, :malformed}
   end
 
-  defp decrypt_presentation_response(_encrypted_response, _store), do: {:error, :malformed}
+  defp decrypt_presentation_response(_encrypted_response, _store, _flow), do: {:error, :malformed}
+
+  defp matching_response_id(id, {:dc_api, id}), do: :ok
+  defp matching_response_id(_id, :redirect), do: :ok
+  defp matching_response_id(_id, _flow), do: {:error, :malformed}
 
   defp jwe_kid(%{"kid" => kid}) when is_binary(kid) and kid != "", do: {:ok, kid}
   defp jwe_kid(_header), do: {:error, :malformed}
@@ -669,14 +796,20 @@ defmodule AttestoPhoenix.Verifier do
     end
   end
 
-  defp decoded_presentation_response(%{"state" => state, "vp_token" => raw_vp_token})
+  defp decoded_presentation_response(%{"state" => state, "vp_token" => raw_vp_token}, :redirect, _kid)
        when is_binary(state) and state != "" do
     with {:ok, vp_token} <- decode_vp_token(raw_vp_token) do
       {:ok, state, vp_token}
     end
   end
 
-  defp decoded_presentation_response(_params), do: {:error, :malformed}
+  defp decoded_presentation_response(%{"vp_token" => vp_token} = params, {:dc_api, id}, id) when is_map(vp_token) do
+    # Appendix A.2 does not define state for DC API. A matching optional echo
+    # is harmless, but it must never choose a different session.
+    if Map.get(params, "state", id) == id, do: {:ok, id, vp_token}, else: {:error, :malformed}
+  end
+
+  defp decoded_presentation_response(_params, _flow, _kid), do: {:error, :malformed}
 
   defp compact_jwe(encrypted_response) when byte_size(encrypted_response) <= @max_compact_jwe_bytes do
     with [protected, rest] <- :binary.split(encrypted_response, "."),
@@ -744,8 +877,17 @@ defmodule AttestoPhoenix.Verifier do
 
   defp decode_vp_token(_vp_token), do: {:error, :malformed}
 
-  defp verify_presentation_response(config, store, state, vp_token) do
-    options = [now: System.system_time(:second), haip: Config.verifier_haip(config)]
+  defp verify_presentation_response(config, store, state, vp_token, claims) do
+    options = [
+      now: System.system_time(:second),
+      haip: Config.verifier_haip(config)
+    ]
+
+    options =
+      case Config.verifier_accepted_algs(config) do
+        nil -> options
+        algs -> Keyword.put(options, :accepted_algs, algs)
+      end
 
     options =
       case Config.verifier_certificate_trust(config) do
@@ -753,13 +895,55 @@ defmodule AttestoPhoenix.Verifier do
         callback -> Keyword.put(options, :certificate_trust, fn chain -> Callback.invoke(callback, [chain]) end)
       end
 
-    PresentationSession.verify_response(
-      store,
-      {:state, state},
-      vp_token,
-      options
-    )
+    case claims do
+      %{"response_mode" => "dc_api.jwt", "expected_origins" => [origin]} ->
+        verify_dc_api_response(config, store, state, vp_token, origin, options)
+
+      %{"response_mode" => mode} when mode in ["direct_post", "direct_post.jwt"] ->
+        PresentationSession.verify_response(store, {:state, state}, vp_token, options)
+
+      _ ->
+        {:error, :malformed}
+    end
   rescue
     ArgumentError -> {:error, :malformed}
+  end
+
+  defp verify_dc_api_response(config, store, id, vp_token, origin, options) do
+    # PresentationSession 2.17 does not forward :dc_api_origin. Keep its stored
+    # context and atomic completion contract, calling the same VpToken verifier
+    # directly for this flow. request_object/2 already validated the pending
+    # session and its context before this point.
+    with true <- origin == Config.verifier_dc_api_origin(config),
+         {:ok, %{id: ^id, data: %{status: :pending} = data, expires_at: expires_at}} <- store.get(id),
+         true <- expires_at > options[:now],
+         true <- data.audience == "origin:" <> origin,
+         {:ok, results} <- VpToken.verify(vp_token, dc_api_verify_options(data, origin, options)),
+         :ok <- store.complete(id, %{results: results}) do
+      {:ok, results}
+    else
+      _ -> {:error, :invalid_request}
+    end
+  end
+
+  defp dc_api_verify_options(data, origin, options) do
+    {trust_key, trust_value} = data.issuer_trust
+
+    options
+    |> Keyword.merge(
+      Map.to_list(
+        Map.take(data, [
+          :nonce,
+          :audience,
+          :expected_query_ids,
+          :permitted_query_ids,
+          :query_constraints,
+          :required_credential_sets,
+          :response_encryption_jwk
+        ])
+      )
+    )
+    |> Keyword.put(trust_key, trust_value)
+    |> Keyword.put(:dc_api_origin, origin)
   end
 end

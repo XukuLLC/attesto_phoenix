@@ -4,14 +4,16 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
 
   A wallet dereferences the opaque presentation-session identifier to obtain
   the signed authorization request object created by `AttestoPhoenix.Verifier`.
+  For a DC API session, the page receives JSON containing `protocol` and
+  `data.request` (OpenID4VP 1.0 §A.1 and §A.3.2.1). Redirect sessions retain
+  their `application/oauth-authz-req+jwt` response.
   """
 
   use AttestoPhoenix.Controller, formats: [:json]
 
   import Plug.Conn, only: [put_resp_header: 3, send_resp: 3]
 
-  alias Attesto.PresentationSession
-  alias AttestoPhoenix.{Config, OAuthError}
+  alias AttestoPhoenix.{Config, OAuthError, Verifier}
 
   @request_object_content_type "application/oauth-authz-req+jwt"
 
@@ -22,11 +24,17 @@ defmodule AttestoPhoenix.Controller.PresentationRequestController do
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_https(conn, config, invalid_request()),
-         {:ok, store} <- presentation_session_store(config),
-         {:ok, request_object} <- PresentationSession.request_object(store, id) do
-      conn
-      |> put_resp_header("content-type", @request_object_content_type)
-      |> send_resp(200, request_object)
+         {:ok, _store} <- presentation_session_store(config),
+         {:ok, flow, request} <- Verifier.presentation_request(config, id) do
+      case flow do
+        :dc_api ->
+          json(conn, request)
+
+        :redirect ->
+          conn
+          |> put_resp_header("content-type", @request_object_content_type)
+          |> send_resp(200, request)
+      end
     else
       :error -> send_resp(conn, 404, "")
       {:error, %OAuthError{} = error} -> OAuthError.render(conn, error, config: config)

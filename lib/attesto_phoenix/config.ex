@@ -38,11 +38,10 @@ defmodule AttestoPhoenix.Config do
       defaults to `:keystore`. Configure a separate EC/ES256 keystore here to
       issue ES256-signed credentials (e.g. for HAIP) while ID tokens keep their
       own signing key.
-    * `:verifier_encryption_keystore` - a dedicated EC P-256 keystore used only
-      to advertise and decrypt encrypted OID4VP `direct_post.jwt` responses.
-      It has no fallback to `:keystore`; encrypted-response request creation
-      fails closed when this setting is absent or is not a usable private P-256
-      key.
+    * `:verifier_encryption_keystore` - retained for configuration compatibility.
+      Presentation requests generate and persist a fresh P-256 recipient key
+      per session for both `direct_post.jwt` and `dc_api.jwt`; this setting is
+      not used by that path.
     * `:repo` - `Ecto.Repo` module used by the Ecto-backed code, refresh,
       nonce, and replay stores.
     * `:load_client` - `(client_id -> {:ok, client} | {:error, :not_found} |
@@ -1138,9 +1137,10 @@ defmodule AttestoPhoenix.Config do
     * `:verifier_client_id_scheme` - OID4VP verifier client-id scheme. `nil`
       (the default) and `"redirect_uri"` retain the configured
       `:verifier_client_id`; `"x509_san_dns"` derives the identifier from
-      `:verifier_dns`.
+      `:verifier_dns`; `"x509_hash"` derives it from the leaf certificate's
+      SHA-256 hash (HAIP 1.0 §5).
     * `:verifier_x5c` - verifier certificate chain as DER binaries, leaf first.
-      Required when `:verifier_client_id_scheme` is `"x509_san_dns"`. Identifies
+      Required for `"x509_san_dns"` and `"x509_hash"`. Identifies
       the request signer; it does not establish trust in credential issuers.
     * `:verifier_trusted_certificates` - non-empty list of DER issuer trust
       anchors, or `nil` (default). PEM is not accepted, matching `:verifier_x5c`.
@@ -1163,9 +1163,23 @@ defmodule AttestoPhoenix.Config do
     * `:verifier_dns` - dNSName advertised by the verifier. Required when
       `:verifier_client_id_scheme` is `"x509_san_dns"`.
     * `:presentation_response_mode` - OID4VP response mode advertised to wallets.
-      Defaults to `"direct_post"`; set to `"direct_post.jwt"` to require an
-      encrypted authorization response. That mode also requires a usable
-      `:verifier_encryption_keystore` when a presentation request is created.
+      Defaults to `"direct_post"`; `"direct_post.jwt"` encrypts redirect responses.
+      `"dc_api.jwt"` selects the Digital Credentials API with encrypted responses.
+      Both encrypted modes use a fresh P-256 recipient key per session.
+      Plain `"dc_api"` is not offered (HAIP 1.0 §5.2).
+    * `:verifier_dc_api_origin` - the HTTPS origin of the host's browser page,
+      such as `"https://verifier.example"`. Required for `"dc_api.jwt"`; otherwise
+      optional. Validated at boot, with no path, trailing slash, credentials,
+      query, fragment, or explicit default port. Recorded in the session's
+      signed request as `expected_origins` and used for core `:dc_api_origin`.
+      Use a separately validated Config for each origin; never populate it
+      from request headers, parameters, or wallet data.
+    * `:verifier_accepted_algs` - credential issuer algorithm list forwarded as
+      `:accepted_algs`. The default `nil` retains core's ES256-only mdoc policy
+      and the existing SD-JWT policy. An explicit list may include `"ES256"`,
+      `"ES384"`, and `"ES512"`; an empty list denies all issuer signatures. Core enforces
+      P-256/P-384/P-521 pairing. SD-JWT issuer checks also receive this option
+      and retain core's separate FAPI policy. Device authentication is unchanged.
     * `:sweep_interval_ms` - interval for `AttestoPhoenix.Store.Sweeper`.
       `start_link/1` rejects an unset or non-positive value. The installer adds
       the supervised process automatically; manual Ecto configurations must
@@ -1272,6 +1286,7 @@ defmodule AttestoPhoenix.Config do
   resolving to `nil` at request time.
   """
 
+  alias Attesto.Mdoc.Origin
   alias Attesto.RequestObject.Policy
   alias Attesto.ResourceIndicator
   alias AttestoPhoenix.AuthorizationServer.Userinfo
@@ -1417,6 +1432,7 @@ defmodule AttestoPhoenix.Config do
     :verifier_certificate_trust,
     :verifier_issuer_trust,
     :verifier_dns,
+    :verifier_dc_api_origin,
     :credential_configurations_supported,
     :federation_authority_hints,
     :federation_entity_metadata,
@@ -1489,6 +1505,7 @@ defmodule AttestoPhoenix.Config do
     session_management: [],
     presentation_response_mode: "direct_post",
     verifier_haip: true,
+    verifier_accepted_algs: nil,
     basic_realm: "OAuth"
   ]
 
@@ -1655,6 +1672,8 @@ defmodule AttestoPhoenix.Config do
           verifier_issuer_trust: {:issuer_jwks, map() | list()} | {:resolve_issuer, callback()} | nil,
           verifier_haip: boolean(),
           verifier_dns: String.t() | nil,
+          verifier_dc_api_origin: String.t() | nil,
+          verifier_accepted_algs: [String.t()] | nil,
           presentation_response_mode: String.t(),
           credential_configurations_supported: map() | nil,
           federation_authority_hints: [String.t()] | nil,
@@ -2596,6 +2615,14 @@ defmodule AttestoPhoenix.Config do
   @doc "The default issuer keys or resolver used when no per-request trust is supplied."
   @spec verifier_issuer_trust(t()) :: {:issuer_jwks, map() | list()} | {:resolve_issuer, callback()} | nil
   def verifier_issuer_trust(%__MODULE__{verifier_issuer_trust: trust}), do: trust
+
+  @doc "The configured DC API page origin; never derived from HTTP input."
+  @spec verifier_dc_api_origin(t()) :: String.t() | nil
+  def verifier_dc_api_origin(%__MODULE__{verifier_dc_api_origin: origin}), do: origin
+
+  @doc "Accepted credential issuer algorithms, forwarded to core as `:accepted_algs`."
+  @spec verifier_accepted_algs(t()) :: [String.t()] | nil
+  def verifier_accepted_algs(%__MODULE__{verifier_accepted_algs: algs}), do: algs
 
   @doc "The dNSName advertised by an `x509_san_dns` verifier."
   @spec verifier_dns(t()) :: String.t() | nil
@@ -4708,6 +4735,8 @@ defmodule AttestoPhoenix.Config do
     validate_verifier_trust!(config)
     validate_verifier_dns!(config.verifier_dns)
     validate_presentation_response_mode!(config.presentation_response_mode)
+    validate_verifier_dc_api!(config)
+    validate_verifier_accepted_algs!(config.verifier_accepted_algs)
     validate_mtls_endpoint_aliases!(config.mtls_endpoint_aliases)
     validate_mtls_client_auth!(config)
 
@@ -6134,12 +6163,13 @@ defmodule AttestoPhoenix.Config do
             "got #{inspect(client_id)}"
   end
 
-  defp validate_verifier_client_id_scheme!(scheme) when scheme in [nil, "redirect_uri", "x509_san_dns"], do: :ok
+  defp validate_verifier_client_id_scheme!(scheme) when scheme in [nil, "redirect_uri", "x509_san_dns", "x509_hash"],
+    do: :ok
 
   defp validate_verifier_client_id_scheme!(scheme) do
     raise ArgumentError,
           "AttestoPhoenix.Config: :verifier_client_id_scheme must be nil, \"redirect_uri\", or " <>
-            "\"x509_san_dns\"; got #{inspect(scheme)}"
+            "\"x509_san_dns\" or \"x509_hash\"; got #{inspect(scheme)}"
   end
 
   defp validate_verifier_x5c!(nil), do: :ok
@@ -6218,12 +6248,41 @@ defmodule AttestoPhoenix.Config do
             "got #{inspect(dns)}"
   end
 
-  defp validate_presentation_response_mode!(mode) when mode in ["direct_post", "direct_post.jwt"], do: :ok
+  defp validate_verifier_dc_api!(config) do
+    origin = config.verifier_dc_api_origin
+
+    if (not is_nil(origin) and not valid_dc_api_origin?(origin)) or
+         (config.presentation_response_mode == "dc_api.jwt" and is_nil(origin)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :verifier_dc_api_origin must be a serialized HTTPS origin " <>
+              "without credentials, path, query, fragment, or explicit default port; required for dc_api.jwt"
+    end
+  end
+
+  defp valid_dc_api_origin?(origin) when is_binary(origin) do
+    # Core's origin validator also permits native platform URIs. This Phoenix
+    # integration serves browser pages, so it requires an HTTPS web origin.
+    String.starts_with?(origin, "https://") and Origin.valid?(origin)
+  end
+
+  defp valid_dc_api_origin?(_origin), do: false
+
+  defp validate_verifier_accepted_algs!(nil), do: :ok
+
+  defp validate_verifier_accepted_algs!(algs) do
+    if not (is_list(algs) and Enum.all?(algs, &(&1 in ["ES256", "ES384", "ES512"])) and
+              Enum.uniq(algs) == algs) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :verifier_accepted_algs must be a list of distinct ES256, ES384, or ES512 values"
+    end
+  end
+
+  defp validate_presentation_response_mode!(mode) when mode in ["direct_post", "direct_post.jwt", "dc_api.jwt"], do: :ok
 
   defp validate_presentation_response_mode!(mode) do
     raise ArgumentError,
           "AttestoPhoenix.Config: :presentation_response_mode must be \"direct_post\" or " <>
-            "\"direct_post.jwt\"; got #{inspect(mode)}"
+            "\"direct_post.jwt\" or \"dc_api.jwt\"; got #{inspect(mode)}"
   end
 end
 

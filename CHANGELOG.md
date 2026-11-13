@@ -6,6 +6,25 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.10.0] - 2026-11-12
+
+Requires `attesto >= 2.17.0 and < 3.0.0`.
+
+### Added
+
+- Digital Credentials API presentation requests and encrypted `dc_api.jwt`
+  responses (OpenID4VP 1.0 §§A.1–A.4, B.2.6.2). The host configures its page
+  origin at boot. Signed requests include `expected_origins`; each stored
+  session records its flow and refuses responses from another flow or origin.
+  The page posts the returned response to a session-specific endpoint, using
+  the existing response decryption and single-use result handling. Plain
+  `dc_api` is not offered because HAIP 1.0 §5.2 requires `dc_api.jwt`.
+  Redirect presentations remain the default.
+- `:verifier_accepted_algs` to opt into ES384/P-384 and ES512/P-521 mdoc issuer
+  signatures through core's `:accepted_algs`. The default mdoc policy remains
+  ES256-only. Requests advertise the configured issuer algorithms; device
+  authentication is unchanged (HAIP 1.0 §7).
+
 ## [4.9.0] - 2026-11-12
 
 Requires `attesto >= 2.16.0 and < 3.0.0`.

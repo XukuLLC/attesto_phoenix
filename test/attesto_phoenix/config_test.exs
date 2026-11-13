@@ -2724,6 +2724,62 @@ defmodule AttestoPhoenix.ConfigTest do
       end
     end
 
+    test "DC API requires a configured serialized HTTPS origin at boot" do
+      for origin <- ["https://page.example", "https://page.example:8443", "https://[::1]:8443"] do
+        built = config(presentation_response_mode: "dc_api.jwt", verifier_dc_api_origin: origin)
+        assert Config.verifier_dc_api_origin(built) == origin
+        assert Config.presentation_response_mode(built) == "dc_api.jwt"
+      end
+
+      for origin <- [
+            nil,
+            "",
+            42,
+            :origin,
+            "http://page.example",
+            "origin:https://page.example",
+            "https://page.example/",
+            "https://page.example/path",
+            "https://user@page.example",
+            "https://page.example?query",
+            "https://page.example#fragment",
+            "https://page.example:443",
+            "https://page.example:65536",
+            "https://PAGE.example",
+            "https://page.example\n"
+          ] do
+        assert_raise ArgumentError, ~r/:verifier_dc_api_origin/, fn ->
+          config(presentation_response_mode: "dc_api.jwt", verifier_dc_api_origin: origin)
+        end
+      end
+
+      assert_raise ArgumentError, ~r/:verifier_dc_api_origin/, fn ->
+        config(verifier_dc_api_origin: "https://page.example/")
+      end
+
+      assert Config.verifier_dc_api_origin(config()) == nil
+    end
+
+    test "plain DC API mode is not offered" do
+      assert_raise ArgumentError, ~r/:presentation_response_mode/, fn ->
+        config(presentation_response_mode: "dc_api", verifier_dc_api_origin: "https://page.example")
+      end
+    end
+
+    test "issuer algorithm policy defaults to core and accepts explicit mdoc algorithms" do
+      assert Config.verifier_accepted_algs(config()) == nil
+
+      for algs <- [[], ["ES256"], ["ES384"], ["ES256", "ES384", "ES512"]] do
+        assert Config.verifier_accepted_algs(config(verifier_accepted_algs: algs)) == algs
+      end
+
+      for algs <- ["ES256", [:ES256], ["ES256", "ES256"], ["none"], ["RS256"], ["EdDSA"], [42]] do
+        assert_raise ArgumentError, ~r/:verifier_accepted_algs/, fn ->
+          config(verifier_accepted_algs: algs)
+        end
+      end
+    end
+
     test "accepts only supported verifier client-id schemes" do
       assert Config.verifier_client_id_scheme(config(verifier_client_id_scheme: "redirect_uri")) ==
                "redirect_uri"

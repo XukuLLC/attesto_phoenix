@@ -57,6 +57,9 @@ defmodule AttestoPhoenix.Router do
       endpoint, mounted only with `presentation: true`.
     * `POST /oauth/presentation_response` - the OID4VP direct-post response
       endpoint, mounted only with `presentation: true`.
+    * `POST /oauth/presentation_response/:id` - the encrypted DC API response
+      posted back by the page, also mounted with `presentation: true`. Configure
+      `:verifier_dc_api_origin` before creating DC API sessions.
     * `GET /.well-known/openid-credential-issuer` - OID4VCI Credential Issuer
       Metadata, mounted with `credential_issuance: true`.
     * `GET /.well-known/jwt-vc-issuer` - SD-JWT VC JWT VC Issuer Metadata,
@@ -257,9 +260,11 @@ defmodule AttestoPhoenix.Router do
       lists. The host must also configure `:status_list_store`; the endpoint
       answers 404 for a list it cannot resolve.
     * `:presentation` - when `true`, independently mounts the public OID4VP
-      request-object and direct-post response endpoints. Defaults to `false`.
-      The host must configure `:presentation_session_store` and
-      `:verifier_client_id`.
+      request and response endpoints, including the DC API page POST at
+      `/oauth/presentation_response/:id`. Defaults to `false`. The host must
+      configure `:presentation_session_store` and `:verifier_client_id`.
+      DC API sessions also require a boot-validated `:verifier_dc_api_origin`.
+      Browser-session binding and CSRF enforcement belong to the host pipeline.
     * `:ciba` - when `true`, mounts `POST /oauth/bc-authorize`, the OpenID
       Connect CIBA backchannel authentication endpoint. Defaults to `false`.
       The endpoint still fails closed at request time unless the host also
@@ -1117,6 +1122,12 @@ defmodule AttestoPhoenix.Router do
         unquote(prefix <> presentation_response_path),
         unquote(@presentation_response_controller),
         :create
+      )
+
+      post(
+        unquote(prefix <> presentation_response_path <> "/:id"),
+        unquote(@presentation_response_controller),
+        :create_dc_api
       )
     end
   end
