@@ -80,6 +80,15 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   no-store cache headers (RFC 7234 §5.2) because the body can carry a freshly
   minted credential.
 
+  An authenticated `GET` or `PUT` without the required management callbacks
+  returns `405 Method Not Allowed` with an empty body and an `Allow` header
+  (RFC 9110 §15.5.6, §10.2.1). The header lists configured, mounted `GET`,
+  `PUT` and `DELETE` methods for this client resource. `POST` belongs to the
+  collection endpoint and is not included. Missing or invalid registration
+  access tokens still return `401 invalid_token` (RFC 7592 §2).
+  Hosts can omit read and update entirely with the router's
+  `registration_read: false` and `registration_update: false` options.
+
   ## Event
 
   A successful registration emits a `:client_registered` event (RFC 7591)
@@ -94,6 +103,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   alias AttestoPhoenix.AuthorizationServer.Registration
   alias AttestoPhoenix.AuthorizationServer.Registration.Request
   alias AttestoPhoenix.{Config, Event, OAuthError}
+  alias AttestoPhoenix.RouteControls
 
   # RFC 7591 §3.1: the registration request body is a JSON object.
   @content_type_json "application/json"
@@ -141,7 +151,8 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   registration access token. Renders the client's current registration.
 
   A host must wire `:client_registration_access_token_hash` and
-  `:client_registration_metadata`; absent either, the endpoint fails closed.
+  `:client_registration_metadata`. Without the token callback authentication
+  fails; without the metadata callback an authenticated request receives 405.
   """
   @spec show(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def show(conn, %{"client_id" => client_id}) when is_binary(client_id) do
@@ -149,6 +160,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_management_https(conn, config),
+         :ok <- check_management_method(conn, config, client_id, "GET"),
          {:ok, response} <- Registration.read(config, client_id, registration_bearer_token(conn)) do
       json(conn, response)
     else
@@ -162,8 +174,9 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   `application/json`. Renders the updated registration.
 
   A host must wire `:client_registration_access_token_hash`,
-  `:client_registration_metadata` and `:update_client`; absent any, the
-  endpoint fails closed.
+  `:client_registration_metadata` and `:update_client`. Without the token
+  callback authentication fails; without either management callback an
+  authenticated request receives 405 before its metadata is inspected.
   """
   @spec update(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def update(conn, %{"client_id" => client_id}) when is_binary(client_id) do
@@ -171,6 +184,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
     conn = OAuthError.no_store(conn, config)
 
     with :ok <- require_management_https(conn, config),
+         :ok <- check_management_method(conn, config, client_id, "PUT"),
          :ok <- check_content_type(conn),
          {:ok, response, events} <-
            Registration.update(config, client_id, registration_bearer_token(conn), Map.get(conn, :body_params)) do
@@ -183,6 +197,38 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   defp require_management_https(conn, config) do
     require_https(conn, config, {:error, error(:invalid_request, "the request must be made over TLS")})
+  end
+
+  # Authenticate unavailable methods before reporting capabilities, just as
+  # the registration core authenticates available methods (RFC 7592 §2).
+  defp check_management_method(conn, config, client_id, method) do
+    allowed = available_management_methods(conn, config)
+
+    if method in allowed do
+      :ok
+    else
+      with {:ok, _client, _token} <-
+             Registration.authorize_management(config, client_id, registration_bearer_token(conn)) do
+        {:error,
+         OAuthError.new(:method_not_allowed, nil,
+           status: 405,
+           headers: [{"allow", Enum.join(allowed, ", ")}]
+         )}
+      end
+    end
+  end
+
+  defp available_management_methods(conn, config) do
+    omitted = RouteControls.omitted(conn)
+    metadata? = not is_nil(Config.client_registration_metadata_fun(config))
+
+    [
+      {"GET", metadata? and :registration_read not in omitted},
+      {"PUT", metadata? and not is_nil(Config.update_client_fun(config)) and :registration_update not in omitted},
+      {"DELETE", not is_nil(Config.unregister_client_fun(config))}
+    ]
+    |> Enum.filter(fn {_method, available?} -> available? end)
+    |> Enum.map(fn {method, _available?} -> method end)
   end
 
   @doc """
@@ -281,6 +327,14 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   defp render_delete_error(conn, %OAuthError{error: @error_invalid_token} = err) do
     OAuthError.render(conn, err, auth_scheme: :bearer, config: Config.resolve!(conn))
+  end
+
+  # An unavailable HTTP method is not an RFC 7591 metadata error. No OAuth
+  # error code is invented; RFC 9110 §15.5.6 requires the Allow header.
+  defp render_delete_error(conn, %OAuthError{error: :method_not_allowed, status: 405, headers: headers}) do
+    conn
+    |> merge_resp_headers(headers)
+    |> send_resp(:method_not_allowed, "")
   end
 
   defp render_delete_error(conn, %OAuthError{} = err), do: render_error(conn, err)

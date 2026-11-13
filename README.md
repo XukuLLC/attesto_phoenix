@@ -158,9 +158,35 @@ Requires `attesto >= 2.18.0 and < 3.0.0`.
 
 For `prompt=login`, the authentication callback must return `auth_time` at or
 later than `auth_opts.parked_at` on an interaction resume. Fresh requests allow
-60 seconds before arrival, as the interactive `max_age` check does. The host
+`AttestoPhoenix.Interaction.reauthentication_allowance_seconds/0` (60 seconds)
+before arrival, as the interactive `max_age` check does. The host
 still owns reauthentication; unusable timestamps are logged and produce
 `server_error` (OpenID Connect Core §3.1.2.3).
+
+In authentication and consent callbacks,
+`AttestoPhoenix.Interaction.request_params(conn)` returns the parked parameters
+on resume, or the request's query and parsed body parameters otherwise. For
+PAR it returns the front-channel `request_uri`, which is resolved again on
+resume; use the validated `request` argument for resolved protocol fields.
+
+A consent page can use the existing `AttestoPhoenix.Interaction.park/2` and
+return to `/oauth/authorize?resume=<id>`. Parking again after a login resume
+preserves the original parameters and park time. `prompt=login` still requires
+authentication at or after the first park. See `AttestoPhoenix.Interaction`
+for a consent callback example and the freshness requirements.
+
+To offer registration and deletion without read or update, mount:
+
+```elixir
+attesto_routes(registration: true, registration_read: false, registration_update: false)
+```
+
+Read and update remain mounted by default with `registration: true`. When
+mounted but missing `:client_registration_metadata` or `:update_client`, they
+now return `405 Method Not Allowed` to an authenticated client, with an empty
+body and `Allow` listing configured, mounted methods for that client resource.
+This replaces `400 invalid_client_metadata` for those missing callbacks
+(RFC 7592 §2.1, §2.2; RFC 9110 §15.5.6, §10.2.1).
 
 Set `render_end_session_error: fn conn, error -> ... end` to render logout
 errors. The callback receives an `AttestoPhoenix.OAuthError` with library-owned

@@ -70,6 +70,36 @@ defmodule AttestoPhoenix.RouterTest do
     end
   end
 
+  defmodule RegistrationCreateDeleteRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    attesto_routes(registration: true, registration_read: false, registration_update: false)
+  end
+
+  defmodule RegistrationWithoutReadRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    pipeline :registration_protocol do
+      plug :accepts, ["json"]
+    end
+
+    attesto_routes(
+      prefix: "/auth",
+      route_pipelines: [protocol: :registration_protocol],
+      registration: true,
+      registration_read: false
+    )
+  end
+
+  defmodule RegistrationWithoutUpdateRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    attesto_routes(prefix: "/auth", registration: true, registration_update: false)
+  end
+
   defmodule FederationRouter do
     use Phoenix.Router
     use AttestoPhoenix.Router
@@ -816,6 +846,8 @@ defmodule AttestoPhoenix.RouterTest do
 
     test "does not mount registration by default" do
       refute find_route(DefaultRouter, :post, "/oauth/register")
+      refute find_route(DefaultRouter, :get, "/oauth/register/:client_id")
+      refute find_route(DefaultRouter, :put, "/oauth/register/:client_id")
       refute find_route(DefaultRouter, :delete, "/oauth/register/:client_id")
     end
 
@@ -833,6 +865,55 @@ defmodule AttestoPhoenix.RouterTest do
       assert find_route(RegistrationRouter, :get, "/oauth/register/:client_id")
       assert find_route(RegistrationRouter, :put, "/oauth/register/:client_id")
       assert find_route(RegistrationRouter, :delete, "/oauth/register/:client_id")
+    end
+
+    test "read and update can both be omitted while create and delete remain mounted" do
+      assert find_route(RegistrationCreateDeleteRouter, :post, "/oauth/register")
+      assert find_route(RegistrationCreateDeleteRouter, :delete, "/oauth/register/:client_id")
+      refute find_route(RegistrationCreateDeleteRouter, :get, "/oauth/register/:client_id")
+      refute find_route(RegistrationCreateDeleteRouter, :put, "/oauth/register/:client_id")
+
+      for method <- [:get, :put] do
+        assert_raise NoRouteError, fn ->
+          RegistrationCreateDeleteRouter.call(conn(method, "/oauth/register/client-123"), [])
+        end
+      end
+    end
+
+    test "read and update controls work independently with prefixes and class pipelines" do
+      path = "/auth/oauth/register/:client_id"
+      refute find_route(RegistrationWithoutReadRouter, :get, path)
+      assert find_route(RegistrationWithoutReadRouter, :put, path)
+      assert route_pipeline(RegistrationWithoutReadRouter, :put, path) == [:registration_protocol]
+      assert find_route(RegistrationWithoutUpdateRouter, :get, path)
+      refute find_route(RegistrationWithoutUpdateRouter, :put, path)
+
+      for router <- [RegistrationWithoutReadRouter, RegistrationWithoutUpdateRouter] do
+        assert find_route(router, :post, "/auth/oauth/register")
+        assert find_route(router, :delete, path)
+      end
+    end
+
+    test "a mounted PUT excludes an omitted GET from Allow even when its callback exists" do
+      config =
+        metadata_config(
+          registration_enabled: true,
+          register_client: fn attrs -> {:ok, attrs} end,
+          load_client: fn "client-123" -> {:ok, %{}} end,
+          client_registration_access_token_hash: fn _client -> Attesto.Secret.hash("registration-token") end,
+          client_registration_metadata: fn _client -> %{} end,
+          unregister_client: fn _client -> :ok end
+        )
+
+      response =
+        :put
+        |> configured_conn("/auth/oauth/register/client-123", config)
+        |> Map.put(:scheme, :https)
+        |> put_req_header("authorization", "Bearer registration-token")
+        |> RegistrationWithoutReadRouter.call([])
+
+      assert response.status == 405
+      assert get_resp_header(response, "allow") == ["DELETE"]
     end
 
     test "mounts presentation routes only when independently enabled" do
@@ -1251,6 +1332,8 @@ defmodule AttestoPhoenix.RouterTest do
     test "all route-mount controls reject non-boolean compile-time values" do
       controls = [
         :registration,
+        :registration_read,
+        :registration_update,
         :device,
         :credential_issuance,
         :federation,

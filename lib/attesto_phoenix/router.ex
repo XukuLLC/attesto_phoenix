@@ -196,6 +196,14 @@ defmodule AttestoPhoenix.Router do
       host has wired the registration callbacks in `AttestoPhoenix.Config`;
       this option only controls whether the routes exist, so a deployment that
       never offers registration presents no registration surface at all.
+    * `:registration_read`, `:registration_update` - compile-time controls
+      for `GET` and `PUT /oauth/register/:client_id` (RFC 7592 §2.1, §2.2).
+      Each defaults to `true` and only takes effect with `registration: true`.
+      Set either to `false` to omit that route while keeping `POST` and
+      `DELETE`. Mounted read/update routes without the required host callbacks
+      return `405 Method Not Allowed` to an authenticated client, with `Allow`
+      listing the configured, mounted methods at that client resource
+      (RFC 9110 §15.5.6, §10.2.1).
     * `:userinfo` - a compile-time route-mount control. When `false`, omits
       `GET`/`POST /oauth/userinfo` while retaining the generic OAuth
       authorization-server routes. Defaults to `true` for compatibility.
@@ -483,9 +491,8 @@ defmodule AttestoPhoenix.Router do
     session_management? = normalize_route_mount_control!(opts, :session_management, false, __CALLER__)
     userinfo? = normalize_route_mount_control!(opts, :userinfo, true, __CALLER__)
 
-    # PAR, revocation and introspection are mounted by default. The omitted
-    # ones are recorded on the metadata and authorization routes, where
-    # `AttestoPhoenix.RouteControls` reads them back.
+    # Optional routes default to mounted. Record omissions for discovery,
+    # authorization policy and registration management's Allow header.
     omitted_routes =
       Enum.reject(AttestoPhoenix.RouteControls.controls(), fn control ->
         normalize_route_mount_control!(opts, control, true, __CALLER__)
@@ -572,16 +579,28 @@ defmodule AttestoPhoenix.Router do
             :create
           )
 
-          get(
-            unquote(prefix <> register_path <> "/:client_id"),
-            unquote(registration_controller),
-            :show
+          unquote(
+            registration_management_route(
+              :get,
+              :show,
+              :registration_read,
+              omitted_routes,
+              prefix <> register_path <> "/:client_id",
+              registration_controller,
+              omitted_private
+            )
           )
 
-          put(
-            unquote(prefix <> register_path <> "/:client_id"),
-            unquote(registration_controller),
-            :update
+          unquote(
+            registration_management_route(
+              :put,
+              :update,
+              :registration_update,
+              omitted_routes,
+              prefix <> register_path <> "/:client_id",
+              registration_controller,
+              omitted_private
+            )
           )
 
           delete(
@@ -1213,6 +1232,16 @@ defmodule AttestoPhoenix.Router do
     if control not in omitted do
       quote do
         post(unquote(path), unquote(controller), :create)
+      end
+    end
+  end
+
+  defp registration_management_route(method, action, control, omitted, path, controller, private) do
+    if control not in omitted do
+      opts = if map_size(private) == 0, do: [], else: [private: private]
+
+      quote do
+        unquote(method)(unquote(path), unquote(controller), unquote(action), unquote(Macro.escape(opts)))
       end
     end
   end

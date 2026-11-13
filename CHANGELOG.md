@@ -54,6 +54,30 @@ defaults in a minor release.
   description, and status. Request parameters are never copied into the error.
   The default HTML/JSON responses are unchanged (RP-Initiated Logout §4).
 
+- `AttestoPhoenix.Interaction.request_params/1` returns the parked parameters
+  on resume, or the request's query and parsed body parameters otherwise.
+  PAR retains its front-channel `request_uri` and resolves it again on resume
+  (RFC 9126 §2.3).
+- `AttestoPhoenix.Interaction.reauthentication_allowance_seconds/0` exposes
+  the 60-second allowance used by the controller for interactive `max_age`
+  and fresh `prompt=login` requests (OpenID Connect Core §3.1.2.1, §3.1.2.3).
+- Router options `registration_read: false` and `registration_update: false`
+  omit `GET` and `PUT /oauth/register/:client_id` independently. Both default
+  to `true` when registration is mounted (RFC 7592 §2.1, §2.2).
+- A consent callback example using the existing `Interaction.park/2` and
+  resume flow (OpenID Connect Core §3.1.2.4).
+
+### Changed
+
+- Parking a resumed request for consent now retains the original parameters
+  and first park time. `prompt=login` still requires authentication at or
+  after that original park (OpenID Connect Core §3.1.2.1, §3.1.2.3).
+- Mounted registration read/update routes without their required host
+  callbacks now return `405 Method Not Allowed` to an authenticated client,
+  with an empty body and `Allow` listing the configured, mounted methods at
+  that client resource. Previously they returned `400 invalid_client_metadata`
+  (RFC 7592 §2.1, §2.2; RFC 9110 §15.5.6, §10.2.1).
+
 ## [4.10.0] - 2026-11-12
 
 Requires `attesto >= 2.17.0 and < 3.0.0`.

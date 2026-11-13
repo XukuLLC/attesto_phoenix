@@ -203,7 +203,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     with true <- map_size(params) == 1,
          :ok <- RequestContext.check_https(conn, config),
          {:ok, parked} <- Interaction.take(config, conn, resume_id) do
-      {:ok, Plug.Conn.put_private(conn, @resumed_private_key, parked), parked.params}
+      conn = Plug.Conn.put_private(conn, @resumed_private_key, parked)
+      {:ok, conn, Interaction.request_params(conn)}
     else
       false -> {:error, :resume_with_parameters}
       {:error, :insecure_transport} -> {:error, :insecure_transport}
@@ -666,14 +667,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   #     contract violation, not something the client can fix: `server_error`.
   #     A host that did re-authenticate comes back to this endpoint a moment
   #     after the login completed, so the interactive check allows
-  #     `@reauthentication_allowance_seconds` beyond `max_age`; without it
+  #     `Interaction.reauthentication_allowance_seconds/0` beyond `max_age`; without it
   #     `max_age=0` could never be satisfied.
   #     A resumed request has the time it was parked, so that interval is
   #     replaced by `Interaction.max_age_allowance/3`: an authentication made
   #     after the park satisfies `max_age`, an earlier one is checked exactly.
   #   * A missing or malformed `auth_time` is a host fault under either prompt.
-  @reauthentication_allowance_seconds 60
-
   defp check_authentication_age(conn, request, subject, prompt_none?) do
     auth_time = Map.get(subject, :auth_time)
     now = System.system_time(:second)
@@ -681,7 +680,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     allowance =
       case resumed(conn) do
         _any when prompt_none? -> 0
-        nil -> @reauthentication_allowance_seconds
+        nil -> Interaction.reauthentication_allowance_seconds()
         %{parked_at: parked_at} -> Interaction.max_age_allowance(parked_at, auth_time, now)
       end
 
@@ -702,7 +701,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     {since, allowance} =
       case resumed(conn) do
         %{parked_at: parked_at} -> {parked_at, 0}
-        nil -> {conn.private.attesto_phoenix_authorization_arrived_at, @reauthentication_allowance_seconds}
+        nil -> {conn.private.attesto_phoenix_authorization_arrived_at, Interaction.reauthentication_allowance_seconds()}
       end
 
     case AuthorizationRequest.check_prompt_login(request, Map.get(subject, :auth_time), since,

@@ -2,19 +2,24 @@ defmodule AttestoPhoenix.RouteControls do
   @moduledoc """
   Which optional protocol routes `attesto_routes/1` left unmounted.
 
-  `par: false`, `revocation: false` and `introspection: false` are compile-time
+  `par: false`, `revocation: false`, `introspection: false`,
+  `registration_read: false` and `registration_update: false` are compile-time
   router options, while the metadata documents are built at request time from
   `AttestoPhoenix.Config`. The macro records the omitted routes on the routes
   that need to know (both metadata documents and the authorization endpoint),
   and this module is the one place that reads the record back, so the RFC 8414
   document and the OpenID Provider document cannot disagree about which
   endpoints exist.
+
+  Registration management routes also read this record when constructing
+  their `Allow` header (RFC 9110 §10.2.1). Omitting read or update does not
+  remove the registration endpoint from discovery.
   """
 
   alias AttestoPhoenix.{Callback, Config}
 
   @private_key :attesto_phoenix_omitted_routes
-  @controls [:par, :revocation, :introspection]
+  @controls [:par, :revocation, :introspection, :registration_read, :registration_update]
 
   # RFC 8414 §2 / RFC 9126 §5: the members that describe each endpoint. A
   # document must not advertise an endpoint the router does not serve.
@@ -25,6 +30,8 @@ defmodule AttestoPhoenix.RouteControls do
       revocation_endpoint_auth_methods_supported
       revocation_endpoint_auth_signing_alg_values_supported
     ),
+    registration_read: [],
+    registration_update: [],
     introspection: ~w(
       introspection_endpoint
       introspection_endpoint_auth_methods_supported
@@ -33,7 +40,7 @@ defmodule AttestoPhoenix.RouteControls do
     )
   }
 
-  @type control :: :par | :revocation | :introspection
+  @type control :: :par | :revocation | :introspection | :registration_read | :registration_update
 
   @doc "The route controls this module tracks."
   @spec controls() :: [control()]

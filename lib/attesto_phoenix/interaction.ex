@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.Interaction do
   @moduledoc """
-  Park an authorization request while the End-User authenticates, and resume
-  it afterwards.
+  Park an authorization request while the End-User authenticates or grants
+  consent, and resume it afterwards.
 
   When `:authenticate_resource_owner` has to send the End-User to a login page
   (no session, `prompt=login`, or an authentication older than `max_age`), the
@@ -32,6 +32,43 @@ defmodule AttestoPhoenix.Interaction do
   must be at or after `parked_at`. A stale session, missing time, or invalid
   time is a host contract violation: it is logged and returned as
   `server_error`. The host must perform reauthentication before resuming.
+  Both host callbacks can use `request_params/1` to read the original
+  parameters; `conn.params` still describes the HTTP request containing only
+  `resume`.
+
+  ## Leaving the authorization endpoint for consent
+
+  `park/2` can already be called from `:consent`. Save the consent decision
+  against the validated request and subject, then return the browser to
+  `/oauth/authorize?resume=<resume_id>` (use the host's configured path).
+  Returning with the original query instead starts a new request, including
+  a new `prompt=login` authentication requirement (OpenID Connect Core
+  §3.1.2.1, §3.1.2.3, §3.1.2.4).
+
+      def consent(conn, request, subject) do
+        if consent_recorded?(conn, request, subject) do
+          {:consented, subject}
+        else
+          {:ok, resume_id} = AttestoPhoenix.Interaction.park(conn, request)
+          {:halt, redirect(conn, to: "/consent?resume=" <> resume_id)}
+        end
+      end
+
+  Here `consent_recorded?/3` is host policy: it checks consent for the same
+  client, subject, scopes and resources. The consent page records approval
+  before redirecting back; a resume identifier alone is not approval.
+  The controller still runs authentication, scope policy and consent again.
+
+  A login resume may itself be parked for consent. That second park retains
+  the original parameters and original `parked_at`, so authentication after
+  the login park remains usable even after a long consent step. The host's
+  authentication callback should accept that authentication using
+  `auth_opts.parked_at`, while still honoring `auth_opts.force_reauth`.
+  If the first park happens in consent, `prompt=login` requires authentication
+  at or after that park; an earlier session does not qualify, even within the
+  fresh-request allowance. Park before reauthentication when the flow needs
+  both login and consent. Never treat `auth_opts.resumed` alone as evidence
+  of fresh authentication.
 
   A parked request can be resumed once. It is bound to the browser that parked
   it through the host's `:interaction_browser_binding` callback
@@ -46,9 +83,9 @@ defmodule AttestoPhoenix.Interaction do
 
   ## `max_age`
 
-  A request with `max_age` normally allows a short interval beyond `max_age`
-  for the trip back from the login page. On a resumed request that interval is
-  replaced by an exact rule: an authentication performed after the request was
+  A request with `max_age` normally allows `reauthentication_allowance_seconds/0`
+  beyond `max_age` for the trip back from the login page. On a resumed request
+  that interval is replaced by an exact rule: an authentication performed after the request was
   parked satisfies `max_age` (the End-User re-authenticated for this request);
   one performed before it must still be within `max_age` now. `max_age=0` on a
   resumed request therefore requires an authentication newer than the park.
@@ -74,6 +111,8 @@ defmodule AttestoPhoenix.Interaction do
 
   @key_prefix "urn:attesto:interaction:"
   @resume_id_bytes 32
+  @resumed_private_key :attesto_phoenix_resumed_interaction
+  @reauthentication_allowance_seconds 60
 
   @type parked :: %{params: map(), client_id: String.t(), parked_at: integer()}
 
@@ -84,6 +123,10 @@ defmodule AttestoPhoenix.Interaction do
   `request` is the validated request the host callback received. Call this
   from `:authenticate_resource_owner` (or `:consent`), where `conn` still
   carries the authorization request's parameters.
+
+  Parking a resumed request preserves its original parameters and first
+  `parked_at`. Each park issues a new single-use identifier bound to the
+  browser; the consumed identifier cannot be reused.
 
   Raises `ArgumentError` when the configuration cannot park a request: no
   `:interaction_browser_binding`, a `:par_store` without `take/1`, or a
@@ -97,10 +140,10 @@ defmodule AttestoPhoenix.Interaction do
     resume_id = Secret.generate(@resume_id_bytes)
 
     entry = %{
-      "params" => parked_params(conn),
+      "params" => request_params(conn),
       "client_id" => request.client_id,
       "binding" => binding_hash(binding),
-      "parked_at" => System.system_time(:second)
+      "parked_at" => original_parked_at(conn)
     }
 
     case store.put(@key_prefix <> resume_id, entry, config.interaction_ttl) do
@@ -155,10 +198,27 @@ defmodule AttestoPhoenix.Interaction do
 
   def max_age_allowance(_parked_at, _auth_time, _now), do: 0
 
-  # The authorization parameters as they arrived: query and body, without
-  # router path parameters. A `request_uri` among them is kept as the
-  # reference; the pushed request is resolved again on resume.
-  defp parked_params(%Plug.Conn{} = conn) do
+  @doc """
+  The authorization parameters used as input to request validation.
+
+  On a resumed request, returns the original parked parameters. Otherwise,
+  fetches the query parameters and merges the already parsed body parameters
+  over them, excluding router path parameters. An unfetched body contributes
+  no parameters; the host pipeline must parse request bodies before dispatch.
+
+  For PAR, returns the front-channel parameters, including `request_uri`,
+  rather than the pushed parameters. The controller resolves that reference
+  again on each resume and consumes it only on completion (RFC 9126 §2.3).
+  Signed Request Objects are likewise left encoded. Use the validated
+  `request` argument for protocol fields and policy decisions.
+
+  Available to both `:authenticate_resource_owner` and `:consent`; callers
+  need not read private connection fields or the resume-only `conn.params`.
+  """
+  @spec request_params(Plug.Conn.t()) :: map()
+  def request_params(%Plug.Conn{private: %{@resumed_private_key => %{params: params}}}), do: params
+
+  def request_params(%Plug.Conn{} = conn) do
     conn = Plug.Conn.fetch_query_params(conn)
 
     body =
@@ -167,8 +227,24 @@ defmodule AttestoPhoenix.Interaction do
         %{} = params -> params
       end
 
-    conn.query_params |> Map.merge(body) |> Map.delete("resume")
+    Map.merge(conn.query_params, body)
   end
+
+  @doc """
+  The interactive allowance, in seconds, for a fresh authorization request.
+
+  The controller allows this interval beyond `max_age`, or before request
+  arrival for `prompt=login` (OpenID Connect Core §3.1.2.1, §3.1.2.3).
+  `prompt=none` gets no allowance. Resumes use the original `parked_at`
+  instead: `prompt=login` requires `auth_time >= parked_at`, and `max_age`
+  uses `max_age_allowance/3`. Hosts must still perform reauthentication.
+  """
+  @spec reauthentication_allowance_seconds() :: non_neg_integer()
+  def reauthentication_allowance_seconds, do: @reauthentication_allowance_seconds
+
+  defp original_parked_at(%Plug.Conn{private: %{@resumed_private_key => %{parked_at: parked_at}}}), do: parked_at
+
+  defp original_parked_at(%Plug.Conn{}), do: System.system_time(:second)
 
   defp store!(config) do
     case store(config) do

@@ -1805,15 +1805,65 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       end
     end
 
-    test "GET and PUT fail closed when the host has not wired the callbacks" do
-      no_metadata = management_config(stored_registration(), client_registration_metadata: nil)
-      assert management_request(:get, :show, no_metadata, @management_token).status == 400
+    test "GET and PUT return 405 with DELETE allowed when metadata is not configured" do
+      config =
+        management_config(stored_registration(),
+          client_registration_metadata: nil,
+          unregister_client: fn _client -> :ok end
+        )
 
-      no_update = management_config(stored_registration(), update_client: nil)
-      conn = management_request(:put, :update, no_update, @management_token, update_document())
-      assert conn.status == 400
-      assert body(conn)["error"] == "invalid_client_metadata"
-      assert body(conn)["error_description"] =~ "not configured"
+      for {method, action, document} <- [{:get, :show, nil}, {:put, :update, update_document()}] do
+        conn = management_request(method, action, config, @management_token, document)
+        assert conn.status == 405
+        assert conn.resp_body == ""
+        assert get_resp_header(conn, "allow") == ["DELETE"]
+        assert get_resp_header(conn, "cache-control") == ["no-store"]
+        assert get_resp_header(conn, "www-authenticate") == []
+      end
+
+      refute_received {:updated, _, _}
+    end
+
+    test "PUT without an update callback allows configured GET and DELETE" do
+      config =
+        management_config(stored_registration(),
+          update_client: nil,
+          unregister_client: fn _client -> :ok end
+        )
+
+      conn = management_request(:put, :update, config, @management_token, update_document())
+      assert conn.status == 405
+      assert get_resp_header(conn, "allow") == ["GET, DELETE"]
+      assert management_request(:get, :show, config, @management_token).status == 200
+    end
+
+    test "Allow excludes an unconfigured DELETE and can be empty" do
+      for {metadata, expected} <- [{fn client -> client end, "GET"}, {nil, ""}] do
+        config = management_config(stored_registration(), client_registration_metadata: metadata, update_client: nil)
+        conn = management_request(:put, :update, config, @management_token, update_document())
+        assert conn.status == 405
+        assert get_resp_header(conn, "allow") == [expected]
+      end
+    end
+
+    test "unavailable methods authenticate before disclosing capabilities" do
+      config = management_config(stored_registration(), client_registration_metadata: nil, update_client: nil)
+
+      for {method, action} <- [{:get, :show}, {:put, :update}], token <- [nil, "wrong-token"] do
+        conn = management_request(method, action, config, token)
+        assert conn.status == 401
+        assert body(conn)["error"] == "invalid_token"
+        assert get_resp_header(conn, "allow") == []
+        assert ["Bearer " <> _] = get_resp_header(conn, "www-authenticate")
+      end
+    end
+
+    test "an unavailable PUT returns 405 before checking content type or metadata" do
+      config = management_config(stored_registration(), update_client: nil)
+      conn = management_request(:put, :update, config, @management_token)
+      assert conn.status == 405
+      assert get_resp_header(conn, "allow") == ["GET"]
+      refute_received {:updated, _, _}
     end
 
     test "PUT replaces the metadata, keeps the identifier and issuance time, and rotates nothing" do

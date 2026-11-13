@@ -18,6 +18,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Interaction
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
 
@@ -2019,6 +2020,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   describe "park and resume (AttestoPhoenix.Interaction)" do
+    test "request_params merges query and parsed body without path parameters" do
+      conn = Plug.Test.conn(:post, "/oauth/authorize?state=query&login_hint=user")
+      assert Interaction.request_params(conn) == %{"state" => "query", "login_hint" => "user"}
+
+      conn = %{conn | body_params: %{"state" => "body"}, params: %{"path_only" => "ignored"}}
+      assert Interaction.request_params(conn) == %{"state" => "body", "login_hint" => "user"}
+    end
+
     defp call_query(params, browser \\ "browser-1") do
       :get
       |> Plug.Test.conn("/oauth/authorize?" <> URI.encode_query(params))
@@ -2044,6 +2053,139 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert_received {:parked, resume_id}
       assert_received {:auth_opts, %{resumed: false}}
       resume_id
+    end
+
+    test "both callbacks can read the original POST parameters after resume" do
+      params = valid_params(%{"login_hint" => "person@example.com", "state" => "body"})
+
+      put_config(
+        authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        consent: fn conn, _request, subject ->
+          send(self(), {:consent_params, Interaction.request_params(conn)})
+          {:consented, subject}
+        end
+      )
+
+      conn =
+        :post
+        |> Plug.Test.conn("/oauth/authorize?state=query", params)
+        |> Map.put(:body_params, params)
+        |> Map.put(:scheme, :https)
+        |> put_req_header("x-browser", "browser-1")
+        |> with_config()
+        |> AuthorizeController.authorize(params)
+
+      assert conn.resp_body == "login"
+      assert_received {:auth_params, ^params}
+      assert_received {:parked, resume_id}
+      assert is_binary(location_query(call_query(%{"resume" => resume_id}))["code"])
+      assert_received {:auth_params, ^params}
+      assert_received {:consent_params, ^params}
+    end
+
+    test "PAR parameters retain the reference through parking and are resolved again" do
+      uri = "urn:ietf:params:oauth:request_uri:accessor"
+      params = %{"client_id" => @client_id, "request_uri" => uri}
+      :ok = PARStore.put(uri, valid_params(), 60)
+
+      put_config(
+        par_store: PARStore,
+        authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        consent: fn conn, request, subject ->
+          assert Interaction.request_params(conn) == params
+          assert request.state == "pushed-state"
+          {:consented, subject}
+        end
+      )
+
+      assert call_query(params).resp_body == "login"
+      assert_received {:auth_params, ^params}
+      assert_received {:parked, resume_id}
+      assert {:ok, _stored} = PARStore.take(uri)
+      :ok = PARStore.put(uri, valid_params(%{"state" => "pushed-state"}), 60)
+      assert %{"code" => code, "state" => "pushed-state"} = location_query(call_query(%{"resume" => resume_id}))
+      assert is_binary(code)
+      assert_received {:auth_params, ^params}
+      assert :error = PARStore.fetch(uri)
+    end
+
+    test "consent can park a fresh request and resume after authentication" do
+      params = valid_params(%{"prompt" => "login"})
+
+      put_config(
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        authenticate_resource_owner: fn _conn, _request, opts ->
+          send(self(), {:auth_opts, opts})
+          auth_time = opts.parked_at || System.system_time(:second)
+          {:authenticated, %{subject: "user-42", auth_time: auth_time}}
+        end,
+        consent: &__MODULE__.park_consent_once/3
+      )
+
+      assert call_query(params).resp_body == "consent"
+      assert_received {:consent_params, ^params}
+      assert_received {:consent_parked, resume_id}
+      assert is_binary(location_query(call_query(%{"resume" => resume_id}))["code"])
+      assert_received {:auth_opts, %{resumed: true, force_reauth: true, parked_at: parked_at}}
+      assert is_integer(parked_at)
+      assert_received {:consent_params, ^params}
+    end
+
+    test "login then consent can park twice without losing parameters or the original park time" do
+      resume_id = park!(%{"prompt" => "login", "max_age" => "0"}, consent: &__MODULE__.park_consent_once/3)
+      parked_at = backdate_park(resume_id)
+      Process.put(:resume_auth_time, parked_at + 1)
+
+      assert call_query(%{"resume" => resume_id}).resp_body == "consent"
+      assert_received {:auth_opts, %{parked_at: ^parked_at}}
+      assert_received {:consent_parked, consent_id}
+      assert_received {:consent_params, params}
+      assert params == valid_params(%{"prompt" => "login", "max_age" => "0"})
+
+      assert is_binary(location_query(call_query(%{"resume" => consent_id}))["code"])
+      assert_received {:auth_opts, %{parked_at: ^parked_at}}
+      assert_received {:consent_params, ^params}
+      assert call_query(%{"resume" => consent_id}).status == 400
+    end
+
+    test "a consent resume still refuses authentication older than the original login park" do
+      resume_id = park!(%{"prompt" => "login"}, consent: &__MODULE__.park_consent_once/3)
+      parked_at = backdate_park(resume_id)
+      Process.put(:resume_auth_time, parked_at)
+      assert call_query(%{"resume" => resume_id}).resp_body == "consent"
+      assert_received {:consent_parked, consent_id}
+
+      Process.put(:resume_auth_time, parked_at - 1)
+      assert %{"error" => "server_error"} = location_query(call_query(%{"resume" => consent_id}))
+      assert TestStore.count() == 0
+    end
+
+    defp backdate_park(resume_id) do
+      key = "urn:attesto:interaction:" <> resume_id
+      {:ok, entry} = PARStore.take(key)
+      parked_at = System.system_time(:second) - 120
+      :ok = PARStore.put(key, Map.put(entry, "parked_at", parked_at), 600)
+      parked_at
+    end
+
+    test "the public allowance matches fresh prompt=login and max_age checks" do
+      allowance = Interaction.reauthentication_allowance_seconds()
+      assert allowance == 60
+
+      for params <- [%{"prompt" => "login"}, %{"max_age" => "0"}] do
+        for {age, accepted?} <- [{allowance - 5, true}, {allowance + 5, false}] do
+          put_config(
+            authenticate_resource_owner: fn _conn, _request, _opts ->
+              {:authenticated, %{subject: "user-42", auth_time: System.system_time(:second) - age}}
+            end
+          )
+
+          result = location_query(call_query(valid_params(params)))
+          if accepted?, do: assert(is_binary(result["code"])), else: assert(result["error"] == "server_error")
+        end
+      end
     end
 
     test "prompt=login exposes park time and refuses stale, missing, or future authentication" do
@@ -3243,6 +3385,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   # on the resume.
   def park_or_authenticate(conn, request, auth_opts) do
     send(self(), {:auth_opts, auth_opts})
+    send(self(), {:auth_params, Interaction.request_params(conn)})
 
     if auth_opts.resumed do
       auth_time = Process.get(:resume_auth_time, System.system_time(:second))
@@ -3255,6 +3398,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   def browser_binding(conn), do: conn |> Plug.Conn.get_req_header("x-browser") |> List.first()
+
+  def park_consent_once(conn, request, subject) do
+    send(self(), {:consent_params, Interaction.request_params(conn)})
+
+    if Process.get(:consent_parked) do
+      {:consented, subject}
+    else
+      Process.put(:consent_parked, true)
+      {:ok, resume_id} = Interaction.park(conn, request)
+      send(self(), {:consent_parked, resume_id})
+      {:halt, Plug.Conn.send_resp(conn, 200, "consent")}
+    end
+  end
 
   def consent(_conn, _request, subject), do: {:consented, subject}
 end

@@ -229,15 +229,16 @@ defmodule AttestoPhoenix.Config do
       `:register_client` or `:update_client` returned, so a host that narrows
       scopes or grant types answers with what it kept. Credential hashes in
       the map are never sent to the client. Optional; when unset, `GET` and
-      `PUT` fail closed, and a registration response reports the validated
-      request.
+      `PUT` return `405 Method Not Allowed` to an authenticated client, and a
+      registration response reports the validated request.
     * `:update_client` - `(client, metadata -> {:ok, client} | {:error,
       reason})`. Replaces a dynamically registered client's metadata after a
       validated `PUT` to the registration management endpoint (RFC 7592
       §2.2). `metadata` is the complete new registration, validated by the
       rules a registration request is, with `client_id` and
       `client_id_issued_at`; the host replaces what it stored and keeps the
-      credential hashes. Optional; when unset, `PUT` fails closed.
+      credential hashes. Optional; when unset, an authenticated `PUT` returns
+      `405 Method Not Allowed` with the available methods in `Allow`.
     * `:introspection_authorize` - `(caller_client_id, response -> boolean)`.
       Authorizes the authenticated introspection caller against the token being
       introspected (RFC 7662 §4 / RFC 9701 §5). Consulted only for an active
