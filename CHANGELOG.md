@@ -6,6 +6,22 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.14.1] - 2026-11-13
+
+### Fixed
+
+- `Interaction.decide/4` refused every consent decision posted from a page
+  with `Referrer-Policy: no-referrer`. Browsers send `Origin: null` on a
+  same-origin form POST from such a page (Fetch, "append a request `Origin`
+  header"), and 4.14.0 treated `null` as a foreign origin. `Origin: null` is
+  now not refused on its own; `Sec-Fetch-Site` other than `same-origin`, an
+  `Origin` naming another origin, and the resume id as the form's
+  synchronizer token still apply.
+- `Interaction.decide/4` raised `ArgumentError` when the browser had no
+  binding value, for example a browser that never parked a request or lost
+  its session. It now returns `{:error, :invalid_resume}`, as `take/3` does.
+  It still raises when `:interaction_browser_binding` is not configured.
+
 ## [4.14.0] - 2026-11-13
 
 ### Added

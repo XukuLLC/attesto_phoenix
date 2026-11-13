@@ -101,8 +101,10 @@ defmodule AttestoPhoenix.Interaction do
   server-side on the parked entry, and appears in no URL until the decision is
   recorded, so another site cannot build a valid POST. `decide/4` also refuses
   a request whose `Sec-Fetch-Site` header is present and not `same-origin`, or
-  whose `Origin` header is present and is not the issuer's origin, before it
-  reads the store. A page rendered from `:consent` is served by the
+  whose `Origin` header names an origin other than the issuer's, before it
+  reads the store. `Origin: null`, which browsers send on a same-origin form
+  POST from a page with `Referrer-Policy: no-referrer`, names no origin and is
+  not refused on its own. A page rendered from `:consent` is served by the
   authorization route, which cannot run `:protect_from_forgery` because the
   authorization endpoint must accept cross-site POST requests (OIDC Core
   §3.1.2.1); a Plug CSRF token put in that page is not saved to the session,
@@ -279,22 +281,31 @@ defmodule AttestoPhoenix.Interaction do
 
   Returns `{:error, :cross_origin}`, before reading the store, when the
   request's `Sec-Fetch-Site` header is present and not `same-origin`, or its
-  `Origin` header is present and is not the issuer's origin.
+  `Origin` header names an origin other than the issuer's (`Origin: null` is
+  not refused on its own). A browser with no binding value, such as one that
+  never parked a request, gets `{:error, :invalid_resume}`.
 
   Call from the host's browser POST handler, using the current subject from
-  its session. Raises `ArgumentError` for an unusable browser binding or a
-  configured `:par_store` without `replace/2`.
+  its session. Raises `ArgumentError` when `:interaction_browser_binding` is
+  not configured or the configured `:par_store` has no `replace/2`.
   """
   @spec decide(Plug.Conn.t(), String.t(), :allow | :deny, String.t()) ::
           :ok | {:error, :invalid_resume | :cross_origin}
   def decide(%Plug.Conn{} = conn, resume_id, decision, subject_id) when decision in [:allow, :deny] do
     config = Config.resolve!(conn)
     store = decision_store!(config)
-    binding = browser_binding!(config, conn)
 
-    if same_origin_request?(conn, config.issuer),
-      do: record_decision(config, store, binding, resume_id, decision, subject_id),
-      else: {:error, :cross_origin}
+    if config.interaction_browser_binding == nil,
+      do: raise(ArgumentError, "AttestoPhoenix.Interaction: :interaction_browser_binding must be configured")
+
+    if same_origin_request?(conn, config.issuer) do
+      case browser_binding(config, conn) do
+        {:ok, binding} -> record_decision(config, store, binding, resume_id, decision, subject_id)
+        :error -> {:error, :invalid_resume}
+      end
+    else
+      {:error, :cross_origin}
+    end
   end
 
   defp record_decision(config, store, binding, resume_id, decision, subject_id) do
@@ -506,6 +517,10 @@ defmodule AttestoPhoenix.Interaction do
 
   # Fetch Metadata and Origin (RFC 6454 §7) as browsers send them on a form
   # POST. Absent headers are allowed; a present one must say same-origin.
+  # `Origin: null` carries no origin: browsers send it on a same-origin form
+  # POST when the page's Referrer-Policy is `no-referrer` (Fetch, "append a
+  # request `Origin` header"), so it defers to `Sec-Fetch-Site` and the resume
+  # id, the form's synchronizer token.
   defp same_origin_request?(conn, issuer) do
     fetch_site = Plug.Conn.get_req_header(conn, "sec-fetch-site")
     origin = Plug.Conn.get_req_header(conn, "origin")
@@ -514,6 +529,7 @@ defmodule AttestoPhoenix.Interaction do
   end
 
   defp allowed_origin?([], _issuer_origin), do: true
+  defp allowed_origin?(["null"], _issuer_origin), do: true
   defp allowed_origin?([origin], issuer_origin) when issuer_origin != nil, do: origin_of(origin) == issuer_origin
   defp allowed_origin?(_origin, _issuer_origin), do: false
 

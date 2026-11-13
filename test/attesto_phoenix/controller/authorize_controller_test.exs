@@ -2168,8 +2168,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
             {"sec-fetch-site", "same-site"},
             {"origin", "https://attacker.example"},
             {"origin", "http://issuer.example.com"},
-            {"origin", "https://issuer.example.com:8443"},
-            {"origin", "null"}
+            {"origin", "https://issuer.example.com:8443"}
           ] do
         conn = put_req_header(decision_conn(), header, value)
         assert {:error, :cross_origin} = Interaction.decide(conn, id, :allow, "user-42")
@@ -2185,6 +2184,41 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert :ok = Interaction.decide(conn, id, :allow, "user-42")
       assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
       assert_received {:consent_decision, :allow}
+    end
+
+    test "decide accepts Origin: null from a no-referrer page and defers to Sec-Fetch-Site" do
+      decision_config()
+      id = park_for_decision()
+      key = Interaction.parked_key(id, "browser-1")
+      assert {:ok, original} = PARStore.fetch(key)
+
+      cross_site =
+        decision_conn()
+        |> put_req_header("origin", "null")
+        |> put_req_header("sec-fetch-site", "cross-site")
+
+      assert {:error, :cross_origin} = Interaction.decide(cross_site, id, :allow, "user-42")
+      assert {:ok, ^original} = PARStore.fetch(key)
+
+      same_origin =
+        decision_conn()
+        |> put_req_header("origin", "null")
+        |> put_req_header("sec-fetch-site", "same-origin")
+
+      assert :ok = Interaction.decide(same_origin, id, :allow, "user-42")
+      assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
+      assert_received {:consent_decision, :allow}
+    end
+
+    test "decide from a browser with no binding value is invalid_resume, not an exception" do
+      decision_config()
+      id = park_for_decision()
+      key = Interaction.parked_key(id, "browser-1")
+      assert {:ok, original} = PARStore.fetch(key)
+
+      no_binding = :post |> Plug.Test.conn("/consent") |> with_config()
+      assert {:error, :invalid_resume} = Interaction.decide(no_binding, id, :allow, "user-42")
+      assert {:ok, ^original} = PARStore.fetch(key)
     end
 
     test "decide refuses entries parked without a subject and preserves park/2 resume" do
