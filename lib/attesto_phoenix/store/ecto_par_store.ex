@@ -22,6 +22,9 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
     * `take/1` resolves and atomically deletes a live reference in one
       `DELETE … RETURNING` statement, for hosts that want single-use semantics.
       Exactly one of any number of racing callers gets the row.
+    * `replace/2` atomically updates a live entry's value without changing its
+      expiry, for `AttestoPhoenix.Interaction.decide/4`. It never recreates a
+      taken entry.
 
   The repository module is supplied by the host application (`:repo` under the
   `:attesto_phoenix` app) and read at call time; a store with no backing
@@ -143,6 +146,35 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
 
     case repo.delete_all(query, prefix: prefix, log: false, telemetry_event: nil) do
       {1, [params]} -> {:ok, params}
+      {0, _} -> :error
+    end
+  end
+
+  @doc """
+  Atomically replaces a live entry's value, keeping its expiry.
+
+  One `UPDATE … WHERE` statement returns `:ok` only when the entry is still
+  present and unexpired. A concurrent `take/1` either gets the whole updated
+  value or removes the row before this update, which then returns `:error`.
+  """
+  @impl AttestoPhoenix.PARStore
+  @spec replace(String.t(), map()) :: :ok | :error
+  def replace(request_uri, params) when is_binary(request_uri) and is_map(params) do
+    if StoreEcto.text_value?(request_uri) and nul_free?(params) do
+      replace_stored(request_uri, params)
+    else
+      :error
+    end
+  end
+
+  defp replace_stored(request_uri, params) do
+    {repo, prefix} = StoreEcto.mutation_context()
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    query = from p in PushedRequest, where: p.request_uri == ^request_uri and p.expires_at > ^now
+
+    case repo.update_all(query, [set: [params: params]], prefix: prefix, log: false, telemetry_event: nil) do
+      {1, _} -> :ok
       {0, _} -> :error
     end
   end

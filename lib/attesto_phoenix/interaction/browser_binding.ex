@@ -19,8 +19,9 @@ defmodule AttestoPhoenix.Interaction.BrowserBinding do
   `configure_session(conn, renew: true)` keeps the session data while renewing
   the session; `drop: true` discards it. If the value is lost, the next browser
   request gets a different binding and resume is refused through the
-  wrong-browser path, spending the parked request. The browser must start a
-  new authorization request.
+  wrong-browser path. The parked request can no longer be found by any
+  browser and expires with `:interaction_ttl`; the browser must start a new
+  authorization request.
   """
 
   @behaviour Plug

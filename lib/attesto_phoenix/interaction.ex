@@ -44,30 +44,95 @@ defmodule AttestoPhoenix.Interaction do
   parameters; `conn.params` still describes the HTTP request containing only
   `resume`.
 
-  ## Leaving the authorization endpoint for consent
+  ## Recording a consent decision
 
-  `park/2` can already be called from `:consent`. Save the consent decision
-  against the validated request and subject, then return the browser to
-  `/oauth/authorize?resume=<resume_id>` (use the host's configured path).
-  Returning with the original query instead starts a new request, including
-  a new `prompt=login` authentication requirement (OpenID Connect Core
-  §3.1.2.1, §3.1.2.3, §3.1.2.4).
+  From `:consent`, park with the authenticated OIDC `sub` and render the host's
+  consent page. On resume, use `consent_decision/3` against the newly validated
+  request and authenticated subject:
 
       def consent(conn, request, subject) do
-        if consent_recorded?(conn, request, subject) do
-          {:consented, subject}
-        else
-          case AttestoPhoenix.Interaction.park(conn, request) do
-            {:ok, resume_id} -> {:halt, redirect(conn, to: "/consent?resume=" <> resume_id)}
-            {:error, _reason} -> {:error, :temporarily_unavailable}
-          end
+        case AttestoPhoenix.Interaction.consent_decision(conn, request, subject) do
+          :allow ->
+            {:consented, subject}
+
+          :deny ->
+            {:denied, :user_denied}
+
+          nil ->
+            case AttestoPhoenix.Interaction.park(conn, request, subject: subject.subject) do
+              {:ok, resume_id} ->
+                {:halt, render(conn, :consent, resume_id: resume_id, request: request)}
+
+              {:error, _reason} ->
+                {:error, :temporarily_unavailable}
+            end
         end
       end
 
-  Here `consent_recorded?/3` is host policy: it checks consent for the same
-  client, subject, scopes and resources. The consent page records approval
-  before redirecting back; a resume identifier alone is not approval.
-  The controller still runs authentication, scope policy and consent again.
+  The page POSTs the resume id and Allow/Deny choice to a host handler with a
+  fetched session, the `AttestoPhoenix.Interaction.BrowserBinding` plug and
+  `AttestoPhoenix.Plug.PutConfig`, as on the authorization route. Read the
+  current authenticated subject from the host session, never from the form:
+
+      def record_consent(conn, %{"resume" => resume_id, "decision" => choice}) do
+        subject_id = get_session(conn, :subject)
+
+        decision = case choice do
+          "allow" -> :allow
+          "deny" -> :deny
+          _ -> nil
+        end
+
+        if decision in [:allow, :deny] and is_binary(subject_id) do
+          case AttestoPhoenix.Interaction.decide(conn, resume_id, decision, subject_id) do
+            :ok -> redirect(conn, to: "/oauth/authorize?" <> URI.encode_query(%{"resume" => resume_id}))
+            {:error, :invalid_resume} -> send_resp(conn, 400, "Invalid consent request")
+          end
+        else
+          send_resp(conn, 400, "Invalid consent request")
+        end
+      end
+
+  Use the host's configured authorization path and return with
+  `?resume=<resume_id>` only.
+
+  Cross-site request forgery: the resume id in the form is the page's
+  synchronizer token. It is random, bound to this browser and subject, held
+  server-side on the parked entry, and appears in no URL until the decision is
+  recorded, so another site cannot build a valid POST. `decide/4` also refuses
+  a request whose `Sec-Fetch-Site` header is present and not `same-origin`, or
+  whose `Origin` header is present and is not the issuer's origin, before it
+  reads the store. A page rendered from `:consent` is served by the
+  authorization route, which cannot run `:protect_from_forgery` because the
+  authorization endpoint must accept cross-site POST requests (OIDC Core
+  §3.1.2.1); a Plug CSRF token put in that page is not saved to the session,
+  so do not require one on this handler. Serve the page and the handler from
+  the issuer's origin.
+
+  The library ships no POST controller because the session, the subject and
+  the page belong to the host. Protect the consent page against clickjacking
+  with a Content-Security-Policy `frame-ancestors` directive appropriate for
+  the host (for example, `frame-ancestors 'none'`).
+
+  No separate `AttestoPhoenix.ConsentGrant` is needed for this flow. The
+  decision lives on the single-use parked entry: its key binds it to the
+  browser, `decide/4` and `consent_decision/3` bind it to the subject, and the
+  stored consent binding hash binds it to the request. The accessor recomputes
+  that hash from the resumed validated request, covering the client, redirect
+  URI, effective scope, resource, PKCE challenge and method, claims, DPoP key,
+  and authorization details (all `AttestoPhoenix.ConsentGrant.binding/2`
+  fields; RFC 6749 §4.1.1, §3.3). Nothing about the decision is in a cookie.
+  Two consent pages in one browser have separate entries. Another decision
+  before resume replaces the first without extending expiry. Re-parking
+  always clears the decision; supply `subject:` again for a new consent page.
+
+  A resume id alone is not approval. The library does not act on a recorded
+  decision: the host's `:consent` chooses whether to consent, deny, or park
+  again. The controller still loads the client and runs validation, scope
+  policy, authentication and consent. A consent halt under `prompt=none`
+  still becomes `consent_required` (OIDC Core §3.1.2.1, §3.1.2.6).
+  Returning with the original query starts a fresh request, including a new
+  `prompt=login` requirement (OIDC Core §3.1.2.1, §3.1.2.3, §3.1.2.4).
 
   If a fresh `prompt=login` request passes authentication before parking in
   consent, `prompt_login_since` records the bound that check used: request
@@ -80,29 +145,6 @@ defmodule AttestoPhoenix.Interaction do
   The host can reuse an authentication satisfying `auth_opts.prompt_login_since`
   on resume while honoring `auth_opts.force_reauth`. Never treat
   `auth_opts.resumed` alone as evidence of fresh authentication.
-
-  For a single-use consent grant, save `params = request_params(conn)` and the
-  validated `request` in the host's consent context before leaving this
-  callback. On the consent page, after approval, mint and keep the token in
-  the browser's session:
-
-      binding = AttestoPhoenix.ConsentGrant.binding_from_params(
-        params, subject, scope: request.scope
-      )
-      {:ok, token} = AttestoPhoenix.Store.EctoConsentGrantStore.mint(binding, 300)
-
-      conn
-      |> put_session(:consent_grant, %{"resume" => resume_id, "token" => token})
-      |> redirect(to: "/oauth/authorize?resume=" <> resume_id)
-
-  Here `subject` is the authenticated subject identifier and the saved context
-  must be tied to this browser and consent page; do not trust replacement
-  parameters from the page submission. In `:consent` on resume, read the
-  session token for that `resume_id` and consume it against
-  `AttestoPhoenix.ConsentGrant.binding(request, subject.subject)` before
-  returning `{:consented, subject}`. See `AttestoPhoenix.ConsentGrant` for the
-  complete callback example and the PAR / signed Request Object case. Do not
-  add the grant token to the resume URL; `resume` must be its only parameter.
 
   A parked request can be resumed once. It is bound to the browser that parked
   it through the host's `:interaction_browser_binding` callback
@@ -147,8 +189,9 @@ defmodule AttestoPhoenix.Interaction do
 
   Parked requests live in the configured `:par_store`, under a key no pushed
   authorization request can have, for `:interaction_ttl` seconds (default 600,
-  at most 3600). The store must implement atomic `take/1`. The bundled stores
-  expire the rows as they do pushed requests (the Ecto store through the
+  at most 3600). The store must implement atomic `take/1`, and atomic
+  `replace/2` only when using `decide/4`. The bundled stores expire the rows
+  as they do pushed requests (the Ecto store through the
   sweeper), and parked requests count toward the ETS store's
   `:par_max_entries`.
   """
@@ -157,6 +200,7 @@ defmodule AttestoPhoenix.Interaction do
   alias Attesto.Secret
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.ConsentGrant
   # Not a `urn:ietf:params:oauth:request_uri:` reference, so the key space is
   # disjoint from pushed authorization requests held in the same store.
   alias AttestoPhoenix.Store.PAR.ETS
@@ -171,7 +215,10 @@ defmodule AttestoPhoenix.Interaction do
           params: map(),
           client_id: String.t(),
           parked_at: integer(),
-          prompt_login_since: integer()
+          prompt_login_since: integer(),
+          subject: String.t() | nil,
+          consent_binding: String.t() | nil,
+          consent_decision: String.t() | nil
         }
 
   @doc """
@@ -188,25 +235,32 @@ defmodule AttestoPhoenix.Interaction do
   that check uses the park time. Each park issues a new single-use identifier
   bound to the browser; the consumed identifier cannot be reused.
 
+  Pass `subject: subject_id` (a non-empty OIDC `sub`) to bind a subsequent
+  `decide/4` call to that subject and this validated request. Re-parking never
+  carries over a consent decision, even when the subject is supplied again.
+
   Raises `ArgumentError` when the configuration cannot park a request: no
   `:interaction_browser_binding`, a `:par_store` without `take/1`, or a
   callback that returns no usable browser value.
   """
   @spec park(Plug.Conn.t(), AuthorizationRequest.t()) :: {:ok, String.t()} | {:error, term()}
-  def park(%Plug.Conn{} = conn, %AuthorizationRequest{} = request) do
+  @spec park(Plug.Conn.t(), AuthorizationRequest.t(), keyword()) :: {:ok, String.t()} | {:error, term()}
+  def park(%Plug.Conn{} = conn, %AuthorizationRequest{} = request, opts \\ []) do
     config = Config.resolve!(conn)
     store = store!(config)
     binding = browser_binding!(config, conn)
     resume_id = Secret.generate(@resume_id_bytes)
     parked_at = original_parked_at(conn)
 
-    entry = %{
-      "params" => request_params(conn),
-      "client_id" => request.client_id,
-      "binding" => binding_hash(binding),
-      "parked_at" => parked_at,
-      "prompt_login_since" => original_prompt_login_since(conn, parked_at)
-    }
+    entry =
+      %{
+        "params" => request_params(conn),
+        "client_id" => request.client_id,
+        "binding" => binding_hash(binding),
+        "parked_at" => parked_at,
+        "prompt_login_since" => original_prompt_login_since(conn, parked_at)
+      }
+      |> bind_subject(request, opts)
 
     case store.put(parked_key(resume_id, binding), entry, config.interaction_ttl) do
       :ok -> {:ok, resume_id}
@@ -215,9 +269,79 @@ defmodule AttestoPhoenix.Interaction do
   end
 
   @doc """
+  Record `:allow` or `:deny` on a live parked request for the current browser
+  and authenticated OIDC `subject_id`. A later call replaces the decision.
+
+  Returns `{:error, :invalid_resume}` without changing the entry for a wrong
+  browser or subject, an entry parked without `subject:`, or an unknown,
+  expired or taken id. Replacement retains the entry's original expiry and
+  cannot recreate a taken entry.
+
+  Returns `{:error, :cross_origin}`, before reading the store, when the
+  request's `Sec-Fetch-Site` header is present and not `same-origin`, or its
+  `Origin` header is present and is not the issuer's origin.
+
+  Call from the host's browser POST handler, using the current subject from
+  its session. Raises `ArgumentError` for an unusable browser binding or a
+  configured `:par_store` without `replace/2`.
+  """
+  @spec decide(Plug.Conn.t(), String.t(), :allow | :deny, String.t()) ::
+          :ok | {:error, :invalid_resume | :cross_origin}
+  def decide(%Plug.Conn{} = conn, resume_id, decision, subject_id) when decision in [:allow, :deny] do
+    config = Config.resolve!(conn)
+    store = decision_store!(config)
+    binding = browser_binding!(config, conn)
+
+    if same_origin_request?(conn, config.issuer),
+      do: record_decision(config, store, binding, resume_id, decision, subject_id),
+      else: {:error, :cross_origin}
+  end
+
+  defp record_decision(config, store, binding, resume_id, decision, subject_id) do
+    Config.with_request_config(config, fn ->
+      with true <- is_binary(resume_id) and resume_id != "",
+           true <- is_binary(subject_id) and subject_id != "",
+           key = parked_key(resume_id, binding),
+           {:ok, %{"subject" => stored_subject} = entry} <- store.fetch(key),
+           true <- secure_equal?(stored_subject, subject_id),
+           :ok <- store.replace(key, Map.put(entry, "consent_decision", Atom.to_string(decision))) do
+        :ok
+      else
+        _ -> {:error, :invalid_resume}
+      end
+    end)
+  end
+
+  @doc """
+  The decision recorded on the resumed request, if it still matches the
+  authenticated subject and validated request's consent binding.
+
+  Use inside `:consent`. Returns `nil` for a fresh request, an absent decision,
+  or a changed subject or request binding (including the effective scope).
+  The host decides whether to consent, deny, or park for consent again.
+  """
+  @spec consent_decision(Plug.Conn.t(), AuthorizationRequest.t(), map()) :: :allow | :deny | nil
+  def consent_decision(%Plug.Conn{} = conn, %AuthorizationRequest{} = request, subject) do
+    with %{subject: subject_id} when is_binary(subject_id) and subject_id != "" <- subject,
+         %{subject: stored_subject, consent_binding: stored_binding, consent_decision: decision}
+         when decision in ["allow", "deny"] <- conn.private[@resumed_private_key],
+         true <- secure_equal?(stored_subject, subject_id),
+         true <- secure_equal?(stored_binding, consent_binding(request, subject_id)) do
+      case decision do
+        "allow" -> :allow
+        "deny" -> :deny
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  @doc """
   Take the request parked under `resume_id` for the browser on `conn`.
 
-  Returns `{:ok, %{params: ..., client_id: ..., parked_at: ..., prompt_login_since: ...}}`, or
+  Returns `{:ok, parked}` with the original parameters, client id, park and
+  login times, and `subject`, `consent_binding`, `consent_decision` (each `nil`
+  when absent), or
   `{:error, :invalid_resume}` when the id is unknown, expired or already used,
   the browser value does not match, or the configuration cannot resume. The
   lookup key includes the browser value, so a wrong browser's lookup finds no
@@ -232,7 +356,16 @@ defmodule AttestoPhoenix.Interaction do
          when is_map(params) and is_binary(client_id) and is_binary(stored) and is_integer(parked_at) <- entry,
          true <- Plug.Crypto.secure_compare(stored, binding_hash(binding)),
          since when is_integer(since) and since >= 0 <- Map.get(entry, "prompt_login_since", parked_at) do
-      {:ok, %{params: params, client_id: client_id, parked_at: parked_at, prompt_login_since: since}}
+      {:ok,
+       %{
+         params: params,
+         client_id: client_id,
+         parked_at: parked_at,
+         prompt_login_since: since,
+         subject: Map.get(entry, "subject"),
+         consent_binding: Map.get(entry, "consent_binding"),
+         consent_decision: Map.get(entry, "consent_decision")
+       }}
     else
       _ -> {:error, :invalid_resume}
     end
@@ -338,6 +471,64 @@ defmodule AttestoPhoenix.Interaction do
               "AttestoPhoenix.Interaction: :par_store must implement put/3 and atomic take/1 to park a request"
     end
   end
+
+  defp decision_store!(config) do
+    store = store!(config)
+
+    if function_exported?(store, :replace, 2) do
+      store
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Interaction: :par_store must implement atomic replace/2 to record a consent decision"
+    end
+  end
+
+  defp bind_subject(entry, request, opts) do
+    case Keyword.fetch(opts, :subject) do
+      {:ok, subject} when is_binary(subject) and subject != "" ->
+        entry
+        |> Map.put("subject", subject)
+        |> Map.put("consent_binding", consent_binding(request, subject))
+
+      :error ->
+        entry
+
+      _ ->
+        raise ArgumentError, "AttestoPhoenix.Interaction: :subject must be a non-empty binary OIDC sub"
+    end
+  end
+
+  defp consent_binding(request, subject), do: ConsentGrant.binding_hash(ConsentGrant.binding(request, subject))
+
+  defp secure_equal?(left, right) when is_binary(left) and is_binary(right), do: Plug.Crypto.secure_compare(left, right)
+
+  defp secure_equal?(_left, _right), do: false
+
+  # Fetch Metadata and Origin (RFC 6454 §7) as browsers send them on a form
+  # POST. Absent headers are allowed; a present one must say same-origin.
+  defp same_origin_request?(conn, issuer) do
+    fetch_site = Plug.Conn.get_req_header(conn, "sec-fetch-site")
+    origin = Plug.Conn.get_req_header(conn, "origin")
+
+    fetch_site in [[], ["same-origin"]] and allowed_origin?(origin, origin_of(issuer))
+  end
+
+  defp allowed_origin?([], _issuer_origin), do: true
+  defp allowed_origin?([origin], issuer_origin) when issuer_origin != nil, do: origin_of(origin) == issuer_origin
+  defp allowed_origin?(_origin, _issuer_origin), do: false
+
+  defp origin_of(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host, port: port} when is_binary(scheme) and is_binary(host) and host != "" ->
+        if String.downcase(scheme) in ["https", "http"],
+          do: {String.downcase(scheme), String.downcase(host), port}
+
+      _other ->
+        nil
+    end
+  end
+
+  defp origin_of(_url), do: nil
 
   defp store(config) do
     store = config.par_store || ETS

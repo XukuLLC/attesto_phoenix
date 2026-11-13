@@ -14,71 +14,12 @@ defmodule AttestoPhoenix.ConsentGrant do
   canonical field list and therefore yield the same `binding_hash/1` for the
   equivalent request.
 
-  ## Consent with park/resume
-
-  A resume URL accepts only `resume`; carry the consent grant in the browser's
-  session. Before parking in `:consent`, save
-  `params = AttestoPhoenix.Interaction.request_params(conn)`, the validated
-  `request`, and the authenticated subject in a host-owned consent context.
-  Tie that context to this browser and `resume_id`. On the consent page,
-  after checking the current subject, CSRF protection, and approval, mint:
-
-      def approve_consent(conn, resume_id) do
-        %{params: params, request: request, subject: subject} =
-          load_consent_context!(conn, resume_id)
-
-        binding = AttestoPhoenix.ConsentGrant.binding_from_params(
-          params, subject, scope: request.scope
-        )
-        {:ok, token} = AttestoPhoenix.Store.EctoConsentGrantStore.mint(binding, 300)
-
-        conn
-        |> put_session(:consent_grant, %{"resume" => resume_id, "token" => token})
-        |> redirect(to: "/oauth/authorize?resume=" <> resume_id)
-      end
-
-  The context helpers below are host code. Save trusted values on the server;
-  do not accept replacement authorization parameters from the approval form.
-  Consume the grant in `:consent` against the request validated on resume:
-
-      def consent(conn, request, subject) do
-        resume_id = conn.params["resume"]
-
-        case get_session(conn, :consent_grant) do
-          %{"resume" => ^resume_id, "token" => token} when is_binary(resume_id) ->
-            binding = AttestoPhoenix.ConsentGrant.binding(request, subject.subject)
-
-            case AttestoPhoenix.Store.EctoConsentGrantStore.consume(token, binding) do
-              :ok -> {:consented, subject}
-              {:error, reason} -> {:denied, reason}
-            end
-
-          _ ->
-            params = AttestoPhoenix.Interaction.request_params(conn)
-
-            case AttestoPhoenix.Interaction.park(conn, request) do
-              {:ok, resume_id} ->
-                save_consent_context!(conn, resume_id, %{
-                  params: params, request: request, subject: subject.subject
-                })
-                {:halt, redirect(conn, to: "/consent?resume=" <> resume_id)}
-
-              {:error, _reason} ->
-                {:error, :temporarily_unavailable}
-            end
-        end
-      end
-
-  The session pairs the token with its resume id so a leftover token is not
-  applied to a later authorization request. Session changes inside a
-  `{:consented, subject}` callback are not persisted; `consume/2` enforces
-  single use even if the token remains in the session. A token is not consent
-  until its binding has been checked and it has been consumed.
-
-  `request_params/1` returns front-channel parameters. For PAR or a signed
-  Request Object, those do not contain all validated fields: save the binding
-  built with `binding(request, subject)` in the trusted consent context and
-  mint from it after approval instead of rebuilding from the raw parameters.
+  Hosts that park requests should use `AttestoPhoenix.Interaction.park/3`
+  with `subject:` and `AttestoPhoenix.Interaction.decide/4` to record consent
+  on the parked entry, then read `AttestoPhoenix.Interaction.consent_decision/3`
+  on resume. That flow needs no separate consent grant or session token; see
+  `AttestoPhoenix.Interaction` for the consent callback and host POST handler.
+  Keep `ConsentGrant` for hosts that do not park, as described below.
 
   ## Consent without resume
 

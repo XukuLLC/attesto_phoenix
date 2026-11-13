@@ -82,6 +82,45 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
     assert :error = EctoPARStore.take(@request_uri)
   end
 
+  test "replace changes only a live value and never resurrects a taken entry" do
+    assert :ok = EctoPARStore.put(@request_uri, @params, 90)
+    original = TestRepo.get!(PushedAuthorizationRequest, @request_uri)
+    updated = Map.put(@params, "consent_decision", "allow")
+    assert :ok = EctoPARStore.replace(@request_uri, updated)
+    assert {:ok, ^updated} = EctoPARStore.fetch(@request_uri)
+    row = TestRepo.get!(PushedAuthorizationRequest, @request_uri)
+    assert row.expires_at == original.expires_at
+    assert row.inserted_at == original.inserted_at
+    assert {:ok, ^updated} = EctoPARStore.take(@request_uri)
+    assert :error = EctoPARStore.replace(@request_uri, @params)
+    refute TestRepo.get(PushedAuthorizationRequest, @request_uri)
+    assert :error = EctoPARStore.replace("unknown", @params)
+  end
+
+  test "replace refuses an expired entry without changing it" do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    original =
+      %{request_uri: @request_uri, params: @params, expires_at: DateTime.add(now, -1, :second), inserted_at: now}
+      |> PushedAuthorizationRequest.put_changeset()
+      |> TestRepo.insert!()
+
+    assert :error = EctoPARStore.replace(@request_uri, %{"consent_decision" => "allow"})
+    assert TestRepo.get!(PushedAuthorizationRequest, @request_uri) == original
+    assert :error = EctoPARStore.take(@request_uri)
+  end
+
+  test "replace refuses invalid PostgreSQL text without changing the entry" do
+    assert :ok = EctoPARStore.put(@request_uri, @params, 90)
+
+    for key <- [@request_uri <> <<0>>, @request_uri <> <<0xFF>>] do
+      assert :error = EctoPARStore.replace(key, @params)
+    end
+
+    assert :error = EctoPARStore.replace(@request_uri, %{"subject" => "bad\0subject"})
+    assert {:ok, @params} = EctoPARStore.fetch(@request_uri)
+  end
+
   test "put rejects a duplicate request_uri rather than overwriting" do
     :ok = EctoPARStore.put(@request_uri, @params, 90)
 
@@ -126,6 +165,8 @@ defmodule AttestoPhoenix.Store.EctoPARStoreTest do
         assert :ok = EctoPARStore.put(@request_uri, @params, 90)
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert {:ok, _} = EctoPARStore.fetch(@request_uri)
+        assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
+        assert :ok = EctoPARStore.replace(@request_uri, Map.put(@params, "consent_decision", "allow"))
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         assert {:ok, _} = EctoPARStore.take(@request_uri)
         assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []

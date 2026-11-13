@@ -59,6 +59,21 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     def take(_request_uri), do: {:error, :store_unavailable}
   end
 
+  defmodule TakenBeforeReplacePARStore do
+    @moduledoc false
+    @behaviour AttestoPhoenix.PARStore
+
+    @impl true
+    defdelegate put(key, value, ttl), to: ETS
+    @impl true
+    defdelegate take(key), to: ETS
+    @impl true
+    defdelegate replace(key, value), to: ETS
+
+    @impl true
+    def fetch(key), do: ETS.take(key)
+  end
+
   # A fixed S256 PKCE pair (RFC 7636 §4.2): the challenge is the
   # BASE64URL-no-pad encoding of SHA-256(verifier). Computed inline here (the
   # transform is fixed by the RFC) so the test does not depend on a core helper.
@@ -2076,6 +2091,264 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   describe "park and resume (AttestoPhoenix.Interaction)" do
+    defp decision_config(overrides \\ []) do
+      put_config(
+        Keyword.merge(
+          [interaction_browser_binding: &__MODULE__.browser_binding/1, consent: &consent_with_decision/3],
+          overrides
+        )
+      )
+    end
+
+    defp consent_with_decision(conn, request, subject) do
+      decision = Interaction.consent_decision(conn, request, subject)
+      send(self(), {:consent_decision, decision})
+
+      case decision do
+        :allow ->
+          {:consented, subject}
+
+        :deny ->
+          {:denied, :user_denied}
+
+        nil ->
+          {:ok, id} = Interaction.park(conn, request, subject: subject.subject)
+          send(self(), {:consent_parked, id})
+          {:halt, send_resp(conn, 200, "consent")}
+      end
+    end
+
+    defp decision_conn(browser \\ "browser-1") do
+      :post
+      |> Plug.Test.conn("/consent")
+      |> put_req_header("x-browser", browser)
+      |> with_config()
+    end
+
+    defp park_for_decision(params \\ %{}) do
+      assert call_query(valid_params(params)).resp_body == "consent"
+      assert_received {:consent_decision, nil}
+      assert_received {:consent_parked, id}
+      id
+    end
+
+    test "decide refuses other browsers and subjects without changing the entry" do
+      decision_config()
+      id = park_for_decision()
+      key = Interaction.parked_key(id, "browser-1")
+      assert {:ok, original} = PARStore.fetch(key)
+      assert original["subject"] == "user-42"
+      assert is_binary(original["consent_binding"])
+      refute Map.has_key?(original, "consent_decision")
+
+      assert {:error, :invalid_resume} = Interaction.decide(decision_conn("browser-2"), id, :deny, "user-42")
+      assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), id, :deny, "user-43")
+      assert {:ok, ^original} = PARStore.fetch(key)
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
+      resumed = call_query(%{"resume" => id})
+      assert is_binary(location_query(resumed)["code"])
+      assert_received {:consent_decision, :allow}
+
+      assert %{subject: "user-42", consent_binding: hash, consent_decision: "allow"} =
+               resumed.private.attesto_phoenix_resumed_interaction
+
+      assert hash == original["consent_binding"]
+      assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), id, :deny, "user-42")
+      assert call_query(%{"resume" => id}).status == 400
+    end
+
+    test "decide refuses a cross-origin request before reading the store" do
+      decision_config()
+      id = park_for_decision()
+      key = Interaction.parked_key(id, "browser-1")
+      assert {:ok, original} = PARStore.fetch(key)
+
+      for {header, value} <- [
+            {"sec-fetch-site", "cross-site"},
+            {"sec-fetch-site", "same-site"},
+            {"origin", "https://attacker.example"},
+            {"origin", "http://issuer.example.com"},
+            {"origin", "https://issuer.example.com:8443"},
+            {"origin", "null"}
+          ] do
+        conn = put_req_header(decision_conn(), header, value)
+        assert {:error, :cross_origin} = Interaction.decide(conn, id, :allow, "user-42")
+      end
+
+      assert {:ok, ^original} = PARStore.fetch(key)
+
+      conn =
+        decision_conn()
+        |> put_req_header("sec-fetch-site", "same-origin")
+        |> put_req_header("origin", "https://ISSUER.example.com")
+
+      assert :ok = Interaction.decide(conn, id, :allow, "user-42")
+      assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
+      assert_received {:consent_decision, :allow}
+    end
+
+    test "decide refuses entries parked without a subject and preserves park/2 resume" do
+      id = park!()
+      key = Interaction.parked_key(id, "browser-1")
+      assert {:ok, original} = PARStore.fetch(key)
+      assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), id, :allow, "user-42")
+      assert {:ok, ^original} = PARStore.fetch(key)
+      resumed = call_query(%{"resume" => id})
+      assert is_binary(location_query(resumed)["code"])
+
+      assert %{subject: nil, consent_binding: nil, consent_decision: nil} =
+               resumed.private.attesto_phoenix_resumed_interaction
+    end
+
+    test "two consent pages in one browser have separate Allow and Deny decisions" do
+      decision_config()
+      allow_id = park_for_decision(%{"state" => "allow-page"})
+      deny_id = park_for_decision(%{"state" => "deny-page"})
+      assert :ok = Interaction.decide(decision_conn(), allow_id, :allow, "user-42")
+      assert :ok = Interaction.decide(decision_conn(), deny_id, :deny, "user-42")
+
+      assert %{"error" => "access_denied", "state" => "deny-page"} =
+               location_query(call_query(%{"resume" => deny_id}))
+
+      assert_received {:consent_decision, :deny}
+      assert TestStore.count() == 0
+      assert %{"code" => code, "state" => "allow-page"} = location_query(call_query(%{"resume" => allow_id}))
+      assert is_binary(code)
+      assert_received {:consent_decision, :allow}
+      assert TestStore.count() == 1
+    end
+
+    test "a second decide replaces the first" do
+      decision_config()
+      id = park_for_decision()
+      assert :ok = Interaction.decide(decision_conn(), id, :deny, "user-42")
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
+      assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
+      assert_received {:consent_decision, :allow}
+    end
+
+    test "a changed effective scope ignores Allow and re-parking clears the decision" do
+      decision_config(
+        authorize_scope: fn _client, _scopes -> {:ok, Process.get(:effective_scope, ~w(openid profile))} end
+      )
+
+      id = park_for_decision()
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
+      Process.put(:effective_scope, ~w(openid))
+      assert call_query(%{"resume" => id}).resp_body == "consent"
+      assert_received {:consent_decision, nil}
+      assert_received {:consent_parked, next_id}
+      assert {:ok, next_entry} = PARStore.fetch(Interaction.parked_key(next_id, "browser-1"))
+      assert next_entry["subject"] == "user-42"
+      refute Map.has_key?(next_entry, "consent_decision")
+      assert :ok = Interaction.decide(decision_conn(), next_id, :allow, "user-42")
+      resumed = call_query(%{"resume" => next_id})
+      assert %{"code" => code} = location_query(resumed)
+      assert TestStore.peek(code).data.scope == ~w(openid)
+      assert_received {:consent_decision, :allow}
+    end
+
+    test "a changed authenticated subject ignores Allow" do
+      decision_config(
+        authenticate_resource_owner: fn _conn, _request, _opts ->
+          {:authenticated, %{subject: Process.get(:current_subject, "user-42"), auth_time: System.system_time(:second)}}
+        end
+      )
+
+      id = park_for_decision()
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
+      Process.put(:current_subject, "user-43")
+      assert call_query(%{"resume" => id}).resp_body == "consent"
+      assert_received {:consent_decision, nil}
+      assert_received {:consent_parked, next_id}
+      assert {:ok, %{"subject" => "user-43"} = entry} = PARStore.fetch(Interaction.parked_key(next_id, "browser-1"))
+      refute Map.has_key?(entry, "consent_decision")
+      assert TestStore.count() == 0
+    end
+
+    test "re-parking a matching resumed request never carries over its decision" do
+      decision_config()
+      id = park_for_decision()
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
+
+      decision_config(
+        consent: fn conn, request, subject ->
+          assert :allow = Interaction.consent_decision(conn, request, subject)
+
+          for opts <- [[], [subject: subject.subject]] do
+            assert {:ok, next_id} = Interaction.park(conn, request, opts)
+            assert {:ok, entry} = PARStore.fetch(Interaction.parked_key(next_id, "browser-1"))
+            refute Map.has_key?(entry, "consent_decision")
+            assert entry["subject"] == opts[:subject]
+          end
+
+          {:halt, send_resp(conn, 200, "consent")}
+        end
+      )
+
+      assert call_query(%{"resume" => id}).resp_body == "consent"
+    end
+
+    test "decide and resume both refuse an expired consent entry" do
+      decision_config()
+      id = park_for_decision()
+      key = Interaction.parked_key(id, "browser-1")
+      [{^key, entry, _expires_at}] = :ets.lookup(:attesto_phoenix_par_requests, key)
+      :ets.insert(:attesto_phoenix_par_requests, {key, entry, System.system_time(:second) - 1})
+      assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), id, :allow, "user-42")
+      assert call_query(%{"resume" => id}).status == 400
+    end
+
+    test "decide refuses unknown or malformed ids and subjects" do
+      decision_config()
+      id = park_for_decision()
+
+      for bad_id <- ["unknown", "", nil, []] do
+        assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), bad_id, :allow, "user-42")
+      end
+
+      for subject <- [nil, "", 42] do
+        assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), id, :allow, subject)
+      end
+
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
+    end
+
+    test "decide requires replace/2 and a browser binding" do
+      put_config(par_store: TakeLosesPARStore, interaction_browser_binding: &__MODULE__.browser_binding/1)
+
+      assert_raise ArgumentError, ~r/:par_store must implement atomic replace\/2/, fn ->
+        Interaction.decide(decision_conn(), "id", :allow, "user-42")
+      end
+
+      put_config([])
+
+      assert_raise ArgumentError, ~r/:interaction_browser_binding must be configured/, fn ->
+        Interaction.decide(decision_conn(), "id", :allow, "user-42")
+      end
+    end
+
+    test "a take between decide's fetch and replace refuses the decision without recreating the entry" do
+      decision_config(par_store: TakenBeforeReplacePARStore)
+      id = park_for_decision()
+      assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), id, :allow, "user-42")
+      assert :error = PARStore.fetch(Interaction.parked_key(id, "browser-1"))
+      assert call_query(%{"resume" => id}).status == 400
+    end
+
+    test "park/3 rejects an invalid subject" do
+      for subject <- [nil, "", 42] do
+        decision_config(consent: fn conn, request, _subject -> Interaction.park(conn, request, subject: subject) end)
+        assert_raise ArgumentError, ~r/:subject must be a non-empty binary/, fn -> call_query(valid_params()) end
+      end
+    end
+
+    test "prompt=none still converts a consent halt to consent_required" do
+      decision_config()
+      assert %{"error" => "consent_required"} = location_query(call_query(valid_params(%{"prompt" => "none"})))
+      assert_received {:consent_decision, nil}
+    end
+
     test "request_params merges query and parsed body without path parameters" do
       conn = Plug.Test.conn(:post, "/oauth/authorize?state=query&login_hint=user")
       assert Interaction.request_params(conn) == %{"state" => "query", "login_hint" => "user"}

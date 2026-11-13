@@ -6,6 +6,35 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.14.0] - 2026-11-13
+
+### Added
+
+- `AttestoPhoenix.Interaction.park/3` accepts `subject:` to bind a consent
+  page to the authenticated OIDC `sub` and validated request.
+  `Interaction.decide/4` records Allow/Deny on that single-use, browser-bound
+  parked entry, and `Interaction.consent_decision/3` returns it on resume only
+  for the same subject and consent binding, including the effective scope.
+  Hosts can keep consent decisions without a separate table or consent grant;
+  the host's POST handler records the decision and redirects with `resume`
+  only. Re-parking clears the decision. The resume id in the consent form is
+  the page's synchronizer token, and `decide/4` returns
+  `{:error, :cross_origin}` before reading the store when `Sec-Fetch-Site` is
+  present and not `same-origin`, or `Origin` is present and is not the
+  issuer's origin. The `Interaction` moduledoc explains why the handler cannot
+  rely on `:protect_from_forgery` for a page rendered from `:consent` (the
+  authorization endpoint must accept cross-site POST, OIDC Core §3.1.2.1).
+- Optional `c:AttestoPhoenix.PARStore.replace/2`, implemented atomically by the
+  bundled ETS and Ecto stores, updates a live entry without extending expiry
+  or recreating an entry removed by `take/1`. It is needed only for
+  `Interaction.decide/4`; existing park/resume hosts need no changes or migration.
+
+### Documentation
+
+- `Interaction.BrowserBinding`: a lost binding no longer spends the parked
+  request (since 4.13.0); it can no longer be found by any browser and
+  expires with `:interaction_ttl`.
+
 ## [4.13.0] - 2026-11-13
 
 ### Added

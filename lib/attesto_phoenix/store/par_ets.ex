@@ -70,6 +70,21 @@ defmodule AttestoPhoenix.Store.PAR.ETS do
     end
   end
 
+  @impl true
+  def replace(request_uri, params) when is_binary(request_uri) and is_map(params) do
+    ensure_table()
+    now = System.system_time(:second)
+
+    match_spec = [
+      {{request_uri, :_, :"$1"}, [{:>, :"$1", now}], [{{request_uri, {:const, params}, :"$1"}}]}
+    ]
+
+    case :ets.select_replace(@table, match_spec) do
+      1 -> :ok
+      0 -> :error
+    end
+  end
+
   defp ensure_table do
     ETSOwner.ensure(@table, @table_options)
   end

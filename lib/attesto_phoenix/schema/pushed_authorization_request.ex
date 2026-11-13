@@ -40,9 +40,8 @@ defmodule AttestoPhoenix.Schema.PushedAuthorizationRequest do
           inserted_at: DateTime.t() | nil
         }
 
-  # A pushed request is fully described by its reference, the stored params, and
-  # the two instants; there is no surrogate id and no mutable state, so every
-  # field is set once at insert.
+  # The reference and two instants are set once at insert. Parked interactions
+  # can replace params to record consent without extending the original expiry.
   @insert_fields [:request_uri, :params, :expires_at, :inserted_at]
 
   @primary_key {:request_uri, :string, autogenerate: false}

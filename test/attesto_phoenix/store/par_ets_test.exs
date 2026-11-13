@@ -91,6 +91,61 @@ defmodule AttestoPhoenix.Store.PAR.ETSTest do
     assert Enum.count(results, &(&1 == :error)) == 49
   end
 
+  test "replace changes a live entry atomically and keeps its expiry" do
+    assert :ok = ETS.put("replace", %{"old" => true}, 60)
+    [{"replace", _, expiry}] = :ets.lookup(@table, "replace")
+    value = %{"consent_decision" => "allow", "nested" => %{"value" => ["$1", "$_"]}}
+    assert :ok = ETS.replace("replace", value)
+    assert [{"replace", ^value, ^expiry}] = :ets.lookup(@table, "replace")
+    assert {:ok, ^value} = ETS.take("replace")
+    assert :error = ETS.replace("replace", %{"resurrected" => true})
+    assert :error = ETS.fetch("replace")
+    assert :error = ETS.replace("unknown", value)
+  end
+
+  test "replace refuses an expired entry without changing or extending it" do
+    assert :ok = ETS.put("expired", %{"old" => true}, 60)
+    original = {"expired", %{"old" => true}, System.system_time(:second) - 1}
+    :ets.insert(@table, original)
+    assert :error = ETS.replace("expired", %{"new" => true})
+    assert [^original] = :ets.lookup(@table, "expired")
+    assert :error = ETS.take("expired")
+  end
+
+  test "concurrent replace and take never resurrect or expose a partial value" do
+    for i <- 1..50 do
+      key = "replace-take-#{i}"
+      original = %{"subject" => "user", "consent_binding" => "binding"}
+      updated = Map.put(original, "consent_decision", "allow")
+      assert :ok = ETS.put(key, original, 60)
+      parent = self()
+
+      tasks =
+        for operation <- [fn -> ETS.replace(key, updated) end, fn -> ETS.take(key) end] do
+          Task.async(fn ->
+            send(parent, {:ready, self()})
+            receive do: (:go -> operation.())
+          end)
+        end
+
+      ready =
+        for _ <- tasks do
+          assert_receive {:ready, pid}
+          pid
+        end
+
+      Enum.each(ready, &send(&1, :go))
+
+      [replaced, taken] = Task.await_many(tasks)
+      assert replaced in [:ok, :error]
+      assert taken in [{:ok, original}, {:ok, updated}]
+      if replaced == :ok, do: assert(taken == {:ok, updated})
+      assert :error = ETS.take(key)
+      assert :error = ETS.replace(key, updated)
+      assert [] = :ets.lookup(@table, key)
+    end
+  end
+
   defp request_config(overrides) do
     struct!(
       Config,
