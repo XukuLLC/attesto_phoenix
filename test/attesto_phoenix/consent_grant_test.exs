@@ -81,6 +81,33 @@ defmodule AttestoPhoenix.ConsentGrantTest do
       assert ConsentGrant.binding_hash(from_params) == ConsentGrant.binding_hash(from_request)
     end
 
+    test "the :scope option binds the scope the policy decided, not the raw parameter" do
+      # A request that omitted scope (or a pushed one without it) reaches
+      # :consent with the policy's default in request.scope.
+      defaulted = request(scope: ["profile"])
+      raw = Map.delete(params(), "scope")
+
+      refute ConsentGrant.binding_hash(ConsentGrant.binding_from_params(raw, @subject)) ==
+               ConsentGrant.binding_hash(ConsentGrant.binding(defaulted, @subject))
+
+      for scope <- [["profile"], "profile"] do
+        assert ConsentGrant.binding_hash(ConsentGrant.binding_from_params(raw, @subject, scope: scope)) ==
+                 ConsentGrant.binding_hash(ConsentGrant.binding(defaulted, @subject))
+      end
+
+      # A policy that narrowed the request: the option replaces the raw scope.
+      narrowed = request(scope: ["openid"])
+
+      assert ConsentGrant.binding_hash(ConsentGrant.binding_from_params(params(), @subject, scope: narrowed.scope)) ==
+               ConsentGrant.binding_hash(ConsentGrant.binding(narrowed, @subject))
+    end
+
+    test "a malformed :scope option is refused" do
+      for scope <- [[""], ["two words"], [:openid], 42, %{}] do
+        assert {:error, :invalid_binding} = ConsentGrant.safe_binding_from_params(params(), @subject, scope: scope)
+      end
+    end
+
     test "scope order remains insignificant across raw params and validated request" do
       from_params = ConsentGrant.binding_from_params(params(%{"scope" => "email openid profile"}), @subject)
       from_request = ConsentGrant.binding(request(scope: ["openid", "profile", "email"]), @subject)

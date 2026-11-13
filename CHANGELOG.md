@@ -6,6 +6,20 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.11.1] - 2026-11-12
+
+### Fixed
+
+- `ConsentGrant.binding_from_params/3` and `safe_binding_from_params/3` take
+  `scope:`, the scope the scope policy decided, which the `:consent` callback
+  receives as `request.scope`. `binding/2` hashes that scope; the params
+  builders hashed the raw `scope` parameter. Since 4.11.0 a request without
+  `scope`, with an empty one, or pushed without one reaches `:consent` with the
+  policy's default, so a consent grant minted from the consent screen's
+  parameters never matched and the consent screen repeated. The same mismatch
+  applied when the policy narrowed a requested scope. Pass `scope:
+  request.scope` when minting; without it the builders behave as before.
+
 ## [4.11.0] - 2026-11-12
 
 ### Breaking

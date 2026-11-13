@@ -109,13 +109,24 @@ defmodule AttestoPhoenix.ConsentGrant do
   and `authorization_details` the original JSON array string or an
   already-decoded list. Unknown params are ignored. Malformed values raise `ArgumentError`; callers
   handling untrusted data without an existing validation boundary should use
-  `safe_binding_from_params/2`. For the equivalent validated request,
-  `binding_hash(binding_from_params(params, subject)) ==
+  `safe_binding_from_params/3`. For the equivalent validated request,
+  `binding_hash(binding_from_params(params, subject, scope: request.scope)) ==
   binding_hash(binding(request, subject))`.
+
+  ## The effective scope
+
+  `binding/2` hashes the validated request's `scope`, which is the scope the
+  scope policy decided: the client's request narrowed by the policy, or the
+  policy's default when the request omitted `scope` (RFC 6749 §3.3), including
+  a pushed request without one. The raw `scope` parameter can differ from it in
+  both cases, so pass the scope the consent screen showed, which is
+  `request.scope` in the `:consent` callback, as the `:scope` option. When
+  `:scope` is given it replaces the `scope` parameter; it is a list of scope
+  strings or a space-delimited string.
   """
-  @spec binding_from_params(map(), String.t()) :: binding()
-  def binding_from_params(params, subject) when is_map(params) and is_binary(subject) do
-    case safe_binding_from_params(params, subject) do
+  @spec binding_from_params(map(), String.t(), keyword()) :: binding()
+  def binding_from_params(params, subject, opts \\ []) when is_map(params) and is_binary(subject) do
+    case safe_binding_from_params(params, subject, opts) do
       {:ok, binding} -> binding
       {:error, :invalid_binding} -> raise ArgumentError, "invalid consent binding parameters"
     end
@@ -126,12 +137,15 @@ defmodule AttestoPhoenix.ConsentGrant do
 
   Returns `{:error, :invalid_binding}` for an invalid required scalar, set,
   claims object, authorization details array, DPoP thumbprint value, or nested
-  JSON value.
+  JSON value. Takes the same `:scope` option as `binding_from_params/3`.
   """
-  @spec safe_binding_from_params(map(), String.t()) ::
+  @spec safe_binding_from_params(map(), String.t(), keyword()) ::
           {:ok, binding()} | {:error, :invalid_binding}
-  def safe_binding_from_params(params, subject) when is_map(params) and is_binary(subject) do
+  def safe_binding_from_params(params, subject, opts \\ [])
+
+  def safe_binding_from_params(params, subject, opts) when is_map(params) and is_binary(subject) and is_list(opts) do
     with :ok <- validate_required_string(subject),
+         {:ok, params} <- put_effective_scope(params, opts),
          {:ok, source} <- safe_params_binding_source(params),
          {:ok, binding} <- validate_binding(canonical_binding(source, subject)) do
       {:ok, binding}
@@ -140,7 +154,27 @@ defmodule AttestoPhoenix.ConsentGrant do
     end
   end
 
-  def safe_binding_from_params(_params, _subject), do: {:error, :invalid_binding}
+  def safe_binding_from_params(_params, _subject, _opts), do: {:error, :invalid_binding}
+
+  # The `:scope` option replaces the raw parameter with the scope the policy
+  # decided; a list is joined so it goes through the same set normalization.
+  defp put_effective_scope(params, opts) do
+    case Keyword.fetch(opts, :scope) do
+      :error ->
+        {:ok, params}
+
+      {:ok, scope} when is_binary(scope) ->
+        {:ok, Map.put(params, "scope", scope)}
+
+      {:ok, scope} when is_list(scope) ->
+        if Enum.all?(scope, &(is_binary(&1) and &1 != "" and not String.contains?(&1, " "))),
+          do: {:ok, Map.put(params, "scope", Enum.join(scope, " "))},
+          else: {:error, :invalid_binding}
+
+      {:ok, _other} ->
+        {:error, :invalid_binding}
+    end
+  end
 
   @doc """
   The canonical binding hash for `binding`.
