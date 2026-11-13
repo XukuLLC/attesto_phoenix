@@ -17,10 +17,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.ConsentGrant
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Interaction
+  alias AttestoPhoenix.Interaction.BrowserBinding
+  alias AttestoPhoenix.Store.EctoConsentGrantStore, as: Grants
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
+  alias AttestoPhoenix.TestRepo
+  alias Ecto.Adapters.SQL.Sandbox
 
   # A PAR store that resolves (fetch) normally but whose single-use claim (take)
   # always loses - simulating a concurrent completion (on another node) that
@@ -2133,6 +2138,239 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert_received {:consent_params, ^params}
     end
 
+    test "consent parking keeps the accepted fresh login bound across a later resume" do
+      put_config(
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        authenticate_resource_owner: fn conn, _request, opts ->
+          arrival = conn.private.attesto_phoenix_authorization_arrived_at
+          send(self(), {:auth_opts, opts})
+          send(self(), {:arrival, arrival})
+          {:authenticated, %{subject: "user-42", auth_time: Process.get(:resume_auth_time, arrival - 30)}}
+        end,
+        consent: &__MODULE__.park_consent_once/3
+      )
+
+      assert call_query(valid_params(%{"prompt" => "login"})).resp_body == "consent"
+      assert_received {:arrival, arrival}
+      assert_received {:consent_parked, resume_id}
+      key = "urn:attesto:interaction:" <> resume_id
+      {:ok, entry} = PARStore.take(key)
+      since = arrival - Interaction.reauthentication_allowance_seconds()
+      assert entry["prompt_login_since"] == since
+      assert entry["parked_at"] >= arrival
+
+      # Move the first pass into the past to model time spent on the consent
+      # page without sleeping. Keep its relative times and accepted bound.
+      entry = entry |> Map.update!("parked_at", &(&1 - 120)) |> Map.update!("prompt_login_since", &(&1 - 120))
+      :ok = PARStore.put(key, entry, 600)
+      Process.put(:resume_auth_time, arrival - 30 - 120)
+      assert is_binary(location_query(call_query(%{"resume" => resume_id}))["code"])
+      assert_received {:auth_opts, %{resumed: true, prompt_login_since: recorded_since}}
+      assert recorded_since == since - 120
+    end
+
+    test "a login 90 seconds before fresh arrival is refused before consent can park" do
+      put_config(
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        authenticate_resource_owner: fn conn, _request, _opts ->
+          {:authenticated, %{subject: "user-42", auth_time: conn.private.attesto_phoenix_authorization_arrived_at - 90}}
+        end,
+        consent: &__MODULE__.park_consent_once/3
+      )
+
+      assert %{"error" => "server_error"} = location_query(call_query(valid_params(%{"prompt" => "login"})))
+      refute_received {:consent_parked, _id}
+      assert TestStore.count() == 0
+    end
+
+    test "consent resumes accept exactly the first login bound and preserve it on re-park" do
+      for offset <- [0, -1] do
+        put_config(
+          interaction_browser_binding: &__MODULE__.browser_binding/1,
+          authenticate_resource_owner: fn conn, _request, opts ->
+            send(self(), {:auth_opts, opts})
+            auth_time = Process.get(:resume_auth_time, conn.private.attesto_phoenix_authorization_arrived_at - 30)
+            {:authenticated, %{subject: "user-42", auth_time: auth_time}}
+          end,
+          consent: fn conn, request, _subject ->
+            {:ok, id} = Interaction.park(conn, request)
+            send(self(), {:consent_parked, id})
+            {:halt, send_resp(conn, 200, "consent")}
+          end
+        )
+
+        Process.delete(:resume_auth_time)
+        assert call_query(valid_params(%{"prompt" => "login"})).resp_body == "consent"
+        assert_received {:consent_parked, id}
+        {:ok, first} = PARStore.fetch("urn:attesto:interaction:" <> id)
+        since = first["prompt_login_since"]
+        Process.put(:resume_auth_time, since + offset)
+        result = call_query(%{"resume" => id})
+
+        if offset == 0 do
+          assert result.resp_body == "consent"
+          assert_received {:consent_parked, second_id}
+          {:ok, second} = PARStore.fetch("urn:attesto:interaction:" <> second_id)
+          assert second["prompt_login_since"] == since
+          assert second["parked_at"] == first["parked_at"]
+          Process.put(:resume_auth_time, since - 1)
+          assert %{"error" => "server_error"} = location_query(call_query(%{"resume" => second_id}))
+        else
+          assert %{"error" => "server_error"} = location_query(result)
+          refute_received {:consent_parked, _id}
+        end
+      end
+
+      assert TestStore.count() == 0
+    end
+
+    test "consent's earlier login bound does not replace the real park time for max_age" do
+      for {max_age, accepted?} <- [{"0", false}, {"300", true}] do
+        Process.delete(:consent_parked)
+
+        put_config(
+          interaction_browser_binding: &__MODULE__.browser_binding/1,
+          authenticate_resource_owner: fn conn, _request, _opts ->
+            auth_time = Process.get(:resume_auth_time, conn.private.attesto_phoenix_authorization_arrived_at - 30)
+            {:authenticated, %{subject: "user-42", auth_time: auth_time}}
+          end,
+          consent: &__MODULE__.park_consent_once/3
+        )
+
+        Process.delete(:resume_auth_time)
+        assert call_query(valid_params(%{"prompt" => "login", "max_age" => max_age})).resp_body == "consent"
+        assert_received {:consent_parked, id}
+        {:ok, entry} = PARStore.fetch("urn:attesto:interaction:" <> id)
+        Process.put(:resume_auth_time, entry["prompt_login_since"] + 30)
+        result = location_query(call_query(%{"resume" => id}))
+        if accepted?, do: assert(is_binary(result["code"])), else: assert(result["error"] == "server_error")
+      end
+    end
+
+    test "a legacy parked entry without a login bound still requires the park time" do
+      id = park!(%{"prompt" => "login"})
+      key = "urn:attesto:interaction:" <> id
+      {:ok, entry} = PARStore.take(key)
+      :ok = PARStore.put(key, Map.delete(entry, "prompt_login_since"), 600)
+      Process.put(:resume_auth_time, entry["parked_at"] - 1)
+      assert %{"error" => "server_error"} = location_query(call_query(%{"resume" => id}))
+      assert_received {:auth_opts, %{resumed: true, prompt_login_since: since}}
+      assert since == entry["parked_at"]
+    end
+
+    test "the session browser binding survives login renewal and controller park/resume" do
+      put_config(
+        authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+        interaction_browser_binding: &BrowserBinding.binding/1
+      )
+
+      first = call_session_query(valid_params(%{"prompt" => "login"}))
+      assert first.resp_body == "login"
+      assert_received {:parked, resume_id}
+      binding = BrowserBinding.binding(first)
+      assert is_binary(binding)
+
+      login =
+        %{}
+        |> session_conn(first)
+        |> configure_session(renew: true)
+        |> put_session(:subject, "user-42")
+        |> send_resp(200, "signed in")
+
+      assert BrowserBinding.binding(login) == binding
+      assert get_session(login, :subject) == "user-42"
+      assert is_binary(location_query(call_session_query(%{"resume" => resume_id}, login))["code"])
+      assert TestStore.count() == 1
+    end
+
+    test "a lost session browser binding refuses resume through the wrong-browser path" do
+      put_config(
+        authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+        interaction_browser_binding: &BrowserBinding.binding/1
+      )
+
+      first = call_session_query(valid_params())
+      assert_received {:parked, resume_id}
+      dropped = %{} |> session_conn(first) |> configure_session(drop: true) |> send_resp(200, "dropped")
+      refused = call_session_query(%{"resume" => resume_id}, dropped)
+      assert BrowserBinding.binding(refused) != BrowserBinding.binding(first)
+      assert refused.status == 400
+      assert refused.resp_body =~ "belongs to another browser"
+      assert location(refused) == nil
+      assert call_session_query(%{"resume" => resume_id}, first).status == 400
+      assert TestStore.count() == 0
+    end
+
+    @tag :ecto
+    test "a consent page mints a session grant with effective scope and consumes it on resume" do
+      :ok = Sandbox.checkout(TestRepo)
+
+      put_config(
+        repo: TestRepo,
+        interaction_browser_binding: &BrowserBinding.binding/1,
+        authenticate_resource_owner: &__MODULE__.authenticate_aged_30s/3,
+        authorize_scope: fn _client, [] -> {:ok, ~w(openid profile)} end,
+        consent: fn conn, request, subject ->
+          resume_id = conn.params["resume"]
+
+          case get_session(conn, :consent_grant) do
+            %{"resume" => ^resume_id, "token" => token} when is_binary(resume_id) ->
+              assert Interaction.request_params(conn)["prompt"] == "login"
+              assert conn.params == %{"resume" => resume_id}
+              assert :ok = Grants.consume(token, ConsentGrant.binding(request, subject.subject))
+              {:consented, subject}
+
+            _ ->
+              {:ok, resume_id} = Interaction.park(conn, request)
+              send(self(), {:consent_context, resume_id, Interaction.request_params(conn), request, subject.subject})
+              {:halt, send_resp(conn, 200, "consent")}
+          end
+        end
+      )
+
+      params = valid_params(%{"prompt" => "login"}) |> Map.delete("scope")
+      first = call_session_query(params)
+      assert first.resp_body == "consent"
+      assert_received {:consent_context, resume_id, ^params, request, subject}
+      assert request.scope == ~w(openid profile)
+      binding = ConsentGrant.binding_from_params(params, subject, scope: request.scope)
+      assert {:ok, token} = Grants.mint(binding, 300)
+
+      approval =
+        %{}
+        |> session_conn(first)
+        |> put_session(:consent_grant, %{"resume" => resume_id, "token" => token})
+        |> send_resp(200, "approved")
+
+      resumed = call_session_query(%{"resume" => resume_id}, approval)
+      assert is_binary(location_query(resumed)["code"])
+      assert {:error, :consumed} = Grants.consume(token, binding)
+      assert TestStore.count() == 1
+    end
+
+    defp call_session_query(params, previous \\ nil) do
+      params
+      |> session_conn(previous)
+      |> with_config()
+      |> AuthorizeController.authorize(params)
+    end
+
+    defp session_conn(params, previous) do
+      conn =
+        :get
+        |> Plug.Test.conn("/oauth/authorize?" <> URI.encode_query(params))
+        |> Map.put(:scheme, :https)
+        |> Map.put(:secret_key_base, String.duplicate("session-test-secret-", 4))
+
+      conn = if previous, do: Plug.Test.recycle_cookies(conn, previous), else: conn
+
+      conn
+      |> Plug.Session.call(Plug.Session.init(store: :cookie, key: "_interaction_test", signing_salt: "interaction"))
+      |> fetch_session()
+      |> fetch_query_params()
+      |> BrowserBinding.call(BrowserBinding.init([]))
+    end
+
     test "login then consent can park twice without losing parameters or the original park time" do
       resume_id = park!(%{"prompt" => "login", "max_age" => "0"}, consent: &__MODULE__.park_consent_once/3)
       parked_at = backdate_park(resume_id)
@@ -2166,7 +2404,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       key = "urn:attesto:interaction:" <> resume_id
       {:ok, entry} = PARStore.take(key)
       parked_at = System.system_time(:second) - 120
-      :ok = PARStore.put(key, Map.put(entry, "parked_at", parked_at), 600)
+      entry = entry |> Map.put("parked_at", parked_at) |> Map.put("prompt_login_since", parked_at)
+      :ok = PARStore.put(key, entry, 600)
       parked_at
     end
 

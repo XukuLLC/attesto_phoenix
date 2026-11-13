@@ -6,6 +6,41 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.12.0] - 2026-11-12
+
+### Fixed
+
+- A fresh `prompt=login` request first parked in consent retains the exact
+  authentication bound it already passed: arrival minus the 60-second
+  allowance. Resume adds no allowance to that bound. A login detour still
+  requires `auth_time >= parked_at`, and re-parking keeps the first bound.
+  `parked_at` remains the real first park time for `max_age`; its behavior is
+  unchanged (OIDC Core §3.1.2.1, §3.1.2.3).
+
+### Added
+
+- `AttestoPhoenix.Interaction.BrowserBinding` puts a random 32-byte secret in
+  the fetched session if absent; `binding/1` reads it for
+  `:interaction_browser_binding`. Mount before the authorize route and keep
+  the value through login. Session renewal with `renew: true` keeps session
+  data; `drop: true` discards it. A lost binding causes the wrong-browser
+  refusal and spends the parked request.
+- Consent grant examples keep the token in the browser's session, mint with
+  the saved authorization parameters and `scope: request.scope`, and consume
+  in `:consent` on resume. A resume URL carries no other parameter. The
+  non-resume token pattern remains documented.
+- `auth_opts.prompt_login_since` exposes the earliest acceptable
+  `prompt=login` authentication time on resume, separately from `parked_at`.
+
+### Upgrading from 4.10
+
+Return `:auth_time` (Unix seconds) from `:authenticate_resource_owner`. Send
+the browser to login when `auth_opts.force_reauth` is true or the existing
+authentication exceeds `auth_opts.max_age`, and return the new authentication
+time (OIDC Core §3.1.2.1, §3.1.2.3). Use park/resume to keep the request across
+login and consent; on resume, check the recorded authentication bounds before
+reusing the login.
+
 ## [4.11.1] - 2026-11-12
 
 ### Fixed

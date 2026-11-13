@@ -53,8 +53,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       session reachable by the end-session endpoint), threaded into the code's
       claims so the token endpoint can mint the ID token.
 
-      For `prompt=login`, `auth_time` must be at or after `auth_opts.parked_at`
-      on resume. A fresh request permits 60 seconds before request arrival,
+      For `prompt=login`, `auth_time` must be at or after
+      `auth_opts.prompt_login_since` on resume: the first park time for a login
+      detour, or the bound already checked before a first park in consent.
+      A fresh request permits 60 seconds before request arrival,
       matching the interactive `max_age` allowance. An unusable time is logged
       and returned as `server_error` (OIDC Core §3.1.2.3).
 
@@ -644,7 +646,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp run_authenticated(conn, config, client, request, subject, prompt_none?, dpop_jkt) do
     case with :ok <- check_authentication_age(conn, request, subject, prompt_none?),
               do: check_prompt_login(conn, request, subject) do
-      :ok ->
+      {:ok, conn} ->
         run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt)
 
       {:error, error_code} ->
@@ -700,7 +702,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp check_prompt_login(conn, request, subject) do
     {since, allowance} =
       case resumed(conn) do
-        %{parked_at: parked_at} -> {parked_at, 0}
+        %{prompt_login_since: since} -> {since, 0}
         nil -> {conn.private.attesto_phoenix_authorization_arrived_at, Interaction.reauthentication_allowance_seconds()}
       end
 
@@ -709,7 +711,14 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
            allowance: allowance
          ) do
       :ok ->
-        :ok
+        # Only consent receives this connection after the check has passed.
+        # A login detour parks before this point and must use the park time.
+        conn =
+          if @prompt_login in request.prompt,
+            do: put_private(conn, :attesto_phoenix_prompt_login_since, since - allowance),
+            else: conn
+
+        {:ok, conn}
 
       {:error, reason} ->
         Logger.error("prompt=login was requested but the host returned an unusable authentication: #{reason}")
@@ -1210,8 +1219,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   #
   # `:resumed` is `true` when the request was restored from
   # `AttestoPhoenix.Interaction.park/2`: the End-User has been through the
-  # host's login for this request, so a host that parks on `prompt=login` does
-  # not send them there again.
+  # host's login or consent step. It does not by itself establish freshness;
+  # `:prompt_login_since` is the earliest acceptable authentication on resume.
   defp auth_opts(conn, request) do
     %{
       prompt: request.prompt,
@@ -1219,7 +1228,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       interactive: @prompt_none not in request.prompt,
       max_age: request.max_age,
       resumed: not is_nil(resumed(conn)),
-      parked_at: (resumed(conn) || %{})[:parked_at]
+      parked_at: (resumed(conn) || %{})[:parked_at],
+      prompt_login_since: (resumed(conn) || %{})[:prompt_login_since]
     }
   end
 

@@ -448,9 +448,11 @@ defmodule AttestoPhoenix.Config do
       required (OIDC Core §3.1.2.6). `auth_opts` is a map carrying the OIDC Core
       §3.1.2.1 `prompt`/`max_age` directives the host must honour: `:prompt`,
       `:force_reauth` (`prompt=login`), `:interactive` (`false` for
-      `prompt=none`, forbidding UI), `:max_age`, `:resumed`, and `:parked_at`
-      (Unix seconds on resume, otherwise nil). For `prompt=login`, return an
-      `auth_time` at or after `parked_at` on resume; for a fresh request it
+      `prompt=none`, forbidding UI), `:max_age`, `:resumed`, `:parked_at`, and
+      `:prompt_login_since` (Unix seconds on resume, otherwise nil). For
+      `prompt=login`, return an `auth_time` at or after `prompt_login_since`
+      on resume: the first park time for a login detour, or the bound already
+      checked before a first park in consent. For a fresh request it
       must be no earlier than arrival minus 60 seconds. An unusable time is
       logged and returned as `server_error` (OIDC Core §3.1.2.3).
       The host owns all login
@@ -739,7 +741,11 @@ defmodule AttestoPhoenix.Config do
     * `:interaction_browser_binding` - `(conn -> binary)`. Returns a value that
       identifies the current browser, stable from the moment a request is
       parked until it is resumed and not presentable by another browser, such
-      as a pre-login session identifier held in a cookie. Required to use
+      as the session secret provided by `AttestoPhoenix.Interaction.BrowserBinding`.
+      Mount that plug after fetching the session and configure this callback
+      as `&AttestoPhoenix.Interaction.BrowserBinding.binding/1`. Preserve the
+      value across login (`renew: true` keeps session data; `drop: true` does
+      not). Losing it causes the wrong-browser refusal. Required to use
       `AttestoPhoenix.Interaction.park/2`; a parked request is resumed only by
       the browser whose value matches. Only a hash of the value is stored.
     * `:interaction_ttl` - how long a parked authorization request can be

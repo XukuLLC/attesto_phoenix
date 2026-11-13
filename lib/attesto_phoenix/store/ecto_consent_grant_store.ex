@@ -10,6 +10,16 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   here, at the database, not advisory: it must hold against two concurrent
   presentations of one token, on any node sharing the database.
 
+  With `AttestoPhoenix.Interaction` park/resume, keep the grant token in the
+  browser's session, paired with its resume id, and consume it in `:consent`
+  on resume. The authorize URL must contain only `resume`. Mint on the
+  consent page using `AttestoPhoenix.ConsentGrant.binding_from_params/3` with
+  `scope: request.scope` and the parameters saved from
+  `AttestoPhoenix.Interaction.request_params/1`. See
+  `AttestoPhoenix.ConsentGrant` for the example and the PAR / Request Object
+  case. Without resume, the token can still be carried alongside the original
+  authorization parameters; that starts a fresh authorization request.
+
   ## Behaviour callbacks
 
     * `mint/2` inserts a grant keyed on an unguessable token, with the canonical
