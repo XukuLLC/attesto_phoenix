@@ -288,7 +288,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp authorize_scope(config, client, request) do
     case ScopeAuthorization.authorize(config, client, request.scope, request.resource) do
       {:ok, granted} ->
-        if granted -- request.scope == [],
+        if ScopeAuthorization.within_request?(granted, request.scope),
           do: {:ok, %{request | scope: granted}},
           else: {:error, {:scope_refused, request, @error_invalid_scope}}
 

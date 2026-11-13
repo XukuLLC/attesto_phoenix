@@ -2342,6 +2342,24 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert TestStore.peek(code).data.scope == ["openid"]
     end
 
+    test "a request without scope takes the policy's default (RFC 6749 §3.3)" do
+      test_pid = self()
+
+      put_config(
+        authorize_scope: fn _client, requested ->
+          send(test_pid, {:policy_saw, requested})
+          {:ok, ["profile"]}
+        end
+      )
+
+      conn = valid_params() |> Map.drop(["scope", "nonce"]) |> call()
+      assert_received {:policy_saw, []}
+
+      code = location_query(conn)["code"]
+      assert is_binary(code), "expected a code, got #{inspect(location_query(conn))}"
+      assert TestStore.peek(code).data.scope == ["profile"]
+    end
+
     test "a policy that adds a scope is refused" do
       put_config(authorize_scope: fn _client, requested -> {:ok, requested ++ ["admin"]} end)
 

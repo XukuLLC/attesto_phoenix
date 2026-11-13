@@ -20,6 +20,15 @@ defaults in a minor release.
 
 ### Fixed
 
+- An authorization request without `scope` is processed with the scope the
+  scope policy returns, as RFC 6749 §3.3 allows ("process the request using a
+  pre-defined default value"). Since 4.7.0 the authorization endpoint treated
+  any scope the request did not name as the policy adding scope, and answered
+  `invalid_scope`; the token endpoint already made this exception. Both now
+  use `ScopeAuthorization.within_request?/2`. On such a request `:consent`
+  receives the policy's default scope in `request.scope`, not `[]`; a host
+  that binds a consent record to the request binds it to that scope.
+
 - Scheduled clustered sweeps hold one session advisory lock on a checked-out
   connection and commit each redaction or table deletion separately. This
   removes the refresh-row/authorization-code lock inversion with revocation.

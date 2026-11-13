@@ -27,6 +27,19 @@ defmodule AttestoPhoenix.AuthorizationServer.ScopeAuthorization do
   @type refusal :: :invalid_scope | :invalid_target
 
   @doc """
+  Whether a policy result stays within what the client asked for (RFC 6749
+  §3.3).
+
+  A policy may narrow the requested scope but may not add to it. When the
+  client omitted `scope` (an empty request), RFC 6749 §3.3 lets the server
+  "process the request using a pre-defined default value", so any granted
+  scope is within the request. Both endpoints use this one rule.
+  """
+  @spec within_request?([String.t()], [String.t()]) :: boolean()
+  def within_request?(_granted, []), do: true
+  def within_request?(granted, requested) when is_list(granted) and is_list(requested), do: granted -- requested == []
+
+  @doc """
   Decide the scope to grant `client` for `requested` scope values and the
   resolved `resources`.
 

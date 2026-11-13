@@ -778,12 +778,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # value the client did not request. An empty request retains OAuth's normal
   # server-defined default-scope behavior; signed/grant-specific ceilings are
   # enforced separately even in that case.
-  defp require_granted_scope_within_request(_granted, []), do: :ok
-
   defp require_granted_scope_within_request(granted, requested) do
-    case granted -- requested do
-      [] -> :ok
-      _added -> {:error, error(@error_invalid_scope, "scope policy exceeded the requested scope")}
+    case ScopeAuthorization.within_request?(granted, requested) do
+      true -> :ok
+      false -> {:error, error(@error_invalid_scope, "scope policy exceeded the requested scope")}
     end
   end
 
