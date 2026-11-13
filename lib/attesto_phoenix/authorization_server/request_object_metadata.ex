@@ -15,6 +15,12 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestObjectMetadata do
   alias Attesto.SigningAlg
   alias AttestoPhoenix.Config
 
+  @doc "The request-parameter capabilities shared by both discovery documents (OIDC Discovery §3)."
+  @spec parameter_support(Config.t()) :: map()
+  def parameter_support(%Config{} = config) do
+    %{"request_parameter_supported" => supported?(config), "request_uri_parameter_supported" => false}
+  end
+
   @doc """
   Whether the authorization endpoint can verify a signed request object.
 

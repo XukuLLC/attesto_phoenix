@@ -17,6 +17,16 @@ defmodule AttestoPhoenix.Revocation do
   change that makes the subject or client ineligible; otherwise a grant issued
   between the two is missed.
 
+  ## Lock order
+
+  Lock authorization-code rows before refresh families. The bundled stores
+  then lock families in ascending family-id order and rows in ascending id
+  order within each family, taking the family advisory lock before its rows.
+  Hosts combining these operations must use the same order, including across
+  multiple calls in one transaction. Scheduled sweeps release each step's
+  locks before the next step. `Sweeper.sweep_once/2` instead remains inside
+  the caller's transaction; do not run it concurrently with grant writes.
+
   ## What is and is not revoked
 
     * Unredeemed authorization codes are deleted; redeeming one afterwards

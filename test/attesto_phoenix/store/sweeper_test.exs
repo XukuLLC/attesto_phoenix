@@ -33,6 +33,9 @@ defmodule AttestoPhoenix.Store.SweeperTest do
     def lock_queries, do: Agent.get(__MODULE__, &Map.get(&1, :lock_queries, []))
 
     def transaction(fun) when is_function(fun, 0), do: {:ok, fun.()}
+    def transaction(fun, _opts), do: transaction(fun)
+    def checkout(fun), do: fun.()
+    def all(_query, _opts), do: []
 
     def query!(sql, params, _opts) do
       Agent.get_and_update(__MODULE__, fn state ->
@@ -488,14 +491,18 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       assert RecordingRepo.lock_queries() == []
     end
 
-    test "cluster_lock runs the deletion pass under a transaction-scoped advisory lock" do
+    test "cluster_lock holds a session advisory lock on the checked-out connection" do
       start_recorder(%{"attesto_device_codes" => 6})
       config = valid_config(sweep_interval_ms: 60_000)
       {:ok, pid} = Sweeper.start_link(config: config, name: nil, cluster_lock: {:advisory, 4_242})
       on_exit(fn -> safe_stop(pid, &GenServer.stop/1) end)
 
       assert %{"attesto_device_codes" => 6} = Sweeper.sweep_now(pid)
-      assert RecordingRepo.lock_queries() == [{"SELECT pg_try_advisory_xact_lock($1)", [4_242]}]
+
+      assert RecordingRepo.lock_queries() == [
+               {"SELECT pg_try_advisory_lock($1)", [4_242]},
+               {"SELECT pg_advisory_unlock($1)", [4_242]}
+             ]
     end
 
     test "cluster_lock skips the pass when another node holds the lock" do

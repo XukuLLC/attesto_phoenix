@@ -110,6 +110,12 @@ defmodule AttestoPhoenix.Config do
       bound to.
     * `:on_event` - `(%AttestoPhoenix.Event{} -> any)`. Audit/telemetry hook.
       No-op by default; the library never stores events itself.
+    * `:render_end_session_error` - `(conn, %AttestoPhoenix.OAuthError{} -> conn)`.
+      Optional, validated at boot. Renders every non-redirecting end-session
+      error (RP-Initiated Logout 1.0 §4). The error contains only the library's
+      code, description, and HTTP status, never request parameters. The conn
+      still contains untrusted input; do not echo it. Defaults to the existing
+      HTML page or JSON response according to Accept.
     * `:render_authorization_error` - `(conn, %AttestoPhoenix.OAuthError{} ->
       conn)`. Optional. Renders every authorization-endpoint error that cannot
       be redirected: an unknown client, a missing, invalid or unregistered
@@ -441,7 +447,12 @@ defmodule AttestoPhoenix.Config do
       required (OIDC Core §3.1.2.6). `auth_opts` is a map carrying the OIDC Core
       §3.1.2.1 `prompt`/`max_age` directives the host must honour: `:prompt`,
       `:force_reauth` (`prompt=login`), `:interactive` (`false` for
-      `prompt=none`, forbidding UI), and `:max_age`. The host owns all login
+      `prompt=none`, forbidding UI), `:max_age`, `:resumed`, and `:parked_at`
+      (Unix seconds on resume, otherwise nil). For `prompt=login`, return an
+      `auth_time` at or after `parked_at` on resume; for a fresh request it
+      must be no earlier than arrival minus 60 seconds. An unusable time is
+      logged and returned as `server_error` (OIDC Core §3.1.2.3).
+      The host owns all login
       UI; the library only invokes this hook. Required only when the
       authorization endpoint is mounted.
     * `:consent` - `(conn, request, subject -> {:consented, subject} |
@@ -586,6 +597,16 @@ defmodule AttestoPhoenix.Config do
       continuation. A presented token with no stored record is not passed to
       the callback; the grant fails as an unknown token. The continuation
       follows the rules of `AttestoPhoenix.AuthorizationServer.Continuation`.
+      With a store implementing `c:Attesto.RefreshStore.with_family_lock/2`
+      (including the bundled Ecto store), the callback and continuation run
+      under the family's rotation/revocation lock and the grant is rechecked
+      before the callback. This also covers a request that becomes a grace
+      retry while waiting. A revocation may still commit immediately after
+      minting; an already minted access token is not undone. To coordinate
+      host eligibility, run minting through the continuation inside the host's
+      transaction and use a consistent host/family lock order. A host that
+      also needs code-row locks must acquire those before entering completion.
+
     * `:authorization_code_completion` - `(context, continuation -> result)`.
       Optional synchronous wrapper around authorization-code completion. It is
       invoked after the code has been redeemed and before `:build_principal` or
@@ -1441,6 +1462,7 @@ defmodule AttestoPhoenix.Config do
     :terminate_session,
     :render_logged_out,
     :render_authorization_error,
+    :render_end_session_error,
     :client_post_logout_redirect_uris,
     :client_backchannel_logout_uri,
     :client_backchannel_logout_session_required,
@@ -1689,6 +1711,7 @@ defmodule AttestoPhoenix.Config do
           on_invalid_id_token_hint: :reject | :terminate_session,
           render_logged_out: callback() | nil,
           render_authorization_error: callback() | nil,
+          render_end_session_error: callback() | nil,
           client_post_logout_redirect_uris: callback() | nil,
           client_backchannel_logout_uri: callback() | nil,
           client_backchannel_logout_session_required: callback() | nil,
@@ -3763,6 +3786,7 @@ defmodule AttestoPhoenix.Config do
     terminate_session: 2,
     render_logged_out: 2,
     render_authorization_error: 2,
+    render_end_session_error: 2,
     interaction_browser_binding: 1
   }
 

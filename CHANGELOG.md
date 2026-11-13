@@ -6,6 +6,45 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.11.0] - 2026-11-12
+
+### Breaking
+
+- Authorization requests with `prompt=login` now require the host's `auth_time`
+  to be at or after the parked request's time, or no more than 60 seconds before
+  a fresh request arrived. Missing, stale, or invalid authentication is logged
+  and returned as `server_error`, like an interactive `max_age` contract failure
+  (OpenID Connect Core §3.1.2.1, §3.1.2.3). Hosts receive `auth_opts.parked_at`.
+- Requires `attesto >= 2.18.0 and < 3.0.0` for the shared freshness check and
+  optional refresh-family lock callback.
+
+### Fixed
+
+- Scheduled clustered sweeps hold one session advisory lock on a checked-out
+  connection and commit each redaction or table deletion separately. This
+  removes the refresh-row/authorization-code lock inversion with revocation.
+  The lock is released on completion or error, or when a crashed connection
+  closes. `sweep_once/2` still participates in the caller's transaction.
+- Bulk refresh revocation sorts family identifiers. Redaction takes the same
+  family locks in that order, then locks affected rows in family/id order before
+  updating. Family deletion also locks rows by id. Store behaviours and
+  `AttestoPhoenix.Revocation` document the shared lock order.
+- Grace-window refresh recovery rechecks the family under the rotation lock.
+  Configured `:refresh_completion` callbacks run under that lock, including retries;
+  rolled-back work cannot return a token. A token minted immediately before
+  revocation commits may still reach the client; host transaction integration
+  remains necessary for host eligibility checks (RFC 9700 §4.14.2; RFC 7009 §2.1).
+- Both discovery documents derive `request_parameter_supported` and
+  `request_uri_parameter_supported` from one function, including explicit false
+  values when unsupported (OpenID Connect Discovery §3; RFC 8414 §2).
+
+### Added
+
+- Optional `:render_end_session_error` callback, validated at boot with two
+  arguments: the connection and an `OAuthError` containing library-owned code,
+  description, and status. Request parameters are never copied into the error.
+  The default HTML/JSON responses are unchanged (RP-Initiated Logout §4).
+
 ## [4.10.0] - 2026-11-12
 
 Requires `attesto >= 2.17.0 and < 3.0.0`.

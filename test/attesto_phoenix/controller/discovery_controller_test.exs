@@ -9,6 +9,7 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.DiscoveryController
+  alias AttestoPhoenix.Controller.OpenIDConfigurationController
 
   @issuer "https://issuer.example"
 
@@ -98,6 +99,26 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
   defp decode_body(conn), do: JSON.decode!(conn.resp_body)
 
   describe "show/2" do
+    test "both discovery documents agree on request parameter support" do
+      for supported <- [false, true] do
+        overrides = if supported, do: [client_jwks: fn _ -> %{"keys" => []} end], else: []
+        config = host_config(overrides)
+        oauth = decode_body(call_show(config, protocol_config()))
+
+        openid =
+          conn(:get, "/.well-known/openid-configuration")
+          |> put_private(:attesto_phoenix_config, config)
+          |> put_private(:attesto_protocol_config, protocol_config())
+          |> OpenIDConfigurationController.show(%{})
+          |> decode_body()
+
+        for document <- [oauth, openid] do
+          assert document["request_parameter_supported"] == supported
+          assert document["request_uri_parameter_supported"] == false
+        end
+      end
+    end
+
     test "experimental refresh expiration discovery is opt-in and declares only token timeouts" do
       refute Map.has_key?(
                decode_body(call_show(host_config(), protocol_config())),
@@ -225,6 +246,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
           "EdDSA",
           "Ed25519"
         ],
+        "request_parameter_supported" => true,
+        "request_uri_parameter_supported" => false,
         "request_object_signing_alg_values_supported" => [
           "PS256",
           "ES256",

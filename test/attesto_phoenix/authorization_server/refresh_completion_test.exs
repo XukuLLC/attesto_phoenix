@@ -59,6 +59,8 @@ defmodule AttestoPhoenix.AuthorizationServer.RefreshCompletionTest do
     defdelegate rotate(parent_hash, child, successor, opts), to: EctoRefreshStore
     @impl true
     defdelegate revoke_family(family_id), to: EctoRefreshStore
+    @impl true
+    defdelegate with_family_lock(family_id, work), to: EctoRefreshStore
   end
 
   setup do
@@ -96,6 +98,64 @@ defmodule AttestoPhoenix.AuthorizationServer.RefreshCompletionTest do
     family_id = TestRepo.one!(from r in RefreshToken, select: r.family_id)
 
     %{refresh_token: initial.refresh_token, family_id: family_id}
+  end
+
+  test "grace retry holds the family lock while running refresh_completion", ctx do
+    plain = config(refresh_token_rotation_grace_seconds: 60)
+    assert {:ok, first, _} = Token.issue(plain, refresh_request(plain, ctx.refresh_token))
+    owner = self()
+
+    callback = fn _context, continuation ->
+      send(owner, {:completion_entered, self(), TestRepo.in_transaction?()})
+
+      receive do
+        :continue -> :ok
+      after
+        5000 -> raise "completion gate timed out"
+      end
+
+      TestRepo.transaction(fn -> continuation.() end)
+    end
+
+    configured = config(refresh_token_rotation_grace_seconds: 60, refresh_completion: callback)
+
+    retry =
+      Task.async(fn ->
+        :ok = Sandbox.checkout(TestRepo, sandbox: false)
+
+        try do
+          Token.issue(configured, refresh_request(configured, ctx.refresh_token))
+        after
+          Sandbox.checkin(TestRepo)
+        end
+      end)
+
+    assert_receive {:completion_entered, pid, in_transaction?}, 5000
+
+    assert {:ok, %{rows: [[false]]}} =
+             TestRepo.transaction(fn ->
+               TestRepo.query!("SELECT pg_try_advisory_xact_lock($1::int4, hashtext($2))", [0x4154_5246, ctx.family_id])
+             end)
+
+    assert in_transaction?
+    send(pid, :continue)
+    assert {:ok, response, _} = Task.await(retry, 5000)
+    assert response.refresh_token == first.refresh_token
+  end
+
+  test "a completion rollback on a grace retry never returns a token", ctx do
+    plain = config(refresh_token_rotation_grace_seconds: 60)
+    assert {:ok, _, _} = Token.issue(plain, refresh_request(plain, ctx.refresh_token))
+
+    callback = fn _context, continuation ->
+      TestRepo.transaction(fn ->
+        assert {:ok, _, _} = continuation.()
+        TestRepo.rollback(:host_refused)
+      end)
+    end
+
+    configured = config(refresh_token_rotation_grace_seconds: 60, refresh_completion: callback)
+    assert {:error, %OAuthError{}, _events} = Token.issue(configured, refresh_request(configured, ctx.refresh_token))
   end
 
   test "with no callback the refresh rotates directly, as before", %{refresh_token: token, family_id: family_id} do

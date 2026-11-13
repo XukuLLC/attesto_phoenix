@@ -42,6 +42,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     signing_alg_values = signing_alg_values(metadata, config, opts)
 
     metadata
+    |> Map.merge(RequestObjectMetadata.parameter_support(config))
     |> Map.merge(%{
       "authorization_endpoint" => config.authorization_endpoint || Config.authorize_endpoint_url(config),
       "response_types_supported" => @response_types_supported,

@@ -191,11 +191,12 @@ defmodule AttestoPhoenix.Store.Sweeper do
   of starting a process that never sweeps.
 
   `:cluster_lock` is optional. `cluster_lock: {:advisory, key}`, with `key` a
-  signed 64-bit integer, makes each scheduled deletion pass run inside a
-  transaction that first takes the PostgreSQL advisory lock `key`
-  (`pg_try_advisory_xact_lock`). When every node's sweeper uses the same key,
-  one node sweeps per interval and the rest skip it. The lock ends with the
-  transaction, so a crashed sweep cannot keep it. Choose a key no other part
+  signed 64-bit integer, holds the PostgreSQL session advisory lock `key`
+  (`pg_try_advisory_lock`) on one checked-out connection for the scheduled
+  pass. Each step uses its own short transaction; no step retains one table's
+  locks while waiting on another. When every node uses the same key, only one
+  sweeps at a time and contenders skip. An `after` block releases the lock;
+  connection termination also releases it after a crash. Choose a key no other part
   of the application uses. Back-channel logout retries are not under the lock;
   they are leased per row.
 
@@ -419,19 +420,20 @@ defmodule AttestoPhoenix.Store.Sweeper do
     end
   end
 
-  # `pg_try_advisory_xact_lock` is held until the transaction ends, so the
-  # lock cannot outlive a crashed sweep, and a node that does not get it skips
-  # this interval instead of queueing behind the holder.
   defp delete_pass_under_advisory_lock(%{repo: repo} = state, now, key) do
-    {:ok, result} =
-      repo.transaction(fn ->
-        case repo.query!("SELECT pg_try_advisory_xact_lock($1)", [key], log: false, telemetry_event: nil) do
-          %{rows: [[true]]} -> delete_pass(state, now)
-          %{rows: [[false]]} -> :skipped
-        end
-      end)
+    repo.checkout(fn ->
+      case repo.query!("SELECT pg_try_advisory_lock($1)", [key], log: false, telemetry_event: nil) do
+        %{rows: [[true]]} ->
+          try do
+            delete_pass(state, now)
+          after
+            repo.query!("SELECT pg_advisory_unlock($1)", [key], log: false, telemetry_event: nil)
+          end
 
-    result
+        %{rows: [[false]]} ->
+          :skipped
+      end
+    end)
   end
 
   # Deletes, per table, every row whose `expires_at` is strictly before `now`.
@@ -595,9 +597,11 @@ defmodule AttestoPhoenix.Store.Sweeper do
   end
 
   defp delete_expired(repo, query, prefix) do
-    {deleted, _} =
-      repo.delete_all(query,
-        prefix: prefix,
+    {:ok, {deleted, _}} =
+      repo.transaction(
+        fn ->
+          repo.delete_all(query, prefix: prefix, log: false, telemetry_event: nil)
+        end,
         log: false,
         telemetry_event: nil
       )

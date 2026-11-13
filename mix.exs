@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.10.0"
+  @version "4.11.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.17.0 and < 3.0.0"
+  @attesto_requirement ">= 2.18.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,8 +76,8 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # The 2.17.0 floor includes DC API mdoc handover verification and
-  # ES384/ES512 issuerAuth, alongside certificate trust and the endpoint APIs.
+  # The 2.18.0 floor includes prompt=login freshness and the optional
+  # family lock callback used for serialized refresh retries.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 

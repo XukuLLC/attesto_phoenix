@@ -68,6 +68,14 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   client — is refused before any session is touched, so the endpoint cannot be
   turned into an open redirector.
 
+  Every non-redirecting error goes through the optional
+  `:render_end_session_error` two-argument callback with the conn and an
+  `AttestoPhoenix.OAuthError`. Only the library's code, description, and status
+  are copied into the error; request parameters remain untrusted on the conn.
+  Without the callback, the existing HTML page or JSON body is rendered.
+  This hook is separate from authorization error rendering so the host can
+  provide logout-specific guidance (RP-Initiated Logout §4).
+
   ## Back-Channel Logout (Back-Channel Logout 1.0 §2.5)
 
   When `:terminate_session` returns a confirmed session, the OP atomically
@@ -129,7 +137,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
          {:ok, redirect} <- confirm_redirect(config, request) do
       logout(conn, config, request, redirect)
     else
-      {:error, status, body} -> render_error(conn, status, body)
+      {:error, status, body} -> render_error(conn, config, status, body)
     end
   end
 
@@ -193,7 +201,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
 
     case terminate_session(conn, config, context) do
       {:error, status, body} ->
-        render_error(conn, status, body)
+        render_error(conn, config, status, body)
 
       {:halt, conn} ->
         conn
@@ -220,7 +228,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
           {:error, :store_unavailable} ->
             conn
             |> expire_browser_state(config)
-            |> render_error(503, %{
+            |> render_error(config, 503, %{
               error: "server_error",
               error_description: "logout notification delivery is temporarily unavailable"
             })
@@ -294,7 +302,24 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   # redirects the user agent here), so a browser (`Accept: text/html`) gets a
   # human-readable page and any other caller keeps the JSON body — mirroring the
   # authorization endpoint's direct-error handling.
-  defp render_error(conn, status, %{error_description: description} = body) do
+  defp render_error(conn, config, status, body) do
+    case config.render_end_session_error do
+      nil ->
+        render_error_default(conn, status, body)
+
+      callback ->
+        error =
+          AttestoPhoenix.OAuthError.new(
+            String.to_existing_atom(body.error),
+            Map.get(body, :error_description),
+            status: status
+          )
+
+        Callback.invoke(callback, [conn, error])
+    end
+  end
+
+  defp render_error_default(conn, status, %{error_description: description} = body) do
     if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
       conn |> put_resp_content_type("text/html") |> send_resp(status, error_html(description))
     else
@@ -302,7 +327,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
     end
   end
 
-  defp render_error(conn, status, body) do
+  defp render_error_default(conn, status, body) do
     conn |> put_status(status) |> json(body)
   end
 

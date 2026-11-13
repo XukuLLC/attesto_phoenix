@@ -83,7 +83,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
 
   alias Attesto.OpenIDDiscovery
   alias AttestoPhoenix.AuthorizationServer.Metadata
-  alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.AuthorizationServer.Userinfo
   alias AttestoPhoenix.{Callback, Config}
@@ -130,12 +129,6 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
     end
   end
 
-  # OpenID Connect Discovery §3 `request_uri_parameter_supported`: this server
-  # resolves PAR `request_uri` URNs it issued, but does not advertise arbitrary
-  # OIDC `request_uri` fetching. `request_parameter_supported` is derived per
-  # install from request-object capability (see request_objects_supported?/1).
-  @request_uri_parameter_supported false
-
   # Translate the configured host capabilities into the OpenID Connect
   # Discovery §3 host members understood by Attesto.OpenIDDiscovery.metadata/2.
   # The core builder drops nil-valued members, so optional members advertise
@@ -161,12 +154,7 @@ defmodule AttestoPhoenix.Controller.OpenIDConfigurationController do
       scopes_supported: Config.effective_scopes_supported(config),
       claims_supported: presence(config.claims_supported),
       # OpenID Connect Discovery §3 capability flags reflecting what is wired.
-      # `request_parameter_supported` tracks actual capability: the authorization
-      # endpoint can verify a signed request object only when the host can
-      # resolve a client's trusted JWKS, so an install without that capability
-      # advertises `false` rather than a JAR support it cannot honour.
-      request_parameter_supported: RequestObjectMetadata.supported?(config),
-      request_uri_parameter_supported: @request_uri_parameter_supported,
+
       claims_parameter_supported: config.claims_parameter_supported,
       # Host catalogs: advertised only when the host configures a non-empty list
       # (the core builder drops the nil the helper returns for `[]`).

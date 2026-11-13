@@ -2046,6 +2046,26 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       resume_id
     end
 
+    test "prompt=login exposes park time and refuses stale, missing, or future authentication" do
+      for time <- [nil, System.system_time(:second) - 30, System.system_time(:second) + 3600] do
+        resume_id = park!(%{"prompt" => "login"})
+        Process.put(:resume_auth_time, time)
+        assert %{"error" => "server_error"} = location_query(call_query(%{"resume" => resume_id}))
+        assert_received {:auth_opts, %{resumed: true, parked_at: parked_at, force_reauth: true}}
+        assert is_integer(parked_at)
+      end
+    end
+
+    test "prompt=login accepts authentication at park time, including combined max_age" do
+      for extra <- [%{}, %{"max_age" => "0"}] do
+        resume_id = park!(Map.put(extra, "prompt", "login"))
+        Process.put(:resume_auth_time, System.system_time(:second))
+        assert is_binary(location_query(call_query(%{"resume" => resume_id}))["code"])
+        assert_received {:auth_opts, %{resumed: true, parked_at: parked_at}}
+        assert is_integer(parked_at)
+      end
+    end
+
     test "a parked request resumes once, with auth_opts.resumed, and issues the code" do
       resume_id = park!()
 
@@ -2411,6 +2431,17 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   end
 
   describe "prompt=login (force re-authentication)" do
+    test "fresh requests require auth_time within the arrival allowance" do
+      for callback <- [&__MODULE__.authenticate_stale/3, &__MODULE__.authenticate_without_auth_time/3] do
+        put_config(authenticate_resource_owner: callback)
+        assert %{"error" => "server_error"} = location_query(call(valid_params(%{"prompt" => "login"})))
+      end
+
+      put_config(authenticate_resource_owner: &__MODULE__.authenticate_aged_30s/3)
+      assert is_binary(location_query(call(valid_params(%{"prompt" => "login"})))["code"])
+      assert %{"error" => "invalid_request"} = location_query(call(valid_params(%{"prompt" => "none login"})))
+    end
+
     test "the host is told to force re-auth" do
       call(valid_params(%{"prompt" => "login"}))
 
@@ -2426,7 +2457,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       # The stub bumps auth_time when force_reauth is set; that fresh value is
       # what the ID token must reflect (OIDC Core §2).
       record = TestStore.peek(code)
-      assert record.data.claims["auth_time"] == 1_700_009_999
+      assert abs(record.data.claims["auth_time"] - System.system_time(:second)) <= 1
     end
   end
 
@@ -3145,7 +3176,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   # passed the right directives, and bumps `auth_time` when a re-auth was asked
   # for (prompt=login or a max_age the existing auth_time would violate).
   @established_auth_time 1_700_000_000
-  @reauth_auth_time 1_700_009_999
 
   def authenticate(_conn, _request, auth_opts) do
     send(self(), {:auth_opts, auth_opts})
@@ -3160,7 +3190,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
           now
 
         auth_opts.force_reauth ->
-          @reauth_auth_time
+          System.system_time(:second)
 
         true ->
           @established_auth_time

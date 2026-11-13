@@ -18,8 +18,9 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
         # requires 2.14.0, whose authorization-request validation
         # takes :request_objects_supported and whose access-token
         # verification checks the JOSE header typ. The next release requires
-        # 2.17.0 for DC API handover verification and ES384/ES512 mdoc issuers.
-        assert Version.match?("2.17.0", requirement)
+        # 2.18.0 for prompt=login freshness and serialized refresh retries.
+        assert Version.match?("2.18.0", requirement)
+        refute Version.match?("2.17.0", requirement)
         refute Version.match?("2.16.0", requirement)
         refute Version.match?("2.15.0", requirement)
         refute Version.match?("2.14.0", requirement)
@@ -79,7 +80,8 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "an empty source path selects the released requirement" do
     with_environment(%{"ATTESTO_SOURCE_PATH" => "", "ATTESTO_PATH" => nil}, fn ->
       assert {:attesto, requirement} = dependency!(:attesto)
-      assert Version.match?("2.17.0", requirement)
+      assert Version.match?("2.18.0", requirement)
+      refute Version.match?("2.17.0", requirement)
       refute Version.match?("2.16.0", requirement)
       refute Version.match?("2.15.0", requirement)
       refute Version.match?("2.14.0", requirement)
@@ -122,9 +124,9 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     assert exit_code == 0, output
 
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
-    assert metadata =~ ~s(<<"version">>,<<"4.10.0">>)
+    assert metadata =~ ~s(<<"version">>,<<"4.11.0">>)
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
-    assert metadata =~ ~s(<<"requirement">>,<<">= 2.17.0 and < 3.0.0">>)
+    assert metadata =~ ~s(<<"requirement">>,<<">= 2.18.0 and < 3.0.0">>)
     assert File.regular?(Path.join(output_path, "guides/upgrade_4_0.md"))
   end
 

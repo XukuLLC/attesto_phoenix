@@ -1351,7 +1351,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with callback when not is_nil(callback) <- Config.refresh_completion_fun(config),
          {:ok, context} <- refresh_completion_context(request, presented) do
       try do
-        Continuation.run(refresh_completion_profile(), &Callback.invoke(callback, &1), context, work)
+        complete_refresh_under_lock(config, context.family_id, fn ->
+          # Recheck under the lock before the host sees a revoked grant.
+          case refresh_completion_context(request, presented) do
+            {:ok, current} ->
+              Continuation.run(refresh_completion_profile(), &Callback.invoke(callback, &1), current, work)
+
+            :error ->
+              {:error, grant_error(:invalid_grant)}
+          end
+        end)
       after
         enforce_detected_reuse(config, context.family_id)
       end
@@ -1361,6 +1370,35 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       _direct -> work.()
     end
   end
+
+  defp complete_refresh_under_lock(config, family_id, work) do
+    store = grant_store(config, :refresh_store)
+
+    if function_exported?(store, :with_family_lock, 2) do
+      result_key = {__MODULE__, make_ref()}
+
+      try do
+        case store.with_family_lock(family_id, fn ->
+               result = work.()
+               Process.put(result_key, result)
+               result
+             end) do
+          {:ok, result} -> result
+          {:error, _rollback} -> refresh_rollback_result(Process.get(result_key))
+        end
+      after
+        Process.delete(result_key)
+      end
+    else
+      work.()
+    end
+  end
+
+  # A host's nested transaction may mark the enclosing retry transaction for
+  # rollback. Preserve its refusal, but never a response minted before rollback.
+  defp refresh_rollback_result({:error, %OAuthError{}} = error), do: error
+  defp refresh_rollback_result({:error, %OAuthError{}, events} = error) when is_list(events), do: error
+  defp refresh_rollback_result(_result), do: {:error, temporarily_unavailable_error()}
 
   # Read, without consuming it, the record the presented token names. Only
   # identifiers and policy inputs go to the host: no token, no token hash, no

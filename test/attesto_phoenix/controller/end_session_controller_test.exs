@@ -221,6 +221,60 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
     {:ok, config: config, hint: hint}
   end
 
+  test "end-session errors invoke their own renderer with only library error data", %{config: config} do
+    owner = self()
+
+    renderer = fn conn, error ->
+      send(owner, {:rendered, error})
+      send_resp(conn, error.status, "custom logout error")
+    end
+
+    config = %{config | render_end_session_error: renderer}
+
+    for params <- [
+          %{"id_token_hint" => "private-attacker-text"},
+          %{"client_id" => "unknown", "post_logout_redirect_uri" => "https://attacker.example/private"},
+          %{"client_id" => @client_id, "post_logout_redirect_uri" => "https://attacker.example/private"}
+        ],
+        accept <- ["text/html", "application/json"] do
+      response =
+        conn(:get, "/oauth/end_session", params)
+        |> put_req_header("accept", accept)
+        |> put_private(:attesto_phoenix_config, config)
+        |> Controller.end_session(params)
+
+      assert response.status == 400
+      assert response.resp_body == "custom logout error"
+
+      assert_receive {:rendered,
+                      %AttestoPhoenix.OAuthError{error: :invalid_request, error_description: description, status: 400}}
+
+      refute description =~ "private"
+      refute description =~ "attacker"
+      refute get_resp_header(response, "location") != []
+    end
+  end
+
+  test "renderer receives disabled endpoint and host failure statuses", %{config: config} do
+    owner = self()
+
+    renderer = fn conn, error ->
+      send(owner, {:rendered, error})
+      send_resp(conn, error.status, "error")
+    end
+
+    for {configured, status, code} <- [
+          {%{config | logout: [enabled: false]}, 404, :not_found},
+          {%{config | terminate_session: fn _, _ -> :bad_result end}, 500, :server_error}
+        ] do
+      conn(:get, "/oauth/end_session")
+      |> put_private(:attesto_phoenix_config, %{configured | render_end_session_error: renderer})
+      |> Controller.end_session(%{})
+
+      assert_receive {:rendered, %AttestoPhoenix.OAuthError{error: ^code, status: ^status}}
+    end
+  end
+
   defp rsa_pem do
     priv = :public_key.generate_key({:rsa, 2048, 65_537})
     :public_key.pem_encode([:public_key.pem_entry_encode(:RSAPrivateKey, priv)])

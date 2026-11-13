@@ -27,7 +27,11 @@ defmodule AttestoPhoenix.Interaction do
   runs it as it would a fresh request with the same parameters: the client is
   loaded again, the request is validated again, the scope policy runs again.
   Nothing the first pass decided is trusted. The host's
-  `:authenticate_resource_owner` then receives `auth_opts.resumed: true`.
+  `:authenticate_resource_owner` then receives `auth_opts.resumed: true` and `auth_opts.parked_at` (Unix seconds).
+  When the original request included `prompt=login`, the returned `auth_time`
+  must be at or after `parked_at`. A stale session, missing time, or invalid
+  time is a host contract violation: it is logged and returned as
+  `server_error`. The host must perform reauthentication before resuming.
 
   A parked request can be resumed once. It is bound to the browser that parked
   it through the host's `:interaction_browser_binding` callback

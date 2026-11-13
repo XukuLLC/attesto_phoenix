@@ -195,6 +195,23 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   end
 
   @doc """
+  Run synchronous work under the rotation/revocation family lock. Nested
+  calls use the caller's transaction. A rollback never returns a success.
+  """
+  @impl Attesto.RefreshStore
+  @spec with_family_lock(String.t(), (-> term())) :: {:ok, term()} | {:error, term()}
+  def with_family_lock(family_id, work) when is_binary(family_id) and is_function(work, 0) do
+    repo().transaction(
+      fn ->
+        lock_family!(family_id)
+        work.()
+      end,
+      log: false,
+      telemetry_event: nil
+    )
+  end
+
+  @doc """
   Administratively binds existing families to an operator-asserted single issuer.
 
   Requires `assert_single_issuer: true`. The default `dry_run: true` audits
@@ -300,7 +317,7 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
         {:ok, 0}
 
       query ->
-        family_ids = repo().all(query, prefix: prefix, log: false, telemetry_event: nil)
+        family_ids = query |> repo().all(prefix: prefix, log: false, telemetry_event: nil) |> Enum.sort()
         Enum.each(family_ids, &revoke_family/1)
         {:ok, length(family_ids)}
     end
@@ -429,13 +446,57 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
         ]
       )
 
-    {modern_count, _} =
-      repo.update_all(modern, [], prefix: prefix, log: false, telemetry_event: nil)
+    {:ok, count} =
+      repo.transaction(
+        fn ->
+          # Take family locks before row locks, in the same order as bulk revocation.
+          # Limit updates to the selected rows: newly eligible rows wait for the
+          # next pass rather than entering an UPDATE without an ordered lock.
+          candidates =
+            from(r in RefreshToken,
+              where:
+                r.id in (modern |> exclude(:update) |> select([r], r.id) |> subquery()) or
+                  r.id in (malformed |> exclude(:update) |> select([r], r.id) |> subquery()),
+              select: {r.family_id, r.id}
+            )
 
-    {legacy_count, _} =
-      repo.update_all(malformed, [], prefix: prefix, log: false, telemetry_event: nil)
+          rows = repo.all(candidates, prefix: prefix, log: false, telemetry_event: nil)
+          rows |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.sort() |> Enum.each(&lock_family!(repo, &1))
+          ids = Enum.map(rows, &elem(&1, 1))
 
-    modern_count + legacy_count
+          repo.all(
+            from(r in RefreshToken,
+              where: r.id in ^ids,
+              order_by: [asc: r.family_id, asc: r.id],
+              lock: "FOR UPDATE",
+              select: r.id
+            ),
+            prefix: prefix,
+            log: false,
+            telemetry_event: nil
+          )
+
+          {modern_count, _} =
+            repo.update_all(from(r in modern, where: r.id in ^ids), [],
+              prefix: prefix,
+              log: false,
+              telemetry_event: nil
+            )
+
+          {legacy_count, _} =
+            repo.update_all(from(r in malformed, where: r.id in ^ids), [],
+              prefix: prefix,
+              log: false,
+              telemetry_event: nil
+            )
+
+          modern_count + legacy_count
+        end,
+        log: false,
+        telemetry_event: nil
+      )
+
+    count
   end
 
   defp rotate_transaction(parent_hash, child, successor, protected, now, repo, prefix) do
@@ -879,6 +940,18 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
   defp revoke_rows!(family_id, prefix) do
     mark_family_revoked!(family_id, prefix)
 
+    repo().all(
+      from(r in RefreshToken,
+        where: r.family_id == ^family_id,
+        order_by: [asc: r.id],
+        lock: "FOR UPDATE",
+        select: r.id
+      ),
+      prefix: prefix,
+      log: false,
+      telemetry_event: nil
+    )
+
     repo().delete_all(
       from(r in RefreshToken, where: r.family_id == ^family_id),
       prefix: prefix,
@@ -920,8 +993,10 @@ defmodule AttestoPhoenix.Store.EctoRefreshStore do
 
   defp insert_error(_), do: :invalid_rotation
 
-  defp lock_family!(family_id) do
-    repo().query!(
+  defp lock_family!(family_id), do: lock_family!(repo(), family_id)
+
+  defp lock_family!(repo, family_id) do
+    repo.query!(
       "SELECT pg_advisory_xact_lock($1::int4, hashtext($2))",
       [@advisory_lock_namespace, family_id],
       log: false,

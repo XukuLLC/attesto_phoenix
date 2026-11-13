@@ -149,12 +149,36 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.10"}
+    {:attesto_phoenix, "~> 4.11"}
   ]
 end
 ```
 
-Requires `attesto >= 2.17.0 and < 3.0.0`.
+Requires `attesto >= 2.18.0 and < 3.0.0`.
+
+For `prompt=login`, the authentication callback must return `auth_time` at or
+later than `auth_opts.parked_at` on an interaction resume. Fresh requests allow
+60 seconds before arrival, as the interactive `max_age` check does. The host
+still owns reauthentication; unusable timestamps are logged and produce
+`server_error` (OpenID Connect Core §3.1.2.3).
+
+Set `render_end_session_error: fn conn, error -> ... end` to render logout
+errors. The callback receives an `AttestoPhoenix.OAuthError` with library-owned
+code, description, and status; request parameters are never copied into it.
+The default HTML and JSON responses remain unchanged (RP-Initiated Logout §4).
+
+With the Ecto refresh store, grace retries check the family under its rotation
+lock, including a configured `:refresh_completion` callback. A refresh racing
+revocation can still yield an access token minted immediately before revocation
+commits. To serialize host eligibility changes with minting, run the completion
+continuation inside the host transaction that checks and locks the relevant
+host state, using the same order as revocation. Already issued access tokens
+need their own expiry/introspection/denylist policy (RFC 7009 §2.1, §2.2).
+
+Scheduled sweeps with `cluster_lock: {:advisory, key}` hold a session lock on one
+checked-out connection and use a separate transaction for redaction and each
+table deletion. `sweep_once/2` remains inside a caller transaction. See
+`AttestoPhoenix.Revocation` for the code/refresh-table lock order.
 
 The optional Igniter installer needs `igniter` available while you run it. It is
 not a runtime dependency of this package:
@@ -162,7 +186,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.10"},
+    {:attesto_phoenix, "~> 4.11"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end

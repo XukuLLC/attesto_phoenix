@@ -53,6 +53,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       session reachable by the end-session endpoint), threaded into the code's
       claims so the token endpoint can mint the ID token.
 
+      For `prompt=login`, `auth_time` must be at or after `auth_opts.parked_at`
+      on resume. A fresh request permits 60 seconds before request arrival,
+      matching the interactive `max_age` allowance. An unusable time is logged
+      and returned as `server_error` (OIDC Core §3.1.2.3).
+
       `auth_opts` is a map carrying the OIDC Core §3.1.2.1 authentication
       directives the host MUST honour: `:prompt` (the parsed `prompt` list),
       `:force_reauth` (`true` for `prompt=login`: reauthenticate even if a
@@ -171,6 +176,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   """
   @spec authorize(Plug.Conn.t(), map()) :: Plug.Conn.t()
   def authorize(conn, params) do
+    conn = put_private(conn, :attesto_phoenix_authorization_arrived_at, System.system_time(:second))
     config = Config.resolve!(conn)
     # `par: false` with a configuration that requires PAR cannot serve any
     # request; fail loudly instead of answering each client `invalid_request`.
@@ -635,7 +641,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp run_authenticated(conn, config, client, request, subject, prompt_none?, dpop_jkt) do
-    case check_authentication_age(conn, request, subject, prompt_none?) do
+    case with :ok <- check_authentication_age(conn, request, subject, prompt_none?),
+              do: check_prompt_login(conn, request, subject) do
       :ok ->
         run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt)
 
@@ -687,6 +694,26 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
       {:error, reason} ->
         Logger.error("max_age was requested but the host returned an unusable authentication: #{reason}")
+        {:error, @error_server_error}
+    end
+  end
+
+  defp check_prompt_login(conn, request, subject) do
+    {since, allowance} =
+      case resumed(conn) do
+        %{parked_at: parked_at} -> {parked_at, 0}
+        nil -> {conn.private.attesto_phoenix_authorization_arrived_at, @reauthentication_allowance_seconds}
+      end
+
+    case AuthorizationRequest.check_prompt_login(request, Map.get(subject, :auth_time), since,
+           now: System.system_time(:second),
+           allowance: allowance
+         ) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error("prompt=login was requested but the host returned an unusable authentication: #{reason}")
         {:error, @error_server_error}
     end
   end
@@ -1192,7 +1219,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       force_reauth: @prompt_login in request.prompt,
       interactive: @prompt_none not in request.prompt,
       max_age: request.max_age,
-      resumed: not is_nil(resumed(conn))
+      resumed: not is_nil(resumed(conn)),
+      parked_at: (resumed(conn) || %{})[:parked_at]
     }
   end
 
