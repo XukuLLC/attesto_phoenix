@@ -2153,7 +2153,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert call_query(valid_params(%{"prompt" => "login"})).resp_body == "consent"
       assert_received {:arrival, arrival}
       assert_received {:consent_parked, resume_id}
-      key = "urn:attesto:interaction:" <> resume_id
+      key = Interaction.parked_key(resume_id, "browser-1")
       {:ok, entry} = PARStore.take(key)
       since = arrival - Interaction.reauthentication_allowance_seconds()
       assert entry["prompt_login_since"] == since
@@ -2202,7 +2202,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         Process.delete(:resume_auth_time)
         assert call_query(valid_params(%{"prompt" => "login"})).resp_body == "consent"
         assert_received {:consent_parked, id}
-        {:ok, first} = PARStore.fetch("urn:attesto:interaction:" <> id)
+        {:ok, first} = PARStore.fetch(Interaction.parked_key(id, "browser-1"))
         since = first["prompt_login_since"]
         Process.put(:resume_auth_time, since + offset)
         result = call_query(%{"resume" => id})
@@ -2210,7 +2210,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         if offset == 0 do
           assert result.resp_body == "consent"
           assert_received {:consent_parked, second_id}
-          {:ok, second} = PARStore.fetch("urn:attesto:interaction:" <> second_id)
+          {:ok, second} = PARStore.fetch(Interaction.parked_key(second_id, "browser-1"))
           assert second["prompt_login_since"] == since
           assert second["parked_at"] == first["parked_at"]
           Process.put(:resume_auth_time, since - 1)
@@ -2240,7 +2240,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         Process.delete(:resume_auth_time)
         assert call_query(valid_params(%{"prompt" => "login", "max_age" => max_age})).resp_body == "consent"
         assert_received {:consent_parked, id}
-        {:ok, entry} = PARStore.fetch("urn:attesto:interaction:" <> id)
+        {:ok, entry} = PARStore.fetch(Interaction.parked_key(id, "browser-1"))
         Process.put(:resume_auth_time, entry["prompt_login_since"] + 30)
         result = location_query(call_query(%{"resume" => id}))
         if accepted?, do: assert(is_binary(result["code"])), else: assert(result["error"] == "server_error")
@@ -2249,7 +2249,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
     test "a legacy parked entry without a login bound still requires the park time" do
       id = park!(%{"prompt" => "login"})
-      key = "urn:attesto:interaction:" <> id
+      key = Interaction.parked_key(id, "browser-1")
       {:ok, entry} = PARStore.take(key)
       :ok = PARStore.put(key, Map.delete(entry, "prompt_login_since"), 600)
       Process.put(:resume_auth_time, entry["parked_at"] - 1)
@@ -2283,7 +2283,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert TestStore.count() == 1
     end
 
-    test "a lost session browser binding refuses resume through the wrong-browser path" do
+    test "a lost session browser binding refuses resume without using up the parked request" do
       put_config(
         authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
         interaction_browser_binding: &BrowserBinding.binding/1
@@ -2297,8 +2297,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert refused.status == 400
       assert refused.resp_body =~ "belongs to another browser"
       assert location(refused) == nil
+      assert is_binary(location_query(call_session_query(%{"resume" => resume_id}, first))["code"])
       assert call_session_query(%{"resume" => resume_id}, first).status == 400
-      assert TestStore.count() == 0
     end
 
     @tag :ecto
@@ -2401,7 +2401,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
 
     defp backdate_park(resume_id) do
-      key = "urn:attesto:interaction:" <> resume_id
+      key = Interaction.parked_key(resume_id, "browser-1")
       {:ok, entry} = PARStore.take(key)
       parked_at = System.system_time(:second) - 120
       entry = entry |> Map.put("parked_at", parked_at) |> Map.put("prompt_login_since", parked_at)
@@ -2467,14 +2467,24 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert_received {:auth_opts, %{resumed: false}}
     end
 
-    test "another browser cannot resume, and the attempt spends the parked request" do
+    test "another browser cannot resume or use up the parked request" do
       resume_id = park!()
 
       stolen = call_query(%{"resume" => resume_id}, "browser-2")
       assert stolen.status == 400
       assert location(stolen) == nil
+      assert {:ok, _entry} = PARStore.fetch(Interaction.parked_key(resume_id, "browser-1"))
 
+      assert is_binary(location_query(call_query(%{"resume" => resume_id}))["code"])
       assert call_query(%{"resume" => resume_id}).status == 400
+    end
+
+    test "the parked key depends on both the resume id and the browser" do
+      resume_id = park!()
+
+      refute Interaction.parked_key(resume_id, "browser-1") == Interaction.parked_key(resume_id, "browser-2")
+      assert :error = PARStore.fetch("urn:attesto:interaction:" <> resume_id)
+      assert Interaction.reserved_key?(Interaction.parked_key(resume_id, "browser-2"))
     end
 
     test "resume cannot be combined with other parameters, and that attempt leaves it usable" do
@@ -2519,7 +2529,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     test "a parked key is refused as a request_uri" do
       resume_id = park!()
 
-      conn = call(%{"client_id" => @client_id, "request_uri" => "urn:attesto:interaction:" <> resume_id})
+      conn = call(%{"client_id" => @client_id, "request_uri" => Interaction.parked_key(resume_id, "browser-1")})
       assert conn.status == 400
       assert location(conn) == nil
     end

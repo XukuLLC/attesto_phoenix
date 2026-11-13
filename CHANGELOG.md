@@ -6,6 +6,29 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.12.1] - 2026-11-13
+
+### Security
+
+- A resume from the wrong browser no longer uses up the parked request.
+  `Interaction.take/3` removed the entry from the store before it compared
+  browser bindings, so anyone holding a leaked resume id (from browser
+  history, a `Referer` header or a request log) and any binding of their own,
+  which any `prompt=login` flow on a public client hands out, could spend the
+  victim's parked request and leave their sign-in on an error page. They got
+  no token, session or request data from it. A parked request is now stored
+  under a key derived from the resume id and the browser binding hash, so a
+  lookup from another browser finds nothing and the browser that parked the
+  request can still resume it. The `:par_store` contract is unchanged: atomic
+  `take/1` is still all it needs.
+
+### Upgrading
+
+- Requests parked by 4.12.0 or earlier are stored under the old key and
+  cannot be resumed after the upgrade. A browser mid-sign-in at deploy time
+  gets the invalid-resume error page and starts the authorization again. Old
+  entries expire after `:interaction_ttl` (default 600 seconds).
+
 ## [4.12.0] - 2026-11-12
 
 ### Fixed

@@ -105,9 +105,11 @@ defmodule AttestoPhoenix.Interaction do
   Preserve the value through login, including session renewal:
   `Plug.Conn.configure_session(conn, renew: true)` keeps session data;
   `drop: true` discards it. Losing the value makes resume follow the
-  wrong-browser refusal path. Only a hash of it is stored. A resume from a
-  browser whose value differs is refused, and that attempt spends the parked
-  request.
+  wrong-browser refusal path. Only a hash of it is stored. The parked request
+  is stored under a key derived from both the resume id and that hash, so a
+  resume from a browser whose value differs finds nothing: it is refused and
+  leaves the parked request in place for the browser that parked it. A leaked
+  resume id alone cannot be used, or used up, from another browser.
 
   `resume` cannot be combined with any other parameter. An unknown, expired,
   already used or wrong-browser `resume` is answered with a direct error page,
@@ -197,7 +199,7 @@ defmodule AttestoPhoenix.Interaction do
       "prompt_login_since" => original_prompt_login_since(conn, parked_at)
     }
 
-    case store.put(@key_prefix <> resume_id, entry, config.interaction_ttl) do
+    case store.put(parked_key(resume_id, binding), entry, config.interaction_ttl) do
       :ok -> {:ok, resume_id}
       {:error, reason} -> {:error, reason}
     end
@@ -209,13 +211,14 @@ defmodule AttestoPhoenix.Interaction do
   Returns `{:ok, %{params: ..., client_id: ..., parked_at: ..., prompt_login_since: ...}}`, or
   `{:error, :invalid_resume}` when the id is unknown, expired or already used,
   the browser value does not match, or the configuration cannot resume. The
-  entry is consumed by the lookup in every case in which it was found.
+  lookup key includes the browser value, so a wrong browser's lookup finds no
+  entry and consumes nothing. A found entry is consumed.
   """
   @spec take(Config.t(), Plug.Conn.t(), term()) :: {:ok, parked()} | {:error, :invalid_resume}
   def take(%Config{} = config, %Plug.Conn{} = conn, resume_id) when is_binary(resume_id) and resume_id != "" do
     with {:ok, store} <- store(config),
          {:ok, binding} <- browser_binding(config, conn),
-         {:ok, entry} <- store.take(@key_prefix <> resume_id),
+         {:ok, entry} <- store.take(parked_key(resume_id, binding)),
          %{"params" => params, "client_id" => client_id, "binding" => stored, "parked_at" => parked_at}
          when is_map(params) and is_binary(client_id) and is_binary(stored) and is_integer(parked_at) <- entry,
          true <- Plug.Crypto.secure_compare(stored, binding_hash(binding)),
@@ -227,6 +230,15 @@ defmodule AttestoPhoenix.Interaction do
   end
 
   def take(%Config{}, %Plug.Conn{}, _resume_id), do: {:error, :invalid_resume}
+
+  @doc false
+  # The store key for a parked request: the resume id and the browser binding
+  # hash together, so a lookup from another browser misses instead of taking
+  # the entry. The resume id is base64url and the hash has a fixed length, so
+  # the "." separator is unambiguous.
+  @spec parked_key(String.t(), String.t()) :: String.t()
+  def parked_key(resume_id, binding) when is_binary(resume_id) and is_binary(binding),
+    do: @key_prefix <> Secret.hash(resume_id <> "." <> binding_hash(binding))
 
   @doc """
   Whether `key` is in the key space parked requests use. The authorization
