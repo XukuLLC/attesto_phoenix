@@ -2288,6 +2288,29 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
                resumed.private.attesto_phoenix_resumed_interaction
     end
 
+    test "a recorded Deny is answered before authentication, even when the session went stale" do
+      decision_config()
+      id = park_for_decision(%{"max_age" => "60", "state" => "stale"})
+      assert :ok = Interaction.decide(decision_conn(), id, :deny, "user-42")
+
+      # While the End-User was on the consent page the session aged past
+      # max_age; authenticating now would mean a login detour.
+      put_config(
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        consent: &consent_with_decision/3,
+        authenticate_resource_owner: fn _conn, _request, _opts ->
+          send(self(), :authenticated_on_deny)
+          {:authenticated, %{subject: "user-42", auth_time: System.system_time(:second) - 3_600}}
+        end
+      )
+
+      assert %{"error" => "access_denied", "state" => "stale"} = location_query(call_query(%{"resume" => id}))
+      refute_received :authenticated_on_deny
+      refute_received {:consent_decision, _decision}
+      assert TestStore.count() == 0
+      assert call_query(%{"resume" => id}).status == 400
+    end
+
     test "two consent pages in one browser have separate Allow and Deny decisions" do
       decision_config()
       allow_id = park_for_decision(%{"state" => "allow-page"})
@@ -2298,7 +2321,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert %{"error" => "access_denied", "state" => "deny-page"} =
                location_query(call_query(%{"resume" => deny_id}))
 
-      assert_received {:consent_decision, :deny}
+      refute_received {:consent_decision, _decision}
       assert TestStore.count() == 0
       assert %{"code" => code, "state" => "allow-page"} = location_query(call_query(%{"resume" => allow_id}))
       assert is_binary(code)

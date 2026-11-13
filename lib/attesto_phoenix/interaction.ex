@@ -131,10 +131,14 @@ defmodule AttestoPhoenix.Interaction do
   before resume replaces the first without extending expiry. Re-parking
   always clears the decision; supply `subject:` again for a new consent page.
 
-  A resume id alone is not approval. The library does not act on a recorded
-  decision: the host's `:consent` chooses whether to consent, deny, or park
-  again. The controller still loads the client and runs validation, scope
-  policy, authentication and consent. A consent halt under `prompt=none`
+  A resume id alone is not approval. A recorded Allow is not acted on by the
+  library: the host's `:consent` reads it with `consent_decision/3` and
+  chooses whether to consent, deny, or park again, after the controller has
+  loaded the client and run validation, scope policy and authentication. A
+  recorded Deny is answered `access_denied` as soon as the resumed request is
+  validated, before authentication and before `:consent` runs: refusing grants
+  nothing, so a session that went stale against `max_age` on the consent page
+  does not send the End-User to sign in again only to lose their Deny. A consent halt under `prompt=none`
   still becomes `consent_required` (OIDC Core §3.1.2.1, §3.1.2.6).
   Returning with the original query starts a fresh request, including a new
   `prompt=login` requirement (OIDC Core §3.1.2.1, §3.1.2.3, §3.1.2.4).
@@ -333,7 +337,8 @@ defmodule AttestoPhoenix.Interaction do
 
   Use inside `:consent`. Returns `nil` for a fresh request, an absent decision,
   or a changed subject or request binding (including the effective scope).
-  The host decides whether to consent, deny, or park for consent again.
+  The host decides whether to consent, deny, or park for consent again. A
+  recorded Deny never reaches `:consent`: the controller answers it first.
   """
   @spec consent_decision(Plug.Conn.t(), AuthorizationRequest.t(), map()) :: :allow | :deny | nil
   def consent_decision(%Plug.Conn{} = conn, %AuthorizationRequest{} = request, subject) do

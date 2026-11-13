@@ -602,6 +602,26 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp run_flow(conn, config, client, request, dpop_jkt) do
     prompt_none? = @prompt_none in request.prompt
 
+    if recorded_deny?(conn),
+      do: answer_recorded_deny(conn, config, request, prompt_none?),
+      else: run_authentication(conn, config, client, request, prompt_none?, dpop_jkt)
+  end
+
+  # A Deny recorded with `AttestoPhoenix.Interaction.decide/4` on the resumed
+  # entry is answered before authentication. Refusing grants nothing, so it
+  # needs no fresh sign-in: a session that went stale against `max_age` while
+  # the End-User was on the consent page must not turn their Deny into a login
+  # detour that loses it. Only the parking browser, for the parked subject,
+  # can record a decision (RFC 6749 §4.1.2.1 `access_denied`; under
+  # `prompt=none`, OIDC Core §3.1.2.6 `consent_required`).
+  defp recorded_deny?(conn), do: match?(%{consent_decision: "deny"}, resumed(conn))
+
+  defp answer_recorded_deny(conn, config, request, prompt_none?) do
+    emit_denied(conn, config, request.client_id)
+    emit_error(conn, config, request, if(prompt_none?, do: @error_consent_required, else: @error_access_denied))
+  end
+
+  defp run_authentication(conn, config, client, request, prompt_none?, dpop_jkt) do
     case authenticate_resource_owner(conn, config, request) do
       {:authenticated, subject} ->
         run_authenticated(conn, config, client, request, subject, prompt_none?, dpop_jkt)

@@ -6,6 +6,21 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.15.2] - 2026-11-13
+
+### Fixed
+
+- A Deny recorded with `Interaction.decide/4` is answered `access_denied`
+  (`consent_required` under `prompt=none`) as soon as the resumed request is
+  validated, before the host's `:authenticate_resource_owner` and `:consent`
+  run. Before, a request with `max_age` whose session went stale while the
+  End-User was on the consent page sent them to sign in after they clicked
+  Deny, then showed the consent page again, and the client never received
+  `access_denied`. Refusing grants nothing, so it needs no fresh
+  authentication; only the parking browser, for the parked subject, can
+  record a decision. A recorded Allow still goes through authentication and
+  the host's `:consent`.
+
 ## [4.15.1] - 2026-11-13
 
 ### Fixed
