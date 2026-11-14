@@ -21,42 +21,15 @@ defmodule AttestoPhoenix.URLComparison do
   """
   @spec same_https_origin?(URI.t() | String.t() | term(), URI.t() | String.t() | term()) :: boolean()
   def same_https_origin?(left, right) do
-    with %URI{scheme: "https", host: left_host} = left_uri when is_binary(left_host) <- to_uri(left),
-         %URI{scheme: "https", host: right_host} = right_uri when is_binary(right_host) <- to_uri(right) do
-      normalize_host(left_host) == normalize_host(right_host) and
-        effective_https_port(left_uri) == effective_https_port(right_uri)
+    with {:ok, "https://" <> _ = left_origin} <- to_origin(left),
+         {:ok, "https://" <> _ = right_origin} <- to_origin(right) do
+      left_origin == right_origin
     else
       _other -> false
     end
   end
 
-  defp to_uri(%URI{} = uri), do: uri
-
-  defp to_uri(value) when is_binary(value) do
-    case URI.new(value) do
-      {:ok, uri} -> uri
-      {:error, _reason} -> nil
-    end
-  end
-
-  defp to_uri(_value), do: nil
-
-  defp effective_https_port(%URI{port: nil}), do: 443
-  defp effective_https_port(%URI{port: port}), do: port
-
-  # RFC 3986 §6.2.2.1/§6.2.2.2: scheme and host are case-insensitive, and
-  # percent-encoded unreserved host bytes are equivalent to their decoded form.
-  defp normalize_host(host) do
-    host
-    |> normalize_percent_encoding(&URI.char_unreserved?/1)
-    |> String.downcase()
-  end
-
-  defp normalize_percent_encoding(value, decoded_char?) do
-    Regex.replace(~r/%[0-9A-Fa-f]{2}/, value, fn "%" <> hex ->
-      byte = String.to_integer(hex, 16)
-
-      if decoded_char?.(byte), do: <<byte>>, else: "%" <> String.upcase(hex)
-    end)
-  end
+  defp to_origin(%URI{} = uri), do: uri |> URI.to_string() |> Attesto.URI.origin()
+  defp to_origin(value) when is_binary(value), do: Attesto.URI.origin(value)
+  defp to_origin(_value), do: {:error, :invalid_uri}
 end

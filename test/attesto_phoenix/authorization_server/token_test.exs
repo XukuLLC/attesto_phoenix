@@ -12,6 +12,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   use ExUnit.Case, async: false
 
   alias Attesto.CodeStore.ETS
+  alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
@@ -717,7 +718,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                ETS.get(Attesto.Secret.hash(Process.get(:auth_code)))
     end
 
-    test "a pairwise client's ID Token carries the derived sub; the access token keeps the host subject" do
+    test "a pairwise client's ID Token and access token carry the derived sub; each token seals the host subject separately" do
       salt = String.duplicate("k", 32)
       code_store = start_code_store("oc_user-1", ["openid"])
 
@@ -744,8 +745,44 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert {:ok, response, _events} = Token.issue(config, code_request)
 
       sector = URI.parse(@redirect_uri).host
-      assert claim!(response.id_token, "sub") == Attesto.PairwiseSubject.derive(sector, "oc_user-1", salt)
-      assert claim!(response.access_token, "sub") == "oc_user-1"
+      pairwise_sub = Attesto.PairwiseSubject.derive(sector, "oc_user-1", salt)
+
+      assert claim!(response.id_token, "sub") == pairwise_sub
+      assert claim!(response.access_token, "sub") == pairwise_sub
+      assert sealed = claim!(response.access_token, Attesto.PairwiseSubject.sealed_claim())
+      assert {:ok, "oc_user-1"} = Attesto.PairwiseSubject.unseal_subject(sealed, pairwise_sub, salt)
+      refute sealed =~ "oc_user-1"
+
+      # Second issuance produces a distinct nonce/ciphertext.
+      code_store2 = start_code_store("oc_user-1", ["openid"])
+      config2 = %{config | code_store: code_store2}
+
+      assert {:ok, response2, _events} =
+               Token.issue(
+                 config2,
+                 request(config2,
+                   request_client_id: "client-1",
+                   grant_type: "authorization_code",
+                   params: %{
+                     "code" => Process.get(:auth_code),
+                     "code_verifier" => @code_verifier,
+                     "redirect_uri" => @redirect_uri
+                   }
+                 )
+               )
+
+      refute claim!(response2.access_token, Attesto.PairwiseSubject.sealed_claim()) == sealed
+
+      # Same-deployment resource verification recovers the host subject; corrupted ciphertext fails closed.
+      assert {:ok, verified} =
+               Attesto.Token.verify(
+                 Config.to_attesto_config(config),
+                 response.access_token,
+                 SubjectIdentifier.verify_opts(config)
+               )
+
+      assert verified["sub"] == "oc_user-1"
+      assert {:error, :invalid_claims} = Attesto.Token.verify(Config.to_attesto_config(config), response.access_token)
     end
 
     test "a pairwise client with no sector identifier is issued no tokens" do
@@ -1944,6 +1981,25 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       assert claim!(response.access_token, "credential_configuration_ids") == ["UniversityDegreeCredential"]
     end
 
+    test "refuses minting for a pairwise client even when client_grant_types is unset" do
+      config =
+        pre_authorized_config(
+          client_redirect_uris: fn _client -> ["https://rp.example/cb"] end,
+          client_subject_type: fn _client -> "pairwise" end,
+          pairwise_subject_salt: String.duplicate("k", 32)
+        )
+
+      code = issue_pre_authorized_code()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, %OAuthError{error: :unauthorized_client}, _events} =
+                   Token.issue(config, pre_authorized_request(config, code))
+        end)
+
+      refute log =~ "token mint failed"
+    end
+
     test "scope policy cannot exceed the credential offer's authorized scopes" do
       config =
         pre_authorized_config(authorize_scope: fn _client, _requested -> {:ok, ["credential", "admin"]} end)
@@ -2307,6 +2363,37 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   end
 
   describe "token exchange grant (RFC 8693)" do
+    test "refuses minting for a pairwise client even when client_grant_types is unset" do
+      subject_config = config()
+      subject_request = request(subject_config, params: %{"scope" => "read"})
+      assert {:ok, subject_response, _events} = Token.issue(subject_config, subject_request)
+
+      pairwise_config =
+        config(
+          client_redirect_uris: fn _client -> ["https://rp.example/cb"] end,
+          client_subject_type: fn _client -> "pairwise" end,
+          pairwise_subject_salt: String.duplicate("k", 32)
+        )
+
+      exchange_request =
+        request(pairwise_config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "scope" => "read"
+          }
+        )
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, %OAuthError{error: :unauthorized_client}, _events} =
+                   Token.issue(pairwise_config, exchange_request)
+        end)
+
+      refute log =~ "mint failed"
+    end
+
     test "a token contained after authorization-code reuse cannot be exchanged" do
       config = config(code_store: RevokedAccessTokenStore)
       subject_request = request(config, params: %{"scope" => "read"})

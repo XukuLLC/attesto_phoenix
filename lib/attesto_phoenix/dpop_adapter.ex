@@ -46,14 +46,31 @@ defmodule AttestoPhoenix.DPoP.Adapter do
   end
 
   @doc """
+  Verify a DPoP `proof` with options built from `config` and `input`.
+
+  When `Canonical` / `:htu` resolves to `nil` (or any non-string), returns
+  `{:error, :invalid_http_uri}` instead of calling `Attesto.DPoP.verify_proof/2`
+  and raising `ArgumentError`.
+  """
+  @spec verify_proof(Config.t(), binary(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def verify_proof(%Config{} = config, proof, input, options \\ []) when is_binary(proof) and is_map(input) do
+    opts = verification_opts(config, input, options)
+
+    case Keyword.get(opts, :http_uri) do
+      uri when is_binary(uri) and uri != "" -> Attesto.DPoP.verify_proof(proof, opts)
+      _other -> {:error, :invalid_http_uri}
+    end
+  end
+
+  @doc """
   Build the DPoP/mTLS options consumed by `Attesto.Plug.Authenticate`.
 
   This is the protected-resource path: replay checking is disabled when DPoP
   is disabled, while `htu`, nonce, nonce issuance, and certificate extraction
-  are resolved from the same Phoenix config used by the endpoint. The `:htu`
-  callback is always present and follows `htu/1`; the result never carries
-  core's `:origin`, so it composes with `Attesto.Plug.Authenticate`, which
-  takes one or the other.
+  are resolved from the same Phoenix config used by the endpoint. When neither
+  `:htu` nor `:resource_origin` is set on `config`, `:htu` is omitted so
+  `Attesto.Plug.Authenticate.init/1` requires an explicit per-route `:origin`
+  or `:htu` whenever DPoP is accepted.
   """
   @spec protected_resource_opts(Config.t()) :: keyword()
   def protected_resource_opts(%Config{} = config) do
@@ -102,15 +119,24 @@ defmodule AttestoPhoenix.DPoP.Adapter do
   def cert_der(%Config{}), do: nil
 
   @doc """
-  Resolve the protected-resource DPoP `htu` callback.
+  Resolve the protected-resource DPoP `htu` callback, or `nil` when no target
+  origin or callback is configured.
 
   See `AttestoPhoenix.RequestContext.protected_resource_url/2`: a configured
-  `:htu` decides; otherwise a configured `:resource_origin` followed by the
-  request path; otherwise the URL derived from the request through
-  `:trusted_proxies`, which follows the request `Host`.
+  `:htu` callback or `:resource_origin` decides. Without either, `nil` is
+  returned so protected resources that accept DPoP must pin `:origin` or
+  `:htu` explicitly instead of trusting the request `Host` header.
   """
-  @spec htu(Config.t()) :: (Plug.Conn.t() -> String.t())
-  def htu(%Config{} = config), do: fn conn -> RequestContext.protected_resource_url(conn, config) end
+  @spec htu(Config.t()) :: (Plug.Conn.t() -> String.t() | nil) | nil
+  def htu(%Config{htu: htu} = config) when not is_nil(htu) do
+    fn conn -> RequestContext.protected_resource_url(conn, config) end
+  end
+
+  def htu(%Config{resource_origin: origin} = config) when is_binary(origin) do
+    fn conn -> RequestContext.protected_resource_url(conn, config) end
+  end
+
+  def htu(%Config{}), do: nil
 
   defp protected_resource_replay_check(%Config{dpop_enabled: false}), do: nil
   defp protected_resource_replay_check(%Config{} = config), do: replay_check(config)

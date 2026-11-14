@@ -35,9 +35,11 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
 
   import Ecto.Query, only: [from: 2]
 
+  alias Attesto.Claims
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Schema.PushedAuthorizationRequest, as: PushedRequest
   alias AttestoPhoenix.Store.Ecto, as: StoreEcto
+  alias AttestoPhoenix.Store.PAR.Capacity
 
   @doc """
   Persists a pushed authorization request under `request_uri` for
@@ -53,10 +55,15 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   @spec put(String.t(), map(), pos_integer()) :: :ok | {:error, term()}
   def put(request_uri, params, ttl_seconds)
       when is_binary(request_uri) and is_map(params) and is_integer(ttl_seconds) and ttl_seconds > 0 do
-    if StoreEcto.text_value?(request_uri) and nul_free?(params) do
-      put_validated(request_uri, params, ttl_seconds)
-    else
-      {:error, :invalid_text}
+    cond do
+      not (Claims.storable_text?(request_uri) and storable_params?(params)) ->
+        {:error, :invalid_text}
+
+      not Capacity.fits?(request_uri, params, System.system_time(:second) + ttl_seconds) ->
+        {:error, :record_too_large}
+
+      true ->
+        put_validated(request_uri, params, ttl_seconds)
     end
   end
 
@@ -75,17 +82,17 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
     end
   end
 
-  defp nul_free?(value) when is_binary(value), do: not String.contains?(value, <<0>>)
-  defp nul_free?(value) when is_list(value), do: Enum.all?(value, &nul_free?/1)
+  defp storable_params?(value) when is_binary(value), do: Claims.storable_text?(value)
+  defp storable_params?(value) when is_list(value), do: Enum.all?(value, &storable_params?/1)
 
-  defp nul_free?(value) when is_map(value) and not is_struct(value) do
-    Enum.all?(value, fn {key, nested} -> nul_free?(key) and nul_free?(nested) end)
+  defp storable_params?(value) when is_map(value) and not is_struct(value) do
+    Enum.all?(value, fn {key, nested} -> storable_params?(key) and storable_params?(nested) end)
   end
 
-  defp nul_free?(value)
+  defp storable_params?(value)
        when is_atom(value) or is_integer(value) or is_float(value) or is_boolean(value) or is_nil(value), do: true
 
-  defp nul_free?(_value), do: false
+  defp storable_params?(_value), do: false
 
   @doc """
   Resolves a live `request_uri` without consuming it.
@@ -160,7 +167,8 @@ defmodule AttestoPhoenix.Store.EctoPARStore do
   @impl AttestoPhoenix.PARStore
   @spec replace(String.t(), map()) :: :ok | :error
   def replace(request_uri, params) when is_binary(request_uri) and is_map(params) do
-    if StoreEcto.text_value?(request_uri) and nul_free?(params) do
+    if Claims.storable_text?(request_uri) and storable_params?(params) and
+         Capacity.fits?(request_uri, params, 0) do
       replace_stored(request_uri, params)
     else
       :error

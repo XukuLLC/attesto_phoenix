@@ -267,7 +267,7 @@ defmodule AttestoPhoenix.Controller.TokenController do
   # assertion audience is derived from trusted `Config` (never the request `Host`).
   # RFC 7523 §3: the assertion `aud` MUST identify the authorization server.
   # `Config.client_assertion_audiences/1` accepts the issuer identifier alone by
-  # default (draft-ietf-oauth-rfc7523bis, FAPI 2.0 Security Profile Final
+  # default (RFC 10070 §4, FAPI 2.0 Security Profile Final
   # §5.3.2.1). The token endpoint URL also names THIS server, but it is the
   # value the 2025 audience-injection attack (CVE-2025-27370 / CVE-2025-27371)
   # exploits: a malicious AS publishes this server's token endpoint URL as one of

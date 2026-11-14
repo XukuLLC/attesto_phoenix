@@ -7,11 +7,14 @@ defmodule AttestoPhoenix.RevocationTest do
 
   use AttestoPhoenix.DataCase, async: false
 
+  alias Attesto.PreAuthorizedCodeStore.ETS
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Revocation
   alias AttestoPhoenix.Schema.RefreshFamilyRevocation
+  alias AttestoPhoenix.Store.EctoCIBAStore
   alias AttestoPhoenix.Store.EctoCodeStore
+  alias AttestoPhoenix.Store.EctoDeviceCodeStore
   alias AttestoPhoenix.Store.EctoRefreshStore
   alias AttestoPhoenix.Store.Sweeper
 
@@ -260,6 +263,139 @@ defmodule AttestoPhoenix.RevocationTest do
       assert_raise ArgumentError, fn -> Revocation.revoke_subject(config(), "") end
       assert_raise ArgumentError, fn -> Revocation.revoke(config(), []) end
       assert code_present?("u1-a")
+    end
+
+    test "a later store without delete_unconsumed/1 raises before code_store deletes anything" do
+      assert_raise ArgumentError, ~r/:device_code_store .* does not implement delete_unconsumed\/1/, fn ->
+        Revocation.revoke_subject(config(device_code_store: CodeStoreWithoutCriteria), "usr_1")
+      end
+
+      assert code_present?("u1-a")
+      assert refresh_present?("u1-a")
+    end
+
+    test "revokes unconsumed device codes, CIBA requests, and pre-authorized codes" do
+      start_supervised!(ETS)
+      now = System.system_time(:second)
+
+      :ok =
+        EctoDeviceCodeStore.put(%{
+          device_code_hash: "dc-u1",
+          user_code: "BCDFGHJK",
+          status: :pending,
+          expires_at: now + 600,
+          data: %{client_id: "client_a", scope: ["openid"], resource: [], dpop_jkt: nil}
+        })
+
+      {:ok, _} = EctoDeviceCodeStore.approve("BCDFGHJK", %{subject: "usr_1"}, %{now: now})
+
+      :ok =
+        EctoCIBAStore.put(%{
+          auth_req_id_hash: "ciba-u1",
+          status: :pending,
+          interval: 0,
+          expires_at: now + 600,
+          data: %{
+            acr_values: [],
+            binding_message: nil,
+            client_id: "client_a",
+            client_notification_token: nil,
+            delivery_mode: :poll,
+            dpop_jkt: nil,
+            resource: [],
+            scope: ["openid"],
+            subject: "usr_1"
+          }
+        })
+
+      {:ok, _} = EctoCIBAStore.approve("ciba-u1", %{subject: "usr_1"}, %{now: now})
+
+      :ok =
+        ETS.put(%{
+          code_hash: "pac-u1",
+          expires_at: now + 600,
+          data: %{client_id: "client_a", subject: "usr_1", credential_configuration_ids: ["id"]}
+        })
+
+      cfg =
+        config(
+          device_code_store: EctoDeviceCodeStore,
+          ciba_store: EctoCIBAStore,
+          pre_authorized_code_store: ETS
+        )
+
+      assert {:ok,
+              %{
+                codes: 2,
+                device_codes: 1,
+                ciba_requests: 1,
+                pre_authorized_codes: 1,
+                refresh_families: 2
+              }} = Revocation.revoke_subject(cfg, "usr_1")
+
+      assert :error = EctoDeviceCodeStore.consume("dc-u1", %{now: now})
+      assert :error = EctoCIBAStore.consume("ciba-u1", %{now: now})
+      assert :error = ETS.take("pac-u1")
+    end
+
+    test "revokes approved device codes and CIBA requests by :sid in Ecto", _ctx do
+      now = System.system_time(:second)
+
+      :ok =
+        EctoDeviceCodeStore.put(%{
+          device_code_hash: "dc-sid1",
+          user_code: "BCDFGHJM",
+          status: :pending,
+          expires_at: now + 600,
+          data: %{client_id: "client_a", scope: ["openid"], resource: [], dpop_jkt: nil}
+        })
+
+      {:ok, _} =
+        EctoDeviceCodeStore.approve("BCDFGHJM", %{subject: "usr_1", granted_claims: %{"sid" => "sid-1"}}, %{now: now})
+
+      :ok =
+        EctoDeviceCodeStore.put(%{
+          device_code_hash: "dc-sid2",
+          user_code: "BCDFGHJN",
+          status: :pending,
+          expires_at: now + 600,
+          data: %{client_id: "client_a", scope: ["openid"], resource: [], dpop_jkt: nil}
+        })
+
+      {:ok, _} =
+        EctoDeviceCodeStore.approve("BCDFGHJN", %{subject: "usr_1", granted_claims: %{"sid" => "sid-2"}}, %{now: now})
+
+      :ok =
+        EctoCIBAStore.put(%{
+          auth_req_id_hash: "ciba-sid1",
+          status: :pending,
+          interval: 0,
+          expires_at: now + 600,
+          data: %{
+            acr_values: [],
+            binding_message: nil,
+            client_id: "client_a",
+            client_notification_token: nil,
+            delivery_mode: :poll,
+            dpop_jkt: nil,
+            resource: [],
+            scope: ["openid"],
+            subject: "usr_1"
+          }
+        })
+
+      {:ok, _} =
+        EctoCIBAStore.approve("ciba-sid1", %{subject: "usr_1", granted_claims: %{"sid" => "sid-1"}}, %{now: now})
+
+      cfg = config(device_code_store: EctoDeviceCodeStore, ciba_store: EctoCIBAStore)
+
+      assert {:ok, %{device_codes: 1, ciba_requests: 1}} =
+               Revocation.revoke_session(cfg, "sid-1")
+               |> then(fn {:ok, res} -> {:ok, Map.take(res, [:device_codes, :ciba_requests])} end)
+
+      assert :error = EctoDeviceCodeStore.consume("dc-sid1", %{now: now})
+      assert {:ok, _} = EctoDeviceCodeStore.consume("dc-sid2", %{now: now})
+      assert :error = EctoCIBAStore.consume("ciba-sid1", %{now: now})
     end
   end
 end

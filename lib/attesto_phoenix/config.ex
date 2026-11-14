@@ -721,13 +721,16 @@ defmodule AttestoPhoenix.Config do
       client is `public` and sees the host's own subject identifier. A
       `pairwise` client sees a `sub` derived from its sector identifier, the
       host subject and `:pairwise_subject_salt`
-      (`Attesto.PairwiseSubject.derive/3`), the same value in its ID Tokens,
-      UserInfo responses, introspection responses and back-channel logout
-      tokens. The sector identifier is the one host the client's registered
-      redirect URIs share; `sector_identifier_uri` is not supported, so a
-      pairwise client whose redirect URIs span hosts is refused wherever a
-      `sub` would be issued. Access tokens keep the host subject in `sub`:
-      they are addressed to the resource server. At the end-session endpoint
+      (`Attesto.PairwiseSubject.derive/3`), the same value in its access
+      tokens, ID Tokens, UserInfo responses, introspection responses and
+      back-channel logout tokens. The sector identifier is the one host the
+      client's registered redirect URIs share; `sector_identifier_uri` is not
+      supported, so a pairwise client whose redirect URIs span hosts is refused
+      wherever a `sub` would be issued. Pairwise access tokens carry an
+      AES-256-GCM sealed copy of the host subject encrypted under
+      `:pairwise_subject_salt` so `AttestoPhoenix.ProtectedResource` and
+      introspection recover the host subject while nothing the client holds
+      reveals it. At the end-session endpoint
       the `:terminate_session` context's `:subject` comes from the
       `id_token_hint`, so for a pairwise client it is the pairwise value, which
       cannot be turned back into the host subject; identify the session by
@@ -756,16 +759,26 @@ defmodule AttestoPhoenix.Config do
       the browser whose value matches. Only a hash of the value is stored.
     * `:interaction_ttl` - how long a parked authorization request can be
       resumed, in seconds. A positive integer no greater than 3600. Default
-      `600`. Parked requests are stored in `:par_store`.
+      `600`. Parked interactions are bounded separately from `:par_max_entries`
+      on the default ETS store (`:interaction_max_entries`, default `8_192`),
+      and anonymous `/authorize` visitors can hold those slots up to
+      `:interaction_ttl` seconds, so public deployments should rate-limit
+      `/authorize` per source. For pushed (`request_uri`) requests, the
+      pushed reference remains governed by `:par_ttl` when shorter than
+      `:interaction_ttl`.
+    * `:interaction_max_entries` - maximum live parked interactions held by
+      the default ETS store, separate from `:par_max_entries`. Default `8_192`.
     * `:par_store` - module implementing `AttestoPhoenix.PARStore`. Defaults to
       the single-node `AttestoPhoenix.Store.PAR.ETS`; use
       `AttestoPhoenix.Store.EctoPARStore` for a clustered/load-balanced
       deployment so a `request_uri` resolves on every node (FAPI 2.0 requires
-      PAR). The default ETS store retains at most `:par_max_entries` live rows
-      (default 1,024), and each serialized row must fit
-      `:par_max_record_bytes` (default 256 KiB). It prunes expired rows before
-      rejecting admission with `temporarily_unavailable`; it never evicts a
-      live authorization request.
+      PAR). The default ETS store retains at most `:par_max_entries` live PAR
+      rows (default `1_024`) and `:interaction_max_entries` live parked
+      interactions (default `8_192`) in separate tables, and each serialized row
+      (across all stores for `Interaction.park/3` and `PAR.ETS` /
+      `EctoPARStore`) must fit `:par_max_record_bytes` (default 256 KiB). It
+      prunes expired rows before rejecting admission with
+      `temporarily_unavailable`; it never evicts a live entry.
     * `:consent_grant_store` - module implementing
       `AttestoPhoenix.ConsentGrantStore`, the single-use request-bound consent
       primitive (RFC 6749 §4.1.1). The host consent screen mints a grant when
@@ -855,7 +868,7 @@ defmodule AttestoPhoenix.Config do
     * `:client_assertion_audiences` - accepted `private_key_jwt` audiences
       at the token and backchannel authentication endpoints, as a list or a
       one-arity function of the config. Defaults to the issuer identifier
-      alone (`draft-ietf-oauth-rfc7523bis`, FAPI 2.0 §5.3.2.1), the value
+      alone (RFC 10070 §4, FAPI 2.0 §5.3.2.1), the value
       every other endpoint already requires. Endpoint URLs are not accepted
       by default because they are what the 2025 audience-injection
       disclosure (CVE-2025-27370, CVE-2025-27371) relies on: a malicious AS
@@ -1524,6 +1537,7 @@ defmodule AttestoPhoenix.Config do
     client_userinfo_signed_response_alg: nil,
     interaction_browser_binding: nil,
     par_max_entries: 1_024,
+    interaction_max_entries: 8_192,
     par_max_record_bytes: 262_144,
     dpop_enabled: true,
     dpop_nonce_required: false,
@@ -1659,7 +1673,7 @@ defmodule AttestoPhoenix.Config do
           require_nonce: boolean(),
           require_pkce: boolean(),
           require_https: boolean(),
-          trusted_proxies: [String.t()],
+          trusted_proxies: [:any | :loopback | :inet.ip_address() | String.t() | Attesto.IPAddress.cidr()],
           response_modes_supported: [String.t()],
           access_token_ttl: pos_integer(),
           id_token_ttl: pos_integer(),
@@ -1682,6 +1696,7 @@ defmodule AttestoPhoenix.Config do
           client_userinfo_signed_response_alg: callback() | nil,
           interaction_browser_binding: callback() | nil,
           par_max_entries: pos_integer(),
+          interaction_max_entries: pos_integer(),
           par_max_record_bytes: pos_integer(),
           dpop_enabled: boolean(),
           dpop_nonce_required: boolean(),
@@ -3956,7 +3971,7 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp absolute_uri?(value) when is_binary(value) and value != "" do
-    String.valid?(value) and not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value) and
+    String.valid?(value) and Attesto.URI.valid_percent_encoding?(value) and
       match?({:ok, %URI{scheme: scheme}} when is_binary(scheme) and scheme != "", URI.new(value))
   end
 
@@ -4820,7 +4835,85 @@ defmodule AttestoPhoenix.Config do
     validate_discovery_endpoints!(config)
     validate_advertised_paths_consistent!(config)
     validate_native_apps!(config)
+
     config
+    |> default_resource_origin()
+    |> Map.put(:trusted_proxies, parse_trusted_proxies!(config.trusted_proxies))
+  end
+
+  defp default_resource_origin(%__MODULE__{resource_origin: nil, htu: nil, dpop_enabled: true} = config) do
+    {:ok, origin} = Attesto.URI.origin(config.audience)
+    %{config | resource_origin: origin}
+  end
+
+  defp default_resource_origin(config), do: config
+
+  @doc false
+  @spec parse_trusted_proxy_cidr(term()) :: [Attesto.IPAddress.cidr()]
+  def parse_trusted_proxy_cidr(cidr) when is_binary(cidr) do
+    cidr
+    |> normalize_cidr_entry()
+    |> List.wrap()
+    |> Attesto.IPAddress.parse_cidrs!()
+  end
+
+  def parse_trusted_proxy_cidr(other), do: Attesto.IPAddress.parse_cidrs!([other])
+
+  defp parse_trusted_proxies!(proxies) when is_list(proxies) do
+    Enum.map(proxies, &parse_trusted_proxy_entry!/1)
+  rescue
+    error in ArgumentError ->
+      reraise ArgumentError,
+              "AttestoPhoenix.Config: :trusted_proxies contains an invalid entry: #{Exception.message(error)}",
+              __STACKTRACE__
+  end
+
+  defp parse_trusted_proxies!(other) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: :trusted_proxies must be a list; got #{inspect(other)}."
+  end
+
+  defp parse_trusted_proxy_entry!(entry) when entry in [:any, :loopback], do: entry
+
+  defp parse_trusted_proxy_entry!({ip, length} = entry)
+       when is_tuple(ip) and tuple_size(ip) in [4, 8] and is_integer(length) do
+    case :inet.ntoa(ip) do
+      {:error, _} -> invalid_trusted_proxy!(entry)
+      chars -> hd(parse_trusted_proxy_cidr("#{List.to_string(chars)}/#{length}"))
+    end
+  end
+
+  defp parse_trusted_proxy_entry!(tuple) when tuple_size(tuple) == 4 do
+    if valid_ip_components?(tuple, 0xFF), do: tuple, else: invalid_trusted_proxy!(tuple)
+  end
+
+  defp parse_trusted_proxy_entry!(tuple) when tuple_size(tuple) == 8 do
+    if valid_ip_components?(tuple, 0xFFFF), do: tuple, else: invalid_trusted_proxy!(tuple)
+  end
+
+  defp parse_trusted_proxy_entry!(cidr) when is_binary(cidr), do: hd(parse_trusted_proxy_cidr(cidr))
+  defp parse_trusted_proxy_entry!(other), do: invalid_trusted_proxy!(other)
+
+  defp normalize_cidr_entry(entry) do
+    if String.contains?(entry, "/") do
+      entry
+    else
+      case :inet.parse_strict_address(String.to_charlist(entry)) do
+        {:ok, {_, _, _, _}} -> entry <> "/32"
+        {:ok, {_, _, _, _, _, _, _, _}} -> entry <> "/128"
+        _other -> entry
+      end
+    end
+  end
+
+  defp valid_ip_components?(tuple, max) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.all?(&(is_integer(&1) and &1 in 0..max))
+  end
+
+  defp invalid_trusted_proxy!(other) do
+    raise ArgumentError, "invalid trusted proxy entry #{inspect(other)}"
   end
 
   defp validate_upgrade_policies!(config) do
@@ -5135,12 +5228,7 @@ defmodule AttestoPhoenix.Config do
     :ok
   end
 
-  # `absolute_resource_url?/1` is false for a non-binary, so `URI.new/1` only
-  # sees a string.
-  defp resource_origin?(origin) do
-    absolute_resource_url?(origin) and
-      match?({:ok, %URI{path: path, query: nil}} when path in [nil, "", "/"], URI.new(origin))
-  end
+  defp resource_origin?(origin), do: Attesto.URI.origin?(origin)
 
   # The rule is core's (`Attesto.AuthorizationRequest.response_modes!/1`); this
   # runs it at boot and names the configuration key.
@@ -5527,7 +5615,7 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp validate_par_limits!(%__MODULE__{} = config) do
-    Enum.each([:par_max_entries, :par_max_record_bytes], fn key ->
+    Enum.each([:par_max_entries, :interaction_max_entries, :par_max_record_bytes], fn key ->
       value = Map.fetch!(config, key)
 
       if !(is_integer(value) and value > 0) do
@@ -5692,15 +5780,8 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  @spec valid_issuer?(binary()) :: boolean()
-  defp valid_issuer?(issuer) when is_binary(issuer) do
-    with true <- Attesto.URI.https_identifier?(issuer),
-         {:ok, %URI{query: nil}} <- URI.new(issuer) do
-      true
-    else
-      _ -> false
-    end
-  end
+  @spec valid_issuer?(term()) :: boolean()
+  defp valid_issuer?(issuer), do: Attesto.URI.issuer_identifier?(issuer)
 
   defp validate_optional_https_endpoint!(_key, nil), do: :ok
 
@@ -6164,10 +6245,10 @@ defmodule AttestoPhoenix.Config do
   end
 
   defp valid_endpoint_path?(value) when is_binary(value) and value != "" do
-    String.valid?(value) and String.starts_with?(value, "/") and
+    String.starts_with?(value, "/") and
       not String.starts_with?(value, "//") and not String.contains?(value, "\\") and
-      not Regex.match?(~r/[\x00-\x1F\x7F]/, value) and
-      not Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value) and
+      Attesto.Claims.no_terminal_controls?(value) and
+      Attesto.URI.valid_percent_encoding?(value) and
       match?(
         {:ok,
          %URI{
@@ -6247,7 +6328,7 @@ defmodule AttestoPhoenix.Config do
   defp validate_verifier_anchors!(nil), do: :ok
 
   defp validate_verifier_anchors!(anchors) do
-    if anchors == [] or not der_certificates?(anchors) do
+    if not Attesto.X509.valid_trust_anchors?(anchors) or not Enum.all?(anchors, &der_certificate?/1) do
       raise ArgumentError,
             "AttestoPhoenix.Config: :verifier_trusted_certificates must be a non-empty list of DER certificates"
     end
@@ -6255,16 +6336,12 @@ defmodule AttestoPhoenix.Config do
 
   # Decode configuration at boot, without deciding certificate trust here.
   # Path, validity, issuer binding, and purpose checks belong to Attesto.X509.
-  defp der_certificates?([]), do: true
-
-  defp der_certificates?([der | rest]) when is_binary(der) and byte_size(der) > 0 do
+  defp der_certificate?(der) do
     _certificate = :public_key.pkix_decode_cert(der, :plain)
-    der_certificates?(rest)
+    true
   rescue
     _error -> false
   end
-
-  defp der_certificates?(_certificates), do: false
 
   defp validate_verifier_issuer_trust!(nil), do: :ok
   defp validate_verifier_issuer_trust!({:issuer_jwks, keys}) when is_map(keys) or is_list(keys), do: :ok

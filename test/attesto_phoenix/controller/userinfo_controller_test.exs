@@ -17,6 +17,8 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
   import Plug.Conn
   import Plug.Test, only: []
 
+  alias Attesto.DPoP.ReplayCache
+  alias Attesto.Test.DPoP
   alias Attesto.Token
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.UserinfoController
@@ -623,6 +625,45 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
     end
   end
 
+  describe "DPoP configured endpoint pin" do
+    test "compares DPoP htu against the configured UserInfo endpoint URL rather than the Host header" do
+      start_supervised!({ReplayCache, []})
+      key = DPoP.generate_key()
+      {_, public} = key |> JOSE.JWK.to_public() |> JOSE.JWK.to_map()
+      jkt = Attesto.DPoP.compute_jkt(public)
+
+      base = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(base, :dpop_enabled, true))
+      token = mint(scope: "openid", dpop_jkt: jkt)
+
+      forged_proof = DPoP.proof(key, "GET", "https://evil.example/oauth/userinfo", access_token: token)
+
+      refused =
+        :get
+        |> Plug.Test.conn("https://evil.example/oauth/userinfo")
+        |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+        |> put_req_header("authorization", "DPoP " <> token)
+        |> put_req_header("dpop", forged_proof)
+        |> UserinfoController.userinfo(%{})
+
+      assert refused.status == 401
+      assert body(refused)["error"] == "invalid_dpop_proof"
+
+      valid_proof = DPoP.proof(key, "GET", @issuer <> @endpoint_path, access_token: token)
+
+      accepted =
+        :get
+        |> Plug.Test.conn("http://internal.local:4000/oauth/userinfo")
+        |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+        |> put_req_header("authorization", "DPoP " <> token)
+        |> put_req_header("dpop", valid_proof)
+        |> UserinfoController.userinfo(%{})
+
+      assert accepted.status == 200
+      assert body(accepted)["sub"] == @subject
+    end
+  end
+
   # ── helpers ──────────────────────────────────────────────────────────────
 
   # Mint a signed access token carrying the given scope, the subject, and the
@@ -658,7 +699,7 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
       claims: Map.put(extra_claims, "client_id", "test-client")
     }
 
-    {:ok, %{access_token: token}} = Token.mint(config, principal)
+    {:ok, %{access_token: token}} = Token.mint(config, principal, Keyword.take(opts, [:dpop_jkt]))
     token
   end
 

@@ -811,7 +811,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     @tag registered_auth_method: :private_key_jwt
     test "the default rejects a token endpoint private_key_jwt audience (CVE-2025-27370)" do
-      # rfc7523bis-11 requires the authorization server issuer identifier; the
+      # RFC 10070 §4 requires the authorization server issuer identifier; the
       # endpoint URL is the value an audience-injection attacker republishes.
       client_key = JOSE.JWK.generate_key({:ec, "P-256"})
       client_jwks = %{"keys" => [public_jwk(client_key)]}

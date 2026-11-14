@@ -19,7 +19,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   never touches a `Plug.Conn`, and returns events as data.
   """
 
-  alias Attesto.{Key, PairwiseSubject, RedirectURI, Secret, SecureCompare, SigningAlg}
+  alias Attesto.{Key, MapParams, PairwiseSubject, RedirectURI, Secret, SecureCompare, SigningAlg, X509}
+  alias AttestoPhoenix.AuthorizationServer.Authorize
   alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.AuthorizationServer.Userinfo
@@ -292,13 +293,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   # `redirect_uris`).
   @redirect_uri_array_metadata ~w(post_logout_redirect_uris)
 
-  # OAuth 2.0 / OIDC authorization, JARM, and RP-Initiated Logout response
-  # parameters appended to a registered redirect URI's query component. A
-  # registration carrying any of these names in its own query string would
-  # produce duplicate response parameters on redirect (Keycloak CVE-2026-9689 /
-  # CVE-2026-18209, django-oauth-toolkit 3.4.1, Doorkeeper #1851).
-  @reserved_redirect_query_params ~w(code state iss error error_description session_state response)
-
   # Bounds for unauthenticated registration metadata. URL parsing and JOSE key
   # construction both run only after their input is capped.
   @max_human_metadata_bytes 4_096
@@ -311,7 +305,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   @max_inline_jwks_bytes 65_536
   @max_inline_jwks_keys 16
   @max_jwk_public_member_bytes 2_048
-  @max_x5c_chain_length 8
+  @max_x5c_chain_length X509.max_chain_length()
   @max_x5c_certificate_bytes 16_384
   @private_jwk_members ~w(d p q dp dq qi oth k)
   @asymmetric_jwk_types ~w(RSA EC OKP)
@@ -502,6 +496,20 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
                                  registration_access_token registration_access_token_hash
                                  registration_client_uri)
 
+  @doc false
+  @spec available_management_methods(Config.t(), [atom()]) :: [String.t()]
+  def available_management_methods(%Config{} = config, omitted \\ []) when is_list(omitted) do
+    metadata? = not is_nil(Config.client_registration_metadata_fun(config))
+
+    [
+      {"GET", metadata? and :registration_read not in omitted},
+      {"PUT", metadata? and not is_nil(Config.update_client_fun(config)) and :registration_update not in omitted},
+      {"DELETE", not is_nil(Config.unregister_client_fun(config))}
+    ]
+    |> Enum.filter(fn {_method, available?} -> available? end)
+    |> Enum.map(fn {method, _available?} -> method end)
+  end
+
   defp check_update_members(config, client, client_id, metadata) when is_map(metadata) and not is_struct(metadata) do
     cond do
       Map.get(metadata, "client_id") != client_id ->
@@ -563,11 +571,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   defp updated_attrs(validated, client_id, current) do
     validated
     |> Map.put("client_id", client_id)
-    |> put_if_present("client_id_issued_at", Map.get(current, "client_id_issued_at"))
+    |> MapParams.put_optional("client_id_issued_at", Map.get(current, "client_id_issued_at"))
   end
-
-  defp put_if_present(map, _key, nil), do: map
-  defp put_if_present(map, key, value), do: Map.put(map, key, value)
 
   defp registered_metadata(config, client) do
     with callback when not is_nil(callback) <- Config.client_registration_metadata_fun(config),
@@ -650,7 +655,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
          :ok <- validate_key_source_metadata(passthrough),
          :ok <- validate_method_metadata(auth_method, passthrough, config),
          :ok <- validate_frontchannel_logout_origin(passthrough, redirect_uris),
-         {:ok, oidc} <- validate_oidc_response_metadata(metadata, redirect_uris, config) do
+         {:ok, oidc} <- validate_oidc_response_metadata(metadata, grant_types, redirect_uris, config) do
       core =
         oidc
         |> Map.merge(%{
@@ -660,7 +665,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
           "redirect_uris" => redirect_uris,
           "scope" => scope
         })
-        |> put_if_present("response_types", response_types)
+        |> MapParams.put_optional("response_types", response_types)
 
       # The known RFC 7591 §2 display/identity members are merged UNDER the
       # protocol-critical members so a request can never override the validated
@@ -676,13 +681,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   # redirect URIs share one host (`sector_identifier_uri` is not fetched, so it
   # is refused), and a UserInfo signing algorithm it signs with. An absent
   # member is left out so the host stores only what the client registered.
-  defp validate_oidc_response_metadata(metadata, redirect_uris, config) do
-    with {:ok, acc} <- validate_subject_type(metadata, redirect_uris, config) do
+  defp validate_oidc_response_metadata(metadata, grant_types, redirect_uris, config) do
+    with {:ok, acc} <- validate_subject_type(metadata, grant_types, redirect_uris, config) do
       validate_userinfo_signed_response_alg(metadata, acc, config)
     end
   end
 
-  defp validate_subject_type(metadata, redirect_uris, config) do
+  defp validate_subject_type(metadata, grant_types, redirect_uris, config) do
     subject_type = Map.get(metadata, "subject_type")
 
     cond do
@@ -695,11 +700,35 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
       subject_type not in SubjectIdentifier.subject_types_supported(config) ->
         {:error, error(@error_invalid_client_metadata, "subject_type is not supported")}
 
-      subject_type == "pairwise" and not match?({:ok, _}, PairwiseSubject.sector_identifier(redirect_uris)) ->
-        {:error, error(@error_invalid_client_metadata, "a pairwise client's redirect_uris must all be on one host")}
+      subject_type == "pairwise" and not SubjectIdentifier.pairwise_grants_allowed?(grant_types) ->
+        {:error,
+         error(
+           @error_invalid_client_metadata,
+           "pairwise subject_type is only allowed with authorization_code and refresh_token grants"
+         )}
+
+      subject_type == "pairwise" ->
+        validate_pairwise_sector(redirect_uris, subject_type)
 
       true ->
         {:ok, %{"subject_type" => subject_type}}
+    end
+  end
+
+  defp validate_pairwise_sector(redirect_uris, subject_type) do
+    case PairwiseSubject.sector_identifier(redirect_uris) do
+      {:ok, _sector} ->
+        {:ok, %{"subject_type" => subject_type}}
+
+      {:error, :multiple_hosts} ->
+        {:error, error(@error_invalid_client_metadata, "a pairwise client's redirect_uris must all be on one host")}
+
+      {:error, _reason} ->
+        {:error,
+         error(
+           @error_invalid_client_metadata,
+           "a pairwise client's redirect_uris must use non-loopback https URIs sharing one host"
+         )}
     end
   end
 
@@ -951,7 +980,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
 
   defp valid_metadata_uri?(_value, _schemes, _allow_fragment?), do: false
 
-  defp invalid_percent_encoding?(value), do: Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value)
+  defp invalid_percent_encoding?(value), do: not Attesto.URI.valid_percent_encoding?(value)
 
   defp valid_tls_identity?(key, value) do
     bounded_text?(value, @max_tls_identity_bytes) and
@@ -1579,6 +1608,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   end
 
   defp reserved_redirect_query_param?(value) when is_binary(value) do
+    reserved = Authorize.reserved_response_params()
+
     case URI.new(value) do
       {:ok, %URI{query: query}} when is_binary(query) and query != "" ->
         query
@@ -1586,8 +1617,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
         |> Enum.any?(fn segment ->
           [raw_key | _] = String.split(segment, "=", parts: 2)
 
-          raw_key in @reserved_redirect_query_params or
-            URI.decode_www_form(raw_key) in @reserved_redirect_query_params
+          raw_key in reserved or
+            URI.decode_www_form(raw_key) in reserved
         end)
 
       _other ->

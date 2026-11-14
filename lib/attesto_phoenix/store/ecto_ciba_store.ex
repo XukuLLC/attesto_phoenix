@@ -106,6 +106,12 @@ defmodule AttestoPhoenix.Store.EctoCIBAStore do
     )
   end
 
+  @impl Attesto.CIBAStore
+  @spec delete_unconsumed(Attesto.RevocationCriteria.criteria()) :: {:ok, non_neg_integer()}
+  def delete_unconsumed(criteria) do
+    PendingDecision.delete_unconsumed(CIBARequest, criteria, fallback_subject_field: :hint_subject)
+  end
+
   # ----- internal -----
 
   defp unix_to_datetime(nil), do: nil

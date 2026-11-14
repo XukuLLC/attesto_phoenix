@@ -6,6 +6,74 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.16.0] - 2026-11-14
+
+Requires attesto >= 2.20.0 (was >= 2.19.0).
+
+### Security
+
+- `AttestoPhoenix.Plug.Authenticate` and `AttestoPhoenix.ProtectedResource` no
+  longer fall back to the request `Host` header for DPoP `htu` verification:
+  bundled `/userinfo`, `/credential`, and `/deferred_credential` endpoints
+  use their configured endpoint URLs, `Config.new/1` defaults `:resource_origin`
+  to the origin of `:audience` when neither `:resource_origin` nor `:htu` is
+  set with DPoP enabled, `Authenticate.init/1` refuses DPoP mounts with no
+  pinned target URI and refuses malformed `:htu` options, and a `nil` return
+  from a `:htu` callback refuses DPoP requests with `invalid_dpop_proof` across
+  both protected resources and authorization-server DPoP endpoints (`/token`,
+  `/par`, `/device_authorization`) instead of falling back to `Host` or crashing.
+- Pairwise clients now receive the derived pairwise `sub` in access tokens with
+  the host subject sealed via `Attesto.PairwiseSubject`. Sector identifier
+  derivation rejects non-`https` and loopback redirect URIs, and dynamic
+  registration, `SubjectIdentifier`, and the token endpoint allow only
+  `authorization_code` and `refresh_token` grant types for `pairwise` clients
+  (refusing `device_code`, `ciba`, `jwt-bearer`, `token-exchange`,
+  `pre-authorized_code`, and `client_credentials`).
+- `AttestoPhoenix.Revocation` now revokes unconsumed pending and approved device
+  codes, CIBA requests, and pre-authorized codes on subject, client, and
+  session (`:sid`) revocation across both ETS and Ecto stores.
+- Parked authorization interactions now use a dedicated ETS table bounded by
+  `:interaction_max_entries` (default `8_192`), `Interaction.park/3` stores a
+  fixed allowlist of 24 request parameters rather than arbitrary keys, and
+  `:par_max_record_bytes` is enforced in `Interaction.park/3` across all stores
+  and in the bundled Ecto PAR store's `put/3`.
+- `AuthorizationServer.Authorize` applies `require_nonce` after scope
+  narrowing against the host policy's effective scope, so a request with no
+  `scope` and no `nonce` is refused when the default scope contains `"openid"`.
+- `URLComparison` no longer treats a percent-encoded host as equal to its
+  decoded form.
+- CIBA refuses C1 control characters in binding/display text.
+- `Verifier` caps JWE protected headers at 16 KiB.
+
+### Breaking
+
+- `AttestoPhoenix.Config.new/1` defaults `:resource_origin` to the origin of
+  `:audience` when DPoP is enabled and neither `:resource_origin` nor `:htu` is
+  set; hosts serving protected resources at another origin must set
+  `:resource_origin` (or `:htu`).
+- `AttestoPhoenix.Config.new/1` validates `:trusted_proxies` at boot and raises
+  `ArgumentError` on `0.0.0.0/0`, entries with host bits set, and malformed
+  entries; `{network, prefix}` CIDR tuples are accepted alongside CIDR strings,
+  IP tuples, `:any`, and `:loopback`.
+- `AttestoPhoenix.Plug.Authenticate.init/1` raises `ArgumentError` on malformed
+  `:htu` options or when DPoP is enabled with no pinned `:resource_origin`,
+  `:htu`, or route `:origin`.
+- Pairwise access tokens carry the derived pairwise `sub` and the sealed
+  `"attesto.pairwise_subject"` claim; resource servers validating tokens
+  directly require `:pairwise_subject_salt`. Pairwise clients with any grant
+  type other than `authorization_code` or `refresh_token` are refused.
+- Parked authorization requests keep only the 24 listed request parameters;
+  custom host parameters are no longer visible on resume.
+- `AttestoPhoenix.Revocation.revoke/2` raises when a configured device-code,
+  CIBA, or pre-authorized-code store lacks `delete_unconsumed/1`, and returns
+  three additional revocation counts in its summary.
+
+### Added
+
+- `AttestoPhoenix.AuthorizationServer.Authorize` conn-free
+  authorization-endpoint core module.
+- `AttestoPhoenix.Config` `:interaction_max_entries` option (default `8_192`).
+
 ## [4.15.2] - 2026-11-13
 
 ### Fixed

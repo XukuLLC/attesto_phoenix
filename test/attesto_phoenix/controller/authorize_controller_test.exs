@@ -1,3 +1,14 @@
+defmodule AttestoPhoenix.Controller.AuthorizeControllerTest.TenantRouter do
+  @moduledoc false
+  use Phoenix.Router
+
+  alias AttestoPhoenix.Controller.AuthorizeController
+
+  scope "/:tenant" do
+    get("/oauth/authorize", AuthorizeController, :authorize)
+  end
+end
+
 defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   @moduledoc """
   Tests for the authorization endpoint (RFC 6749 §3.1, OIDC Core §3.1.2).
@@ -13,6 +24,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   import Phoenix.ConnTest
   import Plug.Conn
 
+  alias __MODULE__.TenantRouter
   alias Attesto.AuthorizationCode
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
@@ -1926,6 +1938,112 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert conn.status == 302
       assert is_binary(location_query(conn)["code"])
     end
+
+    test "require_nonce follows effective granted scope after :authorize_scope narrows openid away" do
+      put_config(
+        require_nonce: true,
+        authorize_scope: fn _client, _requested -> {:ok, ["profile"]} end
+      )
+
+      conn = valid_params(%{"scope" => "openid profile"}) |> Map.delete("nonce") |> call()
+
+      assert conn.status == 302
+      assert is_binary(location_query(conn)["code"])
+    end
+
+    test "require_nonce rejects missing nonce when :authorize_scope retains openid" do
+      put_config(
+        require_nonce: true,
+        authorize_scope: fn _client, _requested -> {:ok, ["openid"]} end
+      )
+
+      conn = valid_params(%{"scope" => "openid profile"}) |> Map.delete("nonce") |> call()
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert query["error"] == "invalid_request"
+      refute Map.has_key?(query, "code")
+    end
+  end
+
+  describe "storable nonce and response parameter stripping" do
+    test "nonce containing a NUL byte is rejected with a redirect error before code issuance" do
+      conn = valid_params(%{"nonce" => "bad\x00nonce"}) |> call()
+
+      assert conn.status == 302
+      query = location_query(conn)
+      assert query["error"] == "invalid_request"
+      assert query["state"] == "xyz"
+      refute Map.has_key?(query, "code")
+    end
+
+    test "form_post and fragment.jwt strip registered state and code from redirect_uri while keeping other params" do
+      query_redirect = "https://client.example.com/callback?keep=1&state=static&code=old"
+
+      put_config(client_redirect_uris: fn _client -> [query_redirect] end)
+
+      form_conn = call(valid_params(%{"redirect_uri" => query_redirect, "response_mode" => "form_post"}))
+      assert form_conn.status == 200
+      assert form_conn.resp_body =~ ~s(<form method="post" action="https://client.example.com/callback?keep=1">)
+      refute form_conn.resp_body =~ "state=static"
+      refute form_conn.resp_body =~ "code=old"
+
+      frag_conn = call(valid_params(%{"redirect_uri" => query_redirect, "response_mode" => "fragment.jwt"}))
+      assert frag_conn.status == 302
+      [base, fragment] = frag_conn |> location() |> String.split("#", parts: 2)
+      assert base == "https://client.example.com/callback?keep=1"
+      assert fragment =~ "response="
+    end
+  end
+
+  describe "router path parameters under Interaction resume" do
+    test "resuming under scope \"/:tenant\" ignores router path params and still rejects extra query params" do
+      put_config(
+        authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+        interaction_browser_binding: &__MODULE__.browser_binding/1
+      )
+
+      initial_conn =
+        Plug.Test.conn(:get, "/acme/oauth/authorize", valid_params())
+        |> Map.put(:scheme, :https)
+        |> put_req_header("x-browser", "browser-tenant")
+        |> with_config()
+        |> TenantRouter.call(TenantRouter.init([]))
+
+      assert initial_conn.status == 200
+      assert_receive {:parked, resume_id}
+
+      resumed_conn =
+        Plug.Test.conn(:get, "/acme/oauth/authorize", %{"resume" => resume_id})
+        |> Map.put(:scheme, :https)
+        |> put_req_header("x-browser", "browser-tenant")
+        |> with_config()
+        |> TenantRouter.call(TenantRouter.init([]))
+
+      assert resumed_conn.status == 302
+      assert is_binary(location_query(resumed_conn)["code"])
+
+      # A tampered query parameter beside `resume` is still refused even under dynamic scope.
+      {:ok, parked_id} =
+        Plug.Test.conn(:get, "/acme/oauth/authorize", valid_params())
+        |> Map.put(:scheme, :https)
+        |> put_req_header("x-browser", "browser-tenant")
+        |> with_config()
+        |> then(fn c ->
+          c = TenantRouter.call(c, TenantRouter.init([]))
+          assert c.status == 200
+          receive do: ({:parked, id} -> {:ok, id})
+        end)
+
+      tampered_conn =
+        Plug.Test.conn(:get, "/acme/oauth/authorize", %{"resume" => parked_id, "scope" => "admin"})
+        |> Map.put(:scheme, :https)
+        |> put_req_header("x-browser", "browser-tenant")
+        |> with_config()
+        |> TenantRouter.call(TenantRouter.init([]))
+
+      assert tampered_conn.status == 400
+    end
   end
 
   # ── prompt handling (OIDC Core §3.1.2.1 / §3.1.2.6) ────────────────────────
@@ -2404,8 +2522,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       decision_config()
       id = park_for_decision()
       key = Interaction.parked_key(id, "browser-1")
-      [{^key, entry, _expires_at}] = :ets.lookup(:attesto_phoenix_par_requests, key)
-      :ets.insert(:attesto_phoenix_par_requests, {key, entry, System.system_time(:second) - 1})
+      [{^key, entry, _expires_at}] = :ets.lookup(:attesto_phoenix_interactions, key)
+      :ets.insert(:attesto_phoenix_interactions, {key, entry, System.system_time(:second) - 1})
       assert {:error, :invalid_resume} = Interaction.decide(decision_conn(), id, :allow, "user-42")
       assert call_query(%{"resume" => id}).status == 400
     end
@@ -2919,7 +3037,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       refute Interaction.parked_key(resume_id, "browser-1") == Interaction.parked_key(resume_id, "browser-2")
       assert :error = PARStore.fetch("urn:attesto:interaction:" <> resume_id)
-      assert Interaction.reserved_key?(Interaction.parked_key(resume_id, "browser-2"))
+      reserved = Interaction.parked_key(resume_id, "browser-2")
+      assert Interaction.reserved_key?(reserved)
+
+      :ok = ETS.put(reserved, %{"client_id" => "client-1"}, 60)
+
+      bad_conn = call_query(%{"request_uri" => reserved, "client_id" => "client-1"})
+      assert bad_conn.status == 400
+      assert location(bad_conn) == nil
+      assert {:ok, _kept} = PARStore.fetch(reserved)
     end
 
     test "resume cannot be combined with other parameters, and that attempt leaves it usable" do

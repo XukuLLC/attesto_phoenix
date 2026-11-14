@@ -17,13 +17,13 @@ defmodule AttestoPhoenix.ProtectedResource do
     1. a per-route override passed to `AttestoPhoenix.Plug.Authenticate`:
        core's `:htu` callback or core's `:origin`;
     2. the configuration's `:htu` callback;
-    3. the configuration's `:resource_origin` followed by `conn.request_path`;
-    4. the URL derived from the request through `:trusted_proxies`, whose host
-       is the request `Host` header or the forwarded host.
+    3. the configuration's `:resource_origin` followed by `conn.request_path`
+       (`AttestoPhoenix.Config.new/1` defaults `:resource_origin` to the
+       origin of `:audience` when neither `:htu` nor `:resource_origin` is
+       set and DPoP is enabled).
 
-  The last form follows the request `Host`, so a server that answers more than
-  one `Host` accepts a DPoP-bound token together with a proof made for another
-  server. Pin the origin with one configuration value:
+  Requests never fall back to the `Host` header when DPoP is enabled. Pin an
+  explicit resource origin when it differs from `:audience`:
 
       config :my_app, AttestoPhoenix.Config,
         issuer: "https://auth.example.com",
@@ -38,6 +38,7 @@ defmodule AttestoPhoenix.ProtectedResource do
 
   alias Attesto.Plug.Authenticate
   alias Attesto.Plug.OAuthError
+  alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.{Config, DenialAudit, DPoP.Adapter, RequestContext}
 
   # The conn assign `Attesto.Plug.Authenticate` writes the verified claims
@@ -140,6 +141,7 @@ defmodule AttestoPhoenix.ProtectedResource do
     |> put_optional(:send_error, config.send_error)
     |> put_optional(:www_authenticate, config.www_authenticate)
     |> put_optional(:no_store, config.no_store)
+    |> Keyword.merge(SubjectIdentifier.verify_opts(config))
     |> Keyword.merge(adapter_opts(config, overrides))
     |> Keyword.merge(overrides)
     # RFC 9728 §5.1: the engine verify path renders the auth-failure 401, so it

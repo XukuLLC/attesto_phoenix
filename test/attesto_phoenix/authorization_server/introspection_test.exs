@@ -141,6 +141,40 @@ defmodule AttestoPhoenix.AuthorizationServer.IntrospectionTest do
                %{"active" => false}
     end
 
+    test "unseals a pairwise-sub access token and presents each caller's own sub view" do
+      salt = String.duplicate("k", 32)
+
+      clients = %{
+        "client-1" => %{type: "pairwise", redirect_uris: ["https://rp.example/cb"]},
+        "client-2" => %{type: "public", redirect_uris: ["https://two.example/cb"]}
+      }
+
+      config =
+        build_config(
+          load_client: fn id -> with :error <- Map.fetch(clients, id), do: {:error, :not_found} end,
+          client_redirect_uris: fn client -> client.redirect_uris end,
+          client_subject_type: fn client -> client.type end,
+          pairwise_subject_salt: salt,
+          introspection_authorize: fn _caller, _resp -> true end
+        )
+
+      {:ok, %{access_token: pairwise_jwt}} =
+        Token.mint(
+          Config.to_attesto_config(config),
+          %{kind: "user", sub: "usr_42", scopes: ["openid"], claims: %{"client_id" => "client-1"}},
+          pairwise: {"rp.example", salt}
+        )
+
+      res1 = Introspection.introspect(config, "client-1", pairwise_jwt)
+      assert res1["active"] == true
+      assert res1["sub"] == Attesto.PairwiseSubject.derive("rp.example", "usr_42", salt)
+      refute Map.has_key?(res1, Attesto.PairwiseSubject.sealed_claim())
+
+      res2 = Introspection.introspect(config, "client-2", pairwise_jwt)
+      assert res2["active"] == true
+      assert res2["sub"] == "usr_42"
+    end
+
     test "downgrades to inactive when introspection_authorize denies the caller" do
       config =
         build_config(

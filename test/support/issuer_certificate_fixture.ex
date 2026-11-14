@@ -20,16 +20,16 @@ defmodule AttestoPhoenix.IssuerCertificateFixture do
   def issuer, do: @issuer
   def doc_type, do: @doc_type
   def namespace, do: @namespace
-  def root, do: :public_key.pkix_test_root_cert(~c"synthetic-issuer-root", key: @curve)
+  def root, do: :public_key.pkix_test_root_cert(~c"synthetic-issuer-root", key: @curve, digest: :sha256)
 
   def chain(root, format, opts \\ []) do
     extensions = [san(Keyword.get(opts, :issuer, @issuer)) | purpose_extensions(format)]
-    peer = Keyword.merge([key: @curve, extensions: extensions], Keyword.get(opts, :peer, []))
+    peer = Keyword.merge([key: @curve, digest: :sha256, extensions: extensions], Keyword.get(opts, :peer, []))
 
     data =
       :public_key.pkix_test_data(%{
         root: root,
-        intermediates: [[key: @curve]],
+        intermediates: [[key: @curve, digest: :sha256]],
         peer: peer
       })
 
@@ -51,6 +51,7 @@ defmodule AttestoPhoenix.IssuerCertificateFixture do
     root =
       :public_key.pkix_test_root_cert(~c"synthetic-self-signed-leaf",
         key: @curve,
+        digest: :sha256,
         extensions:
           [
             san(@issuer),

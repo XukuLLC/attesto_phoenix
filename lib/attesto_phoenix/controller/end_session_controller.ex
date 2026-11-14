@@ -117,6 +117,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   alias Attesto.FrontChannelLogout
   alias AttestoPhoenix.BackChannelLogout.Delivery
   alias AttestoPhoenix.{BrowserState, Callback, Config, HTTPAccept}
+  alias AttestoPhoenix.Controller.ErrorRender
 
   require Logger
 
@@ -315,16 +316,18 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
             status: status
           )
 
-        Callback.invoke(callback, [conn, error])
+        ErrorRender.invoke_hook(
+          conn,
+          callback,
+          error,
+          &render_error_default(&1, status, body),
+          "end-session error render callback did not send a response; rendering the built-in page"
+        )
     end
   end
 
   defp render_error_default(conn, status, %{error_description: description} = body) do
-    if HTTPAccept.accepts?(get_req_header(conn, "accept"), "text/html") do
-      conn |> put_resp_content_type("text/html") |> send_resp(status, error_html(description))
-    else
-      conn |> put_status(status) |> json(body)
-    end
+    ErrorRender.negotiated(conn, status, error_html(description), body)
   end
 
   defp render_error_default(conn, status, body) do

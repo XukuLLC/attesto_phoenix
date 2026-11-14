@@ -1745,7 +1745,11 @@ defmodule AttestoPhoenix.ConfigTest do
         assert Config.new(Keyword.put(base, :resource_origin, good)).resource_origin == good
       end
 
-      assert Config.new(base).resource_origin == nil
+      assert Config.new(base).resource_origin == "https://api.example.com"
+      assert Config.new(Keyword.put(base, :dpop_enabled, false)).resource_origin == nil
+
+      assert Config.new(Keyword.put(base, :htu, fn conn -> "https://alt.example" <> conn.request_path end)).resource_origin ==
+               nil
     end
 
     test ":resource_metadata_resolver selects per-request metadata and may deliberately omit it" do

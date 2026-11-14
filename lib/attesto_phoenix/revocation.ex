@@ -51,7 +51,21 @@ defmodule AttestoPhoenix.Revocation do
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
 
-  @type counts :: %{codes: non_neg_integer(), refresh_families: non_neg_integer()}
+  @type counts :: %{
+          codes: non_neg_integer(),
+          device_codes: non_neg_integer(),
+          ciba_requests: non_neg_integer(),
+          pre_authorized_codes: non_neg_integer(),
+          refresh_families: non_neg_integer()
+        }
+
+  @store_specs [
+    {:code_store, :delete_unconsumed},
+    {:device_code_store, :delete_unconsumed},
+    {:ciba_store, :delete_unconsumed},
+    {:pre_authorized_code_store, :delete_unconsumed},
+    {:refresh_store, :revoke_families}
+  ]
 
   @doc """
   Delete the unredeemed codes and revoke the refresh families issued for
@@ -80,19 +94,29 @@ defmodule AttestoPhoenix.Revocation do
   """
   @spec revoke(Config.t(), RevocationCriteria.criteria()) :: {:ok, counts()}
   def revoke(%Config{} = config, criteria) do
-    # Validate once, before either store is touched, so invalid criteria can
-    # never delete codes and then fail on the refresh store.
+    # Validate criteria and every configured store callback up front so a fault
+    # in a later store can never leave earlier stores partially revoked.
     _validated = RevocationCriteria.new!(criteria)
+    stores = validate_stores!(config)
 
     Config.with_request_config(config, fn ->
-      {:ok, codes} = call(config, :code_store, :delete_unconsumed, criteria)
+      {:ok, codes} = invoke_store(stores[:code_store], :delete_unconsumed, criteria)
+      {:ok, device_codes} = invoke_store(stores[:device_code_store], :delete_unconsumed, criteria)
+      {:ok, ciba_requests} = invoke_store(stores[:ciba_store], :delete_unconsumed, criteria)
+      {:ok, pre_authorized_codes} = invoke_store(stores[:pre_authorized_code_store], :delete_unconsumed, criteria)
 
       # A refresh context records the session under this module's own key, not
       # the code's `sid` claim.
-      refresh_criteria = refresh_criteria(criteria)
-      {:ok, families} = call(config, :refresh_store, :revoke_families, refresh_criteria)
+      {:ok, families} = invoke_store(stores[:refresh_store], :revoke_families, refresh_criteria(criteria))
 
-      {:ok, %{codes: codes, refresh_families: families}}
+      {:ok,
+       %{
+         codes: codes,
+         device_codes: device_codes,
+         ciba_requests: ciba_requests,
+         pre_authorized_codes: pre_authorized_codes,
+         refresh_families: families
+       }}
     end)
   end
 
@@ -102,14 +126,20 @@ defmodule AttestoPhoenix.Revocation do
       else: criteria
   end
 
-  defp call(config, store_key, function, criteria) do
+  defp validate_stores!(config) do
+    Map.new(@store_specs, fn {store_key, function} ->
+      {store_key, validated_store!(config, store_key, function)}
+    end)
+  end
+
+  defp validated_store!(config, store_key, function) do
     case Callback.config_callback(config, store_key) do
       nil ->
-        {:ok, 0}
+        nil
 
       store ->
         if Code.ensure_loaded?(store) and function_exported?(store, function, 1) do
-          apply(store, function, [criteria])
+          store
         else
           raise ArgumentError,
                 "AttestoPhoenix.Revocation: #{inspect(store_key)} #{inspect(store)} does not implement " <>
@@ -117,4 +147,7 @@ defmodule AttestoPhoenix.Revocation do
         end
     end
   end
+
+  defp invoke_store(nil, _function, _criteria), do: {:ok, 0}
+  defp invoke_store(store, function, criteria), do: apply(store, function, [criteria])
 end

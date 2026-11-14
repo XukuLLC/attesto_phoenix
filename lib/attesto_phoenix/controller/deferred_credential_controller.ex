@@ -27,7 +27,7 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   import AttestoPhoenix.Controller.OID4VCIHelpers, only: [body_params: 2, invalid_request: 4]
 
-  alias AttestoPhoenix.{Config, CredentialIssuer, ProtectedResource}
+  alias AttestoPhoenix.{Config, CredentialIssuer, ProtectedResource, RequestContext}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
   @doc """
@@ -45,7 +45,18 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
     config = Config.resolve!(conn)
     resource_metadata = Config.resource_metadata_url(config, conn)
 
-    case ProtectedResource.authenticate(conn, config, resource_metadata) do
+    htu_override = [
+      htu: fn req_conn ->
+        RequestContext.canonical_url(
+          req_conn,
+          config,
+          Config.deferred_credential_endpoint_url(config),
+          "deferred_credential_endpoint"
+        )
+      end
+    ]
+
+    case ProtectedResource.authenticate(conn, config, resource_metadata, core_overrides: htu_override) do
       {:ok, conn, claims} ->
         respond(conn, config, body_params(conn, params), claims)
 

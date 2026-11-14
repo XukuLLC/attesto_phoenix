@@ -55,15 +55,14 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   ## DPoP target URI
 
   The URI a DPoP proof must sign (`htu`, RFC 9449 §4.3) comes from the
-  configuration's `:htu` callback when that is set, otherwise from its
-  `:resource_origin` followed by `conn.request_path`, and otherwise from the
-  request as seen through `:trusted_proxies`, which follows the request `Host`
-  header. Set `:resource_origin` on any deployment that
-  accepts DPoP-bound tokens and answers more than one `Host`; see "DPoP target
-  URI" in `AttestoPhoenix.ProtectedResource` for the full order. Every option
-  not listed above is passed to `Attesto.Plug.Authenticate`, so a route can
-  also pin its own target URI with core's `:origin` (which replaces the
-  configured derivation for that route) or `:htu`.
+  configuration's `:htu` callback when that is set, and otherwise from its
+  `:resource_origin` (which `AttestoPhoenix.Config.new/1` defaults to the
+  origin of `:audience` when neither `:resource_origin` nor `:htu` is set)
+  followed by `conn.request_path`. Every option not listed above is passed to
+  `Attesto.Plug.Authenticate`, so a route can also pin its own target URI with
+  core's `:origin` (which replaces the configured derivation for that route)
+  or `:htu`. When DPoP is enabled, a pin is required — requests never fall back
+  to the `Host` header.
   """
 
   @behaviour Plug
@@ -81,21 +80,78 @@ defmodule AttestoPhoenix.Plug.Authenticate do
 
   @impl Plug
   def init(opts) when is_list(opts) do
+    validate_resource_metadata_opt!(opts)
+    validate_dpop_pin_opts!(opts)
+    opts
+  end
+
+  defp validate_resource_metadata_opt!(opts) do
     case Keyword.fetch(opts, :resource_metadata) do
       :error ->
-        opts
+        :ok
 
       {:ok, nil} ->
-        opts
+        :ok
 
       {:ok, candidate} ->
-        if Config.valid_resource_metadata_url?(candidate) do
-          opts
-        else
+        if !Config.valid_resource_metadata_url?(candidate) do
           raise ArgumentError,
                 "AttestoPhoenix.Plug.Authenticate: :resource_metadata, when set, must be an " <>
                   "absolute https URL with a host and no fragment; got #{inspect(candidate)}."
         end
+    end
+  end
+
+  defp validate_dpop_pin_opts!(opts) do
+    has_htu? = Keyword.has_key?(opts, :htu)
+    has_origin? = Keyword.has_key?(opts, :origin)
+
+    validate_htu_opt!(has_htu?, opts)
+    validate_origin_opt!(has_origin?, has_htu?, opts)
+    validate_config_pin!(opts, has_origin?, has_htu?)
+  end
+
+  defp validate_htu_opt!(false, _opts), do: :ok
+
+  defp validate_htu_opt!(true, opts) do
+    htu = Keyword.get(opts, :htu)
+
+    if !is_function(htu, 1) do
+      raise ArgumentError,
+            "AttestoPhoenix.Plug.Authenticate: :htu must be a 1-arity function (conn -> uri); " <>
+              "got #{inspect(htu)}"
+    end
+  end
+
+  defp validate_origin_opt!(false, _has_htu?, _opts), do: :ok
+
+  defp validate_origin_opt!(true, true, _opts) do
+    raise ArgumentError,
+          "AttestoPhoenix.Plug.Authenticate: set either :origin or :htu, not both; " <>
+            ":htu builds the whole DPoP target URI."
+  end
+
+  defp validate_origin_opt!(true, false, opts) do
+    origin = Keyword.get(opts, :origin)
+
+    if !Attesto.URI.origin?(origin) do
+      raise ArgumentError,
+            "AttestoPhoenix.Plug.Authenticate: :origin must be an https URL with a host, an " <>
+              "optional port, and no path, userinfo, query, or fragment; " <>
+              "got #{inspect(origin)}"
+    end
+  end
+
+  defp validate_config_pin!(opts, has_origin?, has_htu?) do
+    with %Config{} = config <- Keyword.get(opts, :config),
+         true <- Keyword.get(opts, :dpop_enabled, config.dpop_enabled) != false,
+         true <- is_nil(config.resource_origin) and is_nil(config.htu) and not has_origin? and not has_htu? do
+      raise ArgumentError,
+            "AttestoPhoenix.Plug.Authenticate accepts DPoP proofs but no target URI is pinned; " <>
+              "set :resource_origin or :htu on AttestoPhoenix.Config, pass :origin or :htu to " <>
+              "the plug, or set dpop_enabled: false on the configuration"
+    else
+      _ -> :ok
     end
   end
 

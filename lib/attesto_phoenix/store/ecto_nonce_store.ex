@@ -92,7 +92,7 @@ defmodule AttestoPhoenix.Store.EctoNonceStore do
 
   defp issue_with(repo, prefix, ttl_seconds) do
     Sweeper.check_running_for_store(repo, prefix)
-    nonce = :crypto.strong_rand_bytes(@nonce_bytes) |> Base.url_encode64(padding: false)
+    nonce = Attesto.Secret.generate(@nonce_bytes)
     now = DateTime.utc_now() |> DateTime.truncate(:second)
     expires_at = DateTime.add(now, ttl_seconds, :second)
 

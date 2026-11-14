@@ -264,15 +264,11 @@ defmodule AttestoPhoenix.ClientIdMetadata do
     # public predicate must not depend on its caller having validated first.
     with true <- Attesto.RedirectURI.unambiguous?(redirect_uri),
          true <- Attesto.RedirectURI.unambiguous?(client_id),
-         {:ok, %URI{scheme: cs, host: ch, fragment: nil} = client_uri}
-         when is_binary(ch) and ch != "" <- URI.new(client_id),
-         {:ok, %URI{scheme: rs, host: rh, fragment: nil} = redirect}
-         when is_binary(rh) and rh != "" <- URI.new(redirect_uri),
-         client_port = effective_port(client_uri),
-         redirect_port = effective_port(redirect),
-         true <- Attesto.URI.valid_port?(client_id, client_port),
-         true <- Attesto.URI.valid_port?(redirect_uri, redirect_port) do
-      cs == rs and ch == rh and client_port == redirect_port
+         false <- String.contains?(client_id, "#"),
+         false <- String.contains?(redirect_uri, "#"),
+         {:ok, client_origin} <- Attesto.URI.origin(client_id),
+         {:ok, redirect_origin} <- Attesto.URI.origin(redirect_uri) do
+      client_origin == redirect_origin
     else
       _ -> false
     end
@@ -360,10 +356,4 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   # and different from whatever this URI already has.
   defp probe_port(%URI{port: @probe_port}), do: @probe_port - 1
   defp probe_port(%URI{}), do: @probe_port
-
-  # The effective port: the explicit `:port` when present, else the scheme's
-  # default (`URI.default_port/1`), so `https://h/p` and `https://h:443/p`
-  # compare equal.
-  defp effective_port(%URI{port: port}) when is_integer(port), do: port
-  defp effective_port(%URI{scheme: scheme}), do: URI.default_port(scheme)
 end

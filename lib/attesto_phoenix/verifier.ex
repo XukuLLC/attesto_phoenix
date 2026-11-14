@@ -15,6 +15,7 @@ defmodule AttestoPhoenix.Verifier do
   """
 
   alias Attesto.{
+    Cose,
     JWE,
     JWS,
     Key,
@@ -23,7 +24,8 @@ defmodule AttestoPhoenix.Verifier do
     Secret,
     SigningAlg,
     StrictJSON,
-    VpToken
+    VpToken,
+    X509
   }
 
   alias AttestoPhoenix.{Callback, Config}
@@ -106,13 +108,11 @@ defmodule AttestoPhoenix.Verifier do
   # A response code carries a session identifier and registered claims only
   # and is read before any authentication.
   @max_response_code_bytes 16 * 1_024
-  # `response` is attacker-controlled input at a public endpoint. Bound it and
-  # parse at most four separators before JOSE performs Base64URL decoding or
-  # authenticated decryption. Presentations may be substantially larger than
-  # ordinary JWTs, so the ciphertext receives a 16 MiB total envelope while the
-  # protected header retains the hardened 256 KiB JOSE ceiling.
+  # `response` is attacker-controlled input at a public endpoint. Bound the
+  # full JWE envelope to 16 MiB while `Attesto.JWE.peek_protected_header/1`
+  # enforces core's 16 KiB protected-header ceiling before Base64URL decoding or
+  # decryption.
   @max_compact_jwe_bytes 16 * 1_024 * 1_024
-  @max_protected_segment_bytes 256 * 1_024
   @encrypted_response_alg "ECDH-ES"
   # HAIP §5 requires the verifier to advertise both A128GCM and A256GCM content
   # encryption.
@@ -474,20 +474,14 @@ defmodule AttestoPhoenix.Verifier do
       state: session.id
     ]
 
-    # Core 2.17's builder supports redirect modes only. Reuse its DCQL and
-    # metadata validation, then apply Appendix A.2's DC API parameters.
     mode = Keyword.get(response_options, :response_mode, "direct_post")
 
     builder_options =
-      if mode == "dc_api.jwt",
-        do: Keyword.put(response_options, :response_mode, "direct_post.jwt"),
-        else: response_options
-
-    request =
       request_options
-      |> Keyword.merge(builder_options)
-      |> PresentationRequest.build()
-      |> request_for_flow(config, mode)
+      |> Keyword.merge(response_options)
+      |> maybe_put_dc_api_opts(config, mode)
+
+    request = PresentationRequest.build(builder_options)
 
     claims =
       Map.merge(request, %{
@@ -545,14 +539,13 @@ defmodule AttestoPhoenix.Verifier do
   defp presentation_audience(config, _client_id, "dc_api.jwt"), do: "origin:" <> Config.verifier_dc_api_origin(config)
   defp presentation_audience(_config, client_id, _mode), do: client_id
 
-  defp request_for_flow(request, config, "dc_api.jwt") do
-    request
-    |> Map.drop(["state", "response_uri"])
-    |> Map.put("response_mode", "dc_api.jwt")
-    |> Map.put("expected_origins", [Config.verifier_dc_api_origin(config)])
+  defp maybe_put_dc_api_opts(opts, config, "dc_api.jwt") do
+    opts
+    |> Keyword.drop([:state, :response_uri])
+    |> Keyword.put(:expected_origins, [Config.verifier_dc_api_origin(config)])
   end
 
-  defp request_for_flow(request, _config, _mode), do: request
+  defp maybe_put_dc_api_opts(opts, _config, _mode), do: opts
 
   # OID4VP 1.0 final §5.1: the request's `client_metadata` MUST advertise the
   # verifier's supported presentation formats via `vp_formats_supported`. The
@@ -567,16 +560,12 @@ defmodule AttestoPhoenix.Verifier do
           "kb-jwt_alg_values" => ["ES256"]
         },
         "mso_mdoc" => %{
-          "issuerauth_alg_values" => Enum.map(Config.verifier_accepted_algs(config) || ["ES256"], &issuer_cose_alg/1),
+          "issuerauth_alg_values" => Enum.map(Config.verifier_accepted_algs(config) || ["ES256"], &Cose.alg_id/1),
           "deviceauth_alg_values" => [-7]
         }
       }
     }
   end
-
-  defp issuer_cose_alg("ES256"), do: -7
-  defp issuer_cose_alg("ES384"), do: -35
-  defp issuer_cose_alg("ES512"), do: -36
 
   # OID4VP 1.0 final / HAIP §5: the verifier MUST supply a fresh (ephemeral)
   # response-encryption key per Authorization Request. Generate an EC P-256 key
@@ -646,12 +635,11 @@ defmodule AttestoPhoenix.Verifier do
   defp x509_hash_verifier_client_id(config) do
     x5c = Config.verifier_x5c(config)
 
-    if valid_x5c?(x5c) do
-      leaf = hd(x5c)
-      hash = :crypto.hash(:sha256, leaf) |> Base.url_encode64(padding: false)
-      {:ok, "x509_hash:" <> hash}
+    with true <- valid_x5c?(x5c),
+         {:ok, client_id} <- X509.x509_hash_client_id(hd(x5c)) do
+      {:ok, client_id}
     else
-      {:error, :x509_config_required}
+      _ -> {:error, :x509_config_required}
     end
   end
 
@@ -735,8 +723,8 @@ defmodule AttestoPhoenix.Verifier do
     # private key to decrypt. `Attesto.JWE` admits only a public P-256 `epk`
     # before JOSE sees the header: the wallet chooses that key, and JOSE before
     # 1.11.13 looped forever on a key of another type.
-    with {:ok, segments} <- compact_jwe(encrypted_response),
-         {:ok, header} <- protected_jwe_header(segments.protected),
+    with {:ok, header} <- JWE.peek_protected_header(encrypted_response),
+         {:ok, segments} <- compact_jwe(encrypted_response),
          :ok <- encrypted_response_algorithms(header),
          :ok <- encrypted_response_parameters(segments),
          {:ok, kid} <- jwe_kid(header),
@@ -770,15 +758,6 @@ defmodule AttestoPhoenix.Verifier do
 
   defp jwe_kid(%{"kid" => kid}) when is_binary(kid) and kid != "", do: {:ok, kid}
   defp jwe_kid(_header), do: {:error, :malformed}
-
-  defp protected_jwe_header(encoded) do
-    with {:ok, json} <- decode64(encoded),
-         {:ok, header} <- decode_json_map(json) do
-      {:ok, header}
-    else
-      _ -> {:error, :malformed}
-    end
-  end
 
   defp decode_json_map(bytes) do
     case StrictJSON.decode(bytes) do
@@ -817,10 +796,9 @@ defmodule AttestoPhoenix.Verifier do
          [iv, rest] <- :binary.split(rest, "."),
          [ciphertext, tag] <- :binary.split(rest, "."),
          :nomatch <- :binary.match(tag, "."),
-         true <- protected != "" and byte_size(protected) <= @max_protected_segment_bytes do
+         true <- protected != "" do
       {:ok,
        %{
-         protected: protected,
          encrypted_key: encrypted_key,
          iv: iv,
          ciphertext: ciphertext,
@@ -910,40 +888,10 @@ defmodule AttestoPhoenix.Verifier do
   end
 
   defp verify_dc_api_response(config, store, id, vp_token, origin, options) do
-    # PresentationSession 2.17 does not forward :dc_api_origin. Keep its stored
-    # context and atomic completion contract, calling the same VpToken verifier
-    # directly for this flow. request_object/2 already validated the pending
-    # session and its context before this point.
-    with true <- origin == Config.verifier_dc_api_origin(config),
-         {:ok, %{id: ^id, data: %{status: :pending} = data, expires_at: expires_at}} <- store.get(id),
-         true <- expires_at > options[:now],
-         true <- data.audience == "origin:" <> origin,
-         {:ok, results} <- VpToken.verify(vp_token, dc_api_verify_options(data, origin, options)),
-         :ok <- store.complete(id, %{results: results}) do
-      {:ok, results}
+    if origin == Config.verifier_dc_api_origin(config) do
+      PresentationSession.verify_response(store, {:id, id}, vp_token, Keyword.put(options, :dc_api_origin, origin))
     else
-      _ -> {:error, :invalid_request}
+      {:error, :invalid_request}
     end
-  end
-
-  defp dc_api_verify_options(data, origin, options) do
-    {trust_key, trust_value} = data.issuer_trust
-
-    options
-    |> Keyword.merge(
-      Map.to_list(
-        Map.take(data, [
-          :nonce,
-          :audience,
-          :expected_query_ids,
-          :permitted_query_ids,
-          :query_constraints,
-          :required_credential_sets,
-          :response_encryption_jwk
-        ])
-      )
-    )
-    |> Keyword.put(trust_key, trust_value)
-    |> Keyword.put(:dc_api_origin, origin)
   end
 end

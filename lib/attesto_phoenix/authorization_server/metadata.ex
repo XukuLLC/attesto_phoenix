@@ -10,7 +10,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   the corresponding endpoint policies.
   """
 
-  alias Attesto.SigningAlg
+  alias Attesto.{MapParams, SigningAlg}
   alias AttestoPhoenix.AuthorizationServer.RequestObjectMetadata
   alias AttestoPhoenix.Config
 
@@ -56,44 +56,53 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       "revocation_endpoint_auth_methods_supported" => revocation_auth_methods(config),
       "pushed_authorization_request_endpoint" => Config.par_endpoint_url(config)
     })
-    |> put_if_present("require_pushed_authorization_requests", require_pushed_authorization_requests(config))
-    |> put_if_present("device_authorization_endpoint", device_authorization_endpoint(config))
-    |> put_if_present("backchannel_authentication_endpoint", backchannel_authentication_endpoint(config))
-    |> put_if_present("backchannel_token_delivery_modes_supported", backchannel_token_delivery_modes_supported(config))
-    |> put_if_present(
+    |> MapParams.put_optional("require_pushed_authorization_requests", require_pushed_authorization_requests(config))
+    |> MapParams.put_optional("device_authorization_endpoint", device_authorization_endpoint(config))
+    |> MapParams.put_optional("backchannel_authentication_endpoint", backchannel_authentication_endpoint(config))
+    |> MapParams.put_optional(
+      "backchannel_token_delivery_modes_supported",
+      backchannel_token_delivery_modes_supported(config)
+    )
+    |> MapParams.put_optional(
       "backchannel_authentication_request_signing_alg_values_supported",
       backchannel_authentication_request_signing_alg_values_supported(config)
     )
-    |> put_if_present("backchannel_user_code_parameter_supported", backchannel_user_code_parameter_supported(config))
-    |> put_if_present("end_session_endpoint", end_session_endpoint(config))
-    |> put_if_present("backchannel_logout_supported", backchannel_logout_supported(config))
-    |> put_if_present("backchannel_logout_session_supported", backchannel_logout_session_supported(config))
-    |> put_if_present("registration_endpoint", registration_endpoint(config))
-    |> put_if_present("request_object_signing_alg_values_supported", RequestObjectMetadata.signing_alg_values(config))
-    |> put_if_present("require_signed_request_object", RequestObjectMetadata.require_signed(config))
-    |> put_if_present("client_id_metadata_document_supported", client_id_metadata_document_supported(config))
-    |> put_if_present("refresh_token_expiration_types_supported", refresh_expiration_types(config))
-    |> put_if_present(
+    |> MapParams.put_optional(
+      "backchannel_user_code_parameter_supported",
+      backchannel_user_code_parameter_supported(config)
+    )
+    |> MapParams.put_optional("end_session_endpoint", end_session_endpoint(config))
+    |> MapParams.put_optional("backchannel_logout_supported", backchannel_logout_supported(config))
+    |> MapParams.put_optional("backchannel_logout_session_supported", backchannel_logout_session_supported(config))
+    |> MapParams.put_optional("registration_endpoint", registration_endpoint(config))
+    |> MapParams.put_optional(
+      "request_object_signing_alg_values_supported",
+      RequestObjectMetadata.signing_alg_values(config)
+    )
+    |> MapParams.put_optional("require_signed_request_object", RequestObjectMetadata.require_signed(config))
+    |> MapParams.put_optional("client_id_metadata_document_supported", client_id_metadata_document_supported(config))
+    |> MapParams.put_optional("refresh_token_expiration_types_supported", refresh_expiration_types(config))
+    |> MapParams.put_optional(
       "authorization_details_types_supported",
       authorization_details_types_supported(config)
     )
-    |> put_if_present(
+    |> MapParams.put_optional(
       "client_attestation_signing_alg_values_supported",
       client_attestation_alg_values_supported(config)
     )
-    |> put_if_present(
+    |> MapParams.put_optional(
       "client_attestation_pop_signing_alg_values_supported",
       client_attestation_alg_values_supported(config)
     )
-    |> put_if_present(
+    |> MapParams.put_optional(
       "authorization_response_iss_parameter_supported",
       authorization_response_iss_parameter_supported(config)
     )
-    |> put_if_present(
+    |> MapParams.put_optional(
       "tls_client_certificate_bound_access_tokens",
       tls_client_certificate_bound_access_tokens(config)
     )
-    |> put_if_present("mtls_endpoint_aliases", config.mtls_endpoint_aliases)
+    |> MapParams.put_optional("mtls_endpoint_aliases", config.mtls_endpoint_aliases)
     |> put_signing_alg_metadata(signing_alg_values)
     |> put_introspection_auth_signing_alg_values_supported(config)
     |> put_revocation_auth_signing_alg_values_supported(config)
@@ -139,9 +148,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       metadata
     end
   end
-
-  defp put_if_present(metadata, _key, nil), do: metadata
-  defp put_if_present(metadata, key, value), do: Map.put(metadata, key, value)
 
   defp introspection_auth_methods(config) do
     Enum.reject(

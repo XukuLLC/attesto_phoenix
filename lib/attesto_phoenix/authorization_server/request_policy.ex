@@ -41,7 +41,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
           {:ok, AuthorizationRequest.t()} | {:error, AuthorizationRequest.error()}
   def validate(config, client, params, extra_opts \\ []) do
     params
-    |> AuthorizationRequest.validate(validation_opts(config, client) ++ extra_opts)
+    |> AuthorizationRequest.validate(Keyword.merge(validation_opts(config, client), extra_opts))
     |> enforce_cimd_redirect_origin(config, client)
   end
 

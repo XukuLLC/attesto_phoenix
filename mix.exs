@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.15.2"
+  @version "4.16.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.19.0 and < 3.0.0"
+  @attesto_requirement ">= 2.20.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,8 +76,10 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # The 2.19.0 floor includes Attesto.URI.put_query_params/3, which keeps a
-  # registered redirect URI's query without duplicating response parameters.
+  # The 2.20.0 floor includes the pinned DPoP target URI in
+  # Attesto.Plug.Authenticate, pairwise access tokens (Attesto.Token.mint/3
+  # :pairwise), delete_unconsumed/1 on the polling-grant stores, and the shared
+  # Attesto.URI origin and issuer helpers this package now calls.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 

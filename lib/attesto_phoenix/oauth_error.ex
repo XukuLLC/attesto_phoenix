@@ -72,6 +72,7 @@ if Code.ensure_loaded?(Plug.Conn) do
 
     import Plug.Conn
 
+    alias Attesto.Plug.OAuthError
     alias AttestoPhoenix.Callback
     alias AttestoPhoenix.Config
 
@@ -209,7 +210,18 @@ if Code.ensure_loaded?(Plug.Conn) do
     without lowercasing or rewriting it.
     """
     @spec format_challenge(challenge_scheme(), keyword() | [{String.t(), String.t()}]) :: String.t()
-    def format_challenge(scheme, params \\ []) when is_list(params) do
+    def format_challenge(scheme, params \\ [])
+
+    def format_challenge(scheme, [_ | _] = params) when scheme in [:bearer, :dpop] do
+      pairs =
+        if Keyword.keyword?(params),
+          do: Enum.map(params, fn {key, value} -> {to_string(key), value} end),
+          else: params
+
+      OAuthError.format_challenge(scheme, pairs)
+    end
+
+    def format_challenge(scheme, params) when is_list(params) do
       label = challenge_scheme_label(scheme)
 
       params =

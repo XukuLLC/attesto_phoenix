@@ -149,12 +149,12 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.15"}
+    {:attesto_phoenix, "~> 4.16"}
   ]
 end
 ```
 
-Requires `attesto >= 2.19.0 and < 3.0.0`.
+Requires `attesto >= 2.20.0 and < 3.0.0`.
 
 For `prompt=login`, the authentication callback must return `auth_time` at or
 later than `auth_opts.parked_at` on an interaction resume. Fresh requests allow
@@ -212,7 +212,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.15"},
+    {:attesto_phoenix, "~> 4.16"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -1475,9 +1475,9 @@ advertised and rejected only at request time.
 
 `:client_assertion_audiences` controls accepted `private_key_jwt` audiences
 at the token and backchannel authentication endpoints. Since 4.3 it defaults
-to the issuer identifier alone (`draft-ietf-oauth-rfc7523bis-11`, RFC Editor
-queue, RFC 10070), the value PAR, introspection, device authorization and
-revocation already required. The token endpoint URL is no longer accepted by
+to the issuer identifier alone (RFC 10070 §4, which updates RFC 7523), the
+value PAR, introspection, device authorization and revocation already
+required. The token endpoint URL is no longer accepted by
 default: it is the value the 2025 audience-injection attack (CVE-2025-27370,
 CVE-2025-27371) relies on, where a malicious authorization server republishes
 this server's token endpoint as its own and replays the assertion a shared-key

@@ -121,5 +121,36 @@ defmodule AttestoPhoenix.AuthorizationServer.SubjectIdentifierTest do
       assert {:error, :invalid_token} = Userinfo.resolve_claims(config(), token_claims("spread-rp"))
       assert {:error, :invalid_token} = Userinfo.resolve_claims(config(), token_claims("gone"))
     end
+
+    test "a pairwise client configured with any grant outside authorization_code and refresh_token is refused" do
+      for grant <- [
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "urn:openid:params:grant-type:ciba",
+            "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+            "urn:ietf:params:oauth:grant-type:pre-authorized_code",
+            "client_credentials",
+            "implicit"
+          ] do
+        cfg = config(client_grant_types: fn _client -> ["authorization_code", grant] end)
+
+        assert {:error, :unsupported_pairwise_grant} =
+                 SubjectIdentifier.for_client(cfg, @clients["pairwise-rp"], "usr_1")
+
+        assert {:error, :unsupported_pairwise_grant} =
+                 SubjectIdentifier.access_token_opts(cfg, @clients["pairwise-rp"])
+      end
+
+      assert {:error, :unsupported_pairwise_grant} =
+               SubjectIdentifier.for_client(
+                 config(client_grant_types: fn _client -> [] end),
+                 @clients["pairwise-rp"],
+                 "usr_1"
+               )
+
+      code_cfg = config(client_grant_types: fn _client -> ["authorization_code", "refresh_token"] end)
+      assert {:ok, _sub} = SubjectIdentifier.for_client(code_cfg, @clients["pairwise-rp"], "usr_1")
+      assert {:ok, [_ | _]} = SubjectIdentifier.access_token_opts(code_cfg, @clients["pairwise-rp"])
+    end
   end
 end

@@ -2016,8 +2016,78 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
       assert body(post_register(public_only, oidc_metadata(%{"subject_type" => "pairwise"})))["error"] ==
                "invalid_client_metadata"
 
+      # Pairwise refuses non-https (custom scheme) and loopback redirect URIs, even for native clients.
+      for {app_type, bad_uri, expected_error} <- [
+            {"native", "com.evil.app://victim-rp.example/cb", "invalid_client_metadata"},
+            {"native", "http://127.0.0.1/cb", "invalid_client_metadata"},
+            {"web", "https://localhost/cb", "invalid_client_metadata"},
+            {"web", "https://127.0.0.1/cb", "invalid_client_metadata"},
+            {"web", "http://rp.example/cb", "invalid_redirect_uri"}
+          ] do
+        conn =
+          post_register(
+            pairwise,
+            oidc_metadata(%{
+              "application_type" => app_type,
+              "subject_type" => "pairwise",
+              "redirect_uris" => [bad_uri]
+            })
+          )
+
+        assert conn.status == 400
+        assert body(conn)["error"] == expected_error
+      end
+
       assert post_register(public_only, oidc_metadata(%{"subject_type" => "public"})).status == 201
       refute Map.has_key?(body(post_register(public_only, oidc_metadata(%{}))), "subject_type")
+
+      non_code_grant_pairwise =
+        config(
+          client_subject_type: fn _client -> "pairwise" end,
+          pairwise_subject_salt: String.duplicate("k", 32),
+          registration_grant_types: [
+            "authorization_code",
+            "refresh_token",
+            "client_credentials",
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "urn:openid:params:grant-type:ciba",
+            "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+            "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+          ],
+          grant_types_supported: [
+            "authorization_code",
+            "refresh_token",
+            "client_credentials",
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "urn:openid:params:grant-type:ciba",
+            "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+            "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+          ]
+        )
+
+      for grant <- [
+            "client_credentials",
+            "urn:ietf:params:oauth:grant-type:device_code",
+            "urn:openid:params:grant-type:ciba",
+            "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+            "urn:ietf:params:oauth:grant-type:pre-authorized_code"
+          ] do
+        conn =
+          post_register(non_code_grant_pairwise, %{
+            "redirect_uris" => ["https://rp.example/cb"],
+            "subject_type" => "pairwise",
+            "grant_types" => ["authorization_code", grant],
+            "response_types" => ["code"],
+            "token_endpoint_auth_method" => "none"
+          })
+
+        assert conn.status == 400
+        assert body(conn)["error"] == "invalid_client_metadata"
+        assert body(conn)["error_description"] =~ "authorization_code"
+      end
     end
 
     test "userinfo_signed_response_alg is refused when signed responses are not configured" do

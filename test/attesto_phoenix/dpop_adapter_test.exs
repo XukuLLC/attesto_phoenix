@@ -161,16 +161,23 @@ defmodule AttestoPhoenix.DPoP.AdapterTest do
     refute Keyword.has_key?(opts, :origin)
   end
 
-  test "protected-resource htu is derived from the request without :resource_origin or :htu" do
+  test "protected-resource htu is omitted without :resource_origin or :htu" do
     opts = Adapter.protected_resource_opts(config([]))
 
-    assert opts[:htu].(conn(:get, "https://other.example/reports")) == "https://other.example/reports"
+    refute Keyword.has_key?(opts, :htu)
   end
 
   test "protected-resource replay is disabled with DPoP disabled" do
-    opts = Adapter.protected_resource_opts(config(dpop_enabled: false))
+    opts = Adapter.protected_resource_opts(config(dpop_enabled: false, resource_origin: "https://api.example.com"))
 
     refute Keyword.has_key?(opts, :replay_check)
     assert is_function(opts[:htu], 1)
+  end
+
+  test "verify_proof/4 fails closed when http_uri resolves to nil instead of raising" do
+    cfg = config(htu: {__MODULE__, :nil_htu})
+    input = %{http_method: "POST", http_uri: nil}
+
+    assert {:error, :invalid_http_uri} = Adapter.verify_proof(cfg, "not.a.proof", input)
   end
 end

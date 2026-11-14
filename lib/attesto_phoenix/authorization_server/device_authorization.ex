@@ -23,7 +23,6 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   """
 
   alias Attesto.{DeviceCode, MapParams, ResourceIndicator, Scope}
-  alias Attesto.DPoP
   alias AttestoPhoenix.{ClientIdMetadata, Config, DPoP.Adapter, OAuthError}
 
   @error_invalid_request :invalid_request
@@ -146,9 +145,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
         {:ok, nil}
 
       [proof] ->
-        opts = Adapter.verification_opts(config, dpop_input, http_method_default: "POST")
-
-        case DPoP.verify_proof(proof, opts) do
+        case Adapter.verify_proof(config, proof, dpop_input, http_method_default: "POST") do
           {:ok, %{jkt: jkt}} -> {:ok, jkt}
           {:error, reason} -> {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: #{inspect(reason)}")}
         end
@@ -200,16 +197,7 @@ defmodule AttestoPhoenix.AuthorizationServer.DeviceAuthorization do
   end
 
   defp append_user_code(verification_uri, user_code) do
-    uri = URI.parse(verification_uri)
-    encoded_user_code = URI.encode_query(%{"user_code" => user_code})
-
-    query =
-      case uri.query do
-        value when is_binary(value) and value != "" -> value <> "&" <> encoded_user_code
-        _ -> encoded_user_code
-      end
-
-    %{uri | query: query} |> URI.to_string()
+    Attesto.URI.put_query_params(verification_uri, [{"user_code", user_code}], replace: ["user_code"])
   end
 
   defp error(code, description), do: OAuthError.new(code, description, status: 400)

@@ -122,8 +122,7 @@ defmodule AttestoPhoenix.RequestContext do
   @ios_mobile_marker "mobile/"
   @ios_browser_marker "safari/"
 
-  @loopback_v4_cidr {{127, 0, 0, 0}, 8}
-  @loopback_v6 {0, 0, 0, 0, 0, 0, 0, 1}
+  @loopback_cidrs [{{127, 0, 0, 0}, 8}, {{0, 0, 0, 0, 0, 0, 0, 1}, 128}]
 
   @max_port 65_535
 
@@ -310,9 +309,9 @@ defmodule AttestoPhoenix.RequestContext do
   the direct connection's authority and the proof either verifies against the
   real listener URL or fails on its signature.
   """
-  @spec canonical_url(Plug.Conn.t(), Config.t()) :: String.t()
-  def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu} = config) when not is_nil(htu) do
-    Callback.invoke(htu, [conn]) || canonical_url(conn, %{config | htu: nil})
+  @spec canonical_url(Plug.Conn.t(), Config.t()) :: String.t() | nil
+  def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu}) when not is_nil(htu) do
+    Callback.invoke(htu, [conn])
   end
 
   def canonical_url(%Plug.Conn{} = conn, %Config{} = config) do
@@ -343,7 +342,11 @@ defmodule AttestoPhoenix.RequestContext do
   reached as seen through `:trusted_proxies`, whose host comes from the
   request `Host` header or the forwarded host.
   """
-  @spec protected_resource_url(Plug.Conn.t(), Config.t()) :: String.t()
+  @spec protected_resource_url(Plug.Conn.t(), Config.t()) :: String.t() | nil
+  def protected_resource_url(%Plug.Conn{} = conn, %Config{htu: htu}) when not is_nil(htu) do
+    Callback.invoke(htu, [conn])
+  end
+
   def protected_resource_url(%Plug.Conn{} = conn, %Config{htu: nil, resource_origin: origin}) when is_binary(origin) do
     String.trim_trailing(origin, "/") <> conn.request_path
   end
@@ -351,10 +354,10 @@ defmodule AttestoPhoenix.RequestContext do
   def protected_resource_url(%Plug.Conn{} = conn, %Config{} = config), do: canonical_url(conn, config)
 
   @doc false
-  @spec canonical_url(Plug.Conn.t(), Config.t(), String.t()) :: String.t()
+  @spec canonical_url(Plug.Conn.t(), Config.t(), String.t()) :: String.t() | nil
   def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu}, configured_url)
       when not is_nil(htu) and is_binary(configured_url) do
-    Callback.invoke(htu, [conn]) || configured_url
+    Callback.invoke(htu, [conn])
   end
 
   def canonical_url(%Plug.Conn{}, %Config{}, configured_url) when is_binary(configured_url) do
@@ -362,11 +365,10 @@ defmodule AttestoPhoenix.RequestContext do
   end
 
   @doc false
-  @spec canonical_url(Plug.Conn.t(), Config.t(), String.t(), String.t()) :: String.t()
-  def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu} = config, configured_url, endpoint_name)
+  @spec canonical_url(Plug.Conn.t(), Config.t(), String.t(), String.t()) :: String.t() | nil
+  def canonical_url(%Plug.Conn{} = conn, %Config{htu: htu}, configured_url, endpoint_name)
       when not is_nil(htu) and is_binary(configured_url) and is_binary(endpoint_name) do
-    Callback.invoke(htu, [conn]) ||
-      canonical_url(conn, %{config | htu: nil}, configured_url, endpoint_name)
+    Callback.invoke(htu, [conn])
   end
 
   def canonical_url(%Plug.Conn{} = conn, %Config{} = config, configured_url, endpoint_name)
@@ -527,7 +529,7 @@ defmodule AttestoPhoenix.RequestContext do
     # IP to test against the allowlist, so it fails closed. `conn.remote_ip` is
     # intentionally not authoritative here: middleware may rewrite that plain
     # struct field from an untrusted X-Forwarded-For header.
-    ip = conn |> socket_peer_ip() |> normalize_peer_ip()
+    ip = conn |> socket_peer_ip() |> Attesto.IPAddress.unmap_ipv4()
     is_tuple(ip) and Enum.any?(List.wrap(proxies), &peer_matches?(ip, &1))
   end
 
@@ -537,19 +539,6 @@ defmodule AttestoPhoenix.RequestContext do
   rescue
     _ -> nil
   end
-
-  # A dual-stack IPv6 listener (e.g. an app bound on `::` behind a reverse proxy
-  # that reaches it over an IPv4 bridge network, the common Docker / Kamal
-  # topology) surfaces the proxy's IPv4 peer as an IPv4-mapped IPv6 address
-  # `::ffff:a.b.c.d` (`{0, 0, 0, 0, 0, 0xFFFF, g, h}`). Fold it back to its IPv4
-  # 4-tuple so it matches an IPv4 CIDR allowlist (e.g. `172.16.0.0/12`); without
-  # this the 8-tuple peer never matches a 4-tuple network and a legitimately
-  # proxied HTTPS request is misread as plain HTTP and refused.
-  defp normalize_peer_ip({0, 0, 0, 0, 0, 0xFFFF, g, h}) do
-    {Bitwise.bsr(g, 8), Bitwise.band(g, 0xFF), Bitwise.bsr(h, 8), Bitwise.band(h, 0xFF)}
-  end
-
-  defp normalize_peer_ip(ip), do: ip
 
   # ----- effective scheme -----
 
@@ -709,85 +698,19 @@ defmodule AttestoPhoenix.RequestContext do
 
   defp peer_matches?(_remote_ip, :any), do: true
 
-  defp peer_matches?(remote_ip, :loopback) do
-    cidr_contains?(@loopback_v4_cidr, remote_ip) or remote_ip == @loopback_v6
+  defp peer_matches?(remote_ip, :loopback), do: Attesto.IPAddress.in_any_cidr?(remote_ip, @loopback_cidrs)
+
+  defp peer_matches?(remote_ip, {network, prefix} = cidr) when is_tuple(network) and is_integer(prefix) do
+    Attesto.IPAddress.in_any_cidr?(remote_ip, [cidr])
   end
 
   defp peer_matches?(remote_ip, ip) when is_tuple(ip), do: remote_ip == ip
 
   defp peer_matches?(remote_ip, cidr) when is_binary(cidr) do
-    case parse_cidr(cidr) do
-      {:ok, parsed} -> cidr_contains?(parsed, remote_ip)
-      :error -> false
-    end
+    Attesto.IPAddress.in_any_cidr?(remote_ip, Config.parse_trusted_proxy_cidr(cidr))
+  rescue
+    ArgumentError -> false
   end
 
   defp peer_matches?(_remote_ip, _other), do: false
-
-  # Parse `"<address>/<prefix>"` into `{network_tuple, prefix_len}`. An address
-  # with no `/` is treated as a host route (full-length prefix). A malformed
-  # entry returns `:error` and is treated as "does not match" rather than
-  # raising; misconfiguration must not crash request handling, and a non-match
-  # is the fail-closed outcome (the peer is not trusted).
-  defp parse_cidr(cidr) do
-    case String.split(cidr, "/", parts: 2) do
-      [address, prefix] ->
-        with {:ok, ip} <- parse_address(address),
-             {prefix_len, ""} <- Integer.parse(prefix),
-             true <- valid_prefix?(ip, prefix_len) do
-          {:ok, {ip, prefix_len}}
-        else
-          _ -> :error
-        end
-
-      [address] ->
-        case parse_address(address) do
-          {:ok, ip} -> {:ok, {ip, full_prefix(ip)}}
-          :error -> :error
-        end
-    end
-  end
-
-  defp parse_address(address) do
-    case :inet.parse_address(String.to_charlist(address)) do
-      {:ok, ip} -> {:ok, ip}
-      {:error, _} -> :error
-    end
-  end
-
-  defp full_prefix(ip) when tuple_size(ip) == 4, do: 32
-  defp full_prefix(ip) when tuple_size(ip) == 8, do: 128
-
-  defp valid_prefix?(ip, prefix_len) when tuple_size(ip) == 4, do: prefix_len in 0..32
-
-  defp valid_prefix?(ip, prefix_len) when tuple_size(ip) == 8, do: prefix_len in 0..128
-
-  # Containment by integer masking. The network and the candidate must be the
-  # same address family (both IPv4 or both IPv6) to match; an IPv4 peer never
-  # matches an IPv6 CIDR or vice versa.
-  defp cidr_contains?({network, prefix_len}, candidate) when tuple_size(network) == tuple_size(candidate) do
-    mask = bitmask(full_prefix(network), prefix_len)
-    Bitwise.band(ip_to_integer(network), mask) == Bitwise.band(ip_to_integer(candidate), mask)
-  end
-
-  defp cidr_contains?(_network, _candidate), do: false
-
-  # All host bits cleared: a `prefix_len`-bit network mask over a `total_bits`
-  # address space.
-  defp bitmask(total_bits, prefix_len) do
-    host_bits = total_bits - prefix_len
-    Bitwise.bsl(Bitwise.bsl(1, prefix_len) - 1, host_bits)
-  end
-
-  defp ip_to_integer(ip) when tuple_size(ip) == 4 do
-    ip
-    |> Tuple.to_list()
-    |> Enum.reduce(0, fn octet, acc -> acc * 256 + octet end)
-  end
-
-  defp ip_to_integer(ip) when tuple_size(ip) == 8 do
-    ip
-    |> Tuple.to_list()
-    |> Enum.reduce(0, fn group, acc -> acc * 65_536 + group end)
-  end
 end

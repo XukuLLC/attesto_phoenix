@@ -61,7 +61,7 @@ defmodule AttestoPhoenix.Store.EctoConsentGrantStore do
   @spec mint(ConsentGrant.binding(), pos_integer()) :: {:ok, String.t()} | {:error, Ecto.Changeset.t()}
   def mint(%{} = binding, ttl_seconds) when is_integer(ttl_seconds) and ttl_seconds > 0 do
     {repo, prefix} = StoreEcto.mutation_context()
-    token = :crypto.strong_rand_bytes(@token_bytes) |> Base.url_encode64(padding: false)
+    token = Attesto.Secret.generate(@token_bytes)
     now = DateTime.utc_now()
 
     attrs = %{

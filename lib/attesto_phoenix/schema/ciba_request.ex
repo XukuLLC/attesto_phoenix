@@ -226,7 +226,7 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
   defp valid_optional_display_text?(nil), do: true
 
   defp valid_optional_display_text?(value) when is_binary(value) and value != "",
-    do: String.valid?(value) and not Regex.match?(~r/[\x00-\x1F\x7F]/u, value)
+    do: Attesto.Claims.no_terminal_controls?(value)
 
   defp valid_optional_display_text?(_value), do: false
 

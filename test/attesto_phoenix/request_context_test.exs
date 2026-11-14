@@ -153,7 +153,7 @@ defmodule AttestoPhoenix.RequestContextTest do
     end
 
     test "address family does not cross: IPv4 peer never matches IPv6 CIDR" do
-      cfg = config(trusted_proxies: ["::/0"])
+      cfg = config(trusted_proxies: ["fd00::/8"])
 
       refute RequestContext.from_trusted_proxy?(
                build_conn(:get, "/", remote_ip: {10, 0, 0, 1}),
@@ -161,13 +161,48 @@ defmodule AttestoPhoenix.RequestContextTest do
              )
     end
 
-    test "malformed CIDR is treated as no-match, not a crash" do
-      cfg = config(trusted_proxies: ["not-a-cidr", "10.0.0.0/99"])
+    test "bare IPv4 and IPv6 strings match exact host routes" do
+      cfg = config(trusted_proxies: ["10.1.2.3", "::1"])
 
-      refute RequestContext.from_trusted_proxy?(
-               build_conn(:get, "/", remote_ip: {10, 0, 0, 1}),
+      assert RequestContext.from_trusted_proxy?(
+               build_conn(:get, "/", remote_ip: {10, 1, 2, 3}),
                cfg
              )
+
+      refute RequestContext.from_trusted_proxy?(
+               build_conn(:get, "/", remote_ip: {10, 1, 2, 4}),
+               cfg
+             )
+
+      assert RequestContext.from_trusted_proxy?(
+               build_conn(:get, "/", remote_ip: {0, 0, 0, 0, 0, 0, 0, 1}),
+               cfg
+             )
+    end
+
+    test "malformed, host-bit, or zero-prefix CIDRs raise at boot" do
+      for bad <- ["not-a-cidr", "10.0.0.0/99", "0.0.0.0/0", "::/0", "10.1/8", "10.0.0.5/8", "10.0.0.0/+8"] do
+        assert_raise ArgumentError, fn ->
+          config(trusted_proxies: [bad])
+        end
+      end
+    end
+
+    test "CIDR {network, prefix} tuples are accepted and validated at boot" do
+      cfg = config(trusted_proxies: [{{10, 0, 0, 0}, 8}, {{0xFD00, 0, 0, 0, 0, 0, 0, 0}, 8}])
+
+      assert RequestContext.from_trusted_proxy?(
+               build_conn(:get, "/", remote_ip: {10, 1, 2, 3}),
+               cfg
+             )
+
+      assert_raise ArgumentError, fn ->
+        config(trusted_proxies: [{{0, 0, 0, 0}, 0}])
+      end
+
+      assert_raise ArgumentError, fn ->
+        config(trusted_proxies: [{{10, 0, 0, 1}, 8}])
+      end
     end
 
     test "missing socket peer address is never trusted" do
@@ -533,10 +568,13 @@ defmodule AttestoPhoenix.RequestContextTest do
                "https://override.example/path"
     end
 
-    test "falls back to derivation when the htu callback returns nil" do
+    test "returns nil when the htu callback returns nil (fail closed)" do
       cfg = config(htu: fn _conn -> nil end)
       conn = build_conn(:get, "/x", scheme: :https, host: "h", port: 443)
-      assert RequestContext.canonical_url(conn, cfg) == "https://h/x"
+      assert RequestContext.canonical_url(conn, cfg) == nil
+      assert RequestContext.canonical_url(conn, cfg, "https://issuer.example/x") == nil
+      assert RequestContext.canonical_url(conn, cfg, "https://issuer.example/x", "token_endpoint") == nil
+      assert RequestContext.protected_resource_url(conn, cfg) == nil
     end
   end
 

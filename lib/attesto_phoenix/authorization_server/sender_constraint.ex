@@ -345,9 +345,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
 
     # `:replay_check` is deliberately deferred; see `resolve/3`. The token
     # endpoint commits the returned identity only after grant validation.
-    verify_opts = Adapter.verification_opts(config, input, replay_check: :deferred, nonce_check: true)
-
-    case invoke_dpop_verify(proof, verify_opts) do
+    case Adapter.verify_proof(config, proof, input, replay_check: :deferred, nonce_check: true) do
       # Defer the NAMESPACED, opaque replay identity (`replay_key`), not the raw
       # `jti` - `jti` is unique only per key, so recording it alone would collide
       # across keys (a cross-client false replay and a targeted DoS). This must
@@ -363,13 +361,6 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
       {:error, reason} ->
         {:error, error(@error_invalid_dpop_proof, "invalid DPoP proof: #{inspect(reason)}")}
     end
-  end
-
-  # The proof verifier is part of the `Attesto.DPoP` core; the replay-check
-  # callback is host-supplied. Both are reached only through the configured
-  # surface so this module hardcodes neither a store nor a clock.
-  defp invoke_dpop_verify(proof, opts) do
-    Attesto.DPoP.verify_proof(proof, opts)
   end
 
   defp bind_mtls(input) do

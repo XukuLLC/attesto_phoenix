@@ -87,6 +87,7 @@ defmodule AttestoPhoenix.Interaction do
           case AttestoPhoenix.Interaction.decide(conn, resume_id, decision, subject_id) do
             :ok -> redirect(conn, to: "/oauth/authorize?" <> URI.encode_query(%{"resume" => resume_id}))
             {:error, :invalid_resume} -> send_resp(conn, 400, "Invalid consent request")
+            {:error, :cross_origin} -> send_resp(conn, 403, "Cross-origin consent request")
           end
         else
           send_resp(conn, 400, "Invalid consent request")
@@ -198,11 +199,16 @@ defmodule AttestoPhoenix.Interaction do
 
   Parked requests live in the configured `:par_store`, under a key no pushed
   authorization request can have, for `:interaction_ttl` seconds (default 600,
-  at most 3600). The store must implement atomic `take/1`, and atomic
-  `replace/2` only when using `decide/4`. The bundled stores expire the rows
-  as they do pushed requests (the Ecto store through the
-  sweeper), and parked requests count toward the ETS store's
-  `:par_max_entries`.
+  at most 3600). Pushed `request_uri` requests remain governed by `:par_ttl`
+  when shorter than `:interaction_ttl`. The store must implement atomic
+  `take/1`, and atomic `replace/2` only when using `decide/4`. The bundled
+  stores expire the rows as they do pushed requests (the Ecto store through
+  the sweeper); on the default ETS store, parked requests have their own
+  table and count bounded by `:interaction_max_entries` (default `8_192`),
+  separate from `:par_max_entries`, and `park/3` enforces `:par_max_record_bytes`
+  for every store. Because anonymous `/authorize` requests can hold interaction
+  slots up to `:interaction_ttl`, public deployments should rate-limit
+  `/authorize` per source.
   """
 
   alias Attesto.AuthorizationRequest
@@ -211,11 +217,38 @@ defmodule AttestoPhoenix.Interaction do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.ConsentGrant
   alias AttestoPhoenix.RequestContext
-  # Not a `urn:ietf:params:oauth:request_uri:` reference, so the key space is
-  # disjoint from pushed authorization requests held in the same store.
+  alias AttestoPhoenix.Store.PAR.Capacity
   alias AttestoPhoenix.Store.PAR.ETS
   alias Plug.Conn.Unfetched
 
+  @storable_request_param_keys ~w(
+    acr_values
+    authorization_details
+    claims
+    claims_locales
+    client_id
+    code_challenge
+    code_challenge_method
+    display
+    dpop_jkt
+    id_token_hint
+    issuer_state
+    login_hint
+    max_age
+    nonce
+    prompt
+    redirect_uri
+    request
+    request_uri
+    resource
+    response_mode
+    response_type
+    scope
+    state
+    ui_locales
+  )
+  # Not a `urn:ietf:params:oauth:request_uri:` reference, so the key space is
+  # disjoint from pushed authorization requests held in the same store.
   @key_prefix "urn:attesto:interaction:"
   @resume_id_bytes 32
   @resumed_private_key :attesto_phoenix_resumed_interaction
@@ -262,9 +295,12 @@ defmodule AttestoPhoenix.Interaction do
     resume_id = Secret.generate(@resume_id_bytes)
     parked_at = original_parked_at(conn)
 
+    parked_key = parked_key(resume_id, binding)
+    storable_params = Map.take(request_params(conn), @storable_request_param_keys)
+
     entry =
       %{
-        "params" => request_params(conn),
+        "params" => storable_params,
         "client_id" => request.client_id,
         "binding" => binding_hash(binding),
         "parked_at" => parked_at,
@@ -272,9 +308,15 @@ defmodule AttestoPhoenix.Interaction do
       }
       |> bind_subject(request, opts)
 
-    case store.put(parked_key(resume_id, binding), entry, config.interaction_ttl) do
-      :ok -> {:ok, resume_id}
-      {:error, reason} -> {:error, reason}
+    expires_at = parked_at + config.interaction_ttl
+
+    if Capacity.fits?(parked_key, entry, expires_at, config) do
+      case store.put(parked_key, entry, config.interaction_ttl) do
+        :ok -> {:ok, resume_id}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, :record_too_large}
     end
   end
 
@@ -551,18 +593,13 @@ defmodule AttestoPhoenix.Interaction do
   defp allowed_origin?([origin], allowed), do: origin_of(origin) in allowed and origin_of(origin) != nil
   defp allowed_origin?(_origin, _allowed), do: false
 
-  defp origin_of(url) when is_binary(url) do
-    case URI.parse(url) do
-      %URI{scheme: scheme, host: host, port: port} when is_binary(scheme) and is_binary(host) and host != "" ->
-        if String.downcase(scheme) in ["https", "http"],
-          do: {String.downcase(scheme), String.downcase(host), port}
-
-      _other ->
-        nil
+  defp origin_of(url) do
+    case Attesto.URI.origin(url) do
+      {:ok, "https://" <> _ = origin} -> origin
+      {:ok, "http://" <> _ = origin} -> origin
+      _other -> nil
     end
   end
-
-  defp origin_of(_url), do: nil
 
   defp store(config) do
     store = config.par_store || ETS

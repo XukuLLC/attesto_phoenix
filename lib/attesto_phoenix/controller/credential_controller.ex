@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.Controller.CredentialController do
   import Plug.Conn
 
   alias AttestoPhoenix.Callback
-  alias AttestoPhoenix.{Config, CredentialIssuer, ProtectedResource}
+  alias AttestoPhoenix.{Config, CredentialIssuer, ProtectedResource, RequestContext}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
   @doc """
@@ -40,7 +40,13 @@ defmodule AttestoPhoenix.Controller.CredentialController do
     config = Config.resolve!(conn)
     resource_metadata = Config.resource_metadata_url(config, conn)
 
-    case ProtectedResource.authenticate(conn, config, resource_metadata) do
+    htu_override = [
+      htu: fn req_conn ->
+        RequestContext.canonical_url(req_conn, config, Config.credential_endpoint_url(config), "credential_endpoint")
+      end
+    ]
+
+    case ProtectedResource.authenticate(conn, config, resource_metadata, core_overrides: htu_override) do
       {:ok, conn, claims} ->
         respond(conn, config, body_params(conn, params), resource_metadata, claims)
 

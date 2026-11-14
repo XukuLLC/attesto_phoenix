@@ -18,9 +18,13 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
         # requires 2.14.0, whose authorization-request validation
         # takes :request_objects_supported and whose access-token
         # verification checks the JOSE header typ. 4.12 requires 2.18.0 for
-        # prompt=login freshness and serialized refresh retries, and 4.15
-        # requires 2.19.0 for Attesto.URI.put_query_params/3.
-        assert Version.match?("2.19.0", requirement)
+        # prompt=login freshness and serialized refresh retries, 4.15
+        # requires 2.19.0 for Attesto.URI.put_query_params/3, and 4.16
+        # requires 2.20.0 for the pinned DPoP target URI, pairwise access
+        # tokens, criteria revocation of polling grants and the shared
+        # Attesto.URI origin helpers.
+        assert Version.match?("2.20.0", requirement)
+        refute Version.match?("2.19.0", requirement)
         refute Version.match?("2.18.0", requirement)
         refute Version.match?("2.17.0", requirement)
         refute Version.match?("2.16.0", requirement)
@@ -82,7 +86,8 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "an empty source path selects the released requirement" do
     with_environment(%{"ATTESTO_SOURCE_PATH" => "", "ATTESTO_PATH" => nil}, fn ->
       assert {:attesto, requirement} = dependency!(:attesto)
-      assert Version.match?("2.19.0", requirement)
+      assert Version.match?("2.20.0", requirement)
+      refute Version.match?("2.19.0", requirement)
       refute Version.match?("2.18.0", requirement)
       refute Version.match?("2.17.0", requirement)
       refute Version.match?("2.16.0", requirement)
@@ -129,7 +134,7 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
     assert metadata =~ ~s(<<"version">>,<<"#{Mix.Project.config()[:version]}">>)
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
-    assert metadata =~ ~s(<<"requirement">>,<<">= 2.19.0 and < 3.0.0">>)
+    assert metadata =~ ~s(<<"requirement">>,<<">= 2.20.0 and < 3.0.0">>)
     assert File.regular?(Path.join(output_path, "guides/upgrade_4_0.md"))
   end
 

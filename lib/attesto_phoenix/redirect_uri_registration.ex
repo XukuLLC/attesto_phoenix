@@ -16,10 +16,9 @@ defmodule AttestoPhoenix.RedirectURIRegistration do
          true <- String.valid?(value),
          false <- Regex.match?(~r/\p{Cc}/u, value),
          false <- String.contains?(value, "\\"),
-         false <- Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, value),
+         true <- Attesto.URI.valid_percent_encoding?(value),
          true <- RedirectURI.unambiguous?(value),
-         {:ok, %URI{fragment: nil, userinfo: nil} = uri} <- URI.new(value),
-         false <- String.ends_with?(URI.parse(value).authority || "", ":") do
+         {:ok, %URI{fragment: nil, userinfo: nil} = uri} <- URI.new(value) do
       acceptable?(uri, value, opts)
     else
       _other -> false
@@ -32,35 +31,34 @@ defmodule AttestoPhoenix.RedirectURIRegistration do
 
   def valid?(_value, _opts), do: false
 
-  defp acceptable?(%URI{scheme: "https", host: host, port: port}, _original, _opts) do
-    valid_host?(host) and valid_port?(port, false)
+  defp acceptable?(%URI{scheme: "https", host: host, port: port}, original, _opts) do
+    valid_host?(host) and Attesto.URI.valid_port?(original, port)
   end
 
   defp acceptable?(%URI{scheme: "http", port: port}, original, opts) do
     case Keyword.get(opts, :loopback_mode) do
       mode when mode in [:exact_allow_loopback_port, :exact_allow_loopback_port_including_localhost] ->
-        valid_port?(port, true) and ClientIdMetadata.loopback_redirect_uri?(original, mode)
+        valid_loopback_port?(original, port) and ClientIdMetadata.loopback_redirect_uri?(original, mode)
 
       _other ->
         false
     end
   end
 
-  defp acceptable?(%URI{scheme: scheme, host: host, path: path, port: port}, _original, opts) do
+  defp acceptable?(%URI{scheme: scheme, host: host, path: path, port: port}, original, opts) do
     Keyword.get(opts, :allow_private_use, false) and
       is_binary(scheme) and Regex.match?(@private_scheme, scheme) and
-      valid_port?(port, false) and
+      Attesto.URI.valid_port?(original, port) and
       ((is_nil(host) and is_binary(path) and path != "") or
          (is_binary(host) and host != ""))
   end
+
+  defp valid_loopback_port?(original, 0), do: Attesto.URI.valid_port?(original, nil)
+  defp valid_loopback_port?(original, port), do: Attesto.URI.valid_port?(original, port)
 
   defp valid_host?(host) when is_binary(host) and host != "" do
     match?({:ok, _canonical}, HostPolicy.canonicalize(host))
   end
 
   defp valid_host?(_host), do: false
-
-  defp valid_port?(nil, _allow_zero?), do: true
-  defp valid_port?(0, true), do: true
-  defp valid_port?(port, _allow_zero?) when is_integer(port), do: port in 1..65_535
 end

@@ -104,6 +104,7 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
         load_principal: fn subject -> {:ok, %{subject: subject, kind: :user}} end,
         on_event: fn event -> send(self(), {:event, event}) end,
         principal_kinds: [@user_kind],
+        resource_origin: @issuer,
         require_https: false
       )
 
@@ -794,6 +795,50 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
         ctx
         |> dpop_resource_request("https://other.example/reports", "https://mcp.example/reports")
         |> Authenticate.call(opts)
+
+      refute accepted.halted
+    end
+
+    test "refuses to initialize when DPoP is enabled and neither resource_origin/htu nor route origin/htu is set",
+         ctx do
+      unpinned = %{ctx.config | resource_origin: nil, htu: nil}
+
+      assert_raise ArgumentError, ~r/no target URI is pinned/, fn ->
+        Authenticate.init(config: unpinned)
+      end
+
+      assert is_list(Authenticate.init(config: %{unpinned | dpop_enabled: false}))
+      assert is_list(Authenticate.init(config: unpinned, origin: "https://mcp.example"))
+    end
+
+    test "refuses malformed :htu at init/1 instead of discarding the pin", ctx do
+      for bad_htu <- ["https://mcp.example", {__MODULE__, :htu}, nil] do
+        assert_raise ArgumentError, ~r/:htu must be a 1-arity function/, fn ->
+          Authenticate.init(config: ctx.config, htu: bad_htu)
+        end
+      end
+    end
+
+    test "refuses DPoP proof when :htu callback returns nil instead of falling back to Host", ctx do
+      config = %{ctx.config | resource_origin: nil, htu: fn _conn -> nil end}
+
+      refused =
+        ctx
+        |> dpop_resource_request("https://other.example/reports", "https://other.example/reports")
+        |> Authenticate.call(Authenticate.init(config: config))
+
+      assert_dpop_refused(refused)
+    end
+
+    test "runtime PutConfig built with Config.new defaults :resource_origin from :audience without 500s", ctx do
+      put_cfg = Config.new(Map.from_struct(%{ctx.config | resource_origin: nil, htu: nil}))
+      assert put_cfg.resource_origin == @issuer
+
+      accepted =
+        ctx
+        |> dpop_resource_request("https://other.example/reports", @issuer <> "/reports")
+        |> Plug.Conn.put_private(:attesto_phoenix_config, put_cfg)
+        |> Authenticate.call(Authenticate.init(otp_app: :unused_at_runtime))
 
       refute accepted.halted
     end

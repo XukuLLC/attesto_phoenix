@@ -11,8 +11,11 @@ defmodule AttestoPhoenix.AuthorizationServer.SubjectIdentifier do
 
   Every response that tells a client who the resource owner is goes through
   this module, so one client sees one `sub` for one End-User everywhere: the
-  ID Token, the UserInfo response, the introspection response and the
-  back-channel logout token.
+  access token, ID Token, the UserInfo response, the introspection response and
+  the back-channel logout token. For access tokens issued to a pairwise client,
+  `access_token_opts/2` directs `Attesto.Token.mint/3` to emit the pairwise
+  `sub` alongside the AES-256-GCM sealed host subject, which `verify_opts/1`
+  unseals for same-deployment protected resources and introspection.
 
   A client resolved from a Client ID Metadata Document is always `public`.
 
@@ -36,6 +39,21 @@ defmodule AttestoPhoenix.AuthorizationServer.SubjectIdentifier do
           | :no_redirect_uris
           | :invalid_redirect_uri
           | :multiple_hosts
+          | :unsupported_pairwise_grant
+
+  @pairwise_allowed_grants ~w(authorization_code refresh_token)
+
+  @doc false
+  @spec pairwise_allowed_grant_types() :: [String.t()]
+  def pairwise_allowed_grant_types, do: @pairwise_allowed_grants
+
+  @doc false
+  @spec pairwise_grants_allowed?(term()) :: boolean()
+  def pairwise_grants_allowed?(grant_types) when is_list(grant_types) and grant_types != [] do
+    Enum.all?(grant_types, &(&1 in @pairwise_allowed_grants))
+  end
+
+  def pairwise_grants_allowed?(_grant_types), do: false
 
   @doc """
   Whether any client of this configuration can be pairwise: the host
@@ -47,7 +65,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SubjectIdentifier do
   @doc "The subject types this configuration issues, for discovery."
   @spec subject_types_supported(Config.t()) :: [String.t()]
   def subject_types_supported(%Config{} = config) do
-    if pairwise_possible?(config), do: ["public", "pairwise"], else: ["public"]
+    if pairwise_possible?(config), do: PairwiseSubject.subject_types(), else: ["public"]
   end
 
   @doc """
@@ -104,13 +122,65 @@ defmodule AttestoPhoenix.AuthorizationServer.SubjectIdentifier do
     end
   end
 
-  defp pairwise(%Config{pairwise_subject_salt: salt} = config, client, subject) do
-    if PairwiseSubject.valid_salt?(salt) do
-      with {:ok, sector} <- sector_identifier(config, client) do
-        {:ok, PairwiseSubject.derive(sector, subject, salt)}
+  defp pairwise(%Config{} = config, client, subject) do
+    with {:ok, sector} <- pairwise_sector(config, client) do
+      {:ok, PairwiseSubject.derive(sector, subject, config.pairwise_subject_salt)}
+    end
+  end
+
+  defp pairwise_sector(%Config{pairwise_subject_salt: salt} = config, client) do
+    with :ok <- check_pairwise_grants(config, client) do
+      if PairwiseSubject.valid_salt?(salt) do
+        sector_identifier(config, client)
+      else
+        {:error, :pairwise_not_configured}
       end
+    end
+  end
+
+  defp check_pairwise_grants(config, client) do
+    case Config.client_grant_types_fun(config) do
+      nil -> :ok
+      callback -> check_grant_list(Callback.invoke(callback, [client]))
+    end
+  end
+
+  defp check_grant_list(grant_types) when is_list(grant_types) do
+    if pairwise_grants_allowed?(grant_types) do
+      :ok
     else
-      {:error, :pairwise_not_configured}
+      {:error, :unsupported_pairwise_grant}
+    end
+  end
+
+  defp check_grant_list(_other), do: :ok
+
+  @doc """
+  Extra `Attesto.Token.mint/3` options for an access token minted for `client`.
+  """
+  @spec access_token_opts(Config.t(), term()) :: {:ok, keyword()} | {:error, error()}
+  def access_token_opts(%Config{} = config, client) do
+    case subject_type(config, client) do
+      "public" ->
+        {:ok, []}
+
+      "pairwise" ->
+        with {:ok, sector} <- pairwise_sector(config, client) do
+          {:ok, [pairwise: {sector, config.pairwise_subject_salt}]}
+        end
+    end
+  end
+
+  @doc """
+  Extra `Attesto.Token.verify/3` options needed to unseal pairwise access tokens
+  under `config`.
+  """
+  @spec verify_opts(Config.t()) :: keyword()
+  def verify_opts(%Config{} = config) do
+    if pairwise_possible?(config) and PairwiseSubject.valid_salt?(config.pairwise_subject_salt) do
+      [pairwise_subject_salt: config.pairwise_subject_salt]
+    else
+      []
     end
   end
 

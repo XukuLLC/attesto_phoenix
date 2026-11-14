@@ -47,7 +47,6 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
       is demonstrated later at the token endpoint.
   """
 
-  alias Attesto.DPoP
   alias Attesto.RequestObject
   alias AttestoPhoenix.AuthorizationServer.PAR.Request
   alias AttestoPhoenix.AuthorizationServer.RequestPolicy
@@ -231,9 +230,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   end
 
   defp verify_dpop_proof(config, dpop_input, params, proof) do
-    opts = Adapter.verification_opts(config, dpop_input)
-
-    with {:ok, %{jkt: verified_jkt}} <- DPoP.verify_proof(proof, opts),
+    with {:ok, %{jkt: verified_jkt}} <- Adapter.verify_proof(config, proof, dpop_input),
          :ok <- check_submitted_dpop_jkt(Map.get(params, "dpop_jkt"), verified_jkt) do
       {:ok, verified_jkt}
     else
@@ -298,7 +295,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   defp par_store(config), do: config_field(config, :par_store, ETS)
 
   defp dpop_proofs(dpop_input), do: Map.get(dpop_input, :proofs, [])
-  defp random, do: 32 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+  defp random, do: Attesto.Secret.generate(32)
 
   defp config_field(config, field, default) do
     case Map.get(config, field) do
@@ -327,50 +324,36 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # for a host that exposes no `:client_id`, and `Attesto.RequestObject` treats
   # a nil expected issuer as unverifiable, so every signed request object pushed
   # to PAR by such a deployment would be rejected as `invalid_request_object`.
-  defp verify_request_object(config, client, bound_client_id, %{"request" => request})
-       when is_binary(request) and request != "" do
+  defp verify_request_object(config, client, bound_client_id, params) do
     jwks = client_jwks(config, client)
 
-    if RequestPolicy.request_objects_supported?(config, jwks) do
-      opts =
-        [issuer: bound_client_id, audience: config.issuer] ++
-          RequestObject.Policy.to_verify_opts(request_object_policy(config))
+    opts = [
+      request_objects_supported: RequestPolicy.request_objects_supported?(config, jwks),
+      request_object_jwks: jwks || %{"keys" => []},
+      issuer: bound_client_id,
+      request_object_audience: config.issuer,
+      request_object_policy: request_object_policy(config),
+      keep_request_param: true
+    ]
 
-      case RequestObject.verify(request, jwks || %{"keys" => []}, opts) do
-        {:ok, object_params} ->
-          {:ok, Map.put(object_params, "request", request)}
+    case Attesto.AuthorizationRequest.resolve_request_object(params, opts) do
+      {:ok, resolved} ->
+        {:ok, resolved}
 
-        {:error, _reason} ->
-          {:error, error(@error_invalid_request_object, "request object is invalid")}
-      end
-    else
-      # OIDC Core §3.1.2.6: this server does not support the `request`
-      # parameter, which is a different answer from an object it could not
-      # verify.
-      {:error, OAuthError.new(:request_not_supported, "request object is not supported", status: 400)}
-    end
-  end
+      {:error, :request_not_supported} ->
+        # OIDC Core §3.1.2.6: this server does not support the `request`
+        # parameter, which is a different answer from an object it could not
+        # verify.
+        {:error, OAuthError.new(:request_not_supported, "request object is not supported", status: 400)}
 
-  # RFC 6749 §3.1: a parameter MUST NOT be included more than once. A `request`
-  # that arrives as a list or a map is not one Request Object.
-  defp verify_request_object(_config, _client, _bound_client_id, %{"request" => request})
-       when not is_binary(request) and not is_nil(request) do
-    {:error, error(@error_invalid_request, "request must be a single value")}
-  end
+      {:error, :duplicate_request} ->
+        {:error, error(@error_invalid_request, "request must be a single value")}
 
-  # No `request` object pushed. FAPI 2.0 Message Signing §5.3.1: when the
-  # configured policy requires a signed request object, a PAR carrying none is
-  # rejected here (RFC 9126 §2.3 invalid_request) rather than stored as a plain
-  # request; otherwise the pushed plain parameters stand (generic OIDC §6.1).
-  defp verify_request_object(config, _client, _bound_client_id, params) do
-    if RequestObject.Policy.require_request_object?(request_object_policy(config)) do
-      {:error,
-       error(
-         @error_invalid_request,
-         "pushed authorization request must use a signed request object"
-       )}
-    else
-      {:ok, params}
+      {:error, :request_object_required} ->
+        {:error, error(@error_invalid_request, "pushed authorization request must use a signed request object")}
+
+      {:error, :invalid_request_object} ->
+        {:error, error(@error_invalid_request_object, "request object is invalid")}
     end
   end
 

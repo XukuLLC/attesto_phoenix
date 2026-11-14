@@ -98,7 +98,7 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
   alias AttestoPhoenix.AuthorizationServer.Userinfo
   alias AttestoPhoenix.Callback
-  alias AttestoPhoenix.{Config, ProtectedResource}
+  alias AttestoPhoenix.{Config, ProtectedResource, RequestContext}
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
   require Logger
@@ -120,8 +120,13 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
 
     if Config.openid_provider?(config) do
       resource_metadata = Config.resource_metadata_url(config, conn)
+      endpoint_url = configured_userinfo_url(config)
 
-      case ProtectedResource.authenticate(conn, config, resource_metadata) do
+      htu_override = [
+        htu: fn req_conn -> RequestContext.canonical_url(req_conn, config, endpoint_url, "userinfo_endpoint") end
+      ]
+
+      case ProtectedResource.authenticate(conn, config, resource_metadata, core_overrides: htu_override) do
         {:ok, conn, claims} ->
           respond(conn, config, resource_metadata, claims)
 
@@ -184,6 +189,9 @@ defmodule AttestoPhoenix.Controller.UserinfoController do
   # host transport hooks and validated RFC 9728 pointer as every other failure.
   # The shared core helper intentionally owns a generic description, so this
   # endpoint keeps its established wire contract at the controller boundary.
+  defp configured_userinfo_url(%Config{userinfo_endpoint: url}) when is_binary(url), do: url
+  defp configured_userinfo_url(%Config{} = config), do: Config.userinfo_endpoint_url(config)
+
   defp insufficient_scope(conn, config, scheme, resource_metadata) do
     challenge =
       PhoenixOAuthError.format_challenge(

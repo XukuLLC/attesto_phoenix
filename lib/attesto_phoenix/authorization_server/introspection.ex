@@ -68,12 +68,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Introspection do
     protocol_config = Config.to_attesto_config(config)
 
     protocol_config
-    |> Introspection.introspect(token,
-      refresh_store: refresh_store(config),
-      issuer: config.issuer,
-      token_type_hint: token_type_hint,
-      trusted_audiences: ResourceAudiencePolicy.resolver(config),
-      authorize: caller_authorize(config, client_id)
+    |> Introspection.introspect(
+      token,
+      [
+        refresh_store: refresh_store(config),
+        issuer: config.issuer,
+        token_type_hint: token_type_hint,
+        trusted_audiences: ResourceAudiencePolicy.resolver(config),
+        authorize: caller_authorize(config, client_id)
+      ] ++ SubjectIdentifier.verify_opts(config)
     )
     |> suppress_contained_access_token(config)
     |> put_caller_subject(config, client_id)

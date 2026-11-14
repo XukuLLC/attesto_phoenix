@@ -70,6 +70,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §5.2 error codes, held as the atoms `OAuthError.new/3` requires so
   # there is no string round-trip that could raise before the atom exists.
   @error_invalid_request :invalid_request
+  @error_unauthorized_client :unauthorized_client
   @error_invalid_client :invalid_client
   @error_invalid_grant :invalid_grant
   @error_invalid_scope :invalid_scope
@@ -189,8 +190,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     with :ok <- require_supported_grant_type(request),
          :ok <- require_attestation_instance_key(request),
          :ok <- require_confidential_client(request),
-         :ok <- require_registered_grant_type(request) do
+         :ok <- require_registered_grant_type(request),
+         :ok <- require_pairwise_allowed_grant(request) do
       dispatch(request)
+    end
+  end
+
+  defp require_pairwise_allowed_grant(%Request{config: config, client: client, grant_type: grant_type}) do
+    if grant_type not in SubjectIdentifier.pairwise_allowed_grant_types() and
+         SubjectIdentifier.subject_type(config, host_client(client)) == "pairwise" do
+      {:error, error(@error_unauthorized_client, "pairwise clients are not authorized for this grant type")}
+    else
+      :ok
     end
   end
 
@@ -1924,7 +1935,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp subject_token_verify_opts(config, binding_opts \\ []) do
-    [expected_typ: "access", trusted_audiences: ResourceAudiencePolicy.resolver(config)] ++ binding_opts
+    [expected_typ: "access", trusted_audiences: ResourceAudiencePolicy.resolver(config)] ++
+      SubjectIdentifier.verify_opts(config) ++ binding_opts
   end
 
   defp requested_exchange_scope(params, claims) do
@@ -2029,11 +2041,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     principal = merge_principal_claims(config, principal, extra_claims)
 
     with {:ok, principal} <- put_access_token_client_id(principal, token_client_id(request)),
+         {:ok, pairwise_opts} <- pairwise_mint_opts(request),
          {:ok, minted} <-
            Attesto.Token.mint(
              attesto_config(config),
              principal,
-             SenderConstraint.mint_opts(binding) ++ mint_extra_opts
+             SenderConstraint.mint_opts(binding) ++ pairwise_opts ++ mint_extra_opts
            ) do
       {:ok,
        %{
@@ -2043,11 +2056,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          scope: minted.scope
        }}
     else
-      {:error, reason} ->
-        # A mint failure here is a server/config fault, not a client error;
-        # surface it as RFC 6749 §5.2 invalid_request rather than leak detail.
-        Logger.error("token mint failed: #{inspect(reason)}")
-        {:error, error(@error_invalid_request, "unable to issue token")}
+      {:error, reason} -> mint_failure("token mint failed", reason)
     end
   end
 
@@ -2231,6 +2240,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
     with {:ok, authenticated_client_id} <- require_token_client_id(request),
          {:ok, lifetime} <- remaining_subject_lifetime(claims, now),
+         {:ok, pairwise_opts} <- pairwise_mint_opts(request),
          principal = %{
            kind: Map.get(claims, kind_claim),
            sub: Map.get(claims, "sub"),
@@ -2246,7 +2256,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
              attesto_config,
              principal,
              SenderConstraint.mint_opts(binding) ++
-               audience_opts(audience) ++ [now: now, lifetime: lifetime]
+               pairwise_opts ++ audience_opts(audience) ++ [now: now, lifetime: lifetime]
            ) do
       {:ok,
        %{
@@ -2256,9 +2266,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          scope: minted.scope
        }}
     else
-      {:error, reason} ->
-        Logger.error("token exchange mint failed: #{inspect(reason)}")
-        {:error, error(@error_invalid_request, "unable to issue token")}
+      {:error, reason} -> mint_failure("token exchange mint failed", reason)
     end
   end
 
@@ -2305,6 +2313,30 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     case invoke(Config.build_principal_fun(config), [host_client(client), subject, scope]) do
       %{} = principal -> {:ok, principal}
       _ -> {:error, :no_principal_builder}
+    end
+  end
+
+  defp mint_failure(_label, :unsupported_pairwise_grant) do
+    {:error, error(@error_unauthorized_client, "pairwise clients are not authorized for this grant type")}
+  end
+
+  defp mint_failure(label, reason) do
+    # A mint failure here is a server/config fault, not a client error;
+    # surface it as RFC 6749 §5.2 invalid_request rather than leak detail.
+    Logger.error("#{label}: #{inspect(reason)}")
+    {:error, error(@error_invalid_request, "unable to issue token")}
+  end
+
+  defp pairwise_mint_opts(%Request{config: config, client: client, grant_type: grant_type}) do
+    host = host_client(client)
+
+    if SubjectIdentifier.subject_type(config, host) == "pairwise" and
+         grant_type not in SubjectIdentifier.pairwise_allowed_grant_types() do
+      {:error, :unsupported_pairwise_grant}
+    else
+      if grant_type == "client_credentials",
+        do: {:ok, []},
+        else: SubjectIdentifier.access_token_opts(config, host)
     end
   end
 

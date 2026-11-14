@@ -170,8 +170,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthentication do
   end
 
   defp valid_acr_value?(value) do
-    byte_size(value) <= @max_acr_value_bytes and String.valid?(value) and
-      not Regex.match?(~r/[\x00-\x1F\x7F]/, value)
+    byte_size(value) <= @max_acr_value_bytes and Attesto.Claims.no_terminal_controls?(value)
   end
 
   # RFC 8707 §2.2: syntax is validated in the conn-free CIBA request parser;

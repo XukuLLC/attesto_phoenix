@@ -4,6 +4,7 @@ defmodule AttestoPhoenix.Store.PendingDecision do
   import Ecto.Query, only: [from: 2, dynamic: 2]
 
   alias Attesto.Claims
+  alias Attesto.RevocationCriteria
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Store.Ecto, as: StoreEcto
 
@@ -84,6 +85,46 @@ defmodule AttestoPhoenix.Store.PendingDecision do
       {1, [row]} -> {:ok, schema.to_entry(%{row | status: :consumed})}
       {0, _} -> :error
     end
+  end
+
+  @spec delete_unconsumed(module(), RevocationCriteria.criteria(), keyword()) :: {:ok, non_neg_integer()}
+  def delete_unconsumed(schema, criteria, opts \\ []) when is_atom(schema) and is_list(opts) do
+    validated = RevocationCriteria.new!(criteria)
+    {repo, prefix} = StoreEcto.mutation_context()
+
+    if valid_criteria_values?(validated) do
+      query =
+        from(row in schema, where: row.status in [:pending, :approved])
+        |> filter_client_id(validated.client_id)
+        |> filter_subject(validated.subject, Keyword.get(opts, :fallback_subject_field))
+        |> filter_session(validated.sid, validated.sid_claim)
+
+      {count, _} = repo.delete_all(query, query_options(prefix))
+      {:ok, count}
+    else
+      {:ok, 0}
+    end
+  end
+
+  defp valid_criteria_values?(%{subject: subject, client_id: client_id, sid: sid, sid_claim: sid_claim}) do
+    Enum.all?([subject, client_id, sid, sid_claim], &(is_nil(&1) or StoreEcto.text_value?(&1)))
+  end
+
+  defp filter_client_id(query, nil), do: query
+  defp filter_client_id(query, client_id), do: from(row in query, where: row.client_id == ^client_id)
+
+  defp filter_subject(query, nil, _fallback), do: query
+
+  defp filter_subject(query, subject, nil), do: from(row in query, where: row.subject == ^subject)
+
+  defp filter_subject(query, subject, fallback) when is_atom(fallback) do
+    from(row in query, where: coalesce(row.subject, field(row, ^fallback)) == ^subject)
+  end
+
+  defp filter_session(query, nil, _sid_claim), do: query
+
+  defp filter_session(query, sid, sid_claim) do
+    from(row in query, where: fragment("?->>? = ?", row.granted_claims, ^sid_claim, ^sid))
   end
 
   @spec slow_down_or_missing(module(), atom(), String.t(), module(), String.t() | nil) ::

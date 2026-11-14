@@ -43,6 +43,7 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   use AttestoPhoenix.Controller, formats: [:html, :json]
 
   alias Attesto.DeviceCode
+  alias Attesto.Scope
   alias AttestoPhoenix.{Callback, Config}
 
   @spec verify(Plug.Conn.t(), map()) :: Plug.Conn.t()
@@ -102,7 +103,7 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
     scope =
       case Map.fetch(subject, :scope) do
         :error -> pending_scope
-        {:ok, value} when is_binary(value) -> String.split(value, " ", trim: true)
+        {:ok, value} when is_binary(value) -> Scope.parse(value)
         {:ok, value} -> value
       end
 
@@ -130,34 +131,33 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   # than asking the user to confirm a request that cannot complete. Store
   # lookups do not filter on expiry, so the check is made here.
   defp prompt(conn, config, store, user_code) do
-    case lookup_device_code(config, store, user_code) do
-      {:ok, %{status: :pending, expires_at: expires_at} = view} ->
-        if expires_at > System.system_time(:second),
-          do: render_stage(conn, config, :prompt, user_code, view),
-          else: render_stage(conn, config, :invalid, user_code, nil)
-
-      {:ok, _decided} ->
-        render_stage(conn, config, :invalid, user_code, nil)
-
-      :error ->
-        render_stage(conn, config, :invalid, user_code, nil)
-
-      {:error, :invalid_user_code} ->
-        render_stage(conn, config, :invalid, user_code, nil)
+    with {:ok, view} <- lookup_device_code(config, store, user_code),
+         :ok <- DeviceCode.decision_available?(view, System.system_time(:second)) do
+      render_stage(conn, config, :prompt, user_code, view)
+    else
+      _ -> render_stage(conn, config, :invalid, user_code, nil)
     end
   end
 
   defp pending_scope(_config, _store, nil), do: {:error, :invalid_user_code}
 
   defp pending_scope(config, store, user_code) do
-    case lookup_device_code(config, store, user_code) do
-      {:ok, %{status: :pending, scope: scope}} when is_list(scope) -> {:ok, scope}
-      {:ok, %{status: status}} when status in [:approved, :denied, :consumed] -> {:error, :not_pending}
+    with {:ok, view} <- lookup_device_code(config, store, user_code),
+         true <- valid_pending_scope?(view),
+         :ok <- DeviceCode.decision_available?(view, System.system_time(:second)) do
+      {:ok, view.scope}
+    else
       :error -> {:error, :not_found}
       {:error, :invalid_user_code} = error -> error
-      {:ok, _malformed_pending_view} -> device_code_contract_error!(:lookup)
+      {:error, :expired} -> {:error, :not_pending}
+      {:error, :already_decided} -> {:error, :not_pending}
+      false -> device_code_contract_error!(:lookup)
     end
   end
+
+  defp valid_pending_scope?(%{status: :pending, scope: scope}) when is_list(scope), do: true
+  defp valid_pending_scope?(%{status: status}) when status in [:approved, :denied, :consumed], do: true
+  defp valid_pending_scope?(_view), do: false
 
   defp lookup_device_code(config, store, user_code) do
     result =

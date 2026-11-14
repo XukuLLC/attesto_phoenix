@@ -100,6 +100,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   import Plug.Conn
 
+  alias Attesto.Plug.Authenticate
   alias AttestoPhoenix.AuthorizationServer.Registration
   alias AttestoPhoenix.AuthorizationServer.Registration.Request
   alias AttestoPhoenix.{Config, Event, OAuthError}
@@ -202,7 +203,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
   # Authenticate unavailable methods before reporting capabilities, just as
   # the registration core authenticates available methods (RFC 7592 §2).
   defp check_management_method(conn, config, client_id, method) do
-    allowed = available_management_methods(conn, config)
+    allowed = Registration.available_management_methods(config, RouteControls.omitted(conn))
 
     if method in allowed do
       :ok
@@ -216,19 +217,6 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
          )}
       end
     end
-  end
-
-  defp available_management_methods(conn, config) do
-    omitted = RouteControls.omitted(conn)
-    metadata? = not is_nil(Config.client_registration_metadata_fun(config))
-
-    [
-      {"GET", metadata? and :registration_read not in omitted},
-      {"PUT", metadata? and not is_nil(Config.update_client_fun(config)) and :registration_update not in omitted},
-      {"DELETE", not is_nil(Config.unregister_client_fun(config))}
-    ]
-    |> Enum.filter(fn {_method, available?} -> available? end)
-    |> Enum.map(fn {method, _available?} -> method end)
   end
 
   @doc """
@@ -306,8 +294,7 @@ defmodule AttestoPhoenix.Controller.RegistrationController do
 
   defp registration_bearer_token(conn) do
     with [header] <- get_req_header(conn, "authorization"),
-         [scheme, token] when token != "" <- String.split(header, " ", parts: 2),
-         true <- String.downcase(scheme) == "bearer" do
+         {:ok, :bearer, token} <- Authenticate.parse_authorization(header) do
       token
     else
       _ -> nil

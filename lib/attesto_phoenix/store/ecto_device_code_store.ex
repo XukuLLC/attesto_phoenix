@@ -108,5 +108,11 @@ defmodule AttestoPhoenix.Store.EctoDeviceCodeStore do
     )
   end
 
+  @impl Attesto.DeviceCodeStore
+  @spec delete_unconsumed(Attesto.RevocationCriteria.criteria()) :: {:ok, non_neg_integer()}
+  def delete_unconsumed(criteria) do
+    PendingDecision.delete_unconsumed(DeviceCode, criteria)
+  end
+
   # ----- internal -----
 end

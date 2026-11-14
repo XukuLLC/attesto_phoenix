@@ -275,6 +275,19 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
     end
   end
 
+  test "unchecked return from :render_end_session_error falls back to built-in error page", %{config: config} do
+    renderer = fn conn, _error -> conn end
+
+    response =
+      conn(:get, "/oauth/end_session", %{"id_token_hint" => "malformed"})
+      |> put_req_header("accept", "application/json")
+      |> put_private(:attesto_phoenix_config, %{config | render_end_session_error: renderer})
+      |> Controller.end_session(%{"id_token_hint" => "malformed"})
+
+    assert response.status == 400
+    assert %{"error" => "invalid_request"} = JSON.decode!(response.resp_body)
+  end
+
   defp rsa_pem do
     priv = :public_key.generate_key({:rsa, 2048, 65_537})
     :public_key.pem_encode([:public_key.pem_entry_encode(:RSAPrivateKey, priv)])
