@@ -1883,10 +1883,10 @@ flow fans out to them:
   leases in bounded batches on the next `sweep_interval_ms`. A custom
   logout-session store must provide its own persistent retry scheduler and
   backoff policy.
-- **Front-Channel Logout** — the end-session page renders each RP's
+- **Front-Channel Logout** (certified) — the end-session page renders each RP's
   `frontchannel_logout_uri` in an iframe, so browser-reachable RPs clear their
   session within the same logout navigation.
-- **Session Management** — `GET /oauth/check_session` serves the
+- **Session Management** (certified) — `GET /oauth/check_session` serves the
   `check_session_iframe` and the authorization endpoint returns `session_state`,
   letting an RP detect a change to the OP login session without a full redirect.
   Mount with `attesto_routes(session_management: true)`.
