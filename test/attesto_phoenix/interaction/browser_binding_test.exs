@@ -32,6 +32,19 @@ defmodule AttestoPhoenix.Interaction.BrowserBindingTest do
     assert get_session(conn) == %{}
   end
 
+  test "a binding written back under the documented session key survives a cleared session" do
+    conn = conn(:get, "/") |> init_test_session(subject: "user-42") |> bind()
+    binding = BrowserBinding.binding(conn)
+
+    cleared = conn |> configure_session(renew: true) |> clear_session()
+    assert BrowserBinding.binding(cleared) == nil
+
+    restored = put_session(cleared, :attesto_phoenix_interaction_browser_binding, binding)
+    assert BrowserBinding.binding(restored) == binding
+    assert BrowserBinding.binding(bind(restored)) == binding
+    assert get_session(restored, :subject) == nil
+  end
+
   test "requires a fetched session" do
     assert_raise ArgumentError, ~r/session not fetched/, fn -> bind(conn(:get, "/")) end
   end

@@ -794,8 +794,9 @@ defmodule AttestoPhoenix.Config do
       as the session secret provided by `AttestoPhoenix.Interaction.BrowserBinding`.
       Mount that plug after fetching the session and configure this callback
       as `&AttestoPhoenix.Interaction.BrowserBinding.binding/1`. Preserve the
-      value across login (`renew: true` keeps session data; `drop: true` does
-      not). Losing it causes the wrong-browser refusal. Required to use
+      value across login (`renew: true` keeps session data; `drop: true` and
+      `Plug.Conn.clear_session/1` do not). Losing it causes the wrong-browser
+      refusal. Required to use
       `AttestoPhoenix.Interaction.park/2`; a parked request is resumed only by
       the browser whose value matches. Only a hash of the value is stored.
     * `:interaction_ttl` - how long a parked authorization request can be

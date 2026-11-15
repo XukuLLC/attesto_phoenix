@@ -70,28 +70,43 @@ defmodule AttestoPhoenix.Interaction do
         end
       end
 
-  The host consent controller reads without consuming the parked request:
+  The host consent controller reads the parked request without consuming it,
+  and renders it only for the signed-in subject it was parked for:
 
       def consent_page(conn, %{"view" => token}) do
         conn = put_resp_header(conn, "referrer-policy", "no-referrer")
 
-        case AttestoPhoenix.Interaction.pending(conn, token) do
-          {:ok, pending} ->
-            render(conn, :consent, resume_id: pending.resume_id, request: pending.request)
+        case get_session(conn, :subject) do
+          subject_id when is_binary(subject_id) ->
+            case AttestoPhoenix.Interaction.pending(conn, token) do
+              {:ok, %{subject: ^subject_id} = pending} ->
+                render(conn, :consent, resume_id: pending.resume_id, request: pending.request)
 
-          {:error, :invalid_resume} ->
-            send_resp(conn, 400, "Invalid consent request")
+              _invalid_or_another_subject ->
+                send_resp(conn, 400, "Invalid consent request")
+            end
+
+          _signed_out ->
+            conn
+            |> put_session(:return_to, current_path(conn))
+            |> redirect(to: "/login")
         end
       end
 
   The page can be reloaded until the decision is recorded and the request
-  resumes. Before rendering, compare `pending.subject` with the subject in the
-  host session and refuse a mismatch, so one account on a shared browser is
-  not shown a request parked by another; `decide/4` refuses the mismatch as
-  well. Both host routes need the fetched session, browser binding and
-  configuration plugs. The endpoint supplies `conn.secret_key_base` to seal
-  the handle; a route without it raises. Keep the resume id out of the consent
-  URL, and set `Referrer-Policy: no-referrer` on the page.
+  resumes. `pending/2` answers the browser that parked the request whether or
+  not anyone is signed in there, so the controller reads the host session
+  first. It renders only when `pending.subject` is the session's subject, so
+  one account on a shared browser is not shown a request parked by another;
+  `decide/4` refuses the mismatch as well. A browser whose sign-in has ended
+  goes to the host's sign-in with the consent URL as the return path. After
+  sign-in the page renders again, for as long as the parked request has not
+  expired (`:interaction_ttl`) and the browser binding is unchanged. Never
+  store the decision POST as a return path. Both host routes need the fetched
+  session, browser binding and configuration plugs. The endpoint supplies
+  `conn.secret_key_base` to seal the handle; a route without it raises. Keep
+  the resume id out of the consent URL, and set `Referrer-Policy: no-referrer`
+  on the page.
 
   The page POSTs the resume id and Allow/Deny choice to a host handler with a
   fetched session, the `AttestoPhoenix.Interaction.BrowserBinding` plug and
@@ -189,7 +204,9 @@ defmodule AttestoPhoenix.Interaction do
   `&AttestoPhoenix.Interaction.BrowserBinding.binding/1`.
   Preserve the value through login, including session renewal:
   `Plug.Conn.configure_session(conn, renew: true)` keeps session data;
-  `drop: true` discards it. Losing the value makes resume follow the
+  `drop: true` and `Plug.Conn.clear_session/1` discard it (see
+  `AttestoPhoenix.Interaction.BrowserBinding` for a sign-in that clears the
+  session). Losing the value makes resume and `pending/2` follow the
   wrong-browser refusal path. Only a hash of it is stored. The parked request
   is stored under a key derived from both the resume id and that hash, so a
   resume from a browser whose value differs finds nothing: it is refused and
@@ -372,6 +389,10 @@ defmodule AttestoPhoenix.Interaction do
   The request is rebuilt through authorization validation and scope policy,
   as on resume. Reads never consume or extend the entry, including a decided
   entry that has not yet resumed.
+
+  The entry is returned to the browser that parked it whether or not anyone is
+  signed in there. Compare `:subject` with the subject in the host session
+  before rendering.
 
   Invalid, expired, consumed or wrong-browser handles and request rebuild
   failures return `{:error, :invalid_resume}`. Requires `conn.secret_key_base`;
