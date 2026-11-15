@@ -50,6 +50,9 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
 
   defmodule RevokedTokenStore do
     @moduledoc false
+    use Attesto.CodeStoreTestDelegates
+
+    @impl true
 
     def access_token_revoked?(jti), do: jti == Process.get(:attesto_phoenix_revoked_jti)
   end

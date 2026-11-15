@@ -567,7 +567,6 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
         """
         SELECT
           relation.relname,
-          attribute.attnum,
           attribute.attname,
           pg_catalog.format_type(attribute.atttypid, attribute.atttypmod),
           attribute.attnotnull,
@@ -585,7 +584,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
           AND relation.relkind IN ('r', 'p')
           AND attribute.attnum > 0
           AND NOT attribute.attisdropped
-        ORDER BY relation.relname, attribute.attnum
+        ORDER BY relation.relname, attribute.attname
         """,
         [prefix, @store_tables]
       )
@@ -724,7 +723,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationIntegrationTest do
                  expires_at: now + 600
                })
 
-      assert {:ok, _} = EctoCodeStore.get("generated-code-#{now}")
+      assert {:ok, _} = EctoCodeStore.read("generated-code-#{now}")
 
       par_uri = "urn:ietf:params:oauth:request_uri:generated-#{now}"
       assert :ok = EctoPARStore.put(par_uri, %{"client_id" => "client-1"}, 600)

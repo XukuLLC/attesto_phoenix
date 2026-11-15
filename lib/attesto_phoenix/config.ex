@@ -741,7 +741,7 @@ defmodule AttestoPhoenix.Config do
       events, and `issue/2` returns the normal `:token_denied` event for that
       error. Persisted or external side effects from a committed continuation
       remain the host's responsibility to reconcile.
-      The spent row has `consumed_at` set and `consumed_success: false`, with no
+      The spent row remains in the `:claimed` state, with no
       refresh family.
       When unset, the continuation runs directly, preserving existing behavior.
     * `:code_store` - module implementing `Attesto.CodeStore`.

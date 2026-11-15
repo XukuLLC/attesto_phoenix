@@ -6,6 +6,43 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.19.0] - 2026-11-15
+
+Requires `attesto >= 2.23.0 and < 3.0.0`.
+
+### Breaking
+
+- `Attesto.CodeStore` is now one required behaviour with explicit live, claimed
+  and redeemed states. Reads never write; atomic claim, replay flagging and
+  finish callbacks retain immutable bindings and redemption records, with one
+  revocation flag for replay or grant cut-off. Access-token
+  linkage and revocation callbacks are required. Custom stores must migrate to
+  this contract; the upgrade guide maps every previous callback.
+- `Attesto.AuthorizationCode.redeem/4` compares client, redirect URI,
+  PKCE when challenged and DPoP when bound before any state change. A failed
+  comparison no longer spends the code. Reuse revocation applies only to a
+  matching presentation, including after code expiry and during token issuance.
+  Expiry prevents claiming live codes only. This
+  departs from the literal wording of RFC 6749 §4.1.2 so possession of a code
+  alone cannot revoke another client's tokens.
+- Authorization-code redemption always requires the bound client identifier;
+  the client-id opt-out is removed. A verifier presented for a code issued
+  without a PKCE challenge is refused.
+- Existing PostgreSQL databases require the migration generator's
+  `--upgrade 4.19` additive migration before rolling
+  nodes. All previous columns keep their meaning. During the roll, old nodes
+  still spend failed presentations and revoke on non-matching replays.
+  Both sweepers keep claims through a five-minute reservation and retain
+  redeemed records while a bundled refresh-family member remains unexpired.
+  External refresh stores use the recorded family deadline. Removed codes become
+  unknown; a missing row at finish revokes newly issued credentials and returns
+  no tokens. The migration adds one nullable provenance column, with no
+  database triggers, functions or rules. New writers
+  preserve authorization provenance separately from redemption family linkage;
+  provenance already overwritten by an old writer cannot be recovered.
+- The token endpoint still returns the same generic `invalid_grant` body for
+  redemption refusals, and the existing failure event still fires.
+
 ## [4.18.0] - 2026-11-15
 
 Requires `attesto >= 2.22.0 and < 3.0.0`.

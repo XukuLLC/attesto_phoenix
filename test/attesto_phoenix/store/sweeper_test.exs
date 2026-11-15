@@ -586,75 +586,6 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       end)
     end
 
-    test "authorization-code query preserves live linked access tokens" do
-      start_recorder(%{})
-      config = valid_config(sweep_interval_ms: 60_000)
-      pid = start_sweeper(config)
-
-      Sweeper.sweep_now(pid)
-
-      authorization_call =
-        RecordingRepo.calls()
-        |> Enum.find(&(&1.table == "attesto_authorization_codes"))
-
-      assert %DateTime{} = authorization_call.now
-
-      assert {:and, _,
-              [
-                {:and, _, [{:<, _, [expires_at, {:^, _, [0]}]}, token_liveness]},
-                replay_retention
-              ]} = authorization_call.expr
-
-      assert field_name(expires_at) == :expires_at
-
-      assert token_liveness
-             |> flatten_or()
-             |> Enum.any?(fn
-               {:is_nil, _, [field]} -> field_name(field) == :access_token_jti
-               _ -> false
-             end)
-
-      retention_fields =
-        replay_retention
-        |> flatten_boolean()
-        |> Enum.flat_map(fn
-          {_operator, _, operands} when is_list(operands) -> Enum.map(operands, &field_name/1)
-          _other -> []
-        end)
-
-      assert :consumed_at in retention_fields
-      assert :consumed_success in retention_fields
-      assert :family_id in retention_fields
-      assert :replay_retain_until in retention_fields
-
-      assert token_liveness
-             |> flatten_or()
-             |> Enum.any?(fn
-               {:==, _, [field, %Ecto.Query.Tagged{value: ""}]} ->
-                 field_name(field) == :access_token_jti
-
-               _ ->
-                 false
-             end)
-
-      assert token_liveness
-             |> flatten_or()
-             |> Enum.any?(fn
-               {:is_nil, _, [field]} -> field_name(field) == :access_token_expires_at
-               _ -> false
-             end)
-
-      assert token_liveness
-             |> flatten_or()
-             |> Enum.any?(fn
-               {:<=, _, [field, {:^, _, [1]}]} ->
-                 field_name(field) == :access_token_expires_at
-
-               _ ->
-                 false
-             end)
-    end
-
     test "handle_info(:sweep, state) runs a sweep and reschedules" do
       start_recorder(%{"dpop_replays" => 2})
       config = valid_config(sweep_interval_ms: 60_000)
@@ -2914,16 +2845,4 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       Process.sleep(10)
       eventually(assertion, attempts - 1)
   end
-
-  defp field_name({{:., _, [{:&, _, [_binding]}, field]}, _, []}), do: field
-  defp field_name(_), do: nil
-
-  defp flatten_or({:or, _, [left, right]}), do: flatten_or(left) ++ flatten_or(right)
-  defp flatten_or(expression), do: [expression]
-
-  defp flatten_boolean({operator, _, [left, right]}) when operator in [:and, :or] do
-    flatten_boolean(left) ++ flatten_boolean(right)
-  end
-
-  defp flatten_boolean(expression), do: [expression]
 end

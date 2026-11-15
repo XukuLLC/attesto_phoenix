@@ -52,16 +52,24 @@ defmodule AttestoPhoenix.Store.EctoSweeperMutationCoverageTest do
     record = code_record()
     prepare_with_worker(fn -> EctoCodeStore.put(record) end)
 
-    assert {:ok, _entry} = assert_missing_signal(fn -> EctoCodeStore.take(record.code_hash) end)
+    assert :ok = assert_missing_signal(fn -> EctoCodeStore.claim(record.code_hash) end)
   end
 
   test "authorization-code lifecycle updates signal when the sweeper is absent" do
     record = code_record()
-    prepare_with_worker(fn -> EctoCodeStore.put(record) end)
 
-    assert :ok =
+    prepare_with_worker(fn ->
+      EctoCodeStore.put(record)
+      EctoCodeStore.claim(record.code_hash)
+    end)
+
+    assert {:ok, false} =
              assert_missing_signal(fn ->
-               EctoCodeStore.mark_consumed(record.code_hash, %{family_id: record.data.family_id})
+               EctoCodeStore.finish(record.code_hash, %{
+                 family_id: record.data.family_id,
+                 subject: record.data.subject,
+                 replay_retain_until: nil
+               })
              end)
 
     assert :ok =
@@ -74,14 +82,23 @@ defmodule AttestoPhoenix.Store.EctoSweeperMutationCoverageTest do
 
   test "authorization-code family lifecycle updates signal when the sweeper is absent" do
     record = code_record()
-    prepare_with_worker(fn -> EctoCodeStore.put(record) end)
+    jti = unique("jti")
 
-    assert :ok =
-             assert_missing_signal(fn ->
-               EctoCodeStore.record_access_token(record.data.family_id, unique("jti"), unix_now() + 60)
-             end)
+    prepare_with_worker(fn ->
+      EctoCodeStore.put(record)
+      EctoCodeStore.claim(record.code_hash)
+
+      EctoCodeStore.finish(record.code_hash, %{
+        family_id: record.data.family_id,
+        subject: record.data.subject,
+        replay_retain_until: nil
+      })
+
+      EctoCodeStore.record_access_token_for_code(record.code_hash, jti, unix_now() + 60)
+    end)
 
     assert :ok = assert_missing_signal(fn -> EctoCodeStore.revoke_family_access_tokens(record.data.family_id) end)
+    assert EctoCodeStore.access_token_revoked?(jti)
   end
 
   test "device-code insertion signals when the sweeper is absent" do

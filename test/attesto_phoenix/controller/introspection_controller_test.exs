@@ -51,6 +51,9 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
 
   defmodule RevokedAccessTokenStore do
     @moduledoc false
+    use Attesto.CodeStoreTestDelegates
+
+    @impl true
 
     def access_token_revoked?(jti), do: jti == Process.get({__MODULE__, :jti})
   end

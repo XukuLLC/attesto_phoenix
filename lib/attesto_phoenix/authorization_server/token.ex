@@ -791,8 +791,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # No refresh token is issued, so the original grant provenance remains
       # the only family metadata and the legacy finalize/3 API is correct.
       :ok = record_code_access_token(config, grant, response, code)
-      :ok = AuthorizationCode.finalize(grant_store(config, :code_store), code, grant)
-      {:ok, response, events}
+
+      case AuthorizationCode.finalize(grant_store(config, :code_store), code, grant) do
+        :ok -> {:ok, response, events}
+        {:error, :invalid_grant} -> {:error, grant_error(:invalid_grant)}
+      end
     end
   end
 
@@ -1049,7 +1052,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   defp grant_present?(config, :code, code) do
-    grant_present_in_store?(grant_store(config, :code_store), Attesto.Secret.hash(code))
+    store = grant_store(config, :code_store)
+    Attesto.CodeStore.validate!(store)
+
+    case store.read(Attesto.Secret.hash(code)) do
+      {:ok, %{state: :live}} -> true
+      {:ok, _record} -> false
+      :error -> false
+      _invalid -> raise RuntimeError, "#{inspect(store)}.read/1 violated its grant-store return contract"
+    end
   end
 
   defp grant_present?(config, :refresh, token) do
@@ -1089,8 +1100,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       # then fail closed with the generic `invalid_grant` so the replay learns
       # nothing on the wire.
       {:error, {:reuse, meta}} ->
-        revoke_reused_family(config, meta)
         revoke_reused_access_tokens(config, meta, code)
+        revoke_reused_family(config, meta)
         {:error, grant_error(:invalid_grant)}
 
       {:error, reason} ->
@@ -1302,7 +1313,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   end
 
   # The replayed code's first-redemption context is the
-  # `Attesto.CodeStore.consumed_meta()` map (always a map per that callback's
+  # `Attesto.CodeStore.redemption()` map (always a map per that callback's
   # spec). Read the `:family_id` under both atom and string keys so a store
   # that serialised it either way is honoured; absent it, return nil and the
   # caller treats revocation as a no-op.
@@ -1331,22 +1342,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp revoke_reused_access_tokens(config, meta, code) do
     store = grant_store(config, :code_store)
 
+    Attesto.CodeStore.validate!(store)
+
     case reuse_family_id(meta) do
       family_id when is_binary(family_id) and family_id != "" ->
-        if store && function_exported?(store, :revoke_family_access_tokens, 1) do
-          :ok = store.revoke_family_access_tokens(family_id)
-
-          :ok
-        else
-          raise RuntimeError, "code store does not support family access-token revocation"
-        end
+        :ok = store.revoke_family_access_tokens(family_id)
 
       _ ->
-        if store && function_exported?(store, :revoke_access_token_for_code, 1) do
-          :ok = store.revoke_access_token_for_code(Attesto.Secret.hash(code))
-        end
-
-        :ok
+        :ok = store.revoke_access_token_for_code(Attesto.Secret.hash(code))
     end
   end
 
@@ -1654,10 +1657,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     context = initial_refresh_context(request, grant, scope, resource, sender, "authorization_code")
 
     # The composition API finalizes the code as part of successful issuance.
-    # Record the minted access JTI first when the store supports Phoenix's
-    # optional code-hash index. The core CodeStore contract does not require
-    # that index, so a store which only records consumed-code metadata remains
-    # compatible and still revokes its generated refresh family on replay.
+    # Record the minted access JTI first so finalization can revoke it if the
+    # claim was revoked or disappeared during issuance.
     :ok = record_code_access_token_by_code(config, response, Attesto.Secret.hash(code))
 
     case AuthorizationCode.issue_refresh_and_finalize(
@@ -1673,6 +1674,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         response = put_refresh_response(response, refresh, config)
         issued = refresh_issued_event(request, grant.subject, scope, "authorization_code", token_type, binding)
         {:ok, response, events ++ [issued]}
+
+      {:error, :invalid_grant} ->
+        {:error, grant_error(:invalid_grant)}
 
       {:error, reason} ->
         # Issuance is a server/config fault, not a client error; do not leak
@@ -2209,71 +2213,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp record_code_access_token_by_code(config, response, code_hash) do
     store = grant_store(config, :code_store)
-
-    cond do
-      store && function_exported?(store, :mark_consumed, 2) &&
-        function_exported?(store, :record_access_token_for_code, 3) &&
-          function_exported?(store, :revoke_family_access_tokens, 1) ->
-        record_minted_access_token_for_code!(store, response.access_token, code_hash)
-        :ok
-
-      store && function_exported?(store, :mark_consumed, 2) ->
-        # Reuse tracking is additive to the CodeStore contract. A store may
-        # retain the consumed-code signal without implementing Phoenix's
-        # optional access-token index; in that case the issued refresh family
-        # is still revoked on replay, while the access token remains subject to
-        # its ordinary lifetime and revocation policy.
-        :ok
-
-      true ->
-        # Stores without reuse markers have no access-token replay path to
-        # protect, so preserve their existing refresh issuance behavior.
-        :ok
-    end
+    Attesto.CodeStore.validate!(store)
+    record_minted_access_token_for_code!(store, response.access_token, code_hash)
   end
 
-  defp record_code_access_token(config, grant, response, code) do
-    store = grant_store(config, :code_store)
-
-    cond do
-      store && function_exported?(store, :mark_consumed, 2) ->
-        maybe_record_reuse_access_token(store, response, code)
-
-      store && function_exported?(store, :record_access_token, 3) ->
-        record_family_access_token(store, grant, response)
-
-      true ->
-        :ok
-    end
-  end
-
-  defp maybe_record_reuse_access_token(store, response, code) do
-    if function_exported?(store, :record_access_token_for_code, 3) and
-         function_exported?(store, :revoke_access_token_for_code, 1) do
-      record_minted_access_token_for_code!(store, response.access_token, Attesto.Secret.hash(code))
-    end
-
-    :ok
-  end
-
-  defp record_family_access_token(store, grant, response) do
-    case grant.family_id do
-      family_id when is_binary(family_id) and family_id != "" ->
-        record_minted_access_token!(store, family_id, response.access_token)
-
-      _without_family ->
-        :ok
-    end
-  end
-
-  defp record_minted_access_token!(store, family_id, access_token) do
-    with {:ok, %{"jti" => jti, "exp" => exp}} <- decode_access_token_claims(access_token),
-         true <- is_binary(jti) and jti != "" and is_integer(exp) do
-      :ok = store.record_access_token(family_id, jti, exp)
-    else
-      _invalid_minted_token ->
-        raise RuntimeError, "minted access token lacks the claims required for code-reuse revocation"
-    end
+  defp record_code_access_token(config, _grant, response, code) do
+    record_code_access_token_by_code(config, response, Attesto.Secret.hash(code))
   end
 
   defp record_minted_access_token_for_code!(store, access_token, code_hash) do

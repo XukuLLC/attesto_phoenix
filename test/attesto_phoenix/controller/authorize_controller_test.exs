@@ -118,36 +118,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   @established_binding "user-42\n1700000000\n"
 
   defmodule TestStore do
-    @moduledoc false
-    @behaviour Attesto.CodeStore
-
-    def start_link do
-      Agent.start_link(fn -> %{} end, name: __MODULE__)
-    end
-
-    @impl true
-    def put(record) do
-      Agent.update(__MODULE__, &Map.put(&1, record.code_hash, record))
-      :ok
-    end
-
-    @impl true
-    def take(code_hash) do
-      Agent.get_and_update(__MODULE__, fn state ->
-        case Map.fetch(state, code_hash) do
-          {:ok, record} -> {{:ok, record}, Map.delete(state, code_hash)}
-          :error -> {:error, state}
-        end
-      end)
-    end
-
-    def count, do: Agent.get(__MODULE__, &map_size/1)
-    def reset, do: Agent.update(__MODULE__, fn _state -> %{} end)
-
-    # Test-only peek that does not consume the code.
-    def peek(code) do
-      Agent.get(__MODULE__, &Map.get(&1, Attesto.Secret.hash(code)))
-    end
+    use Attesto.CodeStoreTestAgent
   end
 
   setup do

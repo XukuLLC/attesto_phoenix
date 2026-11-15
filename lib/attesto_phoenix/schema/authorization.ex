@@ -3,7 +3,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
   Ecto schema for the single-use authorization codes backing an
   `Attesto.CodeStore`.
 
-  This is the persistent record shape behind the authorization-code grant
+  This is the persistent record layout behind the authorization-code grant
   (RFC 6749 §4.1). The store layer mints one row per code at the
   authorization endpoint and consumes it at the token endpoint; this module
   only describes the row and translates it to and from the protocol struct
@@ -73,14 +73,17 @@ defmodule AttestoPhoenix.Schema.Authorization do
       (RFC 6749 §4.1.2) is enforced by an atomic claim in the store; this
       column also lets a later presentation be recognized as reuse instead of
       an unknown code.
-    * `:consumed_success` - whether the first presentation completed all
-      redemption checks. Only successful redemption is replayed as reuse.
-    * `:replay_retain_until` - a temporary finalization reservation while a
-      claimed code is being exchanged, then the immutable refresh-family
-      deadline after successful refresh issuance. Cleanup of a successful row
-      also checks the refresh-token table and retains the marker while that
-      family has an unexpired member. This lets legacy rows with a NULL deadline
-      retire once their family has ended.
+    * `:consumed_success` - whether token issuance finished. False with a
+      non-null `:consumed_at` means claimed; true means redeemed.
+    * `:authorization_family_id` - preserved authorization provenance. Live and
+      claimed rows fall back to `:family_id`; redeemed rows report this column
+      alone, possibly nil when an old writer finished before provenance was copied.
+    * `:access_token_revoked_at` on a claimed row supplies the single revocation
+      flag for both a replay and a grant cut-off. Redemption uses `:subject`.
+    * `:replay_retain_until` - a fixed 300-second claim reservation, then the
+      refresh-family deadline. Housekeeping retains redeemed rows while the
+      bundled refresh table has an unexpired family member; an external refresh
+      store instead requires retention through this deadline, indefinitely if nil.
     * `:inserted_at` - insertion timestamp.
 
   ## Record bridge
@@ -193,6 +196,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
     field :access_token_expires_at, :utc_datetime
     field :access_token_revoked_at, :utc_datetime
     field :expires_at, :utc_datetime
+    field :authorization_family_id, :string
     field :consumed_at, :utc_datetime
     field :consumed_success, :boolean, default: false
     field :replay_retain_until, :utc_datetime
@@ -212,6 +216,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
   # no challenge/method. When present they are still constrained (the method to
   # S256, see validate_inclusion below); when absent the columns are NULL.
   @optional [
+    :authorization_family_id,
     :scope,
     :resource,
     :cnf,
@@ -292,6 +297,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
       nonce: nil,
       claims: data.claims,
       family_id: data.family_id,
+      authorization_family_id: data.family_id,
       expires_at: unix_to_datetime(Map.get(record, :expires_at)),
       inserted_at: now
     }
@@ -324,7 +330,7 @@ defmodule AttestoPhoenix.Schema.Authorization do
   non-NULL constraints keep scope, resource, and claims populated for normal
   rows; malformed NULL values are preserved for the protocol layer to reject,
   rather than defaulted into a valid-looking grant. The protocol layer
-  re-checks expiry after taking the record, so a row that is past `:expires_at`
+  checks live-code expiry before claiming the record, so a row that is past `:expires_at`
   is still returned here and rejected downstream.
   """
   @spec to_record(t()) :: store_record()
@@ -365,14 +371,37 @@ defmodule AttestoPhoenix.Schema.Authorization do
     end
   end
 
-  @doc false
-  @spec consumed_meta(t()) :: map()
-  def consumed_meta(%__MODULE__{} = row) do
-    %{
-      family_id: row.family_id,
-      subject: row.subject
-    }
+  @doc "Returns the non-writing code snapshot with explicit lifecycle state."
+  @spec to_state_record(t()) :: Attesto.CodeStore.snapshot()
+  def to_state_record(%__MODULE__{} = row) do
+    state = lifecycle_state(row)
+
+    redemption =
+      if state == :redeemed do
+        %{
+          family_id: row.family_id,
+          subject: row.subject,
+          replay_retain_until: datetime_to_unix(row.replay_retain_until)
+        }
+      end
+
+    record = to_record(row)
+
+    provenance =
+      if state == :redeemed, do: row.authorization_family_id, else: row.authorization_family_id || row.family_id
+
+    record = put_in(record.data.family_id, provenance)
+
+    Map.merge(record, %{
+      state: state,
+      redemption: redemption,
+      revoked: state == :claimed and not is_nil(row.access_token_revoked_at)
+    })
   end
+
+  defp lifecycle_state(%{consumed_success: true}), do: :redeemed
+  defp lifecycle_state(%{consumed_at: nil}), do: :live
+  defp lifecycle_state(_row), do: :claimed
 
   # RFC 7800: the `cnf` member carries the key the token (and here, the
   # code) is bound to. RFC 9449 §6 names the DPoP thumbprint `jkt`; the

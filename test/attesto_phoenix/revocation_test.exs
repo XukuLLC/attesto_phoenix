@@ -139,42 +139,42 @@ defmodule AttestoPhoenix.RevocationTest do
     |> Enum.sort()
   end
 
-  defp code_present?(name), do: match?({:ok, _}, EctoCodeStore.get("code-" <> name))
+  defp code_present?(name), do: match?({:ok, _}, EctoCodeStore.read("code-" <> name))
   defp refresh_present?(name), do: match?({:ok, _}, EctoRefreshStore.get("refresh-#{name}-0"))
 
   describe "EctoCodeStore.delete_unconsumed/1" do
     test "deletes the matching unredeemed codes" do
-      assert {:ok, 2} = EctoCodeStore.delete_unconsumed(subject: "usr_1")
+      assert {:ok, 2} = EctoCodeStore.delete_unclaimed(subject: "usr_1")
 
       refute code_present?("u1-a")
       refute code_present?("u1-b")
       assert code_present?("u2-a")
-      assert :error = EctoCodeStore.take("code-u1-a")
+      assert :error = EctoCodeStore.claim("code-u1-a")
     end
 
     test "criteria are ANDed and sid is matched inside the claims column" do
-      assert {:ok, 1} = EctoCodeStore.delete_unconsumed(subject: "usr_1", client_id: "client_a")
-      assert {:ok, 1} = EctoCodeStore.delete_unconsumed(sid: "s3")
-      assert {:ok, 0} = EctoCodeStore.delete_unconsumed(sid: "s1")
-      assert {:ok, 0} = EctoCodeStore.delete_unconsumed(sid: "s2", sid_claim: "other")
+      assert {:ok, 1} = EctoCodeStore.delete_unclaimed(subject: "usr_1", client_id: "client_a")
+      assert {:ok, 1} = EctoCodeStore.delete_unclaimed(sid: "s3")
+      assert {:ok, 0} = EctoCodeStore.delete_unclaimed(sid: "s1")
+      assert {:ok, 0} = EctoCodeStore.delete_unclaimed(sid: "s2", sid_claim: "other")
       assert code_present?("u1-b")
     end
 
     test "a redeemed code is kept, with its reuse marker" do
-      assert {:ok, _} = EctoCodeStore.take("code-u1-a")
-      assert :ok = EctoCodeStore.mark_consumed("code-u1-a", %{family_id: nil})
+      assert :ok = EctoCodeStore.claim("code-u1-a")
+      assert {:ok, _} = EctoCodeStore.finish("code-u1-a", %{family_id: nil, subject: "usr_1", replay_retain_until: nil})
 
-      assert {:ok, 1} = EctoCodeStore.delete_unconsumed(subject: "usr_1")
-      assert {:error, :consumed, _meta} = EctoCodeStore.take("code-u1-a")
+      assert {:ok, 1} = EctoCodeStore.delete_unclaimed(subject: "usr_1")
+      assert {:ok, %{state: :redeemed}} = EctoCodeStore.read("code-u1-a")
     end
 
     test "a value PostgreSQL cannot bind as text matches nothing" do
-      assert {:ok, 0} = EctoCodeStore.delete_unconsumed(subject: "usr_1" <> <<0>>)
+      assert {:ok, 0} = EctoCodeStore.delete_unclaimed(subject: "usr_1" <> <<0>>)
       assert code_present?("u1-a")
     end
 
     test "empty criteria are refused" do
-      assert_raise ArgumentError, fn -> EctoCodeStore.delete_unconsumed([]) end
+      assert_raise ArgumentError, fn -> EctoCodeStore.delete_unclaimed([]) end
       assert code_present?("u1-a")
     end
   end
@@ -252,7 +252,7 @@ defmodule AttestoPhoenix.RevocationTest do
     end
 
     test "a store without the callback raises before anything is reported revoked" do
-      assert_raise ArgumentError, ~r/:code_store .* does not implement delete_unconsumed\/1/, fn ->
+      assert_raise ArgumentError, ~r/:code_store .* does not implement delete_unclaimed\/1/, fn ->
         Revocation.revoke_subject(config(code_store: CodeStoreWithoutCriteria), "usr_1")
       end
 

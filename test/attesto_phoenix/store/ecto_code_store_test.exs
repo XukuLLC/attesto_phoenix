@@ -21,7 +21,6 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   alias AttestoPhoenix.Schema.Authorization
   alias AttestoPhoenix.Store.EctoCodeStore
   alias AttestoPhoenix.TestRepo
-  alias Ecto.Adapters.SQL.Sandbox
 
   @moduletag :ecto
 
@@ -74,7 +73,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
   describe "put/1" do
     test "persists a record retrievable by its code_hash" do
       assert :ok = EctoCodeStore.put(entry("hash-1"))
-      assert {:ok, %{code_hash: "hash-1"}} = EctoCodeStore.take("hash-1")
+      assert {:ok, %{code_hash: "hash-1"}} = EctoCodeStore.read("hash-1")
     end
 
     test "persists a client_id, scope token, and resource longer than 255 characters" do
@@ -89,12 +88,12 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert :ok = EctoCodeStore.put(entry("hash-long-values", data))
 
       assert {:ok, %{data: %{client_id: ^client_id, scope: ^scope, resource: ^resource}}} =
-               EctoCodeStore.take("hash-long-values")
+               EctoCodeStore.read("hash-long-values")
     end
 
     test "round-trips the grant context through the column bridge" do
       assert :ok = EctoCodeStore.put(entry("hash-rt"))
-      assert {:ok, %{data: data}} = EctoCodeStore.take("hash-rt")
+      assert {:ok, %{data: data}} = EctoCodeStore.read("hash-rt")
 
       assert data.client_id == "client-abc"
       assert data.subject == "subject-1"
@@ -128,7 +127,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       }
 
       assert :ok = EctoCodeStore.put(entry("hash-jsonb-claims", grant_data(%{claims: claims})))
-      assert {:ok, %{data: %{claims: ^claims}}} = EctoCodeStore.take("hash-jsonb-claims")
+      assert {:ok, %{data: %{claims: ^claims}}} = EctoCodeStore.read("hash-jsonb-claims")
     end
 
     test "accepts the portable depth-64 boundary and alternating object/array boundary" do
@@ -149,7 +148,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
 
     test "preserves expires_at as absolute unix seconds across storage" do
       assert :ok = EctoCodeStore.put(entry("hash-exp"))
-      assert {:ok, %{expires_at: @future_seconds}} = EctoCodeStore.take("hash-exp")
+      assert {:ok, %{expires_at: @future_seconds}} = EctoCodeStore.read("hash-exp")
     end
 
     test "rejects a duplicate code_hash rather than overwriting" do
@@ -180,7 +179,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       refute inspect(error) =~ sentinel
 
       # The original row is untouched.
-      assert {:ok, %{data: %{subject: "first"}}} = EctoCodeStore.take("hash-dup")
+      assert {:ok, %{data: %{subject: "first"}}} = EctoCodeStore.read("hash-dup")
     end
 
     test "fails closed when a required canonical grant key is missing" do
@@ -200,248 +199,49 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
     end
   end
 
-  describe "take/1" do
-    test "returns the record and claims it so a code is redeemable once" do
-      before_take = DateTime.utc_now() |> DateTime.truncate(:second)
-      assert :ok = EctoCodeStore.put(entry("hash-once"))
+  describe "atomic transitions" do
+    test "replay flagging reports to core and never revokes a family itself" do
+      :ok = EctoCodeStore.put(entry("hash-overlap"))
+      :ok = EctoCodeStore.claim("hash-overlap")
+      :ok = EctoCodeStore.record_access_token_for_code("hash-overlap", "jti-overlap", @future_seconds)
+      :ok = EctoCodeStore.flag_replay("hash-overlap")
 
-      assert {:ok, %{code_hash: "hash-once"}} = EctoCodeStore.take("hash-once")
-
-      assert %Authorization{consumed_at: %DateTime{}, replay_retain_until: reserved_until} =
-               TestRepo.get_by!(Authorization, code_hash: "hash-once")
-
-      assert DateTime.compare(reserved_until, DateTime.add(before_take, 300, :second)) in [:eq, :gt]
-
-      # The first presentation has only claimed the row. Until the protocol
-      # layer reports successful redemption, a second presentation is not
-      # replay evidence and fails closed as an unknown/invalid grant.
-      assert :error = EctoCodeStore.take("hash-once")
-    end
-
-    test "clears authorization provenance when no refresh family is finalized" do
-      assert :ok = EctoCodeStore.put(entry("hash-consumed", grant_data(%{family_id: "fam-ok"})))
-
-      assert {:ok, %{code_hash: "hash-consumed"}} = EctoCodeStore.take("hash-consumed")
-      assert :ok = EctoCodeStore.mark_consumed("hash-consumed", %{})
-
-      assert {:error, :consumed, %{family_id: nil, subject: "subject-1"}} =
-               EctoCodeStore.take("hash-consumed")
-    end
-
-    test "an explicit nil family clears authorization provenance" do
-      assert :ok = EctoCodeStore.put(entry("hash-consumed-nil", grant_data(%{family_id: "fam-ok"})))
-
-      assert {:ok, %{code_hash: "hash-consumed-nil"}} = EctoCodeStore.take("hash-consumed-nil")
-      assert :ok = EctoCodeStore.mark_consumed("hash-consumed-nil", %{family_id: nil})
-
-      assert {:error, :consumed, %{family_id: nil, subject: "subject-1"}} =
-               EctoCodeStore.take("hash-consumed-nil")
-    end
-
-    test "binds a finalized refresh family to the consumed authorization row" do
-      assert :ok = EctoCodeStore.put(entry("hash-finalized", grant_data(%{family_id: "fam-origin"})))
-
-      assert {:ok, %{code_hash: "hash-finalized"}} = EctoCodeStore.take("hash-finalized")
-      deadline = System.system_time(:second) + 3_600
-
-      assert :ok =
-               EctoCodeStore.mark_consumed("hash-finalized", %{
-                 family_id: "fam-issued",
-                 replay_retain_until: deadline
-               })
-
-      assert {:error, :consumed, %{family_id: "fam-issued", subject: "subject-1"}} =
-               EctoCodeStore.take("hash-finalized")
-
-      assert %Authorization{
-               family_id: "fam-issued",
-               replay_retain_until: %DateTime{} = retained_until
-             } = TestRepo.get_by!(Authorization, code_hash: "hash-finalized")
-
-      assert DateTime.to_unix(retained_until) == deadline
-    end
-
-    test "an unbounded refresh family replaces the temporary reservation with a NULL deadline" do
-      assert :ok = EctoCodeStore.put(entry("hash-unbounded", grant_data(%{family_id: nil})))
-      assert {:ok, _record} = EctoCodeStore.take("hash-unbounded")
-
-      assert %Authorization{replay_retain_until: %DateTime{}} =
-               TestRepo.get_by!(Authorization, code_hash: "hash-unbounded")
-
-      assert :ok =
-               EctoCodeStore.mark_consumed("hash-unbounded", %{
-                 family_id: "fam-unbounded",
+      assert {:ok, true} =
+               EctoCodeStore.finish("hash-overlap", %{
+                 family_id: "issued",
+                 subject: "subject-1",
                  replay_retain_until: nil
                })
 
-      assert %Authorization{
-               family_id: "fam-unbounded",
-               consumed_success: true,
-               replay_retain_until: nil
-             } = TestRepo.get_by!(Authorization, code_hash: "hash-unbounded")
-    end
+      assert EctoCodeStore.access_token_revoked?("jti-overlap")
 
-    test "a replay racing successful finalization revokes the newly issued family" do
-      expires_at = System.system_time(:second) + 600
-      assert :ok = EctoCodeStore.put(entry("hash-overlap", grant_data(%{family_id: nil})))
-      assert {:ok, _record} = EctoCodeStore.take("hash-overlap")
-      assert :ok = EctoCodeStore.record_access_token_for_code("hash-overlap", "jti-overlap", expires_at)
+      assert {:ok, %{data: %{family_id: "fam-1"}, redemption: %{family_id: "issued"}}} =
+               EctoCodeStore.read("hash-overlap")
 
-      # A second presentation lands while the first request is still issuing.
-      assert :error = EctoCodeStore.take("hash-overlap")
-
-      config = %Config{
-        issuer: "https://issuer.example",
-        keystore: __MODULE__,
-        repo: TestRepo,
-        refresh_store: ProbeRefreshStore
-      }
-
-      assert :ok =
-               Config.with_request_config(config, fn ->
-                 EctoCodeStore.mark_consumed("hash-overlap", %{
-                   family_id: "family-overlap",
-                   replay_retain_until: nil
-                 })
-               end)
-
-      assert_received {:refresh_family_revoked, "family-overlap"}
+      :ok = EctoCodeStore.revoke_family_access_tokens("issued")
       assert EctoCodeStore.access_token_revoked?("jti-overlap")
     end
 
-    test "rejects malformed replay retention metadata" do
-      assert :ok = EctoCodeStore.put(entry("hash-invalid-retention"))
-      assert {:ok, _record} = EctoCodeStore.take("hash-invalid-retention")
+    test "malformed redemption is rejected before writing" do
+      :ok = EctoCodeStore.put(entry("hash-invalid"))
+      :ok = EctoCodeStore.claim("hash-invalid")
 
-      assert_raise ArgumentError, ~r/received invalid consumed metadata/, fn ->
-        EctoCodeStore.mark_consumed("hash-invalid-retention", %{
-          family_id: "fam",
-          replay_retain_until: "tomorrow"
-        })
+      for redemption <- [
+            %{},
+            %{family_id: "fam", subject: "subject-1", replay_retain_until: "tomorrow"},
+            %{family_id: nil, subject: "subject-1", replay_retain_until: @future_seconds}
+          ] do
+        assert_raise ArgumentError, "invalid authorization-code redemption record", fn ->
+          EctoCodeStore.finish("hash-invalid", redemption)
+        end
       end
 
-      assert_raise ArgumentError, ~r/received invalid consumed metadata/, fn ->
-        EctoCodeStore.mark_consumed("hash-invalid-retention", %{
-          family_id: nil,
-          replay_retain_until: System.system_time(:second) + 60
-        })
-      end
+      assert {:ok, %{state: :claimed}} = EctoCodeStore.read("hash-invalid")
     end
 
-    test "records an access token by code hash before family rebinding" do
-      expires_at = System.system_time(:second) + 600
-
-      assert :ok = EctoCodeStore.put(entry("hash-access-code", grant_data(%{family_id: nil})))
-      assert {:ok, %{code_hash: "hash-access-code"}} = EctoCodeStore.take("hash-access-code")
-
-      assert :ok =
-               EctoCodeStore.record_access_token_for_code(
-                 "hash-access-code",
-                 "jti-code",
-                 expires_at
-               )
-
-      assert %Authorization{access_token_jti: "jti-code"} =
-               TestRepo.get_by!(Authorization, code_hash: "hash-access-code")
-    end
-
-    test "returns :error for an absent code_hash" do
-      assert :error = EctoCodeStore.take("hash-missing")
-    end
-
-    test "legacy consumed rows without an access-token JTI are a replay no-op" do
-      # 2.14.x could leave a successful consumed marker without either a
-      # refresh-family ID or access-token linkage. Reuse containment must still
-      # return :ok for that row instead of raising on a zero-row UPDATE.
-      assert :ok = EctoCodeStore.put(entry("hash-legacy", grant_data(%{family_id: nil})))
-      assert {:ok, %{code_hash: "hash-legacy"}} = EctoCodeStore.take("hash-legacy")
-      assert :ok = EctoCodeStore.mark_consumed("hash-legacy", %{family_id: nil})
-
-      assert :ok = EctoCodeStore.revoke_access_token_for_code("hash-legacy")
-
-      row = TestRepo.get_by!(Authorization, code_hash: "hash-legacy")
-      assert is_nil(row.family_id)
-      assert is_nil(row.access_token_jti)
-      assert is_nil(row.access_token_revoked_at)
-    end
-
-    test "replay revocation is idempotent when the authorization row is gone" do
-      assert :ok = EctoCodeStore.revoke_access_token_for_code("hash-missing")
-    end
-
-    test "mark_consumed fails loudly when no authorization row exists" do
-      assert_raise RuntimeError, ~r/mark_consumed failed to update exactly one authorization record/, fn ->
-        EctoCodeStore.mark_consumed("hash-missing", %{})
-      end
-    end
-
-    test "consumes the row regardless of expiry" do
-      stale = entry("hash-stale", grant_data(), System.system_time(:second) - 1)
-      assert :ok = EctoCodeStore.put(stale)
-
-      # take/1 does not gate on expiry; the caller re-checks. The row is still
-      # spent on first presentation, denying replayed validation attempts.
-      assert {:ok, %{code_hash: "hash-stale"}} = EctoCodeStore.take("hash-stale")
-      assert :error = EctoCodeStore.take("hash-stale")
-    end
-
-    test "only one of two concurrent redemptions wins" do
-      assert :ok = EctoCodeStore.put(entry("hash-race"))
-      owner = self()
-
-      results =
-        ["hash-race", "hash-race"]
-        |> Task.async_stream(
-          fn h ->
-            # Each task runs in its own process; grant it the test's sandboxed
-            # connection so both takes hit the same transaction state.
-            Sandbox.allow(TestRepo, owner, self())
-            EctoCodeStore.take(h)
-          end,
-          max_concurrency: 2
-        )
-        |> Enum.map(fn {:ok, result} -> result end)
-
-      # The atomic UPDATE ... RETURNING serialises on the row: exactly one
-      # winner claims the record, the other gets :error.
-      assert Enum.count(results, &match?({:ok, _}, &1)) == 1
-      assert Enum.count(results, &(&1 == :error)) == 1
-    end
-  end
-
-  describe "access-token revocation after authorization-code reuse" do
-    test "records, revokes, and checks the access token issued from a code family" do
-      expires_at = System.system_time(:second) + 600
-
-      assert :ok = EctoCodeStore.put(entry("hash-access", grant_data(%{family_id: "fam-access"})))
-      assert {:ok, %{code_hash: "hash-access"}} = EctoCodeStore.take("hash-access")
-
-      assert :ok = EctoCodeStore.record_access_token("fam-access", "jti-1", expires_at)
-      refute EctoCodeStore.access_token_revoked?("jti-1")
-
-      assert :ok = EctoCodeStore.revoke_family_access_tokens("fam-access")
-      assert EctoCodeStore.access_token_revoked?("jti-1")
-    end
-
-    test "expired revoked access tokens are ignored" do
-      expires_at = System.system_time(:second) - 1
-
-      assert :ok =
-               EctoCodeStore.put(entry("hash-expired-token", grant_data(%{family_id: "fam-exp"})))
-
-      assert {:ok, %{code_hash: "hash-expired-token"}} = EctoCodeStore.take("hash-expired-token")
-
-      assert :ok = EctoCodeStore.record_access_token("fam-exp", "jti-expired", expires_at)
-      assert :ok = EctoCodeStore.revoke_family_access_tokens("fam-exp")
-
-      refute EctoCodeStore.access_token_revoked?("jti-expired")
-    end
-
-    test "record_access_token fails loudly when the family row is absent" do
-      expires_at = System.system_time(:second) + 600
-
-      assert_raise RuntimeError, ~r/record_access_token failed to update exactly one authorization record/, fn ->
-        EctoCodeStore.record_access_token("fam-missing", "jti-missing", expires_at)
+    test "missing access-token linkage fails loudly" do
+      assert_raise ArgumentError, ~r/access-token linkage requires/, fn ->
+        EctoCodeStore.record_access_token_for_code("missing", "jti", @future_seconds)
       end
     end
   end
@@ -459,41 +259,45 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       code_hash = "telemetry-code-#{System.unique_integer([:positive])}"
       family_id = "telemetry-family-#{System.unique_integer([:positive])}"
       code_jti = "telemetry-code-jti-#{System.unique_integer([:positive])}"
-      family_jti = "telemetry-family-jti-#{System.unique_integer([:positive])}"
       expires_at = now + 600
 
       log =
         capture_log([level: :debug], fn ->
           assert :ok = EctoCodeStore.put(entry(code_hash, grant_data(%{family_id: nil}), expires_at))
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert {:ok, _} = EctoCodeStore.get(code_hash)
+          assert {:ok, _} = EctoCodeStore.read(code_hash)
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert {:ok, _} = EctoCodeStore.take(code_hash)
+          assert :ok = EctoCodeStore.claim(code_hash)
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert :ok = EctoCodeStore.mark_consumed(code_hash, %{family_id: family_id})
+
+          assert {:ok, _} =
+                   EctoCodeStore.finish(code_hash, %{
+                     family_id: family_id,
+                     subject: "subject-1",
+                     replay_retain_until: nil
+                   })
+
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
 
           assert :ok = EctoCodeStore.record_access_token_for_code(code_hash, code_jti, expires_at)
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert :ok = EctoCodeStore.record_access_token(family_id, family_jti, expires_at)
-          assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
           assert :ok = EctoCodeStore.revoke_family_access_tokens(family_id)
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert EctoCodeStore.access_token_revoked?(family_jti)
+          assert EctoCodeStore.access_token_revoked?(code_jti)
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
           assert :ok = EctoCodeStore.revoke_access_token_for_code(code_hash)
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
           assert :ok = EctoCodeStore.revoke_access_token_for_code("telemetry-code-missing")
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert {:error, :consumed, _} = EctoCodeStore.take(code_hash)
+          assert {:ok, %{state: :redeemed}} = EctoCodeStore.read(code_hash)
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert :error = EctoCodeStore.get("telemetry-code-missing")
+          assert :error = EctoCodeStore.read("telemetry-code-missing")
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
-          assert :error = EctoCodeStore.take("telemetry-code-missing")
+          assert :error = EctoCodeStore.read("telemetry-code-missing")
           assert AttestoPhoenix.TestTelemetryCapture.collect(ref) == []
         end)
 
-      for sentinel <- [code_hash, family_id, code_jti, family_jti] do
+      for sentinel <- [code_hash, family_id, code_jti] do
         refute log =~ sentinel
       end
     end
@@ -571,7 +375,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTest do
       assert %{"code" => code} = location |> URI.parse() |> Map.fetch!(:query) |> URI.decode_query()
 
       assert {:ok, %{data: %{client_id: @long_client_id, scope: ["openid", ^long_scope]}}} =
-               EctoCodeStore.take(Attesto.Secret.hash(code))
+               EctoCodeStore.read(Attesto.Secret.hash(code))
     end
   end
 end

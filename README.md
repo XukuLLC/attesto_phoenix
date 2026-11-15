@@ -907,7 +907,7 @@ returned success would serve a response whose writes were rolled back.
 The authorization code is atomically claimed before the callback runs. A host
 refusal, malformed private context, missing callback for a context-bearing code,
 or callback failure before the continuation succeeds therefore leaves it spent
-but unfinalized: `consumed_at` is set, `consumed_success` remains false, and no
+but unfinalized: `state` is `:claimed`, and no
 refresh family is recorded. The Ecto store retains that claimed row for a
 five-minute finalization window so the sweeper cannot erase it while token
 issuance is still running. After successful refresh issuance, the replay marker

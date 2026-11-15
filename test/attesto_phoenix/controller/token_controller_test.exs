@@ -190,118 +190,17 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # controller's reuse branch fire and revoke the descendant family. State lives
   # in two ETS tables keyed by code hash: live codes and consumed-markers.
   defmodule ReuseCodeStore do
-    @moduledoc false
-    @behaviour Attesto.CodeStore
-
-    @live :"#{__MODULE__}.Live"
-    @consumed :"#{__MODULE__}.Consumed"
-    @access_tokens :"#{__MODULE__}.AccessTokens"
-
-    def reset do
-      for table <- [@live, @consumed, @access_tokens] do
-        if :ets.whereis(table) == :undefined do
-          :ets.new(table, [:set, :public, :named_table])
-        else
-          :ets.delete_all_objects(table)
-        end
-      end
-
-      :ok
-    end
-
-    @impl true
-    def put(%{code_hash: code_hash} = record) do
-      true = :ets.insert(@live, {code_hash, record})
-      :ok
-    end
-
-    @impl true
-    def take(code_hash) do
-      case :ets.take(@live, code_hash) do
-        [{^code_hash, record}] ->
-          {:ok, record}
-
-        [] ->
-          # OAuth 2.0 Security BCP §4.13: distinguish an already-redeemed code
-          # (reuse) from a never-issued one via the consumed-marker table.
-          case :ets.lookup(@consumed, code_hash) do
-            [{^code_hash, meta}] -> {:error, :consumed, meta}
-            [] -> :error
-          end
-      end
-    end
-
-    @impl true
-    def mark_consumed(code_hash, meta) do
-      true = :ets.insert(@consumed, {code_hash, meta})
-
-      case {Map.get(meta, :family_id), :ets.lookup(@access_tokens, {:code_token, code_hash})} do
-        {family_id, [{{:code_token, ^code_hash}, jti}]}
-        when is_binary(family_id) and family_id != "" ->
-          true = :ets.insert(@access_tokens, {{:token, family_id}, jti})
-
-        _ ->
-          :ok
-      end
-
-      :ok
-    end
-
-    def consumed_meta(code_hash) do
-      case :ets.lookup(@consumed, code_hash) do
-        [{^code_hash, meta}] -> {:ok, meta}
-        [] -> :error
-      end
-    end
-
-    def record_access_token(family_id, jti, _expires_at) do
-      true = :ets.insert(@access_tokens, {{:token, family_id}, jti})
-      :ok
-    end
-
-    def revoke_family_access_tokens(family_id) do
-      for {{:token, ^family_id}, jti} <- :ets.tab2list(@access_tokens) do
-        true = :ets.insert(@access_tokens, {{:revoked, jti}, true})
-      end
-
-      :ok
-    end
-
-    def access_token_revoked?(jti) do
-      :ets.lookup(@access_tokens, {:revoked, jti}) != []
-    end
-
-    def access_token_recorded_for_family?(family_id) do
-      :ets.lookup(@access_tokens, {:token, family_id}) != []
-    end
-
-    def record_access_token_for_code(code_hash, jti, _expires_at) do
-      true = :ets.insert(@access_tokens, {{:code_token, code_hash}, jti})
-      :ok
-    end
-
-    def revoke_access_token_for_code(code_hash) do
-      for {{:code_token, ^code_hash}, jti} <- :ets.tab2list(@access_tokens) do
-        true = :ets.insert(@access_tokens, {{:revoked, jti}, true})
-      end
-
-      :ok
-    end
+    use Attesto.CodeStoreTestAgent
   end
 
   # Reuse-tracking store deliberately lacking Phoenix's optional code-hash JTI
   # callbacks. Core's consumed-code contract remains usable; only access-token
   # indexing is unavailable.
   defmodule LegacyReuseCodeStore do
-    @moduledoc false
-    @behaviour Attesto.CodeStore
-
-    defdelegate put(record), to: ReuseCodeStore
-    defdelegate take(code_hash), to: ReuseCodeStore
-    defdelegate mark_consumed(code_hash, meta), to: ReuseCodeStore
-    defdelegate record_access_token(family_id, jti, expires_at), to: ReuseCodeStore
-    defdelegate revoke_family_access_tokens(family_id), to: ReuseCodeStore
-    defdelegate access_token_revoked?(jti), to: ReuseCodeStore
+    for {name, arity} <- Attesto.CodeStore.behaviour_info(:callbacks), name != :record_access_token_for_code do
+      args = Macro.generate_arguments(arity, __MODULE__)
+      defdelegate unquote(name)(unquote_splicing(args)), to: ReuseCodeStore
+    end
   end
 
   # A refresh store probe for no-refresh replay tests. If the consumed
@@ -1777,7 +1676,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "invalid_dpop_proof"
 
       # The code must still be there: a refused request may not spend it.
-      assert {:ok, _entry} = code_store.get(Attesto.Secret.hash(code)),
+      assert {:ok, _entry} = code_store.read(Attesto.Secret.hash(code)),
              "a replayed proof consumed the authorization code it was refused for"
     end
 
@@ -2202,7 +2101,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         )
 
       code_hash = Process.get(:auth_code) |> Attesto.Secret.hash()
-      assert {:ok, authorization} = code_store.get(code_hash)
+      assert {:ok, authorization} = code_store.read(code_hash)
       assert authorization.data.family_id == family_id
 
       put_config(
@@ -2274,7 +2173,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       code_store = start_code_store("oc_sub-1", ["read", "offline_access"])
 
       code_hash = Process.get(:auth_code) |> Attesto.Secret.hash()
-      assert {:ok, authorization} = code_store.get(code_hash)
+      assert {:ok, authorization} = code_store.read(code_hash)
       assert is_nil(authorization.data.family_id)
 
       put_config(
@@ -3031,6 +2930,46 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # provenance, so the code's family marker must never be passed as public
   # refresh issuance state.
   describe "authorization-code reuse detection (OAuth 2.0 Security BCP §4.13)" do
+    test "non-matching finalized presentations preserve tokens and emit the same refusal" do
+      enable_minting()
+      start_refresh_store()
+      store = start_family_code_store(["offline_access"], "provenance")
+      put_config(refresh_store: Attesto.RefreshStore.ETS, code_store: store)
+      first = post_auth_code()
+      assert first.status == 200
+      token = body(first)["access_token"]
+      refresh = body(first)["refresh_token"]
+      capture_events()
+
+      params = %{
+        "grant_type" => "authorization_code",
+        "client_id" => "public-1",
+        "code" => Process.get(:auth_code),
+        "code_verifier" => @code_verifier,
+        "redirect_uri" => @redirect_uri
+      }
+
+      for overrides <- [
+            %{"client_id" => "confidential-1", "client_secret" => "s3cr3t"},
+            %{"redirect_uri" => "https://other.example/cb"},
+            %{"code_verifier" => String.duplicate("x", 43)}
+          ] do
+        refused = post_token(Map.merge(params, overrides))
+        assert refused.status == 400
+
+        assert body(refused) == %{
+                 "error" => "invalid_grant",
+                 "error_description" => "authorization grant is invalid or expired"
+               }
+
+        assert_receive {:event, %AttestoPhoenix.Event{name: :token_denied}}
+        refute store.access_token_revoked?(peek_claims(token)["jti"])
+        assert {:ok, _} = Attesto.Token.verify(id_token_config(), token)
+      end
+
+      assert {:ok, _} = Attesto.RefreshToken.rotate(Attesto.RefreshStore.ETS, refresh, client_id: "public-1")
+    end
+
     test "reusing a code revokes the descendant family and returns invalid_grant" do
       enable_minting()
       start_refresh_store()
@@ -3061,10 +3000,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       # The replay marker must bind to the family returned by RefreshToken.issue/3,
       # not the authorization provenance family carried by the code.
-      assert {:ok, %{family_id: ^refresh_family}} =
-               ReuseCodeStore.consumed_meta(Attesto.Secret.hash(Process.get(:auth_code)))
-
-      refute ReuseCodeStore.access_token_recorded_for_family?("fam-reuse")
+      assert {:ok, %{redemption: %{family_id: ^refresh_family}}} =
+               ReuseCodeStore.read(Attesto.Secret.hash(Process.get(:auth_code)))
 
       # Second redemption of the SAME code is reuse: invalid_grant on the wire.
       second = post_auth_code()
@@ -3078,36 +3015,10 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert code_store.access_token_revoked?(jti)
     end
 
-    test "a core reuse-tracking store without the Phoenix JTI index remains compatible" do
-      enable_minting()
-      start_refresh_store()
-      start_family_code_store(["offline_access"], "fam-reuse")
-
-      put_config(
-        refresh_store: Attesto.RefreshStore.ETS,
-        code_store: LegacyReuseCodeStore
-      )
-
-      first = post_auth_code()
-      assert first.status == 200
-      refresh_token = body(first)["refresh_token"]
-      assert is_binary(refresh_token)
-
-      assert {:ok, %{family_id: refresh_family}} =
-               Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
-
-      # The access token was not indexed under the authorization provenance
-      # family merely because the richer callback was unavailable.
-      refute ReuseCodeStore.access_token_recorded_for_family?("fam-reuse")
-
-      replay = post_auth_code()
-      assert replay.status == 400
-      assert body(replay)["error"] == "invalid_grant"
-
-      # The core marker still binds the generated refresh family, so the
-      # strongest containment supported by this store remains active.
-      assert :error = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
-      refute refresh_family == "fam-reuse"
+    test "a store without required token linkage is refused" do
+      assert_raise ArgumentError, ~r/record_access_token_for_code\/3/, fn ->
+        Attesto.CodeStore.validate!(LegacyReuseCodeStore)
+      end
     end
 
     @tag :ecto
@@ -3201,7 +3112,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       # Model the successful 2.14.x consumed marker: no provenance family and
       # no access-token JTI were persisted.
-      assert :ok = EctoCodeStore.mark_consumed(code_hash, %{family_id: nil})
+      assert {:ok, _} =
+               EctoCodeStore.finish(code_hash, %{family_id: nil, subject: "oc_sub-1", replay_retain_until: nil})
 
       replay = post_auth_code()
 
@@ -3212,7 +3124,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       row = AttestoPhoenix.TestRepo.get_by!(Authorization, code_hash: code_hash)
       assert is_nil(row.family_id)
       assert is_nil(row.access_token_jti)
-      assert is_nil(row.access_token_revoked_at)
+      assert %DateTime{} = row.access_token_revoked_at
     end
 
     test "reuse with no :refresh_store configured still fails closed with invalid_grant" do
@@ -4113,7 +4025,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # `{:error, {:reuse, meta}}` from `Attesto.AuthorizationCode.redeem/4` to the
   # controller (the bundled `Attesto.CodeStore.ETS` does not track reuse).
   defp start_family_code_store(scope, family_id) do
-    :ok = ReuseCodeStore.reset()
+    {:ok, _} = ReuseCodeStore.start_link()
 
     {:ok, code} =
       Attesto.AuthorizationCode.issue(ReuseCodeStore, %{

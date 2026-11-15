@@ -63,6 +63,9 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
   defmodule RevokedTokenStore do
     @moduledoc false
+    use Attesto.CodeStoreTestDelegates
+
+    @impl true
 
     def access_token_revoked?(jti) do
       case Process.get({__MODULE__, :result}, :__not_configured__) do
@@ -74,8 +77,11 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
   defmodule ConfigObservingRevokedTokenStore do
     @moduledoc false
+    use Attesto.CodeStoreTestDelegates
 
     alias AttestoPhoenix.Config
+
+    @impl true
 
     def access_token_revoked?(_jti) do
       send(self(), {:protected_resource_config, Config.request_config()})
@@ -361,16 +367,15 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
     end
   end
 
-  test "loads configured code stores before probing their optional revocation callback", %{
+  test "loads stores and refuses missing required revocation callbacks", %{
     config: config
   } do
     token = mint(config, scope: "openid")
     claims = peek_claims(config, token)
 
-    refute ProtectedResource.access_token_revoked?(
-             %{config | code_store: MissingRevocationCallbackStore},
-             claims
-           )
+    assert_raise ArgumentError, ~r/must implement Attesto.CodeStore/, fn ->
+      ProtectedResource.access_token_revoked?(%{config | code_store: MissingRevocationCallbackStore}, claims)
+    end
 
     for store <- ["not-a-module", AttestoPhoenix.CodeStoreMissing] do
       config = %{config | code_store: store}

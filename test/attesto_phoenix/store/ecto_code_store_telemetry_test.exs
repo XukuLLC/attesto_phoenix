@@ -85,7 +85,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTelemetryTest do
       assert :ok = EctoCodeStore.put(entry("hash-private-get", private_data))
 
       assert_private_query_suppressed(sentinel, fn ->
-        assert {:ok, %{data: %{claims: claims}}} = EctoCodeStore.get("hash-private-get")
+        assert {:ok, %{data: %{claims: claims}}} = EctoCodeStore.read("hash-private-get")
         assert claims[PrivateContext.claims_key()] == %{"nested" => %{"sentinel" => sentinel}}
       end)
     end
@@ -95,7 +95,8 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTelemetryTest do
       assert :ok = EctoCodeStore.put(entry("hash-private-take", private_data))
 
       assert_private_query_suppressed(sentinel, fn ->
-        assert {:ok, %{data: %{claims: claims}}} = EctoCodeStore.take("hash-private-take")
+        assert :ok = EctoCodeStore.claim("hash-private-take")
+        assert {:ok, %{data: %{claims: claims}}} = EctoCodeStore.read("hash-private-take")
         assert claims[PrivateContext.claims_key()] == %{"nested" => %{"sentinel" => sentinel}}
       end)
     end
@@ -103,24 +104,29 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTelemetryTest do
     test "a consumed take/1 fallback emits neither query telemetry nor SQL logs" do
       {private_data, sentinel} = private_grant_data(%{family_id: "fam-private-replay"})
       assert :ok = EctoCodeStore.put(entry("hash-private-replay", private_data))
-      assert {:ok, _record} = EctoCodeStore.take("hash-private-replay")
+      assert :ok = EctoCodeStore.claim("hash-private-replay")
       # A real redemption binds the refresh family it issued; `%{}` would clear
       # the family as an explicit no-refresh marker and report nil on replay.
-      assert :ok = EctoCodeStore.mark_consumed("hash-private-replay", %{family_id: "fam-private-replay"})
+      assert {:ok, _} =
+               EctoCodeStore.finish("hash-private-replay", %{
+                 family_id: "fam-private-replay",
+                 subject: "subject-1",
+                 replay_retain_until: nil
+               })
 
       # The replay read binds the code hash and returns the subject and family
       # ID, so it is suppressed like every other authorization-row query. The
       # narrow select additionally keeps `claims` out of the decoded row.
       assert_private_query_suppressed(sentinel, fn ->
-        assert {:error, :consumed, %{family_id: "fam-private-replay", subject: "subject-1"}} =
-                 EctoCodeStore.take("hash-private-replay")
+        assert {:ok, %{state: :redeemed, redemption: %{family_id: "fam-private-replay", subject: "subject-1"}}} =
+                 EctoCodeStore.read("hash-private-replay")
       end)
     end
 
     test "the revocation linkage fallback emits neither query telemetry nor SQL logs" do
       {private_data, sentinel} = private_grant_data(%{family_id: "fam-private-revoke"})
       assert :ok = EctoCodeStore.put(entry("hash-private-revoke", private_data))
-      assert {:ok, _record} = EctoCodeStore.take("hash-private-revoke")
+      assert :ok = EctoCodeStore.claim("hash-private-revoke")
 
       # No access-token linkage was ever recorded, so revocation takes the
       # `legacy_or_missing_revoke/2` path - which reads the row by code hash and
@@ -133,10 +139,15 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreTelemetryTest do
     test "the lifecycle update on a private-context row stays suppressed" do
       {private_data, sentinel} = private_grant_data(%{family_id: "fam-private-consume"})
       assert :ok = EctoCodeStore.put(entry("hash-private-consume", private_data))
-      assert {:ok, _record} = EctoCodeStore.take("hash-private-consume")
+      assert :ok = EctoCodeStore.claim("hash-private-consume")
 
       assert_private_query_suppressed(sentinel, fn ->
-        assert :ok = EctoCodeStore.mark_consumed("hash-private-consume", %{family_id: "fam-private-consume"})
+        assert {:ok, _} =
+                 EctoCodeStore.finish("hash-private-consume", %{
+                   family_id: "fam-private-consume",
+                   subject: "subject-1",
+                   replay_retain_until: nil
+                 })
       end)
     end
 

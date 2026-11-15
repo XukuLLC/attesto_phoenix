@@ -35,7 +35,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
 
   ## Correctness vs. housekeeping
 
-  Expiry-row deletion is not required for authorization correctness. Every store re-validates
+  Expiry-row deletion is not required for authorization correctness. Core validates live authorization-code expiry; other stores validate
   `expires_at` against the current time on read, so an expired row that has not
   yet been swept is never honored: an expired authorization code is rejected, an
   expired nonce is rejected, and an expired replay record no longer blocks a
@@ -498,11 +498,10 @@ defmodule AttestoPhoenix.Store.Sweeper do
   # live; otherwise a replay can no longer find the row and revoke descendants.
   # When the refresh-token table belongs to the configured refresh store, a
   # successful family marker is retained while that table still contains an
-  # unexpired member of the family. This mirrors the core ETS
-  # store's live-descendant rule and lets legacy successful rows whose
+  # unexpired member of the family. This lets legacy successful rows whose
   # `replay_retain_until` is NULL retire once their family has ended. An
   # unsuccessful claimed row is retained only through its short finalization
-  # reservation, preventing a sweep between `take/1` and `mark_consumed/2`.
+  # reservation, preventing a sweep between claim and finish.
   defp authorization_codes_expired_query(now, true = _refresh_table_authoritative?) do
     expired = authorization_code_expired(now)
 
@@ -522,7 +521,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
     )
   end
 
-  # Core `Attesto.CodeStore.mark_consumed/2` contract: a successful marker for a
+  # Core `Attesto.CodeStore` retention contract: a successful marker for a
   # refresh family persists through `replay_retain_until`, and a NULL deadline
   # on a family means no fixed maximum lifetime, so no local timer retires it.
   defp authorization_codes_expired_query(now, false = _refresh_table_authoritative?) do

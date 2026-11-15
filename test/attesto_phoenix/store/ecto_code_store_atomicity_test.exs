@@ -78,6 +78,7 @@ defmodule AttestoPhoenix.Store.EctoCodeStoreAtomicityTest do
     spent = row(code)
     refute is_nil(spent.consumed_at)
     refute spent.consumed_success
+    assert spent.family_id == "fam-1"
 
     # A replay (e.g. the client retrying a transient failure) is a clean
     # invalid_grant, NOT a reuse attack that would revoke the family.

@@ -210,6 +210,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       `AttestoPhoenix.Config` keyword under. Defaults to `AttestoPhoenix.Config`,
       matching `AttestoPhoenix.Config.from_otp_app/2`.
 
+  The `--upgrade 4.19` milestone adds provenance and
+  replay flags without changing previous columns or installing database triggers.
+  Run it before rolling nodes from 4.18.0. During overlap the old sweeper still
+  applies its previous retention rule; see the migration guide.
+
   Fresh-install migrations are reversible. The 3.0 upgrade migration has a
   guarded rollback that refuses to discard revocations which 2.x cannot
   represent. An application downgrade also requires stopped writers and a
@@ -241,7 +246,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   @nonce_column_size 255
   @identifier_column_size 255
   @max_migration_version 99_999_999_999_999
-  @upgrade_milestones ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5)
+  @upgrade_milestones ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5 4.19)
   @accepted_option_labels [
     "--help",
     "--repo (-r)",
@@ -588,6 +593,21 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     end
   end
 
+  defp generate_for_repo(repo, opts, prefix, "4.19") do
+    ensure_repo(repo, [])
+    path = migrations_path(repo, opts)
+    create_directory(path)
+    base_name = "upgrade_attesto_phoenix_to_4_19"
+
+    assigns = [
+      module: migration_module(repo, base_name),
+      prefix: normalize_configured_prefix(prefix),
+      identifier_size: @identifier_column_size
+    ]
+
+    create_migration_file(path, base_name, code_retention_upgrade_migration_template(assigns), :code_retention)
+  end
+
   defp generate_for_repo(repo, opts, prefix, upgrade_version) do
     case upgrade_version do
       "3.0" -> generate_upgrade_3_0_for_repo(repo, opts, prefix)
@@ -697,7 +717,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     path = migrations_path(repo, opts)
     create_directory(path)
     base_name = "upgrade_attesto_phoenix_to_3_4"
-    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    assigns = [
+      module: migration_module(repo, base_name),
+      prefix: normalize_configured_prefix(prefix),
+      identifier_size: @identifier_column_size
+    ]
+
     create_migration_file(path, base_name, refresh_family_upgrade_migration_template(assigns), :upgrade_3_4)
   end
 
@@ -706,7 +732,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     path = migrations_path(repo, opts)
     create_directory(path)
     base_name = "upgrade_attesto_phoenix_to_3_6"
-    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    assigns = [
+      module: migration_module(repo, base_name),
+      prefix: normalize_configured_prefix(prefix),
+      identifier_size: @identifier_column_size
+    ]
+
     create_migration_file(path, base_name, cimd_url_upgrade_migration_template(assigns), :upgrade_3_6)
   end
 
@@ -715,7 +747,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     path = migrations_path(repo, opts)
     create_directory(path)
     base_name = "upgrade_attesto_phoenix_to_3_7"
-    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    assigns = [
+      module: migration_module(repo, base_name),
+      prefix: normalize_configured_prefix(prefix),
+      identifier_size: @identifier_column_size
+    ]
 
     create_migration_file(
       path,
@@ -730,7 +767,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     path = migrations_path(repo, opts)
     create_directory(path)
     base_name = "upgrade_attesto_phoenix_to_4_2"
-    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    assigns = [
+      module: migration_module(repo, base_name),
+      prefix: normalize_configured_prefix(prefix),
+      identifier_size: @identifier_column_size
+    ]
 
     create_migration_file(
       path,
@@ -745,7 +787,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     path = migrations_path(repo, opts)
     create_directory(path)
     base_name = "upgrade_attesto_phoenix_to_4_5"
-    assigns = [module: migration_module(repo, base_name), prefix: normalize_configured_prefix(prefix)]
+
+    assigns = [
+      module: migration_module(repo, base_name),
+      prefix: normalize_configured_prefix(prefix),
+      identifier_size: @identifier_column_size
+    ]
 
     create_migration_file(
       path,
@@ -970,7 +1017,8 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_6") ++
         migration_kind_files(path, "upgrade_attesto_phoenix_to_3_7") ++
         migration_kind_files(path, "upgrade_attesto_phoenix_to_4_2") ++
-        migration_kind_files(path, "upgrade_attesto_phoenix_to_4_5")
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_4_5") ++
+        migration_kind_files(path, "upgrade_attesto_phoenix_to_4_19")
 
     if upgrade_files != [] do
       file_names =
@@ -1053,6 +1101,12 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
   defp ensure_migration_kind_available!(path, base_name, :upgrade_4_5) do
     if migration_kind_files(path, base_name) != [] do
       Mix.raise("migration #{inspect(base_name)} already exists in #{path}; remove it before regenerating")
+    end
+  end
+
+  defp ensure_migration_kind_available!(path, base_name, :code_retention) do
+    if migration_kind_files(path, base_name) != [] do
+      Mix.raise("migration #{inspect(base_name)} already exists in #{path}")
     end
   end
 
@@ -1220,7 +1274,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # AttestoPhoenix.Schema.Authorization / AttestoPhoenix.Store.EctoCodeStore.
       # One row per issued code. Only the hash of the code is stored (RFC 6749,
       # section 10.3); it is the PRIMARY KEY and the single-use lookup key
-      # (EctoCodeStore.take/1 claims it with a conditional UPDATE by code_hash).
+      # (EctoCodeStore.claim/1 claims it with a conditional UPDATE by code_hash).
       # The schema keys on :code_hash, so there is no surrogate id. A primary
       # key, not merely a unique index, also supplies the usable index selected
       # by REPLICA IDENTITY DEFAULT. A logical-replication publication needs
@@ -1265,6 +1319,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
         # descendants while a failed first presentation remains plain invalid_grant.
         add :consumed_at, :utc_datetime
         add :consumed_success, :boolean, null: false, default: false
+        add :authorization_family_id, :string, size: <%= @identifier_size %>
         # Temporary claim-finalization reservation, replaced with the immutable
         # refresh-family deadline after successful refresh issuance. Cleanup
         # also correlates successful family rows with the refresh-token table,
@@ -1278,7 +1333,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # A duplicate code hash violates attesto_authorization_codes_pkey, the
       # primary-key name the schema maps onto the changeset alongside the legacy
       # unique-index name for rolling upgrades. Single-use redemption is
-      # enforced by take/1's conditional UPDATE of consumed_at.
+      # enforced by claim/1's conditional UPDATE of consumed_at.
       # Expiry sweeps scan by expiry (AttestoPhoenix.Store.Sweeper).
       create index(:<%= @authorization_codes %>, [:expires_at], prefix: prefix)
       create index(:<%= @authorization_codes %>, [:family_id], prefix: prefix)
@@ -2986,6 +3041,41 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
     defp quote_identifier(identifier) do
       "\\\"" <> String.replace(to_string(identifier), "\\\"", "\\\"\\\"") <> "\\\""
+    end
+  end
+  """)
+
+  embed_template(:code_retention_upgrade_migration, """
+  defmodule <%= inspect @module %> do
+    use Ecto.Migration
+
+    def up do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+
+      alter table(:attesto_authorization_codes, prefix: prefix) do
+        add :authorization_family_id, :string, size: <%= @identifier_size %>
+      end
+    end
+
+    def down do
+      prefix = effective_prefix(<%= inspect @prefix %>)
+
+      alter table(:attesto_authorization_codes, prefix: prefix) do
+        remove :authorization_family_id
+      end
+    end
+
+    defp effective_prefix(explicit_prefix) do
+      cond do
+        is_binary(explicit_prefix) and byte_size(explicit_prefix) > 0 ->
+          explicit_prefix
+
+        migrator_prefix = Ecto.Migration.prefix() ->
+          migrator_prefix
+
+        true ->
+          repo().config()[:migration_default_prefix]
+      end
     end
   end
   """)

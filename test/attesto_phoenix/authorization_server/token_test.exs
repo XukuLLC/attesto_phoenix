@@ -51,7 +51,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
   defmodule OneShotLookupFailureCodeStore do
     @moduledoc false
-    @behaviour Attesto.CodeStore
+    use Attesto.CodeStoreTestDelegates, to: ETS
 
     def fail_next_lookup, do: Process.put({__MODULE__, :fail_next_lookup}, true)
 
@@ -59,18 +59,18 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     def put(record), do: ETS.put(record)
 
     @impl true
-    def get(code_hash) do
+    def read(code_hash) do
       if Process.delete({__MODULE__, :fail_next_lookup}) do
         {:error, :store_unavailable}
       else
-        ETS.get(code_hash)
+        ETS.read(code_hash)
       end
     end
 
     @impl true
-    def take(code_hash) do
+    def claim(code_hash) do
       send(self(), {__MODULE__, :take_called})
-      ETS.take(code_hash)
+      ETS.claim(code_hash)
     end
   end
 
@@ -104,6 +104,9 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   defmodule RevokedAccessTokenStore do
     @moduledoc false
 
+    use Attesto.CodeStoreTestDelegates
+
+    @impl true
     def access_token_revoked?(jti), do: jti == Process.get({__MODULE__, :jti})
   end
 
@@ -707,7 +710,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
           }
         )
 
-      assert_raise RuntimeError, ~r/get\/1 violated its grant-store return contract/, fn ->
+      assert_raise RuntimeError, ~r/read\/1 violated its grant-store return contract/, fn ->
         Token.issue(config, request)
       end
 
@@ -715,7 +718,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
       refute_received :dpop_replay_claimed
 
       assert {:ok, _entry} =
-               ETS.get(Attesto.Secret.hash(Process.get(:auth_code)))
+               ETS.read(Attesto.Secret.hash(Process.get(:auth_code)))
     end
 
     test "a pairwise client's ID Token and access token carry the derived sub; each token seals the host subject separately" do

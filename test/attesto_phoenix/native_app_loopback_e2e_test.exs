@@ -58,26 +58,7 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
   end
 
   defmodule CodeStore do
-    @moduledoc false
-    @behaviour Attesto.CodeStore
-
-    def start_link, do: Agent.start_link(fn -> %{} end, name: __MODULE__)
-
-    @impl true
-    def put(record) do
-      Agent.update(__MODULE__, &Map.put(&1, record.code_hash, record))
-      :ok
-    end
-
-    @impl true
-    def take(code_hash) do
-      Agent.get_and_update(__MODULE__, fn state ->
-        case Map.fetch(state, code_hash) do
-          {:ok, record} -> {{:ok, record}, Map.delete(state, code_hash)}
-          :error -> {:error, state}
-        end
-      end)
-    end
+    use Attesto.CodeStoreTestAgent
   end
 
   defmodule Router do

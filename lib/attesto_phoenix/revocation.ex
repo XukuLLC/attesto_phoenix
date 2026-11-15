@@ -9,7 +9,7 @@ defmodule AttestoPhoenix.Revocation do
       end)
 
   Each function calls the configured `:code_store`'s
-  `c:Attesto.CodeStore.delete_unconsumed/1` and the configured
+  `c:Attesto.CodeStore.delete_unclaimed/1` and the configured
   `:refresh_store`'s `c:Attesto.RefreshStore.revoke_families/1`. With the
   bundled Ecto stores both run on the configured repo and open no outer
   transaction of their own, so a call made inside the host's transaction
@@ -60,7 +60,7 @@ defmodule AttestoPhoenix.Revocation do
         }
 
   @store_specs [
-    {:code_store, :delete_unconsumed},
+    {:code_store, :delete_unclaimed},
     {:device_code_store, :delete_unconsumed},
     {:ciba_store, :delete_unconsumed},
     {:pre_authorized_code_store, :delete_unconsumed},
@@ -100,7 +100,7 @@ defmodule AttestoPhoenix.Revocation do
     stores = validate_stores!(config)
 
     Config.with_request_config(config, fn ->
-      {:ok, codes} = invoke_store(stores[:code_store], :delete_unconsumed, criteria)
+      {:ok, codes} = invoke_store(stores[:code_store], :delete_unclaimed, criteria)
       {:ok, device_codes} = invoke_store(stores[:device_code_store], :delete_unconsumed, criteria)
       {:ok, ciba_requests} = invoke_store(stores[:ciba_store], :delete_unconsumed, criteria)
       {:ok, pre_authorized_codes} = invoke_store(stores[:pre_authorized_code_store], :delete_unconsumed, criteria)

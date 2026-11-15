@@ -180,11 +180,8 @@ defmodule AttestoPhoenix.ProtectedResource do
   def access_token_revoked?(_config, _claims), do: false
 
   defp access_token_revoked_by_store?(store, jti) do
-    if function_exported?(store, :access_token_revoked?, 1) do
-      require_boolean_revocation_result!(store.access_token_revoked?(jti))
-    else
-      false
-    end
+    Attesto.CodeStore.validate!(store)
+    require_boolean_revocation_result!(store.access_token_revoked?(jti))
   end
 
   defp require_boolean_revocation_result!(true), do: true

@@ -49,21 +49,21 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule CompletionCodeStore do
     @moduledoc false
-    @behaviour Attesto.CodeStore
+    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
 
     @impl true
     def put(record), do: EctoCodeStore.put(record)
 
     @impl true
-    def take(code_hash), do: EctoCodeStore.take(code_hash)
+    def claim(code_hash), do: EctoCodeStore.claim(code_hash)
 
     @impl true
-    def get(code_hash), do: EctoCodeStore.get(code_hash)
+    def read(code_hash), do: EctoCodeStore.read(code_hash)
 
     @impl true
-    def mark_consumed(code_hash, meta) do
+    def finish(code_hash, meta) do
       notify(:code_finalization)
-      EctoCodeStore.mark_consumed(code_hash, meta)
+      EctoCodeStore.finish(code_hash, meta)
     end
 
     def record_access_token_for_code(code_hash, jti, expires_at) do
@@ -136,19 +136,19 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule FailingAccessJTIStore do
     @moduledoc false
-    @behaviour Attesto.CodeStore
+    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
 
     @impl true
     defdelegate put(record), to: EctoCodeStore
 
     @impl true
-    defdelegate take(code_hash), to: EctoCodeStore
+    defdelegate claim(code_hash), to: EctoCodeStore
 
     @impl true
-    defdelegate get(code_hash), to: EctoCodeStore
+    defdelegate read(code_hash), to: EctoCodeStore
 
     @impl true
-    defdelegate mark_consumed(code_hash, meta), to: EctoCodeStore
+    defdelegate finish(code_hash, meta), to: EctoCodeStore
 
     def record_access_token_for_code(_code_hash, _jti, _expires_at) do
       logout_count = TestRepo.aggregate(LogoutSession, :count)
@@ -169,19 +169,19 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule PartialWriteTerminationCodeStore do
     @moduledoc false
-    @behaviour Attesto.CodeStore
+    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
 
     @impl true
     defdelegate put(record), to: EctoCodeStore
 
     @impl true
-    defdelegate take(code_hash), to: EctoCodeStore
+    defdelegate claim(code_hash), to: EctoCodeStore
 
     @impl true
-    defdelegate get(code_hash), to: EctoCodeStore
+    defdelegate read(code_hash), to: EctoCodeStore
 
     @impl true
-    defdelegate mark_consumed(code_hash, meta), to: EctoCodeStore
+    defdelegate finish(code_hash, meta), to: EctoCodeStore
 
     def record_access_token_for_code(_code_hash, _jti, _expires_at) do
       logout_count = TestRepo.aggregate(LogoutSession, :count)
@@ -207,16 +207,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule FailingFinalizationCodeStore do
     @moduledoc false
-    @behaviour Attesto.CodeStore
+    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
 
     @impl true
     defdelegate put(record), to: EctoCodeStore
 
     @impl true
-    defdelegate take(code_hash), to: EctoCodeStore
+    defdelegate claim(code_hash), to: EctoCodeStore
 
     @impl true
-    defdelegate get(code_hash), to: EctoCodeStore
+    defdelegate read(code_hash), to: EctoCodeStore
 
     defdelegate record_access_token_for_code(code_hash, jti, expires_at), to: EctoCodeStore
 
@@ -225,7 +225,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     defdelegate revoke_family_access_tokens(family_id), to: EctoCodeStore
 
     @impl true
-    def mark_consumed(code_hash, _meta) do
+    def finish(code_hash, _meta) do
       row = TestRepo.get_by!(Authorization, code_hash: code_hash)
 
       notify({
@@ -245,73 +245,22 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     end
   end
 
+  defmodule DeletedClaimStore do
+    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
+
+    def finish(hash, redemption) do
+      TestRepo.delete_all(from a in Authorization, where: a.code_hash == ^hash)
+      EctoCodeStore.finish(hash, redemption)
+    end
+
+    def revoke_access_token_for_code(hash) do
+      send(self(), {:missing_claim_revoked, hash})
+      EctoCodeStore.revoke_access_token_for_code(hash)
+    end
+  end
+
   defmodule AgentCodeStore do
-    @moduledoc false
-    @behaviour Attesto.CodeStore
-
-    def child_spec(_opts) do
-      %{id: __MODULE__, start: {__MODULE__, :start_link, [[]]}}
-    end
-
-    def start_link(_opts), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
-
-    @impl true
-    def put(record) do
-      entry = %{record: record, consumed: false, consumed_success: false, meta: nil, access_token_jti: nil}
-      Agent.update(__MODULE__, &Map.put(&1, record.code_hash, entry))
-      :ok
-    end
-
-    @impl true
-    def get(code_hash) do
-      Agent.get(__MODULE__, fn state ->
-        case Map.get(state, code_hash) do
-          %{consumed: false, record: record} -> {:ok, record}
-          _other -> :error
-        end
-      end)
-    end
-
-    @impl true
-    def take(code_hash) do
-      Agent.get_and_update(__MODULE__, fn state ->
-        case Map.get(state, code_hash) do
-          %{consumed: false, record: record} = entry ->
-            {{:ok, record}, Map.put(state, code_hash, %{entry | consumed: true})}
-
-          %{consumed_success: true, meta: meta} ->
-            {{:error, :consumed, meta}, state}
-
-          _other ->
-            {:error, state}
-        end
-      end)
-    end
-
-    @impl true
-    def mark_consumed(code_hash, meta) do
-      Agent.update(__MODULE__, fn state ->
-        Map.update!(state, code_hash, &%{&1 | consumed_success: true, meta: meta})
-      end)
-
-      :ok
-    end
-
-    def record_access_token_for_code(code_hash, jti, _expires_at) do
-      Agent.update(__MODULE__, fn state ->
-        Map.update!(state, code_hash, &%{&1 | access_token_jti: jti})
-      end)
-
-      :ok
-    end
-
-    def revoke_access_token_for_code(_code_hash), do: :ok
-
-    def revoke_family_access_tokens(_family_id), do: :ok
-
-    def entry(code) do
-      Agent.get(__MODULE__, &Map.fetch!(&1, Attesto.Secret.hash(code)))
-    end
+    use Attesto.CodeStoreTestAgent
   end
 
   setup do
@@ -355,6 +304,19 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     :ok
   end
 
+  test "a code deleted before finish returns invalid_grant without tokens and revokes its issued family" do
+    for refresh? <- [true, false] do
+      code = issue_code("deleted-claim")
+      config = config(code_store: DeletedClaimStore, issue_refresh_token?: fn _, _ -> refresh? end)
+      assert {:error, %OAuthError{error: :invalid_grant}, events} = Token.issue(config, code_request(config, code))
+      assert Enum.any?(events, &(&1.name == :token_denied))
+      hash = Attesto.Secret.hash(code)
+      assert_received {:missing_claim_revoked, ^hash}
+      assert TestRepo.aggregate(RefreshToken, :count) == 0
+      assert :error = EctoCodeStore.read(hash)
+    end
+  end
+
   test "the absent callback preserves direct completion and all writes" do
     family_id = "family-default"
     code = issue_code(family_id)
@@ -366,7 +328,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert is_binary(response.refresh_token)
 
     row = authorization_by_code!(code)
-    assert row.consumed_at
+    assert not is_nil(row.consumed_at)
     assert row.consumed_success
     assert row.access_token_jti == claim!(response.access_token, "jti")
 
@@ -892,7 +854,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     # the refresh row, were rolled back. The initial atomic code claim occurred
     # before the host transaction and remains spent-but-unfinalized.
     row = authorization_by_code!(code)
-    refute row.consumed_success
+    assert not is_nil(row.consumed_at) and not row.consumed_success
     refute row.access_token_jti
     assert TestRepo.aggregate(RefreshToken, :count) == 0
   end
@@ -921,7 +883,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert log =~ "may have committed partial writes"
     refute log =~ "authorization code completion callback failed"
     row = authorization!(family_id)
-    assert row.consumed_at
+    refute is_nil(row.consumed_at)
     refute row.consumed_success
     assert is_binary(row.access_token_jti)
     assert TestRepo.aggregate(RefreshToken, :count) == 0
@@ -1214,7 +1176,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       # intentionally asserts only the invariant that no successful code
       # finalization was reported, not a particular rollback outcome.
       row = authorization!(family_id)
-      assert row.consumed_at
+      refute is_nil(row.consumed_at)
       refute row.consumed_success
     end)
   end
@@ -1265,7 +1227,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     refute continuation_state_key()
 
     row = authorization!(family_id)
-    assert row.consumed_at
+    refute is_nil(row.consumed_at)
     refute row.consumed_success
   end
 
@@ -1316,12 +1278,12 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     refute claim!(response.access_token, "private_context")
 
     entry = AgentCodeStore.entry(code)
-    assert entry.consumed
-    assert entry.consumed_success
-    assert is_binary(entry.access_token_jti)
-    assert entry.record.data.claims[PrivateContext.claims_key()] == private_context
+    assert entry.snapshot.state != :live
+    assert entry.snapshot.state == :redeemed
+    assert is_binary(entry.token.jti)
+    assert entry.snapshot.data.claims[PrivateContext.claims_key()] == private_context
     # The canonical grant data admits no sibling key (core enforces exactly nine).
-    refute Map.has_key?(entry.record.data, :attesto_phoenix_private_context)
+    refute Map.has_key?(entry.snapshot.data, :attesto_phoenix_private_context)
   end
 
   test "retry after a committed-success substitution revokes only that response lineage" do
@@ -1333,7 +1295,11 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
     unrelated_row = authorization_by_code!(unrelated_code)
     refute EctoCodeStore.access_token_revoked?(unrelated_row.access_token_jti)
-    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^unrelated_row.family_id), :count) == 1
+
+    assert TestRepo.aggregate(
+             from(r in RefreshToken, where: r.family_id == ^unrelated_row.family_id),
+             :count
+           ) == 1
 
     family_id = "family-commit-then-error"
     code = issue_code(family_id)
@@ -1373,7 +1339,11 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     assert EctoCodeStore.access_token_revoked?(row.access_token_jti)
     assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^row.family_id), :count) == 0
     refute EctoCodeStore.access_token_revoked?(unrelated_row.access_token_jti)
-    assert TestRepo.aggregate(from(r in RefreshToken, where: r.family_id == ^unrelated_row.family_id), :count) == 1
+
+    assert TestRepo.aggregate(
+             from(r in RefreshToken, where: r.family_id == ^unrelated_row.family_id),
+             :count
+           ) == 1
   end
 
   test "a non-OAuth error after a successful continuation is normalized and names the retry hazard" do
@@ -1467,7 +1437,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     # continuation made stands; what matters is that the code was never
     # finalized, so the client's retry is not scored as reuse.
     row = authorization!(family_id)
-    assert row.consumed_at
+    refute is_nil(row.consumed_at)
     refute row.consumed_success
   end
 
@@ -1686,7 +1656,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defp assert_spent_without_completion(family_id) do
     row = authorization!(family_id)
-    assert row.consumed_at
+    refute is_nil(row.consumed_at)
     refute row.consumed_success
     refute row.access_token_jti
     # Table-wide, not `where: family_id == ^family_id`: core 2.0 mints a FRESH

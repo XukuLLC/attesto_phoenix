@@ -134,3 +134,56 @@ such as `token_path: "/mcp/oauth/token2"` changes metadata only; add a matching
 host route when using one. The installer accepts only `/oauth` or a prefix that
 ends in `/oauth`, using literal slash-separated segments with letters, digits,
 `_`, or `-`; it rejects other values before changing files.
+
+## Authorization-code retention upgrade
+
+1. Generate `mix attesto_phoenix.gen.migration --upgrade 4.19`
+   and apply it with the usual Ecto migration command while old nodes run.
+2. Roll nodes to the new release. No drain or service stop is required.
+3. Confirm every node runs the new release before relying on binding-aware replay
+   handling for every request.
+
+The migration is additive: `consumed_at`, `consumed_success`, `family_id`,
+`replay_retain_until` and access-token linkage retain their previous meanings.
+The store derives live, claimed and redeemed states from those columns. The
+self-contained Ecto migration adds one nullable `authorization_family_id` column;
+its down migration removes that column. No database triggers, functions or rules
+are installed or inspected. The existing `subject` supplies redemption subject.
+The existing pending `access_token_revoked_at` marker supplies the one revocation
+flag for replay and grant cut-off. It conservatively denies linked access tokens
+immediately; core controls refresh-family revocation at finish.
+
+During the roll, a request reaching an old node still spends a code on a failed
+comparison and still revokes on a non-matching replay. A new node refuses either
+without changing the store. Both versions share one atomic claim predicate, so
+only one can redeem a code. Matching replay containment works across versions.
+Expiry refuses only live codes; retained claimed or redeemed codes can still
+trigger matching replay containment after their code expiry.
+
+Both sweepers keep claimed rows through a fixed five-minute reservation after
+claim. They may then delete a claim once its code and linked access token expire.
+Redeemed rows remain through code and access-token expiry and while the bundled
+refresh table holds an unexpired family member, even for families without a
+maximum lifetime. When a host uses an external refresh store, the sweeper uses
+the recorded family deadline instead, retaining indefinitely if none is known.
+A deleted code returns `invalid_grant`; if deletion wins against finish, core
+revokes the newly issued family and access-token link and returns no tokens.
+Never reopen a claimed code.
+
+New transitions copy original family provenance only before a row is finished.
+Live and claimed reads fall back to `family_id`; redeemed reads use only
+`authorization_family_id`. An old finalization can overwrite original provenance
+before a new writer copies it; that redeemed row reports nil provenance. No
+sentinel is used, and unavailable history is never inferred from the redemption
+family. Client, redirect URI, PKCE and DPoP bindings remain unchanged.
+
+The migration takes PostgreSQL DDL locks but does not backfill or update rows.
+Use the host's usual lock-timeout practices. An application rollback leaves the
+additive column in place. Run the down migration only after all new writers
+have been rolled back. Fresh installations receive the same nullable column.
+
+A custom store must implement every callback in `Attesto.CodeStore`; consult
+attesto's custom-store upgrade guide for the complete mapping. Its migration
+must also be additive, retain the previous writer's columns and semantics, share
+atomic claims and replay markers, and document any old-sweeper retention limit during overlap.
+Removal of old columns belongs to a later release.
