@@ -46,8 +46,8 @@ defmodule AttestoPhoenix.Interaction do
 
   ## Recording a consent decision
 
-  From `:consent`, park with the authenticated OIDC `sub` and render the host's
-  consent page. On resume, use `consent_decision/3` against the newly validated
+  From `:consent`, park with the authenticated OIDC `sub` and redirect to the
+  host's consent page with an encrypted `view_token/2` handle. On resume, use `consent_decision/3` against the newly validated
   request and authenticated subject:
 
       def consent(conn, request, subject) do
@@ -61,13 +61,37 @@ defmodule AttestoPhoenix.Interaction do
           nil ->
             case AttestoPhoenix.Interaction.park(conn, request, subject: subject.subject) do
               {:ok, resume_id} ->
-                {:halt, render(conn, :consent, resume_id: resume_id, request: request)}
+                token = AttestoPhoenix.Interaction.view_token(conn, resume_id)
+                {:halt, redirect(conn, to: "/consent?" <> URI.encode_query(%{"view" => token}))}
 
               {:error, _reason} ->
                 {:error, :temporarily_unavailable}
             end
         end
       end
+
+  The host consent controller reads without consuming the parked request:
+
+      def consent_page(conn, %{"view" => token}) do
+        conn = put_resp_header(conn, "referrer-policy", "no-referrer")
+
+        case AttestoPhoenix.Interaction.pending(conn, token) do
+          {:ok, pending} ->
+            render(conn, :consent, resume_id: pending.resume_id, request: pending.request)
+
+          {:error, :invalid_resume} ->
+            send_resp(conn, 400, "Invalid consent request")
+        end
+      end
+
+  The page can be reloaded until the decision is recorded and the request
+  resumes. Before rendering, compare `pending.subject` with the subject in the
+  host session and refuse a mismatch, so one account on a shared browser is
+  not shown a request parked by another; `decide/4` refuses the mismatch as
+  well. Both host routes need the fetched session, browser binding and
+  configuration plugs. The endpoint supplies `conn.secret_key_base` to seal
+  the handle; a route without it raises. Keep the resume id out of the consent
+  URL, and set `Referrer-Policy: no-referrer` on the page.
 
   The page POSTs the resume id and Allow/Deny choice to a host handler with a
   fetched session, the `AttestoPhoenix.Interaction.BrowserBinding` plug and
@@ -105,11 +129,11 @@ defmodule AttestoPhoenix.Interaction do
   whose `Origin` header names an origin other than the issuer's or the one the
   request reached, before it reads the store. `Origin: null`, which browsers
   send on a same-origin form POST from a page with `Referrer-Policy:
-  no-referrer`, names no origin and is not refused on its own. A page rendered from `:consent` is served by the
-  authorization route, which cannot run `:protect_from_forgery` because the
-  authorization endpoint must accept cross-site POST requests (OIDC Core
-  §3.1.2.1); a Plug CSRF token put in that page is not saved to the session,
-  so do not require one on this handler. Serve the page and the handler from
+  no-referrer`, names no origin and is not refused on its own. The consent
+  page and handler are host routes and can also run `:protect_from_forgery`.
+  When they do, include the host's CSRF token in the form. The authorization
+  endpoint itself must accept cross-site POST requests (OIDC Core §3.1.2.1).
+  Serve the page and the handler from
   one origin: the issuer's, or the one the browser reached (for example a
   development server on `http://localhost:4000` with an `https://localhost`
   issuer). Behind a TLS-terminating proxy, list it in `:trusted_proxies` so
@@ -213,6 +237,7 @@ defmodule AttestoPhoenix.Interaction do
 
   alias Attesto.AuthorizationRequest
   alias Attesto.Secret
+  alias AttestoPhoenix.AuthorizationServer.Authorize
   alias AttestoPhoenix.Callback
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.ConsentGrant
@@ -250,6 +275,7 @@ defmodule AttestoPhoenix.Interaction do
   # Not a `urn:ietf:params:oauth:request_uri:` reference, so the key space is
   # disjoint from pushed authorization requests held in the same store.
   @key_prefix "urn:attesto:interaction:"
+  @view_salt "attesto_phoenix.interaction.view"
   @resume_id_bytes 32
   @resumed_private_key :attesto_phoenix_resumed_interaction
   @reauthentication_allowance_seconds 60
@@ -319,6 +345,76 @@ defmodule AttestoPhoenix.Interaction do
       {:error, :record_too_large}
     end
   end
+
+  @doc """
+  Encrypt a resume id for the host consent URL, without exposing the form's
+  synchronizer token. The handle expires after `:interaction_ttl` seconds.
+
+  Requires `conn.secret_key_base`, supplied by the Phoenix endpoint; raises
+  `ArgumentError` if it is missing or the resume id is invalid.
+  """
+  @spec view_token(Plug.Conn.t(), String.t()) :: String.t()
+  def view_token(%Plug.Conn{} = conn, resume_id) do
+    secret = view_secret!(conn)
+    config = Config.resolve!(conn)
+
+    if !valid_resume_id?(resume_id),
+      do: raise(ArgumentError, "AttestoPhoenix.Interaction: invalid resume id")
+
+    Plug.Crypto.encrypt(secret, @view_salt, resume_id, max_age: config.interaction_ttl)
+  end
+
+  @doc """
+  Read a parked request through an encrypted view token for the current browser.
+
+  Returns `{:ok, pending}` with `:resume_id`, `:client_id`, `:request`,
+  `:subject`, `:parked_at` and `:consent_decision` (nil, `"allow"` or `"deny"`).
+  The request is rebuilt through authorization validation and scope policy,
+  as on resume. Reads never consume or extend the entry, including a decided
+  entry that has not yet resumed.
+
+  Invalid, expired, consumed or wrong-browser handles and request rebuild
+  failures return `{:error, :invalid_resume}`. Requires `conn.secret_key_base`;
+  raises `ArgumentError` naming that value when it is missing.
+  """
+  @spec pending(Plug.Conn.t(), term()) :: {:ok, map()} | {:error, :invalid_resume}
+  def pending(%Plug.Conn{} = conn, token) do
+    secret = view_secret!(conn)
+    config = Config.resolve!(conn)
+
+    Config.with_request_config(config, fn ->
+      with {:ok, resume_id} <- Plug.Crypto.decrypt(secret, @view_salt, token, max_age: config.interaction_ttl),
+           true <- valid_resume_id?(resume_id),
+           {:ok, store} <- store(config),
+           {:ok, binding} <- browser_binding(config, conn),
+           {:ok, entry} <- store.fetch(parked_key(resume_id, binding)),
+           {:ok, parked} <- read_entry(entry, binding),
+           true <- parked.parked_at + config.interaction_ttl > System.system_time(:second),
+           {:ok, %{request: request}} <-
+             Authorize.prepare_request(config, parked.params, parked) do
+        {:ok,
+         parked
+         |> Map.take([:client_id, :subject, :parked_at, :consent_decision])
+         |> Map.merge(%{resume_id: resume_id, request: request})}
+      else
+        _ -> {:error, :invalid_resume}
+      end
+    end)
+  end
+
+  defp view_secret!(%Plug.Conn{secret_key_base: secret}) when is_binary(secret) and secret != "", do: secret
+
+  defp view_secret!(_conn),
+    do: raise(ArgumentError, "AttestoPhoenix.Interaction: conn.secret_key_base must be configured")
+
+  defp valid_resume_id?(resume_id) when is_binary(resume_id) and byte_size(resume_id) == 43 do
+    case Base.url_decode64(resume_id, padding: false) do
+      {:ok, bytes} -> byte_size(bytes) == @resume_id_bytes and Base.url_encode64(bytes, padding: false) == resume_id
+      :error -> false
+    end
+  end
+
+  defp valid_resume_id?(_resume_id), do: false
 
   @doc """
   Record `:allow` or `:deny` on a live parked request for the current browser
@@ -413,8 +509,17 @@ defmodule AttestoPhoenix.Interaction do
   def take(%Config{} = config, %Plug.Conn{} = conn, resume_id) when is_binary(resume_id) and resume_id != "" do
     with {:ok, store} <- store(config),
          {:ok, binding} <- browser_binding(config, conn),
-         {:ok, entry} <- store.take(parked_key(resume_id, binding)),
-         %{"params" => params, "client_id" => client_id, "binding" => stored, "parked_at" => parked_at}
+         {:ok, entry} <- store.take(parked_key(resume_id, binding)) do
+      read_entry(entry, binding)
+    else
+      _ -> {:error, :invalid_resume}
+    end
+  end
+
+  def take(%Config{}, %Plug.Conn{}, _resume_id), do: {:error, :invalid_resume}
+
+  defp read_entry(entry, binding) do
+    with %{"params" => params, "client_id" => client_id, "binding" => stored, "parked_at" => parked_at}
          when is_map(params) and is_binary(client_id) and is_binary(stored) and is_integer(parked_at) <- entry,
          true <- Plug.Crypto.secure_compare(stored, binding_hash(binding)),
          since when is_integer(since) and since >= 0 <- Map.get(entry, "prompt_login_since", parked_at) do
@@ -432,8 +537,6 @@ defmodule AttestoPhoenix.Interaction do
       _ -> {:error, :invalid_resume}
     end
   end
-
-  def take(%Config{}, %Plug.Conn{}, _resume_id), do: {:error, :invalid_resume}
 
   @doc false
   # The store key for a parked request: the resume id and the browser binding

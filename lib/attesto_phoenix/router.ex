@@ -299,7 +299,7 @@ defmodule AttestoPhoenix.Router do
       at request time when the configured resource identifier's path does not
       match. More than one entry is a compile-time error: one controller
       document cannot equal two identifiers; multi-resource hosts should use
-      `attesto_mcp`'s `AttestoMCP.Router.attesto_mcp_protected_resource_metadata/2`,
+      `attesto_protected_resource_metadata/2`,
       which serves per-resource documents and per-resource scope catalogs. The
       root and optional single path-inserted document mounted here are two
       locations for the same resource and share
@@ -307,8 +307,8 @@ defmodule AttestoPhoenix.Router do
       `[]` (root only, today's behavior).
     * `:protected_resource_root` - when `false`, does not mount the root
       `/.well-known/oauth-protected-resource` document. Use this when PRM
-      ownership lives elsewhere: a host that mounts `attesto_mcp`'s
-      `attesto_mcp_protected_resource_metadata/2` with its root compatibility
+      ownership lives elsewhere: a host that mounts
+      `attesto_protected_resource_metadata/2` with its root compatibility
       document enabled should pass `protected_resource_root: false` here so
       exactly one package owns each PRM route. Defaults to `true` (today's
       behavior).
@@ -337,8 +337,8 @@ defmodule AttestoPhoenix.Router do
   (§3.3) or the client is required to reject it. A single-resource AS+RS host
   covers all of this with `attesto_routes(protected_resource_paths: ["/mcp"])`;
   a host with multiple protected resources needs per-resource documents and
-  should mount them with `attesto_mcp`'s
-  `AttestoMCP.Router.attesto_mcp_protected_resource_metadata/2` instead
+  should mount them with
+  `attesto_protected_resource_metadata/2` instead
   (passing `protected_resource_root: false` here if that macro also owns the
   root document, so each PRM route has exactly one owner).
   """
@@ -469,8 +469,106 @@ defmodule AttestoPhoenix.Router do
   @doc false
   defmacro __using__(_opts) do
     quote do
-      import AttestoPhoenix.Router, only: [attesto_routes: 0, attesto_routes: 1]
+      import AttestoPhoenix.Router,
+        only: [
+          attesto_routes: 0,
+          attesto_routes: 1,
+          attesto_protected_resource_metadata: 1,
+          attesto_protected_resource_metadata: 2
+        ]
     end
+  end
+
+  @doc """
+  Mount a separate RFC 9728 metadata document for one protected resource.
+
+  Declare at the router root. Options are those of
+  `Attesto.ResourceMetadata.protected_resource/3`; `:scopes` names this
+  resource's own scope catalog. Supply `:issuer`, `:authorization_servers`
+  or a core `:config` and pin `:base_url` / `:origin` to match the protected
+  route. No MCP dependency or MCP scope convention applies.
+
+      attesto_protected_resource_metadata "/documents",
+        base_url: "https://api.example.com",
+        issuer: "https://auth.example.com",
+        scopes: ["documents.read"],
+        root: false
+
+  Protect the corresponding route with `Attesto.Plug.ProtectResource`, using
+  the same `:resource_path` and pin, `resource_audience: :resource`, the
+  operation's `:scopes`, and optionally `:principal` to load its principal.
+
+  A single declaration mounts the root compatibility document by default.
+  For multiple resources set `root: false` on each or explicitly nominate one
+  with `root: true`. If `attesto_routes/1` also runs, set its
+  `protected_resource_root: false` when this macro owns the root.
+
+  Each document answers with CORS headers and has an `OPTIONS` route, as the
+  root document mounted by `attesto_routes/1` does, so a browser-based client
+  can read it. `:cors_origins` takes the same values as the
+  `AttestoPhoenix.Config` option of that name (`:*`, a list of origins, a
+  one-arity predicate, or `false`); when it is omitted the request's
+  AttestoPhoenix config decides, and `:*` applies where there is none.
+  """
+  defmacro attesto_protected_resource_metadata(resource_path, opts \\ []) do
+    quote bind_quoted: [resource_path: resource_path, opts: opts] do
+      if Phoenix.Router.scoped_path(__MODULE__, "/") != "/" do
+        raise ArgumentError, "attesto_protected_resource_metadata must be declared at the router root"
+      end
+
+      {cors_origins, opts} = Keyword.pop(opts, :cors_origins)
+      AttestoPhoenix.Router.validate_resource_cors_origins!(cors_origins)
+
+      {path, root, metadata_opts} = Attesto.ResourceMetadata.mount_options(resource_path, opts)
+
+      private = %{
+        attesto_resource_path: path,
+        attesto_resource_metadata_opts: metadata_opts,
+        attesto_resource_cors_origins: cors_origins
+      }
+
+      metadata_path = Attesto.ResourceMetadata.protected_resource_metadata_path(path)
+      root_path = Attesto.ResourceMetadata.protected_resource_metadata_path("/")
+
+      state =
+        Module.get_attribute(__MODULE__, :attesto_resource_route_state) ||
+          %{count: 0, mounted?: false, explicit?: false}
+
+      {mount_root?, state} = Attesto.ResourceRoutes.mount(root, state)
+      Module.put_attribute(__MODULE__, :attesto_resource_route_state, state)
+
+      get metadata_path, AttestoPhoenix.Controller.ResourceMetadataController, :show, private: private
+      options metadata_path, AttestoPhoenix.Controller.ResourceMetadataController, :preflight, private: private
+
+      if mount_root? and metadata_path != root_path do
+        get root_path, AttestoPhoenix.Controller.ResourceMetadataController, :show, private: private
+        options root_path, AttestoPhoenix.Controller.ResourceMetadataController, :preflight, private: private
+      end
+    end
+  end
+
+  @doc false
+  # Compile-time shape check for the per-resource `:cors_origins` option; the
+  # values are those `AttestoPhoenix.Plug.CORS` resolves at request time.
+  def validate_resource_cors_origins!(policy) when policy in [nil, false, :*, :all, "*"], do: :ok
+
+  def validate_resource_cors_origins!([_ | _] = origins) do
+    if Enum.all?(origins, &is_binary/1),
+      do: :ok,
+      else: raise(ArgumentError, "attesto_protected_resource_metadata: :cors_origins must list origin strings")
+  end
+
+  def validate_resource_cors_origins!(callback) when is_function(callback, 1), do: :ok
+
+  def validate_resource_cors_origins!({module, function}) when is_atom(module) and is_atom(function), do: :ok
+
+  def validate_resource_cors_origins!({module, function, args})
+      when is_atom(module) and is_atom(function) and is_list(args), do: :ok
+
+  def validate_resource_cors_origins!(other) do
+    raise ArgumentError,
+          "attesto_protected_resource_metadata: :cors_origins must be :*, false, a non-empty list of origins, " <>
+            "or a one-arity callback; got #{inspect(other)}"
   end
 
   @doc """
@@ -1460,8 +1558,8 @@ defmodule AttestoPhoenix.Router do
                 "protected-resource metadata controller serves a single document whose " <>
                 "`resource` member must equal the identifier each well-known URI is derived " <>
                 "from (RFC 9728 §3.3), so only one path can be mounted here. For a host with " <>
-                "multiple protected resources use attesto_mcp's " <>
-                "AttestoMCP.Router.attesto_mcp_protected_resource_metadata/2, which serves " <>
+                "multiple protected resources use " <>
+                "AttestoPhoenix.Router.attesto_protected_resource_metadata/2, which serves " <>
                 "per-resource documents."
     end
   end

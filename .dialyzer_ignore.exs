@@ -10,9 +10,9 @@
   {"lib/mix/tasks/attesto_phoenix.backfill_refresh_issuer.ex", :pattern_match, 1},
 
   # Manually assembled Config structs can violate declared struct field types.
-  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {4620, 8}},
-  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {5037, 8}},
-  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {6480, 7}},
+  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {4647, 8}},
+  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {5064, 8}},
+  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {6507, 7}},
 
   # Host callbacks are not constrained at runtime by their declared success type.
   {"lib/attesto_phoenix/credential_issuer.ex", :pattern_match_cov, {643, 8}},

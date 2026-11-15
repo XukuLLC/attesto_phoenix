@@ -1520,8 +1520,8 @@ defmodule AttestoPhoenix.RouterTest do
              )
     end
 
-    test "more than one path is a compile-time error pointing at attesto_mcp's macro" do
-      assert_raise ArgumentError, ~r/attesto_mcp_protected_resource_metadata/, fn ->
+    test "more than one path is a compile-time error pointing at the per-resource macro" do
+      assert_raise ArgumentError, ~r/attesto_protected_resource_metadata/, fn ->
         defmodule TwoPathRouter do
           use Phoenix.Router
           use AttestoPhoenix.Router

@@ -6,6 +6,19 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.18.0] - 2026-11-15
+
+Requires `attesto >= 2.22.0 and < 3.0.0`.
+
+### Added
+
+- `AttestoPhoenix.Router.attesto_protected_resource_metadata/2` mounts one RFC 9728 document per protected resource, each with its own `:scopes`, CORS headers and `OPTIONS` route. Protect the routes with `Attesto.Plug.ProtectResource`. A host with several protected resources no longer needs attesto_mcp for the ones that are not MCP servers.
+- `AttestoPhoenix.Interaction.pending/2` reads a parked authorization request for the current browser without consuming it, and `AttestoPhoenix.Interaction.view_token/2` encrypts a resume id into a handle for the consent page's URL. A host consent page rendered from `pending/2` can be reloaded until the decision is recorded and the request resumes, including after a `prompt=login` or `max_age` sign-in.
+
+### Changed
+
+- The documented consent pattern parks the request and redirects to a host consent route with the encrypted handle, where it used to render the page from the authorization request. Rendering from the authorization request still works, and a page rendered that way after a resume still cannot be reloaded. The consent route needs `conn.secret_key_base`.
+
 ## [4.17.0] - 2026-11-15
 
 ### Security

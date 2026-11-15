@@ -35,6 +35,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   alias AttestoPhoenix.Interaction
   alias AttestoPhoenix.Interaction.BrowserBinding
   alias AttestoPhoenix.Store.EctoConsentGrantStore, as: Grants
+  alias AttestoPhoenix.Store.EctoPARStore
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.PAR.ETS, as: PARStore
   alias AttestoPhoenix.TestRepo
@@ -2296,6 +2297,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     defp consent_with_decision(conn, request, subject) do
       decision = Interaction.consent_decision(conn, request, subject)
       send(self(), {:consent_decision, decision})
+      send(self(), {:consent_request, request})
 
       case decision do
         :allow ->
@@ -2323,6 +2325,95 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert_received {:consent_decision, nil}
       assert_received {:consent_parked, id}
       id
+    end
+
+    for {store, ecto?} <- [{PARStore, false}, {EctoPARStore, true}] do
+      if ecto?, do: @tag(:ecto)
+
+      test "consent view reloads after login and preserves the decision with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+
+        decision_config(
+          par_store: store,
+          repo: TestRepo,
+          authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+          authorize_scope: fn _client, _scope -> {:ok, ~w(openid profile email)} end
+        )
+
+        assert call_query(Map.delete(valid_params(%{"prompt" => "login"}), "scope")).resp_body == "login"
+        assert_received {:parked, login_id}
+        assert call_query(%{"resume" => login_id}).resp_body == "consent"
+        assert_received {:consent_parked, id}
+        assert_received {:consent_request, consent_request}
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+        refute token =~ id
+        assert {:ok, pending} = Interaction.pending(conn, token)
+        assert pending.request == consent_request
+        assert pending.resume_id == id
+        assert pending.subject == "user-42"
+        assert pending.request.scope == ~w(openid profile email)
+        assert pending.request.prompt == ["login"]
+        assert {:ok, ^pending} = Interaction.pending(conn, token)
+        other = put_req_header(conn, "x-browser", "browser-2")
+        assert {:error, :invalid_resume} = Interaction.pending(other, token)
+        assert :ok = Interaction.decide(conn, id, :allow, "user-42")
+        assert {:ok, %{consent_decision: "allow", request: request}} = Interaction.pending(conn, token)
+        assert request == pending.request
+        assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
+        assert_received {:consent_decision, :allow}
+        assert {:error, :invalid_resume} = Interaction.pending(conn, token)
+        assert {:error, :invalid_resume} = Interaction.decide(conn, id, :deny, "user-42")
+      end
+
+      if ecto?, do: @tag(:ecto)
+
+      test "consent view rejects invalid handles, expiry and rebuild failures with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+        salt = "attesto_phoenix.interaction.view"
+
+        expired = Plug.Crypto.encrypt(conn.secret_key_base, salt, id, signed_at: System.system_time(:second) - 601)
+        invalid = Plug.Crypto.encrypt(conn.secret_key_base, salt, %{"resume" => id})
+
+        for bad <- [token <> "!", expired, invalid, nil, 42] do
+          assert {:error, :invalid_resume} = Interaction.pending(conn, bad)
+        end
+
+        config = Config.resolve!(conn)
+        bad_config = %{config | authorize_scope: fn _, _ -> {:error, :invalid_scope} end}
+        bad_conn = put_private(conn, :attesto_phoenix_config, bad_config)
+        assert {:error, :invalid_resume} = Interaction.pending(bad_conn, token)
+        assert {:ok, %{resume_id: ^id}} = Interaction.pending(conn, token)
+        assert {:ok, %{consent_decision: nil}} = Interaction.take(config, conn, id)
+        assert {:error, :invalid_resume} = Interaction.pending(conn, token)
+
+        expired_id = park_for_decision()
+        expired_token = Interaction.view_token(conn, expired_id)
+        key = Interaction.parked_key(expired_id, "browser-1")
+
+        Config.with_request_config(config, fn ->
+          assert {:ok, entry} = store.take(key)
+          assert :ok = store.put(key, entry, 1)
+        end)
+
+        Process.sleep(1_100)
+        assert {:error, :invalid_resume} = Interaction.pending(conn, expired_token)
+      end
+    end
+
+    test "consent handles require the endpoint secret key base" do
+      decision_config()
+      id = park_for_decision()
+      assert_raise ArgumentError, ~r/conn.secret_key_base/, fn -> Interaction.view_token(decision_conn(), id) end
+      assert_raise ArgumentError, ~r/conn.secret_key_base/, fn -> Interaction.pending(decision_conn(), "token") end
+      conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+      assert_raise ArgumentError, ~r/invalid resume id/, fn -> Interaction.view_token(conn, "invalid") end
     end
 
     test "decide refuses other browsers and subjects without changing the entry" do
