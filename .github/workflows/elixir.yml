@@ -120,11 +120,11 @@ jobs:
         if: ${{ matrix.lint }}
         run: mix credo --strict
 
-      - name: Build docs
+      - name: Build docs (warnings as errors)
         if: ${{ matrix.lint }}
         env:
           MIX_ENV: dev
-        run: mix docs
+        run: mix docs --warnings-as-errors
 
       - name: Compile minimum consumer without optional Req
         # Exercise the exact source checkout above while the fixture keeps the

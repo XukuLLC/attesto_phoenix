@@ -53,7 +53,7 @@ Requires attesto >= 2.20.0 (was >= 2.19.0).
 - `AttestoPhoenix.Plug.Authenticate` and `AttestoPhoenix.ProtectedResource` no
   longer fall back to the request `Host` header for DPoP `htu` verification:
   bundled `/userinfo`, `/credential`, and `/deferred_credential` endpoints
-  use their configured endpoint URLs, `Config.new/1` defaults `:resource_origin`
+  use their configured endpoint URLs, `AttestoPhoenix.Config.new/1` defaults `:resource_origin`
   to the origin of `:audience` when neither `:resource_origin` nor `:htu` is
   set with DPoP enabled, `Authenticate.init/1` refuses DPoP mounts with no
   pinned target URI and refuses malformed `:htu` options, and a `nil` return
@@ -759,14 +759,14 @@ Requires `attesto >= 2.13.0`.
 
   To pin the origin, add `resource_origin: "https://api.example.com"` (the
   origin of your protected resources) to `config :my_app,
-  AttestoPhoenix.Config` or to the options given to `Config.new/1`. It is not
+  AttestoPhoenix.Config` or to the options given to `AttestoPhoenix.Config.new/1`. It is not
   the issuer: the authorization server may live on another origin, and
   `:issuer` is not consulted. When the bundled UserInfo or credential
   endpoints are served on a different origin than the host's own resources,
   set `:htu` instead, or pin each route with
   `plug AttestoPhoenix.Plug.Authenticate, origin: "..."`.
   `:resource_origin` must be an `https` URL with a host, an optional port, and
-  no path, userinfo, query, or fragment, and `Config.new/1` raises when it is
+  no path, userinfo, query, or fragment, and `AttestoPhoenix.Config.new/1` raises when it is
   combined with `:htu`.
 
   Behaviour change: none until `:resource_origin` is set. Without it the

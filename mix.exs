@@ -198,6 +198,14 @@ defmodule AttestoPhoenix.MixProject do
       main: "readme",
       source_ref: "v#{@version}",
       source_url: @url,
+      # Hidden functions that the changelog and one moduledoc name; render
+      # them as code without links.
+      skip_code_autolink_to: [
+        "Attesto.Plug.Authenticate.init/1",
+        "Attesto.URI.valid_port?/2",
+        "AttestoPhoenix.Plug.Authenticate.init/1",
+        "AttestoPhoenix.RedirectURIRegistration.valid?/2"
+      ],
       extras: [
         "README.md",
         "guides/upgrade_4_0.md",
