@@ -40,7 +40,7 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   authorization action must not cross a plain-HTTP hop).
   """
 
-  use AttestoPhoenix.Controller, formats: [:html, :json]
+  use AttestoPhoenix.Controller, cors: false, formats: [:html, :json]
 
   alias Attesto.DeviceCode
   alias Attesto.Scope

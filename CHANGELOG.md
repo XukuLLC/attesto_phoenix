@@ -6,6 +6,31 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.17.0] - 2026-11-15
+
+### Security
+
+- A subject, client or session revocation that runs while an authorization code is being exchanged now revokes the access token and the refresh family that exchange produces. `AttestoPhoenix.Store.EctoCodeStore.delete_unconsumed/1` marks rows that were taken and not yet finalized, and finalization revokes what they minted. The ETS store gets the same protection from attesto 2.21.0.
+
+### Breaking
+
+- Requires `attesto >= 2.21.0 and < 3.0.0`.
+- `AttestoPhoenix.Verifier` fetches and enforces credential status references. A revoked or suspended credential, an invalid list and a failed fetch reject the presentation. `:verifier_status_resolver` replaces the fetch; no option turns enforcement off.
+- CORS (RFC 10017) is on by default. Every endpoint except the authorization, device verification, end-session and check-session endpoints answers with `Access-Control-Allow-Origin: *` and never with `Access-Control-Allow-Credentials`, and `AttestoPhoenix.Router` mounts an `OPTIONS` route beside each of them. `:cors_origins` takes a list of origins, a one-arity predicate, or `false`.
+- `:client_assertion_audiences` accepts only the issuer and this server's own token, PAR and backchannel authentication endpoint URLs, whether given as a list or returned by a callback. The issuer-only default is unchanged.
+- Client registration refuses a redirect URI whose query carries an authorization request or response parameter. 4.16.0 refused response parameters only.
+- Token exchange refuses a `requested_token_type` other than `urn:ietf:params:oauth:token-type:access_token` with `invalid_request`, unless `:identity_chaining` is enabled and lists that type.
+- A CIMD metadata fetch that fails transiently answers `503 temporarily_unavailable`, where it answered 400. A malformed, invalid or refused document still answers 400.
+- The credential issuer issues `dc+sd-jwt` only, and Ed25519 and Ed448 signing keys sign as `Ed25519` and `Ed448`; see the attesto 2.21.0 entry for both.
+- Removed `AttestoPhoenix.PinnedHTTP`. `Attesto.PinnedHTTP` replaces it.
+
+### Added
+
+- OpenID4VCI 1.0 Credential Request decryption and Credential Response encryption at the credential and deferred credential endpoints, with `zip: "DEF"` on the response when the wallet asks for it. `:credential_encryption_keystore` supplies the P-256 keys and must share no key with `:keystore`; `:credential_encryption_required` makes encryption mandatory. A request that asks for an encrypted response has to be encrypted itself.
+- Identity chaining (`draft-ietf-oauth-identity-chaining-17`), off by default under `:identity_chaining`. A token exchange that names an allowed authorization server in `audience` or `resource`, or that sends `requested_token_type` `urn:ietf:params:oauth:token-type:jwt` or `urn:ietf:params:oauth:token-type:id-jag`, returns a JWT authorization grant with `token_type: "N_A"` and the matching `issued_token_type`. The authorization server metadata advertises `identity_chaining_requested_token_types_supported`.
+- CIMD `draft-ietf-oauth-client-id-metadata-document-03`: `AttestoPhoenix.ClientIdMetadata.auth_methods/1`, `supported_by_server?/2`, `transient_error?/1` and `prefetch_logo/3`. `prefetch_logo/3` fetches a `logo_uri` through the same address screening as the metadata document and accepts PNG, JPEG, GIF and WebP whose bytes match the declared type.
+- `AttestoPhoenix.Plug.CORS`, for a host that mounts its own protected routes and wants the same CORS policy on them.
+
 ## [4.16.0] - 2026-11-14
 
 Requires attesto >= 2.20.0 (was >= 2.19.0).
@@ -312,6 +337,8 @@ reusing the login.
   resume flow (OpenID Connect Core §3.1.2.4).
 
 ### Changed
+
+- Credential Response metadata advertises outbound `DEF` compression; the issuer compresses encrypted responses only when the wallet explicitly requests it. Compressed inbound requests remain refused.
 
 - Parking a resumed request for consent now retains the original parameters
   and first park time. `prompt=login` still requires authentication at or

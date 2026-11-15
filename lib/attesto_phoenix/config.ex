@@ -42,6 +42,47 @@ defmodule AttestoPhoenix.Config do
       Presentation requests generate and persist a fresh P-256 recipient key
       per session for both `direct_post.jwt` and `dc_api.jwt`; this setting is
       not used by that path.
+    * `:credential_encryption_keystore` - optional `Attesto.Keystore` module
+      providing EC P-256 keys (`signing_pem/0` and `verification_pems/0`) for
+      OID4VCI Credential Request and Credential Response encryption (§8.2,
+      §10, §12.2.4). Must be distinct from, and not share key material with,
+      the token-signing `:keystore`. When configured, the issuer metadata
+      advertises both `credential_request_encryption` and
+      `credential_response_encryption`, decrypts `application/jwt` credential
+      and deferred credential requests, and encrypts `application/jwt`
+      responses when requested.
+    * `:credential_encryption_required` - boolean (default `false`)
+      controlling `encryption_required` in the advertised OID4VCI encryption
+      metadata and requiring encrypted `application/jwt` requests with
+      `credential_response_encryption`. May be `true` only when
+      `:credential_encryption_keystore` is configured.
+    * `:cors_origins` - which origins receive CORS response headers
+      (RFC 10017 §6.3.3.4) from the metadata, JWKS, token, PAR, revocation,
+      introspection, registration, UserInfo, credential and verifier
+      endpoints. `:*` (the default) sends `Access-Control-Allow-Origin: *`.
+      A non-empty list of origins, or a one-arity predicate receiving the
+      request `Origin`, echoes a matching origin and adds `Vary: origin`.
+      `false` sends no CORS headers. `Access-Control-Allow-Credentials` is
+      never sent, and the authorization, device verification, end-session
+      and check-session endpoints never receive CORS headers.
+    * `:identity_chaining` - keyword options for issuing a JWT authorization
+      grant to another authorization server from token exchange
+      (`draft-ietf-oauth-identity-chaining-17`). Off by default.
+        * `:enabled` - `true` to turn it on.
+        * `:allowed_audiences` - the issuer identifiers a grant may be
+          minted for. Required when `:enabled` is `true`, unless
+          `:authorize_target` is set.
+        * `:authorize_target` - optional callback receiving the client, the
+          requested target, the requested resources and the subject token's
+          claims. Return `:ok`, or `{:ok, target}` to substitute the target;
+          any other result refuses the request with `invalid_target`.
+        * `:requested_token_types` - the `requested_token_type` values
+          accepted, from `urn:ietf:params:oauth:token-type:jwt` (the
+          default) and `urn:ietf:params:oauth:token-type:id-jag`. A request
+          that omits the parameter and names an allowed audience in
+          `audience` or `resource` gets the first.
+        * `:assertion_lifetime_seconds` - maximum grant lifetime, default
+          `60`; a grant never outlives the subject token.
     * `:repo` - `Ecto.Repo` module used by the Ecto-backed code, refresh,
       nonce, and replay stores.
     * `:load_client` - `(client_id -> {:ok, client} | {:error, :not_found} |
@@ -877,10 +918,12 @@ defmodule AttestoPhoenix.Config do
       deployment whose clients still send an endpoint URL (older RFC 7523
       clients, FAPI-CIBA test plans) can list it explicitly, for example
       `fn config -> [config.issuer, AttestoPhoenix.Config.token_endpoint_url(config)] end`;
-      accepted non-issuer audiences emit
+      only this server's issuer and its own token, PAR, and backchannel
+      authentication endpoint URLs are accepted, and accepted non-issuer
+      audiences emit
       `[:attesto_phoenix, :client_authentication, :legacy_assertion_audience]`.
-      Assertions still carry exactly one audience, including a single-member
-      array.
+      Assertions must carry a single scalar `aud` string; JSON arrays (including
+      single-member arrays) are rejected.
     * `:client_auth_enforce_fapi_alg_policy` - additionally enforce FAPI's RSA
       modulus and Edwards-curve restrictions for `private_key_jwt`. When unset,
       this defaults to `true` if `:client_auth_signing_algs` is omitted and to
@@ -1092,7 +1135,7 @@ defmodule AttestoPhoenix.Config do
       tokens with no resource owner in the loop. Read it back with
       `registration_grant_types/1`.
     * `:client_id_metadata` - Client ID Metadata Document support - CIMD
-      (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG). A
+      (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG). A
       keyword list configuring whether (and how) the authorization server
       dereferences an HTTPS `client_id` URL to a client metadata document. The
       whole feature is off by default; when `enabled: true`, discovery
@@ -1199,6 +1242,14 @@ defmodule AttestoPhoenix.Config do
       or `{:error, reason}` to refuse it. Accepts a function, `{module, function}`,
       or `{module, function, extra_args}`. Forwarded as `:certificate_trust`;
       never persisted in the session and cannot override core validation.
+    * `:verifier_status_resolver` - optional 2-arity callback receiving the
+      signed credential's status URI and requested media type. Returns
+      `{:ok, binary}` or `{:error, reason}`. The default uses
+      `Attesto.StatusList.fetch/3`: HTTPS, public addresses, pinned DNS, no
+      redirects, a five-second deadline and a 1 MiB cap. Status references
+      are always enforced; fetch and verification failures reject the
+      presentation. A custom callback owns equivalent transport protection.
+
     * `:verifier_haip` - boolean, default `true`, forwarded as `:haip` for
       certificate verification. HAIP forbids self-signed leaves and chains
       containing a trust anchor. `false` retains certificate path validation.
@@ -1472,6 +1523,7 @@ defmodule AttestoPhoenix.Config do
     :status_list_store,
     :presentation_session_store,
     :verifier_encryption_keystore,
+    :credential_encryption_keystore,
     :verifier_client_id,
     :verifier_client_id_scheme,
     :verifier_x5c,
@@ -1512,6 +1564,7 @@ defmodule AttestoPhoenix.Config do
     require_pkce: true,
     require_pushed_authorization_requests: false,
     authorization_response_iss: true,
+    cors_origins: :*,
     require_https: true,
     trusted_proxies: [],
     response_modes_supported: Attesto.AuthorizationRequest.supported_response_modes(),
@@ -1545,6 +1598,7 @@ defmodule AttestoPhoenix.Config do
     registration_enabled: false,
     client_id_metadata: [],
     jwt_bearer: [],
+    identity_chaining: [],
     native_apps: [],
     resource_indicators: [],
     device_authorization: [],
@@ -1553,8 +1607,10 @@ defmodule AttestoPhoenix.Config do
     logout: [],
     session_management: [],
     presentation_response_mode: "direct_post",
+    credential_encryption_required: false,
     verifier_haip: true,
     verifier_accepted_algs: nil,
+    verifier_status_resolver: nil,
     basic_realm: "OAuth"
   ]
 
@@ -1646,6 +1702,7 @@ defmodule AttestoPhoenix.Config do
           openid_provider: boolean(),
           require_pushed_authorization_requests: boolean(),
           authorization_response_iss: boolean(),
+          cors_origins: :* | :all | String.t() | [String.t()] | false | callback(),
           authorization_endpoint: String.t() | nil,
           userinfo_endpoint: String.t() | :derived | nil,
           replay_check: callback() | nil,
@@ -1705,6 +1762,7 @@ defmodule AttestoPhoenix.Config do
           registration_enabled: boolean(),
           client_id_metadata: keyword(),
           jwt_bearer: keyword(),
+          identity_chaining: keyword(),
           native_apps: keyword(),
           resource_indicators: keyword(),
           device_code_store: module() | nil,
@@ -1714,6 +1772,8 @@ defmodule AttestoPhoenix.Config do
           status_list_store: module() | nil,
           presentation_session_store: module() | nil,
           verifier_encryption_keystore: module() | nil,
+          credential_encryption_keystore: module() | nil,
+          credential_encryption_required: boolean(),
           verifier_client_id: String.t() | nil,
           verifier_client_id_scheme: String.t() | nil,
           verifier_x5c: [binary()] | nil,
@@ -1721,6 +1781,7 @@ defmodule AttestoPhoenix.Config do
           verifier_certificate_trust: callback() | nil,
           verifier_issuer_trust: {:issuer_jwks, map() | list()} | {:resolve_issuer, callback()} | nil,
           verifier_haip: boolean(),
+          verifier_status_resolver: callback() | nil,
           verifier_dns: String.t() | nil,
           verifier_dc_api_origin: String.t() | nil,
           verifier_accepted_algs: [String.t()] | nil,
@@ -1815,6 +1876,7 @@ defmodule AttestoPhoenix.Config do
         request_object_policy: request_object_policy,
         client_id_metadata: normalize_client_id_metadata(config.client_id_metadata),
         jwt_bearer: normalize_jwt_bearer(config.jwt_bearer),
+        identity_chaining: normalize_identity_chaining(config.identity_chaining),
         native_apps: normalize_native_apps(config.native_apps),
         resource_indicators: normalize_resource_indicators(config.resource_indicators),
         mtls_endpoint_aliases: normalize_mtls_endpoint_aliases(config.mtls_endpoint_aliases),
@@ -1855,7 +1917,7 @@ defmodule AttestoPhoenix.Config do
   end
 
   # The CIMD defaults the host's `:client_id_metadata` keyword list is merged
-  # over (`draft-ietf-oauth-client-id-metadata-document-02` §9). The whole
+  # over (`draft-ietf-oauth-client-id-metadata-document-03` §9). The whole
   # feature is off by default; a host enables it with `enabled: true` and may
   # override any individual member. The merged list is what `client_id_metadata/1`
   # returns and what the resolver / discovery wiring read.
@@ -1911,6 +1973,25 @@ defmodule AttestoPhoenix.Config do
 
   defp normalize_jwt_bearer(opts) when is_list(opts) do
     Keyword.merge(@jwt_bearer_defaults, opts)
+  end
+
+  @identity_chaining_defaults [
+    enabled: false,
+    allowed_audiences: [],
+    requested_token_types: ["urn:ietf:params:oauth:token-type:jwt"],
+    assertion_lifetime_seconds: 60,
+    authorize_target: nil
+  ]
+
+  @supported_identity_chaining_token_types [
+    "urn:ietf:params:oauth:token-type:jwt",
+    "urn:ietf:params:oauth:token-type:id-jag"
+  ]
+
+  defp normalize_identity_chaining(nil), do: @identity_chaining_defaults
+
+  defp normalize_identity_chaining(opts) when is_list(opts) do
+    Keyword.merge(@identity_chaining_defaults, opts)
   end
 
   # RFC 8252 (BCP 212) native-app profile.
@@ -2278,6 +2359,10 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
+  @doc "The optional status-list fetch callback; nil selects the screened default fetcher."
+  @spec verifier_status_resolver(t()) :: callback() | nil
+  def verifier_status_resolver(%__MODULE__{verifier_status_resolver: callback}), do: callback
+
   @doc "The configured keystore used for ID-token and authorization-server signing."
   @spec keystore(t()) :: module()
   def keystore(%__MODULE__{keystore: keystore}), do: keystore
@@ -2387,7 +2472,7 @@ defmodule AttestoPhoenix.Config do
   Returns the merged, defaulted Client ID Metadata Document (CIMD) options.
 
   This is the host's `:client_id_metadata` keyword list merged over the library
-  defaults (`draft-ietf-oauth-client-id-metadata-document-02` §9), so every
+  defaults (`draft-ietf-oauth-client-id-metadata-document-03` §9), so every
   recognized member (`:enabled`, `:fetcher`, `:cache`, `:allow_loopback`,
   `:max_document_bytes`, `:request_timeout_ms`, `:cache_ttl_bounds`,
   `:require_same_origin_redirect_uri`, `:allowed_hosts`, `:blocked_hosts`) is
@@ -2581,6 +2666,22 @@ defmodule AttestoPhoenix.Config do
   end
 
   @doc """
+  The merged, defaulted OAuth Identity and Authorization Chaining Across Domains
+  (`draft-ietf-oauth-identity-chaining-17` / RFC 10092) options.
+  """
+  @spec identity_chaining(t()) :: keyword()
+  def identity_chaining(%__MODULE__{identity_chaining: opts}), do: opts
+
+  @doc """
+  Returns `true` iff Trust Domain A identity-chaining ID-JAG issuance is enabled
+  (`identity_chaining: [enabled: true, ...]`).
+  """
+  @spec identity_chaining_enabled?(t()) :: boolean()
+  def identity_chaining_enabled?(%__MODULE__{} = config) do
+    config |> identity_chaining() |> Keyword.get(:enabled, false) == true
+  end
+
+  @doc """
   Returns `true` iff the Identity Assertion JWT Authorization Grant (ID-JAG /
   `jwt-bearer`) is enabled.
 
@@ -2638,6 +2739,14 @@ defmodule AttestoPhoenix.Config do
   @doc "The dedicated EC P-256 keystore for encrypted OID4VP responses, or `nil`."
   @spec verifier_encryption_keystore(t()) :: module() | nil
   def verifier_encryption_keystore(%__MODULE__{verifier_encryption_keystore: keystore}), do: keystore
+
+  @doc "The EC P-256 keystore for OID4VCI Credential Request and Response encryption, or `nil`."
+  @spec credential_encryption_keystore(t()) :: module() | nil
+  def credential_encryption_keystore(%__MODULE__{credential_encryption_keystore: keystore}), do: keystore
+
+  @doc "Whether OID4VCI Credential Request and Response encryption is mandatory (default `false`)."
+  @spec credential_encryption_required(t()) :: boolean()
+  def credential_encryption_required(%__MODULE__{credential_encryption_required: required}), do: required
 
   @doc "The verifier client identifier used as the OID4VP presentation audience."
   @spec verifier_client_id(t()) :: String.t() | nil
@@ -3476,7 +3585,7 @@ defmodule AttestoPhoenix.Config do
         audiences when is_list(audiences) -> audiences
       end
 
-    validate_assertion_audience_list!(audiences, ":client_assertion_audiences callback")
+    validate_assertion_audience_list!(audiences, config, ":client_assertion_audiences callback")
   end
 
   @doc """
@@ -3798,6 +3907,7 @@ defmodule AttestoPhoenix.Config do
     forwarded_cert_der: 1,
     client_certificate_chain_validated?: 2,
     verifier_certificate_trust: 1,
+    verifier_status_resolver: 2,
     introspection_authorize: 2,
     build_credential: 3,
     build_deferred_credential: 2,
@@ -3914,7 +4024,8 @@ defmodule AttestoPhoenix.Config do
     # These two options intentionally have narrower contracts than the general
     # callback type: audiences may be a static list or a one-argument function,
     # while a list of principal kinds is also a valid static value.
-    validate_client_assertion_audiences!(config.client_assertion_audiences)
+    validate_client_assertion_audiences!(config.client_assertion_audiences, config)
+    validate_cors_origins!(config.cors_origins)
 
     case config.principal_kinds do
       nil -> :ok
@@ -3939,43 +4050,81 @@ defmodule AttestoPhoenix.Config do
     )
   end
 
-  defp validate_client_assertion_audiences!(nil), do: :ok
+  defp validate_client_assertion_audiences!(nil, _config), do: :ok
 
-  defp validate_client_assertion_audiences!(audiences) when is_list(audiences) do
-    _ = validate_assertion_audience_list!(audiences, ":client_assertion_audiences")
+  defp validate_client_assertion_audiences!(audiences, config) when is_list(audiences) do
+    _ = validate_assertion_audience_list!(audiences, config, ":client_assertion_audiences")
     :ok
   end
 
-  defp validate_client_assertion_audiences!(callback) when is_function(callback, 1), do: :ok
+  defp validate_client_assertion_audiences!(callback, _config) when is_function(callback, 1), do: :ok
 
-  defp validate_client_assertion_audiences!(_invalid) do
+  defp validate_client_assertion_audiences!(_invalid, _config) do
     raise ArgumentError,
           "AttestoPhoenix.Config: :client_assertion_audiences must be a non-empty list of " <>
-            "distinct absolute URI strings or a one-argument function returning such a list."
+            "distinct absolute URI strings from this server's issuer and token, PAR, or " <>
+            "backchannel authentication endpoint URLs, or a one-argument function returning such a list."
   end
 
-  defp validate_assertion_audience_list!(audiences, source) when is_list(audiences) and audiences != [] do
-    if Enum.all?(audiences, &absolute_uri?/1) and Enum.uniq(audiences) == audiences do
+  defp validate_cors_origins!(policy) when policy in [:*, :all, "*", false], do: :ok
+
+  defp validate_cors_origins!(origins) when is_list(origins) and origins != [] do
+    if Enum.all?(origins, &valid_cors_origin?/1) and Enum.uniq(origins) == origins do
+      :ok
+    else
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :cors_origins must be a non-empty list of distinct HTTP/HTTPS origins"
+    end
+  end
+
+  defp validate_cors_origins!(callback) do
+    case callback_contract(callback, 1) do
+      :ok ->
+        :ok
+
+      _ ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :cors_origins must be :*, false, a non-empty list of origins, or a 1-arity callback"
+    end
+  end
+
+  defp valid_cors_origin?(value) when is_binary(value) do
+    uri = URI.parse(value)
+
+    uri.scheme in ["http", "https"] and is_binary(uri.host) and uri.host != "" and
+      is_nil(uri.userinfo) and uri.path in [nil, ""] and is_nil(uri.query) and is_nil(uri.fragment)
+  end
+
+  defp valid_cors_origin?(_), do: false
+
+  defp permitted_client_assertion_audiences(%__MODULE__{} = config) do
+    [
+      config.issuer,
+      token_endpoint_url(config),
+      par_endpoint_url(config),
+      backchannel_authentication_endpoint_url(config)
+    ]
+  end
+
+  defp validate_assertion_audience_list!(audiences, config, source) when is_list(audiences) and audiences != [] do
+    permitted = permitted_client_assertion_audiences(config)
+
+    if Enum.all?(audiences, &(&1 in permitted)) and Enum.uniq(audiences) == audiences do
       audiences
     else
       raise ArgumentError,
             "AttestoPhoenix.Config: #{source} must return a non-empty list of distinct, " <>
-              "non-empty absolute URI strings; got #{inspect(audiences)}."
+              "non-empty absolute URI strings chosen from #{inspect(permitted)}; got #{inspect(audiences)}."
     end
   end
 
-  defp validate_assertion_audience_list!(audiences, source) do
+  defp validate_assertion_audience_list!(audiences, config, source) do
+    permitted = permitted_client_assertion_audiences(config)
+
     raise ArgumentError,
           "AttestoPhoenix.Config: #{source} must return a non-empty list of distinct, " <>
-            "non-empty absolute URI strings; got #{inspect(audiences)}."
+            "non-empty absolute URI strings chosen from #{inspect(permitted)}; got #{inspect(audiences)}."
   end
-
-  defp absolute_uri?(value) when is_binary(value) and value != "" do
-    String.valid?(value) and Attesto.URI.valid_percent_encoding?(value) and
-      match?({:ok, %URI{scheme: scheme}} when is_binary(scheme) and scheme != "", URI.new(value))
-  end
-
-  defp absolute_uri?(_value), do: false
 
   # The behaviour-module Config keys, each paired with the behaviour module it
   # is expected to implement. Used for boot-time conformance validation.
@@ -4554,6 +4703,48 @@ defmodule AttestoPhoenix.Config do
     :ok
   end
 
+  defp validate_identity_chaining!(%__MODULE__{} = config) do
+    if identity_chaining_enabled?(config) do
+      opts = identity_chaining(config)
+      validate_chaining_audiences!(opts)
+      validate_chaining_token_types!(Keyword.get(opts, :requested_token_types, []))
+      validate_chaining_lifetime!(Keyword.get(opts, :assertion_lifetime_seconds))
+    end
+
+    :ok
+  end
+
+  defp validate_chaining_audiences!(opts) do
+    allowed = Keyword.get(opts, :allowed_audiences, [])
+    authorize_target = Keyword.get(opts, :authorize_target)
+    valid_list? = is_list(allowed) and allowed != [] and Enum.all?(allowed, &(is_binary(&1) and &1 != ""))
+
+    if not valid_list? and is_nil(authorize_target) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: identity_chaining requires a non-empty :allowed_audiences " <>
+              "list or an :authorize_target callback when :enabled is true."
+    end
+  end
+
+  defp validate_chaining_token_types!(requested_types) do
+    valid? =
+      is_list(requested_types) and requested_types != [] and
+        Enum.all?(requested_types, &(&1 in @supported_identity_chaining_token_types))
+
+    if !valid? do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: identity_chaining :requested_token_types must be a non-empty " <>
+              "subset of #{inspect(@supported_identity_chaining_token_types)}."
+    end
+  end
+
+  defp validate_chaining_lifetime!(lifetime) when is_integer(lifetime) and lifetime > 0, do: :ok
+
+  defp validate_chaining_lifetime!(_lifetime) do
+    raise ArgumentError,
+          "AttestoPhoenix.Config: identity_chaining :assertion_lifetime_seconds must be a positive integer."
+  end
+
   # Req is optional, so its bundled adapters are compiled only when a consumer
   # actually resolves the dependency. Keep disabled configurations Req-free,
   # but validate the selected module and callback whenever an outbound path is
@@ -4774,6 +4965,7 @@ defmodule AttestoPhoenix.Config do
     validate_dpop_nonce!(config)
     validate_wallet_attestation_challenge_store!(config.wallet_attestation_challenge_store)
     validate_key_attestation!(config)
+    validate_credential_encryption!(config)
     validate_authorization_grant_id_claim!(config)
     validate_authorization_code_private_context!(config)
     validate_supported_value_lists!(config)
@@ -4808,6 +5000,7 @@ defmodule AttestoPhoenix.Config do
     validate_registration_default_scope!(config)
     validate_registration_grant_types!(config)
     validate_jwt_bearer!(config)
+    validate_identity_chaining!(config)
     validate_req_adapters!(config)
     validate_behaviour_modules!(config)
     validate_algorithm_policy!(config)
@@ -5511,6 +5704,7 @@ defmodule AttestoPhoenix.Config do
   @strict_nested_boolean_keys [
     client_id_metadata: [:enabled, :allow_loopback, :require_same_origin_redirect_uri],
     jwt_bearer: [:enabled],
+    identity_chaining: [:enabled],
     device_authorization: [:enabled],
     ciba: [
       :enabled,
@@ -6270,6 +6464,124 @@ defmodule AttestoPhoenix.Config do
   # set it must be an absolute path reference.
   defp validate_optional_path!(_key, nil), do: :ok
   defp validate_optional_path!(key, value), do: validate_path!(key, value)
+
+  defp validate_credential_encryption!(%__MODULE__{} = config) do
+    required = config.credential_encryption_required
+    keystore = config.credential_encryption_keystore
+
+    if not is_boolean(required) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :credential_encryption_required must be a boolean; got #{inspect(required)}."
+    end
+
+    if required and is_nil(keystore) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :credential_encryption_required is true, so :credential_encryption_keystore must be configured."
+    end
+
+    case keystore do
+      nil ->
+        :ok
+
+      module when is_atom(module) ->
+        case Code.ensure_loaded(module) do
+          {:error, _reason} ->
+            raise ArgumentError,
+                  "AttestoPhoenix.Config: :credential_encryption_keystore #{inspect(module)} cannot be loaded."
+
+          {:module, ^module} ->
+            validate_behaviour_callback!(:credential_encryption_keystore, Attesto.Keystore, module, {:signing_pem, 0})
+
+            validate_behaviour_callback!(
+              :credential_encryption_keystore,
+              Attesto.Keystore,
+              module,
+              {:verification_pems, 0}
+            )
+
+            _metadata = Attesto.CredentialEncryption.request_metadata(module, encryption_required: required)
+            validate_credential_encryption_keystore_distinct!(config.keystore, module)
+            :ok
+        end
+
+      other ->
+        raise ArgumentError,
+              "AttestoPhoenix.Config: :credential_encryption_keystore must be a module implementing Attesto.Keystore; " <>
+                "got #{inspect(other)}."
+    end
+  end
+
+  defp validate_credential_encryption_keystore_distinct!(signing_keystore, enc_keystore) do
+    if signing_keystore == enc_keystore do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :credential_encryption_keystore must be distinct from :keystore (#{inspect(enc_keystore)})."
+    end
+
+    if not MapSet.disjoint?(keystore_kids(signing_keystore), keystore_kids(enc_keystore)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :credential_encryption_keystore must not share keys with :keystore."
+    end
+  end
+
+  defp keystore_kids(module) when is_atom(module) do
+    pems =
+      []
+      |> prepend_exported(module, :signing_pem)
+      |> concat_exported(module, :verification_pems)
+
+    jwks = prepend_exported([], module, :signing_jwk)
+
+    pem_kids = Enum.flat_map(pems, &safe_pem_kid/1)
+    jwk_kids = Enum.flat_map(jwks, &safe_jwk_kid/1)
+    MapSet.new(pem_kids ++ jwk_kids)
+  end
+
+  defp prepend_exported(list, module, fun) do
+    if function_exported?(module, fun, 0) do
+      case apply(module, fun, []) do
+        nil -> list
+        value -> [value | list]
+      end
+    else
+      list
+    end
+  rescue
+    _ -> list
+  end
+
+  defp concat_exported(list, module, fun) do
+    if function_exported?(module, fun, 0) do
+      case apply(module, fun, []) do
+        values when is_list(values) -> values ++ list
+        _ -> list
+      end
+    else
+      list
+    end
+  rescue
+    _ -> list
+  end
+
+  defp safe_pem_kid(pem) when is_binary(pem) and pem != "" do
+    [Attesto.Key.kid(pem)]
+  rescue
+    _ -> []
+  catch
+    _, _ -> []
+  end
+
+  defp safe_pem_kid(_), do: []
+
+  defp safe_jwk_kid(%JOSE.JWK{} = jwk) do
+    case Attesto.Thumbprint.of_jwk(jwk) do
+      {:ok, kid} -> [kid]
+      _ -> []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp safe_jwk_kid(_), do: []
 
   defp validate_verifier_client_id!(nil), do: :ok
 

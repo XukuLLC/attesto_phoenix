@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.Controller.CredentialOfferController do
   @moduledoc """
   OID4VCI by-reference Credential Offer endpoint
-  (`draft-ietf-oauth-openid4vci` §4.1.3).
+  (`OpenID4VCI 1.0`, 2025-09-16, §4.1.3).
 
   Serves the stored Credential Offer object a wallet dereferences from a
   `credential_offer_uri`. The offer is created and stored elsewhere - by the

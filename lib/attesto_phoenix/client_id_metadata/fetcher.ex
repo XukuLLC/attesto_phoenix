@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Fetcher do
   @moduledoc """
   Behaviour for dereferencing a Client ID Metadata Document URL - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL

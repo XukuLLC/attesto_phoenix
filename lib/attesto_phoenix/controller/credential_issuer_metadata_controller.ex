@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   @moduledoc """
   OID4VCI Credential Issuer Metadata endpoint
-  (`draft-ietf-oauth-openid4vci` §11.2).
+  (`OpenID4VCI 1.0`, 2025-09-16, §11.2).
 
   Builds the issuer document from the configured credential catalog and the
   convention-derived credential and nonce endpoint paths.
@@ -12,9 +12,9 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   import Plug.Conn,
     only: [get_req_header: 2, put_resp_content_type: 2, put_resp_header: 3, send_resp: 3]
 
-  alias Attesto.CredentialIssuerMetadata
+  alias Attesto.{CredentialEncryption, CredentialIssuerMetadata}
   alias AttestoPhoenix.{Config, HTTPAccept}
-  alias AttestoPhoenix.Controller.MetadataSupport
+  alias AttestoPhoenix.Controller.{MetadataSupport, OID4VCIHelpers}
 
   @cache_max_age_seconds 3600
   @signed_metadata_content_type "application/jwt"
@@ -31,13 +31,15 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
     config = Config.resolve!(conn)
 
     metadata =
-      CredentialIssuerMetadata.build(
+      [
         credential_issuer: config.issuer,
         credential_endpoint: Config.credential_endpoint_url(config),
         nonce_endpoint: Config.nonce_endpoint_url(config),
         deferred_credential_endpoint: deferred_credential_endpoint(config),
         credential_configurations_supported: Config.credential_configurations_supported(config)
-      )
+      ]
+      |> put_encryption_metadata(config)
+      |> CredentialIssuerMetadata.build()
 
     conn = conn |> MetadataSupport.put_public_cache(@cache_max_age_seconds) |> put_resp_header("vary", "Accept")
 
@@ -65,5 +67,25 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataController do
   # wallets at an endpoint whose host callback is unconfigured.
   defp deferred_credential_endpoint(config) do
     if Config.build_deferred_credential_fun(config), do: Config.deferred_credential_endpoint_url(config)
+  end
+
+  defp put_encryption_metadata(opts, config) do
+    case Config.credential_encryption_keystore(config) do
+      nil ->
+        opts
+
+      keystore ->
+        required? = Config.credential_encryption_required(config)
+
+        opts
+        |> OID4VCIHelpers.maybe_put_option(
+          :credential_request_encryption,
+          CredentialEncryption.request_metadata(keystore, encryption_required: required?)
+        )
+        |> OID4VCIHelpers.maybe_put_option(
+          :credential_response_encryption,
+          CredentialEncryption.response_metadata(encryption_required: required?)
+        )
+    end
   end
 end

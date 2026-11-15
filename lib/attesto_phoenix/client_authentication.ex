@@ -61,7 +61,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   ## Client ID Metadata Documents (CIMD)
 
-  When CIMD (`draft-ietf-oauth-client-id-metadata-document-02`) is enabled and
+  When CIMD (`draft-ietf-oauth-client-id-metadata-document-03`) is enabled and
   the presented `client_id` is a CIMD URL, the client is dereferenced from that
   URL (`AttestoPhoenix.ClientIdMetadata`) rather than looked up in the host
   registry. A CIMD client carries no shared symmetric secret (the document
@@ -736,6 +736,18 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # data, never a request parameter. Even a single server-wide method cannot
   # establish what an opaque client previously registered. Without the lookup,
   # only an explicitly classified public client can use the none path.
+  defp require_registered_client_auth_method(_config, %CIMDClient{metadata: metadata}, method) do
+    expected = Atom.to_string(method)
+    declared = ClientIdMetadata.auth_methods(metadata)
+
+    if expected in declared do
+      :ok
+    else
+      emit_method_mismatch(Enum.join(declared, " "), expected, :method_mismatch, false)
+      {:error, error(@error_invalid_client, @client_auth_failed)}
+    end
+  end
+
   defp require_registered_client_auth_method(config, client, method) do
     expected = Atom.to_string(method)
 
@@ -770,10 +782,6 @@ defmodule AttestoPhoenix.ClientAuthentication do
         outcome: if(observed?, do: :observed, else: :rejected)
       }
     )
-  end
-
-  defp registered_client_auth_method(_config, %CIMDClient{metadata: metadata}) do
-    normalize_registered_auth_method(Map.get(metadata, "token_endpoint_auth_method", "none"))
   end
 
   defp registered_client_auth_method(config, client) do
@@ -875,7 +883,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp verify_private_key_jwt_client(config, policy, assertion) do
     with {:ok, client_id} <- ClientAssertion.peek_client_id(assertion),
          :ok <- require_allowed_client_id(config, policy, client_id),
-         {:ok, client} <- resolve_client(config, client_id),
+         {:ok, client} <- resolve_client_detailed(config, client_id),
          :ok <- require_registered_client_auth_method(config, client, :private_key_jwt),
          {:ok, jwks} <- client_jwks(config, client),
          {:ok, claims} <-
@@ -898,6 +906,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
       {:ok, result}
     else
+      {:error, :temporarily_unavailable} -> {:error, cimd_unavailable_error()}
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
@@ -905,7 +914,7 @@ defmodule AttestoPhoenix.ClientAuthentication do
   defp verify_attested_client(config, policy, attestation, pop, presented_client_id) do
     with {:ok, client_id} <- attested_client_id(attestation, presented_client_id),
          :ok <- require_allowed_client_id(config, policy, client_id),
-         {:ok, client} <- resolve_client(config, client_id),
+         {:ok, client} <- resolve_client_detailed(config, client_id),
          :ok <- require_registered_client_auth_method(config, client, :attest_jwt_client_auth),
          trusted_jwks when not is_nil(trusted_jwks) <- Config.trusted_wallet_provider_jwks(config),
          {:ok, verified} <-
@@ -918,6 +927,9 @@ defmodule AttestoPhoenix.ClientAuthentication do
          :ok <- consume_wallet_attestation_replay(config, verified) do
       {:ok, %{result | attestation_jkt: verified.instance_key.jkt}}
     else
+      {:error, :temporarily_unavailable} ->
+        {:error, cimd_unavailable_error()}
+
       {:error, :invalid_pop_challenge} ->
         {:error, wallet_attestation_challenge_error(config)}
 
@@ -941,9 +953,10 @@ defmodule AttestoPhoenix.ClientAuthentication do
 
   defp verify_mtls_client(config, policy, client_id, certificate) do
     with :ok <- require_allowed_client_id(config, policy, client_id),
-         {:ok, client} <- resolve_client(config, client_id) do
+         {:ok, client} <- resolve_client_detailed(config, client_id) do
       authenticate_certificate_client(config, policy, client, client_id, certificate)
     else
+      {:error, :temporarily_unavailable} -> {:error, cimd_unavailable_error()}
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
   end
@@ -1131,14 +1144,19 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # for revocation. A revoked or unknown client, and a confidential client
   # presenting no credential, fails closed with the single generic message.
   defp load_public_client(config, client_id) do
-    with {:ok, client} <- resolve_client(config, client_id),
+    with {:ok, client} <- resolve_client_detailed(config, client_id),
          :ok <- require_registered_client_auth_method(config, client, :none),
          true <- client_public?(config, client),
          {:ok, result} <- result(config, client, client_id, :none) do
       {:ok, result}
     else
+      {:error, :temporarily_unavailable} -> {:error, cimd_unavailable_error()}
       _other -> {:error, error(@error_invalid_client, @client_auth_failed)}
     end
+  end
+
+  defp cimd_unavailable_error do
+    OAuthError.new(:temporarily_unavailable, "client metadata temporarily unavailable", status: 503)
   end
 
   # Resolve a client through the same registry/CIMD path used by authentication.
@@ -1151,21 +1169,43 @@ defmodule AttestoPhoenix.ClientAuthentication do
   # was revoked.
   @doc false
   @spec resolve_client(Config.t(), String.t()) :: {:ok, term()} | {:error, :not_found}
-  def resolve_client(%Config{} = config, client_id) when is_binary(client_id) and client_id != "" do
-    if ClientIdMetadata.cimd_client_id?(client_id, config) do
-      case ClientIdMetadata.resolve(client_id, config) do
-        {:ok, metadata} -> {:ok, %CIMDClient{metadata: metadata}}
-        {:error, _reason} -> {:error, :not_found}
-      end
-    else
-      case Config.client_store_load(config, client_id) do
-        {:ok, client} -> {:ok, client}
-        {:error, reason} when reason in [:not_found, :revoked] -> {:error, :not_found}
-      end
+  def resolve_client(%Config{} = config, client_id) do
+    case resolve_client_detailed(config, client_id) do
+      {:ok, client} -> {:ok, client}
+      {:error, _reason} -> {:error, :not_found}
     end
   end
 
-  def resolve_client(%Config{}, _client_id), do: {:error, :not_found}
+  defp resolve_client_detailed(%Config{} = config, client_id) when is_binary(client_id) and client_id != "" do
+    if ClientIdMetadata.cimd_client_id?(client_id, config) do
+      resolve_cimd_client(client_id, config)
+    else
+      resolve_store_client(config, client_id)
+    end
+  end
+
+  defp resolve_client_detailed(%Config{}, _client_id), do: {:error, :not_found}
+
+  defp resolve_cimd_client(client_id, config) do
+    case ClientIdMetadata.resolve(client_id, config) do
+      {:ok, metadata} ->
+        if ClientIdMetadata.supported_by_server?(metadata, config),
+          do: {:ok, %CIMDClient{metadata: metadata}},
+          else: {:error, :not_found}
+
+      {:error, reason} ->
+        if ClientIdMetadata.transient_error?(reason),
+          do: {:error, :temporarily_unavailable},
+          else: {:error, :not_found}
+    end
+  end
+
+  defp resolve_store_client(config, client_id) do
+    case Config.client_store_load(config, client_id) do
+      {:ok, client} -> {:ok, client}
+      {:error, reason} when reason in [:not_found, :revoked] -> {:error, :not_found}
+    end
+  end
 
   # The public/confidential discriminator (RFC 6749 §2.1). Read defensively
   # from the configuration; fail closed (treat as confidential, i.e. not

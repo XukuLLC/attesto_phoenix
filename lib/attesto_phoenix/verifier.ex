@@ -858,7 +858,8 @@ defmodule AttestoPhoenix.Verifier do
   defp verify_presentation_response(config, store, state, vp_token, claims) do
     options = [
       now: System.system_time(:second),
-      haip: Config.verifier_haip(config)
+      haip: Config.verifier_haip(config),
+      resolve_status: status_resolver(config)
     ]
 
     options =
@@ -885,6 +886,13 @@ defmodule AttestoPhoenix.Verifier do
     end
   rescue
     ArgumentError -> {:error, :malformed}
+  end
+
+  defp status_resolver(config) do
+    case Config.verifier_status_resolver(config) do
+      nil -> &Attesto.StatusList.fetch/2
+      callback -> fn uri, accept -> Callback.invoke(callback, [uri, accept]) end
+    end
   end
 
   defp verify_dc_api_response(config, store, id, vp_token, origin, options) do

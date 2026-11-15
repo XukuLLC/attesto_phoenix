@@ -29,7 +29,7 @@ defmodule AttestoPhoenix.Controller.CheckSessionController do
   mounted-but-unconfigured route never advertises a capability that is off.
   """
 
-  use AttestoPhoenix.Controller, formats: [:html, :json]
+  use AttestoPhoenix.Controller, cors: false, formats: [:html, :json]
 
   import Plug.Conn
 

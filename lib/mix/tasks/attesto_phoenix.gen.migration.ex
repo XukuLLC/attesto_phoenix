@@ -83,7 +83,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
 
     * `attesto_client_id_metadata` - the Client ID Metadata Document cache
       (`AttestoPhoenix.Schema.ClientIdMetadata`,
-      `draft-ietf-oauth-client-id-metadata-document-01`). Each row caches one
+      `draft-ietf-oauth-client-id-metadata-document-03`). Each row caches one
       *validated* CIMD document under its `client_id` URL (the PRIMARY KEY), as a
       jsonb `metadata` map plus the `expires_at` derived from the response's HTTP
       freshness directives (RFC 9111). Keeps every authorization request from
@@ -1547,7 +1547,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       create index(:<%= @pushed_authorization_requests %>, [:expires_at], prefix: prefix)
 
       # Client ID Metadata Document cache
-      # (draft-ietf-oauth-client-id-metadata-document-01), backing
+      # (draft-ietf-oauth-client-id-metadata-document-03), backing
       # AttestoPhoenix.Schema.ClientIdMetadata /
       # AttestoPhoenix.ClientIdMetadata.Cache.Ecto. The CIMD client_id URL is the
       # PRIMARY KEY, so the cache lookup (get/1) hits the primary key and a

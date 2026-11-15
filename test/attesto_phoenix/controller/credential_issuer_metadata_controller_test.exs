@@ -14,7 +14,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
   @oauth_prefix "/oauth"
   @credential_configurations %{
     "UniversityDegreeCredential" => %{
-      format: "vc+sd-jwt",
+      format: "dc+sd-jwt",
       vct: "https://credentials.example/UniversityDegreeCredential"
     }
   }
@@ -25,6 +25,20 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
     @behaviour Attesto.Keystore
 
     @pem JOSE.JWK.generate_key({:rsa, 2048}) |> JOSE.JWK.to_pem() |> elem(1)
+
+    @impl true
+    def signing_pem, do: @pem
+
+    @impl true
+    def verification_pems, do: [@pem]
+  end
+
+  defmodule EncKeystore do
+    @moduledoc false
+
+    @behaviour Attesto.Keystore
+
+    @pem JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
 
     @impl true
     def signing_pem, do: @pem
@@ -81,7 +95,7 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
 
     assert body["credential_configurations_supported"] == %{
              "UniversityDegreeCredential" => %{
-               "format" => "vc+sd-jwt",
+               "format" => "dc+sd-jwt",
                "vct" => "https://credentials.example/UniversityDegreeCredential"
              }
            }
@@ -130,6 +144,50 @@ defmodule AttestoPhoenix.Controller.CredentialIssuerMetadataControllerTest do
     assert body["credential_endpoint"] == @issuer <> "/wallet/oauth/credential"
     assert body["nonce_endpoint"] == @issuer <> "/wallet/oauth/nonce"
     assert body["deferred_credential_endpoint"] == @issuer <> "/wallet/oauth/deferred_credential"
+  end
+
+  test "advertises both credential_request_encryption and credential_response_encryption when configured" do
+    config =
+      Application.fetch_env!(:attesto_phoenix, Config)
+      |> Keyword.put(:credential_encryption_keystore, __MODULE__.EncKeystore)
+      |> Keyword.put(:credential_encryption_required, true)
+
+    put_config(config)
+
+    response =
+      conn(:get, @metadata_path)
+      |> put_private(:attesto_phoenix_config, Config.new(Application.fetch_env!(:attesto_phoenix, Config)))
+      |> CredentialIssuerMetadataController.show(%{})
+
+    assert response.status == 200
+    body = JSON.decode!(response.resp_body)
+
+    assert %{"keys" => [key]} = body["credential_request_encryption"]["jwks"]
+    assert key["alg"] == "ECDH-ES"
+    assert key["use"] == "enc"
+    assert is_binary(key["kid"]) and key["kid"] != ""
+    assert body["credential_request_encryption"]["enc_values_supported"] == ["A256GCM", "A128GCM"]
+    assert body["credential_request_encryption"]["encryption_required"] == true
+
+    assert body["credential_response_encryption"] == %{
+             "alg_values_supported" => ["ECDH-ES"],
+             "enc_values_supported" => ["A256GCM", "A128GCM"],
+             "zip_values_supported" => ["DEF"],
+             "encryption_required" => true
+           }
+
+    assert_raise ArgumentError, ~r/credential_encryption_keystore must be configured/, fn ->
+      Application.fetch_env!(:attesto_phoenix, Config)
+      |> Keyword.delete(:credential_encryption_keystore)
+      |> Keyword.put(:credential_encryption_required, true)
+      |> Config.new()
+    end
+
+    assert_raise ArgumentError, ~r/EC P-256/, fn ->
+      Application.fetch_env!(:attesto_phoenix, Config)
+      |> Keyword.put(:credential_encryption_keystore, __MODULE__.StubKeystore)
+      |> Config.new()
+    end
   end
 
   defp put_config(opts) do

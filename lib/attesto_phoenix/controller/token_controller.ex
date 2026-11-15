@@ -296,17 +296,11 @@ defmodule AttestoPhoenix.Controller.TokenController do
     %{
       err
       | status: 401,
-        headers: put_www_authenticate(err.headers, client_auth_challenge(config, scheme))
+        headers: OAuthError.put_www_authenticate_header(err.headers, client_auth_challenge(config, scheme))
     }
   end
 
   defp token_endpoint_client_auth_error(_config, %OAuthError{} = err, _context), do: err
-
-  defp put_www_authenticate(headers, challenge) do
-    headers
-    |> Enum.reject(fn {key, _value} -> String.downcase(key) == "www-authenticate" end)
-    |> Kernel.++([{"www-authenticate", challenge}])
-  end
 
   defp client_auth_challenge(%Config{basic_realm: realm}, scheme) do
     # `:basic_realm` is typed `String.t()` and defaults to "OAuth", so it is

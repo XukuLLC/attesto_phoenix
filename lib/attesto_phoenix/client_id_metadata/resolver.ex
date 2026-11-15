@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   @moduledoc """
   Resolves a Client ID Metadata Document URL into a client - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL
@@ -24,11 +24,11 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
 
   Each step errors closed; later steps run only when every earlier one passed:
 
-    1. **Grammar (fail fast, no network).** `validate_client_id/1` rejects a
-       non-CIMD `client_id` before any host check or socket - a request whose
-       `client_id` is not a well-formed CIMD URL never reaches the resolver in
-       normal operation, but the check is repeated here so a direct caller is
-       never trusted. Failure -> `{:error, {:invalid_client_id, reason}}`.
+    1. **Grammar + confusion check (fail fast, no network).**
+       `validate_client_id/1` rejects a non-CIMD `client_id` before any host
+       check or socket, and refuses a `client_id` equal to this authorization
+       server's own issuer identifier (draft §10.1 token confusion check).
+       Failure -> `{:error, {:invalid_client_id, reason}}`.
     2. **Host policy.** The URL's host is screened against the configured
        `:blocked_hosts` (always refused) and, when set, `:allowed_hosts` (only
        these are permitted). A blocked or non-allowlisted host is refused
@@ -41,19 +41,21 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
        `GET`, honoring `:max_document_bytes`, `:request_timeout_ms`, and
        `:allow_loopback`. Any transport failure, non-`200`, redirect, non-JSON
        content type, or oversize body is an `{:error, _}` and is **never**
-       cached (draft §6 / RFC 9111).
+       cached (draft §6 / §6.2 / RFC 9111).
     5. **Decode + validate.** The body is JSON-decoded and handed to
-       `validate_document/2`, which enforces the `client_id` match and the
-       no-symmetric-secret rules and normalizes the document into the client
-       shape. A `grant_types` entry that is an empty string is refused as
+       `validate_document/2`, which enforces the `client_id` match, the
+       no-symmetric-secret rules, auth-method consistency, and `jwks` /
+       `jwks_uri` rules, and normalizes the document into the client shape. A
+       `grant_types` entry that is an empty string is refused as
        `:invalid_metadata` as well. A malformed JSON body or an invalid
-       document is an `{:error, _}` and is **never** cached.
+       document is a terminal failure (`draft §6.1`) and is **never** cached.
     6. **Cache + return.** Only after validation succeeds is the document stored
        via `Cache.put/3`, with an `expires_at` derived from the response's
        shared-cache `Cache-Control: s-maxage` / `max-age` / `Expires`
        freshness directives clamped to the configured `:cache_ttl_bounds`
        (RFC 9111). `private`, `no-store`, and `no-cache` responses are not
-       stored. The normalized client map is returned.
+       stored. Previously cached valid metadata is never overwritten on
+       transient failures (draft §6.1). The normalized client map is returned.
 
   The returned client is shaped identically to a host `:load_client` result, so
   downstream resolution (scopes, redirect-URI match, JARM, DPoP) needs no
@@ -78,12 +80,38 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   `t:Attesto.ClientIdMetadata.document_error/0` is a validation failure.
   """
   @type error ::
-          {:invalid_client_id, ClientIdMetadata.url_error()}
-          | {:invalid_client_id, :too_long}
+          {:invalid_client_id, ClientIdMetadata.url_error() | :too_long | :issuer_confusion}
           | {:blocked_host, String.t()}
           | {:fetch, term()}
           | :invalid_json
           | ClientIdMetadata.document_error()
+
+  @transient_fetch_reasons [
+    :fetch_timeout,
+    :concurrency_limit,
+    :rate_limit,
+    :flow_capacity,
+    :failure_backoff,
+    :singleflight_limit,
+    :flow_control_unavailable,
+    :fetch_failed,
+    :unresolvable
+  ]
+
+  @doc """
+  Returns `true` when `error` is a transient discovery failure (`draft §6.1`),
+  such as a network timeout, transport failure, rate-limit backoff, or 5xx/408/
+  429 upstream status, rather than a terminal failure (malformed JSON, document
+  validation failure, policy refusal, redirect, or permanent client HTTP error).
+  """
+  @spec transient_error?(error()) :: boolean()
+  def transient_error?({:fetch, {:status, status}}) when is_integer(status) do
+    status >= 500 or status in [408, 429]
+  end
+
+  def transient_error?({:fetch, {:transport, _reason}}), do: true
+  def transient_error?({:fetch, reason}) when reason in @transient_fetch_reasons, do: true
+  def transient_error?(_error), do: false
 
   @doc """
   Resolve a CIMD `client_id` URL into a normalized client map.
@@ -102,20 +130,25 @@ defmodule AttestoPhoenix.ClientIdMetadata.Resolver do
   defp do_resolve(client_id, %Config{} = config) do
     opts = Config.client_id_metadata(config)
 
-    with {:ok, uri} <- validate_client_id(client_id),
+    with {:ok, uri} <- validate_client_id(client_id, config),
          :ok <- check_host(uri.host, opts) do
       resolve_cached(client_id, opts)
     end
   end
 
-  defp validate_client_id(client_id) do
-    if byte_size(client_id) > @max_client_id_bytes do
-      {:error, {:invalid_client_id, :too_long}}
-    else
-      case ClientIdMetadata.validate_client_id(client_id) do
-        {:ok, uri} -> {:ok, uri}
-        {:error, reason} -> {:error, {:invalid_client_id, reason}}
-      end
+  defp validate_client_id(client_id, %Config{issuer: issuer}) do
+    cond do
+      client_id == issuer ->
+        {:error, {:invalid_client_id, :issuer_confusion}}
+
+      byte_size(client_id) > @max_client_id_bytes ->
+        {:error, {:invalid_client_id, :too_long}}
+
+      true ->
+        case ClientIdMetadata.validate_client_id(client_id) do
+          {:ok, uri} -> {:ok, uri}
+          {:error, reason} -> {:error, {:invalid_client_id, reason}}
+        end
     end
   end
 

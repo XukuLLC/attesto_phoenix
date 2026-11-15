@@ -1891,15 +1891,30 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.client_assertion_audiences(built) == [built.issuer]
     end
 
-    test "accepts a static non-empty absolute URI list" do
-      audiences = ["https://issuer.example", "urn:example:token-endpoint"]
+    test "accepts a static list of the issuer and this server's own token, PAR, and backchannel endpoint URLs" do
+      audiences = [
+        "https://issuer.example",
+        "https://issuer.example/oauth/token",
+        "https://issuer.example/oauth/par",
+        "https://issuer.example/oauth/bc-authorize"
+      ]
+
       built = config(client_assertion_audiences: audiences)
 
       assert Config.client_assertion_audiences(built) == audiences
     end
 
-    test "rejects malformed, empty, and duplicate static lists at boot" do
-      for invalid <- [[], ["relative"], [""], [123], ["https://issuer.example", "https://issuer.example"]] do
+    test "rejects malformed, empty, duplicate, and non-server-endpoint static lists at boot" do
+      for invalid <- [
+            [],
+            ["relative"],
+            [""],
+            [123],
+            ["https://issuer.example", "https://issuer.example"],
+            ["https://issuer.example", "urn:example:token-endpoint"],
+            ["https://issuer.example", "https://other.example/oauth/token"],
+            ["https://issuer.example", "https://issuer.example/oauth/authorize"]
+          ] do
         assert_raise ArgumentError, ~r/:client_assertion_audiences/, fn ->
           config(client_assertion_audiences: invalid)
         end
@@ -1907,10 +1922,15 @@ defmodule AttestoPhoenix.ConfigTest do
     end
 
     test "validates callback output when it is used" do
-      built = config(client_assertion_audiences: fn _config -> [] end)
+      for invalid <- [
+            [],
+            ["https://issuer.example", "https://other.example/oauth/token"]
+          ] do
+        built = config(client_assertion_audiences: fn _config -> invalid end)
 
-      assert_raise ArgumentError, ~r/:client_assertion_audiences callback/, fn ->
-        Config.client_assertion_audiences(built)
+        assert_raise ArgumentError, ~r/:client_assertion_audiences callback/, fn ->
+          Config.client_assertion_audiences(built)
+        end
       end
     end
   end
@@ -3104,6 +3124,94 @@ defmodule AttestoPhoenix.ConfigTest do
       assert_received :inner_resolved
       refute_received :outer_resolved
       refute_received :inner_resolved
+    end
+  end
+
+  describe "identity_chaining configuration (draft-17 / RFC 10092)" do
+    test "defaults to disabled" do
+      cfg = config()
+      refute Config.identity_chaining_enabled?(cfg)
+    end
+
+    test "requires allowed_audiences or authorize_target when enabled" do
+      assert_raise ArgumentError, ~r/identity_chaining requires/, fn ->
+        config(identity_chaining: [enabled: true])
+      end
+
+      assert Config.identity_chaining_enabled?(
+               config(identity_chaining: [enabled: true, allowed_audiences: ["https://as-b.example"]])
+             )
+    end
+
+    test "validates requested_token_types and assertion_lifetime_seconds when enabled" do
+      assert_raise ArgumentError, ~r/:requested_token_types/, fn ->
+        config(
+          identity_chaining: [
+            enabled: true,
+            allowed_audiences: ["https://as-b.example"],
+            requested_token_types: ["urn:example:unsupported"]
+          ]
+        )
+      end
+
+      assert_raise ArgumentError, ~r/:assertion_lifetime_seconds/, fn ->
+        config(
+          identity_chaining: [
+            enabled: true,
+            allowed_audiences: ["https://as-b.example"],
+            assertion_lifetime_seconds: 0
+          ]
+        )
+      end
+    end
+  end
+
+  describe "credential_encryption_keystore key separation" do
+    test "rejects configuring :credential_encryption_keystore equal to or sharing keys with :keystore" do
+      shared_pem = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
+      distinct_pem = JOSE.JWK.generate_key({:ec, "P-256"}) |> JOSE.JWK.to_pem() |> elem(1)
+
+      defmodule SharedSigningKeystore do
+        @behaviour Attesto.Keystore
+
+        @impl true
+        def signing_pem, do: Process.get({__MODULE__, :pem})
+        @impl true
+        def verification_pems, do: [signing_pem()]
+      end
+
+      defmodule SameKeyEncKeystore do
+        @behaviour Attesto.Keystore
+
+        @impl true
+        def signing_pem, do: Process.get({__MODULE__, :pem})
+        @impl true
+        def verification_pems, do: [signing_pem()]
+      end
+
+      defmodule DistinctEncKeystore do
+        @behaviour Attesto.Keystore
+
+        @impl true
+        def signing_pem, do: Process.get({__MODULE__, :pem})
+        @impl true
+        def verification_pems, do: [signing_pem()]
+      end
+
+      Process.put({SharedSigningKeystore, :pem}, shared_pem)
+      Process.put({SameKeyEncKeystore, :pem}, shared_pem)
+      Process.put({DistinctEncKeystore, :pem}, distinct_pem)
+
+      assert_raise ArgumentError, ~r/must be distinct from :keystore/, fn ->
+        config(keystore: SharedSigningKeystore, credential_encryption_keystore: SharedSigningKeystore)
+      end
+
+      assert_raise ArgumentError, ~r/must not share keys with :keystore/, fn ->
+        config(keystore: SharedSigningKeystore, credential_encryption_keystore: SameKeyEncKeystore)
+      end
+
+      cfg = config(keystore: SharedSigningKeystore, credential_encryption_keystore: DistinctEncKeystore)
+      assert Config.credential_encryption_keystore(cfg) == DistinctEncKeystore
     end
   end
 

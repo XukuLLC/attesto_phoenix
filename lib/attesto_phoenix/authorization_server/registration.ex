@@ -20,7 +20,6 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
   """
 
   alias Attesto.{Key, MapParams, PairwiseSubject, RedirectURI, Secret, SecureCompare, SigningAlg, X509}
-  alias AttestoPhoenix.AuthorizationServer.Authorize
   alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.AuthorizationServer.SubjectIdentifier
   alias AttestoPhoenix.AuthorizationServer.Userinfo
@@ -880,11 +879,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
            "#{key} entries must be HTTPS absolute URIs without a fragment"
          )}
 
-      Enum.any?(value, &reserved_redirect_query_param?/1) ->
+      Enum.any?(value, &RedirectURI.reserved_query_param?/1) ->
         {:error,
          error(
            @error_invalid_redirect_uri,
-           "#{key} must not contain reserved OAuth response query parameters"
+           "#{key} must not contain reserved OAuth authorization request or response query parameters"
          )}
 
       true ->
@@ -1595,34 +1594,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Registration do
       not (valid_collection? and Enum.all?(redirect_uris, &valid_redirect_uri?(&1, application_type, config))) ->
         {:error, error(@error_invalid_redirect_uri, "redirect_uris contains an invalid value")}
 
-      Enum.any?(redirect_uris, &reserved_redirect_query_param?/1) ->
+      Enum.any?(redirect_uris, &RedirectURI.reserved_query_param?/1) ->
         {:error,
          error(
            @error_invalid_redirect_uri,
-           "redirect_uris must not contain reserved OAuth response query parameters"
+           "redirect_uris must not contain reserved OAuth authorization request or response query parameters"
          )}
 
       true ->
         {:ok, redirect_uris}
-    end
-  end
-
-  defp reserved_redirect_query_param?(value) when is_binary(value) do
-    reserved = Authorize.reserved_response_params()
-
-    case URI.new(value) do
-      {:ok, %URI{query: query}} when is_binary(query) and query != "" ->
-        query
-        |> String.split(["&", ";"], trim: true)
-        |> Enum.any?(fn segment ->
-          [raw_key | _] = String.split(segment, "=", parts: 2)
-
-          raw_key in reserved or
-            URI.decode_www_form(raw_key) in reserved
-        end)
-
-      _other ->
-        false
     end
   end
 

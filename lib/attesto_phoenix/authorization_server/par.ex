@@ -257,7 +257,7 @@ defmodule AttestoPhoenix.AuthorizationServer.PAR do
   # `:client_id` callback. When no `:client_id` callback is configured the
   # identifier cannot be derived from the opaque client struct (`nil`), matching
   # the resolution used everywhere else in the library.
-  # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-01`) is
+  # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-03`) is
   # identified by the URL its document is bound to; a registered client by the
   # host's `:client_id` callback.
   # RFC 9126 §2.1: the pushed request carries a `client_id`, and it must be the

@@ -494,6 +494,41 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     assert PARStore.count() == 0
   end
 
+  test "returns HTTP 503 temporarily_unavailable on transient CIMD fetch error at PAR" do
+    defmodule TransientCimdFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      def fetch(_url, _opts), do: {:error, {:status, 503}}
+    end
+
+    defmodule TransientCimdCache do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Cache
+
+      def get(_url), do: :miss
+      def put(_url, _meta, _exp), do: :ok
+    end
+
+    cimd_client_id = "https://app.example/clients/#{System.unique_integer([:positive])}/transient.json"
+    put_config(client_id_metadata: [enabled: true, fetcher: TransientCimdFetcher, cache: TransientCimdCache])
+
+    params =
+      Map.merge(auth_params(), %{
+        "client_id" => cimd_client_id,
+        "redirect_uri" => "https://app.example/cb"
+      })
+
+    conn =
+      :post
+      |> conn(@endpoint_path, params)
+      |> PARController.create(params)
+
+    assert conn.status == 503
+    assert JSON.decode!(conn.resp_body)["error"] == "temporarily_unavailable"
+    assert PARStore.count() == 0
+  end
+
   test "stores the verified DPoP proof thumbprint for sender-constrained PAR" do
     params = auth_params()
     credentials = Base.encode64("confidential-1:s3cr3t")

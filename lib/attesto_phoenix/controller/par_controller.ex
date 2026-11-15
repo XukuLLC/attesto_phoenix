@@ -95,8 +95,10 @@ defmodule AttestoPhoenix.Controller.PARController do
   end
 
   defp render_error(conn, config, %OAuthError{} = err) do
-    # PAR's existing renderer returns 400 for every failure, including any
-    # future core error that carries a different default status.
-    OAuthError.render(conn, %{err | status: 400}, auth_scheme: :none, config: config)
+    # Preserve explicit 503 (:temporarily_unavailable, e.g. PAR store capacity or
+    # transient CIMD discovery failure per draft-03 §6.1) while normalizing 4xx
+    # errors to 400 per RFC 9126 §2.3.
+    status = if err.status == 503, do: 503, else: 400
+    OAuthError.render(conn, %{err | status: status}, auth_scheme: :none, config: config)
   end
 end

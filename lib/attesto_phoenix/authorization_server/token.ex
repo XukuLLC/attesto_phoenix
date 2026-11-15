@@ -44,7 +44,17 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   `invalid_request` without leaking detail; the underlying reason is logged.
   """
 
-  alias Attesto.{AuthorizationCode, DeviceCode, IDToken, JWS, MapParams, RefreshToken, ResourceIndicator}
+  alias Attesto.{
+    AuthorizationCode,
+    DeviceCode,
+    IdentityAssertion,
+    IDToken,
+    JWS,
+    MapParams,
+    RefreshToken,
+    ResourceIndicator
+  }
+
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
   alias AttestoPhoenix.AuthorizationServer.Continuation
   alias AttestoPhoenix.AuthorizationServer.JwtBearer
@@ -81,9 +91,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # access token).
   @error_invalid_target :invalid_target
 
-  # RFC 8693 token exchange.
+  # RFC 8693 token exchange & draft-ietf-oauth-identity-chaining-17 (RFC 10092).
   @grant_token_exchange "urn:ietf:params:oauth:grant-type:token-exchange"
   @subject_token_type_access_token "urn:ietf:params:oauth:token-type:access_token"
+  @issued_token_type_jwt "urn:ietf:params:oauth:token-type:jwt"
+  @issued_token_type_id_jag "urn:ietf:params:oauth:token-type:id-jag"
 
   # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
   # JWT-bearer authorization grant (MCP Enterprise-Managed Authorization).
@@ -487,27 +499,20 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # only preserve or narrow scope, never broaden it. When no `scope` is requested
   # the subject token's existing scope is carried forward. `:authorize_scope` may
   # then narrow further (client policy), but cannot re-widen past the subject's.
-  defp dispatch(%Request{grant_type: @grant_token_exchange} = request) do
-    %{config: config, client: client, params: params} = request
+  defp dispatch(%Request{grant_type: @grant_token_exchange, config: config, params: params} = request) do
+    case Map.get(params, "requested_token_type") do
+      @subject_token_type_access_token ->
+        dispatch_access_token_exchange(request)
 
-    with {:ok, subject_token} <- require_param(params, "subject_token"),
-         :ok <- require_subject_token_type(params),
-         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
-         {:ok, claims} <- verify_subject_token(config, subject_token, binding),
-         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
-         requested = requested_exchange_scope(params, claims),
-         :ok <- require_scope_within_subject_token(requested, claims),
-         {:ok, audience} <- exchange_resource_audience(config, client, params, claims),
-         {:ok, scope} <- authorize_scope(config, client, requested, audience),
-         :ok <- require_scope_within_subject_token(scope, claims),
-         :ok <- require_granted_scope_within_request(scope, requested),
-         {:ok, response} <- mint_exchanged_token(request, claims, scope, token_type, binding, audience) do
-      response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
-      issued = token_issued_event(request, Map.get(claims, "sub"), scope, "token_exchange", token_type, binding)
-      {:ok, response, [issued]}
-    else
-      {:error, %OAuthError{} = err} -> {:error, err}
-      {:error, _reason} -> {:error, error(@error_invalid_grant, "subject token is invalid")}
+      nil ->
+        if identity_chaining_target_request?(config, params) do
+          dispatch_identity_chaining(request, default_identity_chaining_type(config))
+        else
+          dispatch_access_token_exchange(request)
+        end
+
+      requested_type ->
+        dispatch_identity_chaining(request, requested_type)
     end
   end
 
@@ -552,6 +557,61 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # RFC 6749 §5.2.
   defp dispatch(%Request{grant_type: grant_type}) do
     {:error, error(@error_unsupported_grant_type, "unsupported grant_type: #{grant_type}")}
+  end
+
+  defp dispatch_access_token_exchange(%Request{config: config, client: client, params: params} = request) do
+    with {:ok, subject_token} <- require_param(params, "subject_token"),
+         :ok <- require_subject_token_type(params),
+         {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
+         {:ok, claims} <- verify_subject_token(config, subject_token, binding),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
+         requested = requested_exchange_scope(params, claims),
+         :ok <- require_scope_within_subject_token(requested, claims),
+         {:ok, audience} <- exchange_resource_audience(config, client, params, claims),
+         {:ok, scope} <- authorize_scope(config, client, requested, audience),
+         :ok <- require_scope_within_subject_token(scope, claims),
+         :ok <- require_granted_scope_within_request(scope, requested),
+         {:ok, response} <- mint_exchanged_token(request, claims, scope, token_type, binding, audience) do
+      response = Map.put(response, :issued_token_type, @subject_token_type_access_token)
+      issued = token_issued_event(request, Map.get(claims, "sub"), scope, "token_exchange", token_type, binding)
+      {:ok, response, [issued]}
+    else
+      {:error, %OAuthError{} = err} -> {:error, err}
+      {:error, _reason} -> {:error, error(@error_invalid_grant, "subject token is invalid")}
+    end
+  end
+
+  defp dispatch_identity_chaining(%Request{config: config, client: client, params: params} = request, requested_type) do
+    with :ok <- require_identity_chaining_requested_type(config, requested_type),
+         {:ok, subject_token} <- require_param(params, "subject_token"),
+         :ok <- require_subject_token_type(params),
+         {:ok, binding, _token_type, pending_claim} <- resolve_sender_constraint(request),
+         {:ok, claims} <- verify_subject_token(config, subject_token, binding),
+         {:ok, sub} <- require_subject_claim(claims),
+         {:ok, {target_as, resource_claim}} <- resolve_identity_chaining_target(config, client, params, claims),
+         requested = requested_exchange_scope(params, claims),
+         :ok <- require_scope_within_subject_token(requested, claims),
+         {:ok, scope} <- authorize_scope(config, client, requested, [target_as]),
+         :ok <- require_scope_within_subject_token(scope, claims),
+         :ok <- require_granted_scope_within_request(scope, requested),
+         :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
+         {:ok, response} <-
+           mint_identity_chaining_assertion(
+             request,
+             claims,
+             sub,
+             target_as,
+             resource_claim,
+             scope,
+             binding,
+             requested_type
+           ) do
+      issued = token_issued_event(request, sub, scope, "token_exchange", "N_A", binding)
+      {:ok, response, [issued]}
+    else
+      {:error, %OAuthError{} = err} -> {:error, err}
+      {:error, _reason} -> {:error, error(@error_invalid_grant, "subject token is invalid")}
+    end
   end
 
   # The host's private authorization state rides with the code inside the
@@ -650,7 +710,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          # Authentication Request (granted scope contains `openid`), the token
          # response additionally carries an ID Token.
          {:ok, response} <- maybe_mint_id_token(request, grant, scope, code, response) do
-      # OID4VCI (draft-ietf-oauth-openid4vci) §6.2 / RFC 9396 §7: when the
+      # OpenID4VCI 1.0 (2025-09-16) §6.2 / RFC 9396 §7: when the
       # code carried `openid_credential` credential_configuration_ids
       # (`access_token_claims/1` already folded them into the minted access
       # token above), echo the granted `authorization_details` on the token
@@ -2273,6 +2333,156 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp remaining_subject_lifetime(%{"exp" => exp}, now) when is_integer(exp) and exp > now, do: {:ok, exp - now}
   defp remaining_subject_lifetime(_claims, _now), do: {:error, :invalid_subject_token_lifetime}
 
+  defp require_identity_chaining_requested_type(config, requested_type) do
+    opts = Config.identity_chaining(config)
+
+    if Config.identity_chaining_enabled?(config) and
+         is_binary(requested_type) and
+         requested_type in Keyword.get(opts, :requested_token_types, []) do
+      :ok
+    else
+      {:error, error(@error_invalid_request, "requested_token_type is unsupported")}
+    end
+  end
+
+  defp require_subject_claim(%{"sub" => sub}) when is_binary(sub) and sub != "", do: {:ok, sub}
+  defp require_subject_claim(_claims), do: {:error, :invalid_subject_token}
+
+  defp resolve_identity_chaining_target(config, client, params, claims) do
+    chaining_opts = Config.identity_chaining(config)
+
+    with {:ok, resources} <- validate_resource_param(params),
+         {:ok, audience_param} <- validate_chaining_audience_param(params),
+         {:ok, target_as, resource_claim} <- pick_chaining_target(audience_param, resources),
+         {:ok, approved_target} <- authorize_chaining_target(chaining_opts, client, target_as, resources, claims) do
+      {:ok, {approved_target, resource_claim}}
+    end
+  end
+
+  defp validate_chaining_audience_param(%{"audience" => audience}) when is_binary(audience) and audience != "",
+    do: {:ok, audience}
+
+  defp validate_chaining_audience_param(%{"audience" => _}),
+    do: {:error, error(@error_invalid_target, "audience must be a non-empty string")}
+
+  defp validate_chaining_audience_param(_params), do: {:ok, nil}
+
+  defp pick_chaining_target(audience, resources) when is_binary(audience) do
+    resource_claim = if resources != [] and resources != [audience], do: resources
+    {:ok, audience, resource_claim}
+  end
+
+  defp pick_chaining_target(nil, [single]), do: {:ok, single, nil}
+
+  defp pick_chaining_target(nil, _resources) do
+    {:error, error(@error_invalid_target, "target audience or resource is required")}
+  end
+
+  defp authorize_chaining_target(chaining_opts, client, target_as, resources, claims) do
+    allowed = Keyword.get(chaining_opts, :allowed_audiences, [])
+    callback = Keyword.get(chaining_opts, :authorize_target)
+
+    with :ok <- check_allowed_chaining_audience(allowed, target_as) do
+      invoke_chaining_target_callback(callback, client, target_as, resources, claims)
+    end
+  end
+
+  defp invoke_chaining_target_callback(nil, _client, target_as, _resources, _claims), do: {:ok, target_as}
+
+  defp invoke_chaining_target_callback(fun, client, target_as, resources, claims) do
+    case Callback.invoke(fun, [host_client(client), target_as, resources, claims]) do
+      :ok -> {:ok, target_as}
+      {:ok, approved} when is_binary(approved) and approved != "" -> {:ok, approved}
+      _ -> {:error, error(@error_invalid_target, "target authorization server is not permitted")}
+    end
+  end
+
+  defp check_allowed_chaining_audience([], _target_as), do: :ok
+
+  defp check_allowed_chaining_audience(allowed, target_as) do
+    if target_as in allowed,
+      do: :ok,
+      else: {:error, error(@error_invalid_target, "target authorization server is not permitted")}
+  end
+
+  defp identity_chaining_target_request?(config, params) do
+    if Config.identity_chaining_enabled?(config) do
+      chaining_opts = Config.identity_chaining(config)
+      allowed = Keyword.get(chaining_opts, :allowed_audiences, [])
+
+      Map.get(params, "audience") in allowed or
+        case ResourceIndicator.validate(Map.get(params, "resource")) do
+          {:ok, [single]} -> single in allowed
+          _other -> false
+        end
+    else
+      false
+    end
+  end
+
+  defp default_identity_chaining_type(config) do
+    config
+    |> Config.identity_chaining()
+    |> Keyword.fetch!(:requested_token_types)
+    |> hd()
+  end
+
+  defp identity_chaining_header_typ(@issued_token_type_id_jag), do: "oauth-id-jag+jwt"
+  defp identity_chaining_header_typ(@issued_token_type_jwt), do: "JWT"
+
+  defp mint_identity_chaining_assertion(
+         %Request{config: config} = request,
+         claims,
+         sub,
+         target_as,
+         resource_claim,
+         scope,
+         binding,
+         requested_type
+       ) do
+    now = Attesto.NumericDate.now([])
+    chaining_opts = Config.identity_chaining(config)
+    max_lifetime = Keyword.fetch!(chaining_opts, :assertion_lifetime_seconds)
+    header_typ = identity_chaining_header_typ(requested_type)
+
+    with {:ok, authenticated_client_id} <- require_token_client_id(request),
+         {:ok, subject_remaining} <- remaining_subject_lifetime(claims, now),
+         {:ok, _pairwise_opts} <- pairwise_mint_opts(request),
+         lifetime = min(subject_remaining, max_lifetime),
+         attrs =
+           %{
+             sub: sub,
+             aud: target_as,
+             client_id: authenticated_client_id
+           }
+           |> maybe_put_attr(:scope, if(scope != [], do: scope))
+           |> maybe_put_attr(:resource, resource_claim)
+           |> maybe_put_attr(:cnf, chaining_cnf_claim(binding)),
+         {:ok, assertion} <-
+           IdentityAssertion.sign(attesto_config(config), attrs, now: now, lifetime: lifetime, typ: header_typ) do
+      {:ok, identity_chaining_response(assertion, lifetime, scope, requested_type)}
+    else
+      {:error, reason} -> mint_failure("identity chaining mint failed", reason)
+    end
+  end
+
+  defp identity_chaining_response(assertion, lifetime, scope, requested_type) do
+    base = %{
+      access_token: assertion,
+      token_type: "N_A",
+      issued_token_type: requested_type,
+      expires_in: lifetime
+    }
+
+    if scope == [], do: base, else: Map.put(base, :scope, Enum.join(scope, " "))
+  end
+
+  defp maybe_put_attr(map, _key, nil), do: map
+  defp maybe_put_attr(map, key, value), do: Map.put(map, key, value)
+
+  defp chaining_cnf_claim({:dpop, jkt}) when is_binary(jkt) and jkt != "", do: %{"jkt" => jkt}
+  defp chaining_cnf_claim(_binding), do: nil
+
   defp exchange_actor(claims, authenticated_client_id) do
     actor = %{"sub" => authenticated_client_id}
 
@@ -2391,7 +2601,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # propagated; authentication-context values like nonce/auth_time stay code/ID
   # token state and are not access-token claims.
   #
-  # OID4VCI (draft-ietf-oauth-openid4vci) §5: when the authorization request
+  # OpenID4VCI 1.0 (2025-09-16) §5: when the authorization request
   # carried `authorization_details` naming `openid_credential` configuration
   # id(s) this issuer offers, `AttestoPhoenix.Controller.AuthorizeController`
   # validated and recorded them onto the code's claims. Carry them onto the
@@ -2724,7 +2934,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # `:issue_refresh_token?`, `:client_grant_types`) are
   # written for the host's own client shape. A CIMD client is handed to them as
   # its bare, string-keyed metadata map (shaped like a `:load_client` result,
-  # `draft-ietf-oauth-client-id-metadata-document-01` §7), with the internal
+  # `draft-ietf-oauth-client-id-metadata-document-03`), with the internal
   # `%CIMDClient{metadata: _}` tag stripped, so a CIMD-aware host reads it like any client map.
   # A registered client passes through untouched.
   #

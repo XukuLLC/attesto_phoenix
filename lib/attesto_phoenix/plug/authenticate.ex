@@ -72,6 +72,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   alias Attesto.Plug.OAuthError
   alias Attesto.Scope
   alias AttestoPhoenix.{Callback, Config, DenialAudit, Event, ProtectedResource}
+  alias AttestoPhoenix.Plug.CORS
 
   @claims_key :attesto_claims
   @principal_key :attesto_principal
@@ -158,6 +159,8 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   @impl Plug
   def call(conn, opts) do
     config = resolve_config(conn, opts)
+    cors_origins = Keyword.get(opts, :cors_origins, config.cors_origins)
+    conn = CORS.apply_headers(conn, origins: cors_origins)
 
     Config.with_request_config(config, fn -> authenticate_request(conn, opts, config) end)
   end
@@ -232,7 +235,7 @@ defmodule AttestoPhoenix.Plug.Authenticate do
   defp scope(_claims), do: []
 
   defp core_overrides(opts) do
-    Keyword.drop(opts, [:config, :otp_app, :claims_key, :principal_key, :context_key])
+    Keyword.drop(opts, [:config, :otp_app, :claims_key, :principal_key, :context_key, :cors_origins])
   end
 
   defp emit_succeeded(config, claims) do

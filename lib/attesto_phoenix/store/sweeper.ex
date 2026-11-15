@@ -21,7 +21,7 @@ defmodule AttestoPhoenix.Store.Sweeper do
     * pushed authorization requests - RFC 9126 §2.2 (a `request_uri` reference is
       short-lived; past its expiry it can resolve nothing).
     * cached Client ID Metadata Documents -
-      `draft-ietf-oauth-client-id-metadata-document-01` §6 / RFC 9111 (a cached
+      `draft-ietf-oauth-client-id-metadata-document-03` §6.2 / RFC 9111 (a cached
       document is fresh only until its `expires_at`; past that it is re-fetched).
     * consent grants - RFC 6749 §4.1.1 / §4.1.2 (consent precedes a short-lived
       authorization code; a grant past its `expires_at` can authorize nothing,

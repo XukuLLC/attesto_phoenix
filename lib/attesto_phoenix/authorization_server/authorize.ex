@@ -330,8 +330,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Authorize do
 
   defp load_cimd_client(config, client_id) do
     case ClientIdMetadata.resolve(client_id, config) do
-      {:ok, metadata} -> {:ok, %CIMDClient{metadata: metadata}}
-      {:error, _reason} -> {:error, {:direct, :invalid_client_id}}
+      {:ok, metadata} ->
+        if ClientIdMetadata.supported_by_server?(metadata, config),
+          do: {:ok, %CIMDClient{metadata: metadata}},
+          else: {:error, {:direct, :invalid_client_id}}
+
+      {:error, reason} ->
+        if ClientIdMetadata.transient_error?(reason),
+          do: {:error, {:direct, :client_metadata_unavailable}},
+          else: {:error, {:direct, :invalid_client_id}}
     end
   end
 

@@ -2711,6 +2711,229 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
     end
   end
 
+  describe "identity chaining Domain A (draft-ietf-oauth-identity-chaining-17 / RFC 10092)" do
+    @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    @token_type_jwt "urn:ietf:params:oauth:token-type:jwt"
+    @token_type_id_jag "urn:ietf:params:oauth:token-type:id-jag"
+
+    defp jwks_from_pem(pem) do
+      {_kty, pub} = pem |> JOSE.JWK.from_pem() |> JOSE.JWK.to_public_map()
+      %{"keys" => [Map.merge(pub, %{"kid" => JOSE.JWK.thumbprint(JOSE.JWK.from_pem(pem)), "use" => "sig"})]}
+    end
+
+    test "refuses requested_token_type=jwt when identity chaining is disabled (default)" do
+      config = config()
+      subject_request = request(config, params: %{"scope" => "read"})
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+
+      exchange_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "requested_token_type" => @token_type_jwt,
+            "audience" => "https://as-b.example"
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_request}, _events} = Token.issue(config, exchange_request)
+    end
+
+    test "rejects unpermitted audience, missing target, and exceeded scope" do
+      domain_b = "https://as-b.example"
+      config = config(identity_chaining: [enabled: true, allowed_audiences: [domain_b]])
+      subject_request = request(config, params: %{"scope" => "read"})
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+
+      bad_aud =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "requested_token_type" => @token_type_jwt,
+            "audience" => "https://untrusted.example"
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_target}, _events} = Token.issue(config, bad_aud)
+
+      missing_target =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "requested_token_type" => @token_type_jwt
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_target}, _events} = Token.issue(config, missing_target)
+
+      wide_scope =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "requested_token_type" => @token_type_jwt,
+            "audience" => domain_b,
+            "scope" => "read admin"
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_scope}, _events} = Token.issue(config, wide_scope)
+    end
+
+    test "draft-17 request omitting requested_token_type dispatches via resource targeting AS B and mints typ=JWT" do
+      domain_b = "https://as-b.example"
+      local_resource = "https://api.example.com/resource"
+
+      config =
+        config(
+          load_client: fn
+            "client-1" -> {:ok, %{id: "client-1", public?: false}}
+            _other -> {:error, :not_found}
+          end,
+          resource_indicators: [allowed_resources_for: fn _client -> [local_resource] end],
+          identity_chaining: [
+            enabled: true,
+            allowed_audiences: [domain_b],
+            assertion_lifetime_seconds: 45
+          ]
+        )
+
+      subject_request =
+        request(config,
+          params: %{"scope" => "read", "resource" => local_resource}
+        )
+
+      assert {:ok, subject_response, _events} = Token.issue(config, subject_request)
+
+      # Omitted requested_token_type with resource naming Domain B AS (draft-17 Figure 2).
+      chaining_request =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "resource" => domain_b,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, chaining_response, _events} = Token.issue(config, chaining_request)
+      assert chaining_response.token_type == "N_A"
+      assert chaining_response.issued_token_type == @token_type_jwt
+      assert {:ok, %{"typ" => "JWT"}} = Attesto.JWS.peek_json(chaining_response.access_token, :protected)
+      assert {:ok, %{"aud" => ^domain_b}} = Attesto.JWS.peek_json(chaining_response.access_token, :payload)
+
+      # Omitted requested_token_type with a local resource or unlisted audience still takes normal RFC 8693 exchange.
+      local_exchange =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "resource" => local_resource,
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, local_response, _events} = Token.issue(config, local_exchange)
+      assert local_response.token_type == "Bearer"
+      assert local_response.issued_token_type == @subject_token_type_access_token
+
+      unlisted_audience_exchange =
+        request(config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "audience" => "other-logical-service",
+            "scope" => "read"
+          }
+        )
+
+      assert {:ok, unlisted_response, _events} = Token.issue(config, unlisted_audience_exchange)
+      assert unlisted_response.token_type == "Bearer"
+      assert unlisted_response.issued_token_type == @subject_token_type_access_token
+    end
+
+    test "round-trips a Domain A ID-JAG into Domain B jwt-bearer token issuance" do
+      domain_b = "https://as-b.example"
+      domain_b_resource = "https://mcp-b.example/api"
+
+      domain_a_config =
+        config(
+          identity_chaining: [
+            enabled: true,
+            allowed_audiences: [domain_b],
+            requested_token_types: [@token_type_jwt, @token_type_id_jag],
+            assertion_lifetime_seconds: 45
+          ]
+        )
+
+      subject_request = request(domain_a_config, params: %{"scope" => "mcp.read mcp.write"})
+      assert {:ok, subject_response, _events} = Token.issue(domain_a_config, subject_request)
+
+      domain_a_exchange =
+        request(domain_a_config,
+          grant_type: @grant_token_exchange,
+          params: %{
+            "subject_token" => subject_response.access_token,
+            "subject_token_type" => @subject_token_type_access_token,
+            "requested_token_type" => @token_type_id_jag,
+            "audience" => domain_b,
+            "resource" => domain_b_resource,
+            "scope" => "mcp.read"
+          }
+        )
+
+      assert {:ok, chaining_response, _events} = Token.issue(domain_a_config, domain_a_exchange)
+      assert chaining_response.token_type == "N_A"
+      assert chaining_response.issued_token_type == @token_type_id_jag
+      assert {:ok, %{"typ" => "oauth-id-jag+jwt"}} = Attesto.JWS.peek_json(chaining_response.access_token, :protected)
+      assert chaining_response.expires_in <= 45
+      refute Map.has_key?(chaining_response, :refresh_token)
+
+      # Trust Domain B verifies Domain A's ID-JAG and mints a Domain B access token.
+      domain_b_config =
+        config(
+          issuer: domain_b,
+          audience: domain_b_resource,
+          replay_check: fn _key, _ttl -> :ok end,
+          jwt_bearer: [
+            enabled: true,
+            issuers: %{@issuer => %{jwks: jwks_from_pem(@signing_pem)}}
+          ],
+          resolve_jwt_bearer_subject: fn %{"sub" => sub} -> {:ok, "local:" <> sub} end
+        )
+
+      domain_b_request =
+        request(domain_b_config,
+          grant_type: @grant_jwt_bearer,
+          params: %{
+            "grant_type" => @grant_jwt_bearer,
+            "assertion" => chaining_response.access_token,
+            "resource" => domain_b_resource,
+            "scope" => "mcp.read"
+          }
+        )
+
+      assert {:ok, domain_b_response, _events} = Token.issue(domain_b_config, domain_b_request)
+      assert domain_b_response.token_type == "Bearer"
+      assert domain_b_response.scope == "mcp.read"
+      refute Map.has_key?(domain_b_response, :refresh_token)
+
+      assert {:ok, %{"sub" => "oc_local:oc_client-1", "aud" => ^domain_b_resource}} =
+               Attesto.Token.verify(Config.to_attesto_config(domain_b_config), domain_b_response.access_token,
+                 trusted_audiences: [domain_b_resource]
+               )
+    end
+  end
+
   describe "denials (RFC 6749 §5.2)" do
     test "a populated authenticated snapshot is never recomputed for denial audit" do
       test_pid = self()

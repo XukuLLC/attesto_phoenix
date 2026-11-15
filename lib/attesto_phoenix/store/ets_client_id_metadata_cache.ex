@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Cache.ETS do
   @moduledoc """
   Single-node ETS `AttestoPhoenix.ClientIdMetadata.Cache` - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG).
 
   Caches a validated Client ID Metadata Document in per-node memory keyed by its
   `client_id` URL. A per-node cache is correct for CIMD - a miss simply

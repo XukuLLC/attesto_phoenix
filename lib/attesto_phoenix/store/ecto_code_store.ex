@@ -507,15 +507,34 @@ defmodule AttestoPhoenix.Store.EctoCodeStore do
   def delete_unconsumed(criteria) do
     criteria = Attesto.RevocationCriteria.new!(criteria)
     {repo, prefix} = StoreEcto.mutation_context()
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
 
-    case StoreEcto.where_criteria(from(r in Authorization, where: is_nil(r.consumed_at)), criteria) do
+    deleted_count =
+      case StoreEcto.where_criteria(from(r in Authorization, where: is_nil(r.consumed_at)), criteria) do
+        :none ->
+          0
+
+        query ->
+          {count, _} = repo.delete_all(query, [prefix: prefix] ++ @claims_query_opts)
+          count
+      end
+
+    case StoreEcto.where_criteria(
+           from(r in Authorization, where: not is_nil(r.consumed_at) and r.consumed_success == false),
+           criteria
+         ) do
       :none ->
-        {:ok, 0}
+        :ok
 
-      query ->
-        {count, _} = repo.delete_all(query, [prefix: prefix] ++ @claims_query_opts)
-        {:ok, count}
+      in_flight_query ->
+        repo.update_all(
+          in_flight_query,
+          [set: [access_token_revoked_at: now]],
+          [prefix: prefix] ++ @claims_query_opts
+        )
     end
+
+    {:ok, deleted_count}
   end
 
   defp repo, do: Config.ecto_repo!()

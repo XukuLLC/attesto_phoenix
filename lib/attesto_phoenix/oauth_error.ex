@@ -240,6 +240,15 @@ if Code.ensure_loaded?(Plug.Conn) do
       end
     end
 
+    @doc false
+    @spec put_www_authenticate_header([{String.t(), String.t()}], String.t()) ::
+            [{String.t(), String.t()}]
+    def put_www_authenticate_header(headers, challenge) when is_list(headers) and is_binary(challenge) do
+      headers
+      |> Enum.reject(fn {key, _value} -> String.downcase(key) == "www-authenticate" end)
+      |> Kernel.++([{"www-authenticate", challenge}])
+    end
+
     @doc """
     Respond 401 with a protected-resource `WWW-Authenticate` challenge for
     `scheme` (RFC 6750 §3 / RFC 9449 §7.1).

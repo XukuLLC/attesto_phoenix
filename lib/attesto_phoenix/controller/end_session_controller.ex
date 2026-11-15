@@ -111,7 +111,7 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
   `check_session_iframe` observes `changed`.
   """
 
-  use AttestoPhoenix.Controller, formats: [:html, :json]
+  use AttestoPhoenix.Controller, cors: false, formats: [:html, :json]
 
   alias Attesto.EndSession
   alias Attesto.FrontChannelLogout

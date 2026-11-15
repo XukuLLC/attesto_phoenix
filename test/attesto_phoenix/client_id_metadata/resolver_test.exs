@@ -710,4 +710,32 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
       refute Map.has_key?(discovery_metadata(host), "client_id_metadata_document_supported")
     end
   end
+
+  describe "draft-03 issuer confusion and transient errors" do
+    test "refuses a CIMD client_id identical to the server issuer before fetching", %{agent: agent} do
+      config = resolver_config()
+
+      assert {:error, {:invalid_client_id, :issuer_confusion}} =
+               Resolver.resolve(config.issuer, config)
+
+      assert Agent.get(agent, & &1) == %{}
+    end
+
+    test "classifies transient vs terminal CIMD resolution errors" do
+      assert Resolver.transient_error?({:fetch, {:status, 503}})
+      assert Resolver.transient_error?({:fetch, {:status, 429}})
+      assert Resolver.transient_error?({:fetch, {:status, 408}})
+      assert Resolver.transient_error?({:fetch, {:transport, :timeout}})
+      assert Resolver.transient_error?({:fetch, :unresolvable})
+      assert Resolver.transient_error?({:fetch, :concurrency_limit})
+      assert Resolver.transient_error?({:fetch, :failure_backoff})
+
+      refute Resolver.transient_error?({:fetch, {:status, 404}})
+      refute Resolver.transient_error?({:fetch, {:status, 410}})
+      refute Resolver.transient_error?(:invalid_metadata)
+      refute Resolver.transient_error?(:invalid_json)
+      refute Resolver.transient_error?({:invalid_client_id, :issuer_confusion})
+      refute Resolver.transient_error?({:blocked_host, "evil.example"})
+    end
+  end
 end

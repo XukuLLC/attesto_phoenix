@@ -2,7 +2,10 @@ defmodule AttestoPhoenix.ClientIdMetadataTest do
   use ExUnit.Case, async: true
 
   alias AttestoPhoenix.ClientIdMetadata
+  alias AttestoPhoenix.ClientIdMetadata.FlowControl
   alias AttestoPhoenix.ClientIdMetadata.HostPolicy
+  alias AttestoPhoenix.Support.TestKeystore
+  alias AttestoPhoenix.Support.TestRepo
 
   describe "CIMD hostname policy" do
     test "compares lowercase IDNA names after removing one DNS root dot" do
@@ -161,6 +164,153 @@ defmodule AttestoPhoenix.ClientIdMetadataTest do
     test "the default mode is the strict one" do
       assert ClientIdMetadata.loopback_redirect_uri?("http://127.0.0.1/cb")
       refute ClientIdMetadata.loopback_redirect_uri?("http://localhost/cb")
+    end
+  end
+
+  describe "auth_methods/1 and supported_by_server?/2" do
+    alias AttestoPhoenix.Config
+
+    defp server_config(overrides) do
+      Keyword.merge(
+        [
+          issuer: "https://issuer.example",
+          audience: "https://api.example.com",
+          keystore: TestKeystore,
+          repo: TestRepo,
+          load_client: fn _ -> {:error, :not_found} end,
+          verify_client_secret: fn _, _ -> false end,
+          load_principal: fn _ -> {:error, :not_found} end,
+          client_id_metadata: [enabled: true]
+        ],
+        overrides
+      )
+      |> Config.new()
+    end
+
+    test "auth_methods/1 prefers token_endpoint_auth_methods_supported and defaults to none" do
+      assert ClientIdMetadata.auth_methods(%{
+               "token_endpoint_auth_methods_supported" => ["none", "private_key_jwt"],
+               "token_endpoint_auth_method" => "none"
+             }) == ["none", "private_key_jwt"]
+
+      assert ClientIdMetadata.auth_methods(%{"token_endpoint_auth_method" => "private_key_jwt"}) ==
+               ["private_key_jwt"]
+
+      assert ClientIdMetadata.auth_methods(%{}) == ["none"]
+    end
+
+    test "supported_by_server?/2 checks auth methods, grant_types, and response_types intersections" do
+      config = server_config(token_endpoint_auth_methods_supported: ["none", "private_key_jwt"])
+
+      assert ClientIdMetadata.supported_by_server?(
+               %{
+                 "token_endpoint_auth_methods_supported" => ["private_key_jwt"],
+                 "grant_types" => ["authorization_code"],
+                 "response_types" => ["code"]
+               },
+               config
+             )
+
+      refute ClientIdMetadata.supported_by_server?(
+               %{"grant_types" => ["urn:example:unsupported_grant"]},
+               config
+             )
+
+      refute ClientIdMetadata.supported_by_server?(
+               %{"response_types" => ["token"]},
+               config
+             )
+
+      assert ClientIdMetadata.supported_by_server?(
+               %{"token_endpoint_auth_method" => "none"},
+               config
+             )
+    end
+  end
+
+  describe "prefetch_logo/3 (draft-03 §10.9)" do
+    alias AttestoPhoenix.Config
+
+    setup do
+      fc = start_supervised!({FlowControl, []})
+      resolver = fn _host, family -> if family == :inet, do: {:ok, [{93, 184, 216, 34}]}, else: {:ok, []} end
+
+      config =
+        Config.new(
+          issuer: "https://issuer.example",
+          audience: "https://api.example.com",
+          keystore: TestKeystore,
+          repo: TestRepo,
+          load_client: fn _ -> {:error, :not_found} end,
+          verify_client_secret: fn _, _ -> false end,
+          load_principal: fn _ -> {:error, :not_found} end,
+          client_id_metadata: [enabled: true, flow_control_server: fc]
+        )
+
+      {:ok, config: config, resolver: resolver}
+    end
+
+    defp logo_plug(status, content_type, body) do
+      fn conn ->
+        conn
+        |> Plug.Conn.put_resp_content_type(content_type)
+        |> Plug.Conn.send_resp(status, body)
+      end
+    end
+
+    test "accepts valid PNG, JPEG, GIF, and WebP logos matching content-type and magic bytes", %{
+      config: config,
+      resolver: resolver
+    } do
+      samples = [
+        {"image/png", <<137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13>>},
+        {"image/jpeg", <<0xFF, 0xD8, 0xFF, 0xE0, 0, 16, "JFIF">>},
+        {"image/gif", <<"GIF89a", 1, 0, 1, 0>>},
+        {"image/webp", <<"RIFF", 12, 0, 0, 0, "WEBP", "VP8 ">>}
+      ]
+
+      for {mime, bytes} <- samples do
+        url = "https://app.example/logo/#{System.unique_integer([:positive])}"
+
+        assert {:ok, %{body: ^bytes, content_type: ^mime}} =
+                 ClientIdMetadata.prefetch_logo(url, config,
+                   resolver: resolver,
+                   req_options: [plug: logo_plug(200, mime, bytes)]
+                 )
+      end
+    end
+
+    test "rejects SVG and spoofed Content-Type payloads", %{config: config, resolver: resolver} do
+      svg_url = "https://app.example/logo/#{System.unique_integer([:positive])}.svg"
+
+      assert {:error, :bad_content_type} =
+               ClientIdMetadata.prefetch_logo(svg_url, config,
+                 resolver: resolver,
+                 req_options: [plug: logo_plug(200, "image/svg+xml", "<svg/>")]
+               )
+
+      spoof_url = "https://app.example/logo/#{System.unique_integer([:positive])}.png"
+
+      assert {:error, :invalid_image} =
+               ClientIdMetadata.prefetch_logo(spoof_url, config,
+                 resolver: resolver,
+                 req_options: [plug: logo_plug(200, "image/png", "<html>not a png</html>")]
+               )
+    end
+
+    test "rejects SSRF loopback IPs and oversized logos", %{config: config, resolver: resolver} do
+      ssrf_resolver = fn _host, family -> if family == :inet, do: {:ok, [{127, 0, 0, 1}]}, else: {:ok, []} end
+      url = "https://app.example/logo/#{System.unique_integer([:positive])}.png"
+
+      assert {:error, {:blocked_ip, {127, 0, 0, 1}}} =
+               ClientIdMetadata.prefetch_logo(url, config, resolver: ssrf_resolver)
+
+      assert {:error, :too_large} =
+               ClientIdMetadata.prefetch_logo(url, config,
+                 resolver: resolver,
+                 max_logo_bytes: 8,
+                 req_options: [plug: logo_plug(200, "image/png", <<137, 80, 78, 71, 13, 10, 26, 10, 0, 0>>)]
+               )
     end
   end
 end

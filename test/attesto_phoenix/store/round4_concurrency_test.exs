@@ -4,6 +4,7 @@ defmodule AttestoPhoenix.Store.Round4ConcurrencyTest do
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Revocation
   alias AttestoPhoenix.Schema.Authorization
+  alias AttestoPhoenix.Schema.RefreshFamilyRevocation
   alias AttestoPhoenix.Schema.RefreshToken
   alias AttestoPhoenix.Store.EctoCodeStore
   alias AttestoPhoenix.Store.EctoRefreshStore
@@ -495,6 +496,76 @@ defmodule AttestoPhoenix.Store.Round4ConcurrencyTest do
       send(pid, :continue)
       assert {:ok, {:ok, 2}} = Task.await(revoke, 10_000)
       assert is_integer(Task.await(redact, 10_000))
+    end)
+  end
+
+  test "subject revocation racing in-flight code redemption revokes both the minted refresh family and access token",
+       ctx do
+    with_cleanup(ctx, fn ->
+      now = System.system_time(:second)
+      {:ok, verifier} = {:ok, "the-quick-brown-fox-jumps-over_the.lazy~dog-0123"}
+      {:ok, challenge} = Attesto.PKCE.challenge(verifier)
+
+      code =
+        Config.with_request_config(ctx.config, fn ->
+          {:ok, issued} =
+            Attesto.AuthorizationCode.issue(EctoCodeStore, %{
+              client_id: "client",
+              redirect_uri: "https://app.example/cb",
+              code_challenge: challenge,
+              subject: "subject",
+              scope: ["openid", "offline_access"]
+            })
+
+          issued
+        end)
+
+      code_hash = Attesto.Secret.hash(code)
+      owner = self()
+
+      redeemer =
+        task(ctx.config, :redeemer, fn ->
+          {:ok, grant} =
+            Attesto.AuthorizationCode.redeem(EctoCodeStore, code, %{
+              client_id: "client",
+              redirect_uri: "https://app.example/cb",
+              code_verifier: verifier
+            })
+
+          :ok = EctoCodeStore.record_access_token_for_code(code_hash, "jti-in-flight", now + 600)
+          pause(owner, :before_refresh_insert)
+
+          Attesto.AuthorizationCode.issue_refresh_and_finalize(
+            EctoCodeStore,
+            code,
+            grant,
+            EctoRefreshStore,
+            %{subject: grant.subject, client_id: grant.client_id, scope: grant.scope, resource: []},
+            now: now
+          )
+        end)
+
+      assert_receive {:before_refresh_insert, pid, _backend}, 5_000
+
+      revoker =
+        task(ctx.config, :revoker, fn ->
+          Revocation.revoke_subject(ctx.config, "subject")
+        end)
+
+      assert {:ok, %{codes: 0, refresh_families: 0}} =
+               Task.await(revoker, 10_000)
+               |> then(fn {:ok, map} -> {:ok, Map.take(map, [:codes, :refresh_families])} end)
+
+      send(pid, :continue)
+      assert {:ok, %{token: refresh_token, family_id: family_id}} = Task.await(redeemer, 10_000)
+
+      Config.with_request_config(ctx.config, fn ->
+        assert EctoCodeStore.access_token_revoked?("jti-in-flight")
+        assert :error = EctoRefreshStore.get(Attesto.Secret.hash(refresh_token))
+
+        assert %RefreshFamilyRevocation{} =
+                 Repo.get_by(RefreshFamilyRevocation, [family_id: family_id], prefix: ctx.prefix)
+      end)
     end)
   end
 end

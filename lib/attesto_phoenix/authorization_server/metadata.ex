@@ -99,6 +99,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       authorization_response_iss_parameter_supported(config)
     )
     |> MapParams.put_optional(
+      "identity_chaining_requested_token_types_supported",
+      identity_chaining_requested_token_types_supported(config)
+    )
+    |> MapParams.put_optional(
       "tls_client_certificate_bound_access_tokens",
       tls_client_certificate_bound_access_tokens(config)
     )
@@ -224,6 +228,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
 
   defp authorization_response_iss_parameter_supported(%Config{authorization_response_iss: true}), do: true
   defp authorization_response_iss_parameter_supported(%Config{}), do: nil
+
+  defp identity_chaining_requested_token_types_supported(%Config{} = config) do
+    if Config.identity_chaining_enabled?(config) do
+      config |> Config.identity_chaining() |> Keyword.fetch!(:requested_token_types)
+    end
+  end
 
   defp tls_client_certificate_bound_access_tokens(%Config{mtls_enabled: true}), do: true
   defp tls_client_certificate_bound_access_tokens(%Config{}), do: nil

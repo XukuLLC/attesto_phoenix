@@ -1,6 +1,6 @@
 defmodule AttestoPhoenix.Controller.CredentialController do
   @moduledoc """
-  OID4VCI Credential Endpoint (`draft-ietf-oauth-openid4vci` §8.2).
+  OID4VCI Credential Endpoint (`OpenID4VCI 1.0`, 2025-09-16, §8.2).
 
   This endpoint authenticates the access token, delegates request validation,
   entitlement checking, holder-key proof verification, `c_nonce` consumption,
@@ -17,7 +17,9 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import AttestoPhoenix.Controller.OID4VCIHelpers, only: [body_params: 2, invalid_request: 4]
+  import AttestoPhoenix.Controller.OID4VCIHelpers,
+    only: [invalid_request: 4, read_credential_request: 3, send_credential_response: 4]
+
   import Plug.Conn
 
   alias AttestoPhoenix.Callback
@@ -48,20 +50,19 @@ defmodule AttestoPhoenix.Controller.CredentialController do
 
     case ProtectedResource.authenticate(conn, config, resource_metadata, core_overrides: htu_override) do
       {:ok, conn, claims} ->
-        respond(conn, config, body_params(conn, params), resource_metadata, claims)
+        respond(conn, params, config, resource_metadata, claims)
 
       {:halt, conn} ->
         conn
     end
   end
 
-  defp respond(conn, config, request, resource_metadata, claims) do
-    case CredentialIssuer.issue_request(config, claims, request) do
-      {:ok, response} ->
-        conn
-        |> PhoenixOAuthError.no_store(config)
-        |> json(response)
-
+  defp respond(conn, params, config, resource_metadata, claims) do
+    with {:ok, request, encrypted_request?, conn} <- read_credential_request(conn, params, config),
+         {:ok, response, response_encryption} <-
+           CredentialIssuer.issue_request(config, claims, request, encrypted_request?: encrypted_request?) do
+      send_credential_response(conn, config, response, response_encryption)
+    else
       {:error, :not_entitled} ->
         not_entitled(conn, config, claims, resource_metadata)
 

@@ -125,7 +125,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       `AttestoPhoenix.Event`).
   """
 
-  use AttestoPhoenix.Controller, formats: [:json]
+  use AttestoPhoenix.Controller, cors: false, formats: [:json]
 
   import Plug.Conn
 
@@ -631,7 +631,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     end
   end
 
-  # ── OID4VCI authorization_details (draft-ietf-oauth-openid4vci §5) ───────
+  # ── OID4VCI authorization_details (OpenID4VCI 1.0, 2025-09-16, §5) ──────
 
   # Stash the resolved credential_configuration_ids (only when non-empty) so
   # `issue_and_redirect_authorized/5` can read them without threading a new
@@ -909,10 +909,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp render_direct_error(conn, config, reason) do
     description = direct_error_description(Callback.map_value(%{reason: reason}, :reason))
     code = direct_error_code(reason)
+    status = if reason == :client_metadata_unavailable, do: 503, else: 400
 
     case config.render_authorization_error do
-      nil -> render_default_direct_error(conn, code, description)
-      callback -> render_host_direct_error(conn, callback, code, description)
+      nil -> render_default_direct_error(conn, status, code, description)
+      callback -> render_host_direct_error(conn, callback, status, code, description)
     end
   end
 
@@ -921,23 +922,24 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # parameter. A callback that does not send a response is a host fault; the
   # person still has to be told something, so the built-in page is rendered
   # on the conn as it arrived.
-  defp render_host_direct_error(conn, callback, code, description) do
-    error = PhoenixOAuthError.new(direct_error_atom(code), description, status: 400)
+  defp render_host_direct_error(conn, callback, status, code, description) do
+    error = PhoenixOAuthError.new(direct_error_atom(code), description, status: status)
 
     ErrorRender.invoke_hook(
       conn,
       callback,
       error,
-      &render_default_direct_error(&1, code, description),
+      &render_default_direct_error(&1, status, code, description),
       "authorization error render callback did not send a response; rendering the built-in page"
     )
   end
 
   defp direct_error_atom("invalid_request_uri"), do: :invalid_request_uri
+  defp direct_error_atom("temporarily_unavailable"), do: :temporarily_unavailable
   defp direct_error_atom(_invalid_request), do: :invalid_request
 
-  defp render_default_direct_error(conn, code, description) do
-    ErrorRender.negotiated(conn, :bad_request, direct_error_html(code, description), %{
+  defp render_default_direct_error(conn, status, code, description) do
+    ErrorRender.negotiated(conn, status, direct_error_html(code, description), %{
       error: code,
       error_description: description
     })
@@ -1014,6 +1016,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     do: "authorization requests from an embedded user agent are not permitted; use the system browser"
 
   defp direct_error_description(:invalid_client_id), do: "client_id is invalid"
+  defp direct_error_description(:client_metadata_unavailable), do: "client metadata is temporarily unavailable"
   defp direct_error_description(:missing_redirect_uri), do: "redirect_uri is required"
   defp direct_error_description(:invalid_redirect_uri), do: "redirect_uri is invalid"
 
@@ -1037,6 +1040,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # else (bad/absent client_id or redirect_uri) is the `invalid_request`
   # catch-all (OIDC Core §3.1.2.6).
   defp direct_error_code(:invalid_request_uri), do: "invalid_request_uri"
+  defp direct_error_code(:client_metadata_unavailable), do: "temporarily_unavailable"
   defp direct_error_code(_reason), do: "invalid_request"
 
   # ── Audit / telemetry ────────────────────────────────────────────────────

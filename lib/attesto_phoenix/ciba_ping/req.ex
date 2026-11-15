@@ -24,43 +24,19 @@ if Code.ensure_loaded?(Req) do
 
     @behaviour AttestoPhoenix.CIBAPing
 
-    # Notification delivery is best-effort; keep a slow/hostile client from
-    # stalling the OP (the tokens are already available at the token endpoint).
-    @timeout_ms 5_000
-
     @impl AttestoPhoenix.CIBAPing
     @spec post(String.t(), String.t(), String.t()) :: :ok | {:error, term()}
     def post(endpoint, client_notification_token, auth_req_id)
         when is_binary(endpoint) and is_binary(client_notification_token) and is_binary(auth_req_id) do
-      # SSRF screen the registered notification endpoint and pin the socket to
-      # the checked IP at connect time (rebind-proof); TLS SNI / cert / Host stay
-      # on the real host.
-      screen_opts = [allow_loopback: Application.get_env(:attesto_phoenix, :allow_loopback_delivery, false)]
-
-      with {:ok, %{url: url, host: host, authority: authority}} <-
-             AttestoPhoenix.SSRFGuard.screen(endpoint, screen_opts) do
-        body = JSON.encode!(%{auth_req_id: auth_req_id})
-
-        AttestoPhoenix.PinnedHTTP.request(
-          :post,
-          url,
-          host,
-          [
-            {"authorization", "Bearer " <> client_notification_token},
-            {"accept", "application/json"},
-            {"content-type", "application/json"},
-            {"host", authority}
-          ],
-          body,
-          @timeout_ms,
-          :discard
-        )
-        |> case do
-          {:ok, %{status: status}} when status in 200..299 -> :ok
-          {:ok, %{status: status}} -> {:error, {:status, status}}
-          {:error, reason} -> {:error, reason}
-        end
-      end
+      AttestoPhoenix.PinnedDelivery.post(
+        endpoint,
+        [
+          {"authorization", "Bearer " <> client_notification_token},
+          {"accept", "application/json"},
+          {"content-type", "application/json"}
+        ],
+        JSON.encode!(%{auth_req_id: auth_req_id})
+      )
     end
   end
 end

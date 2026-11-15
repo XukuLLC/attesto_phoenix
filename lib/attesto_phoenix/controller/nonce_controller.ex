@@ -1,6 +1,6 @@
 defmodule AttestoPhoenix.Controller.NonceController do
   @moduledoc """
-  OID4VCI c_nonce endpoint (`draft-ietf-oauth-openid4vci` §7).
+  OID4VCI c_nonce endpoint (`OpenID4VCI 1.0`, 2025-09-16, §7).
 
   Issues a fresh, short-lived c_nonce from the configured store. The endpoint
   is intentionally unauthenticated: the nonce is a freshness challenge that a

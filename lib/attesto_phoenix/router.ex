@@ -352,6 +352,7 @@ defmodule AttestoPhoenix.Router do
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController
   alias AttestoPhoenix.Controller.CheckSessionController
+  alias AttestoPhoenix.Controller.CORSController
   alias AttestoPhoenix.Controller.CredentialController
   alias AttestoPhoenix.Controller.CredentialIssuerMetadataController
   alias AttestoPhoenix.Controller.CredentialOfferController
@@ -400,7 +401,7 @@ defmodule AttestoPhoenix.Router do
   # so it is not subject to the OAuth endpoint `:prefix`.
   @jwt_vc_issuer_metadata_path "/.well-known/jwt-vc-issuer"
 
-  # OpenID Federation 1.0 §8.1 pins the Entity Configuration to this
+  # OpenID Federation 1.0 Final (2026-02-17) §9 pins the Entity Configuration to this
   # well-known URI at the host root, so it is not subject to `:prefix`.
   @federation_path "/.well-known/openid-federation"
 
@@ -463,6 +464,7 @@ defmodule AttestoPhoenix.Router do
   @credential_issuer_metadata_controller CredentialIssuerMetadataController
   @jwt_vc_issuer_metadata_controller JwtVcIssuerMetadataController
   @federation_controller EntityConfigurationController
+  @cors_controller CORSController
 
   @doc false
   defmacro __using__(_opts) do
@@ -579,6 +581,12 @@ defmodule AttestoPhoenix.Router do
             :create
           )
 
+          options(
+            unquote(prefix <> register_path),
+            unquote(@cors_controller),
+            :preflight
+          )
+
           unquote(
             registration_management_route(
               :get,
@@ -608,6 +616,12 @@ defmodule AttestoPhoenix.Router do
             unquote(registration_controller),
             :delete
           )
+
+          options(
+            unquote(prefix <> register_path <> "/:client_id"),
+            unquote(@cors_controller),
+            :preflight
+          )
         end
       end
 
@@ -625,7 +639,11 @@ defmodule AttestoPhoenix.Router do
         omitted_private
       )
 
-    discovery_route = get_route(discovery_path, discovery_controller, :show, omitted_private)
+    discovery_route =
+      quote do
+        unquote(get_route(discovery_path, discovery_controller, :show, omitted_private))
+        options(unquote(discovery_path), unquote(@cors_controller), :preflight)
+      end
 
     authorize_routes =
       quote do
@@ -703,6 +721,12 @@ defmodule AttestoPhoenix.Router do
             unquote(backchannel_authentication_controller),
             :create
           )
+
+          options(
+            unquote(prefix <> backchannel_authentication_path),
+            unquote(@cors_controller),
+            :preflight
+          )
         end
       end
 
@@ -738,6 +762,12 @@ defmodule AttestoPhoenix.Router do
             unquote(@protected_resource_controller),
             :show
           )
+
+          options(
+            unquote(@protected_resource_path),
+            unquote(@cors_controller),
+            :preflight
+          )
         end
       end
 
@@ -757,6 +787,12 @@ defmodule AttestoPhoenix.Router do
             unquote(@protected_resource_controller),
             :show,
             private: %{attesto_prm_inserted_path: unquote(inserted_path)}
+          )
+
+          options(
+            unquote(@protected_resource_path <> inserted_path),
+            unquote(@cors_controller),
+            :preflight
           )
         end
       end
@@ -793,6 +829,7 @@ defmodule AttestoPhoenix.Router do
             unquote(jwt_vc_issuer_metadata_route)
             unquote(openid_configuration_route)
             get(unquote(jwks_path), unquote(jwks_controller), :show)
+            options(unquote(jwks_path), unquote(@cors_controller), :preflight)
             unquote(protected_resource_root_route)
             unquote_splicing(protected_resource_path_routes)
           end
@@ -807,6 +844,7 @@ defmodule AttestoPhoenix.Router do
             unquote_splicing(Map.fetch!(class_pipe_through_calls, :protocol))
 
             post(unquote(prefix <> token_path), unquote(token_controller), :create)
+            options(unquote(prefix <> token_path), unquote(@cors_controller), :preflight)
             unquote(par_route)
             unquote(revocation_route)
             unquote(introspection_route)
@@ -862,6 +900,7 @@ defmodule AttestoPhoenix.Router do
           unquote(jwt_vc_issuer_metadata_route)
           unquote(openid_configuration_route)
           get(unquote(jwks_path), unquote(jwks_controller), :show)
+          options(unquote(jwks_path), unquote(@cors_controller), :preflight)
 
           # RFC 9728 §3: the protected-resource metadata document is unauthenticated
           # public metadata served at its registered well-known URI at the host
@@ -888,6 +927,7 @@ defmodule AttestoPhoenix.Router do
             # endpoints under the host-chosen prefix. They authenticate the client
             # from the request itself (RFC 6749 §2.3, RFC 7009 §2).
             post(unquote(prefix <> token_path), unquote(token_controller), :create)
+            options(unquote(prefix <> token_path), unquote(@cors_controller), :preflight)
             unquote(par_route)
             unquote(revocation_route)
 
@@ -1051,6 +1091,12 @@ defmodule AttestoPhoenix.Router do
           unquote(authorization_controller),
           :create
         )
+
+        options(
+          unquote(prefix <> authorization_path),
+          unquote(@cors_controller),
+          :preflight
+        )
       end
 
     verification_route =
@@ -1078,6 +1124,7 @@ defmodule AttestoPhoenix.Router do
   defp credential_route(true, prefix, credential_path) do
     quote do
       post(unquote(prefix <> credential_path), unquote(@credential_controller), :create)
+      options(unquote(prefix <> credential_path), unquote(@cors_controller), :preflight)
     end
   end
 
@@ -1086,6 +1133,7 @@ defmodule AttestoPhoenix.Router do
   defp nonce_route(true, prefix, nonce_path) do
     quote do
       post(unquote(prefix <> nonce_path), unquote(@nonce_controller), :create)
+      options(unquote(prefix <> nonce_path), unquote(@cors_controller), :preflight)
     end
   end
 
@@ -1098,6 +1146,12 @@ defmodule AttestoPhoenix.Router do
         unquote(@credential_offer_controller),
         :show
       )
+
+      options(
+        unquote(prefix <> credential_offer_path <> "/:id"),
+        unquote(@cors_controller),
+        :preflight
+      )
     end
   end
 
@@ -1106,6 +1160,7 @@ defmodule AttestoPhoenix.Router do
   defp deferred_credential_route(true, prefix, deferred_credential_path) do
     quote do
       post(unquote(prefix <> deferred_credential_path), unquote(@deferred_credential_controller), :create)
+      options(unquote(prefix <> deferred_credential_path), unquote(@cors_controller), :preflight)
     end
   end
 
@@ -1118,6 +1173,12 @@ defmodule AttestoPhoenix.Router do
         unquote(@status_list_controller),
         :show
       )
+
+      options(
+        unquote(prefix <> status_list_path <> "/:id"),
+        unquote(@cors_controller),
+        :preflight
+      )
     end
   end
 
@@ -1129,6 +1190,12 @@ defmodule AttestoPhoenix.Router do
         unquote(prefix <> presentation_request_path <> "/:id"),
         unquote(@presentation_request_controller),
         :show
+      )
+
+      options(
+        unquote(prefix <> presentation_request_path <> "/:id"),
+        unquote(@cors_controller),
+        :preflight
       )
     end
   end
@@ -1143,10 +1210,22 @@ defmodule AttestoPhoenix.Router do
         :create
       )
 
+      options(
+        unquote(prefix <> presentation_response_path),
+        unquote(@cors_controller),
+        :preflight
+      )
+
       post(
         unquote(prefix <> presentation_response_path <> "/:id"),
         unquote(@presentation_response_controller),
         :create_dc_api
+      )
+
+      options(
+        unquote(prefix <> presentation_response_path <> "/:id"),
+        unquote(@cors_controller),
+        :preflight
       )
     end
   end
@@ -1156,6 +1235,7 @@ defmodule AttestoPhoenix.Router do
   defp credential_issuer_metadata_route(true, path, controller) do
     quote do
       get(unquote(path), unquote(controller), :show)
+      options(unquote(path), unquote(@cors_controller), :preflight)
     end
   end
 
@@ -1164,6 +1244,7 @@ defmodule AttestoPhoenix.Router do
   defp jwt_vc_issuer_metadata_route(true, path, controller) do
     quote do
       get(unquote(path), unquote(controller), :show)
+      options(unquote(path), unquote(@cors_controller), :preflight)
     end
   end
 
@@ -1172,13 +1253,17 @@ defmodule AttestoPhoenix.Router do
   defp federation_route(true, path, controller) do
     quote do
       get(unquote(path), unquote(controller), :show)
+      options(unquote(path), unquote(@cors_controller), :preflight)
     end
   end
 
   defp federation_route(false, _path, _controller), do: nil
 
   defp openid_configuration_route(true, true, _local_userinfo_path, path, controller, omitted_private) do
-    get_route(path, controller, :show, omitted_private)
+    quote do
+      unquote(get_route(path, controller, :show, omitted_private))
+      options(unquote(path), unquote(@cors_controller), :preflight)
+    end
   end
 
   defp openid_configuration_route(true, false, local_userinfo_path, path, controller, omitted_private) do
@@ -1192,7 +1277,10 @@ defmodule AttestoPhoenix.Router do
         {local_userinfo_segments, metadata_path_segment_count}
       )
 
-    get_route(path, controller, :show, private)
+    quote do
+      unquote(get_route(path, controller, :show, private))
+      options(unquote(path), unquote(@cors_controller), :preflight)
+    end
   end
 
   defp openid_configuration_route(false, _userinfo?, _local_userinfo_path, _path, _controller, _omitted_private),
@@ -1232,6 +1320,7 @@ defmodule AttestoPhoenix.Router do
     if control not in omitted do
       quote do
         post(unquote(path), unquote(controller), :create)
+        options(unquote(path), unquote(@cors_controller), :preflight)
       end
     end
   end
@@ -1250,6 +1339,7 @@ defmodule AttestoPhoenix.Router do
     quote do
       get(unquote(prefix <> path), unquote(controller), :userinfo)
       post(unquote(prefix <> path), unquote(controller), :userinfo)
+      options(unquote(prefix <> path), unquote(@cors_controller), :preflight)
     end
   end
 

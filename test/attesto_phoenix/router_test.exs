@@ -14,6 +14,7 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.AuthorizeController
   alias AttestoPhoenix.Controller.BackchannelAuthenticationController
   alias AttestoPhoenix.Controller.CheckSessionController
+  alias AttestoPhoenix.Controller.CORSController
   alias AttestoPhoenix.Controller.DeviceAuthorizationController
   alias AttestoPhoenix.Controller.DeviceVerificationController
   alias AttestoPhoenix.Controller.DiscoveryController
@@ -987,19 +988,30 @@ defmodule AttestoPhoenix.RouterTest do
       assert route_signature(DefaultRouter) == [
                {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery",
                 public_metadata, []},
+               {:options, "/.well-known/oauth-authorization-server", CORSController, :preflight, "cors",
+                public_metadata, []},
                {:get, "/.well-known/openid-configuration", OpenIDConfigurationController, :show,
                 "open_id_configuration", public_metadata, []},
+               {:options, "/.well-known/openid-configuration", CORSController, :preflight, "cors", public_metadata, []},
                {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", public_metadata, []},
+               {:options, "/.well-known/jwks.json", CORSController, :preflight, "cors", public_metadata, []},
                {:get, "/.well-known/oauth-protected-resource", ProtectedResourceController, :show, "protected_resource",
                 public_metadata, []},
+               {:options, "/.well-known/oauth-protected-resource", CORSController, :preflight, "cors", public_metadata,
+                []},
                {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata, []},
                {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata, []},
                {:post, "/oauth/token", TokenController, :create, "token", protected_metadata, []},
+               {:options, "/oauth/token", CORSController, :preflight, "cors", protected_metadata, []},
                {:post, "/oauth/par", PARController, :create, "par", protected_metadata, []},
+               {:options, "/oauth/par", CORSController, :preflight, "cors", protected_metadata, []},
                {:post, "/oauth/revoke", RevocationController, :create, "revocation", protected_metadata, []},
+               {:options, "/oauth/revoke", CORSController, :preflight, "cors", protected_metadata, []},
                {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", protected_metadata, []},
+               {:options, "/oauth/introspect", CORSController, :preflight, "cors", protected_metadata, []},
                {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata, []},
-               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata, []}
+               {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata, []},
+               {:options, "/oauth/userinfo", CORSController, :preflight, "cors", protected_metadata, []}
              ]
     end
 
@@ -1010,37 +1022,56 @@ defmodule AttestoPhoenix.RouterTest do
       assert route_signature(LegacyAllFeaturesRouter) == [
                {:get, "/.well-known/oauth-authorization-server", DiscoveryController, :show, "discovery",
                 public_metadata, [:oauth_server]},
+               {:options, "/.well-known/oauth-authorization-server", CORSController, :preflight, "cors",
+                public_metadata, [:oauth_server]},
                {:get, "/.well-known/openid-configuration", OpenIDConfigurationController, :show,
                 "open_id_configuration", public_metadata, [:oauth_server]},
+               {:options, "/.well-known/openid-configuration", CORSController, :preflight, "cors", public_metadata,
+                [:oauth_server]},
                {:get, "/.well-known/jwks.json", JWKSController, :show, "jwks", public_metadata, [:oauth_server]},
+               {:options, "/.well-known/jwks.json", CORSController, :preflight, "cors", public_metadata,
+                [:oauth_server]},
                {:get, "/.well-known/oauth-protected-resource", ProtectedResourceController, :show, "protected_resource",
                 public_metadata, [:oauth_server]},
+               {:options, "/.well-known/oauth-protected-resource", CORSController, :preflight, "cors", public_metadata,
+                [:oauth_server]},
                {:get, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata,
                 [:oauth_server]},
                {:post, "/oauth/authorize", AuthorizeController, :authorize, "authorize", protected_metadata,
                 [:oauth_server]},
                {:post, "/oauth/token", TokenController, :create, "token", protected_metadata, [:oauth_server]},
+               {:options, "/oauth/token", CORSController, :preflight, "cors", protected_metadata, [:oauth_server]},
                {:post, "/oauth/par", PARController, :create, "par", protected_metadata, [:oauth_server]},
+               {:options, "/oauth/par", CORSController, :preflight, "cors", protected_metadata, [:oauth_server]},
                {:post, "/oauth/revoke", RevocationController, :create, "revocation", protected_metadata,
                 [:oauth_server]},
+               {:options, "/oauth/revoke", CORSController, :preflight, "cors", protected_metadata, [:oauth_server]},
                {:post, "/oauth/introspect", IntrospectionController, :create, "introspection", protected_metadata,
                 [:oauth_server]},
+               {:options, "/oauth/introspect", CORSController, :preflight, "cors", protected_metadata, [:oauth_server]},
                {:post, "/oauth/register", RegistrationController, :create, "registration", protected_metadata,
                 [:oauth_server]},
+               {:options, "/oauth/register", CORSController, :preflight, "cors", protected_metadata, [:oauth_server]},
                {:get, "/oauth/register/:client_id", RegistrationController, :show, "registration", protected_metadata,
                 [:oauth_server]},
                {:put, "/oauth/register/:client_id", RegistrationController, :update, "registration", protected_metadata,
                 [:oauth_server]},
                {:delete, "/oauth/register/:client_id", RegistrationController, :delete, "registration",
                 protected_metadata, [:oauth_server]},
+               {:options, "/oauth/register/:client_id", CORSController, :preflight, "cors", protected_metadata,
+                [:oauth_server]},
                {:post, "/oauth/device_authorization", DeviceAuthorizationController, :create, "device_authorization",
                 protected_metadata, [:oauth_server]},
+               {:options, "/oauth/device_authorization", CORSController, :preflight, "cors", protected_metadata,
+                [:oauth_server]},
                {:get, "/oauth/device_verification", DeviceVerificationController, :verify, "device_verification",
                 protected_metadata, [:oauth_server]},
                {:post, "/oauth/device_verification", DeviceVerificationController, :verify, "device_verification",
                 protected_metadata, [:oauth_server]},
                {:post, "/oauth/bc-authorize", BackchannelAuthenticationController, :create,
                 "backchannel_authentication", protected_metadata, [:oauth_server]},
+               {:options, "/oauth/bc-authorize", CORSController, :preflight, "cors", protected_metadata,
+                [:oauth_server]},
                {:get, "/oauth/end_session", EndSessionController, :end_session, "end_session", protected_metadata,
                 [:oauth_server]},
                {:post, "/oauth/end_session", EndSessionController, :end_session, "end_session", protected_metadata,
@@ -1050,16 +1081,21 @@ defmodule AttestoPhoenix.RouterTest do
                {:get, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata,
                 [:oauth_server]},
                {:post, "/oauth/userinfo", UserinfoController, :userinfo, "userinfo", protected_metadata,
-                [:oauth_server]}
+                [:oauth_server]},
+               {:options, "/oauth/userinfo", CORSController, :preflight, "cors", protected_metadata, [:oauth_server]}
              ]
     end
 
     test "route-class overrides replace only their class and preserve pipeline order" do
       metadata_routes = [
         {:get, "/.well-known/oauth-authorization-server"},
+        {:options, "/.well-known/oauth-authorization-server"},
         {:get, "/.well-known/openid-configuration"},
+        {:options, "/.well-known/openid-configuration"},
         {:get, "/.well-known/jwks.json"},
-        {:get, "/.well-known/oauth-protected-resource"}
+        {:options, "/.well-known/jwks.json"},
+        {:get, "/.well-known/oauth-protected-resource"},
+        {:options, "/.well-known/oauth-protected-resource"}
       ]
 
       interactive_routes = [
@@ -1074,17 +1110,26 @@ defmodule AttestoPhoenix.RouterTest do
 
       protocol_routes = [
         {:post, "/oauth/token"},
+        {:options, "/oauth/token"},
         {:post, "/oauth/par"},
+        {:options, "/oauth/par"},
         {:post, "/oauth/revoke"},
+        {:options, "/oauth/revoke"},
         {:post, "/oauth/introspect"},
+        {:options, "/oauth/introspect"},
         {:post, "/oauth/register"},
+        {:options, "/oauth/register"},
         {:get, "/oauth/register/:client_id"},
         {:put, "/oauth/register/:client_id"},
         {:delete, "/oauth/register/:client_id"},
+        {:options, "/oauth/register/:client_id"},
         {:post, "/oauth/device_authorization"},
+        {:options, "/oauth/device_authorization"},
         {:post, "/oauth/bc-authorize"},
+        {:options, "/oauth/bc-authorize"},
         {:get, "/oauth/userinfo"},
-        {:post, "/oauth/userinfo"}
+        {:post, "/oauth/userinfo"},
+        {:options, "/oauth/userinfo"}
       ]
 
       for {method, path} <- metadata_routes do

@@ -216,7 +216,7 @@ defmodule AttestoPhoenix.Controller.RevocationController do
       error
       | status: @http_unauthorized,
         headers:
-          put_www_authenticate(
+          OAuthError.put_www_authenticate_header(
             error.headers,
             OAuthError.format_challenge(scheme, realm: config.basic_realm)
           )
@@ -224,12 +224,6 @@ defmodule AttestoPhoenix.Controller.RevocationController do
   end
 
   defp revocation_client_auth_error(_config, %OAuthError{} = error, _context), do: error
-
-  defp put_www_authenticate(headers, challenge) do
-    headers
-    |> Enum.reject(fn {key, _value} -> String.downcase(key) == "www-authenticate" end)
-    |> Kernel.++([{"www-authenticate", challenge}])
-  end
 
   # RFC 6749 §5.2: non-authentication revocation errors use the shared JSON
   # envelope without adding a challenge.

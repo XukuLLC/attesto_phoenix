@@ -105,7 +105,7 @@ defmodule AttestoPhoenix.AuthorizationServer.RequestPolicy do
   The client's registered redirect URIs (RFC 6749 §3.1.2.3).
 
   For a CIMD client (`%CIMDClient{metadata: metadata}`,
-  `draft-ietf-oauth-client-id-metadata-document-01`) the document *is* the
+  `draft-ietf-oauth-client-id-metadata-document-03`) the document *is* the
   registration, so the registered set is the document's own `redirect_uris`
   (RFC 9700) and the host's per-client callback is never consulted. For a
   registered client the set is resolved through the host's

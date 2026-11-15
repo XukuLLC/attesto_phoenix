@@ -4,6 +4,7 @@ defmodule AttestoPhoenix.CredentialIssuer do
   import AttestoPhoenix.Controller.OID4VCIHelpers, only: [maybe_put_option: 3]
 
   alias Attesto.{
+    CredentialEncryption,
     CredentialProof,
     CredentialRequest,
     CredentialResponse,
@@ -19,7 +20,7 @@ defmodule AttestoPhoenix.CredentialIssuer do
 
   require Logger
 
-  @sd_jwt_vc_formats ~w(vc+sd-jwt dc+sd-jwt)
+  @sd_jwt_vc_formats ~w(dc+sd-jwt)
   @credential_formats @sd_jwt_vc_formats ++ ["jwt_vc_json", "mso_mdoc"]
   @credential_configuration_ids_claim "credential_configuration_ids"
   # The bound `Attesto.CredentialProof` applies; a proof header may carry a
@@ -35,13 +36,18 @@ defmodule AttestoPhoenix.CredentialIssuer do
 
   @doc """
   Complete a deferred OID4VCI credential request for an authenticated wallet,
-  returning `{:ok, response_map}` or `{:error, error_code, error_description}`.
+  returning `{:ok, response_map, response_encryption}` or
+  `{:error, error_code, error_description}`.
   """
-  @spec issue_deferred_request(Config.t(), map(), map()) ::
-          {:ok, map()} | {:error, String.t(), String.t()}
-  def issue_deferred_request(%Config{} = config, claims, request) when is_map(claims) and is_map(request) do
-    with {:ok, transaction_id} <- deferred_transaction_id(request),
-         {:ok, deferred} <- build_deferred_credential(config, claims["sub"], transaction_id),
+  @spec issue_deferred_request(Config.t(), map(), map(), keyword()) ::
+          {:ok, map(), map() | nil} | {:error, String.t(), String.t()}
+  def issue_deferred_request(%Config{} = config, claims, request, opts \\ [])
+      when is_map(claims) and is_map(request) and is_list(opts) do
+    encrypted_request? = Keyword.get(opts, :encrypted_request?, false)
+
+    with {:ok, parsed} <- CredentialEncryption.parse_deferred_request(request),
+         :ok <- check_response_encryption(config, parsed.response_encryption, encrypted_request?),
+         {:ok, deferred} <- build_deferred_credential(config, claims["sub"], parsed.transaction_id),
          :ok <- deferred_entitled?(claims, deferred.credential_configuration_id),
          {:ok, credential} <-
            issue(
@@ -51,10 +57,16 @@ defmodule AttestoPhoenix.CredentialIssuer do
              deferred.holder_jwk,
              deferred.credential
            ) do
-      {:ok, CredentialResponse.build(credential)}
+      {:ok, CredentialResponse.build(credential), parsed.response_encryption}
     else
       {:error, :missing_transaction_id} ->
         {:error, "invalid_credential_request", "transaction_id is required"}
+
+      {:error, :invalid_credential_response_encryption} ->
+        {:error, "invalid_encryption_parameters", "Invalid Credential Response encryption parameters."}
+
+      {:error, :invalid_encryption_parameters, description} ->
+        {:error, "invalid_encryption_parameters", description}
 
       {:error, :issuance_pending} ->
         {:error, "issuance_pending", "The credential is not yet ready."}
@@ -67,23 +79,25 @@ defmodule AttestoPhoenix.CredentialIssuer do
   @doc """
   Validate an OID4VCI credential request, verify holder-key proof(s), consume
   the `c_nonce`, and issue the holder-bound credential(s) as a conn-free
-  response map.
+  response map paired with optional validated `response_encryption` parameters.
   """
-  @spec issue_request(Config.t(), map(), map()) ::
-          {:ok, map()}
+  @spec issue_request(Config.t(), map(), map(), keyword()) ::
+          {:ok, map(), map() | nil}
           | {:error, :not_entitled}
           | {:error, String.t(), String.t()}
-  def issue_request(%Config{} = config, claims, request) when is_map(claims) and is_map(request) do
+  def issue_request(%Config{} = config, claims, request, opts \\ [])
+      when is_map(claims) and is_map(request) and is_list(opts) do
+    encrypted_request? = Keyword.get(opts, :encrypted_request?, false)
     parsed_request = Callback.map_value(%{result: CredentialRequest.parse(request)}, :result)
 
     with {:ok, parsed} <- parsed_request,
-         :ok <- reject_response_encryption(parsed.response_encryption),
+         :ok <- check_response_encryption(config, parsed.response_encryption, encrypted_request?),
          {:ok, credential_configuration_id} <- selector(parsed.selector),
          :ok <- entitled?(claims, parsed.selector, credential_configuration_id),
          {:ok, holder_jwks} <- verify_proofs(config, claims, parsed.proofs),
          {:ok, credentials} <-
            build_credentials(config, claims["sub"], credential_configuration_id, holder_jwks) do
-      {:ok, CredentialResponse.build(credentials)}
+      {:ok, CredentialResponse.build(credentials), parsed.response_encryption}
     else
       {:error, :not_entitled} ->
         {:error, :not_entitled}
@@ -109,7 +123,10 @@ defmodule AttestoPhoenix.CredentialIssuer do
       {:error, :invalid_credential_request, description} ->
         {:error, "invalid_credential_request", description}
 
-      {:error, :response_encryption_not_supported, description} ->
+      {:error, :invalid_credential_response_encryption} ->
+        {:error, "invalid_encryption_parameters", "Invalid Credential Response encryption parameters."}
+
+      {:error, :invalid_encryption_parameters, description} ->
         {:error, "invalid_encryption_parameters", description}
 
       {:error, :invalid_mdoc_signing_key} ->
@@ -252,8 +269,7 @@ defmodule AttestoPhoenix.CredentialIssuer do
   defp holder_algorithm(%{"kty" => "EC", "crv" => "P-256"}), do: {:ok, "ES256"}
   defp holder_algorithm(%{"kty" => "EC", "crv" => "P-384"}), do: {:ok, "ES384"}
   defp holder_algorithm(%{"kty" => "EC", "crv" => "P-521"}), do: {:ok, "ES512"}
-  defp holder_algorithm(%{"kty" => "OKP", "crv" => "Ed25519"}), do: {:ok, "EdDSA"}
-  defp holder_algorithm(%{"kty" => "OKP", "crv" => "Ed448"}), do: {:ok, "EdDSA"}
+  defp holder_algorithm(%{"kty" => "OKP", "crv" => crv}) when crv in ["Ed25519", "Ed448"], do: {:ok, crv}
   defp holder_algorithm(_holder_jwk), do: {:error, :invalid_holder_key}
 
   defp validate_holder_for_format(%{"kty" => "EC", "crv" => "P-256"}, "mso_mdoc"), do: :ok
@@ -350,18 +366,45 @@ defmodule AttestoPhoenix.CredentialIssuer do
 
   defp configuration_value(configuration, key), do: MapParams.fetch(configuration, key)
 
-  # `Attesto.CredentialRequest.parse` accepts and normalizes a wallet's
-  # `credential_response_encryption` request per OID4VCI §8.2, but this issuer
-  # does not implement Credential Response encryption (a future feature) and
-  # its metadata never advertises it as supported. Silently returning a
-  # plaintext credential when the wallet explicitly required an encrypted
-  # response would be a silent confidentiality downgrade, so fail closed with
-  # a clear OID4VCI error instead.
-  defp reject_response_encryption(nil), do: :ok
+  defp check_response_encryption(config, response_encryption, encrypted_request?) do
+    keystore = Config.credential_encryption_keystore(config)
+    required? = Config.credential_encryption_required(config)
 
-  defp reject_response_encryption(%{}) do
-    {:error, :response_encryption_not_supported,
-     "This credential issuer does not support Credential Response encryption."}
+    with :ok <- check_encryption_presence(keystore, required?, response_encryption, encrypted_request?) do
+      validate_optional_response_encryption(response_encryption)
+    end
+  end
+
+  defp check_encryption_presence(nil, _required?, response_encryption, _encrypted?)
+       when not is_nil(response_encryption),
+       do:
+         {:error, :invalid_encryption_parameters,
+          "This credential issuer does not support Credential Response encryption."}
+
+  defp check_encryption_presence(_keystore, true, _response_encryption, false),
+    do: {:error, :invalid_encryption_parameters, "Credential Request encryption is required by this issuer."}
+
+  defp check_encryption_presence(_keystore, true, nil, _encrypted?),
+    do: {:error, :invalid_encryption_parameters, "Credential Response encryption is required by this issuer."}
+
+  defp check_encryption_presence(_keystore, _required?, response_encryption, false)
+       when not is_nil(response_encryption),
+       do:
+         {:error, :invalid_encryption_parameters,
+          "Credential Request encryption MUST be used when credential_response_encryption is included."}
+
+  defp check_encryption_presence(_keystore, _required?, _response_encryption, _encrypted?), do: :ok
+
+  defp validate_optional_response_encryption(nil), do: :ok
+
+  defp validate_optional_response_encryption(response_encryption) do
+    case CredentialEncryption.validate_response_encryption(response_encryption) do
+      :ok ->
+        :ok
+
+      {:error, :invalid_encryption_parameters} ->
+        {:error, :invalid_encryption_parameters, "Invalid or unsupported Credential Response encryption parameters."}
+    end
   end
 
   defp selector({:configuration_id, id}), do: {:ok, id}
@@ -601,10 +644,6 @@ defmodule AttestoPhoenix.CredentialIssuer do
     Logger.warning(@invalid_builder_result_warning)
     {:error, :invalid_credential}
   end
-
-  defp deferred_transaction_id(%{"transaction_id" => id}) when is_binary(id) and id != "", do: {:ok, id}
-
-  defp deferred_transaction_id(_request), do: {:error, :missing_transaction_id}
 
   defp build_deferred_credential(config, subject, transaction_id) do
     case invoke_deferred_builder(config, subject, transaction_id) do

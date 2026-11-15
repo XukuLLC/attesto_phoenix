@@ -1,6 +1,6 @@
 defmodule AttestoPhoenix.Controller.DeferredCredentialController do
   @moduledoc """
-  OID4VCI Deferred Credential Endpoint (`draft-ietf-oauth-openid4vci` §9).
+  OID4VCI Deferred Credential Endpoint (`OpenID4VCI 1.0`, 2025-09-16, §9).
 
   Completes a credential whose issuance was deferred at the Credential
   endpoint. The wallet polls this endpoint with the same access token and the
@@ -25,10 +25,10 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
   use AttestoPhoenix.Controller, formats: [:json]
 
-  import AttestoPhoenix.Controller.OID4VCIHelpers, only: [body_params: 2, invalid_request: 4]
+  import AttestoPhoenix.Controller.OID4VCIHelpers,
+    only: [invalid_request: 4, read_credential_request: 3, send_credential_response: 4]
 
   alias AttestoPhoenix.{Config, CredentialIssuer, ProtectedResource, RequestContext}
-  alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
 
   @doc """
   Complete a deferred credential for an authenticated wallet.
@@ -58,20 +58,19 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialController do
 
     case ProtectedResource.authenticate(conn, config, resource_metadata, core_overrides: htu_override) do
       {:ok, conn, claims} ->
-        respond(conn, config, body_params(conn, params), claims)
+        respond(conn, params, config, claims)
 
       {:halt, conn} ->
         conn
     end
   end
 
-  defp respond(conn, config, request, claims) do
-    case CredentialIssuer.issue_deferred_request(config, claims, request) do
-      {:ok, response} ->
-        conn
-        |> PhoenixOAuthError.no_store(config)
-        |> json(response)
-
+  defp respond(conn, params, config, claims) do
+    with {:ok, request, encrypted_request?, conn} <- read_credential_request(conn, params, config),
+         {:ok, response, response_encryption} <-
+           CredentialIssuer.issue_deferred_request(config, claims, request, encrypted_request?: encrypted_request?) do
+      send_credential_response(conn, config, response, response_encryption)
+    else
       {:error, error_code, description} ->
         invalid_request(conn, config, error_code, description)
     end

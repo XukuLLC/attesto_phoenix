@@ -146,6 +146,26 @@ defmodule AttestoPhoenix.AuthorizationServer.RegistrationTest do
                  "redirect_uris" => ["https://client.example/cb?code=prepopulated"]
                })
     end
+
+    test "refuses redirect_uris carrying OAuth 2.1 authorization request or response query parameters" do
+      config = build_config()
+
+      for uri <- [
+            "https://client.example/cb?response_type=code",
+            "https://client.example/cb?client_id=c1",
+            "https://client.example/cb?code_challenge=abc",
+            "https://client.example/cb?code_challenge_method=S256",
+            "https://client.example/cb?redirect_uri=https%3A%2F%2Fother.example",
+            "https://client.example/cb?scope=openid",
+            "https://client.example/cb?access_token=tok",
+            "https://client.example/cb?id_token=jwt",
+            "https://client.example/cb?s%63ope=openid"
+          ] do
+        assert {:error, %OAuthError{error: :invalid_redirect_uri}} =
+                 Registration.register(config, %{"redirect_uris" => [uri]}),
+               "expected #{inspect(uri)} to be refused"
+      end
+    end
   end
 
   describe "register/2 response_types (RFC 7591 §2)" do

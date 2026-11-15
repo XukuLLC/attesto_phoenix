@@ -2,7 +2,7 @@ if Code.ensure_loaded?(Req) do
   defmodule AttestoPhoenix.ClientIdMetadata.Fetcher.Req do
     @moduledoc """
     The default, SSRF-guarded Client ID Metadata Document fetcher - CIMD
-    (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
+    (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG).
 
     This is the only component of the CIMD feature that makes an outbound request,
     so it is where the draft's Security Considerations are enforced. Implements
@@ -84,14 +84,36 @@ if Code.ensure_loaded?(Req) do
     @spec fetch(String.t(), keyword()) ::
             {:ok, Fetcher.result()} | {:error, term()}
     def fetch(url, opts \\ []) when is_binary(url) and is_list(opts) do
-      validate_options!(opts, :fetch)
-      run_with_deadline(fn -> do_fetch(url, opts) end, request_timeout!(opts))
+      fetch_with_policy(url, "application/json", &json_content_type?/1, opts)
     end
 
-    defp do_fetch(url, opts) do
+    @doc false
+    @spec fetch_resource(String.t(), String.t(), (String.t() -> boolean()), keyword()) ::
+            {:ok, %{body: binary(), content_type: String.t(), cache_control: keyword()}} | {:error, term()}
+    def fetch_resource(url, accept, content_type_fun, opts \\ [])
+        when is_binary(url) and is_binary(accept) and is_function(content_type_fun, 1) and is_list(opts) do
+      validate_options!(opts, :fetch)
+
+      run_with_deadline(
+        fn -> do_fetch(url, accept, content_type_fun, opts) end,
+        request_timeout!(opts)
+      )
+    end
+
+    defp fetch_with_policy(url, accept, content_type_fun, opts) do
+      case fetch_resource(url, accept, content_type_fun, opts) do
+        {:ok, %{body: body, cache_control: cache_control}} ->
+          {:ok, %{body: body, cache_control: cache_control}}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+
+    defp do_fetch(url, accept, content_type_fun, opts) do
       with {:ok, uri} <- revalidate(url),
            {:ok, screened} <- screen_target(uri, opts) do
-        request(uri, screened.url, opts)
+        request(uri, screened.url, accept, content_type_fun, opts)
       end
     end
 
@@ -215,14 +237,15 @@ if Code.ensure_loaded?(Req) do
     defdelegate special_use_ip?(ip), to: HostPolicy
 
     # Step 4-8: dial the pinned IP while keeping SNI / cert hostname / Host header
-    # on the original host, refuse redirects, require 200 + JSON, cap the body.
-    defp request(uri, pinned_url, opts) do
+    # on the original host, refuse redirects, require 200 + allowed Content-Type,
+    # cap the body.
+    defp request(uri, pinned_url, accept, content_type_fun, opts) do
       timeout = request_timeout!(opts)
       max_bytes = max_document_bytes!(opts)
       started_at = System.monotonic_time(:millisecond)
 
-      case perform_request(uri, pinned_url, timeout, max_bytes, opts) do
-        {:ok, %Req.Response{status: 200} = resp} -> on_ok(resp, max_bytes, started_at)
+      case perform_request(uri, pinned_url, accept, timeout, max_bytes, opts) do
+        {:ok, %Req.Response{status: 200} = resp} -> on_ok(resp, content_type_fun, max_bytes, started_at)
         {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
         {:error, :too_large} -> {:error, :too_large}
         {:error, %{__exception__: true} = exception} -> {:error, {:transport, exception}}
@@ -233,14 +256,14 @@ if Code.ensure_loaded?(Req) do
     # Test transports are intentionally kept on Req. Production requests use a
     # one-shot Mint connection so attacker-selected hostnames cannot create
     # permanent dynamically named Finch pools.
-    defp perform_request(uri, pinned_url, timeout, max_bytes, opts) do
+    defp perform_request(uri, pinned_url, accept, timeout, max_bytes, opts) do
       case Keyword.get(opts, :req_options, []) do
         [] ->
-          case AttestoPhoenix.PinnedHTTP.request_inline(
+          case Attesto.PinnedHTTP.request_inline(
                  :get,
                  pinned_url,
                  uri.host,
-                 [{"accept", "application/json"}, {"host", HostPolicy.authority(uri)}],
+                 [{"accept", accept}, {"host", HostPolicy.authority(uri)}],
                  "",
                  timeout,
                  max_bytes
@@ -251,12 +274,12 @@ if Code.ensure_loaded?(Req) do
 
         _test_override ->
           uri
-          |> build_req(URI.parse(pinned_url).host, timeout, max_bytes, opts)
+          |> build_req(URI.parse(pinned_url).host, accept, timeout, max_bytes, opts)
           |> Req.request()
       end
     end
 
-    defp build_req(%URI{} = uri, pinned_host, timeout, max_bytes, opts) do
+    defp build_req(%URI{} = uri, pinned_host, accept, timeout, max_bytes, opts) do
       [
         # Connect to the pinned IP; `connect_options[:hostname]` keeps TLS SNI,
         # certificate verification, and the derived Host header on the original
@@ -264,7 +287,7 @@ if Code.ensure_loaded?(Req) do
         # request still presents as the real hostname.
         url: %{uri | host: pinned_host},
         method: :get,
-        headers: [{"accept", "application/json"}, {"host", HostPolicy.authority(uri)}],
+        headers: [{"accept", accept}, {"host", HostPolicy.authority(uri)}],
         redirect: false,
         retry: false,
         receive_timeout: timeout,
@@ -297,11 +320,12 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
-    defp on_ok(%Req.Response{} = resp, max_bytes, started_at) do
+    defp on_ok(%Req.Response{} = resp, content_type_fun, max_bytes, started_at) do
       received_at = DateTime.utc_now()
       response_delay_ms = max(0, System.monotonic_time(:millisecond) - started_at)
+      raw_content_type = content_type(resp)
 
-      with :ok <- check_content_type(resp),
+      with :ok <- check_content_type(raw_content_type, content_type_fun),
            {:ok, body} <- check_size(resp, max_bytes) do
         cache_control =
           resp
@@ -309,20 +333,20 @@ if Code.ensure_loaded?(Req) do
           |> Keyword.put(:response_delay_ms, response_delay_ms)
           |> Keyword.put(:received_at, received_at)
 
-        {:ok, %{body: body, cache_control: cache_control}}
+        {:ok,
+         %{
+           body: body,
+           content_type: normalize_content_type(raw_content_type),
+           cache_control: cache_control
+         }}
       end
     end
 
-    # Step 7: content type must be JSON. The draft allows `application/json` and
-    # the structured-suffix `application/<x>+json`.
-    defp check_content_type(%Req.Response{} = resp) do
-      resp
-      |> content_type()
-      |> json_content_type?()
-      |> case do
-        true -> :ok
-        false -> {:error, :bad_content_type}
-      end
+    # Step 7: content type must satisfy the caller's policy (JSON by default).
+    defp check_content_type(raw_content_type, content_type_fun) do
+      if content_type_fun.(raw_content_type),
+        do: :ok,
+        else: {:error, :bad_content_type}
     end
 
     defp content_type(%Req.Response{} = resp) do
@@ -332,13 +356,16 @@ if Code.ensure_loaded?(Req) do
       end
     end
 
+    defp normalize_content_type(value) do
+      value
+      |> String.split(";", parts: 2)
+      |> hd()
+      |> String.trim()
+      |> String.downcase()
+    end
+
     defp json_content_type?(value) do
-      essence =
-        value
-        |> String.split(";", parts: 2)
-        |> hd()
-        |> String.trim()
-        |> String.downcase()
+      essence = normalize_content_type(value)
 
       essence == "application/json" or
         (String.starts_with?(essence, "application/") and String.ends_with?(essence, "+json"))

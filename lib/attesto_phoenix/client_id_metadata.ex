@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata do
   @moduledoc """
   Integration façade for Client ID Metadata Documents - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL
@@ -54,9 +54,10 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   """
 
   alias Attesto.ClientIdMetadata, as: Core
+  alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.{Callback, Config}
   alias AttestoPhoenix.ClientIdMetadata.Client
-  alias AttestoPhoenix.ClientIdMetadata.{HostPolicy, JWKSResolver, Resolver}
+  alias AttestoPhoenix.ClientIdMetadata.{HostPolicy, JWKSResolver, Logo, Resolver}
 
   @typedoc """
   A resolved CIMD client: the normalized, string-keyed metadata map
@@ -166,9 +167,63 @@ defmodule AttestoPhoenix.ClientIdMetadata do
   end
 
   @doc """
+  The CIMD client's declared token endpoint authentication methods (`draft §5`).
+  """
+  @spec auth_methods(client()) :: [String.t()]
+  def auth_methods(metadata) when is_map(metadata), do: Core.auth_methods(metadata)
+
+  @doc """
+  Returns `true` if `error` is a transient metadata discovery failure (`draft §6.1`).
+  """
+  @spec transient_error?(term()) :: boolean()
+  def transient_error?(error), do: Resolver.transient_error?(error)
+
+  @doc """
+  Returns `true` when at least one declared `token_endpoint_auth_methods_supported` /
+  `token_endpoint_auth_method`, `grant_types` (if present), and non-empty
+  `response_types` (if present) intersects what this server supports (`draft §5`, `§6`).
+  """
+  @spec supported_by_server?(client(), Config.t()) :: boolean()
+  def supported_by_server?(metadata, %Config{} = config) when is_map(metadata) do
+    auth_supported? =
+      Enum.any?(Core.auth_methods(metadata), &(&1 in Config.token_endpoint_auth_methods_supported(config)))
+
+    grant_supported? =
+      case Map.fetch(metadata, "grant_types") do
+        {:ok, grants} when is_list(grants) ->
+          Enum.any?(grants, &(&1 in Config.grant_types_supported(config)))
+
+        :error ->
+          true
+      end
+
+    response_supported? =
+      case Map.fetch(metadata, "response_types") do
+        {:ok, [_ | _] = types} ->
+          Enum.any?(types, &(&1 in Metadata.response_types_supported()))
+
+        _absent_or_empty ->
+          true
+      end
+
+    auth_supported? and grant_supported? and response_supported?
+  end
+
+  if Code.ensure_loaded?(Req) do
+    @doc """
+    SSRF-guarded `logo_uri` prefetch and image content validation (`draft §10.9`).
+    """
+    @spec prefetch_logo(String.t() | client() | Client.t(), Config.t(), keyword()) ::
+            {:ok, Logo.logo_result()} | {:error, term()}
+    def prefetch_logo(client_or_url, %Config{} = config, opts \\ []) do
+      Logo.prefetch(client_or_url, config, opts)
+    end
+  end
+
+  @doc """
   The scopes the CIMD document *declares*, as a list.
 
-  `draft-ietf-oauth-client-id-metadata-document-02` §7 carries the RFC 7591 §2
+  `draft-ietf-oauth-client-id-metadata-document-03` §7 carries the RFC 7591 §2
   client-metadata field set, in which `scope` is an OPTIONAL, space-delimited
   string. A document that omits it declares no scopes, so this returns `[]` — an
   empty *declared* set, never a missing key. A CIMD client therefore has no

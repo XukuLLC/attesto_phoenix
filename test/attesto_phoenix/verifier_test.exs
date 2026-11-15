@@ -353,4 +353,65 @@ defmodule AttestoPhoenix.VerifierTest do
     {_kty, public} = pem |> JOSE.JWK.from_pem() |> JOSE.JWK.to_public_map()
     public
   end
+
+  test "status-bearing presentations fail closed and revoked lists never complete a session", ctx do
+    {issuer_pem, issuer_jwk} = keypair()
+    {holder_pem, holder_jwk} = keypair()
+    uri = "https://status.example/list"
+    status = Attesto.StatusList.reference(uri, 0)
+
+    credential =
+      Attesto.SdJwtVc.issue([iss: @issuer, vct: "identity", pem: issuer_pem],
+        cnf: %{"jwk" => holder_jwk},
+        status: status,
+        claims: %{"given_name" => "Alice"}
+      )
+
+    for result <- [:valid, :revoked, :unreachable, :bad_signature, :default, :exception] do
+      token = signed_status_list(issuer_pem, uri, if(result == :revoked, do: 1, else: 0))
+
+      callback = fn ^uri, "application/statuslist+jwt" ->
+        case result do
+          :unreachable -> {:error, :unreachable}
+          :exception -> raise "transport failed"
+          :bad_signature -> {:ok, "invalid.signature.token"}
+          _ -> {:ok, token}
+        end
+      end
+
+      config = %{ctx.config | verifier_status_resolver: if(result != :default, do: callback)}
+      attrs = %{dcql_query: dcql_query(), expected_query_ids: [@query_id], issuer_trust: {:issuer_jwks, issuer_jwk}}
+      assert {:ok, %{id: id, nonce: nonce}} = Verifier.create_presentation_request(config, attrs)
+
+      binding =
+        Attesto.JWS.sign_compact(holder_pem, %{"alg" => "ES256", "typ" => "kb+jwt"}, %{
+          "nonce" => nonce,
+          "aud" => @verifier_client_id,
+          "iat" => System.system_time(:second),
+          "sd_hash" => Attesto.JWS.encode64(:crypto.hash(:sha256, credential))
+        })
+
+      presentation = credential <> binding
+      response = %{"state" => id, "vp_token" => %{@query_id => [presentation]}}
+
+      if result == :valid do
+        assert {:ok, _} = Verifier.complete_presentation_response(config, response)
+      else
+        assert {:error, :invalid_request} = Verifier.complete_presentation_response(config, response)
+        assert {:ok, %{data: %{status: :pending}}} = Store.get(id)
+      end
+    end
+  end
+
+  defp signed_status_list(pem, uri, value) do
+    claims = %{"sub" => uri, "iat" => System.system_time(:second), "status_list" => Attesto.StatusList.build([value])}
+
+    {_jws, jwt} =
+      pem
+      |> JOSE.JWK.from_pem()
+      |> JOSE.JWT.sign(%{"alg" => "ES256", "typ" => "statuslist+jwt"}, claims)
+      |> JOSE.JWS.compact()
+
+    jwt
+  end
 end

@@ -293,7 +293,7 @@ defmodule AttestoPhoenix.AuthorizationServer.SenderConstraint do
   raises as a host integration fault.
   """
   @spec client_requires_dpop?(Config.t(), term()) :: boolean()
-  # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-01`) is governed
+  # A CIMD client (`draft-ietf-oauth-client-id-metadata-document-03`) is governed
   # by its metadata document, not the host's per-client sender-constraint policy,
   # so the host callback does not apply: it does not require DPoP.
   def client_requires_dpop?(%Config{}, %CIMDClient{metadata: _metadata}), do: false

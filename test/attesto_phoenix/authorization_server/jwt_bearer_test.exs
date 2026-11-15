@@ -295,6 +295,11 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert {:ok, response, _} = issue(config, narrow)
       assert access_token_aud(config, response) == a
 
+      assert {:ok, plural_response, _} =
+               issue(config, %{"assertion" => assertion(%{"resource" => [a, b]})})
+
+      assert access_token_aud(config, plural_response) == [a, b]
+
       widen = %{
         "assertion" => assertion(%{"resource" => a}),
         "resource" => b
@@ -619,6 +624,17 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
                  %{"assertion" => assertion(%{"cnf" => %{"jkt" => expected_jkt}})},
                  sender_constraint_input: dpop_request_input(wrong_proof)
                )
+    end
+
+    test "unsupported cnf confirmation methods fail closed with invalid_grant" do
+      config = config()
+      unsupported_x5t = %{"x5t#S256" => Attesto.Thumbprint.of("cert-der")}
+      unsupported_jwk = %{"jwk" => %{"kty" => "EC", "crv" => "P-256", "x" => "a", "y" => "b"}}
+
+      for cnf <- [unsupported_x5t, unsupported_jwk] do
+        assert {:error, %OAuthError{error: :invalid_grant}, _} =
+                 issue(config, %{"assertion" => assertion(%{"cnf" => cnf})})
+      end
     end
 
     test "the grant is rejected when the client is not registered for it" do

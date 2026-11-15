@@ -18,40 +18,17 @@ if Code.ensure_loaded?(Req) do
 
     @behaviour AttestoPhoenix.BackChannelLogout
 
-    # Logout delivery is best-effort; keep the RP from stalling the user's logout.
-    @timeout_ms 5_000
-
     @impl AttestoPhoenix.BackChannelLogout
     @spec post(String.t(), String.t()) :: :ok | {:error, term()}
     def post(backchannel_logout_uri, logout_token) when is_binary(backchannel_logout_uri) and is_binary(logout_token) do
-      # SSRF screen the registered URI and pin the socket to the checked IP
-      # (connect-time, so a DNS rebind can't slip an internal address past a
-      # registration-time check). TLS SNI / cert / Host stay on the real host.
-      screen_opts = [allow_loopback: Application.get_env(:attesto_phoenix, :allow_loopback_delivery, false)]
-
-      with {:ok, %{url: url, host: host, authority: authority}} <-
-             AttestoPhoenix.SSRFGuard.screen(backchannel_logout_uri, screen_opts) do
-        body = URI.encode_query(%{"logout_token" => logout_token})
-
-        AttestoPhoenix.PinnedHTTP.request(
-          :post,
-          url,
-          host,
-          [
-            {"accept", "application/json"},
-            {"content-type", "application/x-www-form-urlencoded"},
-            {"host", authority}
-          ],
-          body,
-          @timeout_ms,
-          :discard
-        )
-        |> case do
-          {:ok, %{status: status}} when status in 200..299 -> :ok
-          {:ok, %{status: status}} -> {:error, {:status, status}}
-          {:error, reason} -> {:error, reason}
-        end
-      end
+      AttestoPhoenix.PinnedDelivery.post(
+        backchannel_logout_uri,
+        [
+          {"accept", "application/json"},
+          {"content-type", "application/x-www-form-urlencoded"}
+        ],
+        URI.encode_query(%{"logout_token" => logout_token})
+      )
     end
   end
 end

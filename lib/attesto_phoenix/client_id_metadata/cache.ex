@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Cache do
   @moduledoc """
   Behaviour for caching a validated Client ID Metadata Document - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-02`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL

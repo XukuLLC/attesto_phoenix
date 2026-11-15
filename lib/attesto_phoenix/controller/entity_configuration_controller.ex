@@ -1,6 +1,6 @@
 defmodule AttestoPhoenix.Controller.EntityConfigurationController do
   @moduledoc """
-  OpenID Federation 1.0 Entity Configuration endpoint.
+  OpenID Federation 1.0 Final (2026-02-17) §9 Entity Configuration endpoint.
 
   Builds a self-issued Entity Statement from the configured issuer, signing
   key, authority hints, and entity metadata.

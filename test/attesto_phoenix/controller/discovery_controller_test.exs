@@ -495,10 +495,8 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
       refute Map.has_key?(body, "revocation_endpoint_auth_signing_alg_values_supported")
     end
 
-    test "advertises RFC 9207 authorization response iss support when enabled" do
-      host = host_config(authorization_response_iss: true)
-
-      body = call_show(host, protocol_config()) |> decode_body()
+    test "advertises RFC 9207 authorization response iss support by default" do
+      body = call_show(host_config(), protocol_config()) |> decode_body()
 
       assert body["authorization_response_iss_parameter_supported"] == true
     end
@@ -653,6 +651,71 @@ defmodule AttestoPhoenix.Controller.DiscoveryControllerTest do
 
       assert body["request_object_signing_alg_values_supported"] ==
                ["PS256", "ES256", "EdDSA", "Ed25519"]
+    end
+  end
+
+  describe "Ed25519 signing keystore metadata (RFC 9864)" do
+    defmodule Ed25519Keystore do
+      @moduledoc false
+      @behaviour Attesto.Keystore
+
+      @pem JOSE.JWK.generate_key({:okp, :Ed25519}) |> JOSE.JWK.to_pem() |> elem(1)
+
+      @impl true
+      def signing_pem, do: @pem
+
+      @impl true
+      def verification_pems, do: [@pem]
+    end
+
+    test "advertises Ed25519 rather than deprecated EdDSA for an Ed25519 keystore" do
+      host = host_config(keystore: Ed25519Keystore, openid_provider: true)
+
+      protocol =
+        ProtocolConfig.new(
+          issuer: @issuer,
+          audience: "https://api.example.com",
+          keystore: Ed25519Keystore,
+          principal_kinds: [
+            PrincipalKind.new("client", "oc_", required_claims: [{"client_id", :non_empty_string}])
+          ]
+        )
+
+      oauth_body = call_show(host, protocol) |> decode_body()
+
+      assert oauth_body["authorization_signing_alg_values_supported"] == ["Ed25519"]
+      assert oauth_body["introspection_signing_alg_values_supported"] == ["Ed25519"]
+
+      oidc_body =
+        conn(:get, "/.well-known/openid-configuration")
+        |> put_private(:attesto_phoenix_config, host)
+        |> put_private(:attesto_protocol_config, protocol)
+        |> OpenIDConfigurationController.show(%{})
+        |> decode_body()
+
+      assert oidc_body["id_token_signing_alg_values_supported"] == ["Ed25519"]
+      assert oidc_body["authorization_signing_alg_values_supported"] == ["Ed25519"]
+      assert oidc_body["introspection_signing_alg_values_supported"] == ["Ed25519"]
+    end
+
+    test "advertises identity_chaining_requested_token_types_supported only when identity_chaining is enabled" do
+      default_body = call_show(host_config(), protocol_config()) |> decode_body()
+      refute Map.has_key?(default_body, "identity_chaining_requested_token_types_supported")
+
+      enabled_host =
+        host_config(
+          identity_chaining: [
+            enabled: true,
+            allowed_audiences: ["https://as-b.example"],
+            requested_token_types: ["urn:ietf:params:oauth:token-type:jwt"]
+          ]
+        )
+
+      enabled_body = call_show(enabled_host, protocol_config()) |> decode_body()
+
+      assert enabled_body["identity_chaining_requested_token_types_supported"] == [
+               "urn:ietf:params:oauth:token-type:jwt"
+             ]
     end
   end
 

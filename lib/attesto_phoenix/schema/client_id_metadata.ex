@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.Schema.ClientIdMetadata do
   @moduledoc """
   Ecto schema for one cached Client ID Metadata Document - CIMD
-  (`draft-ietf-oauth-client-id-metadata-document-01`, IETF OAuth WG).
+  (`draft-ietf-oauth-client-id-metadata-document-03`, IETF OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an
   HTTPS URL as its `client_id`; the authorization server dereferences that URL

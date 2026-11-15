@@ -280,6 +280,64 @@ defmodule AttestoPhoenix.Controller.DeferredCredentialControllerTest do
       assert body(invalid)["error"] == "invalid_credential_request"
     end
 
+    test "decrypts deferred application/jwt request and encrypts 200 response while keeping errors JSON" do
+      config =
+        Application.fetch_env!(:attesto_phoenix, Config)
+        |> Keyword.put(:credential_encryption_keystore, __MODULE__.VcKeystore)
+
+      put_config(config)
+
+      wallet_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      wallet_pub = wallet_key |> JOSE.JWK.to_public_map() |> elem(1) |> Map.merge(%{"alg" => "ECDH-ES", "kid" => "w1"})
+
+      issuer_pub =
+        @vc_signing_pem
+        |> Attesto.Key.jwk()
+        |> JOSE.JWK.to_public_map()
+        |> elem(1)
+        |> Map.merge(%{"alg" => "ECDH-ES", "kid" => Attesto.Key.kid(@vc_signing_pem), "use" => "enc"})
+
+      req_map = %{
+        "transaction_id" => "txn-enc",
+        "credential_response_encryption" => %{"jwk" => wallet_pub, "enc" => "A256GCM"}
+      }
+
+      {:ok, jwe} =
+        Attesto.JWE.encrypt(
+          issuer_pub,
+          JSON.encode!(req_map),
+          %{"alg" => "ECDH-ES", "enc" => "A256GCM", "cty" => "json", "kid" => issuer_pub["kid"]}
+        )
+
+      response =
+        :post
+        |> conn(@endpoint_path, jwe)
+        |> put_req_header("content-type", "application/jwt")
+        |> put_req_header("authorization", "Bearer " <> mint_token())
+        |> CredentialRouter.call([])
+
+      assert response.status == 200
+      assert get_resp_header(response, "content-type") == ["application/jwt; charset=utf-8"]
+      assert {:ok, plaintext, header} = Attesto.JWE.decrypt(wallet_key, response.resp_body)
+      assert header["kid"] == "w1"
+      assert %{"credentials" => [%{"credential" => _}]} = JSON.decode!(plaintext)
+
+      # Pending error response remains JSON even when encryption was requested (§8.3.1.2/§9.2)
+      pending_cfg = Keyword.put(config, :build_deferred_credential, fn _sub, _txn -> {:error, :issuance_pending} end)
+      put_config(pending_cfg)
+
+      pending_resp =
+        :post
+        |> conn(@endpoint_path, jwe)
+        |> put_req_header("content-type", "application/jwt")
+        |> put_req_header("authorization", "Bearer " <> mint_token())
+        |> CredentialRouter.call([])
+
+      assert pending_resp.status == 400
+      assert get_resp_header(pending_resp, "content-type") |> List.first() =~ "application/json"
+      assert body(pending_resp)["error"] == "issuance_pending"
+    end
+
     test "rejects a deferred credential configuration outside the access-token entitlement" do
       config = Application.fetch_env!(:attesto_phoenix, Config)
 

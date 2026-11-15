@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.ClientIdMetadata.Cache.Ecto do
   @moduledoc """
   Postgres-backed `AttestoPhoenix.ClientIdMetadata.Cache` for clustered
-  deployments - CIMD (`draft-ietf-oauth-client-id-metadata-document-02`, IETF
+  deployments - CIMD (`draft-ietf-oauth-client-id-metadata-document-03`, IETF
   OAuth WG).
 
   CIMD lets a client identify itself with no prior registration by using an

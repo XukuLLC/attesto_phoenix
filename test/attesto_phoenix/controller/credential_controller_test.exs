@@ -7,6 +7,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
   import Plug.Test
 
   alias Attesto.CNonceStore.ETS, as: CNonceStore
+  alias Attesto.DPoP.ReplayCache
   alias Attesto.{Mdoc, SdJwtVc, Token}
   alias Attesto.PreAuthorizedCodeStore.ETS
   alias AttestoPhoenix.Config
@@ -119,7 +120,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       pre_authorized_code_store: ETS,
       c_nonce_store: CNonceStore,
       credential_configurations_supported: %{
-        @configuration_id => %{format: "vc+sd-jwt", vct: @vct}
+        @configuration_id => %{format: "dc+sd-jwt", vct: @vct}
       },
       build_credential: fn subject, credential_configuration_id, holder_jwk ->
         send(self(), {:credential_requested, subject, credential_configuration_id, holder_jwk})
@@ -157,7 +158,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       # The JOSE `typ` header follows the credential configuration's `format`.
       issuer_jwt = credential |> String.split("~") |> hd()
-      assert {:ok, %{"typ" => "vc+sd-jwt"}} = Attesto.JWS.peek_json(issuer_jwt, :protected)
+      assert {:ok, %{"typ" => "dc+sd-jwt"}} = Attesto.JWS.peek_json(issuer_jwt, :protected)
 
       issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
       assert Config.resolve!() |> Config.vc_keystore() == Keystore
@@ -173,27 +174,34 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       assert holder_jwk == public_map(@holder_key)
     end
 
-    test "honors callback issued_at for either SD-JWT VC media type" do
+    test "honors callback issued_at for dc+sd-jwt and rejects legacy vc+sd-jwt format" do
       issued_at = System.system_time(:second) - 120
       issuer_jwk = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
 
-      for format <- ["vc+sd-jwt", "dc+sd-jwt"] do
-        config = Application.fetch_env!(:attesto_phoenix, Config)
+      config = Application.fetch_env!(:attesto_phoenix, Config)
 
-        config
-        |> Keyword.put(:credential_configurations_supported, %{@configuration_id => %{format: format, vct: @vct}})
-        |> Keyword.put(:build_credential, fn _subject, _configuration, _holder ->
-          {:ok, %{vct: @vct, claims: %{"degree" => "Bachelor"}, issued_at: issued_at}}
-        end)
-        |> put_config()
+      config
+      |> Keyword.put(:credential_configurations_supported, %{@configuration_id => %{format: "dc+sd-jwt", vct: @vct}})
+      |> Keyword.put(:build_credential, fn _subject, _configuration, _holder ->
+        {:ok, %{vct: @vct, claims: %{"degree" => "Bachelor"}, issued_at: issued_at}}
+      end)
+      |> put_config()
 
-        nonce = CNonceStore.issue(60)
-        response = post_credential(mint_token(), credential_request(nonce))
-        assert response.status == 200
-        assert %{"credentials" => [%{"credential" => credential}]} = body(response)
-        assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk, accepted_algs: ["ES256"])
-        assert verified.claims["iat"] == issued_at
-      end
+      nonce = CNonceStore.issue(60)
+      response = post_credential(mint_token(), credential_request(nonce))
+      assert response.status == 200
+      assert %{"credentials" => [%{"credential" => credential}]} = body(response)
+      assert {:ok, verified} = SdJwtVc.verify(credential, issuer_jwk, accepted_algs: ["ES256"])
+      assert verified.claims["iat"] == issued_at
+
+      config
+      |> Keyword.put(:credential_configurations_supported, %{@configuration_id => %{format: "vc+sd-jwt", vct: @vct}})
+      |> put_config()
+
+      legacy_nonce = CNonceStore.issue(60)
+      rejected = post_credential(mint_token(), credential_request(legacy_nonce))
+      assert rejected.status == 400
+      assert body(rejected)["error"] == "invalid_credential_request"
     end
 
     test "invalid callback issued_at fails closed instead of signing a credential" do
@@ -831,7 +839,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       config = Application.fetch_env!(:attesto_phoenix, Config)
 
       configurations = %{
-        @configuration_id => %{"format" => "vc+sd-jwt", format: nil, vct: @vct}
+        @configuration_id => %{"format" => "dc+sd-jwt", format: nil, vct: @vct}
       }
 
       put_config(Keyword.put(config, :credential_configurations_supported, configurations))
@@ -859,8 +867,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       request =
         credential_request(nonce)
         |> Map.put("credential_response_encryption", %{
-          "jwk" => public_map(@holder_key),
-          "alg" => "ECDH-ES",
+          "jwk" => Map.put(public_map(@holder_key), "alg", "ECDH-ES"),
           "enc" => "A128GCM"
         })
 
@@ -871,11 +878,194 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       refute_received {:credential_requested, _, _, _}
     end
 
+    for zip <- [nil, "DEF"] do
+      @response_zip zip
+      test "decrypts application/jwt requests and encrypts responses with compression #{inspect(@response_zip)}" do
+        config =
+          Application.fetch_env!(:attesto_phoenix, Config)
+          |> Keyword.put(:credential_encryption_keystore, __MODULE__.VcKeystore)
+
+        put_config(config)
+        nonce = CNonceStore.issue(60)
+        wallet_enc_key = JOSE.JWK.generate_key({:ec, "P-256"})
+        wallet_enc_pub = public_map(wallet_enc_key) |> Map.merge(%{"alg" => "ECDH-ES", "kid" => "wallet-1"})
+
+        issuer_pub =
+          @vc_signing_pem
+          |> Attesto.Key.jwk()
+          |> JOSE.JWK.to_public_map()
+          |> elem(1)
+          |> Map.merge(%{"alg" => "ECDH-ES", "kid" => Attesto.Key.kid(@vc_signing_pem), "use" => "enc"})
+
+        response_encryption = %{"jwk" => wallet_enc_pub, "enc" => "A256GCM"}
+
+        response_encryption =
+          if @response_zip, do: Map.put(response_encryption, "zip", @response_zip), else: response_encryption
+
+        request_payload = credential_request(nonce) |> Map.put("credential_response_encryption", response_encryption)
+
+        {:ok, encrypted_req} =
+          Attesto.JWE.encrypt(
+            issuer_pub,
+            JSON.encode!(request_payload),
+            %{"alg" => "ECDH-ES", "enc" => "A256GCM", "cty" => "json", "kid" => issuer_pub["kid"]}
+          )
+
+        parser_opts =
+          Plug.Parsers.init(
+            parsers: [:urlencoded, :json],
+            pass: ["*/*"],
+            json_decoder: JSON,
+            body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+          )
+
+        conn =
+          :post
+          |> conn(@endpoint_path, encrypted_req)
+          |> put_req_header("content-type", "application/jwt")
+          |> put_req_header("authorization", "Bearer " <> mint_token())
+          |> Plug.Parsers.call(parser_opts)
+          |> CredentialRouter.call([])
+
+        assert conn.status == 200
+        assert get_resp_header(conn, "content-type") == ["application/jwt; charset=utf-8"]
+
+        {plaintext, header} =
+          if @response_zip do
+            {plaintext, _jwe} = JOSE.JWE.block_decrypt(wallet_enc_key, conn.resp_body)
+            assert {:ok, header} = Attesto.JWE.peek_protected_header(conn.resp_body)
+            assert header["zip"] == "DEF"
+            assert {:error, :invalid_header} = Attesto.JWE.decrypt(wallet_enc_key, conn.resp_body)
+            {plaintext, header}
+          else
+            assert {:ok, plaintext, header} = Attesto.JWE.decrypt(wallet_enc_key, conn.resp_body)
+            refute Map.has_key?(header, "zip")
+            {plaintext, header}
+          end
+
+        assert header["kid"] == "wallet-1"
+        assert header["cty"] == "json"
+        assert %{"credentials" => [%{"credential" => vc}]} = JSON.decode!(plaintext)
+        vc_pub = @signing_pem |> Attesto.Key.jwk() |> JOSE.JWK.to_public_map() |> elem(1)
+        assert {:ok, _verified} = SdJwtVc.verify(vc, vc_pub)
+      end
+    end
+
+    test "enforces §8.2 encrypted request requirement, encryption_required flag, and rejects bad enc params before nonce consumption" do
+      config =
+        Application.fetch_env!(:attesto_phoenix, Config)
+        |> Keyword.put(:credential_encryption_keystore, __MODULE__.VcKeystore)
+
+      put_config(config)
+      nonce = CNonceStore.issue(60)
+      wallet_enc_pub = public_map(JOSE.JWK.generate_key({:ec, "P-256"})) |> Map.put("alg", "ECDH-ES")
+
+      issuer_pub =
+        @vc_signing_pem
+        |> Attesto.Key.jwk()
+        |> JOSE.JWK.to_public_map()
+        |> elem(1)
+        |> Map.merge(%{"alg" => "ECDH-ES", "kid" => Attesto.Key.kid(@vc_signing_pem), "use" => "enc"})
+
+      # 1. Plaintext request carrying credential_response_encryption must fail (§8.2)
+      plain_with_enc =
+        credential_request(nonce)
+        |> Map.put("credential_response_encryption", %{"jwk" => wallet_enc_pub, "enc" => "A256GCM"})
+
+      resp1 = post_credential(mint_token(), plain_with_enc)
+      assert resp1.status == 400
+      assert body(resp1)["error"] == "invalid_encryption_parameters"
+
+      # 2. Unsupported algorithm inside encrypted request fails before c_nonce consumption
+      bad_alg_payload =
+        credential_request(nonce)
+        |> Map.put("credential_response_encryption", %{
+          "jwk" => Map.put(wallet_enc_pub, "alg", "UNSUPPORTED_ALG"),
+          "enc" => "A256GCM"
+        })
+
+      {:ok, bad_alg_jwe} =
+        Attesto.JWE.encrypt(
+          issuer_pub,
+          JSON.encode!(bad_alg_payload),
+          %{"alg" => "ECDH-ES", "enc" => "A256GCM", "cty" => "json", "kid" => issuer_pub["kid"]}
+        )
+
+      resp2 =
+        :post
+        |> conn(@endpoint_path, bad_alg_jwe)
+        |> put_req_header("content-type", "application/jwt")
+        |> put_req_header("authorization", "Bearer " <> mint_token())
+        |> CredentialRouter.call([])
+
+      assert resp2.status == 400
+      assert body(resp2)["error"] == "invalid_encryption_parameters"
+      # Nonce is still unconsumed!
+      assert CNonceStore.valid?(nonce)
+
+      # 3. encryption_required: true rejects plaintext JSON requests
+      put_config(Keyword.put(config, :credential_encryption_required, true))
+      resp3 = post_credential(mint_token(), credential_request(nonce))
+      assert resp3.status == 400
+      assert body(resp3)["error"] == "invalid_encryption_parameters"
+      assert CNonceStore.valid?(nonce)
+    end
+
     test "the opt-in router mounts POST /credential" do
       response = CredentialRouter.call(conn(:post, @endpoint_path), [])
 
       assert response.status == 401
       assert body(response)["error"] == "invalid_token"
+    end
+
+    test "pins DPoP htu against the configured credential endpoint URL rather than the Host header" do
+      start_supervised!({ReplayCache, []})
+      config = Application.fetch_env!(:attesto_phoenix, Config)
+      put_config(Keyword.put(config, :replay_check, &ReplayCache.check_and_record/2))
+      nonce = CNonceStore.issue(60)
+      dpop_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      {_, pub_map} = JOSE.JWK.to_public_map(dpop_key)
+      jkt = Attesto.DPoP.compute_jkt(pub_map)
+
+      access_token = mint_token(dpop_jkt: jkt)
+      ath = Base.url_encode64(:crypto.hash(:sha256, access_token), padding: false)
+
+      sign_dpop = fn htu ->
+        header = %{"alg" => "ES256", "typ" => "dpop+jwt", "jwk" => pub_map}
+
+        payload = %{
+          "htm" => "POST",
+          "htu" => htu,
+          "iat" => System.system_time(:second),
+          "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false),
+          "ath" => ath
+        }
+
+        {_, compact} = JOSE.JWS.compact(JOSE.JWT.sign(dpop_key, header, payload))
+        compact
+      end
+
+      # Spoofed Host header must not override the configured credential endpoint URL.
+      spoofed_conn =
+        :post
+        |> conn(@endpoint_path, credential_request(nonce))
+        |> Map.put(:host, "evil.example")
+        |> put_req_header("authorization", "DPoP " <> access_token)
+        |> put_req_header("dpop", sign_dpop.("https://evil.example" <> @endpoint_path))
+        |> CredentialRouter.call([])
+
+      assert spoofed_conn.status == 401
+      assert get_resp_header(spoofed_conn, "www-authenticate") |> hd() =~ "invalid_dpop_proof"
+
+      pinned_conn =
+        :post
+        |> conn(@endpoint_path, credential_request(nonce))
+        |> Map.put(:host, "evil.example")
+        |> put_req_header("authorization", "DPoP " <> access_token)
+        |> put_req_header("dpop", sign_dpop.(@issuer <> @endpoint_path))
+        |> CredentialRouter.call([])
+
+      assert pinned_conn.status == 200
     end
   end
 
@@ -979,7 +1169,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       }
     }
 
-    {:ok, %{access_token: token}} = Token.mint(config, principal)
+    {:ok, %{access_token: token}} = Token.mint(config, principal, Keyword.take(opts, [:dpop_jkt]))
     token
   end
 

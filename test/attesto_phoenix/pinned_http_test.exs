@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.PinnedHTTPTest do
   use ExUnit.Case, async: false
 
-  alias AttestoPhoenix.PinnedHTTP
+  alias Attesto.PinnedHTTP
   alias AttestoPhoenix.TestHTTPServer
 
   test "uses a one-shot pinned connection without consuming caller messages" do

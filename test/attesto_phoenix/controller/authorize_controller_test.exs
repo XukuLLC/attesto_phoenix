@@ -28,6 +28,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   alias Attesto.AuthorizationCode
   alias Attesto.RequestObject.Policy
   alias AttestoPhoenix.AuthorizationCodePrivateContext, as: PrivateContext
+  alias AttestoPhoenix.ClientIdMetadata.FlowControl
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.ConsentGrant
   alias AttestoPhoenix.Controller.AuthorizeController
@@ -499,13 +500,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       refute Map.has_key?(location_query(conn), "state")
     end
 
-    test "can include RFC 9207 iss in successful authorization responses" do
-      put_config(authorization_response_iss: true)
+    test "includes RFC 9207 iss in successful query, form_post, and JARM authorization responses by default" do
+      query_conn = call(valid_params())
+      assert query_conn.status == 302
+      assert location_query(query_conn)["iss"] == "https://issuer.example.com"
 
-      conn = call(valid_params())
+      form_conn = call(valid_params(%{"response_mode" => "form_post"}))
+      assert form_conn.status == 200
+      assert form_conn.resp_body =~ ~s(name="iss" value="https://issuer.example.com")
 
-      assert conn.status == 302
-      assert location_query(conn)["iss"] == "https://issuer.example.com"
+      jarm_conn = call(valid_params(%{"response_mode" => "query.jwt"}))
+      assert jarm_conn.status == 302
+      claims = decode_jarm(location_query(jarm_conn)["response"])
+      assert claims["iss"] == "https://issuer.example.com"
     end
   end
 
@@ -644,12 +651,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
           start: {Agent, :start_link, [fn -> %{} end, [name: StubFetcher]]}
         })
 
+      fc = start_supervised!({FlowControl, []})
+      Process.put(:cimd_flow_control_server, fc)
       :ok
     end
 
     defp cimd_config(overrides \\ []) do
       Keyword.merge(
-        [enabled: true, fetcher: StubFetcher, cache: CimdETS],
+        [
+          enabled: true,
+          fetcher: StubFetcher,
+          cache: CimdETS,
+          flow_control_server: Process.get(:cimd_flow_control_server)
+        ],
         overrides
       )
     end
@@ -1159,6 +1173,31 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       assert conn.status == 400
     end
+
+    test "transient CIMD fetch failure renders HTTP 503 directly without redirecting" do
+      client_id = unique_cimd_client_id()
+      StubFetcher.script(client_id, {:error, {:status, 503}})
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => @cimd_redirect_uri}))
+
+      assert conn.status == 503
+      assert get_resp_header(conn, "location") == []
+      assert conn.resp_body =~ "temporarily_unavailable"
+    end
+
+    test "empty CIMD capability intersection with server config renders HTTP 400 directly" do
+      client_id = unique_cimd_client_id()
+      script_doc(client_id, cimd_doc(%{"grant_types" => ["urn:example:unsupported_grant"]}))
+      put_config(client_id_metadata: cimd_config())
+
+      conn =
+        call(valid_params(%{"client_id" => client_id, "redirect_uri" => @cimd_redirect_uri}))
+
+      assert conn.status == 400
+      assert get_resp_header(conn, "location") == []
+    end
   end
 
   describe "PAR-required policy" do
@@ -1639,15 +1678,23 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert location_query(conn)["error"] == "invalid_request_object"
     end
 
-    test "can include RFC 9207 iss in authorization error responses" do
-      put_config(authorization_response_iss: true)
-
-      conn = valid_params(%{}) |> Map.delete("code_challenge") |> call()
-
-      assert conn.status == 302
-      query = location_query(conn)
+    test "includes RFC 9207 iss in query, form_post, and JARM authorization error responses by default" do
+      query_conn = valid_params(%{}) |> Map.delete("code_challenge") |> call()
+      assert query_conn.status == 302
+      query = location_query(query_conn)
       assert query["error"] == "invalid_request"
       assert query["iss"] == "https://issuer.example.com"
+
+      form_conn = valid_params(%{"response_mode" => "form_post"}) |> Map.delete("code_challenge") |> call()
+      assert form_conn.status == 200
+      assert form_conn.resp_body =~ ~s(name="error" value="invalid_request")
+      assert form_conn.resp_body =~ ~s(name="iss" value="https://issuer.example.com")
+
+      jarm_conn = valid_params(%{"response_mode" => "query.jwt"}) |> Map.delete("code_challenge") |> call()
+      assert jarm_conn.status == 302
+      claims = decode_jarm(location_query(jarm_conn)["response"])
+      assert claims["error"] == "invalid_request"
+      assert claims["iss"] == "https://issuer.example.com"
     end
 
     test "PKCE plain method redirects with invalid_request (no downgrade)" do
@@ -3075,6 +3122,29 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert call_query(%{"resume" => resume_id}).status == 400
     end
 
+    test "a parked PAR request expires at par_ttl even within a longer interaction_ttl" do
+      put_config(
+        authenticate_resource_owner: &__MODULE__.park_or_authenticate/3,
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        par_ttl: 1,
+        interaction_ttl: 60
+      )
+
+      request_uri = "urn:ietf:params:oauth:request_uri:parked-par-ttl"
+      :ok = PARStore.put(request_uri, valid_params(), 1)
+
+      conn = call_query(%{"client_id" => @client_id, "request_uri" => request_uri})
+      assert conn.resp_body == "login"
+      assert_received {:parked, resume_id}
+
+      Process.sleep(1_100)
+
+      resumed = call_query(%{"resume" => resume_id})
+      assert resumed.status == 400
+      assert location(resumed) == nil
+      assert JSON.decode!(resumed.resp_body)["error"] == "invalid_request_uri"
+    end
+
     test "a resumed request is validated again: the scope policy still applies" do
       resume_id = park!()
 
@@ -3708,7 +3778,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
   describe "OID4VCI authorization_details" do
     @credential_configurations_supported %{
-      "UniversityDegreeCredential" => %{format: "vc+sd-jwt"}
+      "UniversityDegreeCredential" => %{format: "dc+sd-jwt"}
     }
 
     defp authorization_details_json(entries), do: JSON.encode!(entries)

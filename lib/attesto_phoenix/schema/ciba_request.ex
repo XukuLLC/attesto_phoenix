@@ -45,6 +45,7 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
 
   alias Attesto.Scope
   alias Attesto.Thumbprint
+  alias AttestoPhoenix.Schema.Canonical
 
   @type t :: %__MODULE__{}
 
@@ -168,16 +169,9 @@ defmodule AttestoPhoenix.Schema.CIBARequest do
   end
 
   defp canonical_data!(record) do
-    data = Map.get(record, :data)
-
-    if is_map(data) and
-         map_size(data) == length(@canonical_data_keys) and
-         Enum.all?(@canonical_data_keys, &Map.has_key?(data, &1)) and
-         valid_canonical_data?(data) and valid_record_envelope?(record) do
-      data
-    else
-      raise ArgumentError, @canonical_data_error
-    end
+    Canonical.canonical_data!(record, @canonical_data_keys, @canonical_data_error, fn data ->
+      valid_canonical_data?(data) and valid_record_envelope?(record)
+    end)
   end
 
   defp valid_canonical_data?(data) do

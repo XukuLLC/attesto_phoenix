@@ -23,6 +23,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
   alias Attesto.CodeStore.ETS
   alias Attesto.DPoP.ReplayCache
+  alias AttestoPhoenix.ClientIdMetadata.FlowControl
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.CredentialController
   alias AttestoPhoenix.Controller.TokenController
@@ -831,6 +832,31 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
         })
 
       assert body(conn)["error"] == "invalid_client"
+    end
+
+    @tag registered_auth_method: :private_key_jwt
+    test "rejects array aud values in private_key_jwt assertions (single issuer, single endpoint, and multi-member)" do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      client_jwks = %{"keys" => [public_jwk(client_key)]}
+
+      put_config(client_jwks: fn %{id: "confidential-1"} -> client_jwks end)
+
+      for aud <- [
+            ["https://issuer.example"],
+            ["https://issuer.example/oauth/token"],
+            ["https://issuer.example", "https://issuer.example/oauth/token"]
+          ] do
+        assertion = client_assertion(client_key, "confidential-1", %{"aud" => aud})
+
+        conn =
+          post_token(%{
+            "grant_type" => "unsupported",
+            "client_assertion_type" => Attesto.ClientAssertion.assertion_type(),
+            "client_assertion" => assertion
+          })
+
+        assert body(conn)["error"] == "invalid_client"
+      end
     end
 
     @tag registered_auth_method: :private_key_jwt
@@ -2086,6 +2112,80 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert conn.status == 400
       assert body(conn)["error"] == "invalid_client"
+    end
+
+    test "identity chaining issues a JWT authorization grant with token_type N_A when enabled" do
+      enable_minting()
+      domain_b = "https://as-b.example"
+
+      subject_token =
+        post_token(%{
+          "grant_type" => "client_credentials",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "scope" => "documents.read"
+        })
+        |> body()
+        |> Map.fetch!("access_token")
+
+      put_config(
+        identity_chaining: [
+          enabled: true,
+          allowed_audiences: [domain_b],
+          requested_token_types: ["urn:ietf:params:oauth:token-type:jwt", "urn:ietf:params:oauth:token-type:id-jag"],
+          assertion_lifetime_seconds: 60
+        ]
+      )
+
+      conn =
+        post_token(%{
+          "grant_type" => "urn:ietf:params:oauth:grant-type:token-exchange",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "subject_token_type" => "urn:ietf:params:oauth:token-type:access_token",
+          "subject_token" => subject_token,
+          "requested_token_type" => "urn:ietf:params:oauth:token-type:id-jag",
+          "audience" => domain_b,
+          "scope" => "documents.read"
+        })
+
+      assert conn.status == 200
+      res = body(conn)
+      assert res["token_type"] == "N_A"
+      assert res["issued_token_type"] == "urn:ietf:params:oauth:token-type:id-jag"
+      assert is_integer(res["expires_in"]) and res["expires_in"] <= 60
+      refute Map.has_key?(res, "refresh_token")
+
+      jwk = Keystore.verification_pems() |> hd() |> JOSE.JWK.from_pem()
+      {_kty, pub} = JOSE.JWK.to_public_map(jwk)
+      jwks = %{"keys" => [Map.merge(pub, %{"kid" => JOSE.JWK.thumbprint(jwk), "use" => "sig"})]}
+
+      assert {:ok, claims} =
+               Attesto.IdentityAssertion.verify(res["access_token"], jwks,
+                 issuer: "https://issuer.example",
+                 audience: domain_b,
+                 client_id: "confidential-1"
+               )
+
+      assert claims["scope"] == "documents.read"
+
+      # Draft-17 request omitting requested_token_type emits typ: "JWT" and issued_token_type: "...:jwt".
+      jwt_conn =
+        post_token(%{
+          "grant_type" => "urn:ietf:params:oauth:grant-type:token-exchange",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "subject_token_type" => "urn:ietf:params:oauth:token-type:access_token",
+          "subject_token" => subject_token,
+          "resource" => domain_b,
+          "scope" => "documents.read"
+        })
+
+      assert jwt_conn.status == 200
+      jwt_res = body(jwt_conn)
+      assert jwt_res["token_type"] == "N_A"
+      assert jwt_res["issued_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
+      assert {:ok, %{"typ" => "JWT"}} = Attesto.JWS.peek_json(jwt_res["access_token"], :protected)
     end
   end
 
@@ -3450,14 +3550,18 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       def script(url, doc) do
         body = JSON.encode!(Map.put(doc, "client_id", url))
-        Agent.update(__MODULE__, &Map.put(&1, url, body))
+        Agent.update(__MODULE__, &Map.put(&1, url, {:ok, %{body: body, cache_control: []}}))
+      end
+
+      def script_error(url, reason) do
+        Agent.update(__MODULE__, &Map.put(&1, url, {:error, reason}))
       end
 
       @impl true
       def fetch(url, _opts) do
         case Agent.get(__MODULE__, &Map.get(&1, url)) do
           nil -> {:error, {:status, 404}}
-          body -> {:ok, %{body: body, cache_control: []}}
+          result -> result
         end
       end
     end
@@ -3466,7 +3570,17 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       {:ok, _} =
         start_supervised(%{id: CimdFetcher, start: {Agent, :start_link, [fn -> %{} end, [name: CimdFetcher]]}})
 
-      put_config(client_id_metadata: [enabled: true, fetcher: CimdFetcher, cache: CimdETS])
+      fc = start_supervised!({FlowControl, []})
+
+      put_config(
+        client_id_metadata: [
+          enabled: true,
+          fetcher: CimdFetcher,
+          cache: CimdETS,
+          flow_control_server: fc
+        ]
+      )
+
       :ok
     end
 
@@ -3508,10 +3622,13 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert body(conn)["error"] == "unsupported_grant_type"
     end
 
-    test "draft 02 requires a CIMD client's declared private-key authentication" do
+    test "requires a CIMD client's declared private-key authentication" do
+      doc_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
       CimdFetcher.script(@cimd_pkjwt_client_id, %{
         "redirect_uris" => ["https://app.example/cb"],
-        "token_endpoint_auth_method" => "private_key_jwt"
+        "token_endpoint_auth_method" => "private_key_jwt",
+        "jwks" => %{"keys" => [public_jwk(doc_key)]}
       })
 
       conn = post_token(%{"grant_type" => "unsupported", "client_id" => @cimd_pkjwt_client_id})
@@ -3601,10 +3718,22 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
             {@cimd_public_client_id, "none"},
             {@cimd_pkjwt_client_id, "private_key_jwt"}
           ] do
-        CimdFetcher.script(client_id, %{
-          "redirect_uris" => ["https://app.example/cb"],
-          "token_endpoint_auth_method" => document_method
-        })
+        doc_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+        doc =
+          %{
+            "redirect_uris" => ["https://app.example/cb"],
+            "token_endpoint_auth_method" => document_method
+          }
+          |> then(fn base ->
+            if document_method == "private_key_jwt" do
+              Map.put(base, "jwks", %{"keys" => [public_jwk(doc_key)]})
+            else
+              base
+            end
+          end)
+
+        CimdFetcher.script(client_id, doc)
 
         legacy_client = %{id: client_id, secret: "old-valid-secret"}
 
@@ -3716,6 +3845,57 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       assert conn.status == 200
       assert body(conn)["scope"] == "openid"
       assert_receive {:authorize_scope_saw, []}
+    end
+
+    test "supports token_endpoint_auth_methods_supported array on CIMD documents" do
+      client_id = "https://app.example/clients/#{System.unique_integer([:positive])}/auth-methods.json"
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      CimdFetcher.script(client_id, %{
+        "redirect_uris" => ["https://app.example/cb"],
+        "token_endpoint_auth_methods_supported" => ["none", "private_key_jwt"],
+        "jwks" => %{"keys" => [public_jwk(client_key)]}
+      })
+
+      assertion = client_assertion(client_key, client_id)
+
+      conn =
+        post_token(%{
+          "grant_type" => "unsupported",
+          "client_assertion_type" => "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+          "client_assertion" => assertion
+        })
+
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
+    test "omitted CIMD token_endpoint_auth_method defaults to none" do
+      client_id = "https://app.example/clients/#{System.unique_integer([:positive])}/omitted-auth.json"
+
+      CimdFetcher.script(client_id, %{
+        "redirect_uris" => ["https://app.example/cb"]
+      })
+
+      conn = post_token(%{"grant_type" => "unsupported", "client_id" => client_id})
+      assert body(conn)["error"] == "unsupported_grant_type"
+    end
+
+    test "transient CIMD fetch failure returns HTTP 503 temporarily_unavailable" do
+      client_id = "https://app.example/clients/#{System.unique_integer([:positive])}/transient-503.json"
+      CimdFetcher.script_error(client_id, {:status, 503})
+
+      conn = post_token(%{"grant_type" => "unsupported", "client_id" => client_id})
+      assert conn.status == 503
+      assert body(conn)["error"] == "temporarily_unavailable"
+    end
+
+    test "terminal CIMD fetch failure returns HTTP 400 invalid_client" do
+      client_id = "https://app.example/clients/#{System.unique_integer([:positive])}/terminal-404.json"
+      CimdFetcher.script_error(client_id, {:status, 404})
+
+      conn = post_token(%{"grant_type" => "unsupported", "client_id" => client_id})
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
     end
   end
 
