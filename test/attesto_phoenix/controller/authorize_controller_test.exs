@@ -2378,6 +2378,80 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       end
     end
 
+    for {store, ecto?} <- [{PARStore, false}, {EctoPARStore, true}] do
+      if ecto?, do: @tag(:ecto)
+
+      test "consent view with subject: returns only that subject's request with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+
+        assert {:ok, %{resume_id: ^id, subject: "user-42"} = pending} =
+                 Interaction.pending(conn, token, subject: "user-42")
+
+        assert {:ok, ^pending} = Interaction.pending(conn, token)
+        assert {:ok, ^pending} = Interaction.pending(conn, token, [])
+
+        for other <- ["user-43", "user-4", "user-422", "", nil, :"user-42", ~c"user-42", 42, ["user-42"]] do
+          assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: other)
+        end
+
+        other_browser = put_req_header(conn, "x-browser", "browser-2")
+        assert {:error, :invalid_resume} = Interaction.pending(other_browser, token, subject: "user-42")
+
+        assert {:ok, ^pending} = Interaction.pending(conn, token, subject: "user-42")
+        assert :ok = Interaction.decide(conn, id, :allow, "user-42")
+        assert {:ok, %{consent_decision: "allow"}} = Interaction.pending(conn, token, subject: "user-42")
+        assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: "user-43")
+        assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
+        assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: "user-42")
+      end
+
+      if ecto?, do: @tag(:ecto)
+
+      test "consent view with subject: refuses an entry parked without a subject with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+
+        decision_config(
+          par_store: store,
+          repo: TestRepo,
+          authenticate_resource_owner: &__MODULE__.park_or_authenticate/3
+        )
+
+        assert call_query(valid_params(%{"prompt" => "login"})).resp_body == "login"
+        assert_received {:parked, login_id}
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, login_id)
+
+        assert {:ok, %{resume_id: ^login_id, subject: nil}} = Interaction.pending(conn, token)
+        assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: "user-42")
+        assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: nil)
+        assert {:ok, %{subject: nil}} = Interaction.pending(conn, token)
+      end
+    end
+
+    test "consent view raises on an option other than subject:" do
+      decision_config()
+      id = park_for_decision()
+      conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+      token = Interaction.view_token(conn, id)
+
+      assert_raise ArgumentError, ~r/unknown keys \[:subjct\]/, fn ->
+        Interaction.pending(conn, token, subjct: "user-42")
+      end
+
+      assert_raise ArgumentError, ~r/unknown keys \[:binding\]/, fn ->
+        Interaction.pending(conn, token, subject: "user-42", binding: "browser-1")
+      end
+
+      assert_raise FunctionClauseError, fn -> Interaction.pending(conn, token, %{subject: "user-42"}) end
+      assert {:ok, %{resume_id: ^id}} = Interaction.pending(conn, token, subject: "user-42")
+    end
+
     test "consent handles require the endpoint secret key base" do
       decision_config()
       id = park_for_decision()

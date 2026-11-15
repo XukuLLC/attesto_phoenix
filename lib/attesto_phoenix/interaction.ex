@@ -78,11 +78,11 @@ defmodule AttestoPhoenix.Interaction do
 
         case get_session(conn, :subject) do
           subject_id when is_binary(subject_id) ->
-            case AttestoPhoenix.Interaction.pending(conn, token) do
-              {:ok, %{subject: ^subject_id} = pending} ->
+            case AttestoPhoenix.Interaction.pending(conn, token, subject: subject_id) do
+              {:ok, pending} ->
                 render(conn, :consent, resume_id: pending.resume_id, request: pending.request)
 
-              _invalid_or_another_subject ->
+              {:error, :invalid_resume} ->
                 send_resp(conn, 400, "Invalid consent request")
             end
 
@@ -94,11 +94,12 @@ defmodule AttestoPhoenix.Interaction do
       end
 
   The page can be reloaded until the decision is recorded and the request
-  resumes. `pending/2` answers the browser that parked the request whether or
-  not anyone is signed in there, so the controller reads the host session
-  first. It renders only when `pending.subject` is the session's subject, so
-  one account on a shared browser is not shown a request parked by another;
-  `decide/4` refuses the mismatch as well. A browser whose sign-in has ended
+  resumes. With `subject:`, `pending/3` returns the request only when it was
+  parked for that subject, so one account on a shared browser is not shown a
+  request parked by another; `decide/4` refuses the mismatch as well. Without
+  the option it answers the browser that parked the request whether or not
+  anyone is signed in there, so the controller reads the host session first
+  and always passes the subject it finds. A browser whose sign-in has ended
   goes to the host's sign-in with the consent URL as the return path. After
   sign-in the page renders again, for as long as the parked request has not
   expired (`:interaction_ttl`) and the browser binding is unchanged. Never
@@ -390,18 +391,27 @@ defmodule AttestoPhoenix.Interaction do
   as on resume. Reads never consume or extend the entry, including a decided
   entry that has not yet resumed.
 
-  The entry is returned to the browser that parked it whether or not anyone is
-  signed in there. Compare `:subject` with the subject in the host session
-  before rendering.
+  Pass `subject: subject_id`, the subject in the host session, to read only a
+  request parked for that subject, as a consent page does. When the option is
+  present, every other value returns `{:error, :invalid_resume}`: `nil` from a
+  signed-out session, an empty string, another subject. So does an entry
+  parked without `subject:`. An option other than `:subject` raises
+  `ArgumentError`.
+
+  Without the option, the entry is returned to the browser that parked it
+  whether or not anyone is signed in there. That suits a sign-in page that
+  names the client; never render a consent page from it without comparing
+  `:subject` with the subject in the host session.
 
   Invalid, expired, consumed or wrong-browser handles and request rebuild
   failures return `{:error, :invalid_resume}`. Requires `conn.secret_key_base`;
   raises `ArgumentError` naming that value when it is missing.
   """
-  @spec pending(Plug.Conn.t(), term()) :: {:ok, map()} | {:error, :invalid_resume}
-  def pending(%Plug.Conn{} = conn, token) do
+  @spec pending(Plug.Conn.t(), term(), keyword()) :: {:ok, map()} | {:error, :invalid_resume}
+  def pending(%Plug.Conn{} = conn, token, opts \\ []) when is_list(opts) do
     secret = view_secret!(conn)
     config = Config.resolve!(conn)
+    subject_check = pending_subject_check!(opts)
 
     Config.with_request_config(config, fn ->
       with {:ok, resume_id} <- Plug.Crypto.decrypt(secret, @view_salt, token, max_age: config.interaction_ttl),
@@ -411,6 +421,7 @@ defmodule AttestoPhoenix.Interaction do
            {:ok, entry} <- store.fetch(parked_key(resume_id, binding)),
            {:ok, parked} <- read_entry(entry, binding),
            true <- parked.parked_at + config.interaction_ttl > System.system_time(:second),
+           true <- pending_subject?(subject_check, parked.subject),
            {:ok, %{request: request}} <-
              Authorize.prepare_request(config, parked.params, parked) do
         {:ok,
@@ -422,6 +433,23 @@ defmodule AttestoPhoenix.Interaction do
       end
     end)
   end
+
+  # A present `:subject` is always checked, whatever its value, so a caller
+  # that passes a signed-out session's `nil` is refused. A misspelled key
+  # raises instead of silently reading without the check.
+  defp pending_subject_check!(opts) do
+    case Keyword.fetch(Keyword.validate!(opts, [:subject]), :subject) do
+      {:ok, subject} -> {:subject, subject}
+      :error -> :any
+    end
+  end
+
+  defp pending_subject?(:any, _stored), do: true
+
+  defp pending_subject?({:subject, subject}, stored) when is_binary(subject) and subject != "",
+    do: secure_equal?(stored, subject)
+
+  defp pending_subject?({:subject, _invalid}, _stored), do: false
 
   defp view_secret!(%Plug.Conn{secret_key_base: secret}) when is_binary(secret) and secret != "", do: secret
 

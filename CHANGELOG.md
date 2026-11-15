@@ -43,6 +43,10 @@ Requires `attesto >= 2.23.0 and < 3.0.0`.
 - The token endpoint still returns the same generic `invalid_grant` body for
   redemption refusals, and the existing failure event still fires.
 
+### Added
+
+- `AttestoPhoenix.Interaction.pending/3` takes `subject:`. With it, a parked request is returned only when it was parked for that subject. `nil`, an empty string, another subject, and an entry parked without a subject return `{:error, :invalid_resume}`; an option other than `:subject` raises. A consent page passes the subject from the host session and no longer compares `pending.subject` itself. A call without the option behaves as in 4.18.0.
+
 ## [4.18.0] - 2026-11-15
 
 Requires `attesto >= 2.22.0 and < 3.0.0`.
