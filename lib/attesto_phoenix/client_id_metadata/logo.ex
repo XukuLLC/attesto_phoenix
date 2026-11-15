@@ -123,4 +123,17 @@ if Code.ensure_loaded?(Req) do
       end
     end
   end
+else
+  defmodule AttestoPhoenix.ClientIdMetadata.Logo do
+    @moduledoc false
+
+    # The logo fetcher is built on Req. Without Req the module still exists, so
+    # `AttestoPhoenix.ClientIdMetadata.prefetch_logo/3` compiles and answers an
+    # error instead of being absent.
+    @type logo_result :: %{body: binary(), content_type: String.t(), cache_control: keyword()}
+
+    @doc false
+    @spec prefetch(term(), term(), keyword()) :: {:error, :req_not_available}
+    def prefetch(_client_or_url, _config, _opts), do: {:error, :req_not_available}
+  end
 end

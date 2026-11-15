@@ -209,15 +209,16 @@ defmodule AttestoPhoenix.ClientIdMetadata do
     auth_supported? and grant_supported? and response_supported?
   end
 
-  if Code.ensure_loaded?(Req) do
-    @doc """
-    SSRF-guarded `logo_uri` prefetch and image content validation (`draft §10.9`).
-    """
-    @spec prefetch_logo(String.t() | client() | Client.t(), Config.t(), keyword()) ::
-            {:ok, Logo.logo_result()} | {:error, term()}
-    def prefetch_logo(client_or_url, %Config{} = config, opts \\ []) do
-      Logo.prefetch(client_or_url, config, opts)
-    end
+  @doc """
+  SSRF-guarded `logo_uri` prefetch and image content validation (`draft §10.9`).
+
+  Requires the optional `:req` dependency; without it the result is
+  `{:error, :req_not_available}`.
+  """
+  @spec prefetch_logo(String.t() | client() | Client.t(), Config.t(), keyword()) ::
+          {:ok, Logo.logo_result()} | {:error, term()}
+  def prefetch_logo(client_or_url, %Config{} = config, opts \\ []) do
+    Logo.prefetch(client_or_url, config, opts)
   end
 
   @doc """
