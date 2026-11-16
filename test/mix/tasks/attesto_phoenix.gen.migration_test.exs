@@ -731,7 +731,7 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.MigrationTest do
       assert output =~ "mix attesto_phoenix.gen.migration [options]"
       assert output =~ "mix attesto_phoenix.gen.migration --upgrade MILESTONE [options]"
 
-      for milestone <- ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5) do
+      for milestone <- ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5 4.19) do
         assert output =~ milestone
       end
 

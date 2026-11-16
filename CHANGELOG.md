@@ -6,6 +6,20 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.21.0] - 2026-11-15
+
+### Added
+
+- `AttestoPhoenix.Interaction.pending/3` accepts a function as `:subject`, and
+  `AttestoPhoenix.Interaction.decide/4` accepts one as `subject_id`, to derive
+  the signed-in user's subject from the parked request's client id.
+
+### Fixed
+
+- The install task, README and migration generator documentation now list the
+  4.19 upgrade migration, including its timing before rolling nodes without
+  stopping writers.
+
 ## [4.20.0] - 2026-11-15
 
 Requires `attesto >= 2.24.0 and < 3.0.0`.

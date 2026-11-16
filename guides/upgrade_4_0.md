@@ -160,11 +160,15 @@ that release adds:
 ```sh
 mix attesto_phoenix.gen.migration --upgrade 4.2 --repo MyApp.Repo
 mix attesto_phoenix.gen.migration --upgrade 4.5 --repo MyApp.Repo
+mix attesto_phoenix.gen.migration --upgrade 4.19 --repo MyApp.Repo
 ```
 
 Pass the same `--schema-prefix` used by the runtime stores to every command
 when the deployment uses an explicit PostgreSQL schema. Review the generated
-files before running `mix ecto.migrate`.
+files before running `mix ecto.migrate`. Keep writers stopped for the
+milestones through 4.5. Apply 4.19 before rolling nodes to 4.19.0 or later;
+that migration only adds a nullable column and does not need writers stopped.
+Follow the [rolling-deploy steps](consumer_migration.md#authorization-code-retention-upgrade).
 
 The milestones provide:
 
@@ -189,6 +193,8 @@ The milestones provide:
   `client_id`, which may be 2,048 bytes) makes the Ecto stores raise
   `Postgrex.Error` 22001. PostgreSQL applies these changes without rewriting
   the tables.
+- **4.19:** one nullable `authorization_family_id` column on
+  `attesto_authorization_codes`.
 
 A database already upgraded through an earlier 3.x release only needs later
 milestones it has not applied. Do not generate a second migration for a

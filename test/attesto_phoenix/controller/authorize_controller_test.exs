@@ -2430,7 +2430,207 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         assert {:ok, %{resume_id: ^login_id, subject: nil}} = Interaction.pending(conn, token)
         assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: "user-42")
         assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: nil)
+        config = Config.resolve!(conn)
+        key = Interaction.parked_key(login_id, "browser-1")
+
+        Config.with_request_config(config, fn ->
+          assert {:ok, original} = store.fetch(key)
+          subject = fn _client_id -> "user-42" end
+          assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: subject)
+          assert {:error, :invalid_resume} = Interaction.decide(conn, login_id, :allow, subject)
+          assert {:ok, ^original} = store.fetch(key)
+        end)
+
         assert {:ok, %{subject: nil}} = Interaction.pending(conn, token)
+      end
+    end
+
+    for {store, ecto?} <- [{PARStore, false}, {EctoPARStore, true}] do
+      if ecto?, do: @tag(:ecto)
+
+      test "subject functions receive the parked client id for pending and decide with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+        config = Config.resolve!(conn)
+        key = Interaction.parked_key(id, "browser-1")
+
+        subject = fn client_id ->
+          send(self(), {:subject_client, client_id})
+          "user-42"
+        end
+
+        Config.with_request_config(config, fn ->
+          assert {:ok, original} = store.fetch(key)
+          assert {:ok, %{resume_id: ^id, subject: "user-42"}} = Interaction.pending(conn, token, subject: subject)
+          assert_received {:subject_client, @client_id}
+          refute_received {:subject_client, _}
+          assert {:ok, ^original} = store.fetch(key)
+
+          assert :ok = Interaction.decide(conn, id, :allow, subject)
+          assert_received {:subject_client, @client_id}
+          refute_received {:subject_client, _}
+          expected = Map.put(original, "consent_decision", "allow")
+          assert {:ok, ^expected} = store.fetch(key)
+        end)
+
+        assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
+        assert_received {:consent_decision, :allow}
+      end
+
+      if ecto?, do: @tag(:ecto)
+
+      test "invalid subject function results preserve pending and decided entries with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+        config = Config.resolve!(conn)
+        key = Interaction.parked_key(id, "browser-1")
+
+        Config.with_request_config(config, fn ->
+          for decision <- [nil, :deny] do
+            if decision do
+              assert :ok = Interaction.decide(conn, id, decision, "user-42")
+            end
+
+            assert {:ok, original} = store.fetch(key)
+
+            for value <- [nil, "", 42, "user-43", fn _ -> flunk("returned function was called") end] do
+              subject = fn client_id ->
+                send(self(), {:subject_client, client_id})
+                value
+              end
+
+              assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: subject)
+              assert_received {:subject_client, @client_id}
+              assert {:ok, ^original} = store.fetch(key)
+              assert {:error, :invalid_resume} = Interaction.decide(conn, id, :allow, subject)
+              assert_received {:subject_client, @client_id}
+              refute_received {:subject_client, _}
+              assert {:ok, ^original} = store.fetch(key)
+            end
+          end
+        end)
+      end
+
+      if ecto?, do: @tag(:ecto)
+
+      test "subject functions are not called for unknown, expired or wrong-browser entries with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+        config = Config.resolve!(conn)
+        key = Interaction.parked_key(id, "browser-1")
+        subject = fn _ -> flunk("subject function was called for an unavailable entry") end
+        unknown_id = String.duplicate("A", 43)
+        unknown_token = Interaction.view_token(conn, unknown_id)
+
+        assert {:error, :invalid_resume} = Interaction.pending(conn, unknown_token, subject: subject)
+        assert {:error, :invalid_resume} = Interaction.decide(conn, unknown_id, :allow, subject)
+        other_browser = put_req_header(conn, "x-browser", "browser-2")
+        assert {:error, :invalid_resume} = Interaction.pending(other_browser, token, subject: subject)
+        assert {:error, :invalid_resume} = Interaction.decide(other_browser, id, :allow, subject)
+
+        Config.with_request_config(config, fn ->
+          assert {:ok, original} = store.fetch(key)
+          assert {:ok, ^original} = store.take(key)
+          assert :ok = store.put(key, original, 1)
+        end)
+
+        Process.sleep(1_100)
+        assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: subject)
+        assert {:error, :invalid_resume} = Interaction.decide(conn, id, :allow, subject)
+      end
+
+      if ecto?, do: @tag(:ecto)
+
+      test "subject functions are not called beyond the interaction lifetime with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+        config = Config.resolve!(conn)
+        key = Interaction.parked_key(id, "browser-1")
+        subject = fn _ -> flunk("subject function was called beyond the interaction lifetime") end
+
+        Config.with_request_config(config, fn ->
+          assert {:ok, original} = store.fetch(key)
+          expired = Map.put(original, "parked_at", System.system_time(:second) - config.interaction_ttl)
+          assert :ok = store.replace(key, expired)
+          assert {:error, :invalid_resume} = Interaction.pending(conn, token, subject: subject)
+          assert {:error, :invalid_resume} = Interaction.decide(conn, id, :allow, subject)
+          assert {:ok, ^expired} = store.fetch(key)
+        end)
+      end
+
+      if ecto?, do: @tag(:ecto)
+
+      test "decide does not call subject functions for cross-origin requests with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = decision_conn()
+        config = Config.resolve!(conn)
+        key = Interaction.parked_key(id, "browser-1")
+        subject = fn _ -> flunk("subject function was called for a cross-origin request") end
+
+        Config.with_request_config(config, fn ->
+          assert {:ok, original} = store.fetch(key)
+
+          for {header, value} <- [
+                {"sec-fetch-site", "cross-site"},
+                {"sec-fetch-site", "same-site"},
+                {"origin", "https://attacker.example"},
+                {"origin", "http://issuer.example.com"},
+                {"origin", "https://issuer.example.com:8443"}
+              ] do
+            cross_origin = put_req_header(conn, header, value)
+            assert {:error, :cross_origin} = Interaction.decide(cross_origin, id, :allow, subject)
+            assert {:ok, ^original} = store.fetch(key)
+          end
+        end)
+      end
+
+      if ecto?, do: @tag(:ecto)
+
+      test "subject function exceptions propagate without changing the entry with #{inspect(store)}" do
+        store = unquote(store)
+        if unquote(ecto?), do: Sandbox.checkout(TestRepo)
+        decision_config(par_store: store, repo: TestRepo)
+        id = park_for_decision()
+        conn = Map.put(decision_conn(), :secret_key_base, String.duplicate("view-secret", 8))
+        token = Interaction.view_token(conn, id)
+        config = Config.resolve!(conn)
+        key = Interaction.parked_key(id, "browser-1")
+        subject = fn _ -> raise "subject lookup failed" end
+
+        Config.with_request_config(config, fn ->
+          assert {:ok, original} = store.fetch(key)
+
+          assert_raise RuntimeError, "subject lookup failed", fn ->
+            Interaction.pending(conn, token, subject: subject)
+          end
+
+          assert {:ok, ^original} = store.fetch(key)
+
+          assert_raise RuntimeError, "subject lookup failed", fn ->
+            Interaction.decide(conn, id, :allow, subject)
+          end
+
+          assert {:ok, ^original} = store.fetch(key)
+        end)
       end
     end
 

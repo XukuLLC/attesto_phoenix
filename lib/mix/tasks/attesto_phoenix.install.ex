@@ -38,9 +38,11 @@ defmodule Mix.Tasks.AttestoPhoenix.Install.Docs do
         tables the bundled stores read, including the durable refresh-family
         revocation tombstones. Existing installations generate each migration
         milestone they have not already applied: `--upgrade 3.0`, `3.1`,
-        `3.4`, `3.6`, `3.7`, `4.2`, and `4.5`, in that order, while writers
-        remain stopped.
-        Each validates canonical pre-existing objects before adoption; custom
+        `3.4`, `3.6`, `3.7`, `4.2`, `4.5`, and `4.19`, in that order. Keep
+        writers stopped for the milestones through 4.5. The 4.19 migration
+        only adds a nullable column; apply it before rolling nodes, with no
+        writer stop required (see the consumer migration guide).
+        Existing canonical objects are validated before adoption; custom
         layouts need a reviewed migration.
 
     Every step is idempotent: re-running the task does not duplicate the config,
@@ -127,7 +129,7 @@ if Code.ensure_loaded?(Igniter) do
     @default_oauth_path_prefix "/oauth"
     @config_pipeline :attesto_phoenix_config
     @refresh_successor_secret_bytes 32
-    @upgrade_migration_versions ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5)
+    @upgrade_migration_versions ~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5 4.19)
 
     # The recommended production behaviours and the callbacks each scaffolded
     # module implements. Each tuple is `{submodule, behaviour, [{function,
@@ -2116,13 +2118,13 @@ if Code.ensure_loaded?(Igniter) do
            If this is an upgrade of an existing database, do not run the fresh
            create-table command above. After inventorying the existing layout,
            generate each forward migration milestone that the deployment has
-           not already applied. A 2.x database needs all seven, in this order:
+           not already applied. A 2.x database needs all eight, in this order:
 
                #{upgrade_migration_commands}
 
-           Review and apply the generated files, in that order, while writers remain
-           stopped. The 3.0 file adds the unique `(family_id, generation)`
-           index, creates the durable refresh-family revocation table, and
+           Review and apply the generated files in that order. Keep writers
+           stopped for the milestones through 4.5. The 3.0 file adds the
+           unique `(family_id, generation)` index, creates the durable refresh-family revocation table, and
            backfills revoked families. The 3.1 file promotes the exact
            historical `attesto_authorization_codes_code_hash_index` to the
            current primary key. The 3.4 file adds refresh-family deadlines and
@@ -2135,6 +2137,12 @@ if Code.ensure_loaded?(Igniter) do
            from their UUID primary keys. The 4.5 file removes the
            255-character limit from client- and request-supplied columns such
            as `client_id`, scope lists, and the CIBA binding message.
+           The 4.19 file only adds the nullable `authorization_family_id`
+           column to `attesto_authorization_codes`. Apply it before rolling
+           nodes to 4.19.0 or later; it does not require writers to stop. A host
+           upgrading without it gets SQL errors from the code store because
+           its statements name the new column. Follow the rolling-deploy
+           steps in guides/consumer_migration.md.
            Existing canonical objects are validated before adoption. Stop and
            investigate if any migration rejects the database layout.
 

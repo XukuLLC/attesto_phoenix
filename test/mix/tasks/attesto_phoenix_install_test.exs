@@ -1249,7 +1249,7 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
       assert notice
 
       positions =
-        Enum.map(~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5), fn version ->
+        Enum.map(~w(3.0 3.1 3.4 3.6 3.7 4.2 4.5 4.19), fn version ->
           command =
             "gen.migration --upgrade #{version} --repo Test.Repo --schema-prefix tenant_auth"
 
@@ -1258,6 +1258,13 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
         end)
 
       assert positions == Enum.sort(positions)
+      assert notice =~ "all eight"
+      assert notice =~ "Keep writers"
+      assert notice =~ "stopped for the milestones through 4.5"
+      assert notice =~ "only adds the nullable `authorization_family_id`"
+      assert notice =~ "Apply it before rolling"
+      assert notice =~ "does not require writers to stop"
+      assert notice =~ "SQL errors from the code store"
 
       applied =
         composed
@@ -1854,7 +1861,9 @@ defmodule Mix.Tasks.AttestoPhoenix.InstallTest do
                  notice =~
                    "gen.migration --upgrade 4.2 --repo Test.Repo --schema-prefix tenant_prod" and
                  notice =~
-                   "gen.migration --upgrade 4.5 --repo Test.Repo --schema-prefix tenant_prod"
+                   "gen.migration --upgrade 4.5 --repo Test.Repo --schema-prefix tenant_prod" and
+                 notice =~
+                   "gen.migration --upgrade 4.19 --repo Test.Repo --schema-prefix tenant_prod"
              end)
 
       applied = apply_igniter!(composed)

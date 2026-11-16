@@ -109,6 +109,13 @@ defmodule AttestoPhoenix.Interaction do
   the resume id out of the consent URL, and set `Referrer-Policy: no-referrer`
   on the page.
 
+  A host using pairwise subject identifiers may need the client id before it
+  can derive the signed-in user's subject. Pass a one-argument function as
+  `subject:` to `pending/3` and as `subject_id` to `decide/4`. The function
+  receives the parked request's client id and returns the subject for that
+  client. It runs only for a live entry found for this browser, after the
+  cross-origin check in `decide/4`; its result must match the parked subject.
+
   The page POSTs the resume id and Allow/Deny choice to a host handler with a
   fetched session, the `AttestoPhoenix.Interaction.BrowserBinding` plug and
   `AttestoPhoenix.Plug.PutConfig`, as on the authorization route. Read the
@@ -393,10 +400,15 @@ defmodule AttestoPhoenix.Interaction do
 
   Pass `subject: subject_id`, the subject in the host session, to read only a
   request parked for that subject, as a consent page does. When the option is
-  present, every other value returns `{:error, :invalid_resume}`: `nil` from a
-  signed-out session, an empty string, another subject. So does an entry
-  parked without `subject:`. An option other than `:subject` raises
-  `ArgumentError`.
+  present, only a non-empty binary equal to the parked subject passes. `nil`
+  from a signed-out session, an empty string, a non-binary, another subject,
+  or an entry parked without `subject:` returns `{:error, :invalid_resume}`.
+  An option other than `:subject` raises `ArgumentError`.
+
+  `:subject` also accepts a one-argument function receiving the parked
+  request's client id and returning the subject for that client. It is called
+  only after a live entry has been found for this browser. Its return value
+  is checked exactly as a directly supplied subject; exceptions propagate.
 
   Without the option, the entry is returned to the browser that parked it
   whether or not anyone is signed in there. That suits a sign-in page that
@@ -421,7 +433,7 @@ defmodule AttestoPhoenix.Interaction do
            {:ok, entry} <- store.fetch(parked_key(resume_id, binding)),
            {:ok, parked} <- read_entry(entry, binding),
            true <- parked.parked_at + config.interaction_ttl > System.system_time(:second),
-           true <- pending_subject?(subject_check, parked.subject),
+           true <- pending_subject?(subject_check, parked),
            {:ok, %{request: request}} <-
              Authorize.prepare_request(config, parked.params, parked) do
         {:ok,
@@ -444,12 +456,13 @@ defmodule AttestoPhoenix.Interaction do
     end
   end
 
-  defp pending_subject?(:any, _stored), do: true
+  defp pending_subject?(:any, _parked), do: true
+  defp pending_subject?({:subject, subject}, parked), do: matching_subject?(subject, parked)
 
-  defp pending_subject?({:subject, subject}, stored) when is_binary(subject) and subject != "",
-    do: secure_equal?(stored, subject)
-
-  defp pending_subject?({:subject, _invalid}, _stored), do: false
+  defp matching_subject?(subject, parked) do
+    subject_id = if is_function(subject, 1), do: subject.(parked.client_id), else: subject
+    is_binary(subject_id) and subject_id != "" and secure_equal?(parked.subject, subject_id)
+  end
 
   defp view_secret!(%Plug.Conn{secret_key_base: secret}) when is_binary(secret) and secret != "", do: secret
 
@@ -480,11 +493,19 @@ defmodule AttestoPhoenix.Interaction do
   request reached (`Origin: null` is not refused on its own). A browser with no binding value, such as one that
   never parked a request, gets `{:error, :invalid_resume}`.
 
+  `subject_id` also accepts a one-argument function receiving the parked
+  request's client id and returning the subject for that client. It is called
+  only after the cross-origin check and after a live entry has been found for
+  this browser. As with a directly supplied subject, only a non-empty binary
+  equal to the parked subject passes; `nil`, an empty string, a non-binary or
+  another subject returns `{:error, :invalid_resume}` without changing the
+  entry. Exceptions raised by the function propagate.
+
   Call from the host's browser POST handler, using the current subject from
   its session. Raises `ArgumentError` when `:interaction_browser_binding` is
   not configured or the configured `:par_store` has no `replace/2`.
   """
-  @spec decide(Plug.Conn.t(), String.t(), :allow | :deny, String.t()) ::
+  @spec decide(Plug.Conn.t(), String.t(), :allow | :deny, String.t() | (String.t() -> term())) ::
           :ok | {:error, :invalid_resume | :cross_origin}
   def decide(%Plug.Conn{} = conn, resume_id, decision, subject_id) when decision in [:allow, :deny] do
     config = Config.resolve!(conn)
@@ -506,10 +527,11 @@ defmodule AttestoPhoenix.Interaction do
   defp record_decision(config, store, binding, resume_id, decision, subject_id) do
     Config.with_request_config(config, fn ->
       with true <- is_binary(resume_id) and resume_id != "",
-           true <- is_binary(subject_id) and subject_id != "",
            key = parked_key(resume_id, binding),
-           {:ok, %{"subject" => stored_subject} = entry} <- store.fetch(key),
-           true <- secure_equal?(stored_subject, subject_id),
+           {:ok, entry} <- store.fetch(key),
+           {:ok, parked} <- read_entry(entry, binding),
+           true <- parked.parked_at + config.interaction_ttl > System.system_time(:second),
+           true <- matching_subject?(subject_id, parked),
            :ok <- store.replace(key, Map.put(entry, "consent_decision", Atom.to_string(decision))) do
         :ok
       else

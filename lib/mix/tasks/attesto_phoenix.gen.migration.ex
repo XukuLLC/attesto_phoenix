@@ -126,6 +126,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       # Remove the 255-character limit from client- and request-supplied values:
       mix attesto_phoenix.gen.migration --upgrade 4.5 --repo MyApp.Repo
 
+      # Add the nullable authorization-code family column before rolling nodes:
+      mix attesto_phoenix.gen.migration --upgrade 4.19 --repo MyApp.Repo
+
   ## Options
 
     * `--help` - print concise usage, accepted options, and supported upgrade
@@ -134,9 +137,9 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
     * `--upgrade` - generate a migration to upgrade an existing database rather
       than creating fresh tables. Supported values: `3.0`/`3.0.0` and
       `3.1`/`3.1.0`, `3.4`/`3.4.0`, `3.6`/`3.6.0`, `3.7`/`3.7.0`,
-      `4.2`/`4.2.0`, and `4.5`/`4.5.0`. The 3.4 migration adds the nullable
-      immutable `family_expires_at` and `attestation_jkt` columns without
-      changing existing families. Pre-upgrade attested families require
+      `4.2`/`4.2.0`, `4.5`/`4.5.0`, and `4.19`/`4.19.0`. The 3.4 migration
+      adds the nullable immutable `family_expires_at` and `attestation_jkt`
+      columns without changing existing families. Pre-upgrade attested families require
       revocation and re-authorization because their original instance key was
       not persisted. The migration also widens an existing CIBA
       `client_notification_token` column to `text` for the full 1,024-character
@@ -210,10 +213,13 @@ defmodule Mix.Tasks.AttestoPhoenix.Gen.Migration do
       `AttestoPhoenix.Config` keyword under. Defaults to `AttestoPhoenix.Config`,
       matching `AttestoPhoenix.Config.from_otp_app/2`.
 
-  The `--upgrade 4.19` milestone adds provenance and
-  replay flags without changing previous columns or installing database triggers.
-  Run it before rolling nodes from 4.18.0. During overlap the old sweeper still
-  applies its previous retention rule; see the migration guide.
+  Keep writers stopped when applying the milestones through 4.5. The
+  `--upgrade 4.19` milestone only adds the nullable `authorization_family_id`
+  column to `attesto_authorization_codes`, without changing previous columns
+  or installing database triggers. Apply it before rolling nodes to 4.19.0 or
+  later; no writer stop is required for this migration. During overlap the
+  old sweeper still applies its previous retention rule; see the rolling-deploy
+  steps in the consumer migration guide.
 
   Fresh-install migrations are reversible. The 3.0 upgrade migration has a
   guarded rollback that refuses to discard revocations which 2.x cannot
