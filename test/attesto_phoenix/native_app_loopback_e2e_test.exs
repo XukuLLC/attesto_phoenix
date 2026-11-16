@@ -58,7 +58,7 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
   end
 
   defmodule CodeStore do
-    use Attesto.CodeStoreTestAgent
+    use Attesto.Test.CodeStoreAgent
   end
 
   defmodule Router do

@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.19.0"
+  @version "4.20.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.23.0 and < 3.0.0"
+  @attesto_requirement ">= 2.24.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,9 +76,9 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # The 2.23.0 floor has the required Attesto.CodeStore behaviour (read, claim,
-  # finish and flag_replay), which EctoCodeStore implements and the token
-  # endpoint calls.
+  # The 2.24.0 floor has Attesto.PinnedHTTP's target-and-options entry points
+  # and the screened address list from Attesto.OutboundTarget.screen/2, which
+  # the outbound adapters call.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 

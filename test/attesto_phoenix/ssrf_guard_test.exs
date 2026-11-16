@@ -10,29 +10,29 @@ defmodule AttestoPhoenix.SSRFGuardTest do
 
   @url "https://rp.example/backchannel"
 
-  test "pins a public IP: url rewritten to the checked address, host preserved" do
-    assert {:ok, %{url: url, host: "rp.example", authority: "rp.example"}} =
+  test "carries a checked public IP and preserves the original URL and host" do
+    assert {:ok, %{url: url, addresses: [{93, 184, 216, 34}], host: "rp.example", authority: "rp.example"}} =
              SSRFGuard.screen(@url, resolver: resolver([{93, 184, 216, 34}]))
 
     # The socket targets the checked IP; SNI/cert/Host are carried on the host
     # separately by the caller (connect_options[:hostname] + Host header).
-    assert url == "https://93.184.216.34/backchannel"
+    assert url == @url
   end
 
   test "preserves a non-default port in the Host authority (not just the host)" do
-    assert {:ok, %{url: url, host: "rp.example", authority: "rp.example:8443"}} =
+    assert {:ok, %{url: url, addresses: [{93, 184, 216, 34}], host: "rp.example", authority: "rp.example:8443"}} =
              SSRFGuard.screen("https://rp.example:8443/logout", resolver: resolver([{93, 184, 216, 34}]))
 
-    assert url == "https://93.184.216.34:8443/logout"
+    assert url == "https://rp.example:8443/logout"
   end
 
-  test "brackets a pinned IPv6 address in the URL" do
-    assert {:ok, %{url: url}} =
+  test "carries a screened IPv6 address" do
+    assert {:ok, %{url: url, addresses: [{0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25C8, 0x1946}]}} =
              SSRFGuard.screen(@url,
                resolver: resolver([{0x2606, 0x2800, 0x220, 1, 0x248, 0x1893, 0x25C8, 0x1946}], :inet6)
              )
 
-    assert url == "https://[2606:2800:220:1:248:1893:25c8:1946]/backchannel"
+    assert url == @url
   end
 
   test "blocks the newly-added IPv6 special-purpose ranges (benchmarking, SRv6, discard, doc)" do
@@ -80,7 +80,7 @@ defmodule AttestoPhoenix.SSRFGuardTest do
   end
 
   test "allow_loopback permits http + loopback but nothing else" do
-    assert {:ok, %{url: "http://127.0.0.1/cb"}} =
+    assert {:ok, %{url: "http://local.test/cb", addresses: [{127, 0, 0, 1}]}} =
              SSRFGuard.screen("http://local.test/cb", resolver: resolver([{127, 0, 0, 1}]), allow_loopback: true)
 
     # IPv4-mapped loopback is also exempted under the escape hatch.

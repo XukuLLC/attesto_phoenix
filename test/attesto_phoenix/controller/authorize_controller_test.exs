@@ -118,7 +118,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   @established_binding "user-42\n1700000000\n"
 
   defmodule TestStore do
-    use Attesto.CodeStoreTestAgent
+    use Attesto.Test.CodeStoreAgent
   end
 
   setup do

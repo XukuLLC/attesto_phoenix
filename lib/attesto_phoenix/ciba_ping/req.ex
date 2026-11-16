@@ -7,7 +7,8 @@ if Code.ensure_loaded?(Req) do
     POSTs `{"auth_req_id": ...}` as `application/json` to the client's registered
     `backchannel_client_notification_endpoint` with
     `Authorization: Bearer <client_notification_token>` (OpenID Connect CIBA Core
-    1.0 §10.2). Redirects and retries are disabled and the timeout is short:
+    1.0 §10.2). Redirects are disabled. Only failed connection attempts are retried, up to
+    three times within a five-second deadline, before the HTTP request starts:
     notification delivery is best-effort and must never let a slow or hostile
     client stall the OP - the tokens are already available at the token endpoint,
     and a client that misses the ping falls back to polling.
@@ -16,6 +17,10 @@ if Code.ensure_loaded?(Req) do
     401/403 the suite's non-retry module returns, or a 3xx that must NOT be
     followed - or a transport error) is reported so the caller can log it and
     move on.
+
+    `{:error, {:not_sent, cause}}` means no request was sent.
+    `{:error, {:maybe_sent, cause}}` means delivery may have occurred. Both use
+    the normalized causes documented by `Attesto.PinnedHTTP`.
 
     `Req` is an optional dependency. A host that enables CIBA ping mode with the
     default deliverer must have `:req` available; one that supplies its own

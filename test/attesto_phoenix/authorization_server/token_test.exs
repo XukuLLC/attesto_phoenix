@@ -51,7 +51,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
 
   defmodule OneShotLookupFailureCodeStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates, to: ETS
+    use Attesto.Test.CodeStoreDelegates, to: ETS
 
     def fail_next_lookup, do: Process.put({__MODULE__, :fail_next_lookup}, true)
 
@@ -104,7 +104,7 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
   defmodule RevokedAccessTokenStore do
     @moduledoc false
 
-    use Attesto.CodeStoreTestDelegates
+    use Attesto.Test.CodeStoreDelegates
 
     @impl true
     def access_token_revoked?(jti), do: jti == Process.get({__MODULE__, :jti})

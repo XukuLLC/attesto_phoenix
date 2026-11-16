@@ -63,7 +63,7 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
   defmodule RevokedTokenStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates
+    use Attesto.Test.CodeStoreDelegates
 
     @impl true
 
@@ -77,7 +77,7 @@ defmodule AttestoPhoenix.Plug.AuthenticateTest do
 
   defmodule ConfigObservingRevokedTokenStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates
+    use Attesto.Test.CodeStoreDelegates
 
     alias AttestoPhoenix.Config
 

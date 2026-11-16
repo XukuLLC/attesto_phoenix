@@ -49,7 +49,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule CompletionCodeStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
+    use Attesto.Test.CodeStoreDelegates, to: EctoCodeStore
 
     @impl true
     def put(record), do: EctoCodeStore.put(record)
@@ -136,7 +136,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule FailingAccessJTIStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
+    use Attesto.Test.CodeStoreDelegates, to: EctoCodeStore
 
     @impl true
     defdelegate put(record), to: EctoCodeStore
@@ -169,7 +169,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule PartialWriteTerminationCodeStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
+    use Attesto.Test.CodeStoreDelegates, to: EctoCodeStore
 
     @impl true
     defdelegate put(record), to: EctoCodeStore
@@ -207,7 +207,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
 
   defmodule FailingFinalizationCodeStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
+    use Attesto.Test.CodeStoreDelegates, to: EctoCodeStore
 
     @impl true
     defdelegate put(record), to: EctoCodeStore
@@ -246,7 +246,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
   end
 
   defmodule DeletedClaimStore do
-    use Attesto.CodeStoreTestDelegates, to: EctoCodeStore
+    use Attesto.Test.CodeStoreDelegates, to: EctoCodeStore
 
     def finish(hash, redemption) do
       TestRepo.delete_all(from a in Authorization, where: a.code_hash == ^hash)
@@ -260,7 +260,7 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
   end
 
   defmodule AgentCodeStore do
-    use Attesto.CodeStoreTestAgent
+    use Attesto.Test.CodeStoreAgent
   end
 
   setup do

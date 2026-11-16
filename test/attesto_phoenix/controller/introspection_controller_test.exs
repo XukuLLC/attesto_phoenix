@@ -51,7 +51,7 @@ defmodule AttestoPhoenix.Controller.IntrospectionControllerTest do
 
   defmodule RevokedAccessTokenStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates
+    use Attesto.Test.CodeStoreDelegates
 
     @impl true
 

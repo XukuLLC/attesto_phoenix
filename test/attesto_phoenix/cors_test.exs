@@ -8,6 +8,9 @@ defmodule AttestoPhoenix.CORSTest do
   alias Attesto.{PrincipalKind, Token}
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Plug.Authenticate
+  alias AttestoPhoenix.Plug.CORS
+  alias Phoenix.Router.NoRouteError
+  alias Plug.Conn.WrapperError
 
   @issuer "https://issuer.example"
   @audience "https://api.example"
@@ -35,8 +38,28 @@ defmodule AttestoPhoenix.CORSTest do
     use AttestoPhoenix.Router
 
     scope "/" do
-      attesto_routes()
+      attesto_routes(
+        registration: true,
+        device: true,
+        credential_issuance: true,
+        federation: true,
+        status_list: true,
+        presentation: true,
+        ciba: true,
+        logout: true
+      )
     end
+  end
+
+  defmodule ResourceRouter do
+    use Phoenix.Router
+    use AttestoPhoenix.Router
+
+    attesto_protected_resource_metadata("/documents",
+      base_url: "https://api.example",
+      issuer: "https://issuer.example",
+      cors_origins: false
+    )
   end
 
   defp host_config(overrides \\ []) do
@@ -126,6 +149,74 @@ defmodule AttestoPhoenix.CORSTest do
       interactive = call_as(:get, "/oauth/authorize", host_config())
       assert get_resp_header(interactive, "access-control-allow-origin") == []
     end
+  end
+
+  test "disabled preflights use the same host error renderer as every unmounted path" do
+    parent = self()
+
+    config =
+      host_config(
+        cors_origins: false,
+        load_client: fn id ->
+          send(parent, {:client_lookup, id})
+          if id == "registered", do: {:ok, %{id: id}}, else: {:error, :not_found}
+        end
+      )
+
+    expected = render_missing_route(fn -> call_as(:options, "/unmounted", config) end)
+    assert expected == {404, "host missing route"}
+
+    paths =
+      ASRouter.__routes__()
+      |> Enum.filter(&(&1.verb == :options))
+      |> Enum.flat_map(fn route ->
+        if String.contains?(route.path, ":"),
+          do: [
+            Regex.replace(~r/:[^\/]+/, route.path, "registered"),
+            Regex.replace(~r/:[^\/]+/, route.path, "unregistered")
+          ],
+          else: [route.path]
+      end)
+
+    assert "/oauth/token" in paths
+    assert Enum.any?(paths, &String.ends_with?(&1, "/registered"))
+
+    for path <- paths do
+      assert render_missing_route(fn -> call_as(:options, path, config) end) == expected
+    end
+
+    refute_received {:client_lookup, _}
+  end
+
+  test "a resource's disabled CORS overrides the default and uses missing-route rendering" do
+    config = host_config()
+    expected = render_missing_route(fn -> ResourceRouter.call(conn(:options, "/unmounted"), []) end)
+
+    for path <- ["/.well-known/oauth-protected-resource/documents", "/.well-known/oauth-protected-resource"] do
+      request = conn(:options, path) |> put_private(:attesto_phoenix_config, config)
+      assert render_missing_route(fn -> ResourceRouter.call(request, []) end) == expected
+    end
+  end
+
+  test "disabled preflight outside a router sends an empty 404 and halts" do
+    result = CORS.preflight(conn(:options, "/token"), origins: false)
+    assert {result.status, result.resp_body, result.halted} == {404, "", true}
+    assert get_resp_header(result, "access-control-allow-origin") == []
+  end
+
+  defp render_missing_route(call) do
+    call.()
+    flunk("expected missing route")
+  rescue
+    error in NoRouteError ->
+      assert error.router in [ASRouter, ResourceRouter]
+      assert error.conn.method == "OPTIONS"
+      {Plug.Exception.status(error), "host missing route"}
+
+    error in WrapperError ->
+      assert %NoRouteError{} = error.reason
+      assert error.reason.router in [ASRouter, ResourceRouter]
+      {Plug.Exception.status(error.reason), "host missing route"}
   end
 
   describe "resource server CORS headers (RFC 10017 §6.3.3.4)" do

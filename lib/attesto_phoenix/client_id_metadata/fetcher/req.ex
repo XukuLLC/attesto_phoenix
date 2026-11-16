@@ -42,6 +42,11 @@ if Code.ensure_loaded?(Req) do
       8. **Size cap.** The body is refused once it exceeds `:max_document_bytes`
          (default `5_120`) -> `{:error, :too_large}`.
 
+    Connect failures use core's three-attempt retry with a three-second cap per
+    attempt inside the total deadline. `{:error, {:transport, {:not_sent, cause}}}`
+    means no HTTP request was sent. Other transport failures may follow a sent
+    request. Redirects and failures after sending starts are never retried.
+
     On success returns `{:ok, %{body: body, cache_control: directives}}` where
     `directives` are the parsed `Cache-Control` / `Expires` freshness hints
     (`RFC 9111`) for the caller to clamp and store.
@@ -95,7 +100,7 @@ if Code.ensure_loaded?(Req) do
       validate_options!(opts, :fetch)
 
       run_with_deadline(
-        fn -> do_fetch(url, accept, content_type_fun, opts) end,
+        fn deadline -> do_fetch(url, accept, content_type_fun, Keyword.put(opts, :deadline, deadline)) end,
         request_timeout!(opts)
       )
     end
@@ -113,14 +118,14 @@ if Code.ensure_loaded?(Req) do
     defp do_fetch(url, accept, content_type_fun, opts) do
       with {:ok, uri} <- revalidate(url),
            {:ok, screened} <- screen_target(uri, opts) do
-        request(uri, screened.url, accept, content_type_fun, opts)
+        request(uri, screened, accept, content_type_fun, opts)
       end
     end
 
     @impl Fetcher
     def preflight(url, opts \\ []) when is_binary(url) and is_list(opts) do
       validate_options!(opts, :preflight)
-      run_with_deadline(fn -> do_preflight(url, opts) end, request_timeout!(opts))
+      run_with_deadline(fn _deadline -> do_preflight(url, opts) end, request_timeout!(opts))
     end
 
     defp do_preflight(url, opts) do
@@ -175,10 +180,12 @@ if Code.ensure_loaded?(Req) do
     # opened. Keep it inside the same wall-clock budget as connect/send/receive
     # so a slow resolver cannot retain a FlowControl admission indefinitely.
     defp run_with_deadline(fun, timeout_ms) do
+      deadline = System.monotonic_time(:millisecond) + timeout_ms
+
       task =
         Task.async(fn ->
           try do
-            fun.()
+            fun.(deadline)
           rescue
             exception -> {:error, {:transport, exception}}
           catch
@@ -186,7 +193,7 @@ if Code.ensure_loaded?(Req) do
           end
         end)
 
-      case Task.yield(task, timeout_ms) do
+      case Task.yield(task, timeout_ms + 50) do
         {:ok, result} ->
           result
 
@@ -239,15 +246,15 @@ if Code.ensure_loaded?(Req) do
     # Step 4-8: dial the pinned IP while keeping SNI / cert hostname / Host header
     # on the original host, refuse redirects, require 200 + allowed Content-Type,
     # cap the body.
-    defp request(uri, pinned_url, accept, content_type_fun, opts) do
+    defp request(uri, target, accept, content_type_fun, opts) do
       timeout = request_timeout!(opts)
       max_bytes = max_document_bytes!(opts)
       started_at = System.monotonic_time(:millisecond)
 
-      case perform_request(uri, pinned_url, accept, timeout, max_bytes, opts) do
+      case perform_request(uri, target, accept, timeout, max_bytes, opts) do
         {:ok, %Req.Response{status: 200} = resp} -> on_ok(resp, content_type_fun, max_bytes, started_at)
         {:ok, %Req.Response{status: status}} -> {:error, {:status, status}}
-        {:error, :too_large} -> {:error, :too_large}
+        {:error, {:maybe_sent, :too_large}} -> {:error, :too_large}
         {:error, %{__exception__: true} = exception} -> {:error, {:transport, exception}}
         {:error, reason} -> {:error, {:transport, reason}}
       end
@@ -256,17 +263,15 @@ if Code.ensure_loaded?(Req) do
     # Test transports are intentionally kept on Req. Production requests use a
     # one-shot Mint connection so attacker-selected hostnames cannot create
     # permanent dynamically named Finch pools.
-    defp perform_request(uri, pinned_url, accept, timeout, max_bytes, opts) do
+    defp perform_request(uri, target, accept, timeout, max_bytes, opts) do
       case Keyword.get(opts, :req_options, []) do
         [] ->
           case Attesto.PinnedHTTP.request_inline(
-                 :get,
-                 pinned_url,
-                 uri.host,
-                 [{"accept", accept}, {"host", HostPolicy.authority(uri)}],
-                 "",
-                 timeout,
-                 max_bytes
+                 target,
+                 method: :get,
+                 headers: [{"accept", accept}],
+                 deadline: Keyword.fetch!(opts, :deadline),
+                 body_limit: max_bytes
                ) do
             {:ok, response} -> {:ok, Req.Response.new(response)}
             error -> error
@@ -274,7 +279,7 @@ if Code.ensure_loaded?(Req) do
 
         _test_override ->
           uri
-          |> build_req(URI.parse(pinned_url).host, accept, timeout, max_bytes, opts)
+          |> build_req(target.addresses |> hd() |> :inet.ntoa() |> to_string(), accept, timeout, max_bytes, opts)
           |> Req.request()
       end
     end

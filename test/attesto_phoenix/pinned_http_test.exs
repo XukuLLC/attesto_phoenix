@@ -18,13 +18,9 @@ defmodule AttestoPhoenix.PinnedHTTPTest do
 
     assert {:ok, %{status: 200, body: "document"}} =
              PinnedHTTP.request(
-               :get,
-               "http://127.0.0.1:#{server.port}/document",
-               "client.example",
-               [{"host", "client.example"}],
-               "",
-               1_000,
-               64
+               target(server.port, "/document"),
+               deadline: System.monotonic_time(:millisecond) + 1_000,
+               body_limit: 64
              )
 
     assert_receive :before_request
@@ -39,15 +35,11 @@ defmodule AttestoPhoenix.PinnedHTTPTest do
       Plug.Conn.resp(conn, 200, "late")
     end)
 
-    assert {:error, :request_timeout} =
+    assert {:error, {:maybe_sent, :deadline_exceeded}} =
              PinnedHTTP.request(
-               :get,
-               "http://127.0.0.1:#{server.port}/slow",
-               "client.example",
-               [{"host", "client.example"}],
-               "",
-               200,
-               64
+               target(server.port, "/slow"),
+               deadline: System.monotonic_time(:millisecond) + 200,
+               body_limit: 64
              )
   end
 
@@ -78,10 +70,11 @@ defmodule AttestoPhoenix.PinnedHTTPTest do
                allow_loopback: true
              )
 
-    assert screened.url == "http://[::1]:#{port}/doc"
+    assert screened.url == "http://v6only.example:#{port}/doc"
+    assert screened.addresses == [{0, 0, 0, 0, 0, 0, 0, 1}]
 
     assert {:ok, %{status: 200, body: "ok"}} =
-             PinnedHTTP.request(:get, screened.url, screened.host, [{"host", screened.authority}], "", 2_000, 64)
+             PinnedHTTP.request(screened, deadline: System.monotonic_time(:millisecond) + 2_000, body_limit: 64)
 
     assert_receive {:request, request}
     assert request =~ "host: v6only.example:#{port}"
@@ -94,15 +87,20 @@ defmodule AttestoPhoenix.PinnedHTTPTest do
       Plug.Conn.resp(conn, 200, "too large")
     end)
 
-    assert {:error, :too_large} =
+    assert {:error, {:maybe_sent, :too_large}} =
              PinnedHTTP.request(
-               :get,
-               "http://127.0.0.1:#{server.port}/large",
-               "client.example",
-               [{"host", "client.example"}],
-               "",
-               1_000,
-               3
+               target(server.port, "/large"),
+               deadline: System.monotonic_time(:millisecond) + 1_000,
+               body_limit: 3
              )
+  end
+
+  defp target(port, path) do
+    %{
+      url: "http://client.example:#{port}#{path}",
+      host: "client.example",
+      authority: "client.example",
+      addresses: [{127, 0, 0, 1}]
+    }
   end
 end

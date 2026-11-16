@@ -9,8 +9,8 @@ if Code.ensure_loaded?(Req) do
     `client_notification_endpoint`) can point at internal hosts
     (`169.254.169.254`, RFC 1918, loopback, ...). `screen/2` resolves the host,
     rejects any special-use address (RFC 6890 - reusing the CIMD fetcher's
-    single-source-of-truth `special_use_ip?/1`), and returns the URL rewritten to
-    dial the CHECKED IP plus the original host. Callers connect to that IP while
+    single-source-of-truth `special_use_ip?/1`), and returns the original URL, all checked addresses, host and authority.
+    Callers pass this target to `Attesto.PinnedHTTP`, which connects while
     keeping TLS SNI, certificate-hostname verification, and the `Host` header on
     the original name via Mint's `connect_options: [hostname: host]` - which is
     what closes the DNS-rebinding TOCTOU between the check and the connect. A
@@ -32,7 +32,7 @@ if Code.ensure_loaded?(Req) do
     alias Attesto.OutboundTarget
 
     @typedoc """
-    A screened target. `url` dials the checked IP; `host` is the bare hostname
+    A screened target. `url` is unchanged; `addresses` contains all checked IP tuples; `host` is the bare hostname
     for TLS SNI / certificate verification (`connect_options: [hostname: host]`);
     `authority` is the original `host[:port]` (IPv6 bracketed) for the `Host`
     header.
@@ -40,11 +40,9 @@ if Code.ensure_loaded?(Req) do
     @type screened :: OutboundTarget.screened()
 
     @doc """
-    Screen `url`. On success returns `{:ok, %{url: <url with host replaced by the
-    checked IP>, host: <bare hostname>, authority: <host[:port]>}}`; the caller
-    MUST connect with `connect_options: [hostname: host]` and send
-    `{"host", authority}` so TLS/SNI/cert and the Host header stay on the real
-    name (with its port) while the socket targets the checked IP.
+    Screen `url`. Returns the `Attesto.OutboundTarget.screen/2` result.
+    Pass it to `Attesto.PinnedHTTP` to keep TLS/SNI/certificate verification
+    and the Host header on the original name while dialing only checked IPs.
 
     `{:error, reason}` when the scheme is not `https`, the host does not resolve,
     or any resolved address is special-use (RFC 6890).

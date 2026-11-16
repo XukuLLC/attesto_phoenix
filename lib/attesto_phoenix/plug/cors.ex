@@ -15,7 +15,8 @@ defmodule AttestoPhoenix.Plug.CORS do
     3. Default `:*` (wildcard `Access-Control-Allow-Origin: *`, never paired
        with `Access-Control-Allow-Credentials`).
 
-  Set `cors_origins: false` to disable CORS header emission, or configure an
+  Set `cors_origins: false` to disable CORS headers and refuse preflights
+  through the router's normal missing-route handling, or configure an
   explicit list of allowed origins (`["https://app.example"]`) or a 1-arity
   predicate callback (`(origin -> boolean())`). When an allowlist or callback
   is used, responses vary by `Origin` (`Vary: origin`) and only echo a
@@ -27,6 +28,7 @@ defmodule AttestoPhoenix.Plug.CORS do
   import Plug.Conn
 
   alias AttestoPhoenix.{Callback, Config}
+  alias Phoenix.Router.NoRouteError
 
   @default_methods "GET, POST, PUT, DELETE, OPTIONS"
   @default_allow_headers "authorization, content-type, dpop, oauth-client-attestation, oauth-client-attestation-pop"
@@ -64,14 +66,29 @@ defmodule AttestoPhoenix.Plug.CORS do
 
   @doc """
   Answers an HTTP `OPTIONS` CORS preflight request with `204 No Content` and
-  halted connection state.
+  halted connection state. When the effective policy is `false`, raises
+  `Phoenix.Router.NoRouteError` with the connection and router. Outside a
+  Phoenix router, sends an empty `404` response instead.
   """
   @spec preflight(Plug.Conn.t(), keyword()) :: Plug.Conn.t()
   def preflight(%Plug.Conn{} = conn, opts \\ []) when is_list(opts) do
-    conn
-    |> put_cors_headers(resolve_policy(conn, opts), true, opts)
-    |> send_resp(204, "")
-    |> halt()
+    case resolve_policy(conn, opts) do
+      false ->
+        no_route(conn)
+
+      policy ->
+        conn
+        |> put_cors_headers(policy, true, opts)
+        |> send_resp(204, "")
+        |> halt()
+    end
+  end
+
+  defp no_route(conn) do
+    case conn.private[:phoenix_router] do
+      nil -> conn |> send_resp(404, "") |> halt()
+      router -> raise NoRouteError, conn: conn, router: router
+    end
   end
 
   defp resolve_policy(conn, opts) do

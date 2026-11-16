@@ -6,6 +6,26 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.20.0] - 2026-11-15
+
+Requires `attesto >= 2.24.0 and < 3.0.0`.
+
+### Breaking
+
+- `AttestoPhoenix.Plug.CORS.preflight/2` raises `Phoenix.Router.NoRouteError`
+  when the effective `cors_origins` policy is `false`, so a host's missing-route
+  renderer handles `OPTIONS`, including per-resource metadata and registration
+  management routes. Outside a router it sends an empty `404`. Other policies
+  retain the existing `204` response and headers.
+- `AttestoPhoenix.SSRFGuard.screen/2` returns the original URL and every checked
+  address, as documented by `Attesto.OutboundTarget`. Outbound CIBA ping,
+  Back-Channel Logout and client metadata fetches use core's bounded connection
+  retries; no delivery retry is added after sending starts. A client metadata
+  connect failure returns `{:error, {:transport, {:not_sent, cause}}}`.
+  Delivery failures after sending starts return `{:error, {:maybe_sent, cause}}`
+  with core's normalized causes; client metadata wraps these under `:transport`
+  while retaining `:too_large` for its document-size limit.
+
 ## [4.19.0] - 2026-11-15
 
 Requires `attesto >= 2.23.0 and < 3.0.0`.

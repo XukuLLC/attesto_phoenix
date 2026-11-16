@@ -190,7 +190,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   # controller's reuse branch fire and revoke the descendant family. State lives
   # in two ETS tables keyed by code hash: live codes and consumed-markers.
   defmodule ReuseCodeStore do
-    use Attesto.CodeStoreTestAgent
+    use Attesto.Test.CodeStoreAgent
   end
 
   # Reuse-tracking store deliberately lacking Phoenix's optional code-hash JTI

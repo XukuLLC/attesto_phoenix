@@ -50,7 +50,7 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
 
   defmodule RevokedTokenStore do
     @moduledoc false
-    use Attesto.CodeStoreTestDelegates
+    use Attesto.Test.CodeStoreDelegates
 
     @impl true
 

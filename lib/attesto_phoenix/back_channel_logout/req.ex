@@ -6,10 +6,15 @@ if Code.ensure_loaded?(Req) do
 
     POSTs the `logout_token` to the Relying Party's `backchannel_logout_uri` as
     `application/x-www-form-urlencoded` (OpenID Connect Back-Channel Logout 1.0
-    §2.5). Redirects and retries are disabled and the timeout is short: logout
+    §2.5). Redirects are disabled. Only failed connection attempts are retried, up to
+    three times within a five-second deadline, before the HTTP request starts: logout
     delivery is best-effort and must not let a slow or hostile RP stall the
     end-session response. A 2xx is success; anything else (non-2xx, transport
     error) is reported so the caller can log it.
+
+    `{:error, {:not_sent, cause}}` means no request was sent.
+    `{:error, {:maybe_sent, cause}}` means delivery may have occurred. Both use
+    the normalized causes documented by `Attesto.PinnedHTTP`.
 
     `Req` is an optional dependency. A host that enables Back-Channel Logout with
     the default deliverer must have `:req` available; one that supplies its own
