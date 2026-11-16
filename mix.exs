@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.22.0"
+  @version "4.22.1"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
   @attesto_requirement ">= 2.26.0 and < 3.0.0"
@@ -125,6 +125,10 @@ defmodule AttestoPhoenix.MixProject do
       # Ecto-backed CodeStore/RefreshStore/NonceStore/ReplayCheck + the migration
       # generator.
       {:ecto_sql, "~> 3.10"},
+      # Security floor for Ecto, which ecto_sql brings in. Ecto 3.4.0 through
+      # 3.14.2 grow the query cache without bound from interpolated JSON paths
+      # and splice lists (CVE-2026-118391).
+      {:ecto, ">= 3.14.3 and < 4.0.0"},
       # Security floor for Ecto's Decimal dependency. Decimal < 3.1.2 permits
       # unbounded allocation through attacker-controlled `round/3` places
       # (CVE-2026-97853).

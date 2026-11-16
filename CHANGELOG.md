@@ -6,6 +6,14 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.22.1] - 2026-11-15
+
+### Security
+
+- Requires `ecto >= 3.14.3 and < 4.0.0`. Ecto 3.4.0 through 3.14.2 grow
+  the query cache without bound from interpolated JSON paths and splice lists
+  (CVE-2026-118391).
+
 ## [4.22.0] - 2026-11-15
 
 Requires `attesto >= 2.26.0 and < 3.0.0`. The README section "Upgrading to 4.22" lists what a host changes.
