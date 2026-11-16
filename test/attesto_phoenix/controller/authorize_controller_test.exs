@@ -3764,6 +3764,38 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
   end
 
+  for parameter <- ~w(client_id redirect_uri response_type scope state nonce code_challenge
+                       code_challenge_method prompt acr_values response_mode id_token_hint
+                       login_hint dpop_jkt request request_uri claims max_age),
+      {kind, value} <- [list: ["x"], map: %{"value" => "x"}] do
+    test "JSON authorization refuses #{parameter} as #{kind} before consent or issuance" do
+      put_config(consent: fn _, _, _ -> flunk("consent called for malformed input") end)
+      params = valid_params(%{unquote(parameter) => unquote(Macro.escape(value))})
+
+      conn =
+        Plug.Test.conn(:post, "https://issuer.example.com/oauth/authorize", JSON.encode!(params))
+        |> put_req_header("content-type", "application/json")
+        |> Plug.Parsers.call(
+          Plug.Parsers.init(
+            parsers: [:json],
+            json_decoder: JSON,
+            body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+          )
+        )
+        |> with_config()
+        |> AuthorizeController.call(:authorize)
+
+      if unquote(parameter) in ["client_id", "redirect_uri"] do
+        assert conn.status == 400
+        assert conn.resp_body =~ "invalid_request"
+      else
+        assert location_query(conn)["error"] == "invalid_request"
+      end
+
+      assert TestStore.count() == 0
+    end
+  end
+
   describe "authorization refusal events and request sources" do
     defp observe_refusals do
       put_config(
@@ -3819,6 +3851,66 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       conn = dispatch_authorization(:post, "", URI.encode_query(valid_params()))
       assert is_binary(location_query(conn)["code"])
       refute_received {:refusal, _}
+    end
+
+    test "repeated plain resources reach scope and consent policies validated and deduplicated" do
+      resource = "https://api.example/resource"
+
+      put_config(
+        resource_indicators: [allowed_resources: [resource]],
+        authorize_scope: fn _client, scope, resources ->
+          assert resources == [resource]
+          send(self(), :scope_checked)
+          {:ok, scope}
+        end,
+        authorize_subject_scope: fn _client, _subject, scope, resources ->
+          assert resources == [resource]
+          send(self(), :subject_scope_checked)
+          {:ok, scope}
+        end,
+        consent: fn _conn, request, subject ->
+          assert request.resource == [resource]
+          {:consented, subject}
+        end
+      )
+
+      body = URI.encode_query(Map.to_list(valid_params()) ++ [{"resource", resource}, {"resource", resource}])
+      result = dispatch_authorization(:post, "", body)
+      assert is_binary(location_query(result)["code"])
+      assert_received :scope_checked
+      assert_received :subject_scope_checked
+    end
+
+    test "an empty question mark accepts the authorization body" do
+      observe_refusals()
+      conn = dispatch_authorization(:post, "?", URI.encode_query(valid_params()))
+      assert conn.query_string == ""
+      assert is_binary(location_query(conn)["code"])
+      refute_received {:refusal, _}
+    end
+
+    test "bracketed authorization names emit a fixed refusal before authentication" do
+      observe_refusals()
+
+      for suffix <- ["state[]=private-sentinel", "resource%5B%5D=https%3A%2F%2Fapi.example"],
+          source <- [:query, :body] do
+        valid = valid_params() |> Map.delete("state") |> URI.encode_query()
+
+        {method, query, body} =
+          if source == :query,
+            do: {:get, "?" <> valid <> "&" <> suffix, nil},
+            else: {:post, "", valid <> "&" <> suffix}
+
+        error = assert_raise WrapperError, fn -> dispatch_authorization(method, query, body) end
+        assert %Plug.BadRequestError{} = error.reason
+        assert_received {:refusal, event}
+        assert event.metadata.reason == :bracketed_parameter
+        assert event.result == "invalid_request"
+        refute inspect(event) =~ "private-sentinel"
+        refute_received {:auth_opts, _}
+      end
+
+      assert TestStore.count() == 0
     end
 
     test "missing body analysis emits a refusal naming a registered client only" do

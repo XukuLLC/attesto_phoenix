@@ -136,7 +136,8 @@ defmodule AttestoPhoenix.Config do
       `(client, requested_scope, resources -> {:ok, granted_scope} |
       {:error, :invalid_scope | :invalid_target})`, which also receives the
       request's resolved RFC 8707 resource indicators and is used when the
-      callback has that arity. Validates or narrows requested scope. Defaults
+      callback has that arity. Resources arrive validated and deduplicated, so
+      `resource=R&resource=R` is `[R]`. Validates or narrows requested scope. Defaults
       to requiring every requested scope to appear in the effective
       authorization-server scope catalog. The policy runs at the authorization
       endpoint, after request validation and before the resource owner is
@@ -151,7 +152,8 @@ defmodule AttestoPhoenix.Config do
       checks on every authorization pass, including resume, before consent.
       `subject` is the authenticated map passed to consent. Scope is the
       effective scope already approved by `:authorize_scope`; resources is
-      the resolved list (empty when absent). The result must be a subset,
+      the resolved list (empty when absent). Resources arrive validated and
+      deduplicated, so `resource=R&resource=R` is `[R]`. The result must be a subset,
       even when the effective scope is empty. Consent sees the narrowed scope
       and the authorization code is bound to it. Return `:invalid_target` to
       refuse resources outside the principal's ceiling. This policy does not

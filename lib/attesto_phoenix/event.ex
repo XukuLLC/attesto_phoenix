@@ -67,7 +67,11 @@ defmodule AttestoPhoenix.Event do
   * `:authorization_failed` - an authorization request was rejected before a
     code was issued (RFC 6749 §4.1.2.1), whether reported as a direct error
     page or by redirect, including parameter/body-reader refusals and consent
-    denial. Exactly one is emitted per refused authorization request.
+    denial. Exactly one is emitted per request refused by the authorization
+    endpoint's controller. A request the host endpoint's `Plug.Parsers` rejects
+    (malformed encoding, malformed JSON, or a body over the length limit) never
+    reaches the library and appears in the endpoint's own telemetry and error
+    handling instead.
     `:result` is the OAuth error-code string. `:client_id` is included only
     after a successful registry lookup, never for an ambiguous client id.
     `:metadata` contains `:client_ip`, a fixed `:reason` atom, and

@@ -4,6 +4,8 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
   import Plug.Conn
 
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.PARController
+  alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.DuplicateParameterGuard
   alias Plug.Conn.WrapperError
   alias Plug.Parsers.ParseError
@@ -475,6 +477,53 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
 
     assert {:error, {:duplicate_parameter, "state"}, _cleaned} =
              DuplicateParameterGuard.validate_and_forget(conn)
+  end
+
+  test "single bracketed query and form names are refused on PAR and token dispatch" do
+    for {controller, action, path} <- [
+          {PARController, :create, "/oauth/par"},
+          {TokenController, :token, "/oauth/token"}
+        ],
+        name <- ["state[]", "prompt[value]", "resource[]", "extension[", "scope%5B%5D"],
+        source <- [:query, :body] do
+      conn =
+        if source == :query do
+          Plug.Test.conn(:post, path <> "?" <> name <> "=x") |> fetch_query_params()
+        else
+          Plug.Test.conn(:post, path, name <> "=x")
+          |> put_req_header("content-type", "application/x-www-form-urlencoded")
+          |> parse_form()
+        end
+
+      assert {:error, :bracketed_parameter, cleaned} = DuplicateParameterGuard.validate_and_forget(conn)
+      refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_analysis)
+      error = assert_raise WrapperError, fn -> controller.call(conn, action) end
+      assert %Plug.BadRequestError{} = error.reason
+      assert Plug.Exception.status(error.reason) == 400
+    end
+  end
+
+  test "JSON member names containing brackets remain literal names" do
+    conn =
+      Plug.Test.conn(:post, "/oauth/token", ~s({"extension[]":"x"}))
+      |> put_req_header("content-type", "application/json")
+      |> parse_json()
+
+    assert {:ok, guarded} = DuplicateParameterGuard.validate_and_forget(conn)
+    assert guarded.params == %{"extension[]" => "x"}
+  end
+
+  test "a bracketed form name split across chunks is refused" do
+    reader = {ChunkedReader, :read_body, []}
+
+    conn =
+      Plug.Test.conn(:post, "/oauth/token", "")
+      |> put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> ChunkedReader.put_chunks(["resource%5", "B%5D=x"])
+
+    assert {:more, _, conn} = DuplicateParameterGuard.read_body(conn, [], reader)
+    assert {:ok, _, conn} = DuplicateParameterGuard.read_body(conn, [], reader)
+    assert {:error, :bracketed_parameter, _} = DuplicateParameterGuard.validate_and_forget(conn)
   end
 
   test "preserves RFC 8707 repeated resource indicators instead of collapsing them" do

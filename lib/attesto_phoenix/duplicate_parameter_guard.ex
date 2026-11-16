@@ -24,9 +24,9 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
   RFC 8707 deliberately permits more than one `resource` parameter. Those
   values in URL-encoded input are preserved as a list and passed to Attesto's
   resource-indicator validation. Every other repeated top-level form name is
-  rejected. JSON object names must be unique at every nesting level. Bracketed
-  form names are compared by their top-level root, so
-  `client_id=a&client_id[]=b` cannot evade the check.
+  rejected. JSON object names must be unique at every nesting level. Query and
+  URL-encoded form names containing `[` are rejected, including single bracketed
+  names; JSON member names are unaffected by this bracket rule.
 
   If the host already uses a custom body reader, pass its MFA as the sole extra
   argument:
@@ -60,6 +60,7 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
           {:duplicate_parameter, String.t()}
           | :body_too_large
           | :invalid_parameter_encoding
+          | :bracketed_parameter
 
   @doc false
   @spec body_analysis_missing?(Conn.t()) :: boolean()
@@ -106,7 +107,8 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
     with :ok <- body_analysis_valid(body_analysis),
          {:ok, query_pairs} <- decode_pairs(conn.query_string),
          {:ok, body_pairs} <- body_pairs(conn, body_analysis),
-         :ok <- reject_scalar_duplicates(query_pairs ++ body_pairs) do
+         :ok <- reject_scalar_duplicates(query_pairs ++ body_pairs),
+         :ok <- reject_bracketed_names(query_pairs) do
       {:ok, preserve_repeatable_parameters(conn, query_pairs, body_pairs)}
     else
       {:error, reason} ->
@@ -236,7 +238,9 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
   defp inspect_body(nil, _body), do: {:ok, nil}
 
   defp inspect_urlencoded_body(body) do
-    pairs = URI.query_decoder(body) |> Enum.map(fn {key, value} -> {parameter_root(key), value} end)
+    raw_pairs = Enum.to_list(URI.query_decoder(body))
+    pairs = Enum.map(raw_pairs, fn {key, value} -> {parameter_root(key), value} end)
+    bracketed? = Enum.any?(raw_pairs, fn {key, _} -> String.contains?(key, "[") end)
 
     duplicates =
       pairs
@@ -255,8 +259,13 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
 
     analysis =
       case duplicates do
-        [] -> analysis
-        [first | _] -> Map.put(analysis, :error, {:duplicate_parameter, first})
+        [] ->
+          if bracketed?,
+            do: Map.put(analysis, :error, :bracketed_parameter),
+            else: analysis
+
+        [first | _] ->
+          Map.put(analysis, :error, {:duplicate_parameter, first})
       end
 
     {:ok, analysis}
@@ -299,7 +308,9 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
     pairs =
       encoded
       |> URI.query_decoder()
-      |> Enum.map(fn {key, value} -> %{key: parameter_root(key), value: value} end)
+      |> Enum.map(fn {key, value} ->
+        %{key: parameter_root(key), value: value, bracketed?: String.contains?(key, "[")}
+      end)
 
     {:ok, pairs}
   rescue
@@ -392,6 +403,12 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
 
   defp merge_json_duplicate({:duplicates, nested}, duplicates), do: MapSet.union(nested, duplicates)
   defp merge_json_duplicate(_value, duplicates), do: duplicates
+
+  defp reject_bracketed_names(pairs) do
+    if Enum.any?(pairs, &Map.get(&1, :bracketed?, false)),
+      do: {:error, :bracketed_parameter},
+      else: :ok
+  end
 
   defp reject_scalar_duplicates(pairs) do
     pairs

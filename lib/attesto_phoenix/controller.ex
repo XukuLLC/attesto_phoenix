@@ -2,7 +2,7 @@ defmodule AttestoPhoenix.Controller do
   @moduledoc false
 
   alias AttestoPhoenix.{AuthorizationRefusal, Config, DuplicateParameterGuard, RequestContext}
-  alias AttestoPhoenix.Controller.AuthorizeController
+  alias AttestoPhoenix.Controller.{AuthorizeController, DeviceVerificationController, EndSessionController}
 
   @doc false
   @spec require_https(Plug.Conn.t(), AttestoPhoenix.Config.t(), term()) :: :ok | term()
@@ -31,8 +31,9 @@ defmodule AttestoPhoenix.Controller do
               "request body validation is unavailable; install AttestoPhoenix.DuplicateParameterGuard.read_body/2 as the endpoint body reader"
             )
 
-          controller == AuthorizeController and conn.method == "POST" and conn.query_string != "" ->
-            refuse!(conn, controller, :query_on_post, "authorization POST requests must not contain query parameters")
+          controller in [AuthorizeController, EndSessionController, DeviceVerificationController] and
+            conn.method == "POST" and conn.query_string != "" ->
+            refuse!(conn, controller, :query_on_post, "interactive POST requests must not contain query parameters")
 
           true ->
             conn

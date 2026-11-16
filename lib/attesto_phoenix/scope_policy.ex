@@ -30,7 +30,8 @@ defmodule AttestoPhoenix.ScopePolicy do
   module may export this form alone. `resources` is the list of resource
   indicators the request resolved to (empty when it named none). The policy
   runs at the authorization endpoint and at the token endpoint with the same
-  arguments.
+  arguments. Resources arrive validated and deduplicated, so
+  `resource=R&resource=R` is `[R]`.
 
   Returns `{:ok, granted_scope}`, `{:error, :invalid_scope}`, or
   `{:error, :invalid_target}` when the refusal is about a resource, or about
@@ -47,7 +48,8 @@ defmodule AttestoPhoenix.ScopePolicy do
   `subject` is the authenticated subject map. `resources` is the resolved
   resource list, empty when absent. A result cannot add scope, even to an
   empty effective scope. Refuse resources outside the principal's ceiling
-  with `{:error, :invalid_target}`.
+  with `{:error, :invalid_target}`. Resources arrive validated and deduplicated,
+  so `resource=R&resource=R` is `[R]`.
   """
   @callback authorize_subject_scope(term(), map(), [String.t()], [String.t()]) ::
               {:ok, [String.t()]} | {:error, :invalid_scope | :invalid_target}

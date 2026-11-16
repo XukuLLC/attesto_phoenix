@@ -121,6 +121,46 @@ defmodule AttestoPhoenix.Controller.PARControllerTest do
     :ok
   end
 
+  for parameter <- ~w(redirect_uri response_type scope state nonce code_challenge
+                       code_challenge_method prompt acr_values response_mode id_token_hint
+                       login_hint dpop_jkt request request_uri claims max_age),
+      {kind, value} <- [list: ["x"], map: %{"value" => "x"}] do
+    test "PAR refuses #{parameter} as #{kind} before storing the request" do
+      params = Map.put(auth_params(), unquote(parameter), unquote(Macro.escape(value)))
+      credentials = Base.encode64("confidential-1:s3cr3t")
+
+      result =
+        conn(:post, @endpoint_path, params)
+        |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+        |> PARController.create(params)
+
+      assert result.status == 400
+      assert JSON.decode!(result.resp_body)["error"] == "invalid_request"
+      assert PARStore.count() == 0
+    end
+  end
+
+  test "PAR dispatch accepts repeated plain resources" do
+    resource = "https://api.example/resource"
+    body = URI.encode_query(Map.to_list(auth_params()) ++ [{"resource", resource}, {"resource", resource}])
+    credentials = Base.encode64("confidential-1:s3cr3t")
+
+    result =
+      conn(:post, @endpoint_path, body)
+      |> Plug.Conn.put_req_header("content-type", "application/x-www-form-urlencoded")
+      |> Plug.Conn.put_req_header("authorization", "Basic " <> credentials)
+      |> Plug.Parsers.call(
+        Plug.Parsers.init(
+          parsers: [:urlencoded],
+          body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+        )
+      )
+      |> PARController.call(:create)
+
+    assert result.status == 201
+    assert PARStore.count() == 1
+  end
+
   test "stores a pushed authorization request authenticated with client_secret_basic" do
     params = auth_params()
     credentials = Base.encode64("confidential-1:s3cr3t")

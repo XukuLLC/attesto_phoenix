@@ -35,6 +35,10 @@ defmodule AttestoPhoenix.Controller.EndSessionController do
       "you are now logged out" page when the request asked for no
       `post_logout_redirect_uri`. A minimal 200 is sent when unset.
 
+  POST parameters must arrive in the body: a non-empty query string is refused
+  with HTTP 400 before session termination; an empty `?` is accepted. GET
+  continues to read query parameters.
+
   ## Host responsibility: session binding + CSRF (REQUIRED)
 
   RP-Initiated Logout is a state-changing action reachable by GET (the RP

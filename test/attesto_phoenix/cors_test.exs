@@ -7,6 +7,7 @@ defmodule AttestoPhoenix.CORSTest do
 
   alias Attesto.{PrincipalKind, Token}
   alias AttestoPhoenix.Config
+  alias AttestoPhoenix.Controller.CORSController
   alias AttestoPhoenix.Plug.Authenticate
   alias AttestoPhoenix.Plug.CORS
   alias Phoenix.Router.NoRouteError
@@ -188,6 +189,43 @@ defmodule AttestoPhoenix.CORSTest do
     refute_received {:client_lookup, _}
   end
 
+  test "disabled CORS conceals mounted routes before duplicate query validation" do
+    for policy <- [false, :*], headers <- [[], [{"origin", @origin}]] do
+      config =
+        host_config(
+          cors_origins: policy,
+          load_client: fn id ->
+            send(self(), {:client_lookup, id})
+            {:ok, %{id: id}}
+          end
+        )
+
+      for path <- ["/.well-known/oauth-authorization-server", "/oauth/register/registered", "/unmounted"] do
+        call = fn -> call_as(:options, path <> "?trace=a&trace=b", config, headers) end
+
+        if policy == false or path == "/unmounted" do
+          assert render_missing_route(call) == {404, "host missing route"}
+        else
+          error = assert_raise WrapperError, call
+          assert %Plug.BadRequestError{} = error.reason
+          assert Plug.Exception.status(error.reason) == 400
+        end
+      end
+
+      refute_received {:client_lookup, _}
+    end
+  end
+
+  test "disabled CORS controller outside a router skips duplicate validation" do
+    request =
+      conn(:options, "/oauth/token?trace=a&trace=b")
+      |> fetch_query_params()
+      |> put_private(:attesto_phoenix_config, host_config(cors_origins: false))
+
+    result = CORSController.call(request, :preflight)
+    assert {result.status, result.resp_body, result.halted} == {404, "", true}
+  end
+
   test "a resource's disabled CORS overrides the default and uses missing-route rendering" do
     config = host_config()
     expected = render_missing_route(fn -> ResourceRouter.call(conn(:options, "/unmounted"), []) end)
@@ -195,6 +233,21 @@ defmodule AttestoPhoenix.CORSTest do
     for path <- ["/.well-known/oauth-protected-resource/documents", "/.well-known/oauth-protected-resource"] do
       request = conn(:options, path) |> put_private(:attesto_phoenix_config, config)
       assert render_missing_route(fn -> ResourceRouter.call(request, []) end) == expected
+    end
+  end
+
+  test "resource metadata refuses bracketed names and keeps disabled OPTIONS private" do
+    for path <- ["/.well-known/oauth-protected-resource/documents", "/.well-known/oauth-protected-resource"],
+        query <- ["trace=a&trace=b", "trace[]=a"],
+        headers <- [[], [{"origin", @origin}]] do
+      request =
+        Enum.reduce(headers, conn(:options, path <> "?" <> query), fn {key, value}, conn ->
+          put_req_header(conn, key, value)
+        end)
+
+      assert render_missing_route(fn -> ResourceRouter.call(request, []) end) == {404, "host missing route"}
+      error = assert_raise WrapperError, fn -> ResourceRouter.call(conn(:get, path <> "?" <> query), []) end
+      assert %Plug.BadRequestError{} = error.reason
     end
   end
 

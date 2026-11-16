@@ -23,6 +23,7 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
   alias AttestoPhoenix.Schema.LogoutSession
   alias AttestoPhoenix.Store.EctoLogoutSessionStore, as: Store
   alias AttestoPhoenix.Store.Sweeper
+  alias Plug.Conn.WrapperError
 
   @moduletag :ecto
 
@@ -312,6 +313,59 @@ defmodule AttestoPhoenix.Controller.EndSessionControllerTest do
     )
     |> put_req_header("accept", "text/html,application/xhtml+xml")
     |> Controller.end_session(params)
+  end
+
+  defp dispatch(method, suffix, body) do
+    config =
+      Application.fetch_env!(:attesto_phoenix, @config_key)
+      |> Keyword.put(:on_event, fn event -> send(self(), {:event, event.name}) end)
+      |> Keyword.put(:terminate_session, fn conn, ctx ->
+        send(self(), :session_terminated)
+        send(self(), {:termination_context, ctx})
+        {:ok, conn, %{sid: ctx.sid, subject: ctx.subject}}
+      end)
+      |> Config.new()
+
+    conn(method, "/oauth/end_session" <> suffix, body)
+    |> put_req_header("content-type", "application/x-www-form-urlencoded")
+    |> Plug.Parsers.call(
+      Plug.Parsers.init(
+        parsers: [:urlencoded],
+        body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+      )
+    )
+    |> put_private(:attesto_phoenix_config, config)
+    |> Controller.call(:end_session)
+  end
+
+  for source <- [:query_only, :query_and_body] do
+    test "POST refuses #{source} before terminating the session", %{hint: hint} do
+      body = if unquote(source) == :query_and_body, do: "state=body", else: ""
+      query = URI.encode_query(%{"id_token_hint" => hint})
+      error = assert_raise WrapperError, fn -> dispatch(:post, "?" <> query, body) end
+      assert %Plug.BadRequestError{} = error.reason
+      assert Plug.Exception.status(error.reason) == 400
+      refute_received :session_terminated
+      refute_received {:event, :authorization_failed}
+    end
+  end
+
+  for suffix <- ["", "?"] do
+    test "POST accepts a guarded body with URL suffix #{inspect(suffix)}", %{hint: hint} do
+      result = dispatch(:post, unquote(suffix), URI.encode_query(%{"id_token_hint" => hint}))
+      assert result.query_string == ""
+      assert body(result)["logged_out"]
+      assert_received :session_terminated
+      refute_received {:event, :authorization_failed}
+    end
+  end
+
+  test "GET still reads logout parameters from the query", %{hint: hint} do
+    result = dispatch(:get, "?" <> URI.encode_query(%{"id_token_hint" => hint}), nil)
+    assert body(result)["logged_out"]
+    assert_received :session_terminated
+    assert_received {:termination_context, %{hint: :verified, client_id: @client_id}}
+    refute_received {:event, :authorization_failed}
   end
 
   defp body(conn), do: JSON.decode!(conn.resp_body)

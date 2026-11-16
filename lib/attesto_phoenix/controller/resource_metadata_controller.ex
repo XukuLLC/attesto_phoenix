@@ -5,6 +5,16 @@ defmodule AttestoPhoenix.Controller.ResourceMetadataController do
   alias Attesto.Plug.ResourceMetadata
   alias AttestoPhoenix.Plug.CORS
 
+  def action(conn, options) do
+    conn = if conn.method == "OPTIONS", do: CORS.reject_disabled_preflight(conn, cors_opts(conn)), else: conn
+
+    if conn.halted do
+      conn
+    else
+      conn |> AttestoPhoenix.Controller.validate_request!(__MODULE__) |> super(options)
+    end
+  end
+
   @doc "Serve the RFC 9728 document selected by the route."
   def show(conn, _params) do
     opts = Map.get(conn.private, :attesto_resource_metadata_opts, [])

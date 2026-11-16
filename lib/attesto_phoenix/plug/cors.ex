@@ -84,6 +84,11 @@ defmodule AttestoPhoenix.Plug.CORS do
     end
   end
 
+  @doc false
+  def reject_disabled_preflight(conn, opts \\ []) do
+    if resolve_policy(conn, opts) == false, do: no_route(conn), else: conn
+  end
+
   defp no_route(conn) do
     case conn.private[:phoenix_router] do
       nil -> conn |> send_resp(404, "") |> halt()

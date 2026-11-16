@@ -26,7 +26,9 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationController do
   A `user_code` arriving via `verification_uri_complete` is only ever
   pre-filled — approval requires an explicit user POST carrying
   `decision=approve`. The controller never approves from a GET or from the URL
-  alone, closing the one-click remote-phishing vector.
+  alone, closing the one-click remote-phishing vector. POST parameters must
+  arrive in the body: a non-empty query string is refused with HTTP 400 before
+  authentication or approval; an empty `?` is accepted.
 
   ## Host responsibility: CSRF + session (REQUIRED)
 

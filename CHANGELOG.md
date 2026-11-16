@@ -6,6 +6,36 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.23.0] - 2026-11-15
+
+Requires `attesto >= 2.27.0 and < 3.0.0`.
+
+### Breaking
+
+- A `POST` to the end-session or device verification endpoint with a
+  non-empty query string is refused with a 400 before the action runs, as a
+  `POST` to the authorization endpoint already is. Until now their query and
+  body parameters were merged. A bare `?` is accepted, and end-session `GET`
+  still reads its query.
+- A query or form parameter whose name contains `[` is refused with a 400 on
+  every protocol endpoint, the way a repeated name is. No OAuth or OpenID
+  specification defines such a name, and Plug turned `state[]=x` into a list
+  that the authorization endpoint then ignored. Repeated plain `resource`
+  (RFC 8707) is still accepted. JSON member names are unaffected.
+  `AttestoPhoenix.Controller.ResourceMetadataController` now runs the
+  repeated-name and bracketed-name checks too.
+- With `:cors_origins` set to `false`, an `OPTIONS` request to a mounted route
+  gets the unknown-route answer before any parameter check, so a repeated
+  query name no longer turns that 404 into a 400.
+
+### Changed
+
+- `:authorization_failed` documentation states that it covers requests the
+  authorization endpoint's controller refused; a request the host's
+  `Plug.Parsers` rejects never reaches the library. The `:authorize_scope` and
+  `:authorize_subject_scope` documentation states that resources arrive
+  validated and deduplicated, so `resource=R&resource=R` is `[R]`.
+
 ## [4.22.1] - 2026-11-15
 
 ### Security

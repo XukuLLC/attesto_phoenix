@@ -10,6 +10,7 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationControllerTest do
   alias Attesto.DeviceCodeStore.ETS, as: Store
   alias AttestoPhoenix.Config
   alias AttestoPhoenix.Controller.DeviceVerificationController, as: Controller
+  alias Plug.Conn.WrapperError
 
   @config_key AttestoPhoenix.Config
 
@@ -136,6 +137,55 @@ defmodule AttestoPhoenix.Controller.DeviceVerificationControllerTest do
       @config_key,
       Keyword.put(config, :authenticate_device_user, fn _conn -> {:ok, subject} end)
     )
+  end
+
+  defp dispatch(method, suffix, body) do
+    config =
+      Application.fetch_env!(:attesto_phoenix, @config_key)
+      |> Keyword.put(:on_event, fn event -> send(self(), {:event, event.name}) end)
+      |> Keyword.put(:authenticate_device_user, fn _conn ->
+        send(self(), :device_authenticated)
+        {:ok, %{subject: "user-1", claims: %{}}}
+      end)
+      |> Config.new()
+
+    conn(method, "/oauth/device_verification" <> suffix, body)
+    |> put_req_header("content-type", "application/x-www-form-urlencoded")
+    |> Plug.Parsers.call(
+      Plug.Parsers.init(
+        parsers: [:urlencoded],
+        body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+      )
+    )
+    |> put_private(:attesto_phoenix_config, config)
+    |> Controller.call(:verify)
+  end
+
+  for source <- [:query_only, :query_and_body] do
+    test "POST refuses #{source} before authentication or approval", %{user_code: uc} do
+      body = if unquote(source) == :query_and_body, do: "decision=approve", else: ""
+
+      query =
+        URI.encode_query(if body == "", do: %{"user_code" => uc, "decision" => "approve"}, else: %{"user_code" => uc})
+
+      error = assert_raise WrapperError, fn -> dispatch(:post, "?" <> query, body) end
+      assert %Plug.BadRequestError{} = error.reason
+      assert Plug.Exception.status(error.reason) == 400
+      assert {:ok, %{status: :pending}} = DeviceCode.lookup(Store, uc)
+      refute_received :device_authenticated
+      refute_received {:event, :authorization_failed}
+    end
+  end
+
+  for suffix <- ["", "?"] do
+    test "POST approves a guarded body with URL suffix #{inspect(suffix)}", %{user_code: uc} do
+      result = dispatch(:post, unquote(suffix), URI.encode_query(%{"user_code" => uc, "decision" => "approve"}))
+      assert result.query_string == ""
+      assert body(result)["stage"] == "approved"
+      assert {:ok, %{status: :approved}} = DeviceCode.lookup(Store, uc)
+      assert_received :device_authenticated
+      refute_received {:event, :authorization_failed}
+    end
   end
 
   test "GET with a user_code shows the confirm prompt (no approval)", %{user_code: uc, device_code: dc} do
