@@ -130,8 +130,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   import Plug.Conn
 
   alias Attesto.{Secret, SessionState}
+  alias AttestoPhoenix.{AuthorizationRefusal, BrowserState, Callback, Config, Event, LogMetadata, RequestContext}
   alias AttestoPhoenix.AuthorizationServer.{Authorize, RequestPolicy}
-  alias AttestoPhoenix.{BrowserState, Callback, Config, Event, RequestContext}
   alias AttestoPhoenix.Controller.ErrorRender
   alias AttestoPhoenix.Interaction
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
@@ -184,7 +184,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         authorize_params(conn, config, params)
 
       {:error, reason} ->
-        emit_failure(conn, config, reason)
         render_direct_error(conn, config, reason)
     end
   end
@@ -226,6 +225,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp resumed(conn), do: conn.private[@resumed_private_key]
 
   defp authorize_params(conn, config, params) do
+    conn = put_private(conn, :attesto_phoenix_authorization_client_id, params["client_id"])
+
     with :ok <- RequestContext.check_https(conn, config),
          :ok <- RequestContext.check_embedded_user_agent(conn, config),
          {:ok, prepared} <- Authorize.prepare_request(config, params, resumed(conn)) do
@@ -246,24 +247,20 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # enter. Refused before the client is resolved - the decision depends on
         # nothing but the request - and reported directly: redirecting the flow
         # onward would leave it inside the webview being refused.
-        emit_failure(conn, config, :embedded_user_agent)
         render_direct_error(conn, config, :embedded_user_agent)
 
       {:error, {:direct, reason}} ->
         # OIDC Core §3.1.2.6: bad client_id / redirect_uri is non-redirectable.
-        emit_failure(conn, config, reason)
         render_direct_error(conn, config, reason)
 
       {:error, {:redirect, error}} ->
         # RFC 6749 §4.1.2.1: the client_id/redirect_uri pair is trusted, so the
         # error is reported by redirecting back to the validated redirect_uri.
-        emit_failure(conn, config, error.error)
         emit_redirect_error(conn, config, error)
 
       {:error, {:scope_refused, request, error_code}} ->
         # RFC 6749 §4.1.2.1 `invalid_scope` / RFC 8707 §2 `invalid_target`: the
         # host's scope policy refused a fully validated request.
-        emit_failure(conn, config, error_code)
         emit_error(conn, config, request, error_code)
     end
   end
@@ -315,7 +312,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # (never a UI render); otherwise the host should have halted to its
         # login page, so a bare `{:none}` here is a host/config fault.
         if prompt_none? do
-          emit_failure(conn, config, @error_login_required)
           emit_error(conn, config, request, @error_login_required)
         else
           Logger.error("authenticate_resource_owner returned {:none} without prompt=none")
@@ -333,7 +329,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # the ORIGINAL `conn` (never the host's, which may already have a body
         # under a buggy host) so the redirect is always well-formed.
         if prompt_none? do
-          emit_failure(conn, config, @error_login_required)
           emit_error(conn, config, request, @error_login_required)
         else
           halted_conn
@@ -347,7 +342,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # blocker is neither specifically login nor consent), and it is reported
         # by redirect like the prompt=none conversions above.
         error_code = interaction_error_code(reason)
-        emit_failure(conn, config, error_code)
         emit_error(conn, config, request, error_code)
 
       {:error, reason} when reason in @host_failures ->
@@ -366,10 +360,16 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     case with :ok <- check_authentication_age(conn, request, subject, prompt_none?),
               do: check_prompt_login(conn, request, subject) do
       {:ok, conn} ->
-        run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt)
+        case Authorize.authorize_subject_scope(config, client, subject, request) do
+          {:ok, request} ->
+            conn = stash_credential_configuration_ids(conn, Authorize.credential_configuration_ids(config, request))
+            run_consent(conn, config, client, request, subject, prompt_none?, dpop_jkt)
+
+          {:error, reason} ->
+            emit_error(conn, config, request, Atom.to_string(reason))
+        end
 
       {:error, error_code} ->
-        emit_failure(conn, config, error_code)
         emit_error(conn, config, request, error_code)
     end
   end
@@ -403,7 +403,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         {:error, @error_login_required}
 
       {:error, reason} ->
-        Logger.error("max_age was requested but the host returned an unusable authentication: #{reason}")
+        Logger.error("max_age was requested but the host returned an unusable authentication",
+          reason: LogMetadata.term(reason)
+        )
+
         {:error, @error_server_error}
     end
   end
@@ -421,7 +424,10 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         {:ok, conn}
 
       {:error, reason} ->
-        Logger.error("prompt=login was requested but the host returned an unusable authentication: #{reason}")
+        Logger.error("prompt=login was requested but the host returned an unusable authentication",
+          reason: LogMetadata.term(reason)
+        )
+
         {:error, @error_server_error}
     end
   end
@@ -438,7 +444,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # sent.
   defp emit_host_failure(conn, config, request, reason) when reason in @host_failures do
     error_code = Atom.to_string(reason)
-    emit_failure(conn, config, error_code)
     emit_error(conn, config, request, error_code)
   end
 
@@ -453,7 +458,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # the ORIGINAL `conn` (never the host's halted one, which may already
         # carry a body) so the redirect is always well-formed.
         if prompt_none? do
-          emit_failure(conn, config, @error_consent_required)
           emit_error(conn, config, request, @error_consent_required)
         else
           halted_conn
@@ -487,7 +491,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # and an OP that cannot obtain it MUST return an error, typically
     # consent_required. Without a :consent callback there is no consent step
     # to run.
-    emit_failure(conn, config, @error_consent_required)
     emit_error(conn, config, request, @error_consent_required)
   end
 
@@ -499,7 +502,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
     # Under prompt=none the protocol response is consent_required; on an
     # interactive request, absence of the callback is a host configuration
     # error because this library does not render consent UI itself.
-    emit_failure(conn, config, @error_consent_required)
 
     if prompt_none? do
       emit_error(conn, config, request, @error_consent_required)
@@ -527,7 +529,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # RFC 8707 §2.2: the client requested a resource this server does not
         # serve. A redirectable error (RFC 6749 §4.1.2.1) since the client is
         # already trusted at this point.
-        emit_failure(conn, config, "invalid_target")
         emit_error(conn, config, request, "invalid_target")
     end
   end
@@ -546,7 +547,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
         # login/consent - so no second code is minted from it. The request is
         # fully validated here (trusted redirect_uri), so report by redirect like
         # the other completion-phase failures.
-        emit_failure(conn, config, @error_invalid_request_uri)
         emit_error(conn, config, request, @error_invalid_request_uri)
     end
   end
@@ -607,7 +607,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   end
 
   defp log_private_context_rejection(reason) do
-    Logger.error("authorization code private context rejected: #{inspect(reason)}")
+    Logger.error("authorization code private context rejected", reason: LogMetadata.term(reason))
   end
 
   defp mint_code_and_redirect(conn, config, request, subject, attrs) do
@@ -619,14 +619,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       {:error, %PhoenixOAuthError{} = refusal} ->
         # The host's `:authorization_code_issuance` callback refused.
         error_code = Authorize.issuance_refusal_code(refusal, request)
-        emit_failure(conn, config, error_code)
         emit_error(conn, config, request, error_code)
 
       {:error, reason} ->
         # Issuance failing on a validated request is a server/config fault,
         # not a client error (RFC 6749 §4.1.2.1 server_error). Do not leak
         # detail.
-        Logger.error("authorization code issuance failed: #{inspect(reason)}")
+        Logger.error("authorization code issuance failed", reason: LogMetadata.term(reason))
         emit_error(conn, config, request, @error_server_error)
     end
   end
@@ -637,7 +636,13 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # `issue_and_redirect_authorized/5` can read them without threading a new
   # parameter through the whole authenticate/consent chain — the same idiom
   # `stash_par_request_uri/3` uses for the PAR reference.
-  defp stash_credential_configuration_ids(conn, %{ids: []}), do: conn
+  defp stash_credential_configuration_ids(conn, %{ids: []}) do
+    %{
+      conn
+      | private:
+          Map.drop(conn.private, [:attesto_credential_configuration_ids, :attesto_credential_authorization_details_ids])
+    }
+  end
 
   defp stash_credential_configuration_ids(conn, %{ids: ids, authorization_details_ids: explicit_ids}) do
     conn
@@ -677,7 +682,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
       nil ->
         Logger.error(":authenticate_resource_owner callback is not configured")
 
-        {:halt, emit_error(conn, config, request, @error_server_error)}
+        # Under prompt=none the caller converts this halt to login_required.
+        # Count that final refusal once, preserving the existing response path.
+        {:halt, emit_error(conn, config, request, @error_server_error, @prompt_none not in request.prompt)}
 
       callback ->
         Callback.invoke(callback, [conn, request, auth_opts(conn, request)])
@@ -806,7 +813,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
 
   # RFC 6749 §4.1.2.1: error reported once the client/redirect_uri is trusted,
   # where the validated request (and so its response_mode) is known.
-  defp emit_error(conn, config, request, error_code) do
+  defp emit_error(conn, config, request, error_code, emit_event? \\ true) do
+    if emit_event? do
+      AuthorizationRefusal.emit(conn, config, error_code, error_code, request.client_id)
+    end
+
     emit_response(
       conn,
       config,
@@ -822,6 +833,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   # and the client_id (JARM audience) when the client is trusted; absent those,
   # query encoding is used.
   defp emit_redirect_error(conn, config, error) do
+    AuthorizationRefusal.emit(conn, config, error.error, error.error, Map.get(error, :client_id))
+
     emit_response(
       conn,
       config,
@@ -909,6 +922,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp render_direct_error(conn, config, reason) do
     description = direct_error_description(Callback.map_value(%{reason: reason}, :reason))
     code = direct_error_code(reason)
+    AuthorizationRefusal.emit(conn, config, code, reason)
     status = if reason == :client_metadata_unavailable, do: 503, else: 400
 
     case config.render_authorization_error do
@@ -1057,13 +1071,6 @@ defmodule AttestoPhoenix.Controller.AuthorizeController do
   defp emit_denied(conn, config, client_id) do
     Event.emit(config, :authorization_denied, %{
       client_id: client_id,
-      metadata: %{client_ip: RequestContext.client_ip(conn, config)}
-    })
-  end
-
-  defp emit_failure(conn, config, reason) do
-    Event.emit(config, :authorization_failed, %{
-      result: reason,
       metadata: %{client_ip: RequestContext.client_ip(conn, config)}
     })
   end

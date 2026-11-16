@@ -40,6 +40,38 @@ defmodule AttestoPhoenix.AuthorizationServer.ScopeAuthorization do
   def within_request?(granted, requested) when is_list(granted) and is_list(requested), do: granted -- requested == []
 
   @doc """
+  Apply the authenticated principal's scope and resource ceiling.
+
+  The optional `:authorize_subject_scope` callback can only narrow the
+  effective scope. Unlike default scope selection, an empty effective scope
+  remains empty. Malformed or expanded grants are refused as `:invalid_scope`.
+  """
+  @spec authorize_subject(Config.t(), term(), map(), [String.t()], [String.t()]) ::
+          {:ok, [String.t()]} | {:error, refusal()}
+  def authorize_subject(%Config{} = config, client, subject, scope, resources) do
+    case Config.authorize_subject_scope_fun(config) do
+      nil ->
+        {:ok, scope}
+
+      callback ->
+        callback
+        |> Callback.invoke([ClientIdMetadata.host_client(client), subject, scope, resources])
+        |> narrow_subject_scope(scope)
+    end
+  end
+
+  defp narrow_subject_scope({:ok, granted}, scope) when is_list(granted) do
+    if Enum.all?(granted, &is_binary/1) and granted -- scope == [],
+      do: {:ok, granted},
+      else: {:error, :invalid_scope}
+  end
+
+  defp narrow_subject_scope({:error, reason}, _scope) when reason in [:invalid_scope, :invalid_target],
+    do: {:error, reason}
+
+  defp narrow_subject_scope(_other, _scope), do: {:error, :invalid_scope}
+
+  @doc """
   Decide the scope to grant `client` for `requested` scope values and the
   resolved `resources`.
 

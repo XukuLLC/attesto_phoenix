@@ -7,7 +7,12 @@ defmodule AttestoPhoenix.DCApiTestRouter do
 
   pipeline :presentation do
     plug PutConfig, otp_app: :attesto_phoenix
-    plug Plug.Parsers, parsers: [:json, :urlencoded], pass: ["*/*"], json_decoder: JSON
+
+    plug Plug.Parsers,
+      parsers: [:json, :urlencoded],
+      pass: ["*/*"],
+      body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []},
+      json_decoder: JSON
   end
 
   scope "/" do
@@ -105,7 +110,7 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
       |> put_req_header("origin", "https://other.example")
       |> put_req_header("x-forwarded-host", "other.example")
       |> put_req_header("content-type", "application/json")
-      |> post(URI.parse(session.response_uri).path, JSON.encode!(params))
+      |> post_form(URI.parse(session.response_uri).path, JSON.encode!(params))
 
     assert_invalid(response, session)
     assert post_data(session, encrypted_mdoc(ctx, config, session)).status == 200
@@ -143,7 +148,7 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
         Fixture.encrypt(encryption_jwk(session), %{"vp_token" => %{"identity" => [token]}, "state" => session.id})
     }
 
-    response = post(build_conn(), Config.presentation_response_path(config), params)
+    response = post_form(build_conn(), Config.presentation_response_path(config), params)
     assert_invalid(response, session)
   end
 
@@ -151,7 +156,7 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
     config = configure(ctx)
     dc = create(config)
     dc_params = encrypted_mdoc(ctx, config, dc)
-    assert_invalid(post(build_conn(), Config.presentation_response_path(config), dc_params), dc)
+    assert_invalid(post_form(build_conn(), Config.presentation_response_path(config), dc_params), dc)
     redirect = create(config, %{response_mode: "direct_post.jwt"})
     token = mdoc(ctx, config, redirect, flow: :redirect)
 
@@ -160,7 +165,7 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
         Fixture.encrypt(encryption_jwk(redirect), %{"vp_token" => %{"identity" => [token]}, "state" => redirect.id})
     }
 
-    response = post(build_conn(), Config.presentation_response_path(config) <> "/" <> redirect.id, params)
+    response = post_form(build_conn(), Config.presentation_response_path(config) <> "/" <> redirect.id, params)
     assert_invalid(response, redirect)
   end
 
@@ -202,7 +207,7 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
     config = configure(ctx)
     session = create(config)
     params = encrypted_mdoc(ctx, config, session)
-    response = post(build_conn(), Config.presentation_response_path(config) <> "/unknown", params)
+    response = post_form(build_conn(), Config.presentation_response_path(config) <> "/unknown", params)
     assert json_response(response, 400) == %{"error" => "invalid_request"}
     assert {:ok, entry} = Store.get(session.id)
     expired_id = "expired-session"
@@ -218,7 +223,7 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
     expired_key = Map.put(encryption_jwk(session), "kid", expired_id)
     token = mdoc(ctx, config, session, [])
     expired_params = %{"response" => Fixture.encrypt(expired_key, %{"vp_token" => %{"identity" => [token]}})}
-    response = post(build_conn(), Config.presentation_response_path(config) <> "/" <> expired_id, expired_params)
+    response = post_form(build_conn(), Config.presentation_response_path(config) <> "/" <> expired_id, expired_params)
     assert json_response(response, 400) == %{"error" => "invalid_request"}
     assert get(build_conn(), Config.presentation_request_path(config) <> "/" <> expired_id).status == 404
   end
@@ -449,13 +454,13 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
         Fixture.encrypt(encryption_jwk(session), %{"vp_token" => %{"identity" => [token]}, "state" => session.id})
     }
 
-    post(build_conn(), Config.presentation_response_path(config), params)
+    post_form(build_conn(), Config.presentation_response_path(config), params)
   end
 
   defp post_data(session, params) do
     build_conn()
     |> put_req_header("content-type", "application/json")
-    |> post(URI.parse(session.response_uri).path, JSON.encode!(params))
+    |> post_form(URI.parse(session.response_uri).path, JSON.encode!(params))
   end
 
   defp assert_invalid(response, session, status \\ :pending) do
@@ -467,4 +472,12 @@ defmodule AttestoPhoenix.Controller.PresentationDCApiTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:attesto_phoenix, key)
   defp restore_env(key, value), do: Application.put_env(:attesto_phoenix, key, value)
+  # Encode real HTTP bytes so the endpoint's configured reader runs.
+  defp post_form(conn, path, params) when is_map(params) do
+    conn
+    |> put_req_header("content-type", "application/x-www-form-urlencoded")
+    |> post(path, URI.encode_query(params))
+  end
+
+  defp post_form(conn, path, body), do: post(conn, path, body)
 end

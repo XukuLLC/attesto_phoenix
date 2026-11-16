@@ -111,7 +111,6 @@ defmodule AttestoPhoenix.Controller.RegistrationControllerTest do
 
     cfg =
       config(
-        oauth_body_guard: :required,
         register_client: fn attrs ->
           send(owner, {:registered, attrs})
           {:ok, attrs}

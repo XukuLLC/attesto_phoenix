@@ -47,7 +47,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   setup do
     Application.put_env(:attesto_phoenix, __MODULE__.Keystore, signing_pem: @signing_pem)
     on_exit(fn -> Application.delete_env(:attesto_phoenix, __MODULE__.Keystore) end)
-    start_supervised!({ReplayCache, multi_node_acknowledged?: true})
+    start_supervised!({ReplayCache, single_node?: true})
     :ok
   end
 

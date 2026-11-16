@@ -68,6 +68,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     ClientIdMetadata,
     Config,
     Event,
+    LogMetadata,
     OAuthError,
     ProtectedResource,
     ResourceAudiencePolicy
@@ -644,8 +645,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
           # before enabling private context; an older package version cannot be
           # detected by this check.
           Logger.error(
-            "authorization code carries private context but no :authorization_code_completion " <>
-              "callback is configured; no token was issued"
+            "authorization code carries private context but no :authorization_code_completion callback is configured; no token was issued"
           )
 
           {:error, error(@error_invalid_request, "unable to issue token")}
@@ -1286,7 +1286,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
             {:ok, Map.put(response, :id_token, id_token)}
 
           {:error, reason} ->
-            Logger.error("ciba id token mint failed: #{inspect(reason)}")
+            Logger.error("ciba id token mint failed", reason: LogMetadata.term(reason))
             {:error, error(@error_invalid_request, "unable to issue token")}
         end
 
@@ -1682,7 +1682,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         # Issuance is a server/config fault, not a client error; do not leak
         # detail, and do not hand back an access token whose advertised
         # offline access we then failed to provide.
-        Logger.error("refresh token issuance failed: #{inspect(reason)}")
+        Logger.error("refresh token issuance failed", reason: LogMetadata.term(reason))
         {:error, error(@error_invalid_request, "unable to issue token")}
     end
   end
@@ -1749,7 +1749,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         # Issuance is a server/config fault, not a client error; do not leak
         # detail, and do not hand back an access token whose advertised
         # offline access we then failed to provide.
-        Logger.error("refresh token issuance failed: #{inspect(reason)}")
+        Logger.error("refresh token issuance failed", reason: LogMetadata.term(reason))
         {:error, error(@error_invalid_request, "unable to issue token")}
 
       {:ok, _invalid_result} ->
@@ -1814,7 +1814,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
             # Minting is a server/config fault, not a client error; do not
             # leak detail, and do not hand back an access token whose OpenID
             # Connect contract (an ID Token) we then failed to satisfy.
-            Logger.error("id token mint failed: #{inspect(reason)}")
+            Logger.error("id token mint failed", reason: LogMetadata.term(reason))
             {:error, error(@error_invalid_request, "unable to issue token")}
         end
 
@@ -2096,7 +2096,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
       {:error, reason} ->
         # A mint failure here is a server/config fault, not a client error;
         # surface it as RFC 6749 §5.2 invalid_request rather than leak detail.
-        Logger.error("token mint failed: #{inspect(reason)}")
+        Logger.error("token mint failed", reason: LogMetadata.term(reason))
         {:error, error(@error_invalid_request, "unable to issue token")}
     end
   end
@@ -2478,7 +2478,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp mint_failure(label, reason) do
     # A mint failure here is a server/config fault, not a client error;
     # surface it as RFC 6749 §5.2 invalid_request rather than leak detail.
-    Logger.error("#{label}: #{inspect(reason)}")
+    Logger.error("token operation failed", operation: label, reason: LogMetadata.term(reason))
     {:error, error(@error_invalid_request, "unable to issue token")}
   end
 

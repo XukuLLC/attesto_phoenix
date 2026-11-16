@@ -439,12 +439,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    assert log =~ "returned an error after the continuation succeeded"
+    assert log =~ "callback substituted a result after the continuation succeeded"
+    assert log =~ "callback=authorization code completion callback"
+    assert log =~ "action=returned an error"
     assert log =~ "code may already be finalized"
     assert log =~ "revoke that response's access token and refresh family"
     refute log =~ "host_policy_changed"
@@ -469,10 +477,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: callback)
     Application.delete_env(:attesto_phoenix, :repo)
 
-    capture_log(fn ->
-      assert {:error, %OAuthError{error: :invalid_request}, _events} =
-               Token.issue(config, code_request(config, code))
-    end)
+    capture_log(
+      [
+        format: "$message $metadata\n",
+        metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+      ],
+      fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end
+    )
 
     assert_spent_without_completion(family_id)
   end
@@ -624,12 +638,18 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       )
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_grant}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    refute log =~ "authorization code completion callback failed"
+    refute log =~ "continuation callback failed"
 
     assert_receive {:completion_refused,
                     %{
@@ -653,10 +673,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         authorization_code_completion: transactional_completion(self())
       )
 
-    capture_log(fn ->
-      assert {:error, %OAuthError{error: :invalid_request}, _events} =
-               Token.issue(config, code_request(config, code))
-    end)
+    capture_log(
+      [
+        format: "$message $metadata\n",
+        metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+      ],
+      fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end
+    )
 
     assert_receive {:completion_step, {:access_jti, _jti, _expires_at}, true}
     assert_receive {:completion_step, {:refresh_insert_failed, _refresh_family, 0}, true}
@@ -723,10 +749,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         end
       )
 
-    capture_log(fn ->
-      assert {:error, %OAuthError{error: :invalid_request}, _events} =
-               Token.issue(config, code_request(config, code))
-    end)
+    capture_log(
+      [
+        format: "$message $metadata\n",
+        metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+      ],
+      fn ->
+        assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                 Token.issue(config, code_request(config, code))
+      end
+    )
 
     assert_receive {:escaped_continuation, escaped}
     assert {:error, %OAuthError{error: :invalid_request}} = escaped.()
@@ -748,10 +780,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       )
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
     assert log =~ "does not own it"
     assert_spent_without_completion(family_id)
@@ -763,12 +801,19 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: fn _context, _continuation -> :invalid_result end)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    assert log =~ "authorization code completion callback returned without invoking the continuation"
+    assert log =~ "callback returned without invoking the continuation"
+    assert log =~ "callback=authorization code completion callback"
     refute log =~ "invalid_result"
     assert_spent_without_completion(family_id)
   end
@@ -790,10 +835,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: fn _context, _continuation -> {:ok, forged, []} end)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
     assert log =~ "returned without invoking the continuation"
     refute log =~ "forged.access.token"
@@ -874,14 +925,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       )
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
     assert log =~ "success wrapper around a failed continuation result"
     assert log =~ "may have committed partial writes"
-    refute log =~ "authorization code completion callback failed"
+    refute log =~ "continuation callback failed"
     row = authorization!(family_id)
     refute is_nil(row.consumed_at)
     refute row.consumed_success
@@ -902,12 +959,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    assert log =~ "returned a different result after the continuation succeeded"
+    assert log =~ "callback substituted a result after the continuation succeeded"
+    assert log =~ "callback=authorization code completion callback"
+    assert log =~ "action=returned a different result"
     assert log =~ "revoke that response's access token and refresh family"
 
     row = authorization_by_code!(code)
@@ -928,12 +993,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    assert log =~ "returned a different result after the continuation succeeded"
+    assert log =~ "callback substituted a result after the continuation succeeded"
+    assert log =~ "callback=authorization code completion callback"
+    assert log =~ "action=returned a different result"
     assert log =~ "code may already be finalized"
     assert log =~ "revoke that response's access token and refresh family"
     refute log =~ "substituted.access.token"
@@ -949,14 +1022,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: nil)
 
     log =
-      capture_log(fn ->
-        assert {:error,
-                %OAuthError{
-                  error: :invalid_request,
-                  error_description: "unable to issue token"
-                }, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error,
+                  %OAuthError{
+                    error: :invalid_request,
+                    error_description: "unable to issue token"
+                  }, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
     assert log =~ "no :authorization_code_completion callback is configured"
     refute log =~ "security_epoch"
@@ -1013,30 +1092,38 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       config = config(authorization_code_completion: callback)
 
       log =
-        capture_log(fn ->
-          caught =
-            try do
-              Token.issue(config, code_request(config, code))
-              flunk("the callback termination must propagate")
-            catch
-              caught_kind, caught_reason ->
-                {caught_kind, caught_reason, __STACKTRACE__}
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            caught =
+              try do
+                Token.issue(config, code_request(config, code))
+                flunk("the callback termination must propagate")
+              catch
+                caught_kind, caught_reason ->
+                  {caught_kind, caught_reason, __STACKTRACE__}
+              end
+
+            assert {^kind, caught_reason, stacktrace} = caught
+
+            case kind do
+              :error -> assert %RuntimeError{message: ^reason} = caught_reason
+              _other -> assert caught_reason == reason
             end
 
-          assert {^kind, caught_reason, stacktrace} = caught
-
-          case kind do
-            :error -> assert %RuntimeError{message: ^reason} = caught_reason
-            _other -> assert caught_reason == reason
+            assert Enum.any?(stacktrace, fn
+                     {__MODULE__, :terminate_completion_callback, 2, _location} -> true
+                     _frame -> false
+                   end)
           end
+        )
 
-          assert Enum.any?(stacktrace, fn
-                   {__MODULE__, :terminate_completion_callback, 2, _location} -> true
-                   _frame -> false
-                 end)
-        end)
-
-      assert log =~ "authorization code completion callback #{verb} after the continuation succeeded"
+      assert log =~ "callback terminated after the continuation succeeded"
+      assert log =~ "callback=authorization code completion callback"
+      assert log =~ "termination=#{verb}"
       assert log =~ "code may already be finalized"
       assert log =~ "client retry"
       assert log =~ "revoke that response's access token and refresh family"
@@ -1072,17 +1159,23 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         )
 
       log =
-        capture_log(fn ->
-          caught =
-            try do
-              Token.issue(config, code_request(config, code))
-              flunk("the callback termination must propagate")
-            catch
-              caught_kind, caught_reason -> {caught_kind, caught_reason}
-            end
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            caught =
+              try do
+                Token.issue(config, code_request(config, code))
+                flunk("the callback termination must propagate")
+              catch
+                caught_kind, caught_reason -> {caught_kind, caught_reason}
+              end
 
-          assert {^kind, ^reason} = caught
-        end)
+            assert {^kind, ^reason} = caught
+          end
+        )
 
       refute log =~ "after the continuation succeeded"
       refute log =~ "code may already be finalized"
@@ -1157,10 +1250,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
         )
 
       log =
-        capture_log(fn ->
-          assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                   Token.issue(config, code_request(config, code))
-        end)
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                     Token.issue(config, code_request(config, code))
+          end
+        )
 
       assert_receive {:completion_step, {:access_jti_terminating, logout_count}, false}
       assert logout_count >= 1
@@ -1216,10 +1315,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       )
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
     assert log =~ "returned a result after the continuation terminated"
     assert log =~ "partial writes may have occurred"
@@ -1318,12 +1423,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :access_denied}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :access_denied}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    assert log =~ "returned an error after the continuation succeeded"
+    assert log =~ "callback substituted a result after the continuation succeeded"
+    assert log =~ "callback=authorization code completion callback"
+    assert log =~ "action=returned an error"
     assert log =~ "revoke that response's access token and refresh family"
 
     row = authorization_by_code!(code)
@@ -1359,12 +1472,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    assert log =~ "returned an error after the continuation succeeded"
+    assert log =~ "callback substituted a result after the continuation succeeded"
+    assert log =~ "callback=authorization code completion callback"
+    assert log =~ "action=returned an error"
     assert log =~ "code may already be finalized"
     assert log =~ "client retry"
     assert log =~ "revoke that response's access token and refresh family"
@@ -1389,12 +1510,20 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
     config = config(authorization_code_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    assert log =~ "returned a different result after the continuation succeeded"
+    assert log =~ "callback substituted a result after the continuation succeeded"
+    assert log =~ "callback=authorization code completion callback"
+    assert log =~ "action=returned a different result"
     assert log =~ "code may already be finalized"
     assert log =~ "client retry"
     assert log =~ "revoke that response's access token and refresh family"
@@ -1426,12 +1555,18 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       )
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_grant}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
-    refute log =~ "returned an error after the continuation succeeded"
+    refute log =~ "callback substituted a result after the continuation succeeded"
 
     # This callback runs no transaction of its own, so the JTI write the failed
     # continuation made stands; what matters is that the code was never
@@ -1489,10 +1624,16 @@ defmodule AttestoPhoenix.AuthorizationServer.AuthorizationCodeCompletionTest do
       )
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_grant}, _events} =
-                 Token.issue(config, code_request(config, code))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+                   Token.issue(config, code_request(config, code))
+        end
+      )
 
     assert log =~ "malformed private context"
     refute_received :callback_invoked

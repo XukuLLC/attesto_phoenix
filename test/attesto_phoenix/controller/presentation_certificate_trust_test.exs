@@ -7,7 +7,12 @@ defmodule AttestoPhoenix.CertificatePresentationTestRouter do
 
   pipeline :wallet_protocol do
     plug PutConfig, otp_app: :attesto_phoenix
-    plug Plug.Parsers, parsers: [:urlencoded, :json], pass: ["*/*"], json_decoder: JSON
+
+    plug Plug.Parsers,
+      parsers: [:urlencoded, :json],
+      pass: ["*/*"],
+      body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []},
+      json_decoder: JSON
   end
 
   scope "/" do
@@ -88,12 +93,12 @@ defmodule AttestoPhoenix.Controller.PresentationCertificateTrustTest do
       refute Map.has_key?(entry.data, :verifier_certificate_trust)
 
       params = response_params(ctx, fixture, session, config)
-      response = post(build_conn(), Config.presentation_response_path(config), params)
+      response = post_form(build_conn(), Config.presentation_response_path(config), params)
       assert response.status == 200
       assert get_resp_header(response, "cache-control") == ["no-store"]
       assert {:ok, %{data: %{status: :completed}}} = Store.get(session.id)
 
-      replay = post(build_conn(), Config.presentation_response_path(config), params)
+      replay = post_form(build_conn(), Config.presentation_response_path(config), params)
       assert_invalid_request(replay, session.id, :completed)
 
       code = response_code(response)
@@ -160,7 +165,7 @@ defmodule AttestoPhoenix.Controller.PresentationCertificateTrustTest do
       config = configure(ctx, ctx[@format])
       session = create_request(config, @format)
       params = response_params(ctx, ctx[@format], session, config, omit_chain: true)
-      response = post(build_conn(), Config.presentation_response_path(config), params)
+      response = post_form(build_conn(), Config.presentation_response_path(config), params)
       assert_invalid_request(response, session.id)
     end
 
@@ -169,7 +174,7 @@ defmodule AttestoPhoenix.Controller.PresentationCertificateTrustTest do
       config = configure(ctx, fixture)
       session = create_request(config, @format)
       params = response_params(ctx, fixture, %{session | nonce: "wrong-nonce"}, config)
-      response = post(build_conn(), Config.presentation_response_path(config), params)
+      response = post_form(build_conn(), Config.presentation_response_path(config), params)
       assert_invalid_request(response, session.id)
     end
 
@@ -188,7 +193,7 @@ defmodule AttestoPhoenix.Controller.PresentationCertificateTrustTest do
       for trust <- [{:issuer_jwks, key}, {:resolve_issuer, resolver}] do
         session = create_request(config, @format, %{issuer_trust: trust})
         params = response_params(ctx, fixture, session, config, omit_chain: true)
-        response = post(build_conn(), Config.presentation_response_path(config), params)
+        response = post_form(build_conn(), Config.presentation_response_path(config), params)
         assert {:ok, %{"identity" => [result]}} = Verifier.presentation_result(config, response_code(response))
         assert_claims(@format, result)
       end
@@ -327,7 +332,7 @@ defmodule AttestoPhoenix.Controller.PresentationCertificateTrustTest do
     config = configure(ctx, fixture, options)
     session = create_request(config, fixture.format)
     params = response_params(ctx, fixture, session, config)
-    response = post(build_conn(), Config.presentation_response_path(config), params)
+    response = post_form(build_conn(), Config.presentation_response_path(config), params)
     {response, session, config}
   end
 
@@ -361,4 +366,12 @@ defmodule AttestoPhoenix.Controller.PresentationCertificateTrustTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:attesto_phoenix, key)
   defp restore_env(key, value), do: Application.put_env(:attesto_phoenix, key, value)
+  # Encode real HTTP bytes so the endpoint's configured reader runs.
+  defp post_form(conn, path, params) when is_map(params) do
+    conn
+    |> put_req_header("content-type", "application/x-www-form-urlencoded")
+    |> post(path, URI.encode_query(params))
+  end
+
+  defp post_form(conn, path, body), do: post(conn, path, body)
 end

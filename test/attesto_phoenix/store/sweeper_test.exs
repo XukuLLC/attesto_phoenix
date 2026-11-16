@@ -316,7 +316,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
         end)
       end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         for _attempt <- 1..3 do
           signal = Process.whereis(Signal)
           assert is_pid(signal)
@@ -893,7 +893,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       on_exit(fn -> :telemetry.detach(handler_id) end)
       unsupervised = Function.capture(Signal, :unsupervised, 1)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = unsupervised.({RecordingRepo, prefix})
 
         assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], %{count: 1},
@@ -920,7 +920,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
       log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           Sweeper.check_running_for_store(RecordingRepo, prefix)
 
           assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], measurements, metadata},
@@ -948,7 +948,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       # De-duplicated: second call does not re-log or re-emit telemetry
       second_log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           Sweeper.check_running_for_store(RecordingRepo, prefix)
         end)
 
@@ -971,7 +971,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         1..200
         |> Enum.map(fn _ ->
           Task.async(fn ->
@@ -1004,7 +1004,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, prefix)
 
         assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], _,
@@ -1035,7 +1035,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       prefix = "expired_prune_#{System.unique_integer([:positive])}"
       target = {RecordingRepo, prefix}
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, prefix)
         await_signal_idle()
       end)
@@ -1066,7 +1066,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, first_prefix)
 
         assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], _,
@@ -1120,7 +1120,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
       # Episode 1: missing sweeper emits warning and telemetry
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         Sweeper.check_running_for_store(RecordingRepo, prefix)
 
         assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], %{count: 1},
@@ -1131,7 +1131,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       end)
 
       # Suppressed while missing
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         Sweeper.check_running_for_store(RecordingRepo, prefix)
       end)
 
@@ -1149,7 +1149,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       # Relapse: missing sweeper emits warning and telemetry again!
       log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           Sweeper.check_running_for_store(RecordingRepo, prefix)
 
           assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], %{count: 1},
@@ -1177,7 +1177,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       on_exit(fn -> safe_stop(pid, &GenServer.stop/1) end)
 
       log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           Sweeper.check_running_for_store(RecordingRepo, prefix)
         end)
 
@@ -1523,7 +1523,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       assert Sweeper.running?(worker_2)
 
       log_while_equiv_alive =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           Sweeper.check_running_for_store(RecordingRepo, prefix)
         end)
 
@@ -1537,7 +1537,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       refute Sweeper.running?(worker_2)
 
       log_relapse =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           Sweeper.check_running_for_store(RecordingRepo, prefix)
 
           assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], _,
@@ -1660,7 +1660,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert insert_observed_episode(table, target)
         assert :ets.insert_new(table, {:drain_pending, true})
 
@@ -1690,7 +1690,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert insert_observed_episode(table, target)
         refute :ets.member(table, :drain_pending)
 
@@ -1718,7 +1718,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ets.insert_new(table, {:capacity_pending, true})
         refute :ets.member(table, :drain_pending)
 
@@ -1775,7 +1775,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, prefix)
 
         assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_unsupervised], _,
@@ -1807,7 +1807,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         first_prefix = "blocked_signal_#{System.unique_integer([:positive])}"
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, first_prefix)
         assert_receive {:telemetry_handler_blocked, emitter_pid, ^release_ref}, 1000
@@ -1854,7 +1854,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       prefix = "task_supervisor_restart_#{System.unique_integer([:positive])}"
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, prefix)
         assert_receive {:telemetry_handler_blocked, first_emitter, ^release_ref}, 1000
 
@@ -1893,7 +1893,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       prefix = "crashing_signal_#{System.unique_integer([:positive])}"
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, prefix)
 
         for _attempt <- 1..3 do
@@ -1993,7 +1993,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
       log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           assert :ok = Sweeper.check_running_for_store(RecordingRepo, prefix)
 
           eventually(fn ->
@@ -2070,7 +2070,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       end)
 
       log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           prefixes =
             for i <- 1..1100 do
               "cap_#{i}_#{System.unique_integer([:positive])}"
@@ -2172,7 +2172,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         # 1. Caller calls check_running_for_store during quiet window.
         # Must return promptly without sleeping for the 200ms quiet window.
         start_time = System.monotonic_time(:millisecond)
@@ -2206,7 +2206,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
 
       on_exit(fn -> :telemetry.detach(handler_id) end)
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Sweeper.check_running_for_store(RecordingRepo, prefix)
         assert :sys.get_state(lifecycle).warming
 
@@ -2425,7 +2425,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
              )
 
       log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           assert_receive {:telemetry_event, [:attesto_phoenix, :store, :sweeper_monitor_unavailable], %{count: 1},
                           %{repo: RecordingRepo, schema_prefix: ^prefix}},
                          1500
@@ -2478,7 +2478,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       second_prefix = "queued_outage_second_#{System.unique_integer([:positive])}"
 
       log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           assert :ok = Supervisor.terminate_child(AttestoPhoenix.DiagnosticsSupervisor, SignalTaskSupervisor)
           assert :ok = Supervisor.terminate_child(AttestoPhoenix.DiagnosticsSupervisor, Lifecycle)
 
@@ -2593,7 +2593,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       first_prefix = "transient_recovery_first_#{System.unique_integer([:positive])}"
       second_prefix = "transient_recovery_second_#{System.unique_integer([:positive])}"
 
-      capture_log(fn ->
+      capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
         assert :ok = Supervisor.terminate_child(AttestoPhoenix.DiagnosticsSupervisor, SignalTaskSupervisor)
         assert :ok = Supervisor.terminate_child(AttestoPhoenix.DiagnosticsSupervisor, Lifecycle)
 
@@ -2691,7 +2691,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       on_exit(fn -> if is_pid(Process.whereis(Signal)), do: :sys.resume(Signal) end)
 
       first_log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           for _i <- 1..100 do
             Sweeper.check_running_for_store(RecordingRepo, "unavailable_repeated")
           end
@@ -2733,7 +2733,7 @@ defmodule AttestoPhoenix.Store.SweeperTest do
       end)
 
       second_log =
-        capture_log(fn ->
+        capture_log([format: "$message $metadata\n", metadata: [:repo, :schema_prefix]], fn ->
           for _i <- 1..100 do
             Sweeper.check_running_for_store(RecordingRepo, "unavailable_again_repeated")
           end

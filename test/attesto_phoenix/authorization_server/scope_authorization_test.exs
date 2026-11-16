@@ -59,6 +59,32 @@ defmodule AttestoPhoenix.AuthorizationServer.ScopeAuthorizationTest do
     )
   end
 
+  defmodule PrincipalPolicy do
+    @behaviour AttestoPhoenix.ScopePolicy
+
+    @impl true
+    def authorize_scope(_, scopes), do: {:ok, scopes}
+    @impl true
+    def authorize_subject_scope(_, %{subject: "principal"}, scopes, []), do: {:ok, scopes -- ["write"]}
+  end
+
+  test "principal policy resolves module, function, and MFA forms and validates arity" do
+    for options <- [
+          [scope_policy: PrincipalPolicy],
+          [authorize_subject_scope: {PrincipalPolicy, :authorize_subject_scope}],
+          [authorize_subject_scope: {PrincipalPolicy, :authorize_subject_scope, []}]
+        ] do
+      cfg = config(options)
+
+      assert {:ok, ["read"]} =
+               ScopeAuthorization.authorize_subject(cfg, %{}, %{subject: "principal"}, ["read", "write"], [])
+    end
+
+    assert_raise ArgumentError, ~r/authorize_subject_scope/, fn ->
+      config(authorize_subject_scope: fn _, _, _ -> {:ok, []} end)
+    end
+  end
+
   @client %{id: "client-1"}
 
   describe "authorize/4" do

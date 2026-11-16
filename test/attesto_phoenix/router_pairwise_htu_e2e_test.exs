@@ -73,7 +73,7 @@ defmodule AttestoPhoenix.RouterPairwiseHtuE2ETest do
     Application.put_env(:attesto_phoenix, Keystore, signing_pem: @signing_pem)
     Application.put_env(:attesto_phoenix, :otp_app, :attesto_phoenix)
     start_supervised!(CodeStore)
-    start_supervised!({ReplayCache, []})
+    start_supervised!({ReplayCache, single_node?: true})
     CodeStore.reset()
 
     clients = @clients
@@ -197,7 +197,12 @@ defmodule AttestoPhoenix.RouterPairwiseHtuE2ETest do
           )
           |> put_req_header("content-type", "application/x-www-form-urlencoded")
           |> put_req_header("dpop", dpop_proof(dpop_key, "POST", @issuer <> "/oauth/token"))
-          |> Plug.Parsers.call(Plug.Parsers.init(parsers: [:urlencoded]))
+          |> Plug.Parsers.call(
+            Plug.Parsers.init(
+              parsers: [:urlencoded],
+              body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+            )
+          )
           |> TestRouter.call([])
 
         assert mixed_token.status == 400
@@ -240,7 +245,9 @@ defmodule AttestoPhoenix.RouterPairwiseHtuE2ETest do
       |> put_req_header("content-type", "application/x-www-form-urlencoded")
       |> Map.put(:host, "evil.example")
       |> put_req_header("dpop", dpop_proof(dpop_key, "POST", @issuer <> "/oauth/token"))
-      |> Plug.Parsers.call(Plug.Parsers.init(parsers: [:urlencoded]))
+      |> Plug.Parsers.call(
+        Plug.Parsers.init(parsers: [:urlencoded], body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []})
+      )
       |> TestRouter.call([])
 
     assert token_conn.status == 200

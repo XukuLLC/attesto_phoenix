@@ -118,16 +118,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Continuation do
         # security-relevant intent. The wire answer stays generic; the operator
         # gets the reason.
         Logger.error(
-          "#{profile.continuation} was invoked from a process that does not own it; " <>
-            profile.not_done
+          "continuation was invoked from a process that does not own it",
+          continuation: profile.continuation,
+          consequence: profile.not_done
         )
 
         profile.refusal
 
       :atomics.compare_exchange(gate, 1, 0, 1) != :ok ->
         Logger.error(
-          "#{profile.continuation} was invoked more than once or after its scope " <>
-            "ended; " <> profile.not_done
+          "continuation was invoked more than once or after its scope ended",
+          continuation: profile.continuation,
+          consequence: profile.not_done
         )
 
         profile.refusal
@@ -182,12 +184,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Continuation do
   defp maybe_log_termination(profile, ref, kind) do
     case Process.get(key(profile, ref)) do
       {_digest, :succeeded} ->
-        Logger.error("#{profile.callback} #{verb(kind)} after the continuation succeeded; " <> profile.after_success)
+        Logger.error("callback terminated after the continuation succeeded",
+          callback: profile.callback,
+          termination: verb(kind),
+          consequence: profile.after_success
+        )
 
       :started ->
         Logger.error(
-          "#{profile.callback} #{verb(kind)} after the continuation started; " <>
-            "partial writes may have occurred and " <> profile.no_success
+          "callback terminated after the continuation started; partial writes may have occurred",
+          callback: profile.callback,
+          termination: verb(kind),
+          consequence: profile.no_success
         )
 
       _other ->
@@ -256,21 +264,26 @@ defmodule AttestoPhoenix.AuthorizationServer.Continuation do
   defp normalize_substituted({:error, %OAuthError{}} = error, _profile, :failed), do: error
 
   defp normalize_substituted({:error, _reason}, profile, :failed) do
-    Logger.error("#{profile.callback} failed")
+    Logger.error("continuation callback failed", callback: profile.callback)
     profile.refusal
   end
 
   defp normalize_substituted(_substituted, profile, :failed) do
     Logger.error(
-      "#{profile.callback} did not return the continuation's result " <>
-        "unchanged; " <> profile.no_response
+      "callback did not return the continuation result unchanged",
+      callback: profile.callback,
+      consequence: profile.no_response
     )
 
     profile.refusal
   end
 
   defp log_substituted_after_success(profile, action) do
-    Logger.error("#{profile.callback} #{action} after the continuation succeeded; " <> profile.after_success)
+    Logger.error("callback substituted a result after the continuation succeeded",
+      callback: profile.callback,
+      action: action,
+      consequence: profile.after_success
+    )
   end
 
   # The continuation started but terminated before returning a result. A host
@@ -290,8 +303,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Continuation do
 
   defp normalize_started(_result, profile) do
     Logger.error(
-      "#{profile.callback} returned a result after the continuation " <>
-        "terminated; partial writes may have occurred and " <> profile.no_success
+      "callback returned a result after the continuation terminated; partial writes may have occurred",
+      callback: profile.callback,
+      consequence: profile.no_success
     )
 
     profile.refusal
@@ -310,12 +324,16 @@ defmodule AttestoPhoenix.AuthorizationServer.Continuation do
   defp normalize_incomplete({:error, %OAuthError{}} = error, _profile), do: error
 
   defp normalize_incomplete({:error, _reason}, profile) do
-    Logger.error("#{profile.callback} failed")
+    Logger.error("continuation callback failed", callback: profile.callback)
     profile.refusal
   end
 
   defp normalize_incomplete(_result, profile) do
-    Logger.error("#{profile.callback} returned without invoking the continuation; " <> profile.not_done)
+    Logger.error("callback returned without invoking the continuation",
+      callback: profile.callback,
+      consequence: profile.not_done
+    )
+
     profile.refusal
   end
 
@@ -323,7 +341,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Continuation do
     if profile.well_formed?.(result) do
       result
     else
-      Logger.error("#{profile.work} produced an unusable result; " <> profile.not_done)
+      Logger.error("continuation produced an unusable result", work: profile.work, consequence: profile.not_done)
       profile.refusal
     end
   end

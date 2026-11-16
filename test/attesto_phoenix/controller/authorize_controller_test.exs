@@ -45,6 +45,8 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
   # always loses - simulating a concurrent completion (on another node) that
   # consumed the reference first. Used to exercise the atomic single-use gate in
   # `issue_and_redirect/6` without orchestrating a real race.
+  alias Plug.Conn.WrapperError
+
   defmodule TakeLosesPARStore do
     @moduledoc false
     @behaviour AttestoPhoenix.PARStore
@@ -367,14 +369,20 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         )
 
         log =
-          capture_log(fn ->
-            conn = call(valid_params())
-            query = location_query(conn)
+          capture_log(
+            [
+              format: "$message $metadata\n",
+              metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+            ],
+            fn ->
+              conn = call(valid_params())
+              query = location_query(conn)
 
-            assert query["error"] == "server_error"
-            refute Map.has_key?(query, "code")
-            refute inspect(query) =~ inspect(invalid)
-          end)
+              assert query["error"] == "server_error"
+              refute Map.has_key?(query, "code")
+              refute inspect(query) =~ inspect(invalid)
+            end
+          )
 
         assert log =~ "authorization code private context rejected"
         refute log =~ "authorization code claims rejected"
@@ -392,13 +400,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       )
 
       log =
-        capture_log(fn ->
-          conn = call(valid_params())
-          query = location_query(conn)
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            conn = call(valid_params())
+            query = location_query(conn)
 
-          assert query["error"] == "server_error"
-          refute Map.has_key?(query, "code")
-        end)
+            assert query["error"] == "server_error"
+            refute Map.has_key?(query, "code")
+          end
+        )
 
       assert log =~
                "authorization code claims rejected after private context insertion: combined claims are not portable"
@@ -1792,13 +1806,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       put_config(consent: nil, client_public?: fn _client -> true end)
 
       log =
-        capture_log(fn ->
-          conn = call(valid_params())
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            conn = call(valid_params())
 
-          assert conn.status == 302
-          assert location_query(conn)["error"] == "server_error"
-          refute Map.has_key?(location_query(conn), "code")
-        end)
+            assert conn.status == 302
+            assert location_query(conn)["error"] == "server_error"
+            refute Map.has_key?(location_query(conn), "code")
+          end
+        )
 
       assert log =~ "public-client authorization requires an explicit :consent callback"
     end
@@ -1833,12 +1853,18 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       )
 
       log =
-        capture_log(fn ->
-          conn = call(valid_params())
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            conn = call(valid_params())
 
-          assert conn.status == 302
-          assert location_query(conn)["error"] == "server_error"
-        end)
+            assert conn.status == 302
+            assert location_query(conn)["error"] == "server_error"
+          end
+        )
 
       assert log =~ "authenticate_resource_owner callback returned an invalid result"
       refute log =~ "authorize-login-private-sentinel"
@@ -1852,12 +1878,18 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       )
 
       log =
-        capture_log(fn ->
-          conn = call(valid_params())
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            conn = call(valid_params())
 
-          assert conn.status == 302
-          assert location_query(conn)["error"] == "server_error"
-        end)
+            assert conn.status == 302
+            assert location_query(conn)["error"] == "server_error"
+          end
+        )
 
       assert log =~ "consent callback returned an invalid result"
       refute log =~ "authorize-consent-private-sentinel"
@@ -1870,7 +1902,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
           consent: fn _conn, _request, subject -> {:consented, subject} end
         )
 
-        log = capture_log(fn -> assert_host_failure(call(valid_params(prompt)), reason) end)
+        log =
+          capture_log(
+            [
+              format: "$message $metadata\n",
+              metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+            ],
+            fn -> assert_host_failure(call(valid_params(prompt)), reason) end
+          )
+
         refute log =~ "returned an invalid result"
 
         put_config(
@@ -1878,7 +1918,15 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
           consent: fn _conn, _request, _subject -> {:error, reason} end
         )
 
-        log = capture_log(fn -> assert_host_failure(call(valid_params(prompt)), reason) end)
+        log =
+          capture_log(
+            [
+              format: "$message $metadata\n",
+              metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+            ],
+            fn -> assert_host_failure(call(valid_params(prompt)), reason) end
+          )
+
         refute log =~ "returned an invalid result"
       end
     end
@@ -2212,24 +2260,37 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert %{"error" => "login_required"} = location_query(call(valid_params(%{"prompt" => "none"})))
 
       log =
-        capture_log(fn ->
-          assert %{"error" => "server_error"} = location_query(call(valid_params()))
-        end)
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            assert %{"error" => "server_error"} = location_query(call(valid_params()))
+          end
+        )
 
-      assert log =~ "refused with :login_required, which does not apply to this request"
+      assert log =~ "refused with an inapplicable error"
     end
 
     test "a success returned without calling the continuation issues nothing" do
       put_config(authorization_code_issuance: fn _context, _continuation -> {:ok, "forged-code"} end)
 
       log =
-        capture_log(fn ->
-          query = location_query(call(valid_params()))
-          assert %{"error" => "server_error"} = query
-          refute Map.has_key?(query, "code")
-        end)
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            query = location_query(call(valid_params()))
+            assert %{"error" => "server_error"} = query
+            refute Map.has_key?(query, "code")
+          end
+        )
 
-      assert log =~ "authorization code issuance callback returned without invoking the continuation"
+      assert log =~ "callback returned without invoking the continuation"
+      assert log =~ "callback=authorization code issuance callback"
       assert TestStore.count() == 0
     end
 
@@ -2245,12 +2306,19 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       )
 
       log =
-        capture_log(fn ->
-          assert is_binary(location_query(call(valid_params()))["code"])
-        end)
+        capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            assert is_binary(location_query(call(valid_params()))["code"])
+          end
+        )
 
       assert_receive {:second, {:error, :issuance_callback_contract_violation}}
-      assert log =~ "authorization code issuance continuation was invoked more than once"
+      assert log =~ "continuation was invoked more than once"
+      assert log =~ "continuation=authorization code issuance continuation"
       assert TestStore.count() == 1
     end
   end
@@ -2287,6 +2355,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     defp decision_conn(browser \\ "browser-1") do
       :post
       |> Plug.Test.conn("/consent")
+      |> put_req_header("origin", "https://issuer.example.com")
       |> put_req_header("x-browser", browser)
       |> with_config()
     end
@@ -2715,7 +2784,36 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       assert_received {:consent_decision, :allow}
     end
 
-    test "decide accepts the origin the request reached, such as a development server" do
+    test "same_origin_request?/1 applies the decision's origin rule to any POST" do
+      decision_config()
+
+      assert Interaction.same_origin_request?(decision_conn())
+      assert Interaction.same_origin_request?(put_req_header(decision_conn(), "sec-fetch-site", "same-origin"))
+
+      for {header, value} <- [
+            {"sec-fetch-site", "cross-site"},
+            {"sec-fetch-site", "same-site"},
+            {"origin", "null"},
+            {"origin", "https://attacker.example"},
+            {"origin", "http://issuer.example.com"},
+            {"origin", "https://issuer.example.com:8443"},
+            {"origin", "https://issuer.example.com/"}
+          ] do
+        refute Interaction.same_origin_request?(put_req_header(decision_conn(), header, value))
+      end
+
+      refute Interaction.same_origin_request?(delete_req_header(decision_conn(), "origin"))
+
+      reached =
+        :post
+        |> Plug.Test.conn("http://localhost:4000/logout")
+        |> put_req_header("origin", "http://localhost:4000")
+        |> with_config()
+
+      refute Interaction.same_origin_request?(reached)
+    end
+
+    test "decide refuses the reached origin when it differs from the issuer" do
       decision_config()
       id = park_for_decision()
 
@@ -2727,7 +2825,7 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         |> put_req_header("sec-fetch-site", "same-origin")
         |> with_config()
 
-      assert :ok = Interaction.decide(reached, id, :allow, "user-42")
+      assert {:error, :cross_origin} = Interaction.decide(reached, id, :allow, "user-42")
 
       other_port =
         :post
@@ -2737,11 +2835,12 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         |> with_config()
 
       assert {:error, :cross_origin} = Interaction.decide(other_port, id, :deny, "user-42")
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
       assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
       assert_received {:consent_decision, :allow}
     end
 
-    test "decide accepts Origin: null from a no-referrer page and defers to Sec-Fetch-Site" do
+    test "decide refuses null and absent Origin even with same-origin Fetch Metadata" do
       decision_config()
       id = park_for_decision()
       key = Interaction.parked_key(id, "browser-1")
@@ -2760,7 +2859,11 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
         |> put_req_header("origin", "null")
         |> put_req_header("sec-fetch-site", "same-origin")
 
-      assert :ok = Interaction.decide(same_origin, id, :allow, "user-42")
+      assert {:error, :cross_origin} = Interaction.decide(same_origin, id, :allow, "user-42")
+      absent = delete_req_header(same_origin, "origin")
+      assert {:error, :cross_origin} = Interaction.decide(absent, id, :allow, fn _ -> flunk("subject lookup ran") end)
+      assert {:ok, ^original} = PARStore.fetch(key)
+      assert :ok = Interaction.decide(decision_conn(), id, :allow, "user-42")
       assert is_binary(location_query(call_query(%{"resume" => id}))["code"])
       assert_received {:consent_decision, :allow}
     end
@@ -2771,7 +2874,9 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       key = Interaction.parked_key(id, "browser-1")
       assert {:ok, original} = PARStore.fetch(key)
 
-      no_binding = :post |> Plug.Test.conn("/consent") |> with_config()
+      no_binding =
+        :post |> Plug.Test.conn("/consent") |> put_req_header("origin", "https://issuer.example.com") |> with_config()
+
       assert {:error, :invalid_resume} = Interaction.decide(no_binding, id, :allow, "user-42")
       assert {:ok, ^original} = PARStore.fetch(key)
     end
@@ -3605,14 +3710,21 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
       put_config(render_authorization_error: fn conn, _error -> conn end)
 
       log =
-        ExUnit.CaptureLog.capture_log(fn ->
-          conn = call(valid_params(%{"redirect_uri" => "https://evil.example/steal"}))
+        ExUnit.CaptureLog.capture_log(
+          [
+            format: "$message $metadata\n",
+            metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+          ],
+          fn ->
+            conn = call(valid_params(%{"redirect_uri" => "https://evil.example/steal"}))
 
-          assert conn.status == 400
-          assert JSON.decode!(conn.resp_body)["error_description"] == "redirect_uri is not registered for this client"
-        end)
+            assert conn.status == 400
+            assert JSON.decode!(conn.resp_body)["error_description"] == "redirect_uri is not registered for this client"
+          end
+        )
 
-      assert log =~ "authorization error render callback did not send a response"
+      assert log =~ "error renderer did not return a sent connection"
+      assert log =~ "detail=authorization error render callback did not send a response"
     end
 
     test "unset, the built-in page is unchanged" do
@@ -3652,6 +3764,265 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
     end
   end
 
+  describe "authorization refusal events and request sources" do
+    defp observe_refusals do
+      put_config(
+        on_event: fn event ->
+          if event.name == :authorization_failed, do: send(self(), {:refusal, event})
+        end
+      )
+    end
+
+    defp dispatch_authorization(method, query, body \\ nil, reader \\ true) do
+      conn = Plug.Test.conn(method, "https://issuer.example.com/oauth/authorize" <> query, body)
+
+      conn =
+        if body do
+          opts = [parsers: [:urlencoded, :json], json_decoder: JSON]
+
+          opts =
+            if reader,
+              do: Keyword.put(opts, :body_reader, {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}),
+              else: opts
+
+          conn
+          |> put_req_header("content-type", "application/x-www-form-urlencoded")
+          |> Plug.Parsers.call(Plug.Parsers.init(opts))
+        else
+          Plug.Parsers.call(conn, Plug.Parsers.init(parsers: [:urlencoded]))
+        end
+
+      conn |> with_config() |> AuthorizeController.call(:authorize)
+    end
+
+    test "a POST query is refused before authentication even with distinct body names" do
+      observe_refusals()
+
+      for query <- ["?trace=query-sentinel", "?resource=https%3A%2F%2Fapi.example", "?prompt=none"] do
+        body = URI.encode_query(valid_params())
+        error = assert_raise WrapperError, fn -> dispatch_authorization(:post, query, body) end
+        assert %Plug.BadRequestError{} = error.reason
+        assert_received {:refusal, event}
+        assert event.client_id == @client_id
+        assert event.result == "invalid_request"
+        assert event.metadata.reason == :query_on_post
+        assert event.metadata.repeated_parameters == []
+        refute_received {:refusal, _}
+        refute_received {:auth_opts, _}
+      end
+
+      assert TestStore.count() == 0
+    end
+
+    test "a POST with only a guarded body still authorizes" do
+      observe_refusals()
+      conn = dispatch_authorization(:post, "", URI.encode_query(valid_params()))
+      assert is_binary(location_query(conn)["code"])
+      refute_received {:refusal, _}
+    end
+
+    test "missing body analysis emits a refusal naming a registered client only" do
+      observe_refusals()
+
+      for client <- [@client_id, "unregistered-private-sentinel"] do
+        error =
+          assert_raise WrapperError, fn ->
+            dispatch_authorization(:post, "", URI.encode_query(valid_params(%{"client_id" => client})), false)
+          end
+
+        assert %Plug.BadRequestError{message: message} = error.reason
+        assert message =~ "AttestoPhoenix.DuplicateParameterGuard.read_body/2"
+        assert_received {:refusal, event}
+        assert event.client_id == if(client == @client_id, do: client)
+        assert event.result == "invalid_request"
+        assert event.metadata.reason == :missing_body_analysis
+        assert event.metadata.repeated_parameters == []
+        refute inspect(event) =~ "private-sentinel"
+        refute_received {:refusal, _}
+      end
+    end
+
+    test "duplicates report every name without values or ambiguous client attribution" do
+      observe_refusals()
+
+      for {query, body} <- [
+            {"?client_id=test-client&client_id=private-sentinel&state=a&state=state-sentinel", nil},
+            {"", "client_id=test-client&client_id=private-sentinel&state=a&state=state-sentinel"},
+            {"?client_id=test-client&state=a", "client_id=private-sentinel&state=state-sentinel"}
+          ] do
+        assert_raise WrapperError, fn -> dispatch_authorization(if(body, do: :post, else: :get), query, body) end
+        assert_received {:refusal, event}
+        assert event.client_id == nil
+        assert event.result == "invalid_request"
+        assert event.metadata.reason == :duplicate_parameter
+        assert event.metadata.repeated_parameters == ["client_id", "state"]
+        assert event.scope == nil
+        assert event.subject == nil
+        refute inspect(event) =~ "private-sentinel"
+        refute inspect(event) =~ "state-sentinel"
+        refute_received {:refusal, _}
+      end
+    end
+
+    test "direct and redirect refusals each emit one consistent event" do
+      observe_refusals()
+
+      for {params, code, reason, client_id} <- [
+            {valid_params(%{"client_id" => "unknown-private-sentinel"}), "invalid_request", :invalid_client_id, nil},
+            {valid_params(%{"redirect_uri" => "https://wrong.example"}), "invalid_request",
+             :redirect_uri_not_registered, @client_id},
+            {valid_params(%{"scope" => "uncatalogued-private-sentinel"}), "invalid_scope", :invalid_scope, @client_id},
+            {valid_params(%{"authorization_details" => "private-sentinel"}), "invalid_authorization_details",
+             :invalid_authorization_details, @client_id}
+          ] do
+        dispatch_authorization(:get, "?" <> URI.encode_query(params))
+        assert_received {:refusal, event}
+        assert event.client_id == client_id
+        assert event.result == code
+        assert event.metadata.reason == reason
+        assert event.metadata.repeated_parameters == []
+        refute inspect(event) =~ "private-sentinel"
+        refute_received {:refusal, _}
+      end
+    end
+
+    test "an unconfigured authentication callback emits only the final refusal" do
+      for {prompt, expected} <- [{"none", "login_required"}, {"login", "server_error"}] do
+        put_config(
+          authenticate_resource_owner: nil,
+          on_event: fn event ->
+            if event.name == :authorization_failed, do: send(self(), {:refusal, event})
+          end
+        )
+
+        capture_log(fn -> assert location_query(call(valid_params(%{"prompt" => prompt})))["error"] == expected end)
+        assert_received {:refusal, event}
+        assert event.result == expected
+        refute_received {:refusal, _}
+      end
+    end
+
+    test "consent refusal and a malformed host result are also counted exactly once" do
+      for {consent, expected} <- [
+            {fn _, _, _ -> {:denied, :policy} end, "access_denied"},
+            {fn _, _, _ -> :bad_return end, "server_error"}
+          ] do
+        put_config(
+          consent: consent,
+          on_event: fn event ->
+            if event.name == :authorization_failed, do: send(self(), {:refusal, event})
+          end
+        )
+
+        capture_log(fn -> assert location_query(call(valid_params()))["error"] == expected end)
+        assert_received {:refusal, event}
+        assert event.result == expected
+        assert event.client_id == @client_id
+        refute_received {:refusal, _}
+      end
+    end
+  end
+
+  describe "authenticated principal scope policy" do
+    test "narrows consent and the code after authentication" do
+      put_config(
+        authorize_subject_scope: fn client, subject, scope, resources ->
+          assert client.id == @client_id
+          assert subject.subject == "user-42"
+          assert scope == ~w(openid profile)
+          assert resources == []
+          send(self(), :principal_policy)
+          {:ok, ["profile"]}
+        end,
+        consent: fn _conn, request, subject ->
+          assert_received :principal_policy
+          assert request.scope == ["profile"]
+          refute request.openid?
+          {:consented, subject}
+        end
+      )
+
+      code = location_query(call(valid_params()))["code"]
+      assert TestStore.peek(code).data.scope == ["profile"]
+    end
+
+    test "narrowing removes credential rights derived from discarded scope" do
+      put_config(
+        credential_configurations_supported: %{"ProfileCredential" => %{format: "dc+sd-jwt", scope: "profile"}},
+        authorize_subject_scope: fn _, _, _, _ -> {:ok, ["openid"]} end
+      )
+
+      code = location_query(call(valid_params()))["code"]
+      record = TestStore.peek(code)
+      assert record.data.scope == ["openid"]
+      refute "ProfileCredential" in Map.get(record.data.claims, "credential_configuration_ids", [])
+    end
+
+    test "refuses added scope, malformed scope, and resources before consent" do
+      for result <- [
+            {:ok, ["admin"]},
+            {:ok, [:profile]},
+            :unexpected,
+            {:error, :invalid_scope},
+            {:error, :invalid_target}
+          ] do
+        put_config(
+          authorize_subject_scope: fn _, _, _, _ -> result end,
+          consent: fn _, _, _ -> flunk("consent ran after a policy refusal") end
+        )
+
+        expected = if result == {:error, :invalid_target}, do: "invalid_target", else: "invalid_scope"
+        assert location_query(call(valid_params()))["error"] == expected
+      end
+
+      assert TestStore.count() == 0
+    end
+
+    test "cannot grant a default after the client policy narrowed scope to empty" do
+      put_config(
+        authorize_scope: fn _, _ -> {:ok, []} end,
+        authorize_subject_scope: fn _, _, [], [] -> {:ok, ["profile"]} end
+      )
+
+      assert location_query(call(valid_params()))["error"] == "invalid_scope"
+      assert TestStore.count() == 0
+    end
+
+    test "resume reruns policy with the newly authenticated principal" do
+      Process.put(:policy_subject, "first")
+      on_exit(fn -> Process.delete(:policy_subject) end)
+
+      put_config(
+        interaction_browser_binding: &__MODULE__.browser_binding/1,
+        authenticate_resource_owner: fn _, _, _ -> {:authenticated, %{subject: Process.get(:policy_subject)}} end,
+        authorize_subject_scope: fn _, subject, scope, [] ->
+          send(self(), {:principal_pass, subject.subject, scope})
+          {:ok, if(subject.subject == "first", do: ["profile"], else: ["email"])}
+        end,
+        consent: fn conn, request, subject ->
+          if conn.private[:attesto_phoenix_resumed_interaction] do
+            assert request.scope == ["email"]
+            {:consented, subject}
+          else
+            assert request.scope == ["profile"]
+            {:ok, id} = Interaction.park(conn, request, subject: subject.subject)
+            send(self(), {:principal_parked, id})
+            {:halt, send_resp(conn, 200, "consent")}
+          end
+        end
+      )
+
+      assert call_query(valid_params(%{"scope" => "profile email"})).status == 200
+      assert_received {:principal_pass, "first", ["profile", "email"]}
+      assert_received {:principal_parked, id}
+      Process.put(:policy_subject, "second")
+      code = location_query(call_query(%{"resume" => id}))["code"]
+      assert_received {:principal_pass, "second", ["profile", "email"]}
+      assert TestStore.peek(code).data.scope == ["email"]
+      assert TestStore.peek(code).data.subject == "second"
+    end
+  end
+
   describe "scope policy at the authorization endpoint (RFC 6749 §4.1.2.1, RFC 8707 §2)" do
     test "a refused scope is a redirectable invalid_scope before the resource owner is asked" do
       put_config(authorize_scope: fn _client, _requested -> {:error, :invalid_scope} end)
@@ -3673,6 +4044,34 @@ defmodule AttestoPhoenix.Controller.AuthorizeControllerTest do
 
       conn = call(valid_params(%{"prompt" => "none"}))
       assert %{"error" => "invalid_scope"} = location_query(conn)
+    end
+
+    test "a dynamically registered public client can be required to name exactly one resource" do
+      public_client = %{id: @client_id, public?: true, dynamically_registered?: true}
+
+      put_config(
+        load_client: fn
+          @client_id -> {:ok, public_client}
+          _ -> {:error, :not_found}
+        end,
+        client_public?: fn client -> client.public? end,
+        authorize_scope: fn client, scope, resources ->
+          assert client == public_client
+          send(self(), {:resource_policy, resources})
+
+          if client.dynamically_registered? and client.public? and length(resources) != 1,
+            do: {:error, :invalid_target},
+            else: {:ok, scope}
+        end
+      )
+
+      assert location_query(call(valid_params()))["error"] == "invalid_target"
+      assert_received {:resource_policy, []}
+      resources = ["https://issuer.example.com", "https://second.example.com"]
+      assert location_query(call(valid_params(%{"resource" => resources})))["error"] == "invalid_target"
+      assert_received {:resource_policy, ^resources}
+      assert is_binary(location_query(call(valid_params(%{"resource" => hd(resources)})))["code"])
+      assert_received {:resource_policy, ["https://issuer.example.com"]}
     end
 
     test "a three-argument policy sees the resources and may answer invalid_target" do

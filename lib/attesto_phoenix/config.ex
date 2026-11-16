@@ -125,10 +125,6 @@ defmodule AttestoPhoenix.Config do
       registered for one of those secret methods, while emitting mismatch
       telemetry. Key, certificate, attestation, and public-client differences
       remain rejected. Use this temporary policy to measure a migration.
-    * `:oauth_body_guard` - `:observe` (default) or `:required`. Missing raw-body
-      analysis emits telemetry for protocol requests with form or JSON bodies.
-      The required policy also rejects those requests; configure the endpoint
-      body reader before enabling it.
     * `:bind_unbound_refresh_families` - `:reject` (default) or
       `:configured_issuer`. The compatibility policy is an operator assertion
       that the store belongs to exactly one issuer. It uses the configured
@@ -149,6 +145,17 @@ defmodule AttestoPhoenix.Config do
       or `invalid_target` (RFC 6749 §4.1.2.1, RFC 8707 §2), under `prompt=none`
       too, and a narrowed scope is what the consent step sees and the code is
       bound to.
+    * `:authorize_subject_scope` - `(client, subject, scope, resources ->
+      {:ok, narrowed_scope} | {:error, :invalid_scope | :invalid_target})`.
+      Optional principal policy, applied after authentication and freshness
+      checks on every authorization pass, including resume, before consent.
+      `subject` is the authenticated map passed to consent. Scope is the
+      effective scope already approved by `:authorize_scope`; resources is
+      the resolved list (empty when absent). The result must be a subset,
+      even when the effective scope is empty. Consent sees the narrowed scope
+      and the authorization code is bound to it. Return `:invalid_target` to
+      refuse resources outside the principal's ceiling. This policy does not
+      replace token-endpoint `:authorize_scope` checks.
     * `:on_event` - `(%AttestoPhoenix.Event{} -> any)`. Audit/telemetry hook.
       No-op by default; the library never stores events itself.
     * `:render_end_session_error` - `(conn, %AttestoPhoenix.OAuthError{} -> conn)`.
@@ -1208,7 +1215,13 @@ defmodule AttestoPhoenix.Config do
           cache record, including attached JWKS. Default `16_384` bytes.
     * `:replay_check` - DPoP `jti` replay check as a two-argument function,
       `{module, function}`, or `{module, function, extra_args}` callback.
-      DPoP defaults to the single-node ETS replay cache. CIBA configurations
+      DPoP and jwt-bearer assertions default to the node-local ETS replay cache;
+      supervise `{Attesto.DPoP.ReplayCache, single_node?: true}` only for a
+      deployment with one node. Multiple nodes (including a rolling deploy)
+      must configure a shared callback, such as
+      `AttestoPhoenix.Store.EctoReplayCheck.check_and_record/2`, on every node.
+      Do not supervise the local cache when using a shared callback.
+      CIBA configurations
       that require signed authentication requests must set this explicitly so
       request-JWT replay protection cannot be omitted or left unsupervised. An
       optional signed request is rejected at runtime when this callback is nil.
@@ -1446,6 +1459,7 @@ defmodule AttestoPhoenix.Config do
     :request_object_policy,
     :audience,
     :authorize_scope,
+    :authorize_subject_scope,
     :on_event,
     :send_error,
     :no_store,
@@ -1582,7 +1596,6 @@ defmodule AttestoPhoenix.Config do
     bind_unbound_refresh_families: :reject,
     client_auth_method_validation: :runtime,
     client_secret_auth_method_policy: :strict,
-    oauth_body_guard: :observe,
     authorization_code_ttl: 60,
     par_ttl: 90,
     interaction_ttl: 600,
@@ -1650,6 +1663,7 @@ defmodule AttestoPhoenix.Config do
           request_object_policy: Policy.t() | nil,
           audience: String.t() | nil,
           authorize_scope: callback() | nil,
+          authorize_subject_scope: callback() | nil,
           on_event: callback() | nil,
           send_error: callback() | nil,
           no_store: callback() | nil,
@@ -1745,7 +1759,6 @@ defmodule AttestoPhoenix.Config do
           bind_unbound_refresh_families: :reject | :configured_issuer,
           client_auth_method_validation: :runtime | :boot,
           client_secret_auth_method_policy: :strict | :observe,
-          oauth_body_guard: :observe | :required,
           authorization_code_ttl: pos_integer(),
           par_ttl: pos_integer(),
           interaction_ttl: pos_integer(),
@@ -1836,6 +1849,7 @@ defmodule AttestoPhoenix.Config do
     reject_legacy_global_table_prefix!()
     reject_malformed_prefix_keys!(opts)
     reject_legacy_table_prefix!(opts)
+    reject_removed_body_guard!(opts)
 
     # Validate raw input before struct construction so malformed values are
     # still rejected even though `t()` describes only validated field types.
@@ -2554,12 +2568,6 @@ defmodule AttestoPhoenix.Config do
   """
   @spec client_secret_auth_method_policy(t()) :: :strict | :observe
   def client_secret_auth_method_policy(%__MODULE__{client_secret_auth_method_policy: policy}), do: policy
-
-  @doc """
-  Whether a protocol request missing raw-body analysis is observed or rejected.
-  """
-  @spec oauth_body_guard(t()) :: :observe | :required
-  def oauth_body_guard(%__MODULE__{oauth_body_guard: policy}), do: policy
 
   @doc """
   Returns `true` unless the host has forbidden RFC 8252 §7.3 loopback interface
@@ -3884,6 +3892,7 @@ defmodule AttestoPhoenix.Config do
     authenticate_resource_owner: {:consent_policy, :authenticate_resource_owner, 3},
     consent: {:consent_policy, :consent, 3},
     authorize_scope: {:scope_policy, :authorize_scope, 2},
+    authorize_subject_scope: {:scope_policy, :authorize_subject_scope, 4},
     on_event: {:event_sink, :on_event, 1},
     register_client: {:registration, :register_client, 1},
     unregister_client: {:registration, :unregister_client, 1},
@@ -5116,8 +5125,7 @@ defmodule AttestoPhoenix.Config do
         registration_default_application_type: ["web", "native"],
         bind_unbound_refresh_families: [:reject, :configured_issuer],
         client_auth_method_validation: [:runtime, :boot],
-        client_secret_auth_method_policy: [:strict, :observe],
-        oauth_body_guard: [:observe, :required]
+        client_secret_auth_method_policy: [:strict, :observe]
       ],
       fn {key, choices} ->
         if Map.fetch!(config, key) not in choices do
@@ -5601,6 +5609,16 @@ defmodule AttestoPhoenix.Config do
               "public tables and only the CIBA store and sweeper used it as an " <>
               "Ecto schema prefix. Rename it to :schema_prefix only after " <>
               "inventorying and migrating verified sources before booting."
+    end
+  end
+
+  defp reject_removed_body_guard!(opts) when is_map(opts) do
+    if Map.has_key?(opts, :oauth_body_guard) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: :oauth_body_guard was removed in 4.22. A protocol request " <>
+              "whose body was not read by AttestoPhoenix.DuplicateParameterGuard.read_body/2 " <>
+              "is always refused. Set that function as the :body_reader of the endpoint's " <>
+              "Plug.Parsers and delete the option."
     end
   end
 

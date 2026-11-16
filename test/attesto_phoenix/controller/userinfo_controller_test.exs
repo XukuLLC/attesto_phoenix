@@ -630,7 +630,7 @@ defmodule AttestoPhoenix.Controller.UserinfoControllerTest do
 
   describe "DPoP configured endpoint pin" do
     test "compares DPoP htu against the configured UserInfo endpoint URL rather than the Host header" do
-      start_supervised!({ReplayCache, []})
+      start_supervised!({ReplayCache, single_node?: true})
       key = DPoP.generate_key()
       {_, public} = key |> JOSE.JWK.to_public() |> JOSE.JWK.to_map()
       jkt = Attesto.DPoP.compute_jkt(public)

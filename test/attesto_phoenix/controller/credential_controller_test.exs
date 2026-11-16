@@ -1019,7 +1019,7 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
     end
 
     test "pins DPoP htu against the configured credential endpoint URL rather than the Host header" do
-      start_supervised!({ReplayCache, []})
+      start_supervised!({ReplayCache, single_node?: true})
       config = Application.fetch_env!(:attesto_phoenix, Config)
       put_config(Keyword.put(config, :replay_check, &ReplayCache.check_and_record/2))
       nonce = CNonceStore.issue(60)
@@ -1048,7 +1048,15 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
       # Spoofed Host header must not override the configured credential endpoint URL.
       spoofed_conn =
         :post
-        |> conn(@endpoint_path, credential_request(nonce))
+        |> conn(@endpoint_path, JSON.encode!(credential_request(nonce)))
+        |> put_req_header("content-type", "application/json")
+        |> Plug.Parsers.call(
+          Plug.Parsers.init(
+            parsers: [:json],
+            json_decoder: JSON,
+            body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+          )
+        )
         |> Map.put(:host, "evil.example")
         |> put_req_header("authorization", "DPoP " <> access_token)
         |> put_req_header("dpop", sign_dpop.("https://evil.example" <> @endpoint_path))
@@ -1059,7 +1067,15 @@ defmodule AttestoPhoenix.Controller.CredentialControllerTest do
 
       pinned_conn =
         :post
-        |> conn(@endpoint_path, credential_request(nonce))
+        |> conn(@endpoint_path, JSON.encode!(credential_request(nonce)))
+        |> put_req_header("content-type", "application/json")
+        |> Plug.Parsers.call(
+          Plug.Parsers.init(
+            parsers: [:json],
+            json_decoder: JSON,
+            body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+          )
+        )
         |> Map.put(:host, "evil.example")
         |> put_req_header("authorization", "DPoP " <> access_token)
         |> put_req_header("dpop", sign_dpop.(@issuer <> @endpoint_path))

@@ -272,19 +272,17 @@ defmodule AttestoPhoenix.ConfigTest do
       assert Config.refresh_store_backend(cfg) == nil
       assert Config.client_auth_method_validation(cfg) == :runtime
       assert Config.client_secret_auth_method_policy(cfg) == :strict
-      assert Config.oauth_body_guard(cfg) == :observe
+      refute Map.has_key?(cfg, :oauth_body_guard)
     end
 
     test "validates explicit registration and diagnostic policies" do
       cfg =
         config(
           registration_default_application_type: "native",
-          oauth_body_guard: :required,
           client_secret_auth_method_policy: :observe
         )
 
       assert Config.registration_default_application_type(cfg) == "native"
-      assert Config.oauth_body_guard(cfg) == :required
       assert Config.client_secret_auth_method_policy(cfg) == :observe
 
       for {key, value} <- [
@@ -292,10 +290,17 @@ defmodule AttestoPhoenix.ConfigTest do
             registration_default_application_type: nil,
             bind_unbound_refresh_families: :accept,
             client_auth_method_validation: :ignored,
-            client_secret_auth_method_policy: :disabled,
-            oauth_body_guard: nil
+            client_secret_auth_method_policy: :disabled
           ] do
         assert_raise ArgumentError, ~r/#{key}/, fn -> config([{key, value}]) end
+      end
+    end
+
+    test "the removed body guard option is rejected" do
+      for value <- [:observe, :required, nil] do
+        assert_raise ArgumentError, ~r/:oauth_body_guard was removed in 4\.22.*read_body\/2/s, fn ->
+          config(oauth_body_guard: value)
+        end
       end
     end
 

@@ -15,7 +15,7 @@ defmodule AttestoPhoenix.Controller.ErrorRender do
         rendered
 
       _not_a_sent_conn ->
-        Logger.error(failure_message)
+        Logger.error("error renderer did not return a sent connection", detail: failure_message)
         fallback_fun.(conn)
     end
   end

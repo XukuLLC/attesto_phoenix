@@ -465,8 +465,16 @@ defmodule AttestoPhoenix.Controller.RevocationControllerTest do
       }
 
       conn =
-        params
-        |> build_conn(config: config)
+        conn(:post, "https://issuer.example/oauth/revoke", URI.encode_query(params))
+        |> put_req_header("content-type", "application/x-www-form-urlencoded")
+        |> Plug.Parsers.call(
+          Plug.Parsers.init(
+            parsers: [:urlencoded],
+            body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+          )
+        )
+        |> put_private(:attesto_phoenix_config, config)
+        |> put_private(:attesto_phoenix_refresh_store, StubStore)
         |> RoutedRouter.call(RoutedRouter.init([]))
 
       assert conn.status == 200

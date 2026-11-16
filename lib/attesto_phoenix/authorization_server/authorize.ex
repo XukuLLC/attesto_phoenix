@@ -28,7 +28,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Authorize do
     ScopeAuthorization
   }
 
-  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Interaction}
+  alias AttestoPhoenix.{Callback, ClientIdMetadata, Config, Interaction, LogMetadata}
   alias AttestoPhoenix.ClientIdMetadata.Client, as: CIMDClient
   alias AttestoPhoenix.OAuthError, as: PhoenixOAuthError
   alias AttestoPhoenix.Store.PAR.ETS
@@ -91,6 +91,18 @@ defmodule AttestoPhoenix.AuthorizationServer.Authorize do
            if(par_resolved? and is_binary(par_request_uri) and par_request_uri != "", do: par_request_uri),
          credential_configuration_ids: credential_configuration_ids(config, request)
        }}
+    end
+  end
+
+  @doc """
+  Apply the authenticated principal's policy before consent and code issuance.
+  """
+  @spec authorize_subject_scope(Config.t(), term(), map(), AuthorizationRequest.t()) ::
+          {:ok, AuthorizationRequest.t()} | {:error, :invalid_scope | :invalid_target}
+  def authorize_subject_scope(config, client, subject, request) do
+    with {:ok, granted} <-
+           ScopeAuthorization.authorize_subject(config, client, subject, request.scope, request.resource) do
+      {:ok, %{request | scope: granted, openid?: "openid" in granted}}
     end
   end
 
@@ -227,8 +239,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Authorize do
 
       true ->
         Logger.error(
-          "authorization code issuance callback refused with #{inspect(error)}, which does not " <>
-            "apply to this request; answered server_error"
+          "authorization code issuance callback refused with an inapplicable error; answered server_error",
+          reason: LogMetadata.term(error)
         )
 
         @error_server_error
@@ -412,7 +424,9 @@ defmodule AttestoPhoenix.AuthorizationServer.Authorize do
   defp dpop_jkt_from_params(%{"dpop_jkt" => jkt}) when is_binary(jkt) and jkt != "", do: jkt
   defp dpop_jkt_from_params(_params), do: nil
 
-  defp credential_configuration_ids(config, %AuthorizationRequest{} = request) do
+  @doc "Resolve credential configuration identifiers from the effective authorized request."
+  @spec credential_configuration_ids(Config.t(), AuthorizationRequest.t()) :: map()
+  def credential_configuration_ids(config, %AuthorizationRequest{} = request) do
     supported = Config.credential_configurations_supported(config) || %{}
 
     from_authorization_details =

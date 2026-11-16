@@ -10,15 +10,15 @@
   {"lib/mix/tasks/attesto_phoenix.backfill_refresh_issuer.ex", :pattern_match, 1},
 
   # Manually assembled Config structs can violate declared struct field types.
-  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {4648, 8}},
-  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {5065, 8}},
-  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {6508, 7}},
+  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {4657, 8}},
+  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {5074, 8}},
+  {"lib/attesto_phoenix/config.ex", :pattern_match_cov, {6526, 7}},
 
   # Host callbacks are not constrained at runtime by their declared success type.
   {"lib/attesto_phoenix/credential_issuer.ex", :pattern_match_cov, {643, 8}},
 
   # URI and Plug structs can be manually assembled with malformed field values.
-  {"lib/attesto_phoenix/duplicate_parameter_guard.ex", :pattern_match, {279, 8}},
-  {"lib/attesto_phoenix/duplicate_parameter_guard.ex", :pattern_match_cov, {304, 8}},
-  {"lib/attesto_phoenix/duplicate_parameter_guard.ex", :pattern_match_cov, {330, 8}}
+  {"lib/attesto_phoenix/duplicate_parameter_guard.ex", :pattern_match, {296, 8}},
+  {"lib/attesto_phoenix/duplicate_parameter_guard.ex", :pattern_match_cov, {321, 8}},
+  {"lib/attesto_phoenix/duplicate_parameter_guard.ex", :pattern_match_cov, {347, 8}}
 ]

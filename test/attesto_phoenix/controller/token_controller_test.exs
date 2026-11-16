@@ -1617,7 +1617,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     test "a replayed DPoP proof is rejected at the token endpoint" do
       enable_minting()
-      start_supervised!({ReplayCache, []})
+      start_supervised!({ReplayCache, single_node?: true})
       # The base setup stubs :replay_check to always allow; use the real,
       # jti-recording cache here so the replay is actually rejected.
       put_config(dpop_enabled: true, replay_check: &ReplayCache.check_and_record/2)
@@ -1652,7 +1652,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     # before it is consumed.
     test "a replayed proof does not consume the authorization code it was replayed against" do
       enable_minting()
-      start_supervised!({ReplayCache, []})
+      start_supervised!({ReplayCache, single_node?: true})
 
       code_store = start_code_store("oc_sub-1", ["read"])
 
@@ -1682,7 +1682,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
     test "a public client with a bogus grant cannot write to the replay store" do
       enable_minting()
-      start_supervised!({ReplayCache, []})
+      start_supervised!({ReplayCache, single_node?: true})
 
       put_config(
         dpop_enabled: true,

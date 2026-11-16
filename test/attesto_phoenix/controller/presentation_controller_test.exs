@@ -11,6 +11,7 @@ defmodule AttestoPhoenix.PresentationTestRouter do
     plug Plug.Parsers,
       parsers: [:urlencoded, :json],
       pass: ["application/json", "application/x-www-form-urlencoded"],
+      body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []},
       json_decoder: JSON
   end
 
@@ -607,7 +608,7 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
   defp hash(value), do: :crypto.hash(:sha256, value) |> Base.url_encode64(padding: false)
 
   defp post_response(conn, config, state, vp_token) do
-    post(conn, Config.presentation_response_path(config), %{
+    post_form(conn, Config.presentation_response_path(config), %{
       "state" => state,
       "vp_token" => vp_token
     })
@@ -618,11 +619,11 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
 
     conn
     |> put_req_header("content-type", "application/json")
-    |> post(Config.presentation_response_path(config), body)
+    |> post_form(Config.presentation_response_path(config), body)
   end
 
   defp post_encrypted_response(conn, config, encrypted_response) do
-    post(conn, Config.presentation_response_path(config), %{"response" => encrypted_response})
+    post_form(conn, Config.presentation_response_path(config), %{"response" => encrypted_response})
   end
 
   defp response_code(response) do
@@ -735,4 +736,13 @@ defmodule AttestoPhoenix.Controller.PresentationControllerTest do
     {_kty, public} = pem |> JOSE.JWK.from_pem() |> JOSE.JWK.to_public_map()
     public
   end
+
+  # Encode real HTTP bytes so the endpoint's configured reader runs.
+  defp post_form(conn, path, params) when is_map(params) do
+    conn
+    |> put_req_header("content-type", "application/x-www-form-urlencoded")
+    |> post(path, URI.encode_query(params))
+  end
+
+  defp post_form(conn, path, body), do: post(conn, path, body)
 end

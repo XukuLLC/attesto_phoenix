@@ -167,17 +167,14 @@ plug Plug.Parsers,
   body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
 ```
 
-The default `oauth_body_guard: :observe` emits
-`[:attesto_phoenix, :oauth_body_guard, :missing_analysis]` when a protocol
-form/JSON request has no raw-body analysis. Measurements are `%{count: 1}`;
-metadata contains the HTTP method and body format only. After every endpoint
-uses the reader, select `oauth_body_guard: :required` to refuse those requests
-with HTTP 400. Multipart protocol bodies also emit this event and are rejected
-under `:required`, because Plug's multipart parser bypasses the body reader.
-Host upload routes can keep their existing multipart parsing.
-Duplicate query/header checks remain automatic, and completed
-body analysis is enforced under either policy. Custom readers can be wrapped
-as described in `AttestoPhoenix.DuplicateParameterGuard`.
+Protocol form/JSON requests without raw-body analysis are refused with HTTP
+400 and emit `[:attesto_phoenix, :oauth_body_guard, :missing_analysis]`.
+Measurements are `%{count: 1}`; metadata contains the HTTP method and body
+format only. The `:oauth_body_guard` option has been removed. Multipart protocol
+bodies are refused because Plug's multipart parser bypasses the body reader.
+Host upload routes can keep their existing multipart parsing. Duplicate checks
+remain automatic. Custom readers can be wrapped as described in
+`AttestoPhoenix.DuplicateParameterGuard`.
 
 Protocol tests must exercise the encoded body when testing the reader or using
 `:required`. Passing a params map directly to `Phoenix.ConnTest.post/3` bypasses

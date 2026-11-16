@@ -126,6 +126,7 @@ authorization server, use `attesto_phoenix`.
 ## Contents
 
 - [Installation](#installation)
+- [Upgrading to 4.22](#upgrading-to-422)
 - [Upgrading to 4.5](#upgrading-to-45)
 - [Upgrading to 4.3](#upgrading-to-43)
 - [Upgrading to 4.2](#upgrading-to-42)
@@ -137,6 +138,8 @@ authorization server, use `attesto_phoenix`.
 - [Mounting the routes](#mounting-the-routes)
   - [OpenID for Verifiable Credentials (OID4VC / EU wallet)](#openid-for-verifiable-credentials-oid4vc--eu-wallet)
 - [Protecting resources](#protecting-resources)
+- [Principal and resource policy](#principal-and-resource-policy)
+- [Error log messages](#error-log-messages)
 - [Database migration](#database-migration)
 - [Guides and examples](#guides-and-examples)
 - [Development](#development)
@@ -149,12 +152,12 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.21"}
+    {:attesto_phoenix, "~> 4.22"}
   ]
 end
 ```
 
-Requires `attesto >= 2.24.0 and < 3.0.0`.
+Requires `attesto >= 2.26.0 and < 3.0.0`.
 
 For `prompt=login`, the authentication callback must return `auth_time` at or
 later than `auth_opts.parked_at` on an interaction resume. Fresh requests allow
@@ -212,7 +215,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.21"},
+    {:attesto_phoenix, "~> 4.22"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -320,6 +323,66 @@ leaves the columns widened. Until it has run, a value over 255 characters still
 fails in those stores. CIBA
 `acr_values` entries keep their 255-byte limit, enforced at the backchannel
 endpoint with `invalid_request`.
+
+## Upgrading to 4.22
+
+AttestoPhoenix 4.22 refuses requests that 4.21 accepted. It has no database
+migration. A host makes four changes; the first three also work on 4.21, so
+they can be deployed before the library is upgraded.
+
+**Install the body reader.** A protocol `POST`, `PUT` or `PATCH` with a form or
+JSON body is refused with a 400 unless
+`AttestoPhoenix.DuplicateParameterGuard.read_body/2` read it, and a
+`multipart` body on a protocol endpoint is always refused. Set the reader on
+the endpoint's `Plug.Parsers`, as [Mounting the routes](#mounting-the-routes)
+shows:
+
+```elixir
+plug Plug.Parsers,
+  parsers: [:urlencoded, :multipart, :json],
+  pass: ["*/*"],
+  json_decoder: Phoenix.json_library(),
+  body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []}
+```
+
+Delete `oauth_body_guard:` from the configuration; 4.22 raises at boot when it
+is present. A test that passes a map of parameters to `Phoenix.ConnTest.post/3`
+never reaches the reader and is refused as well. Send the encoded body:
+
+```elixir
+conn
+|> put_req_header("content-type", "application/x-www-form-urlencoded")
+|> post(~p"/oauth/token", URI.encode_query(params))
+```
+
+**Put authorization `POST` parameters in the body.** A `POST` to the
+authorization endpoint with any query string is refused.
+
+**Send `Referrer-Policy: strict-origin` on the consent page, from the issuer's
+origin.** `AttestoPhoenix.Interaction.decide/4` requires an `Origin` header
+that names the issuer's origin. A page with `Referrer-Policy: no-referrer`
+makes the browser send `Origin: null`, which is refused, as is a request with
+no `Origin` and one from the origin the request reached when that is not the
+issuer's. A development server sets its issuer to the origin it serves. A
+host's logout-confirmation handler can apply the same rule with
+`AttestoPhoenix.Interaction.same_origin_request?/1`.
+
+**State the node count where the local replay cache starts.** A host that
+supervises `Attesto.DPoP.ReplayCache`, the default replay check for DPoP proofs
+and jwt-bearer assertions, changes the child to
+`{Attesto.DPoP.ReplayCache, single_node?: true}`. This one needs Attesto 2.26
+and goes out with the upgrade. A deployment with more than one node sets
+`replay_check: &AttestoPhoenix.Store.EctoReplayCheck.check_and_record/2` on
+every node and does not supervise the cache.
+
+Nodes on 4.21 and 4.22 run against the same database during a rolling deploy.
+A 4.21 node keeps accepting what 4.22 refuses until it is replaced.
+
+Two things a host reads change as well. `:authorization_failed` is emitted
+once for every refused authorization request, consent denial and the
+parameter checks included, and its `:result` is always the OAuth error code as
+a string. `Logger.error` messages are fixed strings with their detail in
+metadata; see [Error log messages](#error-log-messages).
 
 ## Quick start
 
@@ -2067,6 +2130,109 @@ proofs that interoperate with `AttestoPhoenix.Plug.Authenticate`. It is not a
 runtime dependency of this package; `attesto_phoenix` uses it only in tests as
 an external client compatibility check.
 
+## Principal and resource policy
+
+A host can require exactly one resource for a dynamically registered public
+client using its existing client metadata and `:authorize_scope` callback:
+
+```elixir
+authorize_scope: fn client, scope, resources ->
+  if client.dynamically_registered? and client.public? and length(resources) != 1 do
+    {:error, :invalid_target}
+  else
+    {:ok, scope}
+  end
+end
+```
+
+The callback receives `[]` when no resource was supplied. It runs before
+resource-owner authentication and again at the token endpoint. Its two-argument
+form remains available for policies that do not need resources.
+
+Use `:authorize_subject_scope` for the authenticated principal's ceiling:
+
+```elixir
+authorize_subject_scope: fn client, subject, scope, resources ->
+  if MyPolicy.resources_allowed?(client, subject, resources) do
+    {:ok, Enum.filter(scope, &MyPolicy.scope_allowed?(client, subject, &1))}
+  else
+    {:error, :invalid_target}
+  end
+end
+```
+
+This callback runs after authentication on every authorization pass, including
+resume with a different signed-in principal. Consent and the issued code receive
+the narrowed scope. It cannot add scopes, including when scope is empty.
+
+## Error log messages
+
+Every `Logger.error` call passes one of the fixed messages below. The values
+that vary are Logger metadata, as atoms or strings: a failure reason from a
+store or a host callback, the name of the callback, what the failure left
+undone. The default formatter prints a metadata key only when it is listed:
+
+```elixir
+config :logger, :default_formatter,
+  metadata: [
+    :reason,
+    :operation,
+    :callback,
+    :continuation,
+    :consequence,
+    :termination,
+    :action,
+    :work,
+    :detail,
+    :repo,
+    :schema_prefix
+  ]
+```
+
+`:reason` is a term returned or raised by a host callback or a store, rendered
+with `inspect/1` unless it is an atom or a string. Leave it out of a log
+destination that must not receive those values.
+
+- `:authenticate_resource_owner callback is not configured`
+- `AttestoPhoenix: missing-sweeper signal capacity is exhausted; additional unmonitored cleanup targets may be suppressed temporarily.`
+- `AttestoPhoenix: sweeper lifecycle monitor is unavailable; cleanup supervision could not be verified`
+- `authenticate_resource_owner callback returned an invalid result`
+- `authenticate_resource_owner returned {:none} without prompt=none`
+- `authorization code carried a malformed private context; no token was issued`
+- `authorization code carries private context but no :authorization_code_completion callback is configured; no token was issued`
+- `authorization code claims rejected after private context insertion: combined claims are not portable`
+- `authorization code claims rejected: reserved private context key`
+- `authorization code issuance callback refused with an inapplicable error; answered server_error`
+- `authorization code issuance failed`
+- `authorization code private context rejected`
+- `callback did not return the continuation result unchanged`
+- `callback returned a result after the continuation terminated; partial writes may have occurred`
+- `callback returned without invoking the continuation`
+- `callback substituted a result after the continuation succeeded`
+- `callback terminated after the continuation started; partial writes may have occurred`
+- `callback terminated after the continuation succeeded`
+- `ciba id token mint failed`
+- `ciba id token mint failed: missing client_id`
+- `consent callback returned an invalid result`
+- `continuation callback failed`
+- `continuation produced an unusable result`
+- `continuation was invoked from a process that does not own it`
+- `continuation was invoked more than once or after its scope ended`
+- `end_session: no :terminate_session callback configured`
+- `error renderer did not return a sent connection`
+- `id token mint failed`
+- `id token mint failed: missing client_id`
+- `logout session store lease failed; verify the Attesto Phoenix 4.2 migration is applied`
+- `max_age was requested but the host returned an unusable authentication`
+- `prompt=login was requested but the host returned an unusable authentication`
+- `public-client authorization requires an explicit :consent callback`
+- `refresh token issuance failed`
+- `refresh token issuance returned an invalid result`
+- `refresh token rotation temporarily unavailable; retry the request`
+- `token mint failed`
+- `token operation failed`
+- `userinfo: the client's userinfo_signed_response_alg is not a supported signing algorithm`
+
 ## Database migration
 
 The generated migration owns the operational tables backing the attesto store
@@ -2197,7 +2363,7 @@ The Ecto refresh store also needs the stable
 Single-node deployments may instead use the in-memory ETS implementations for
 nonces, replay, and PAR; the Ecto variants exist for clustered correctness.
 Signed CIBA still requires an explicit `:replay_check`, so a single-node host
-using ETS must supervise `Attesto.DPoP.ReplayCache` and point the callback at
+using ETS must supervise `{Attesto.DPoP.ReplayCache, single_node?: true}` and point the callback at
 `&Attesto.DPoP.ReplayCache.check_and_record/2`.
 **PAR is the one to watch**: its default is single-node ETS, but FAPI 2.0
 *requires* PAR, so a clustered FAPI deployment must set

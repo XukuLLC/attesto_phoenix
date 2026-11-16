@@ -40,5 +40,17 @@ defmodule AttestoPhoenix.ScopePolicy do
   @callback authorize_scope(client :: term(), requested_scope :: [String.t()], resources :: [String.t()]) ::
               {:ok, [String.t()]} | {:error, :invalid_scope | :invalid_target}
 
-  @optional_callbacks authorize_scope: 2, authorize_scope: 3
+  @doc """
+  Narrow the effective scope after resource-owner authentication.
+
+  Optional. Runs on each authorization pass, including resume, before consent.
+  `subject` is the authenticated subject map. `resources` is the resolved
+  resource list, empty when absent. A result cannot add scope, even to an
+  empty effective scope. Refuse resources outside the principal's ceiling
+  with `{:error, :invalid_target}`.
+  """
+  @callback authorize_subject_scope(term(), map(), [String.t()], [String.t()]) ::
+              {:ok, [String.t()]} | {:error, :invalid_scope | :invalid_target}
+
+  @optional_callbacks authorize_scope: 2, authorize_scope: 3, authorize_subject_scope: 4
 end

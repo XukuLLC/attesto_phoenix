@@ -80,7 +80,13 @@ defmodule AttestoPhoenix.NativeAppLoopbackE2ETest do
     use Plug.Builder
 
     plug :fetch_query
-    plug Plug.Parsers, parsers: [:urlencoded, :json], pass: ["*/*"], json_decoder: JSON
+
+    plug Plug.Parsers,
+      parsers: [:urlencoded, :json],
+      pass: ["*/*"],
+      body_reader: {AttestoPhoenix.DuplicateParameterGuard, :read_body, []},
+      json_decoder: JSON
+
     plug PutConfig
     plug Router
 

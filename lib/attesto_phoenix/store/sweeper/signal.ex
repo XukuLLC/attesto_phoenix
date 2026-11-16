@@ -349,9 +349,9 @@ defmodule AttestoPhoenix.Store.Sweeper.Signal do
         )
 
         Logger.error(
-          "AttestoPhoenix: sweeper lifecycle monitor is unavailable; " <>
-            "cleanup supervision could not be verified for #{inspect(repo)} " <>
-            "(schema_prefix: #{inspect(prefix)})."
+          "AttestoPhoenix: sweeper lifecycle monitor is unavailable; cleanup supervision could not be verified",
+          repo: repo,
+          schema_prefix: prefix
         )
 
         :emitted
@@ -366,8 +366,7 @@ defmodule AttestoPhoenix.Store.Sweeper.Signal do
     )
 
     Logger.error(
-      "AttestoPhoenix: missing-sweeper signal capacity is exhausted; " <>
-        "additional unmonitored cleanup targets may be suppressed temporarily."
+      "AttestoPhoenix: missing-sweeper signal capacity is exhausted; additional unmonitored cleanup targets may be suppressed temporarily."
     )
 
     :emitted

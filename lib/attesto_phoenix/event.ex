@@ -66,7 +66,14 @@ defmodule AttestoPhoenix.Event do
     request, reported to the client as `access_denied` (RFC 6749 §4.1.2.1).
   * `:authorization_failed` - an authorization request was rejected before a
     code was issued (RFC 6749 §4.1.2.1), whether reported as a direct error
-    page or by redirect.
+    page or by redirect, including parameter/body-reader refusals and consent
+    denial. Exactly one is emitted per refused authorization request.
+    `:result` is the OAuth error-code string. `:client_id` is included only
+    after a successful registry lookup, never for an ambiguous client id.
+    `:metadata` contains `:client_ip`, a fixed `:reason` atom, and
+    `:repeated_parameters` (names only; an empty list for other refusals).
+    No state, codes, PKCE values, scope, or other request values are included.
+    The separate `:authorization_denied` event still records consent denial.
   * `:token_revoked` - a previously issued token was revoked (RFC 7009).
   * `:refresh_issued` - an initial refresh token was issued alongside an
     access token at the token endpoint (RFC 6749 §5.1, §6). Distinct from

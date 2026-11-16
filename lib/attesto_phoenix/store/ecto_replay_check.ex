@@ -25,7 +25,7 @@ defmodule AttestoPhoenix.Store.EctoReplayCheck do
   replayable once per node behind a load balancer. A multi-node deployment
   MUST therefore use a shared store such as this one. A single-node host
   may instead wire `Attesto.DPoP.ReplayCache` directly and skip the
-  database round-trip.
+  database round-trip, supervising `{Attesto.DPoP.ReplayCache, single_node?: true}`.
 
   ## Atomic record-and-check
 

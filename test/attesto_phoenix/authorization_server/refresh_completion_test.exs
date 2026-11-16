@@ -235,12 +235,20 @@ defmodule AttestoPhoenix.AuthorizationServer.RefreshCompletionTest do
     config = config(refresh_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_grant}, _events} =
-                 issue(config, refresh_request(config, ctx.refresh_token))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_grant}, _events} =
+                   issue(config, refresh_request(config, ctx.refresh_token))
+        end
+      )
 
-    assert log =~ "refresh completion callback returned an error after the continuation succeeded"
+    assert log =~ "callback substituted a result after the continuation succeeded"
+    assert log =~ "callback=refresh completion callback"
+    assert log =~ "action=returned an error"
     refute log =~ ctx.refresh_token
     assert generations(ctx.family_id) == [0]
 
@@ -258,11 +266,17 @@ defmodule AttestoPhoenix.AuthorizationServer.RefreshCompletionTest do
 
     config = config(refresh_completion: callback)
 
-    capture_log(fn ->
-      assert_raise RuntimeError, "host failure after rotation", fn ->
-        Token.issue(config, refresh_request(config, ctx.refresh_token))
+    capture_log(
+      [
+        format: "$message $metadata\n",
+        metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+      ],
+      fn ->
+        assert_raise RuntimeError, "host failure after rotation", fn ->
+          Token.issue(config, refresh_request(config, ctx.refresh_token))
+        end
       end
-    end)
+    )
 
     assert generations(ctx.family_id) == [0]
 
@@ -282,13 +296,20 @@ defmodule AttestoPhoenix.AuthorizationServer.RefreshCompletionTest do
     config = config(refresh_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:ok, response, _events} = Token.issue(config, refresh_request(config, ctx.refresh_token))
-        assert is_binary(response.refresh_token)
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:ok, response, _events} = Token.issue(config, refresh_request(config, ctx.refresh_token))
+          assert is_binary(response.refresh_token)
+        end
+      )
 
     assert_receive {:second, {:error, %OAuthError{error: :invalid_request}}}
-    assert log =~ "refresh continuation was invoked more than once"
+    assert log =~ "continuation was invoked more than once"
+    assert log =~ "continuation=refresh continuation"
     assert generations(ctx.family_id) == [0, 1]
   end
 
@@ -297,12 +318,19 @@ defmodule AttestoPhoenix.AuthorizationServer.RefreshCompletionTest do
     config = config(refresh_completion: callback)
 
     log =
-      capture_log(fn ->
-        assert {:error, %OAuthError{error: :invalid_request}, _events} =
-                 issue(config, refresh_request(config, ctx.refresh_token))
-      end)
+      capture_log(
+        [
+          format: "$message $metadata\n",
+          metadata: [:callback, :consequence, :action, :termination, :work, :continuation, :detail]
+        ],
+        fn ->
+          assert {:error, %OAuthError{error: :invalid_request}, _events} =
+                   issue(config, refresh_request(config, ctx.refresh_token))
+        end
+      )
 
-    assert log =~ "refresh completion callback returned without invoking the continuation"
+    assert log =~ "callback returned without invoking the continuation"
+    assert log =~ "callback=refresh completion callback"
     assert generations(ctx.family_id) == [0]
 
     plain = config()

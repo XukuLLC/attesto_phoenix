@@ -6,6 +6,59 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.22.0] - 2026-11-15
+
+Requires `attesto >= 2.26.0 and < 3.0.0`. The README section "Upgrading to 4.22" lists what a host changes.
+
+### Breaking
+
+- A protocol request with a form or JSON body is refused unless
+  `AttestoPhoenix.DuplicateParameterGuard.read_body/2` read it as the
+  endpoint's `Plug.Parsers` body reader, and a `multipart` body on a protocol
+  endpoint is always refused. The `:oauth_body_guard` option is removed and
+  configuration that sets it raises at boot. Until now a host without the
+  reader processed a `POST` carrying `client_id` twice with one of the two
+  values. A test that passes a map of parameters to `Phoenix.ConnTest.post/3`
+  is refused as well; send an encoded body with its content type.
+- A `POST` to the authorization endpoint with any query string is refused
+  before the action runs. Until now its query and body were merged.
+- `AttestoPhoenix.Interaction.decide/4` requires an `Origin` header naming the
+  configured issuer's origin. An absent header, `Origin: null`, and the origin
+  the request reached when it is not the issuer's are refused with
+  `{:error, :cross_origin}`. A consent page that sends
+  `Referrer-Policy: no-referrer` changes it to
+  `Referrer-Policy: strict-origin`; with `no-referrer` the browser sends
+  `Origin: null`. The `Sec-Fetch-Site` rule is unchanged.
+- `:authorization_failed` is emitted once for every refused authorization
+  request, including the parameter checks ahead of the action and consent
+  denial, which still emits `:authorization_denied` too. `:result` is always
+  the OAuth error code as a string, where some refusals carried an atom.
+  `:client_id` is set only when the registry knows the client. `:metadata`
+  carries `:client_ip`, a fixed `:reason` atom and `:repeated_parameters`,
+  the names of repeated parameters without their values.
+- Every `Logger.error` message is a fixed string. What varied in the message
+  (a failure reason, a callback's name, the consequence) is Logger metadata;
+  the README lists the messages and the formatter keys that print the detail.
+- With Attesto 2.26, `Attesto.DPoP.ReplayCache` starts only as
+  `{Attesto.DPoP.ReplayCache, single_node?: true}`. A host that relies on the
+  default replay check for DPoP proofs or jwt-bearer assertions changes its
+  supervision tree, or sets `:replay_check` to a shared check such as
+  `AttestoPhoenix.Store.EctoReplayCheck.check_and_record/2` on every node.
+
+### Added
+
+- `:authorize_subject_scope` on `AttestoPhoenix.Config`, and the matching
+  optional `AttestoPhoenix.ScopePolicy` callback, runs after the resource
+  owner is authenticated on every authorization pass, resume included, with
+  the client, the subject, the scope and the resources. It returns a narrowed
+  scope or refuses with `:invalid_scope` or `:invalid_target`. Consent sees
+  the narrowed scope and the code is bound to it.
+- `AttestoPhoenix.Interaction.same_origin_request?/1` applies the decision's
+  origin rule to any request, for a host's logout-confirmation handler.
+- The README shows `:authorize_scope` requiring exactly one resource for a
+  dynamically registered public client. The callback receives an empty list
+  when the request named no resource.
+
 ## [4.21.0] - 2026-11-15
 
 ### Added

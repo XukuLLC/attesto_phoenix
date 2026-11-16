@@ -50,7 +50,7 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
     on_exit(fn -> :telemetry.detach(id) end)
   end
 
-  defp controller_config(policy) do
+  defp controller_config do
     Config.new(
       issuer: "https://issuer.example",
       keystore: __MODULE__.Keystore,
@@ -58,8 +58,7 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
       audience: "https://api.example",
       load_client: fn _ -> {:error, :not_found} end,
       verify_client_secret: fn _, _ -> false end,
-      load_principal: fn _ -> {:error, :not_found} end,
-      oauth_body_guard: policy
+      load_principal: fn _ -> {:error, :not_found} end
     )
   end
 
@@ -112,16 +111,16 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
     assert_receive {:missing_analysis, %{count: 1}, %{format: :json, method: "POST"}}
   end
 
-  test "configured JSON reader records analysis for observation and required controller policies" do
+  test "configured JSON reader records the mandatory controller analysis" do
     capture_missing_analysis()
     metadata = %{"client_name" => "example", "metadata" => %{"labels" => ["first", "second"]}}
 
-    for policy <- [:observe, :required] do
+    for _attempt <- 1..2 do
       conn =
         Plug.Test.conn(:post, "/oauth/register", JSON.encode!(metadata))
         |> put_req_header("content-type", "application/json")
         |> parse_json()
-        |> put_private(:attesto_phoenix_config, controller_config(policy))
+        |> put_private(:attesto_phoenix_config, controller_config())
 
       assert conn.body_params == metadata
       assert conn.private[:attesto_phoenix_duplicate_parameter_analysis] == %{format: :json}
@@ -184,14 +183,18 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
         Plug.Test.conn(:post, "/oauth/token", body)
         |> put_req_header("content-type", content_type)
         |> parser.({Plug.Conn, :read_body, []})
-        |> put_private(:attesto_phoenix_config, controller_config(:required))
+        |> put_private(:attesto_phoenix_config, controller_config())
 
       error = assert_raise WrapperError, fn -> ProbeController.call(conn, :show) end
-      assert %Plug.BadRequestError{message: "request body validation is unavailable"} = error.reason
+
+      assert %Plug.BadRequestError{
+               message:
+                 "request body validation is unavailable; install AttestoPhoenix.DuplicateParameterGuard.read_body/2 as the endpoint body reader"
+             } = error.reason
     end
   end
 
-  test "controller observation allows benign missing analysis and required policy accepts the reader" do
+  test "controller refuses missing analysis and accepts the reader" do
     for {policy, reader} <- [
           {:observe, {Plug.Conn, :read_body, []}},
           {:required, {DuplicateParameterGuard, :read_body, []}}
@@ -200,9 +203,14 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
         Plug.Test.conn(:post, "/oauth/token", "grant_type=client_credentials")
         |> put_req_header("content-type", "application/x-www-form-urlencoded")
         |> parse_form(reader)
-        |> put_private(:attesto_phoenix_config, controller_config(policy))
+        |> put_private(:attesto_phoenix_config, controller_config())
 
-      assert %{status: 204} = ProbeController.call(conn, :show)
+      if policy == :observe do
+        error = assert_raise WrapperError, fn -> ProbeController.call(conn, :show) end
+        assert %Plug.BadRequestError{} = error.reason
+      else
+        assert %{status: 204} = ProbeController.call(conn, :show)
+      end
     end
   end
 
@@ -232,12 +240,17 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
       Plug.Test.conn(:post, "/oauth/token", body)
       |> put_req_header("content-type", "multipart/form-data; boundary=request-boundary")
       |> Plug.Parsers.call(parser)
-      |> put_private(:attesto_phoenix_config, controller_config(:required))
+      |> put_private(:attesto_phoenix_config, controller_config())
 
     assert conn.body_params == %{"client_id" => "second"}
     refute Map.has_key?(conn.private, :attesto_phoenix_duplicate_parameter_analysis)
     error = assert_raise WrapperError, fn -> ProbeController.call(conn, :show) end
-    assert %Plug.BadRequestError{message: "request body validation is unavailable"} = error.reason
+
+    assert %Plug.BadRequestError{
+             message:
+               "request body validation is unavailable; install AttestoPhoenix.DuplicateParameterGuard.read_body/2 as the endpoint body reader"
+           } = error.reason
+
     assert_receive {:missing_analysis, %{count: 1}, %{format: :multipart, method: "POST"}}
   end
 
@@ -257,7 +270,7 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
       Plug.Test.conn(:post, "/oauth/token?client_id=first&client_id=second", "grant_type=client_credentials")
       |> put_req_header("content-type", "application/x-www-form-urlencoded")
       |> parse_form({Plug.Conn, :read_body, []})
-      |> put_private(:attesto_phoenix_config, controller_config(:required))
+      |> put_private(:attesto_phoenix_config, controller_config())
 
     error = assert_raise WrapperError, fn -> ProbeController.call(conn, :show) end
     assert %Plug.BadRequestError{message: "request contains an ambiguous parameter"} = error.reason
@@ -484,6 +497,21 @@ defmodule AttestoPhoenix.DuplicateParameterGuardTest do
     assert guarded.body_params["resource"] == [a, b]
     assert guarded.params["resource"] == [a, b]
     refute Map.has_key?(guarded.private, :attesto_phoenix_duplicate_parameter_analysis)
+  end
+
+  test "collects repeated JSON names across nested objects and arrays" do
+    conn =
+      Plug.Test.conn(
+        :post,
+        "/oauth/register",
+        ~s({"client_id":"a","client_id":"b","nested":[{"scope":"x","scope":"y"}],"state":"x","state":"y"})
+      )
+      |> put_req_header("content-type", "application/json")
+      |> parse_json()
+
+    assert {:error, {:duplicate_parameter, _}, cleaned} = DuplicateParameterGuard.validate_and_forget(conn)
+    assert cleaned.private.attesto_phoenix_repeated_parameters == ["client_id", "scope", "state"]
+    refute Map.has_key?(cleaned.private, :attesto_phoenix_duplicate_parameter_analysis)
   end
 
   test "keeps distinct scalar parameters unchanged" do

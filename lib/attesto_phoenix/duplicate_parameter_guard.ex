@@ -37,13 +37,13 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
         [{MyApp.BodyReader, :read_body, []}]
       }
 
-  Protocol form or JSON requests without the reader emit
+  Protocol form or JSON requests without the reader are refused. The error
+  names `AttestoPhoenix.DuplicateParameterGuard.read_body/2` to install.
+  Missing analysis also emits
   `[:attesto_phoenix, :oauth_body_guard, :missing_analysis]` telemetry with a
-  count and the HTTP method/body format. Configure `oauth_body_guard: :required`
-  to reject missing analysis after installing the reader on every endpoint.
-  Multipart requests also emit this event and are rejected under the required
-  policy: Plug's multipart parser bypasses the body reader, so it cannot
-  establish duplicate analysis. Host upload routes can retain multipart parsing.
+  count and the HTTP method/body format. Multipart protocol requests are
+  refused because Plug's multipart parser bypasses the body reader. Host
+  upload routes can retain multipart parsing.
   """
 
   alias Plug.Conn
@@ -109,7 +109,27 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
          :ok <- reject_scalar_duplicates(query_pairs ++ body_pairs) do
       {:ok, preserve_repeatable_parameters(conn, query_pairs, body_pairs)}
     else
-      {:error, reason} -> {:error, reason, conn}
+      {:error, reason} ->
+        names = repeated_parameter_names(conn, body_analysis)
+        {:error, reason, Conn.put_private(conn, :attesto_phoenix_repeated_parameters, names)}
+    end
+  end
+
+  defp repeated_parameter_names(conn, analysis) do
+    body_duplicates = if is_map(analysis), do: Map.get(analysis, :duplicates, []), else: []
+
+    with {:ok, query} <- decode_pairs(conn.query_string),
+         {:ok, body} <- body_pairs(conn, analysis) do
+      (query ++ body)
+      |> Enum.map(& &1.key)
+      |> Enum.frequencies()
+      |> Enum.filter(fn {key, count} -> count > 1 and not MapSet.member?(@repeatable_roots, key) end)
+      |> Enum.map(&elem(&1, 0))
+      |> Kernel.++(body_duplicates)
+      |> Enum.uniq()
+      |> Enum.sort()
+    else
+      _ -> body_duplicates
     end
   end
 
@@ -216,33 +236,30 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
   defp inspect_body(nil, _body), do: {:ok, nil}
 
   defp inspect_urlencoded_body(body) do
-    body
-    |> URI.query_decoder()
-    |> Enum.reduce_while(
-      {:ok, MapSet.new(), MapSet.new(), []},
-      fn {encoded_key, value}, {:ok, keys, scalar_keys, resources} ->
-        key = parameter_root(encoded_key)
-        keys = MapSet.put(keys, key)
+    pairs = URI.query_decoder(body) |> Enum.map(fn {key, value} -> {parameter_root(key), value} end)
 
-        cond do
-          MapSet.member?(@repeatable_roots, key) ->
-            {:cont, {:ok, keys, scalar_keys, [value | resources]}}
+    duplicates =
+      pairs
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.frequencies()
+      |> Enum.filter(fn {key, count} -> count > 1 and not MapSet.member?(@repeatable_roots, key) end)
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.sort()
 
-          MapSet.member?(scalar_keys, key) ->
-            {:halt, {:error, {:duplicate_parameter, key}}}
+    analysis = %{
+      format: :urlencoded,
+      keys: MapSet.new(pairs, &elem(&1, 0)),
+      resources: for({"resource", value} <- pairs, do: value),
+      duplicates: duplicates
+    }
 
-          true ->
-            {:cont, {:ok, keys, MapSet.put(scalar_keys, key), resources}}
-        end
+    analysis =
+      case duplicates do
+        [] -> analysis
+        [first | _] -> Map.put(analysis, :error, {:duplicate_parameter, first})
       end
-    )
-    |> case do
-      {:ok, keys, _scalar_keys, resources} ->
-        {:ok, %{format: :urlencoded, keys: keys, resources: Enum.reverse(resources)}}
 
-      {:error, _reason} = error ->
-        error
-    end
+    {:ok, analysis}
   rescue
     ArgumentError -> {:error, :invalid_parameter_encoding}
   end
@@ -331,19 +348,25 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
 
   defp reject_json_duplicates(body) do
     decoders = [
-      array_start: fn _old_acc -> nil end,
+      array_start: fn _old_acc -> MapSet.new() end,
       array_push: &merge_json_duplicate/2,
-      array_finish: fn duplicate, old_acc -> {duplicate, old_acc} end,
-      object_start: fn _old_acc -> {MapSet.new(), nil} end,
+      array_finish: fn duplicates, old_acc -> {{:duplicates, duplicates}, old_acc} end,
+      object_start: fn _old_acc -> {MapSet.new(), MapSet.new()} end,
       object_push: &inspect_json_object_member/3,
-      object_finish: fn {_keys, duplicate}, old_acc -> {duplicate, old_acc} end,
+      object_finish: fn {_keys, duplicates}, old_acc -> {{:duplicates, duplicates}, old_acc} end,
       float: fn _encoded -> nil end,
       integer: fn _encoded -> nil end
     ]
 
     case JSON.decode(body, nil, decoders) do
-      {{:duplicate_parameter, _key} = reason, nil, ""} ->
-        {:error, reason}
+      {{:duplicates, duplicates}, nil, ""} ->
+        case Enum.sort(duplicates) do
+          [] ->
+            {:ok, %{format: :json}}
+
+          [first | _] = names ->
+            {:ok, %{format: :json, error: {:duplicate_parameter, first}, duplicates: names}}
+        end
 
       {_decoded, nil, ""} ->
         {:ok, %{format: :json}}
@@ -361,26 +384,14 @@ defmodule AttestoPhoenix.DuplicateParameterGuard do
     ArgumentError -> {:ok, %{format: :json}}
   end
 
-  defp inspect_json_object_member(_key, _value, {keys, duplicate}) when not is_nil(duplicate) do
-    {keys, duplicate}
+  defp inspect_json_object_member(key, value, {keys, duplicates}) do
+    duplicates = merge_json_duplicate(value, duplicates)
+    duplicates = if MapSet.member?(keys, key), do: MapSet.put(duplicates, key), else: duplicates
+    {MapSet.put(keys, key), duplicates}
   end
 
-  defp inspect_json_object_member(key, value, {keys, nil}) do
-    cond do
-      MapSet.member?(keys, key) ->
-        {keys, {:duplicate_parameter, key}}
-
-      match?({:duplicate_parameter, _key}, value) ->
-        {keys, value}
-
-      true ->
-        {MapSet.put(keys, key), nil}
-    end
-  end
-
-  defp merge_json_duplicate(_value, {:duplicate_parameter, _key} = duplicate), do: duplicate
-  defp merge_json_duplicate({:duplicate_parameter, _key} = duplicate, nil), do: duplicate
-  defp merge_json_duplicate(_value, nil), do: nil
+  defp merge_json_duplicate({:duplicates, nested}, duplicates), do: MapSet.union(nested, duplicates)
+  defp merge_json_duplicate(_value, duplicates), do: duplicates
 
   defp reject_scalar_duplicates(pairs) do
     pairs

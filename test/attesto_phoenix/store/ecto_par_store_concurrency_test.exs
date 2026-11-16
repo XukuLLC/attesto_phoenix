@@ -28,6 +28,7 @@ defmodule AttestoPhoenix.Store.EctoPARStoreConcurrencyTest do
     conn =
       :get
       |> Plug.Test.conn("/oauth/authorize?client_id=client")
+      |> Plug.Conn.put_req_header("origin", "https://issuer.example")
       |> Plug.Conn.put_private(:attesto_phoenix_config, config)
 
     request = %Attesto.AuthorizationRequest{
