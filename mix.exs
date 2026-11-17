@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.23.0"
+  @version "4.23.1"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
   @attesto_requirement ">= 2.27.0 and < 3.0.0"
@@ -142,7 +142,7 @@ defmodule AttestoPhoenix.MixProject do
       {:open_api_spex, "~> 3.0", optional: true},
       # Plug behaviours for the protected-resource plugs (also a Phoenix
       # transitive dependency).
-      {:plug, "~> 1.16.6 or ~> 1.17.4 or ~> 1.18.5 or ~> 1.19.5 or >= 1.20.3 and < 2.0.0"},
+      {:plug, ">= 1.20.4 and < 2.0.0"},
       # `mix attesto_phoenix.install` (Mix.Tasks.AttestoPhoenix.Install) is an
       # upgrade-aware Igniter installer: it inspects the host's config and router
       # and applies idempotent patches. Declared `optional: true` so the runtime
