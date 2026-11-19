@@ -21,6 +21,7 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
 
   import ExUnit.CaptureLog
 
+  alias AttestoPhoenix.ClientIdMetadata
   alias AttestoPhoenix.ClientIdMetadata.Cache.ETS
   alias AttestoPhoenix.ClientIdMetadata.FlowControl
   alias AttestoPhoenix.ClientIdMetadata.Resolver
@@ -155,6 +156,47 @@ defmodule AttestoPhoenix.ClientIdMetadata.ResolverTest do
   end
 
   describe "resolve/2" do
+    @tag timeout: 2_000
+    test "refuses oversized CIMD hosts before IDNA or fetch" do
+      config = resolver_config()
+      assert Config.client_id_metadata_enabled?(config)
+      Code.ensure_loaded!(:idna)
+
+      trace = :trace.session_create(:oversized_cimd_hosts, self(), [])
+
+      try do
+        assert :trace.function(trace, {:idna, :encode, 2}, true, [:global]) == 1
+        assert :trace.function(trace, {StubFetcher, :fetch, 2}, true, [:global]) == 1
+
+        task =
+          Task.async(fn ->
+            receive do
+              :resolve ->
+                for host <- ["xn--" <> String.duplicate("a", 99_996), String.duplicate("ü", 100_000)] do
+                  assert {:error, {:invalid_client_id, :too_long}} =
+                           ClientIdMetadata.resolve("https://#{host}/client.json", config)
+                end
+
+                host = String.duplicate("a", 64) <> ".example"
+                client_id = "https://#{host}/client.json"
+                assert ClientIdMetadata.cimd_client_id?(client_id, config)
+                assert {:error, {:blocked_host, ^host}} = ClientIdMetadata.resolve(client_id, config)
+            end
+          end)
+
+        assert :trace.process(trace, task.pid, true, [:call, :arity, :set_on_spawn]) == 1
+        send(task.pid, :resolve)
+        Task.await(task)
+
+        delivered = :trace.delivered(trace, :all)
+        assert_receive {:trace_delivered, :all, ^delivered}
+        refute_received {:trace, _, :call, {:idna, :encode, 2}}
+        refute_received {:trace, _, :call, {StubFetcher, :fetch, 2}}
+      after
+        :trace.session_destroy(trace)
+      end
+    end
+
     test "rejects an overlong client_id before cache or network access" do
       client_id = "https://app.example/" <> String.duplicate("a", 2_048)
       FaultCache.script({:raise, "cache must not run"})

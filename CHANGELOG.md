@@ -6,6 +6,19 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.24.0] - 2026-11-19
+
+### Security
+
+- Requires `idna ~> 8.0`. Before idna 8.0.0, an overlong Punycode label was decoded before its length was checked, causing super-linear CPU use. [EEF-CVE-2026-117678](https://osv.dev/vulnerability/EEF-CVE-2026-117678), [CVE-2026-117678](https://cna.erlef.org/cves/CVE-2026-117678.html).
+- DNS hosts from CIMD `client_id`, logo and JWKS URLs, fetch redirects, and redirect URI registration are limited to 253 code points per name and 63 per label before IDNA encoding. The encoded name and its labels must also fit the DNS octet limits.
+
+### Breaking
+
+- If you use hackney 1.x, upgrade to hackney 4.11.0 or a later 4.x release that supports idna 8. Hackney 1.x pins `idna ~> 6.1.0`.
+- Invalid A-labels such as `xn--abc-`, which decodes to plain ASCII, are now refused. [RFC 5890 §2.3.2.1](https://www.rfc-editor.org/rfc/rfc5890.html#section-2.3.2.1).
+- Unicode labels such as `¡` and `≠` are now accepted under UTS #46 compatibility processing. [UTS #46 §4.1](https://www.unicode.org/reports/tr46/#Validity_Criteria).
+
 ## [4.23.1] - 2026-11-17
 
 ### Security

@@ -21,6 +21,13 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicyTest do
     end
   end
 
+  test "accepts Unicode symbols valid under UTS #46 compatibility processing" do
+    for {host, canonical} <- [{"¡.example", "xn--7a.example"}, {"≠.example", "xn--1ch.example"}] do
+      assert HostPolicy.canonicalize(host) == {:ok, canonical}
+      assert HostPolicy.canonicalize(canonical) == {:ok, canonical}
+    end
+  end
+
   test "invalid labels and malformed IDNA fail closed" do
     for host <- [
           "",
@@ -33,6 +40,8 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicyTest do
           "example。｡",
           "a..example",
           "xn--.example",
+          "xn--abc-.example",
+          "_dmarc.example",
           "a_b.example",
           "-label.example",
           "label-.example",
@@ -44,6 +53,39 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicyTest do
       assert HostPolicy.canonicalize(host) == {:error, :invalid_host}
       assert HostPolicy.check(host, []) == {:error, :blocked_host}
       assert HostPolicy.check("valid.example", blocked_hosts: [host]) == {:error, :blocked_host}
+    end
+  end
+
+  @tag timeout: 2_000
+  test "refuses 100,000-code-point labels" do
+    for host <- ["xn--" <> String.duplicate("a", 99_996), String.duplicate("ü", 100_000)] do
+      assert HostPolicy.canonicalize(host) == {:error, :invalid_host}
+      assert HostPolicy.check(host, []) == {:error, :blocked_host}
+    end
+  end
+
+  test "bounds labels to 63 code points before UTS #46 mapping" do
+    host = String.duplicate("ａ", 63)
+    assert HostPolicy.canonicalize(host) == {:ok, String.duplicate("a", 63)}
+    assert HostPolicy.check(host, []) == :ok
+
+    for overlong <- [host <> "ａ", host <> "\u034F", String.duplicate("a", 64) <> ".example"] do
+      assert HostPolicy.canonicalize(overlong) == {:error, :invalid_host}
+      assert HostPolicy.check(overlong, []) == {:error, :blocked_host}
+      assert HostPolicy.check("valid.example", blocked_hosts: [overlong]) == {:error, :blocked_host}
+    end
+  end
+
+  test "bounds hosts to 253 code points after normalizing separators and the root dot" do
+    labels = for size <- [63, 63, 63, 61], do: String.duplicate("ａ", size)
+    host = Enum.join(labels, "。")
+    canonical = [63, 63, 63, 61] |> Enum.map_join(".", &String.duplicate("a", &1))
+    assert HostPolicy.canonicalize(host <> "。") == {:ok, canonical}
+    assert HostPolicy.check(host <> "。", []) == :ok
+
+    for overlong <- [host <> "ａ", host <> "\u034F", Enum.join(List.duplicate(String.duplicate("a", 63), 5), ".")] do
+      assert HostPolicy.canonicalize(overlong) == {:error, :invalid_host}
+      assert HostPolicy.check(overlong, []) == {:error, :blocked_host}
     end
   end
 

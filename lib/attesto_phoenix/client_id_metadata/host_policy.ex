@@ -49,16 +49,31 @@ defmodule AttestoPhoenix.ClientIdMetadata.HostPolicy do
   defdelegate authority(uri), to: Attesto.OutboundTarget
 
   defp canonicalize_dns(host) do
-    labels =
+    normalized =
       host
       |> String.replace(~r/[。．｡]/u, ".")
       |> String.replace_suffix(".", "")
-      |> String.split(".")
 
-    if Enum.any?(labels, &(&1 == "")),
-      do: {:error, :invalid_host},
-      else: encode_dns(host, length(labels))
+    labels = String.split(normalized, ".")
+
+    cond do
+      "" in labels ->
+        {:error, :invalid_host}
+
+      # Bound the input before IDNA encoding (EEF-CVE-2026-117678: idna before
+      # 8.0.0 decoded Punycode before checking a label's length). An A-label
+      # fits in 63 octets, and Punycode emits at least one character per code
+      # point it encodes, so a longer label cannot be valid. Names that need
+      # UTS #46 to delete ignored code points to fit are refused.
+      code_point_count(normalized) > 253 or Enum.any?(labels, &(code_point_count(&1) > 63)) ->
+        {:error, :invalid_host}
+
+      true ->
+        encode_dns(host, length(labels))
+    end
   end
+
+  defp code_point_count(value), do: length(String.to_charlist(value))
 
   defp encode_dns(host, label_count) do
     canonical =

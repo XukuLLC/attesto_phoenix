@@ -1,6 +1,15 @@
 defmodule AttestoPhoenix.DependencyRequirementsTest do
   use ExUnit.Case, async: false
 
+  test "idna requires the fixed 8.x series" do
+    {:idna, requirement} = dependency!(:idna)
+
+    assert Version.match?("8.0.0", requirement)
+    assert Version.match?("8.99.0", requirement)
+    refute Version.match?("7.1.0", requirement)
+    refute Version.match?("9.0.0", requirement)
+  end
+
   test "Attesto and test-only Postgrex reject their affected predecessors" do
     case dependency!(:attesto) do
       {:attesto, requirement} when is_binary(requirement) ->

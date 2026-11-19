@@ -22,7 +22,7 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.23.1"
+  @version "4.24.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
   @attesto_requirement ">= 2.27.0 and < 3.0.0"
@@ -120,7 +120,7 @@ defmodule AttestoPhoenix.MixProject do
       # OpenIDDiscovery, the store behaviours, and the base plugs.
       attesto_dep(),
       # Canonical DNS policy and resolution names (IDNA 2008 / UTS #46).
-      {:idna, "~> 6.1.0 or ~> 7.1"},
+      {:idna, "~> 8.0"},
       # ISO 18013-5 mdoc encoding for the mso_mdoc credential issuance path.
       {:cbor, "~> 1.0", optional: true},
       # Ecto-backed CodeStore/RefreshStore/NonceStore/ReplayCheck + the migration
