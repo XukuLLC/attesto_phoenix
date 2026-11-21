@@ -95,8 +95,9 @@ defmodule AttestoPhoenix.ClientAuthentication do
     * `:assertion_signing_algs` - the trusted JOSE algorithm allowlist for the
       assertion.
     * `:assertion_enforce_fapi_alg_policy` - whether trusted assertion keys must
-      also satisfy FAPI's RSA modulus and Edwards-curve restrictions. `nil`
-      preserves the explicit-algorithm behavior of older policy structs.
+      also satisfy FAPI's algorithm and Edwards-curve restrictions. RSA keys
+      require at least 2048 bits under every policy. `nil` preserves the
+      explicit-algorithm behavior of older policy structs.
     * `:allowed_methods` - the authentication methods admitted by the endpoint.
     * `:basic_precedence` - whether a Basic header wins over body credentials.
     * `:honor_configured_methods` - whether the endpoint also applies the

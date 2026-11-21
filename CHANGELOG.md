@@ -6,6 +6,14 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.25.0] - 2026-11-20
+
+Requires `attesto >= 2.30.0 and < 3.0.0`.
+
+### Breaking
+
+- The server refuses RSA keys under 2048 bits and certificates with unsupported keys or signatures, duplicate extension OIDs, or `cA` set to `TRUE` on a leaf other than the selected trust anchor, including under an explicit non-FAPI or broader algorithm policy (RFC 7518 §3.3, RFC 5280). Hosts see `invalid_client` for refused client assertions and `invalid_request` for refused signed CIBA requests or credential presentations.
+
 ## [4.24.0] - 2026-11-19
 
 ### Security

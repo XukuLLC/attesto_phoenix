@@ -152,12 +152,12 @@ Add `attesto_phoenix` to your dependencies:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.24"}
+    {:attesto_phoenix, "~> 4.25"}
   ]
 end
 ```
 
-Requires `attesto >= 2.27.0 and < 3.0.0`.
+Requires `attesto >= 2.30.0 and < 3.0.0`.
 
 For `prompt=login`, the authentication callback must return `auth_time` at or
 later than `auth_opts.parked_at` on an interaction resume. Fresh requests allow
@@ -215,7 +215,7 @@ not a runtime dependency of this package:
 ```elixir
 def deps do
   [
-    {:attesto_phoenix, "~> 4.24"},
+    {:attesto_phoenix, "~> 4.25"},
     {:igniter, "~> 0.6", only: [:dev], runtime: false}
   ]
 end
@@ -1540,9 +1540,10 @@ applies the token endpoint's client-authentication rules, then stores the
 authorization request behind a one-time `request_uri`. Public-client requests
 remain subject to PKCE, redirect URI, and stored-request binding checks.
 
-When `:client_auth_signing_algs` is omitted, client assertions use Attesto's
-FAPI allowlist and enforce its key policy: RSA signatures require a modulus of
-at least 2048 bits, and legacy `EdDSA` is FAPI-compatible only over Ed25519.
+RSA client assertions require a modulus of at least 2048 bits under every
+algorithm policy (RFC 7518 §3.3). When `:client_auth_signing_algs` is omitted,
+client assertions use Attesto's FAPI allowlist. Under FAPI, legacy `EdDSA`
+requires an Ed25519 key.
 The default discovery metadata includes both legacy `EdDSA` and RFC 9864's
 exact `Ed25519` identifier. Supplying an explicit algorithm list selects a
 non-FAPI policy for compatibility; pair a narrowed FAPI list with
@@ -1595,11 +1596,11 @@ When `:request_object_policy` is configured, signed request objects are verified
 at PAR submission and re-verified at `/authorize`; verified request-object
 parameters are authoritative over unsigned request body/query values. Set
 `Attesto.RequestObject.Policy.fapi_message_signing/0` to enforce the FAPI 2.0
-Message Signing JAR profile. Request-object policies follow the same presence
-rule: an explicit `accepted_algs` list is non-FAPI unless
-`enforce_fapi_alg_policy` is `true`. The named FAPI policy sets it to `true`, so
-copying that policy and narrowing `accepted_algs` retains the RSA-strength and
-Edwards-curve gate.
+Message Signing JAR profile. RSA request-object signatures require a modulus of
+at least 2048 bits under every policy. An explicit `accepted_algs` list selects
+a non-FAPI policy unless `enforce_fapi_alg_policy` is `true`. The named FAPI
+policy sets it to `true`, so narrowing its `accepted_algs` list retains FAPI's
+algorithm and Edwards-curve restrictions.
 
 The authorization endpoint also emits JARM responses when the validated request
 uses `response_mode=jwt`, `query.jwt`, `fragment.jwt`, or `form_post.jwt`.
@@ -1720,8 +1721,12 @@ verifier_haip: true # default
 
 `:verifier_trusted_certificates` is a non-empty list of DER certificates;
 PEM is not accepted, matching `:verifier_x5c`. Malformed anchors, callbacks,
-and non-boolean HAIP values are rejected at boot. The optional policy accepts
-one argument, the validated leaf-first DER chain, and returns `:ok` or
+and non-boolean HAIP values are rejected at boot. Every certificate in the
+selected path, including the anchor, must use a supported key and signature
+and contain each extension OID at most once. RSA keys require at least 2048
+bits. A leaf with `cA` set to `TRUE` is eligible only as the selected anchor
+(RFC 5280). See `Attesto.X509.verify/2` for the supported keys and signatures.
+The optional policy accepts the validated leaf-first DER chain and returns `:ok` or
 `{:error, reason}`. Functions, `{module, function}`, and
 `{module, function, extra_args}` are supported. The policy is passed at
 verification time and is never stored in a presentation session.
@@ -1901,12 +1906,11 @@ flow the user approves out of band on their own phone, then collects the tokens
 at the token endpoint: in `poll` mode the client polls until the user approves,
 and in `ping` mode the AS calls the client's notification endpoint when the
 tokens are ready. Signed authentication requests follow the FAPI-CIBA profile.
-The default CIBA request algorithm list (`PS256` and `ES256`) retains the same
-FAPI key-strength checks. An explicit `ciba: [request_signing_algs: ...]` list
-is treated as non-FAPI unless paired with `enforce_fapi_alg_policy: true`; this
-lets a generic deployment opt into additional algorithms without weakening a
-narrowed FAPI policy accidentally. An enforced FAPI-CIBA list is limited to
-`PS256` and `ES256`, as required by the profile.
+RSA signatures on CIBA requests require a modulus of at least 2048 bits under
+every algorithm policy. The default FAPI-CIBA list is `PS256` and `ES256`.
+An explicit `ciba: [request_signing_algs: ...]` list selects a non-FAPI policy
+unless paired with `enforce_fapi_alg_policy: true`. An enforced FAPI-CIBA list
+is limited to `PS256` and `ES256`, as required by the profile.
 Because signed CIBA request JWTs carry replay-sensitive `jti` values, enabling
 the default signed-request policy also requires an explicit atomic
 `:replay_check`; the installer configures the cluster-safe Ecto implementation.

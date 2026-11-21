@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.24.0"
+  @version "4.25.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.27.0 and < 3.0.0"
+  @attesto_requirement ">= 2.30.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,12 +76,8 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # The 2.27.0 floor refuses a single-string authorization parameter of any
-  # other type. 2.26.0 added Attesto.DPoP.ReplayCache's :single_node? start
-  # option, which the default replay check's documentation names, and the
-  # log-message scanner the tests use. The outbound adapters call Attesto.PinnedHTTP's
-  # target-and-options entry points and the screened address list from
-  # Attesto.OutboundTarget.screen/2, in core since 2.24.0.
+  # Attesto 2.30.0 requires RSA moduli of at least 2048 bits for JWS verification
+  # and checks the key, signature, and extensions on each X.509 certificate.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 

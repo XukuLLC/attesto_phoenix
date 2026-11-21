@@ -670,7 +670,7 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
     end
 
     @tag registered_auth_method: :private_key_jwt
-    test "an explicit non-FAPI client-auth policy can accept a weak PS256 key" do
+    test "an explicit non-FAPI client-auth policy rejects a weak PS256 key" do
       client_key = JOSE.JWK.generate_key({:rsa, 1024})
       client_jwks = %{"keys" => [public_jwk(client_key, %{"alg" => "PS256"})]}
 
@@ -686,7 +686,8 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
           "client_assertion" => client_assertion(client_key, "confidential-1", %{}, "PS256")
         })
 
-      assert body(conn)["error"] == "unsupported_grant_type"
+      assert conn.status == 400
+      assert body(conn)["error"] == "invalid_client"
     end
 
     @tag registered_auth_method: :private_key_jwt

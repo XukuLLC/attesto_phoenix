@@ -637,7 +637,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
       end
     end
 
-    test "rejects weak PS256 by default and preserves an explicit non-FAPI opt-in" do
+    test "rejects weak PS256 under default, narrowed FAPI, and explicit non-FAPI policies" do
       jwk = JOSE.JWK.generate_key({:rsa, 1024})
       client = signing_client(jwk, "PS256")
       jwt = signed_request(jwk, signed_claims(), "PS256")
@@ -662,7 +662,7 @@ defmodule AttestoPhoenix.AuthorizationServer.BackchannelAuthenticationTest do
                  request
                )
 
-      assert {:ok, _ack} =
+      assert {:error, %OAuthError{error: :invalid_request}} =
                BackchannelAuthentication.request(
                  config(
                    ciba: [

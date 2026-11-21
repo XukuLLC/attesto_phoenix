@@ -1136,9 +1136,7 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
       {:ok, config: registered_method_config(config, :private_key_jwt)}
     end
 
-    test "the default FAPI policy rejects weak PS256 while an explicit non-FAPI policy can opt in", %{
-      config: config
-    } do
+    test "FAPI and explicit non-FAPI policies reject weak PS256", %{config: config} do
       key = JOSE.JWK.generate_key({:rsa, 1024})
       trusted = public_jwk(key, %{"alg" => "PS256"})
       config = %{config | client_jwks: fn @confidential -> %{"keys" => [trusted]} end}
@@ -1152,12 +1150,13 @@ defmodule AttestoPhoenix.ClientAuthenticationTest do
         )
       )
 
-      assert {:ok, %Result{method: :private_key_jwt}} =
-               authenticate([], params, config,
-                 allow_public: false,
-                 assertion_signing_algs: ["PS256"],
-                 assertion_enforce_fapi_alg_policy: false
-               )
+      assert_generic_invalid_client(
+        authenticate([], params, config,
+          allow_public: false,
+          assertion_signing_algs: ["PS256"],
+          assertion_enforce_fapi_alg_policy: false
+        )
+      )
     end
 
     test "the default policy accepts legacy and exact Ed25519 identifiers", %{config: config} do

@@ -934,8 +934,9 @@ defmodule AttestoPhoenix.Config do
       `[:attesto_phoenix, :client_authentication, :legacy_assertion_audience]`.
       Assertions must carry a single scalar `aud` string; JSON arrays (including
       single-member arrays) are rejected.
-    * `:client_auth_enforce_fapi_alg_policy` - additionally enforce FAPI's RSA
-      modulus and Edwards-curve restrictions for `private_key_jwt`. When unset,
+    * `:client_auth_enforce_fapi_alg_policy` - enforce FAPI's algorithm and
+      Edwards-curve restrictions for `private_key_jwt`. RSA keys require at least
+      2048 bits under every policy. When unset,
       this defaults to `true` if `:client_auth_signing_algs` is omitted and to
       `false` if the host supplies an explicit algorithm list. Set it to `true`
       when narrowing the FAPI allowlist; an enforced list must remain a subset
@@ -949,8 +950,9 @@ defmodule AttestoPhoenix.Config do
       enforced both at the PAR endpoint and at `/authorize`. Supplying an
       explicit `accepted_algs` list selects non-FAPI key compatibility unless
       the policy's `enforce_fapi_alg_policy` field is `true`; the named FAPI
-      policy sets that field explicitly, so narrowing its list keeps the key
-      gate enabled.
+      policy sets that field explicitly, so narrowing its list retains FAPI's
+      algorithm and Edwards-curve restrictions. RSA keys require at least 2048
+      bits under every policy.
     * `:openid_provider` - whether this authorization server provides OpenID
       Connect authentication. Defaults to `true` for compatibility. OAuth-only
       hosts set it to `false`. When enabled, the reserved
