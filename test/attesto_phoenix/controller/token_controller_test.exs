@@ -3497,6 +3497,132 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       :ok
     end
 
+    @jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
+    @id_jag_issuer "https://idp.example/organizations/a"
+    @cimd_jwks_uri "https://app.example/clients/keys.json"
+
+    test "accepts an ID-JAG after authenticating a CIMD client against its remote keys" do
+      idp_key = enable_id_jag()
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      script_id_jag_client(client_key)
+
+      conn = post_token(id_jag_params(idp_key, client_key, @cimd_pkjwt_client_id))
+      assert conn.status == 200
+      assert is_binary(body(conn)["access_token"])
+      refute Map.has_key?(body(conn), "refresh_token")
+
+      conn = post_token(id_jag_params(idp_key, client_key, @cimd_public_client_id))
+      assert body(conn)["error"] == "invalid_grant"
+    end
+
+    test "rejects a bad CIMD client assertion as invalid_client before checking the ID-JAG" do
+      idp_key = enable_id_jag()
+      script_id_jag_client(JOSE.JWK.generate_key({:ec, "P-256"}))
+
+      wrong_key = JOSE.JWK.generate_key({:ec, "P-256"})
+      conn = post_token(id_jag_params(idp_key, wrong_key, @cimd_pkjwt_client_id))
+      assert body(conn)["error"] == "invalid_client"
+      refute Map.has_key?(body(conn), "access_token")
+    end
+
+    test "requires an opt-in for a public CIMD client and still requires its exact assertion client ID" do
+      idp_key = enable_id_jag()
+
+      CimdFetcher.script(@cimd_public_client_id, %{
+        "grant_types" => [@jwt_bearer],
+        "token_endpoint_auth_method" => "none"
+      })
+
+      params = %{
+        "grant_type" => @jwt_bearer,
+        "client_id" => @cimd_public_client_id,
+        "assertion" => id_jag(idp_key, @cimd_public_client_id)
+      }
+
+      assert body(post_token(params))["error"] == "invalid_client"
+
+      idp_key = enable_id_jag(public_clients: :allow)
+      conn = post_token(%{params | "assertion" => id_jag(idp_key, @cimd_public_client_id)})
+      assert conn.status == 200
+      assert is_binary(body(conn)["access_token"])
+
+      denied = post_token(%{params | "assertion" => id_jag(idp_key, @cimd_pkjwt_client_id)})
+      assert body(denied)["error"] == "invalid_grant"
+    end
+
+    test "keeps authenticated CIMD clients out of client credentials, token exchange and CIBA" do
+      client_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      grants = [
+        "client_credentials",
+        "urn:ietf:params:oauth:grant-type:token-exchange",
+        "urn:openid:params:grant-type:ciba"
+      ]
+
+      script_id_jag_client(client_key, grants)
+      put_config(grant_types_supported: grants)
+
+      for grant <- grants do
+        conn =
+          post_token(%{
+            "grant_type" => grant,
+            "client_assertion_type" => "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion" => client_assertion(client_key, @cimd_pkjwt_client_id)
+          })
+
+        assert body(conn)["error"] == "invalid_client"
+      end
+    end
+
+    defp enable_id_jag(opts \\ []) do
+      idp_key = JOSE.JWK.generate_key({:ec, "P-256"})
+
+      put_config(
+        jwt_bearer: [enabled: true, issuers: %{@id_jag_issuer => [jwks: %{"keys" => [public_jwk(idp_key)]}]}] ++ opts,
+        resolve_jwt_bearer_subject: fn claims -> {:ok, claims["sub"]} end,
+        principal_kinds: [@client_kind],
+        build_principal: fn client, subject, scope ->
+          %{kind: "client", sub: subject, scopes: scope, claims: %{"client_id" => client["client_id"]}}
+        end
+      )
+
+      idp_key
+    end
+
+    defp script_id_jag_client(key, grants \\ [@jwt_bearer]) do
+      CimdFetcher.script(@cimd_pkjwt_client_id, %{
+        "grant_types" => grants,
+        "token_endpoint_auth_method" => "private_key_jwt",
+        "jwks_uri" => @cimd_jwks_uri
+      })
+
+      CimdFetcher.script(@cimd_jwks_uri, %{"keys" => [public_jwk(key)]})
+    end
+
+    defp id_jag_params(idp_key, client_key, assert_client_id) do
+      %{
+        "grant_type" => @jwt_bearer,
+        "client_id" => @cimd_pkjwt_client_id,
+        "client_assertion_type" => "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "client_assertion" => client_assertion(client_key, @cimd_pkjwt_client_id),
+        "assertion" => id_jag(idp_key, assert_client_id)
+      }
+    end
+
+    defp id_jag(key, client_id) do
+      now = System.system_time(:second)
+
+      sign_jwt(key, %{"alg" => "ES256", "kid" => JOSE.JWK.thumbprint(key), "typ" => "oauth-id-jag+jwt"}, %{
+        "iss" => @id_jag_issuer,
+        "sub" => "oc_member",
+        "client_id" => client_id,
+        "aud" => "https://issuer.example",
+        "iat" => now,
+        "exp" => now + 60,
+        "jti" => Base.url_encode64(:crypto.strong_rand_bytes(16), padding: false)
+      })
+    end
+
     test "a CIMD document with an empty grant type is refused as an invalid client" do
       # A distinct URL: the failed resolution leaves a short fetch backoff for it.
       client_id = "https://app.example/clients/empty-grant-type.json"

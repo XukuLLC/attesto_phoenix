@@ -1969,17 +1969,20 @@ defmodule AttestoPhoenix.Config do
     Keyword.merge(@client_id_metadata_defaults, opts)
   end
 
-  # The Identity Assertion JWT Authorization Grant (ID-JAG / jwt-bearer)
-  # defaults the host's `:jwt_bearer` keyword is merged over
-  # (`draft-ietf-oauth-identity-assertion-authz-grant-04`). The whole feature is
-  # off by default; a host enables it with `enabled: true` and a non-empty
-  # `:issuers` map (or a `:jwks_resolver`). `:jwks_fetcher`/`:jwks_cache` are the
-  # SSRF-guarded remote-JWKS seam (reused from CIMD) for any issuer configured by
-  # `:jwks_uri`. The merged list is what `jwt_bearer/1` returns and what the
-  # grant handler reads.
+  # With the default grant list, the server advertises and accepts this grant
+  # only when `jwt_bearer: [enabled: true]` (RFC 7523 §4 and ID-JAG draft -06 §7.2).
+  @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
+  # ID-JAG is disabled by default. The server requires client authentication,
+  # limits assertions to a 300-second lifetime, and grants no authorization
+  # detail types by default. For remote issuer keys it uses the SSRF-guarded
+  # CIMD fetcher and cache. The server reads these defaults merged with the
+  # configured `:jwt_bearer` options through `jwt_bearer/1`.
   @jwt_bearer_defaults [
     enabled: false,
     issuers: %{},
+    resolve_trusted_issuer: nil,
+    public_clients: :deny,
+    authorization_details_types_supported: [],
     assertion_max_lifetime_seconds: 300,
     jwks_resolver: nil,
     jwks_fetcher: Req,
@@ -2519,16 +2522,20 @@ defmodule AttestoPhoenix.Config do
   Returns the merged, defaulted Identity Assertion JWT Authorization Grant
   (ID-JAG / `jwt-bearer`) options.
 
-  This is the host's `:jwt_bearer` keyword merged over the library defaults
-  (`draft-ietf-oauth-identity-assertion-authz-grant-04`), so every recognized
-  member (`:enabled`, `:issuers`, `:assertion_max_lifetime_seconds`,
-  `:jwks_resolver`, `:jwks_fetcher`, `:jwks_cache`, `:jwks_cache_ttl_bounds`,
-  `:fetch_opts`) is always present.
-  `AttestoPhoenix.AuthorizationServer.JwtBearer` reads the feature's
-  configuration through this helper.
+  The merged options control issuer trust, public-client eligibility, assertion
+  lifetime, granted authorization detail types, and remote key lookup. See
+  `AttestoPhoenix.AuthorizationServer.JwtBearer` and the ID-JAG guide.
   """
   @spec jwt_bearer(t()) :: keyword()
   def jwt_bearer(%__MODULE__{jwt_bearer: opts}), do: opts
+
+  @doc false
+  @spec jwt_bearer_authorization_details_types(t()) :: [String.t()]
+  def jwt_bearer_authorization_details_types(%__MODULE__{} = config) do
+    if jwt_bearer_enabled?(config) and @grant_jwt_bearer in grant_types_supported(config),
+      do: Keyword.get(jwt_bearer(config), :authorization_details_types_supported, []),
+      else: []
+  end
 
   @doc """
   Returns the merged, defaulted RFC 8252 native-app profile options, so every
@@ -3672,10 +3679,6 @@ defmodule AttestoPhoenix.Config do
   enabled. This same catalog drives discovery, endpoint enforcement, and
   dynamic registration.
   """
-  # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
-  # JWT-bearer authorization grant, advertised + accepted only when the feature
-  # is enabled (`jwt_bearer: [enabled: true]`).
-  @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
   @grant_device_code "urn:ietf:params:oauth:grant-type:device_code"
   @grant_pre_authorized_code "urn:ietf:params:oauth:grant-type:pre-authorized_code"
   @grant_ciba "urn:openid:params:grant-type:ciba"
@@ -4024,11 +4027,14 @@ defmodule AttestoPhoenix.Config do
     Enum.each(@resolution, fn {key, {_store_key, _fun, arity}} ->
       callback = Map.get(config, key)
 
-      # `:authorize_scope` has a second, three-argument form that also takes
-      # the request's resources (see `authorize_scope_callback/1`).
-      if !(key == :authorize_scope and not is_nil(callback) and callback_contract(callback, 3) == :ok) do
-        validate_configured_callback!(key, callback, arity)
-      end
+      # Accept the three-argument `:authorize_scope` form for the request's
+      # resources and the two-argument `:resolve_jwt_bearer_subject` form for
+      # issuer and recipient-tenant context.
+      expanded_arity =
+        key in [:authorize_scope, :resolve_jwt_bearer_subject] and
+          callback_contract(callback, arity + 1) == :ok
+
+      if !expanded_arity, do: validate_configured_callback!(key, callback, arity)
     end)
 
     Enum.each(@flat_callback_arities, fn {key, arity} ->
@@ -4061,6 +4067,12 @@ defmodule AttestoPhoenix.Config do
       ":jwt_bearer :jwks_resolver",
       Keyword.get(jwt_bearer, :jwks_resolver),
       2
+    )
+
+    validate_configured_callback!(
+      ":jwt_bearer :resolve_trusted_issuer",
+      Keyword.get(jwt_bearer, :resolve_trusted_issuer),
+      3
     )
   end
 
@@ -4170,7 +4182,16 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  defp resolve_from_store(%__MODULE__{} = config, key) do
+  defp resolve_from_store(%__MODULE__{principal_store: module} = config, :resolve_jwt_bearer_subject)
+       when is_atom(module) and not is_nil(module) do
+    if callback_exported?(module, :resolve_jwt_bearer_subject, 2),
+      do: {module, :resolve_jwt_bearer_subject},
+      else: resolve_default_store_callback(config, :resolve_jwt_bearer_subject)
+  end
+
+  defp resolve_from_store(%__MODULE__{} = config, key), do: resolve_default_store_callback(config, key)
+
+  defp resolve_default_store_callback(%__MODULE__{} = config, key) do
     with {store_key, fun, arity} <- Map.get(@resolution, key),
          module when is_atom(module) and not is_nil(module) <- Map.get(config, store_key),
          true <- callback_exported?(module, fun, arity) do
@@ -4240,6 +4261,13 @@ defmodule AttestoPhoenix.Config do
 
   def authorize_scope_callback(%__MODULE__{authorize_scope: flat}) do
     {flat, if(callback_contract(flat, 3) == :ok, do: 3, else: 2)}
+  end
+
+  @doc false
+  @spec resolve_jwt_bearer_subject_callback(t()) :: {callback() | nil, 1 | 2}
+  def resolve_jwt_bearer_subject_callback(%__MODULE__{} = config) do
+    callback = resolve_jwt_bearer_subject_fun(config)
+    {callback, if(callback_contract(callback, 2) == :ok, do: 2, else: 1)}
   end
 
   defp default_authorize_scope_fun(scopes_supported) do
@@ -4468,12 +4496,6 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  # draft-ietf-oauth-identity-assertion-authz-grant-04: when the jwt-bearer grant
-  # is enabled the host MUST configure both how to TRUST an assertion (a
-  # non-empty `:issuers` map, or a custom `:jwks_resolver`) and how to RESOLVE its
-  # subject to a local principal (`:resolve_jwt_bearer_subject`). Fail closed at
-  # boot rather than reject every assertion at runtime. (`jti` replay reuses the
-  # configured `:replay_check`, falling back to the bundled ETS cache like DPoP.)
   # Logout must never fail open: an enabled end-session endpoint with no host
   # `:terminate_session` callback could report "logged out" without clearing the
   # session. Refuse to build such a config.
@@ -4690,31 +4712,45 @@ defmodule AttestoPhoenix.Config do
     :ok
   end
 
+  # Check issuer configuration and the local subject resolver at startup so
+  # incomplete configuration fails before redemption. A non-empty `:issuers`
+  # map, `:resolve_trusted_issuer`, or `:jwks_resolver` satisfies the issuer
+  # configuration check. At redemption, the server must establish issuer
+  # trust before resolving keys (ID-JAG draft -06 §4.4.1).
   defp validate_jwt_bearer!(%__MODULE__{} = config) do
     if jwt_bearer_enabled?(config) do
-      opts = jwt_bearer(config)
-      issuers = Keyword.get(opts, :issuers, %{})
-
-      if (not is_map(issuers) or map_size(issuers) == 0) and
-           is_nil(Keyword.get(opts, :jwks_resolver)) do
-        raise ArgumentError,
-              "AttestoPhoenix.Config: jwt_bearer requires a non-empty :issuers map " <>
-                "(issuer => [jwks: ... | jwks_uri: ...]) or a :jwks_resolver function " <>
-                "when :enabled is true, or set jwt_bearer: [enabled: false]."
-      end
+      validate_jwt_bearer_options!(jwt_bearer(config))
 
       if is_nil(resolve_jwt_bearer_subject_fun(config)) do
         raise ArgumentError,
               "AttestoPhoenix.Config: :resolve_jwt_bearer_subject is required when the " <>
-                "jwt_bearer grant is enabled. Add a " <>
-                "`resolve_jwt_bearer_subject: &MyApp.AuthZ.resolve_jwt_bearer_subject/1` " <>
-                "callback (or a :principal_store module implementing " <>
-                "resolve_jwt_bearer_subject/1) so the asserted subject maps to a local " <>
-                "principal."
+                "jwt_bearer grant is enabled. Configure a callback or implement it in the :principal_store."
       end
     end
 
     :ok
+  end
+
+  defp validate_jwt_bearer_options!(opts) do
+    issuers = Keyword.get(opts, :issuers, %{})
+
+    if (not is_map(issuers) or map_size(issuers) == 0) and
+         is_nil(Keyword.get(opts, :resolve_trusted_issuer)) and is_nil(Keyword.get(opts, :jwks_resolver)) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: jwt_bearer requires a non-empty :issuers map " <>
+              "or a :resolve_trusted_issuer callback when :enabled is true."
+    end
+
+    if Keyword.get(opts, :public_clients) not in [:deny, :allow] do
+      raise ArgumentError, "AttestoPhoenix.Config: jwt_bearer :public_clients must be :deny or :allow."
+    end
+
+    types = Keyword.fetch!(opts, :authorization_details_types_supported)
+
+    if !(is_list(types) and Enum.all?(types, &(is_binary(&1) and &1 != ""))) do
+      raise ArgumentError,
+            "AttestoPhoenix.Config: jwt_bearer :authorization_details_types_supported must be a list of non-empty strings."
+    end
   end
 
   defp validate_identity_chaining!(%__MODULE__{} = config) do
@@ -4884,17 +4920,15 @@ defmodule AttestoPhoenix.Config do
     end
   end
 
-  # Match AuthorizationServer.JwtBearer's resolution precedence exactly:
-  # custom resolver, then per-issuer static JWKS, then remote JWKS URI. Elixir
-  # treats every value except nil/false as configured, including empty
-  # collections, so preserve that truthiness here rather than imposing a new
-  # validation policy.
+  # Validate the remote fetcher at startup when a static issuer can use
+  # `:jwks_uri` or discovery. With `:resolve_trusted_issuer`, issuer options are
+  # known at redemption. A custom `:jwks_resolver` supplies keys directly.
+  # Treat every `:jwks` value except `nil` and `false` as configured, including
+  # empty collections, as in runtime key selection.
   defp jwt_bearer_uses_remote_jwks?(opts) do
-    if configured?(Keyword.get(opts, :jwks_resolver)) do
-      false
-    else
-      opts |> Keyword.get(:issuers, %{}) |> any_remote_jwks_issuer?()
-    end
+    not configured?(Keyword.get(opts, :jwks_resolver)) and
+      not configured?(Keyword.get(opts, :resolve_trusted_issuer)) and
+      any_remote_jwks_issuer?(Keyword.get(opts, :issuers, %{}))
   end
 
   defp any_remote_jwks_issuer?(issuers) when is_map(issuers) do
@@ -4902,7 +4936,7 @@ defmodule AttestoPhoenix.Config do
       issuer_opts = normalize_jwt_issuer_opts(issuer_opts)
 
       not configured?(Map.get(issuer_opts, :jwks)) and
-        configured?(Map.get(issuer_opts, :jwks_uri))
+        (configured?(Map.get(issuer_opts, :jwks_uri)) or Map.get(issuer_opts, :discovery, true) == true)
     end)
   end
 

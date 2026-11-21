@@ -16,7 +16,7 @@ defmodule AttestoPhoenix.PrincipalStore do
     * `principal_kinds/0` (`:principal_kinds`)
     * `build_principal/3` (`:build_principal`)
     * `build_refresh_principal/2` (`:build_refresh_principal`)
-    * `resolve_jwt_bearer_subject/1` (`:resolve_jwt_bearer_subject`, required only
+    * `resolve_jwt_bearer_subject/1` or `resolve_jwt_bearer_subject/2` (`:resolve_jwt_bearer_subject`, required only
       when the ID-JAG `jwt-bearer` grant is enabled)
   """
 
@@ -62,9 +62,10 @@ defmodule AttestoPhoenix.PrincipalStore do
 
   @doc """
   Build the principal map passed to `Attesto.Token.mint/3` for an
-  authorization-code or `client_credentials` grant. Receives the resolved
+  authorization-code, `client_credentials`, or ID-JAG grant. Receives the resolved
   client, the subject identifier, and the granted scope. The returned map
-  carries at least `:sub` and any host-owned claims.
+  carries at least `:sub` and any host-owned claims. An ID-JAG principal lookup
+  can return `{:error, :access_denied}` to deny the grant.
 
   The returned `:sub` MUST be namespaced with the matching
   `Attesto.PrincipalKind` `sub_prefix` - `Attesto.Token` rejects an unprefixed
@@ -79,7 +80,7 @@ defmodule AttestoPhoenix.PrincipalStore do
               client :: term(),
               subject :: String.t(),
               scope :: [String.t()]
-            ) :: map()
+            ) :: map() | {:error, :access_denied}
 
   @doc """
   Revalidate host-owned principal and session state for a refresh grant, and
@@ -125,14 +126,27 @@ defmodule AttestoPhoenix.PrincipalStore do
 
   Returns `{:ok, subject}` (or a bare `subject` string) to authorize, or
   `{:error, reason}` (or any non-subject value) to deny - a deny becomes
-  RFC 6749 §5.2 `invalid_grant`. Required only when the `jwt-bearer` grant is
-  enabled (`AttestoPhoenix.Config` enforces this at boot).
+  `access_denied` (ID-JAG draft -06 §4.4.3). Either arity satisfies the
+  requirement when the `jwt-bearer` grant is enabled.
   """
   @callback resolve_jwt_bearer_subject(claims :: map()) ::
+              {:ok, subject :: String.t()} | String.t() | {:error, term()}
+
+  @doc """
+  Resolve verified claims within the selected recipient tenant.
+
+  The second argument contains the host's `:issuer_context` and the verified
+  `:aud_tenant`. AttestoPhoenix uses this arity when the store exports both.
+  """
+  @callback resolve_jwt_bearer_subject(
+              claims :: map(),
+              tenant :: %{issuer_context: term(), aud_tenant: String.t() | nil}
+            ) ::
               {:ok, subject :: String.t()} | String.t() | {:error, term()}
 
   @optional_callbacks principal_kinds: 0,
                       build_principal: 3,
                       build_refresh_principal: 2,
-                      resolve_jwt_bearer_subject: 1
+                      resolve_jwt_bearer_subject: 1,
+                      resolve_jwt_bearer_subject: 2
 end

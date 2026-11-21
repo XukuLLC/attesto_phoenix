@@ -3,6 +3,7 @@ defmodule AttestoPhoenix.Application do
 
   use Application
 
+  alias AttestoPhoenix.AuthorizationServer.JwtBearer.KeyRefresh
   alias AttestoPhoenix.ClientIdMetadata.FlowControl
   alias AttestoPhoenix.Store.Sweeper.Liveness
 
@@ -10,6 +11,7 @@ defmodule AttestoPhoenix.Application do
   def start(_type, _args) do
     children = [
       {FlowControl, name: FlowControl},
+      Supervisor.child_spec({FlowControl, name: KeyRefresh}, id: KeyRefresh),
       {Task.Supervisor, name: AttestoPhoenix.DeliverySupervisor},
       # Liveness lookups for the public API come from this registry so
       # a diagnostics outage cannot change their answers.

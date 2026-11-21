@@ -1,7 +1,7 @@
 defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   @moduledoc """
   Data-level tests for the ID-JAG `jwt-bearer` authorization grant
-  (`draft-ietf-oauth-identity-assertion-authz-grant-04`), driven through the
+  (`draft-ietf-oauth-identity-assertion-authz-grant-06`), driven through the
   conn-free token core `AttestoPhoenix.AuthorizationServer.Token.issue/2`.
   """
   use ExUnit.Case, async: false
@@ -11,8 +11,10 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   alias Attesto.DPoP.ReplayCache
   alias AttestoPhoenix.AuthorizationServer.JwtBearer, as: JwtBearerGrant
   alias AttestoPhoenix.AuthorizationServer.JwtBearerTest
+  alias AttestoPhoenix.AuthorizationServer.Metadata
   alias AttestoPhoenix.AuthorizationServer.Token
   alias AttestoPhoenix.AuthorizationServer.Token.Request
+  alias AttestoPhoenix.ClientIdMetadata.Cache.ETS, as: MetadataCache
   alias AttestoPhoenix.{Config, OAuthError}
 
   @grant "urn:ietf:params:oauth:grant-type:jwt-bearer"
@@ -51,9 +53,9 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     :ok
   end
 
-  defp idp_jwks do
-    {_kty, map} = JOSE.JWK.to_public_map(@idp_key)
-    %{"keys" => [Map.merge(map, %{"kid" => JOSE.JWK.thumbprint(@idp_key), "alg" => "RS256"})]}
+  defp idp_jwks(key \\ @idp_key) do
+    {_kty, map} = JOSE.JWK.to_public_map(key)
+    %{"keys" => [Map.put(map, "kid", JOSE.JWK.thumbprint(key))]}
   end
 
   defp config(overrides \\ []) do
@@ -222,12 +224,29 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert response.scope == "mcp:read"
     end
 
-    # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: this
+    # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-06: this
     # grant issues NO refresh token - access is re-derived from a fresh
     # assertion each time. A refresh token would outlive enterprise IdP
     # policy/deprovisioning. This holds even when a `refresh_store` is wired and
     # the assertion carries `offline_access` (the signal that triggers refresh
     # issuance for the authorization_code grant).
+    test "only supported signed authorization details appear in the response and access token" do
+      supported = %{"type" => "records", "actions" => ["read"], "identifier" => "item-1"}
+      ignored = %{"type" => "unrecognized", "actions" => ["write"]}
+
+      config = config(jwt_bearer: [authorization_details_types_supported: ["records"]])
+      jwt = assertion(%{"authorization_details" => [ignored, supported], "scope" => "records:read"})
+
+      assert {:ok, %{authorization_details: [^supported], scope: "records:read"} = response, _} =
+               issue(config, %{"assertion" => jwt})
+
+      assert {:ok, %{"authorization_details" => [^supported]}} =
+               Attesto.Token.verify(Config.to_attesto_config(config), response.access_token)
+
+      assert {:ok, response, _} = issue(config, %{"assertion" => assertion(%{"authorization_details" => [ignored]})})
+      refute Map.has_key?(response, :authorization_details)
+    end
+
     test "never issues a refresh token, even with offline_access and a refresh_store" do
       config = config(refresh_store: __MODULE__.StubRefreshStore)
       params = %{"assertion" => assertion(%{"scope" => "openid offline_access"})}
@@ -369,7 +388,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
     end
   end
 
-  describe "assertion validation → invalid_grant (draft §6.1)" do
+  describe "assertion validation → invalid_grant (draft -06 §4.4.3)" do
     test "untrusted issuer" do
       assert {:error, %OAuthError{error: :invalid_grant}, _} =
                issue(config(), %{"assertion" => assertion(%{"iss" => "https://evil.example"})})
@@ -511,10 +530,17 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
                })
     end
 
-    test "a subject-resolution deny is invalid_grant" do
+    test "a subject denial returns access_denied without a description" do
       config = config(resolve_jwt_bearer_subject: fn _claims -> {:error, :no_such_user} end)
 
-      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+      assert {:error, %OAuthError{error: :access_denied, error_description: nil}, _} =
+               issue(config, %{"assertion" => assertion()})
+    end
+
+    test "an explicit principal denial returns access_denied without a description" do
+      config = config(build_principal: fn _client, _subject, _scope -> {:error, :access_denied} end)
+
+      assert {:error, %OAuthError{error: :access_denied, error_description: nil}, _} =
                issue(config, %{"assertion" => assertion()})
     end
   end
@@ -654,6 +680,16 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
                )
     end
 
+    test "a registered public client can opt in but must match the assertion client" do
+      config = config(jwt_bearer: [public_clients: :allow])
+      request = [client: %{@client | public?: true}, client_auth_method: :none]
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion()}, request)
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(config, %{"assertion" => assertion(%{"client_id" => "other-client"})}, request)
+    end
+
     test "the grant is unsupported when the feature is disabled" do
       config = config(jwt_bearer: [enabled: false])
 
@@ -663,9 +699,110 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
   end
 
   describe "discovery metadata gating" do
-    test "grant_types_supported advertises jwt-bearer only when enabled" do
-      assert @grant in Config.grant_types_supported(config())
-      refute @grant in Config.grant_types_supported(config(jwt_bearer: [enabled: false]))
+    test "advertises the grant, profile, and supported detail types without issuer trust records" do
+      config = config(jwt_bearer: [authorization_details_types_supported: ["records"]])
+      metadata = Metadata.enrich_common(%{}, config)
+
+      assert @grant in metadata["grant_types_supported"]
+      assert metadata["authorization_grant_profiles_supported"] == ["urn:ietf:params:oauth:grant-profile:id-jag"]
+      assert metadata["authorization_details_types_supported"] == ["records"]
+      refute JSON.encode!(metadata) =~ @idp
+
+      for disabled <- [
+            config(jwt_bearer: [enabled: false]),
+            config(grant_types_supported: ["authorization_code"])
+          ] do
+        metadata = Metadata.enrich_common(%{}, disabled)
+        refute @grant in metadata["grant_types_supported"]
+        refute Map.has_key?(metadata, "authorization_grant_profiles_supported")
+      end
+    end
+  end
+
+  describe "host-managed issuer trust" do
+    @issuer_a "https://idp.example/tenants/a"
+    @issuer_b "https://idp.example/tenants/b"
+
+    def subject_with_tenant(claims, tenant, owner) do
+      send(owner, {:resolved_subject, claims["iss"], tenant})
+      {:ok, "u_#{tenant.issuer_context}:#{claims["sub"]}"}
+    end
+
+    defp tenant_config(trust, opts \\ []) do
+      config(
+        Keyword.merge(
+          [
+            jwt_bearer: [issuers: %{}, resolve_trusted_issuer: trust],
+            resolve_jwt_bearer_subject: {__MODULE__, :subject_with_tenant, [self()]}
+          ],
+          opts
+        )
+      )
+    end
+
+    test "passes the request client to issuer lookup and the verified tenant context to subject lookup" do
+      parent = self()
+
+      config =
+        tenant_config(fn
+          @issuer_a, "tenant-a", client ->
+            send(parent, {:lookup_client, client})
+            {:ok, [issuer: @issuer_a, jwks: idp_jwks()], "tenant-a"}
+
+          _, _, _ ->
+            {:error, :not_found}
+        end)
+
+      jwt = assertion(%{"iss" => @issuer_a, "aud_tenant" => "tenant-a"})
+      assert {:ok, _, _} = issue(config, %{"assertion" => jwt})
+      assert_received {:lookup_client, @client}
+      assert_received {:resolved_subject, @issuer_a, %{issuer_context: "tenant-a", aud_tenant: "tenant-a"}}
+    end
+
+    test "rejects missing and ambiguous trust without falling back to static keys" do
+      config =
+        tenant_config(nil,
+          jwt_bearer: [
+            issuers: %{@issuer_a => [jwks: idp_jwks()]},
+            resolve_trusted_issuer: fn
+              @issuer_a, nil, _ -> {:error, :ambiguous}
+              @issuer_b, "tenant-a", _ -> {:error, :not_found}
+              _, _, _ -> {:error, :not_found}
+            end
+          ]
+        )
+
+      for claims <- [
+            %{"iss" => "https://unknown.example"},
+            %{"iss" => @issuer_a},
+            %{"iss" => @issuer_b, "aud_tenant" => "tenant-a"}
+          ] do
+        assert {:error, %OAuthError{error: :invalid_grant}, _} =
+                 issue(config, %{"assertion" => assertion(claims)})
+      end
+
+      refute_received {:resolved_subject, _, _}
+    end
+
+    test "requires the full issuer path in static trust and in the callback's issuer pin" do
+      static = config(jwt_bearer: [issuers: %{@issuer_a => [jwks: idp_jwks()]}])
+      dynamic = tenant_config(fn _issuer, _tenant, _client -> {:ok, [issuer: @issuer_a, jwks: idp_jwks()], "a"} end)
+
+      for config <- [static, dynamic] do
+        assert {:error, %OAuthError{error: :invalid_grant}, _} =
+                 issue(config, %{"assertion" => assertion(%{"iss" => @issuer_b})})
+      end
+    end
+
+    test "rejects malformed and oversized routing claims before calling the trust resolver" do
+      parent = self()
+      config = tenant_config(fn _, _, _ -> send(parent, :trust_lookup) end)
+
+      for jwt <- [assertion(%{"aud_tenant" => []}), String.duplicate("x", 65_537)] do
+        assert {:error, %OAuthError{error: :invalid_grant}, _} = issue(config, %{"assertion" => jwt})
+      end
+
+      refute_received :trust_lookup
     end
   end
 
@@ -704,6 +841,187 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
 
         {:ok, %{body: JSON.encode!(jwks), cache_control: [max_age: 600]}}
       end
+    end
+
+    defmodule ScriptedIssuerFetcher do
+      @moduledoc false
+      @behaviour AttestoPhoenix.ClientIdMetadata.Fetcher
+
+      @impl true
+      def fetch(url, _opts) do
+        send(self(), {:issuer_fetch, url})
+
+        case Process.get({__MODULE__, url}) do
+          {:error, _} = error -> error
+          {document, headers} -> {:ok, %{body: JSON.encode!(document), cache_control: headers}}
+          nil -> {:error, {:status, 404}}
+        end
+      end
+    end
+
+    defp script_fetch(url, document, headers \\ [max_age: 600]) do
+      Process.put({ScriptedIssuerFetcher, url}, {document, headers})
+    end
+
+    test "discovers path-based RFC 8414 metadata and caches metadata and keys independently" do
+      issuer = "https://idp.example/organizations/rfc8414"
+      metadata_url = "https://idp.example/.well-known/oauth-authorization-server/organizations/rfc8414"
+      jwks_uri = "https://idp.example/organizations/rfc8414/keys"
+      script_fetch(metadata_url, %{"issuer" => issuer, "jwks_uri" => jwks_uri})
+      script_fetch(jwks_uri, idp_jwks(), max_age: 0)
+
+      config =
+        config(jwt_bearer: [issuers: %{issuer => []}, jwks_fetcher: ScriptedIssuerFetcher, jwks_cache: MetadataCache])
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion(%{"iss" => issuer})})
+      assert_received {:issuer_fetch, ^metadata_url}
+      assert_received {:issuer_fetch, ^jwks_uri}
+      refute_received {:issuer_fetch, _}
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion(%{"iss" => issuer})})
+      assert_received {:issuer_fetch, ^jwks_uri}
+      refute_received {:issuer_fetch, _}
+    end
+
+    test "falls back to a minimal OpenID Connect document only after HTTP 404" do
+      issuer = "https://idp.example/organizations/oidc"
+      metadata_url = "https://idp.example/.well-known/oauth-authorization-server/organizations/oidc"
+      oidc_url = issuer <> "/.well-known/openid-configuration"
+      jwks_uri = issuer <> "/keys"
+
+      script_fetch(oidc_url, %{"issuer" => issuer, "jwks_uri" => jwks_uri})
+      script_fetch(jwks_uri, idp_jwks())
+
+      config =
+        config(
+          jwt_bearer: [
+            issuers: %{issuer => [discovery: true]},
+            jwks_fetcher: ScriptedIssuerFetcher,
+            jwks_cache: nil
+          ]
+        )
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion(%{"iss" => issuer})})
+      assert_receive {:issuer_fetch, first}
+      assert_receive {:issuer_fetch, second}
+      assert_receive {:issuer_fetch, third}
+      assert [first, second, third] == [metadata_url, oidc_url, jwks_uri]
+
+      Process.put({ScriptedIssuerFetcher, metadata_url}, {:error, {:status, 503}})
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(config, %{"assertion" => assertion(%{"iss" => issuer})})
+
+      assert_received {:issuer_fetch, ^metadata_url}
+      refute_received {:issuer_fetch, _}
+    end
+
+    test "rejects issuer mismatch and HTTP JWKS URIs without retrieving keys or falling back" do
+      issuer = "https://idp.example/organizations/trusted"
+      metadata_url = "https://idp.example/.well-known/oauth-authorization-server/organizations/trusted"
+
+      config =
+        config(
+          jwt_bearer: [issuers: %{issuer => [discovery: true]}, jwks_fetcher: ScriptedIssuerFetcher, jwks_cache: nil]
+        )
+
+      for {returned_issuer, jwks_uri} <- [
+            {"https://idp.example/organizations/another", "https://idp.example/keys"},
+            {issuer, "http://idp.example/keys"}
+          ] do
+        script_fetch(metadata_url, %{"issuer" => returned_issuer, "jwks_uri" => jwks_uri})
+
+        assert {:error, %OAuthError{error: :invalid_grant}, _} =
+                 issue(config, %{"assertion" => assertion(%{"iss" => issuer})})
+
+        assert_received {:issuer_fetch, ^metadata_url}
+        refute_received {:issuer_fetch, _}
+      end
+    end
+
+    test "ignores assertion jku, jwk, x5u and x5c headers" do
+      jwks_uri = "https://idp.example/header-test/keys"
+      script_fetch(jwks_uri, idp_jwks())
+      config = remote_jwks_config(MetadataCache, ScriptedIssuerFetcher, jwks_uri)
+      attacker = JOSE.JWK.generate_key({:rsa, 2048})
+      [attacker_key] = idp_jwks(attacker)["keys"]
+
+      headers = %{
+        "jku" => "https://unknown.example/jwks",
+        "jwk" => Map.put(attacker_key, "kid", JOSE.JWK.thumbprint(@idp_key)),
+        "x5u" => "https://unknown.example/cert",
+        "x5c" => ["unexpected"]
+      }
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion(%{}, headers)})
+      assert_received {:issuer_fetch, ^jwks_uri}
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(config, %{"assertion" => assertion(%{}, headers, attacker)})
+
+      refute_received {:issuer_fetch, _}
+    end
+
+    test "refreshes once on an unseen kid and rate limits subsequent attempts per issuer" do
+      issuer = "https://idp.example/organizations/rotation"
+      jwks_uri = issuer <> "/keys"
+      rotation = JOSE.JWK.generate_key({:rsa, 2048})
+      script_fetch(jwks_uri, idp_jwks())
+
+      config =
+        config(
+          jwt_bearer: [
+            issuers: %{issuer => [jwks_uri: jwks_uri]},
+            jwks_fetcher: ScriptedIssuerFetcher,
+            jwks_cache: MetadataCache
+          ]
+        )
+
+      claims = %{"iss" => issuer}
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion(claims)})
+      assert_received {:issuer_fetch, ^jwks_uri}
+
+      script_fetch(jwks_uri, idp_jwks(rotation))
+      jwt = assertion(claims, %{"kid" => JOSE.JWK.thumbprint(rotation)}, rotation)
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => jwt})
+      assert_received {:issuer_fetch, ^jwks_uri}
+
+      for kid <- ["unknown-1", "unknown-2"] do
+        assert {:error, %OAuthError{error: :invalid_grant}, _} =
+                 issue(config, %{"assertion" => assertion(claims, %{"kid" => kid})})
+      end
+
+      refute_received {:issuer_fetch, _}
+    end
+
+    test "a refresh with a non-cacheable key set evicts the previous set" do
+      issuer = "https://idp.example/organizations/non-cacheable-rotation"
+      jwks_uri = issuer <> "/keys"
+      rotation = JOSE.JWK.generate_key({:rsa, 2048})
+      script_fetch(jwks_uri, idp_jwks())
+
+      config =
+        config(
+          jwt_bearer: [
+            issuers: %{issuer => [jwks_uri: jwks_uri]},
+            jwks_fetcher: ScriptedIssuerFetcher,
+            jwks_cache: MetadataCache
+          ]
+        )
+
+      claims = %{"iss" => issuer}
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion(claims)})
+      assert {:ok, _} = MetadataCache.get(jwks_uri)
+
+      script_fetch(jwks_uri, idp_jwks(rotation), no_store: true)
+      jwt = assertion(claims, %{"kid" => JOSE.JWK.thumbprint(rotation)}, rotation)
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => jwt})
+      assert :miss = MetadataCache.get(jwks_uri)
+
+      assert {:error, %OAuthError{error: :invalid_grant}, _} =
+               issue(config, %{"assertion" => assertion(claims)})
     end
 
     defmodule FailingFetcher do

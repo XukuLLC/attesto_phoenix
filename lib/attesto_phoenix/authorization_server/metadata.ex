@@ -15,6 +15,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
   alias AttestoPhoenix.Config
 
   @response_types_supported ["code"]
+  @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
+  @id_jag_profile "urn:ietf:params:oauth:grant-profile:id-jag"
 
   @doc """
   The OAuth response types the authorization endpoint supports (RFC 8414 §2
@@ -56,6 +58,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
       "revocation_endpoint_auth_methods_supported" => revocation_auth_methods(config),
       "pushed_authorization_request_endpoint" => Config.par_endpoint_url(config)
     })
+    |> MapParams.put_optional("authorization_grant_profiles_supported", authorization_grant_profiles_supported(config))
     |> MapParams.put_optional("require_pushed_authorization_requests", require_pushed_authorization_requests(config))
     |> MapParams.put_optional("device_authorization_endpoint", device_authorization_endpoint(config))
     |> MapParams.put_optional("backchannel_authentication_endpoint", backchannel_authentication_endpoint(config))
@@ -204,15 +207,24 @@ defmodule AttestoPhoenix.AuthorizationServer.Metadata do
     if Config.client_id_metadata_enabled?(config), do: true
   end
 
+  # ID-JAG draft -06 §7.2 pairs the profile with the JWT-bearer grant type.
+  defp authorization_grant_profiles_supported(%Config{} = config) do
+    if Config.jwt_bearer_enabled?(config) and @grant_jwt_bearer in Config.grant_types_supported(config),
+      do: [@id_jag_profile]
+  end
+
   # RFC 9396 §11 / OID4VCI §11.2.3: an OP that issues credentials advertises the
   # `openid_credential` authorization_details type on its AS metadata so a wallet
   # requesting a scope-less credential configuration via `authorization_details`
   # can discover support. Derived from the issuer being configured (a non-empty
   # `credential_configurations_supported`) rather than a separate knob.
   defp authorization_details_types_supported(%Config{} = config) do
+    types = Config.jwt_bearer_authorization_details_types(config)
+
     case Config.credential_configurations_supported(config) do
-      map when is_map(map) and map_size(map) > 0 -> ["openid_credential"]
-      _other -> nil
+      map when is_map(map) and map_size(map) > 0 -> Enum.uniq(["openid_credential" | types])
+      _other when types == [] -> nil
+      _other -> Enum.uniq(types)
     end
   end
 

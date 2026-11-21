@@ -98,8 +98,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   @issued_token_type_jwt "urn:ietf:params:oauth:token-type:jwt"
   @issued_token_type_id_jag "urn:ietf:params:oauth:token-type:id-jag"
 
-  # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
-  # JWT-bearer authorization grant (MCP Enterprise-Managed Authorization).
+  # The JWT-bearer grant type used for ID-JAG redemption (RFC 7523 §4 and
+  # draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4).
   @grant_jwt_bearer "urn:ietf:params:oauth:grant-type:jwt-bearer"
 
   # RFC 8628 §3.4: the device authorization grant token request.
@@ -136,17 +136,14 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   @error_expired_token :expired_token
   @error_access_denied :access_denied
 
-  # RFC 6749 §4.4 / RFC 8693 §2.1: grants that require a confidential client.
-  # client_credentials authenticates the client AS the principal, a token
-  # exchange mints fresh authority off a presented token, and the jwt-bearer
-  # ID-JAG grant binds the assertion to an authenticated `client_id` (the
-  # assertion's `client_id` claim MUST match it); none is safe for a public
-  # (`:none`) client that proved possession of no client credential, so all
-  # reject the public-client path regardless of any per-client policy.
-  # CIBA (CIBA Core §7.1 / FAPI-CIBA §5.2.2) is confidential-clients-only: the
-  # backchannel authentication request was made by an authenticated confidential
-  # client, and the token request must be by that same client.
-  @confidential_only_grants ["client_credentials", @grant_token_exchange, @grant_jwt_bearer, @grant_ciba]
+  # Require a registered confidential client for these grants. With
+  # `client_credentials`, the client proves its own identity as the principal
+  # (RFC 6749 §4.4). In token exchange, authenticate the client so that
+  # possession of the input token alone cannot yield a new token
+  # (RFC 8693 §§2.1 and 4). In CIBA, authenticate the same confidential client
+  # that initiated the backchannel request before returning its tokens
+  # (CIBA Core §§7.1 and 10.1 and FAPI-CIBA §5.2.2).
+  @confidential_only_grants ["client_credentials", @grant_token_exchange, @grant_ciba]
 
   # OIDC Core §3.1.2.1 / §11: the scope values that trigger ID-Token issuance
   # and initial refresh-token issuance respectively.
@@ -202,7 +199,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp run(%Request{} = request) do
     with :ok <- require_supported_grant_type(request),
          :ok <- require_attestation_instance_key(request),
-         :ok <- require_confidential_client(request),
+         :ok <- require_grant_client_authentication(request),
          :ok <- require_registered_grant_type(request),
          :ok <- require_pairwise_allowed_grant(request) do
       dispatch(request)
@@ -226,23 +223,40 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp require_attestation_instance_key(%Request{}), do: :ok
 
-  # RFC 6749 §4.4 / RFC 8693: a public client (auth method `:none`) presented no
-  # client credential, so it may not run a confidential-only grant. Rejected as
-  # invalid_client (RFC 6749 §5.2: client authentication required but absent),
-  # independent of the optional per-client `:client_grant_types` policy - the
-  # library does not depend on the host wiring that callback to keep a public
-  # client out of client_credentials / token-exchange.
-  defp require_confidential_client(%Request{grant_type: grant_type, client: %CIMDClient{}})
+  # Require client authentication by default. Authenticated CIMD clients use
+  # `private_key_jwt` (RFC 7523 §3.2). Allow public clients only with
+  # `public_clients: :allow`. That option permits an unauthenticated client to
+  # redeem a bearer ID-JAG, departing from ID-JAG draft -06 §4.4, which requires
+  # client authentication or a sender-constrained ID-JAG.
+  defp require_grant_client_authentication(%Request{grant_type: @grant_jwt_bearer} = request) do
+    case request do
+      %Request{client_auth_method: :none, config: config} ->
+        if Keyword.get(Config.jwt_bearer(config), :public_clients) == :allow,
+          do: :ok,
+          else: {:error, error(@error_invalid_client, "client authentication is required")}
+
+      %Request{client: %CIMDClient{}, client_auth_method: method} when method != :private_key_jwt ->
+        {:error, error(@error_invalid_client, "private_key_jwt client authentication is required")}
+
+      %Request{} ->
+        :ok
+    end
+  end
+
+  # Return `invalid_client` to CIMD clients or public clients requesting a
+  # confidential-only grant (RFC 6749 §5.2). Apply this check even when no
+  # per-client `:client_grant_types` policy is configured.
+  defp require_grant_client_authentication(%Request{grant_type: grant_type, client: %CIMDClient{}})
        when grant_type in @confidential_only_grants do
     {:error, error(@error_invalid_client, "#{grant_type} requires a registered confidential client")}
   end
 
-  defp require_confidential_client(%Request{grant_type: grant_type, client_auth_method: :none})
+  defp require_grant_client_authentication(%Request{grant_type: grant_type, client_auth_method: :none})
        when grant_type in @confidential_only_grants do
     {:error, error(@error_invalid_client, "#{grant_type} requires a confidential client")}
   end
 
-  defp require_confidential_client(%Request{}), do: :ok
+  defp require_grant_client_authentication(%Request{}), do: :ok
 
   # RFC 8414 §2 / RFC 6749 §5.2: the server gates the token endpoint on the grant
   # types it advertises (`AttestoPhoenix.Config.grant_types_supported/1`). A host
@@ -517,21 +531,15 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: the ID-JAG
-  # JWT-bearer authorization grant. The client presents an Identity Assertion JWT
-  # (signed by a trusted enterprise IdP, asserting one user for this resource
-  # application) in the `assertion` parameter and receives a normal access token.
-  # `AttestoPhoenix.AuthorizationServer.JwtBearer` validates the assertion
-  # (signature against the trusted issuer's JWKS and claims) and maps
-  # its `client_id` claim to the authenticated client, then resolves the local
-  # subject via the host `:resolve_jwt_bearer_subject` callback. The assertion's
-  # `scope` claim, when present, is the ceiling on what may be granted (draft
-  # §6.1); the host `:authorize_scope` policy narrows from there.
+  # The client submits an ID-JAG signed by a trusted IdP in `assertion`
+  # (RFC 7523 §4 and ID-JAG draft -06 §4.4). Verify the signature and claims,
+  # bind the assertion to the request client, and apply local scope policy
+  # within the signed ceiling before resolving the local subject
+  # (ID-JAG draft -06 §4.4.1).
   defp dispatch(%Request{grant_type: @grant_jwt_bearer} = request) do
     %{config: config, client: client, params: params} = request
 
-    with {:ok, %{scope_ceiling: ceiling, claims: claims, replay_claim: assertion_replay}} <-
-           jwt_bearer_authorize(config, token_client_id(request), params),
+    with {:ok, %{scope_ceiling: ceiling, claims: claims} = prepared} <- jwt_bearer_authorize(request),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          :ok <- require_jwt_bearer_cnf(claims, binding),
          {:ok, audience} <- jwt_bearer_resource_audience(config, client, params, claims),
@@ -540,17 +548,19 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
          {:ok, scope} <- authorize_scope(config, client, requested, audience),
          :ok <- require_scope_within_ceiling(scope, ceiling),
          :ok <- require_granted_scope_within_request(scope, requested),
-         {:ok, subject} <- resolve_jwt_bearer_subject(config, claims),
+         {:ok, subject} <- resolve_jwt_bearer_subject(config, prepared),
+         {:ok, principal} <- build_jwt_bearer_principal(config, client, subject, scope),
          :ok <- SenderConstraint.commit_replay_claim(config, pending_claim),
-         :ok <- commit_jwt_bearer_replay(config, assertion_replay),
+         :ok <- commit_jwt_bearer_replay(config, prepared.replay_claim),
+         details = jwt_bearer_authorization_details(config, claims),
+         extra_claims = if(details == [], do: %{}, else: %{"authorization_details" => details}),
          {:ok, response} <-
-           mint(request, subject, scope, token_type, binding, %{}, audience_opts(audience)) do
-      # RFC 7523 §4 / draft-ietf-oauth-identity-assertion-authz-grant-04: this
-      # grant issues NO refresh token. Access is re-derived from a fresh
-      # assertion on each request; a refresh token would outlive the enterprise
-      # IdP's policy/deprovisioning window, letting a client keep minting access
-      # after the IdP has revoked the user's entitlement. The client re-presents
-      # a fresh ID-JAG instead of refreshing.
+           mint_principal(request, principal, token_type, binding, extra_claims, audience_opts(audience)) do
+      # Issue no refresh token (ID-JAG draft -06 §4.4.4). Require a fresh
+      # ID-JAG for each new exchange so the IdP can stop issuing assertions
+      # when it deprovisions the user or revokes the entitlement. A refresh
+      # token could let the client keep minting access tokens after that change.
+      response = if details == [], do: response, else: Map.put(response, :authorization_details, details)
       {:ok, response, [token_issued_event(request, subject, scope, @grant_jwt_bearer, token_type, binding)]}
     end
   end
@@ -799,14 +809,13 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # Validate the ID-JAG and map the handler's reasons to RFC 6749 §5.2 errors: a
-  # missing `assertion` parameter is a malformed request (`invalid_request`);
-  # every assertion/trust/replay/subject failure collapses to `invalid_grant`
-  # (draft §6.1) so the wire never learns which issuers are trusted or why a
-  # subject was denied. The authenticated client's identifier is passed so the
-  # handler can enforce the `client_id`-claim binding.
-  defp jwt_bearer_authorize(config, authenticated_client_id, params) do
-    case JwtBearer.prepare(config, authenticated_client_id, params) do
+  # Pass the request client ID so verification can check the signed
+  # `client_id`. Return `invalid_request` for a missing assertion (RFC 6749
+  # §5.2) and `invalid_grant` for trust, key lookup, or validation failures
+  # (ID-JAG draft -06 §4.4.3). Give callers the same error for an unknown
+  # issuer and a failed signature so the response hides trust relationships.
+  defp jwt_bearer_authorize(%Request{config: config, client: client, params: params} = request) do
+    case JwtBearer.prepare(config, token_client_id(request), params, host_client(client)) do
       {:ok, result} ->
         {:ok, result}
 
@@ -818,12 +827,33 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp resolve_jwt_bearer_subject(config, claims) do
-    case JwtBearer.resolve_subject(config, claims) do
+  # Return `access_denied` when local subject resolution or principal policy
+  # refuses a verified ID-JAG. Omit the reason to avoid disclosing user details
+  # (ID-JAG draft -06 §§4.4.3 and 10).
+  defp resolve_jwt_bearer_subject(config, %{claims: claims, issuer_context: context}) do
+    case JwtBearer.resolve_subject(config, claims, context) do
       {:ok, subject} -> {:ok, subject}
-      {:error, _reason} -> {:error, error(@error_invalid_grant, "the identity assertion is invalid")}
+      {:error, :subject_denied} -> {:error, OAuthError.new(@error_access_denied)}
     end
   end
+
+  defp build_jwt_bearer_principal(config, client, subject, scope) do
+    case build_principal(config, client, subject, scope) do
+      {:ok, principal} -> {:ok, principal}
+      {:error, :access_denied} -> {:error, OAuthError.new(@error_access_denied)}
+      {:error, reason} -> mint_failure("token mint failed", reason)
+    end
+  end
+
+  # Keep signed authorization details only for configured types. Include those
+  # details in the token and response (ID-JAG draft -06 §4.4.1 and RFC 9396
+  # §§7 and 9.1).
+  defp jwt_bearer_authorization_details(config, %{"authorization_details" => details}) do
+    types = Config.jwt_bearer_authorization_details_types(config)
+    Enum.filter(details, &(&1["type"] in types))
+  end
+
+  defp jwt_bearer_authorization_details(_config, _claims), do: []
 
   # When the client requests no scope, default to the assertion's scope ceiling
   # (mirrors token exchange); an absent ceiling leaves the request empty so the
@@ -835,7 +865,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # draft §6.1: the granted scope MUST be within the assertion's `scope` claim
+  # ID-JAG draft -06 §4.4.1: the granted scope MUST be within the assertion's `scope` claim
   # when it carries one. The host `:authorize_scope` callback never sees the
   # assertion, so the library enforces the ceiling before delegating. An absent
   # ceiling (`nil`) imposes no bound.
@@ -869,7 +899,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  # draft §6.1 / RFC 9449: an ID-JAG carrying `cnf.jkt` is proof-of-possession
+  # ID-JAG draft -06 §9.11.1 / RFC 9449: an ID-JAG carrying `cnf.jkt` is proof-of-possession
   # authority, not a bearer assertion. The token request must demonstrate the
   # same DPoP key; a missing, mTLS, or different-key binding is invalid_grant.
   defp require_jwt_bearer_cnf(%{"cnf" => %{"jkt" => expected}}, binding) do
@@ -880,6 +910,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp require_jwt_bearer_cnf(_claims, _binding), do: :ok
 
+  # Return the same generic `invalid_grant` when the client reuses an ID-JAG
+  # (ID-JAG draft -06 §4.4.4).
   defp commit_jwt_bearer_replay(config, replay_claim) do
     case JwtBearer.commit_replay_claim(config, replay_claim) do
       :ok -> :ok
@@ -2467,6 +2499,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp build_principal(config, client, subject, scope) do
     case invoke(Config.build_principal_fun(config), [host_client(client), subject, scope]) do
       %{} = principal -> {:ok, principal}
+      {:error, :access_denied} -> {:error, :access_denied}
       _ -> {:error, :no_principal_builder}
     end
   end

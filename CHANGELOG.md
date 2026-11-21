@@ -6,6 +6,26 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.26.0] - 2026-11-20
+
+Requires `attesto >= 2.31.0 and < 3.0.0`.
+
+### Added
+
+- The token endpoint accepts client ID metadata document clients authenticated with `private_key_jwt` for the ID-JAG grant. Hosts can opt into public-client redemption with `jwt_bearer: [public_clients: :allow]`.
+- The server discovers issuer keys via RFC 8414 metadata, with an OpenID Connect Discovery fallback on HTTP 404. The server refreshes a cached set on an unknown key ID at most once per issuer per node within a 30-second window.
+- Hosts can resolve issuer and tenant trust with `:resolve_trusted_issuer`. A two-argument `:resolve_jwt_bearer_subject` callback receives the verified `aud_tenant` and host context. The one-argument callback still works.
+- The authorization server advertises the ID-JAG profile when the JWT-bearer grant is available (ID-JAG draft -06 §7.2).
+
+### Changed
+
+- The token endpoint grants signed `authorization_details` for configured ID-JAG types and includes the granted objects in the token and token response (ID-JAG draft -06 §4.4.1 and RFC 9396).
+- The server uses discovery by default for a trusted issuer without static keys or a JWKS URI. Set `discovery: false` to disable it.
+
+### Breaking
+
+- The token endpoint returns `access_denied` for subject denials and explicit principal-builder denials (ID-JAG draft -06 §4.4.3). Hosts that handle these denials as `invalid_grant` must update their error handling.
+
 ## [4.25.0] - 2026-11-20
 
 Requires `attesto >= 2.30.0 and < 3.0.0`.

@@ -206,6 +206,17 @@ Consumer.config(
   resolve_jwt_bearer_subject: fn _claims -> {:error, :not_found} end
 )
 
+Consumer.config(
+  jwt_bearer: [
+    enabled: true,
+    resolve_trusted_issuer: fn
+      "https://assertions.example", _tenant, _client -> {:ok, [jwks: %{"keys" => []}], nil}
+      _issuer, _tenant, _client -> {:error, :not_found}
+    end
+  ],
+  resolve_jwt_bearer_subject: fn _claims, _tenant -> {:error, :not_found} end
+)
+
 # An active bundled adapter fails at config construction with an actionable
 # error instead of waiting for the first outbound call to crash.
 Consumer.assert_req_failure!(
@@ -237,6 +248,16 @@ Consumer.assert_req_failure!(
   jwt_bearer: [
     enabled: true,
     issuers: %{"https://assertions.example" => [jwks_uri: "https://assertions.example/jwks"]}
+  ],
+  resolve_jwt_bearer_subject: fn _claims -> {:error, :not_found} end
+)
+
+Consumer.assert_req_failure!(
+  "JWT bearer issuer discovery",
+  "jwt_bearer: [jwks_fetcher: ...]",
+  jwt_bearer: [
+    enabled: true,
+    issuers: %{"https://assertions.example" => []}
   ],
   resolve_jwt_bearer_subject: fn _claims -> {:error, :not_found} end
 )

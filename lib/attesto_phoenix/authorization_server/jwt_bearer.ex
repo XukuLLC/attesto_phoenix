@@ -1,45 +1,45 @@
 defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   @moduledoc """
-  The resource server's half of the Identity Assertion JWT Authorization Grant
-  (ID-JAG), the grant behind MCP Enterprise-Managed Authorization (EMA) -
-  `draft-ietf-oauth-identity-assertion-authz-grant-04`.
+  Verify and redeem Identity Assertion JWT Authorization Grants (ID-JAGs) at
+  the resource authorization server.
+  [ID-JAG draft -06, §4.4](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-identity-assertion-authz-grant-06#section-4.4).
 
-  A token request arrives with
-  `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and an `assertion`
-  parameter carrying an ID-JAG: a short-lived JWT the enterprise IdP signed
-  (after its own RFC 8693 token exchange) asserting one user for this resource
-  application. `authorize/3` turns that assertion into the local subject and
-  scope ceiling the token endpoint mints from. It owns the *stateful* concerns
-  that `Attesto.IdentityAssertion` (conn-free, pure) deliberately leaves out:
+  The token endpoint accepts registered confidential clients and client ID
+  metadata document clients authenticated with RFC 7523 private-key JWT.
+  It requires authentication by default. Setting `jwt_bearer: [public_clients: :allow]`
+  permits public clients, including clients with bearer assertions. Accepting
+  an unauthenticated request with a bearer ID-JAG departs from draft -06 §4.4.
+  The token request is no longer bound to a client credential. The assertion's
+  `client_id` binding, issuer signature, short lifetime, and `jti` replay check
+  still apply.
 
-    * **issuer trust** - the assertion's `iss` must be a configured trusted
-      issuer (`jwt_bearer: [issuers: %{...}]`); an unconfigured issuer is denied
-      without revealing which issuers are trusted.
-    * **JWKS resolution** - static keys, a cached `jwks_uri` fetch (reusing the
-      SSRF-guarded CIMD fetcher + cache), or a custom `:jwks_resolver`.
-    * **`jti` replay** - prepares an issuer-scoped, fixed-size identity for the
-      configured `:replay_check` seam; the token core claims it only after all
-      exchange policy has passed, and before minting.
-    * **subject resolution** - after request policy passes, the host's
-      `:resolve_jwt_bearer_subject` callback maps the validated claims to a local
-      principal subject (or denies).
+  A host can configure trusted issuers by exact identifier or resolve them
+  from its own trust records. Remote issuer keys use the SSRF-guarded fetcher
+  and cache shared with client ID metadata. Assertion headers never supply
+  verification keys or key URLs.
 
-  Every failure returns `{:error, atom}`; the token core
-  (`AttestoPhoenix.AuthorizationServer.Token`) maps a missing `assertion`
-  parameter to RFC 6749 §5.2 `invalid_request` and every assertion/trust/replay/
-  subject failure to `invalid_grant`, as the draft requires.
-
-  This is NOT `private_key_jwt` client authentication (RFC 7523 §3) nor the
-  RFC 8693 token-exchange grant (which runs at the IdP).
+  The token endpoint maps missing assertions to `invalid_request`, assertion
+  validation failures to `invalid_grant`, and subject denials to `access_denied`
+  (RFC 6749 §5.2 and ID-JAG draft -06 §4.4.3).
   """
 
-  alias Attesto.{IdentityAssertion, Scope, StrictJSON}
+  alias Attesto.{IdentityAssertion, JWS, Scope, StrictJSON}
+  alias Attesto.URI, as: AttestoURI
+  alias AttestoPhoenix.AuthorizationServer.JwtBearer.KeyRefresh
   alias AttestoPhoenix.{Callback, Config, DPoP.Adapter, ReplayClaim}
-  alias AttestoPhoenix.ClientIdMetadata.Resolver
+  alias AttestoPhoenix.ClientIdMetadata.{Cache, FlowControl, Resolver}
 
   require Logger
 
   @jti_namespace "idjag:"
+  @metadata_cache_prefix "id-jag:metadata:"
+  @oauth_metadata_segment "/.well-known/oauth-authorization-server"
+  @oidc_metadata_segment "/.well-known/openid-configuration"
+  @refresh_limits [
+    flow_control_server: KeyRefresh,
+    max_fetches_per_host_per_window: 1,
+    fetch_rate_window_ms: 30_000
+  ]
   @cache_read_warning "AttestoPhoenix JWT-bearer JWKS cache failed; fetching fresh keys"
   @cache_write_warning "AttestoPhoenix JWT-bearer JWKS cache failed; fresh keys were not cached"
   @fetch_warning "AttestoPhoenix JWT-bearer JWKS fetch failed; keys unavailable"
@@ -61,6 +61,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   @type prepared_result :: %{
           scope_ceiling: [String.t()] | nil,
           claims: IdentityAssertion.claims(),
+          issuer_context: term(),
           replay_claim: pending_claim()
         }
 
@@ -89,9 +90,9 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   defp do_authorize(%Config{} = config, client_id, params) do
     with {:ok, prepared} <- prepare(config, client_id, params),
          :ok <- reject_unverified_cnf(prepared.claims),
-         {:ok, subject} <- resolve_subject(config, prepared.claims),
+         {:ok, subject} <- resolve_subject(config, prepared.claims, prepared.issuer_context),
          :ok <- commit_replay_claim(config, prepared.replay_claim) do
-      {:ok, prepared |> Map.delete(:replay_claim) |> Map.put(:subject, subject)}
+      {:ok, %{scope_ceiling: prepared.scope_ceiling, claims: prepared.claims, subject: subject}}
     end
   end
 
@@ -109,29 +110,40 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   The token core uses this variant so sender binding, resource, scope, and host
   policy can finish before invoking a potentially side-effecting subject
   resolver or consuming the assertion. A caller MUST then call
-  `resolve_subject/2` and pass `:replay_claim` to `commit_replay_claim/2` before
+  `resolve_subject/3` with `:issuer_context`, then pass `:replay_claim` to `commit_replay_claim/2` before
   minting or releasing an authorization result. Most callers should use
   `authorize/3`, which performs both steps itself.
   """
   @spec prepare(Config.t(), String.t() | nil, map()) ::
           {:ok, prepared_result()} | {:error, error()}
   def prepare(%Config{} = config, client_id, params) when is_map(params) do
-    Config.with_request_config(config, fn -> do_prepare(config, client_id, params) end)
+    prepare(config, client_id, params, client_id)
   end
 
-  defp do_prepare(%Config{} = config, client_id, params) do
+  @doc """
+  Prepare an assertion using the request client supplied to the issuer resolver.
+  `prepare/3` supplies the client identifier when only that identifier is available.
+  """
+  @spec prepare(Config.t(), String.t() | nil, map(), term()) ::
+          {:ok, prepared_result()} | {:error, error()}
+  def prepare(%Config{} = config, client_id, params, client) when is_map(params) do
+    Config.with_request_config(config, fn -> do_prepare(config, client_id, params, client) end)
+  end
+
+  defp do_prepare(%Config{} = config, client_id, params, client) do
     opts = Config.jwt_bearer(config)
 
     with {:ok, assertion} <- require_assertion(params),
-         {:ok, issuer} <- peek_issuer(assertion),
-         {:ok, issuer_opts} <- trusted_issuer(opts, issuer),
-         {:ok, jwks} <- resolve_jwks(opts, issuer, issuer_opts),
-         {:ok, claims} <- verify(config, opts, assertion, issuer, issuer_opts, jwks, client_id),
+         {:ok, issuer, aud_tenant} <- peek_issuer(assertion),
+         {:ok, issuer_opts, context} <- trusted_issuer(opts, issuer, aud_tenant, client),
+         {:ok, key_source} <- key_source(opts, issuer, issuer_opts),
+         {:ok, claims} <- verify(config, opts, assertion, issuer, issuer_opts, key_source, client_id),
          {:ok, replay_claim} <- prepare_replay(opts, claims) do
       {:ok,
        %{
          scope_ceiling: scope_ceiling(claims),
          claims: claims,
+         issuer_context: context,
          replay_claim: replay_claim
        }}
     end
@@ -141,12 +153,19 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   Resolve verified ID-JAG claims to a local principal subject.
 
   Required when the feature is enabled (configuration validation enforces this), so
-  an unset callback is a configuration fault rather than a per-request denial.
+  an unset callback is a configuration fault. The two-argument host callback
+  receives the verified claims and a map containing `:issuer_context` and the
+  verified `:aud_tenant`. The one-argument form receives only the claims.
   """
   @spec resolve_subject(Config.t(), IdentityAssertion.claims()) ::
           {:ok, String.t()} | {:error, :subject_denied}
-  def resolve_subject(%Config{} = config, claims) when is_map(claims) do
-    case Callback.invoke(Config.resolve_jwt_bearer_subject_fun(config), [claims], :no_callback) do
+  @spec resolve_subject(Config.t(), IdentityAssertion.claims(), term()) ::
+          {:ok, String.t()} | {:error, :subject_denied}
+  def resolve_subject(%Config{} = config, claims, context \\ nil) when is_map(claims) do
+    {callback, arity} = Config.resolve_jwt_bearer_subject_callback(config)
+    args = if arity == 2, do: [claims, %{issuer_context: context, aud_tenant: claims["aud_tenant"]}], else: [claims]
+
+    case Callback.invoke(callback, args, :no_callback) do
       {:ok, subject} when is_binary(subject) and subject != "" -> {:ok, subject}
       subject when is_binary(subject) and subject != "" -> {:ok, subject}
       _ -> {:error, :subject_denied}
@@ -165,6 +184,8 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     Config.with_request_config(config, fn -> do_commit_replay_claim(config, key, ttl) end)
   end
 
+  # Reuse DPoP's configured `:replay_check` or the bundled ETS cache to claim
+  # the issuer-scoped assertion identifier before minting.
   defp do_commit_replay_claim(config, key, ttl) do
     ReplayClaim.commit(Adapter.replay_check(config), key, ttl)
   end
@@ -177,63 +198,132 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   end
 
   defp peek_issuer(assertion) do
-    case IdentityAssertion.peek_issuer(assertion) do
-      {:ok, issuer} -> {:ok, issuer}
-      :error -> {:error, :invalid_assertion}
+    with {:ok, %{"iss" => issuer} = claims} when is_binary(issuer) and issuer != "" <-
+           IdentityAssertion.peek_claims(assertion),
+         {:ok, aud_tenant} <- peek_aud_tenant(claims) do
+      {:ok, issuer, aud_tenant}
+    else
+      _ -> {:error, :invalid_assertion}
     end
   end
 
-  # The assertion's (still-unverified) issuer must be a configured trusted
-  # issuer. Denied as `:untrusted_issuer` without revealing the trusted set.
-  defp trusted_issuer(opts, issuer) do
-    opts
-    |> Keyword.get(:issuers, %{})
-    |> Map.get(issuer)
-    |> case do
-      nil -> {:error, :untrusted_issuer}
-      issuer_opts -> {:ok, normalize_issuer_opts(issuer_opts)}
-    end
-  end
+  defp peek_aud_tenant(%{"aud_tenant" => tenant}) when is_binary(tenant), do: {:ok, tenant}
+  defp peek_aud_tenant(%{"aud_tenant" => _tenant}), do: :error
+  defp peek_aud_tenant(_claims), do: {:ok, nil}
 
-  defp normalize_issuer_opts(opts) when is_list(opts), do: Map.new(opts)
-  defp normalize_issuer_opts(%{} = opts), do: opts
-  defp normalize_issuer_opts(_opts), do: %{}
-
-  # JWKS resolution precedence: a custom `:jwks_resolver` (full host control),
-  # then per-issuer static `:jwks`, then a cached `:jwks_uri` fetch.
-  defp resolve_jwks(opts, issuer, issuer_opts) do
-    cond do
-      resolver = Keyword.get(opts, :jwks_resolver) ->
-        case Callback.invoke(resolver, [issuer, issuer_opts]) do
-          {:ok, jwks} when is_map(jwks) or is_list(jwks) -> {:ok, jwks}
-          _ -> {:error, :jwks_unavailable}
+  # Establish trust before looking up keys (ID-JAG draft -06 §4.4.1). Pass
+  # the unverified `iss`, unverified `aud_tenant`, and request client to
+  # `:resolve_trusted_issuer` when configured. Otherwise look up the exact
+  # `iss` in `:issuers`. A resolver refusal is final. Reject a trust record
+  # whose explicit issuer differs from `iss`.
+  defp trusted_issuer(opts, issuer, aud_tenant, client) do
+    case Keyword.get(opts, :resolve_trusted_issuer) do
+      nil ->
+        case Map.fetch(Keyword.get(opts, :issuers, %{}), issuer) do
+          {:ok, issuer_opts} -> resolved_issuer(issuer_opts, issuer, nil)
+          :error -> {:error, :untrusted_issuer}
         end
 
-      jwks = Map.get(issuer_opts, :jwks) ->
-        {:ok, jwks}
-
-      uri = Map.get(issuer_opts, :jwks_uri) ->
-        fetch_jwks(opts, uri)
-
-      true ->
-        {:error, :jwks_unavailable}
+      resolver ->
+        case Callback.invoke(resolver, [issuer, aud_tenant, client]) do
+          {:ok, issuer_opts, context} -> resolved_issuer(issuer_opts, issuer, context)
+          _ -> {:error, :untrusted_issuer}
+        end
     end
   end
 
-  defp fetch_jwks(opts, uri) do
+  defp resolved_issuer(issuer_opts, issuer, context) when is_list(issuer_opts) do
+    if Keyword.keyword?(issuer_opts),
+      do: resolved_issuer(Map.new(issuer_opts), issuer, context),
+      else: {:error, :untrusted_issuer}
+  end
+
+  defp resolved_issuer(%{} = issuer_opts, issuer, context) do
+    if Map.get(issuer_opts, :issuer, issuer) == issuer,
+      do: {:ok, issuer_opts, context},
+      else: {:error, :untrusted_issuer}
+  end
+
+  defp resolved_issuer(_issuer_opts, _issuer, _context), do: {:error, :untrusted_issuer}
+
+  # After establishing issuer trust, use `:jwks_resolver` when configured.
+  # Otherwise use static `:jwks`, explicit `discovery: true`, then `:jwks_uri`.
+  # Without keys or a URI, discover the URI unless discovery is disabled.
+  # If the chosen source fails, reject the assertion. Fetch remote keys
+  # through the SSRF-guarded CIMD fetcher and cache.
+  defp key_source(opts, issuer, issuer_opts) do
+    case Keyword.get(opts, :jwks_resolver) do
+      nil ->
+        configured_key_source(opts, issuer, issuer_opts)
+
+      resolver ->
+        case Callback.invoke(resolver, [issuer, issuer_opts]) do
+          {:ok, jwks} when is_map(jwks) or is_list(jwks) -> {:ok, {:static, jwks}}
+          _ -> {:error, :jwks_unavailable}
+        end
+    end
+  end
+
+  defp configured_key_source(opts, issuer, issuer_opts) do
+    cond do
+      jwks = Map.get(issuer_opts, :jwks) -> {:ok, {:static, jwks}}
+      Map.get(issuer_opts, :discovery) == true -> discover_jwks_uri(opts, issuer)
+      uri = Map.get(issuer_opts, :jwks_uri) -> {:ok, {:remote, uri}}
+      Map.get(issuer_opts, :discovery, true) == true -> discover_jwks_uri(opts, issuer)
+      true -> {:error, :jwks_unavailable}
+    end
+  end
+
+  # RFC 8414 §3.1 inserts the well-known segment before the issuer path.
+  # OpenID Connect Discovery §4.1 appends its segment to that path.
+  # Fetch OAuth metadata first and try OpenID Connect Discovery only on a 404.
+  defp discover_jwks_uri(opts, issuer) do
+    cache_key = @metadata_cache_prefix <> issuer
+
+    with true <- AttestoURI.issuer_identifier?(issuer),
+         {:ok, %{"jwks_uri" => uri}} <-
+           cached_document(opts, cache_key, &issuer_metadata?(issuer, &1), fn -> fetch_metadata(opts, issuer) end) do
+      {:ok, {:remote, uri}}
+    else
+      _ -> {:error, :jwks_unavailable}
+    end
+  end
+
+  defp fetch_metadata(opts, issuer) do
+    uri = URI.parse(issuer)
+    path = String.replace_suffix(uri.path || "", "/", "")
+    oauth_url = URI.to_string(%{uri | path: @oauth_metadata_segment <> path})
+
+    case fetch_document(opts, oauth_url) do
+      {:error, {:status, 404}} ->
+        fetch_document(opts, URI.to_string(%{uri | path: path <> @oidc_metadata_segment}))
+
+      result ->
+        result
+    end
+  end
+
+  # RFC 8414 §3.3 and OpenID Connect Discovery §4.3 require exact issuer matching.
+  defp issuer_metadata?(issuer, %{"issuer" => issuer, "jwks_uri" => uri}), do: AttestoURI.https_identifier?(uri)
+  defp issuer_metadata?(_issuer, _metadata), do: false
+
+  defp jwks?(%{"keys" => keys}) when is_list(keys), do: true
+  defp jwks?(_document), do: false
+
+  defp cached_document(opts, key, valid?, fetch) do
     cache = Keyword.get(opts, :jwks_cache)
 
-    case cache_get(cache, uri) do
-      {:ok, jwks} -> {:ok, jwks}
-      :miss -> fetch_and_cache(opts, cache, uri)
+    case cache_get(cache, key, valid?) do
+      {:ok, document} -> {:ok, document}
+      :miss -> fetch_and_cache(opts, key, valid?, fetch)
     end
   end
 
-  defp cache_get(nil, _uri), do: :miss
+  defp cache_get(nil, _key, _valid?), do: :miss
 
-  defp cache_get(cache, uri) do
-    case cache.get(uri) do
-      {:ok, %{"keys" => keys} = jwks} when is_list(keys) -> {:ok, jwks}
+  defp cache_get(cache, key, valid?) do
+    case cache.get(key) do
+      {:ok, document} -> if valid?.(document), do: {:ok, document}, else: warn_cache_read_fault()
       :miss -> :miss
       _fault -> warn_cache_read_fault()
     end
@@ -243,21 +333,30 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     _kind, _reason -> warn_cache_read_fault()
   end
 
-  defp fetch_and_cache(opts, cache, uri) do
+  defp fetch_document(opts, uri) do
     fetcher = Keyword.fetch!(opts, :jwks_fetcher)
     # JWK sets with several keys exceed the CIMD body cap, so raise the default
     # unless the host pinned its own.
     fetch_opts = opts |> Keyword.get(:fetch_opts, []) |> Keyword.put_new(:max_document_bytes, 16_384)
 
-    case fetcher.fetch(uri, fetch_opts) do
-      {:ok, %{body: body, cache_control: cache_control}} ->
-        case StrictJSON.decode(body) do
-          {:ok, %{"keys" => keys} = jwks} when is_list(keys) ->
-            cache_put(cache, uri, jwks, cache_control, opts)
-            {:ok, jwks}
+    with true <- is_atom(fetcher) and Code.ensure_loaded?(fetcher) and function_exported?(fetcher, :fetch, 2),
+         {:ok, %{body: body, cache_control: cache_control}} <- fetcher.fetch(uri, fetch_opts),
+         {:ok, document} <- StrictJSON.decode(body) do
+      {:ok, document, cache_control}
+    else
+      false -> {:error, :fetcher_unavailable}
+      error -> error
+    end
+  end
 
-          _ ->
-            {:error, :jwks_unavailable}
+  defp fetch_and_cache(opts, key, valid?, fetch, refresh? \\ false) do
+    case fetch.() do
+      {:ok, document, cache_control} ->
+        if valid?.(document) do
+          cache_put(Keyword.get(opts, :jwks_cache), key, document, cache_control, opts, refresh?)
+          {:ok, document}
+        else
+          {:error, :jwks_unavailable}
         end
 
       {:error, _reason} ->
@@ -266,19 +365,21 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     end
   end
 
-  defp cache_put(nil, _uri, _jwks, _cache_control, _opts), do: :ok
+  defp cache_put(nil, _key, _document, _cache_control, _opts, _refresh?), do: :ok
 
-  defp cache_put(cache, uri, jwks, cache_control, opts) do
+  defp cache_put(cache, key, document, cache_control, opts, refresh?) do
     bounds = Keyword.get(opts, :jwks_cache_ttl_bounds, {300, 86_400})
     expires_at = Resolver.key_cache_expires_at(cache_control, cache_ttl_bounds: bounds)
 
-    if DateTime.after?(expires_at, DateTime.utc_now()) do
-      case cache.put(uri, jwks, expires_at) do
-        :ok -> :ok
-        _fault -> warn_cache_write_fault()
-      end
-    else
-      :ok
+    cond do
+      DateTime.after?(expires_at, DateTime.utc_now()) ->
+        if cache.put(key, document, expires_at) != :ok, do: warn_cache_write_fault()
+
+      refresh? ->
+        if Cache.evict(cache, key) != :ok, do: warn_cache_write_fault()
+
+      true ->
+        :ok
     end
   rescue
     _exception -> warn_cache_write_fault()
@@ -296,7 +397,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     :ok
   end
 
-  defp verify(config, opts, assertion, issuer, issuer_opts, jwks, client_id) do
+  defp verify(config, opts, assertion, issuer, issuer_opts, key_source, client_id) do
     verify_opts =
       [
         issuer: issuer,
@@ -305,13 +406,63 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
         max_lifetime_seconds: Keyword.get(opts, :assertion_max_lifetime_seconds)
       ] ++ accepted_algs_opt(issuer_opts)
 
-    case IdentityAssertion.verify(assertion, jwks, verify_opts) do
+    case verify_with_keys(key_source, opts, assertion, verify_opts) do
       {:ok, claims} ->
         {:ok, claims}
 
       {:error, reason} ->
         Logger.debug("jwt_bearer: assertion rejected (#{inspect(reason)})")
         {:error, :invalid_assertion}
+    end
+  end
+
+  defp verify_with_keys({:static, jwks}, _opts, assertion, verify_opts) do
+    IdentityAssertion.verify(assertion, jwks, verify_opts)
+  end
+
+  defp verify_with_keys({:remote, uri}, opts, assertion, verify_opts) do
+    case cache_get(Keyword.get(opts, :jwks_cache), uri, &jwks?/1) do
+      {:ok, jwks} ->
+        verify_cached_keys(jwks, opts, uri, assertion, verify_opts)
+
+      :miss ->
+        with {:ok, jwks} <- fetch_jwks(opts, uri), do: IdentityAssertion.verify(assertion, jwks, verify_opts)
+    end
+  end
+
+  defp verify_cached_keys(jwks, opts, uri, assertion, verify_opts) do
+    case IdentityAssertion.verify(assertion, jwks, verify_opts) do
+      {:error, :invalid_signature} = error ->
+        if unknown_kid?(assertion, jwks),
+          do: refresh_and_verify_keys(opts, uri, assertion, verify_opts),
+          else: error
+
+      result ->
+        result
+    end
+  end
+
+  defp refresh_and_verify_keys(opts, uri, assertion, verify_opts) do
+    issuer = Keyword.fetch!(verify_opts, :issuer)
+    refresh = fn -> fetch_jwks(opts, uri, true) end
+
+    case FlowControl.run(issuer, :id_jag_key_refresh, {uri, opts}, @refresh_limits, refresh) do
+      {:ok, jwks} -> IdentityAssertion.verify(assertion, jwks, verify_opts)
+      {:error, _reason} -> {:error, :invalid_signature}
+    end
+  end
+
+  defp fetch_jwks(opts, uri, refresh? \\ false) do
+    fetch_and_cache(opts, uri, &jwks?/1, fn -> fetch_document(opts, uri) end, refresh?)
+  end
+
+  defp unknown_kid?(assertion, %{"keys" => keys}) do
+    case JWS.peek_json(assertion, :protected, max_compact_bytes: IdentityAssertion.max_assertion_bytes()) do
+      {:ok, %{"kid" => kid}} when is_binary(kid) and kid != "" ->
+        not Enum.any?(keys, &match?(%{"kid" => ^kid}, &1))
+
+      _ ->
+        false
     end
   end
 
@@ -322,8 +473,8 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     end
   end
 
-  # draft §6.1: the assertion `jti` MUST be replay-protected. RFC 7519 scopes
-  # `jti` uniqueness to its issuer. Hash the verified issuer
+  # Accept each assertion once by tracking its `jti` (ID-JAG draft -06 §4.4.4).
+  # RFC 7519 scopes `jti` uniqueness to its issuer. Hash the verified issuer
   # and bounded `jti` into an opaque, fixed-size store key: two trusted IdPs may
   # legitimately choose the same identifier without colliding, while raw IdP
   # input never reaches a database key.
@@ -351,7 +502,7 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     end
   end
 
-  # draft §6.1: `scope` is OPTIONAL. When present it is the UPPER bound on what
+  # ID-JAG draft -06 §§3.1 and 4.4.1: `scope` is OPTIONAL. When present it is the UPPER bound on what
   # the issued token may carry (the token core narrows further via the host
   # `:authorize_scope` policy). An absent scope claim places no ceiling.
   defp scope_ceiling(%{"scope" => scope}) when is_binary(scope) do
