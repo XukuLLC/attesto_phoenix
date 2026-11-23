@@ -86,11 +86,13 @@ defmodule AttestoPhoenix.Event do
   * `:refresh_rotated` - a refresh token was exchanged and a new refresh token
     issued, invalidating the presented one (RFC 6749 §6, RFC 6819 §5.2.2.3).
     Carries the resource-owner `:subject`.
-  * `:refresh_reuse_detected` - an already-rotated refresh token was presented
-    again outside the recoverable retry case (RFC 6819 §5.2.2.3). Emitted
-    alongside the ordinary `:token_denied` event. Detailed family and subject
-    correlation remains on core telemetry at
-    `[:attesto, :refresh_token, :reuse_detected]`.
+  * `:refresh_reuse_detected` - the client a refresh token was issued to
+    presented it again after it was rotated, outside the recoverable retry case
+    (RFC 6819 §5.2.2.3). Emitted alongside the ordinary `:token_denied` event.
+    Detailed family and subject correlation remains on core telemetry at
+    `[:attesto, :refresh_token, :reuse_detected]`. A token presented by a
+    different client is refused with only `:token_denied` and revokes nothing;
+    core telemetry reports it at `[:attesto, :refresh_token, :client_mismatch]`.
   * `:auth_succeeded` - a presented access token authenticated a protected
     resource request (RFC 6750 §2.1).
   * `:auth_denied` - a protected resource request was rejected (RFC 6750 §3.1).

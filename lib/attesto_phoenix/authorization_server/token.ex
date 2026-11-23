@@ -356,12 +356,12 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   # RFC 6749 §6 + §10.4: refresh-token rotation with reuse detection.
   defp dispatch(%Request{grant_type: "refresh_token"} = request) do
-    %{config: config, params: params} = request
+    %{params: params} = request
 
     with {:ok, presented} <- require_param(params, "refresh_token"),
          requested = parse_requested_scope(params),
          {:ok, requested_credentials} <- requested_credential_configurations(params),
-         :ok <- validate_refresh_credential_request(config, presented, requested, requested_credentials),
+         :ok <- validate_refresh_credential_request(request, presented, requested, requested_credentials),
          {:ok, resource} <- refresh_requested_resource(params),
          {:ok, binding, token_type, pending_claim} <- resolve_sender_constraint(request),
          :ok <- commit_claim_for_presented_grant(request, :refresh, presented, pending_claim) do
@@ -1071,8 +1071,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # been accepted, so a refusal consumes nothing.
   defp commit_claim_for_presented_grant(%Request{}, _kind, _presented, nil), do: :ok
 
-  defp commit_claim_for_presented_grant(%Request{config: config}, kind, presented, pending) do
-    if grant_present?(config, kind, presented) do
+  defp commit_claim_for_presented_grant(%Request{config: config} = request, kind, presented, pending) do
+    if grant_present?(request, kind, presented) do
       SenderConstraint.commit_replay_claim(config, pending)
     else
       # The grant is absent or unusable. Say so without touching the replay
@@ -1083,7 +1083,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp grant_present?(config, :code, code) do
+  defp grant_present?(%Request{config: config}, :code, code) do
     store = grant_store(config, :code_store)
     Attesto.CodeStore.validate!(store)
 
@@ -1095,21 +1095,41 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
     end
   end
 
-  defp grant_present?(config, :refresh, token) do
-    grant_present_in_store?(grant_store(config, :refresh_store), Attesto.Secret.hash(token))
-  end
+  defp grant_present?(request, :refresh, token), do: match?({:ok, _record}, presented_refresh_record(request, token))
 
-  defp grant_present_in_store?(store, grant_hash) do
-    case store.get(grant_hash) do
+  # The token endpoint reads a presented refresh token before rotation in three
+  # places: the credential authorization-details check, the DPoP replay claim,
+  # and the `:refresh_completion` context. Each treats a token that is not
+  # bound to the requesting client and this issuer as absent, the same as an
+  # unknown token, so a client the token was not issued to learns nothing about
+  # it, causes no replay-store write, and never reaches the host callback.
+  # Rotation then refuses it with the generic refresh description.
+  defp presented_refresh_record(%Request{config: config} = request, presented) do
+    store = grant_store(config, :refresh_store)
+
+    case store && store.get(Attesto.Secret.hash(presented)) do
+      {:ok, %{data: %{} = data} = record} ->
+        if refresh_bound_to_request?(data, request), do: {:ok, record}, else: :error
+
       {:ok, _record} ->
-        true
+        :error
 
-      :error ->
-        false
+      result when result in [nil, :error] ->
+        :error
 
       _invalid ->
         raise RuntimeError, "#{inspect(store)}.get/1 violated its grant-store return contract"
     end
+  end
+
+  defp refresh_bound_to_request?(data, %Request{config: config} = request) do
+    client_bound? =
+      case Map.get(data, :client_id) do
+        nil -> true
+        client_id -> client_id == token_client_id(request)
+      end
+
+    client_bound? and Attesto.RefreshToken.issuer_matches?(data, config.issuer)
   end
 
   defp redeem_code(%Request{config: config} = request, code, verifier, redirect_uri, jkt) do
@@ -1462,7 +1482,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
               Continuation.run(refresh_completion_profile(), &Callback.invoke(callback, &1), current, work)
 
             :error ->
-              {:error, grant_error(:invalid_grant)}
+              {:error, refresh_grant_error(:invalid_grant)}
           end
         end)
       after
@@ -1507,10 +1527,8 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # Read, without consuming it, the record the presented token names. Only
   # identifiers and policy inputs go to the host: no token, no token hash, no
   # successor material, no host claims.
-  defp refresh_completion_context(%Request{config: config} = request, presented) do
-    store = grant_store(config, :refresh_store)
-
-    case store && store.get(Attesto.Secret.hash(presented)) do
+  defp refresh_completion_context(%Request{} = request, presented) do
+    case presented_refresh_record(request, presented) do
       {:ok, %{family_id: family_id, data: %{} = data}} ->
         claims = Map.get(data, :claims)
 
@@ -2769,12 +2787,10 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
   defp valid_requested_credential_entry?(_entry), do: false
 
-  defp validate_refresh_credential_request(_config, _presented, _scope, nil), do: :ok
+  defp validate_refresh_credential_request(_request, _presented, _scope, nil), do: :ok
 
-  defp validate_refresh_credential_request(config, presented, requested_scope, requested) do
-    with store when is_atom(store) and not is_nil(store) <- grant_store(config, :refresh_store),
-         {:ok, %{data: context}} <- store.get(Attesto.Secret.hash(presented)),
-         true <- is_map(context),
+  defp validate_refresh_credential_request(%Request{config: config} = request, presented, requested_scope, requested) do
+    with {:ok, %{data: context}} <- presented_refresh_record(request, presented),
          scope = if(requested_scope == [], do: context.scope, else: requested_scope),
          permitted = refresh_credential_ids(config, context, scope),
          true <- Enum.all?(requested, &(&1 in permitted)) do

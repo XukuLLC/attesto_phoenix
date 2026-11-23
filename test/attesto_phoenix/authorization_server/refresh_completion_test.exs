@@ -207,6 +207,33 @@ defmodule AttestoPhoenix.AuthorizationServer.RefreshCompletionTest do
     assert generations(ctx.family_id) == [0, 1]
   end
 
+  test "a token presented by another client never reaches the callback and gets the generic description", ctx do
+    test_pid = self()
+
+    watching =
+      config(
+        refresh_completion: fn context, continuation ->
+          send(test_pid, {:completion, context})
+          continuation.()
+        end
+      )
+
+    other_client = %{@client | id: "client-2"}
+
+    other_request = %{
+      refresh_request(watching, ctx.refresh_token)
+      | client: other_client,
+        request_client_id: "client-2"
+    }
+
+    assert {:error, %OAuthError{error: :invalid_grant, error_description: description}, _events} =
+             issue(watching, other_request)
+
+    assert description == "the refresh token is invalid or its authorization was revoked"
+    refute_received {:completion, _}
+    assert generations(ctx.family_id) == [0]
+  end
+
   test "a host refusal leaves the presented token usable", ctx do
     refusing = config(refresh_completion: fn _context, _continuation -> {:error, invalid_grant()} end)
 

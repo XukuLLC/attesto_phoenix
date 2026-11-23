@@ -26,7 +26,7 @@ defmodule AttestoPhoenix.ConsumerWithoutReq.MixProject do
   defp attesto_dep do
     case System.get_env("ATTESTO_SOURCE_PATH") do
       path when is_binary(path) and path != "" -> {:attesto, path: Path.expand(path), override: true}
-      _unset -> {:attesto, "== 2.31.0", override: true}
+      _unset -> {:attesto, "== 2.31.1", override: true}
     end
   end
 end

@@ -6,6 +6,19 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.27.1] - 2026-11-23
+
+Requires `attesto >= 2.31.1 and < 3.0.0`.
+
+### Security
+
+- A refresh token presented by a client it was not issued to gets "the refresh token is invalid or its authorization was revoked" whether the token is live, expired or already rotated. In 4.27.0 an expired token gave "the refresh token has expired" and a rotated one gave the reuse description and revoked the owner's family, which told the presenter the token existed and belonged to another client. Attesto 2.31.1 checks the client binding first.
+- The three places the token endpoint reads a presented refresh token before rotating it treat a token not bound to the requesting client and this issuer as absent, the same as an unknown token: the credential `authorization_details` check, the DPoP replay claim, and the `:refresh_completion` callback. Before, a client the token was not issued to could tell an existing token from an unknown one by the `invalid_authorization_details` response, by whether its DPoP proof was claimed, or by the host callback running with the owner's subject and session.
+
+### Changed
+
+- A rotated refresh token presented by a different client no longer emits `:refresh_reuse_detected` or revokes the family; it gets `:token_denied`. Core telemetry reports it at `[:attesto, :refresh_token, :client_mismatch]`.
+
 ## [4.27.0] - 2026-11-22
 
 ### Security

@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.27.0"
+  @version "4.27.1"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.31.0 and < 3.0.0"
+  @attesto_requirement ">= 2.31.1 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,7 +76,8 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # Attesto 2.31.0 validates the optional ID-JAG draft -06 claims.
+  # Attesto 2.31.1 checks a refresh token's client binding before its expiry
+  # and reuse state, which the reason-specific refresh errors rely on.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 

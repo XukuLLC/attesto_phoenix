@@ -157,7 +157,7 @@ def deps do
 end
 ```
 
-Requires `attesto >= 2.31.0 and < 3.0.0`.
+Requires `attesto >= 2.31.1 and < 3.0.0`.
 
 For `prompt=login`, the authentication callback must return `auth_time` at or
 later than `auth_opts.parked_at` on an interaction resume. Fresh requests allow

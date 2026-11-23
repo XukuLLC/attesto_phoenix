@@ -1564,6 +1564,102 @@ defmodule AttestoPhoenix.AuthorizationServer.TokenTest do
                Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
     end
 
+    test "another client presenting a refresh token does not claim its DPoP proof" do
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1",
+          issuer: @issuer
+        })
+
+      test_pid = self()
+
+      config =
+        config(
+          refresh_store: refresh_store,
+          dpop_enabled: true,
+          replay_check: fn _key, _ttl ->
+            send(test_pid, :dpop_replay_claimed)
+            :ok
+          end
+        )
+
+      {proof, _jkt} = dpop_proof_and_jkt()
+      other_client = @client |> Map.put(:id, "client-2") |> Map.put(:public?, true)
+
+      request =
+        request(config,
+          client: other_client,
+          client_auth_method: :none,
+          grant_type: "refresh_token",
+          request_client_id: "client-2",
+          params: %{"refresh_token" => refresh_token},
+          sender_constraint_input: %{
+            dpop_proof: proof,
+            mtls_cert_der: nil,
+            http_uri: "https://issuer.example/oauth/token",
+            http_method: "POST"
+          }
+        )
+
+      assert {:error, %OAuthError{error: :invalid_grant, error_description: description}, _events} =
+               Token.issue(config, request)
+
+      assert description == "the refresh token is invalid or its authorization was revoked"
+      refute_received :dpop_replay_claimed
+
+      assert {:ok, %{consumed: false}} =
+               Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh_token))
+    end
+
+    test "another client cannot tell a real credential refresh token from an unknown one" do
+      refresh_store = start_refresh_store()
+
+      {:ok, %{token: refresh_token}} =
+        Attesto.RefreshToken.issue(refresh_store, %{
+          subject: "oc_user-1",
+          scope: ["read"],
+          client_id: "client-1",
+          issuer: @issuer,
+          claims: %{
+            "credential_configuration_ids" => ["PID"],
+            "attesto_phoenix.credential_authorization_details_ids" => ["PID"]
+          }
+        })
+
+      config =
+        config(
+          refresh_store: refresh_store,
+          credential_configurations_supported: %{
+            "PID" => %{format: "dc+sd-jwt", vct: "https://issuer.example/credentials/pid", scope: "read"}
+          }
+        )
+
+      details = ~s([{"type":"openid_credential","credential_configuration_id":"PID"}])
+
+      present = fn token, client_id ->
+        request =
+          request(config,
+            client: Map.put(@client, :id, client_id),
+            grant_type: "refresh_token",
+            request_client_id: client_id,
+            params: %{"refresh_token" => token, "authorization_details" => details}
+          )
+
+        case Token.issue(config, request) do
+          {:error, error, _events} -> {:error, error}
+          {:error, error} -> {:error, error}
+          other -> other
+        end
+      end
+
+      assert present.(refresh_token, "client-2") == present.("not-a-real-refresh-token", "client-2")
+      assert {:ok, %{refresh_token: _}, _events} = present.(refresh_token, "client-1")
+    end
+
     test "a DPoP refresh_rotated event carries the token type and jkt" do
       {proof, jkt} = dpop_proof_and_jkt()
       refresh_store = start_refresh_store()

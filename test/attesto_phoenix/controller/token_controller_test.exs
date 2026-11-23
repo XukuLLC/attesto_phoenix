@@ -2357,6 +2357,43 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
 
       assert_refresh_refused(conn, "the refresh token is invalid or its authorization was revoked")
     end
+
+    test "another client presenting an expired refresh token gets the unknown-token description" do
+      put_config(refresh_token_ttl: 1)
+      Process.put(:auth_code, nil)
+      put_config(code_store: start_code_store("oc_sub-1", ["read", "offline_access"]))
+      initial = post_auth_code()
+      assert initial.status == 200
+      Process.sleep(1_100)
+
+      conn =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "refresh_token" => body(initial)["refresh_token"]
+        })
+
+      assert_refresh_refused(conn, "the refresh token is invalid or its authorization was revoked")
+      assert_refresh_refused(post_refresh(body(initial)["refresh_token"]), "the refresh token has expired")
+    end
+
+    test "another client presenting a rotated refresh token gets the unknown-token description and revokes nothing",
+         %{refresh: refresh} do
+      rotated = post_refresh(refresh)
+      assert rotated.status == 200
+
+      conn =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "refresh_token" => refresh
+        })
+
+      assert_refresh_refused(conn, "the refresh token is invalid or its authorization was revoked")
+      assert post_refresh(body(rotated)["refresh_token"]).status == 200
+    end
   end
 
   describe "initial refresh-token issuance (RFC 6749 §6)" do
