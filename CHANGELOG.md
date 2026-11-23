@@ -8,6 +8,10 @@ defaults in a minor release.
 
 ## [4.27.0] - 2026-11-22
 
+### Security
+
+- Requires `phoenix ~> 1.7.25 or >= 1.8.17 and < 2.0.0` (was `~> 1.7.24 or >= 1.8.9`). Phoenix before 1.7.25 and 1.8.17 crashes shared broadcast dispatch when a client selects the V1 serializer and sends a binary payload (CVE-2026-129344, GHSA-5vmc-qgf8-rw36), and crashes the Presence tracker on an unsanitized presence key (CVE-2026-128361, GHSA-pvfx-rx4x-phrr). AttestoPhoenix uses neither Channels nor Presence; the floor moves hosts that do onto the fixed releases.
+
 ### Changed
 
 - Refresh-token `invalid_grant` responses carry a reason-specific `error_description`. The error code and HTTP status are unchanged (RFC 6749 §5.2). Clients that matched the old text, "authorization grant is invalid or expired", must update.

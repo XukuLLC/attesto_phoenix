@@ -132,7 +132,7 @@ defmodule AttestoPhoenix.MixProject do
       # Runtime events emitted by the sweeper-liveness monitor.
       {:telemetry, "~> 1.0"},
       # Controllers + the attesto_routes/1 router macro.
-      {:phoenix, "~> 1.7.24 or >= 1.8.9 and < 2.0.0"},
+      {:phoenix, "~> 1.7.25 or >= 1.8.17 and < 2.0.0"},
       # Optional OpenAPI structs for hosts that publish an OpenApiSpex spec.
       {:open_api_spex, "~> 3.0", optional: true},
       # Plug behaviours for the protected-resource plugs (also a Phoenix
