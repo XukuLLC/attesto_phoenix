@@ -32,6 +32,7 @@ defmodule AttestoPhoenix.RouterTest do
   alias AttestoPhoenix.Controller.TokenController
   alias AttestoPhoenix.Controller.UserinfoController
   alias Phoenix.Router.NoRouteError
+  alias Phoenix.Router.Route
   alias Plug.Conn.WrapperError
 
   @federation_path "/.well-known/openid-federation"
@@ -490,7 +491,13 @@ defmodule AttestoPhoenix.RouterTest do
     {metadata, prepare, _pipeline, _dispatch} =
       match
 
-    prepare.(Plug.Test.conn(method, path), metadata)
+    conn = Plug.Test.conn(method, path)
+
+    # Phoenix 1.7 returns a prepare closure; 1.8.17 returns data that
+    # Phoenix.Router.Route.prepare/3 applies, as its own dispatcher does.
+    if is_function(prepare, 2),
+      do: prepare.(conn, metadata),
+      else: Route.prepare(conn, metadata, prepare)
   end
 
   defp metadata_config(overrides) do
