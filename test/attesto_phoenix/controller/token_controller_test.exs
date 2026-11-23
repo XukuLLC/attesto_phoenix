@@ -2294,6 +2294,71 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
   end
 
   # FIX 5 - INITIAL REFRESH-TOKEN ISSUANCE (RFC 6749 §4.1.4 / §6).
+  describe "refresh-token invalid_grant descriptions (RFC 6749 §5.2)" do
+    setup do
+      enable_minting()
+      start_refresh_store()
+      code_store = start_code_store("oc_sub-1", ["read", "offline_access"])
+
+      put_config(
+        refresh_store: Attesto.RefreshStore.ETS,
+        code_store: code_store,
+        refresh_token_rotation_grace_seconds: 0
+      )
+
+      initial = post_auth_code()
+      assert initial.status == 200
+      %{refresh: body(initial)["refresh_token"]}
+    end
+
+    test "a reused refresh token says every token from the authorization was revoked", %{refresh: refresh} do
+      assert post_refresh(refresh).status == 200
+
+      assert_refresh_refused(
+        post_refresh(refresh),
+        "the refresh token was already used; every token from this authorization has been revoked"
+      )
+    end
+
+    test "a refresh token whose authorization was revoked says it is invalid or revoked", %{refresh: refresh} do
+      {:ok, entry} = Attesto.RefreshStore.ETS.get(Attesto.Secret.hash(refresh))
+      :ok = Attesto.RefreshStore.ETS.revoke_family(entry.family_id)
+
+      assert_refresh_refused(post_refresh(refresh), "the refresh token is invalid or its authorization was revoked")
+    end
+
+    test "an expired refresh token says it expired" do
+      put_config(refresh_token_ttl: 1)
+      Process.put(:auth_code, nil)
+      code_store = start_code_store("oc_sub-1", ["read", "offline_access"])
+      put_config(code_store: code_store)
+      initial = post_auth_code()
+      assert initial.status == 200
+      Process.sleep(1_100)
+
+      assert_refresh_refused(post_refresh(body(initial)["refresh_token"]), "the refresh token has expired")
+    end
+
+    test "an unknown refresh token gets the same description as a revoked one" do
+      assert_refresh_refused(
+        post_refresh(Attesto.Secret.generate(32)),
+        "the refresh token is invalid or its authorization was revoked"
+      )
+    end
+
+    test "a refresh token presented by another client gets the unknown-token description", %{refresh: refresh} do
+      conn =
+        post_token(%{
+          "grant_type" => "refresh_token",
+          "client_id" => "confidential-1",
+          "client_secret" => "s3cr3t",
+          "refresh_token" => refresh
+        })
+
+      assert_refresh_refused(conn, "the refresh token is invalid or its authorization was revoked")
+    end
+  end
+
   describe "initial refresh-token issuance (RFC 6749 §6)" do
     for {backend, label} <- [{Attesto.RefreshStore.ETS, "ETS"}, {EctoRefreshStore, "Postgres"}] do
       @tag ecto: backend == EctoRefreshStore
@@ -4179,6 +4244,15 @@ defmodule AttestoPhoenix.Controller.TokenControllerTest do
       keystore: __MODULE__.Keystore,
       principal_kinds: [@client_kind]
     )
+  end
+
+  defp post_refresh(refresh_token) do
+    post_token(%{"grant_type" => "refresh_token", "client_id" => "public-1", "refresh_token" => refresh_token})
+  end
+
+  defp assert_refresh_refused(conn, description) do
+    assert conn.status == 400
+    assert body(conn) == %{"error" => "invalid_grant", "error_description" => description}
   end
 
   defp post_auth_code do

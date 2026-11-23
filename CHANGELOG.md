@@ -6,6 +6,18 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.27.0] - 2026-11-22
+
+### Changed
+
+- Refresh-token `invalid_grant` responses carry a reason-specific `error_description`. The error code and HTTP status are unchanged (RFC 6749 §5.2). Clients that matched the old text, "authorization grant is invalid or expired", must update.
+  - Expired: "the refresh token has expired".
+  - Reused after rotation: "the refresh token was already used; every token from this authorization has been revoked".
+  - Revoked during rotation: "the authorization behind the refresh token has been revoked".
+  - Unknown, previously revoked, or presented by a client or issuer it was not issued to: "the refresh token is invalid or its authorization was revoked". These cases share one text so a presenter cannot tell that a token was issued to someone else.
+  - A missing, unexpected or mismatched DPoP or client attestation proof names the proof and the problem.
+- Authorization code, device code, CIBA, token exchange, pre-authorized code and ID-JAG errors are unchanged.
+
 ## [4.26.0] - 2026-11-20
 
 Requires `attesto >= 2.31.0 and < 3.0.0`.

@@ -1600,7 +1600,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
 
       {:error, :reuse_detected} ->
         note_detected_reuse(config)
-        {:error, grant_error(:reuse_detected), [refresh_reuse_detected_event(request)]}
+        {:error, refresh_grant_error(:reuse_detected), [refresh_reuse_detected_event(request)]}
 
       # Attesto.RefreshToken uses this result only when its refresh-store
       # transition is known to have rolled back. The parent remains valid, so
@@ -1613,7 +1613,7 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
         {:error, temporarily_unavailable_error()}
 
       {:error, reason} ->
-        {:error, grant_error(reason)}
+        {:error, refresh_grant_error(reason)}
     end
   end
 
@@ -3103,10 +3103,11 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   # code the way `String.to_existing_atom/1` would.
   defp error(code, description), do: OAuthError.new(code, description, status: 400)
 
-  # RFC 6749 §5.2: redemption/rotation failures all map to invalid_grant; the
-  # specific internal reason is not exposed to the client. Reuse detection is
-  # also invalid_grant on the wire (the family is already revoked in the
-  # store), so a captured-token replay learns nothing.
+  # RFC 6749 §5.2: redemption failures map to invalid_grant with one generic
+  # description; the specific internal reason is not exposed to the client.
+  # Authorization-code reuse detection is also invalid_grant on the wire (the
+  # family is already revoked in the store), so a captured-code replay learns
+  # nothing. Refresh-token rotation failures use `refresh_grant_error/1` below.
   defp grant_error(:invalid_scope), do: error(@error_invalid_scope, "requested scope exceeds the grant")
 
   # RFC 8707 §2: a refresh `resource` that is not a subset of the resources the
@@ -3114,6 +3115,51 @@ defmodule AttestoPhoenix.AuthorizationServer.Token do
   defp grant_error(:invalid_target), do: error(@error_invalid_target, "the requested resource is not within the grant")
 
   defp grant_error(_reason), do: error(@error_invalid_grant, "authorization grant is invalid or expired")
+
+  # RFC 6749 §5.2 keeps every refresh-token failure on `invalid_grant`; the
+  # description tells the client holding the token what happened to it, so the
+  # client can tell an expired or revoked authorization (send the user back
+  # through authorization) from a missing or mismatched proof (fix the request).
+  # A party replaying a stolen, already-rotated token learns only that the
+  # authorization is now revoked. A token whose family was revoked earlier is
+  # no longer found, so it gets the same text as an unknown token; client and
+  # issuer binding failures share that text too, because a different answer
+  # would tell a presenter the token was issued to someone else. No description
+  # carries a token value, identifier, timestamp, or store detail.
+  defp refresh_grant_error(:expired), do: error(@error_invalid_grant, "the refresh token has expired")
+
+  defp refresh_grant_error(:reuse_detected),
+    do:
+      error(
+        @error_invalid_grant,
+        "the refresh token was already used; every token from this authorization has been revoked"
+      )
+
+  defp refresh_grant_error(:grant_revoked),
+    do: error(@error_invalid_grant, "the authorization behind the refresh token has been revoked")
+
+  defp refresh_grant_error(:dpop_proof_required),
+    do: error(@error_invalid_grant, "a DPoP proof is required for this refresh token")
+
+  defp refresh_grant_error(:dpop_proof_unexpected),
+    do: error(@error_invalid_grant, "this refresh token is not bound to a DPoP key")
+
+  defp refresh_grant_error(:dpop_binding_mismatch),
+    do: error(@error_invalid_grant, "the DPoP proof key does not match the key this refresh token is bound to")
+
+  defp refresh_grant_error(:attestation_proof_required),
+    do: error(@error_invalid_grant, "a client attestation proof is required for this refresh token")
+
+  defp refresh_grant_error(:attestation_proof_unexpected),
+    do: error(@error_invalid_grant, "this refresh token is not bound to a client instance key")
+
+  defp refresh_grant_error(:attestation_binding_mismatch),
+    do: error(@error_invalid_grant, "the client attestation key does not match the key this refresh token is bound to")
+
+  defp refresh_grant_error(reason) when reason in [:invalid_scope, :invalid_target], do: grant_error(reason)
+
+  defp refresh_grant_error(_reason),
+    do: error(@error_invalid_grant, "the refresh token is invalid or its authorization was revoked")
 
   defp temporarily_unavailable_error do
     OAuthError.new(:temporarily_unavailable, "temporarily unavailable", status: 503)
