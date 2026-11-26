@@ -6,6 +6,32 @@ functions and behaviour contracts remain compatible within 4.x where security
 permits; security and correctness fixes may tighten validation or derived
 defaults in a minor release.
 
+## [4.28.0] - 2026-11-26
+
+Requires `attesto >= 2.32.0 and < 3.0.0` and
+`db_connection >= 2.10.3 and < 3.0.0`.
+
+### Security
+
+- Raises the `db_connection` floor to 2.10.3. Earlier releases can execute the
+  `:log` MFA from a forged `DBConnection.Stream` or
+  `DBConnection.PrepareStream` when a downstream component builds one from
+  untrusted input and enumerates it (CVE-2026-133555,
+  GHSA-gmmq-fw75-wq46). AttestoPhoenix does not deserialize untrusted Erlang
+  terms; the direct floor prevents a host lock from retaining an affected
+  transitive release.
+
+### Changed
+
+- JWT-bearer trusted-issuer discovery uses Attesto's shared metadata candidate
+  ordering: RFC 8414 path insertion, OpenID Connect path insertion, then
+  OpenID Connect path appending. This adds the required OpenID Connect
+  path-insertion form for path-based issuers and removes the duplicated URL
+  construction from the Phoenix package.
+- Discovery advances to another metadata URL only after HTTP 404. A malformed
+  document, issuer mismatch, transport failure, or any other HTTP status fails
+  closed instead of trying a different protocol document.
+
 ## [4.27.1] - 2026-11-23
 
 Requires `attesto >= 2.31.1 and < 3.0.0`.

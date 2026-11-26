@@ -33,8 +33,6 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
 
   @jti_namespace "idjag:"
   @metadata_cache_prefix "id-jag:metadata:"
-  @oauth_metadata_segment "/.well-known/oauth-authorization-server"
-  @oidc_metadata_segment "/.well-known/openid-configuration"
   @refresh_limits [
     flow_control_server: KeyRefresh,
     max_fetches_per_host_per_window: 1,
@@ -274,9 +272,9 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
     end
   end
 
-  # RFC 8414 §3.1 inserts the well-known segment before the issuer path.
-  # OpenID Connect Discovery §4.1 appends its segment to that path.
-  # Fetch OAuth metadata first and try OpenID Connect Discovery only on a 404.
+  # Use the shared authorization-server metadata candidate sequence: OAuth
+  # path insertion, OIDC path insertion, then OIDC path appending. A document
+  # advances to the next candidate only when it is absent.
   defp discover_jwks_uri(opts, issuer) do
     cache_key = @metadata_cache_prefix <> issuer
 
@@ -290,16 +288,15 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearer do
   end
 
   defp fetch_metadata(opts, issuer) do
-    uri = URI.parse(issuer)
-    path = String.replace_suffix(uri.path || "", "/", "")
-    oauth_url = URI.to_string(%{uri | path: @oauth_metadata_segment <> path})
+    with {:ok, candidates} <- Attesto.Discovery.metadata_candidates(issuer) do
+      fetch_metadata_candidate(opts, candidates)
+    end
+  end
 
-    case fetch_document(opts, oauth_url) do
-      {:error, {:status, 404}} ->
-        fetch_document(opts, URI.to_string(%{uri | path: path <> @oidc_metadata_segment}))
-
-      result ->
-        result
+  defp fetch_metadata_candidate(opts, [{_kind, url} | rest]) do
+    case fetch_document(opts, url) do
+      {:error, {:status, 404}} when rest != [] -> fetch_metadata_candidate(opts, rest)
+      result -> result
     end
   end
 

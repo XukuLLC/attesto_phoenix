@@ -22,10 +22,10 @@ defmodule AttestoPhoenix.MixProject do
   alias AttestoPhoenix.Store.PAR.ETS
   alias AttestoPhoenix.Store.Sweeper
 
-  @version "4.27.1"
+  @version "4.28.0"
   @url "https://github.com/XukuLLC/attesto_phoenix"
   @maintainers ["Neil Berkman"]
-  @attesto_requirement ">= 2.31.1 and < 3.0.0"
+  @attesto_requirement ">= 2.32.0 and < 3.0.0"
   @hex_package_tasks ["hex.build", "hex.publish"]
 
   def project do
@@ -76,8 +76,8 @@ defmodule AttestoPhoenix.MixProject do
   # Hex requirement even when a developer's shell exports a path opt-in. This
   # also makes the generated package metadata the release contract every time.
   #
-  # Attesto 2.31.1 checks a refresh token's client binding before its expiry
-  # and reuse state, which the reason-specific refresh errors rely on.
+  # Attesto 2.32.0 supplies the shared authorization-server metadata candidate
+  # ordering used by JWT-bearer issuer discovery.
   defp attesto_dep do
     source_path = System.get_env("ATTESTO_SOURCE_PATH")
 
@@ -126,6 +126,10 @@ defmodule AttestoPhoenix.MixProject do
       # 3.14.2 grow the query cache without bound from interpolated JSON paths
       # and splice lists (CVE-2026-118391).
       {:ecto, ">= 3.14.3 and < 4.0.0"},
+      # Security floor for Ecto SQL's connection layer. Earlier releases can
+      # execute the :log MFA in a forged, enumerated DBConnection stream struct
+      # (CVE-2026-133555).
+      {:db_connection, ">= 2.10.3 and < 3.0.0"},
       # Security floor for Ecto's Decimal dependency. Decimal < 3.1.2 permits
       # unbounded allocation through attacker-controlled `round/3` places
       # (CVE-2026-97853).

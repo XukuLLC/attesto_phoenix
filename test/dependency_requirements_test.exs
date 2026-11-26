@@ -40,9 +40,11 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
         # requires 2.26.0 for the replay cache's single-node start option,
         # 4.23 requires 2.27.0 for single-string authorization parameters,
         # 4.25 requires 2.30.0 for RSA and X.509 verification, 4.26
-        # requires 2.31.0 for ID-JAG draft -06 claim validation, and 4.27.1
-        # requires 2.31.1 for the refresh client-binding order.
-        assert Version.match?("2.31.1", requirement)
+        # requires 2.31.0 for ID-JAG draft -06 claim validation, 4.27.1
+        # requires 2.31.1 for the refresh client-binding order, and 4.28
+        # requires 2.32.0 for shared metadata candidate ordering.
+        assert Version.match?("2.32.0", requirement)
+        refute Version.match?("2.31.1", requirement)
         refute Version.match?("2.31.0", requirement)
         refute Version.match?("2.30.0", requirement)
         refute Version.match?("2.29.0", requirement)
@@ -116,7 +118,8 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
   test "an empty source path selects the released requirement" do
     with_environment(%{"ATTESTO_SOURCE_PATH" => "", "ATTESTO_PATH" => nil}, fn ->
       assert {:attesto, requirement} = dependency!(:attesto)
-      assert Version.match?("2.31.1", requirement)
+      assert Version.match?("2.32.0", requirement)
+      refute Version.match?("2.31.1", requirement)
       refute Version.match?("2.31.0", requirement)
       refute Version.match?("2.30.0", requirement)
       refute Version.match?("2.29.0", requirement)
@@ -170,7 +173,7 @@ defmodule AttestoPhoenix.DependencyRequirementsTest do
     metadata = File.read!(Path.join(output_path, "hex_metadata.config"))
     assert metadata =~ ~s(<<"version">>,<<"#{Mix.Project.config()[:version]}">>)
     assert metadata =~ ~s(<<"name">>,<<"attesto">>)
-    assert metadata =~ ~s(<<"requirement">>,<<">= 2.31.1 and < 3.0.0">>)
+    assert metadata =~ ~s(<<"requirement">>,<<">= 2.32.0 and < 3.0.0">>)
     assert File.regular?(Path.join(output_path, "guides/upgrade_4_0.md"))
   end
 

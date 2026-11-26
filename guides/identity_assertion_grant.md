@@ -69,7 +69,9 @@ to use metadata. The server uses discovery by default when neither key option is
 Set `discovery: false` to require a configured key source.
 
 For discovery, the server inserts `/.well-known/oauth-authorization-server`
-before the issuer path. On HTTP 404 it appends `/.well-known/openid-configuration`
+before the issuer path. On HTTP 404 it inserts
+`/.well-known/openid-configuration` before the issuer path, then on another
+HTTP 404 appends `/.well-known/openid-configuration`
 to the issuer. A document containing only `issuer` and `jwks_uri` suffices.
 The issuer value must match the trusted issuer exactly, including its path,
 and the key URL must use HTTPS. The server caches metadata and keys according

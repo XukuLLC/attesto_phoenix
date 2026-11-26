@@ -883,9 +883,10 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       refute_received {:issuer_fetch, _}
     end
 
-    test "falls back to a minimal OpenID Connect document only after HTTP 404" do
+    test "falls back through both OpenID Connect locations only after HTTP 404" do
       issuer = "https://idp.example/organizations/oidc"
       metadata_url = "https://idp.example/.well-known/oauth-authorization-server/organizations/oidc"
+      inserted_oidc_url = "https://idp.example/.well-known/openid-configuration/organizations/oidc"
       oidc_url = issuer <> "/.well-known/openid-configuration"
       jwks_uri = issuer <> "/keys"
 
@@ -905,7 +906,14 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
       assert_receive {:issuer_fetch, first}
       assert_receive {:issuer_fetch, second}
       assert_receive {:issuer_fetch, third}
-      assert [first, second, third] == [metadata_url, oidc_url, jwks_uri]
+      assert_receive {:issuer_fetch, fourth}
+
+      assert [first, second, third, fourth] == [
+               metadata_url,
+               inserted_oidc_url,
+               oidc_url,
+               jwks_uri
+             ]
 
       Process.put({ScriptedIssuerFetcher, metadata_url}, {:error, {:status, 503}})
 
@@ -913,6 +921,31 @@ defmodule AttestoPhoenix.AuthorizationServer.JwtBearerTest do
                issue(config, %{"assertion" => assertion(%{"iss" => issuer})})
 
       assert_received {:issuer_fetch, ^metadata_url}
+      refute_received {:issuer_fetch, _}
+    end
+
+    test "accepts path-inserted OpenID Connect metadata before path appending" do
+      issuer = "https://idp.example/organizations/inserted"
+      oauth_url = "https://idp.example/.well-known/oauth-authorization-server/organizations/inserted"
+      inserted_oidc_url = "https://idp.example/.well-known/openid-configuration/organizations/inserted"
+      jwks_uri = issuer <> "/keys"
+
+      script_fetch(inserted_oidc_url, %{"issuer" => issuer, "jwks_uri" => jwks_uri})
+      script_fetch(jwks_uri, idp_jwks())
+
+      config =
+        config(
+          jwt_bearer: [
+            issuers: %{issuer => [discovery: true]},
+            jwks_fetcher: ScriptedIssuerFetcher,
+            jwks_cache: nil
+          ]
+        )
+
+      assert {:ok, _, _} = issue(config, %{"assertion" => assertion(%{"iss" => issuer})})
+      assert_received {:issuer_fetch, ^oauth_url}
+      assert_received {:issuer_fetch, ^inserted_oidc_url}
+      assert_received {:issuer_fetch, ^jwks_uri}
       refute_received {:issuer_fetch, _}
     end
 
